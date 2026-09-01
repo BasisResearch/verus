@@ -92,7 +92,7 @@ environment. Run:
 
 ```
 cargo build --release
-cargo run --release -p cargo-verus -- build --release --manifest-path vstd/Cargo.toml
+cargo run --release -p cargo-verus -- --mcp build --release --manifest-path vstd/Cargo.toml
 ```
 
 The first command builds Verus and its supporting libraries. The second builds and verifies
