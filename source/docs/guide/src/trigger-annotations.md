@@ -99,4 +99,4 @@ The behavior can be configured through the command line:
 </tbody></table>
 </div>
 
-See more triggers logging options in `verus --help`
+See more triggers logging options in `verus --mcp --help`

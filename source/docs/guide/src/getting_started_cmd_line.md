@@ -14,16 +14,21 @@ Create a file called `getting_started.rs`, and paste in the following contents:
 
 To run Verus on the file:
 
+> **Note:** In this build of Verus, the `verus` binary refuses to run unless it is given the
+> `--mcp` flag, and prints an error explaining that it is only meant to be invoked by the Verus
+> MCP server rather than directly from a shell. The flag may appear anywhere on the command
+> line and is consumed by the `verus` wrapper; all command-line examples in this guide include it.
+
 If on macOS, Linux, or similar system, run:
 
 ```
-/path/to/verus getting_started.rs
+/path/to/verus --mcp getting_started.rs
 ```
 
 If on Windows, run:
 
 ```
-.\path\to\verus.exe getting_started.rs
+.\path\to\verus.exe --mcp getting_started.rs
 ```
 
 You should see the following output:
@@ -70,13 +75,13 @@ it to a binary, you can `verus` with the `--compile` flag.
 If on macOS, Linux, or similar system, run:
 
 ```
-/path/to/verus getting_started.rs --compile
+/path/to/verus --mcp getting_started.rs --compile
 ```
 
 If on Windows, run:
 
 ```
-.\path\to\verus.exe getting_started.rs --compile
+.\path\to\verus.exe --mcp getting_started.rs --compile
 ```
 
 Either will create a binary `getting_started`.

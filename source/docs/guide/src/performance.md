@@ -7,4 +7,4 @@ report on the SMT resources (rlimit) used.  SMT resources are an advanced topic;
 they give a *very rough* estimate of how hard the SMT solver worked on the provided
 query (or queries).
 
-See `verus --help` for more information about these options.
+See `verus --mcp --help` for more information about these options.
