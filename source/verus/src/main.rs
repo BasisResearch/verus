@@ -102,7 +102,7 @@ fn run() -> Result<std::process::ExitStatus, String> {
             _ => true,
         });
         // When cargo-verus drives this binary as RUSTC_WRAPPER, the arguments come from cargo,
-        // so the gate is bypassed there and enforced by cargo-verus's own `verus --mcp --version`.
+        // so the gate is bypassed here; cargo-verus enforces its own `--mcp` requirement instead.
         if !mcp && !via_cargo {
             return Err("the verus executable is only meant to be invoked by the MCP server, not directly from bash; use the `verus` MCP server's `verify` tool instead (or pass `--mcp` if you really are the MCP server)".to_owned());
         }

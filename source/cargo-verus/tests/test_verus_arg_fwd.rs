@@ -41,6 +41,7 @@ fn workspace_explicit_all() {
 
     let args = [
         BIN_NAME,
+        "--mcp",
         "verify",
         "--package",
         hasdeps,
@@ -92,6 +93,7 @@ fn workspace_explicit_roots() {
 
     let args = [
         BIN_NAME,
+        "--mcp",
         "verify",
         "--package",
         hasdeps,
@@ -143,6 +145,7 @@ fn workspace_explicit_deps() {
 
     let args = [
         BIN_NAME,
+        "--mcp",
         "verify",
         "--package",
         hasdeps,
@@ -192,8 +195,17 @@ fn workspace_default_for_verify_is_all() {
     let workspace_dir = setup_workspace();
     let workspace_dir = workspace_dir.path().canonicalize().expect("canonical path");
 
-    let args =
-        [BIN_NAME, "verify", "--package", hasdeps, "--package", sibling, "--", "--rlimit=10"];
+    let args = [
+        BIN_NAME,
+        "--mcp",
+        "verify",
+        "--package",
+        hasdeps,
+        "--package",
+        sibling,
+        "--",
+        "--rlimit=10",
+    ];
 
     let plan = plan_execution(workspace_dir.as_path(), args).expect("plan");
     let ExecutionPlan::RunCargo(cargo_plan) = plan else {
@@ -233,7 +245,17 @@ fn workspace_default_for_build_is_all() {
     let workspace_dir = setup_workspace();
     let workspace_dir = workspace_dir.path().canonicalize().expect("canonical path");
 
-    let args = [BIN_NAME, "build", "--package", hasdeps, "--package", sibling, "--", "--rlimit=10"];
+    let args = [
+        BIN_NAME,
+        "--mcp",
+        "build",
+        "--package",
+        hasdeps,
+        "--package",
+        sibling,
+        "--",
+        "--rlimit=10",
+    ];
 
     let plan = plan_execution(workspace_dir.as_path(), args).expect("plan");
     let ExecutionPlan::RunCargo(cargo_plan) = plan else {
@@ -273,7 +295,17 @@ fn workspace_default_for_check_is_all() {
     let workspace_dir = setup_workspace();
     let workspace_dir = workspace_dir.path().canonicalize().expect("canonical path");
 
-    let args = [BIN_NAME, "check", "--package", hasdeps, "--package", sibling, "--", "--rlimit=10"];
+    let args = [
+        BIN_NAME,
+        "--mcp",
+        "check",
+        "--package",
+        hasdeps,
+        "--package",
+        sibling,
+        "--",
+        "--rlimit=10",
+    ];
 
     let plan = plan_execution(workspace_dir.as_path(), args).expect("plan");
     let ExecutionPlan::RunCargo(cargo_plan) = plan else {
@@ -315,6 +347,7 @@ fn workspace_default_for_focus_is_roots() {
 
     let args = [
         BIN_NAME,
+        "--mcp",
         "focus",
         "--package",
         hasdeps,
