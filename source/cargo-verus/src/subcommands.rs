@@ -566,13 +566,14 @@ fn get_verus_driver_path() -> PathBuf {
     path
 }
 
-/// Run `verus --version` and capture its output.
+/// Run `verus --mcp --version` and capture its output.
 fn get_verus_driver_version() -> Result<String> {
     let command = get_verus_driver_path();
     let output = Command::new(&command)
+        .arg("--mcp")
         .arg("--version")
         .output()
-        .context(format!("running `{} --version`", command.display()))?;
+        .context(format!("running `{} --mcp --version`", command.display()))?;
 
     if !output.status.success() {
         bail!(
