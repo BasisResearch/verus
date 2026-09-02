@@ -18,7 +18,7 @@ fn crate_optin_manifest() {
     let manifest_path = manifest_path.to_str().expect("manifest path to string");
 
     let temp_dir = tempfile::tempdir().expect("create temp dir");
-    let args = [BIN_NAME, "focus", "--manifest-path", manifest_path];
+    let args = [BIN_NAME, "--mcp", "focus", "--manifest-path", manifest_path];
     let plan = plan_execution(temp_dir.path(), args).expect("plan");
     let ExecutionPlan::RunCargo(cargo_plan) = plan else {
         panic!("expected `ExecutionPlan::RunCargo`");
@@ -66,7 +66,7 @@ fn workspace_manifest() {
     let manifest_path = manifest_path.to_str().expect("manifest path to string");
 
     let temp_dir = tempfile::tempdir().expect("create temp dir");
-    let args = [BIN_NAME, "focus", "--manifest-path", manifest_path];
+    let args = [BIN_NAME, "--mcp", "focus", "--manifest-path", manifest_path];
     let plan = plan_execution(temp_dir.path(), args).expect("plan");
     let ExecutionPlan::RunCargo(cargo_plan) = plan else {
         panic!("expected `ExecutionPlan::RunCargo`");
@@ -124,7 +124,7 @@ fn workspace_package_hasdeps() {
     let verify_unset_prefix = format!("{VERUS_DRIVER_VERIFY}{unset}-0.1.0-");
     let verify_hasdeps_prefix = format!("{VERUS_DRIVER_VERIFY}{hasdeps}-0.1.0-");
 
-    let args = [BIN_NAME, "focus", "--package", hasdeps];
+    let args = [BIN_NAME, "--mcp", "focus", "--package", hasdeps];
 
     let plan = plan_execution(workspace_dir.as_path(), args).expect("plan");
     let ExecutionPlan::RunCargo(cargo_plan) = plan else {
@@ -168,7 +168,7 @@ fn workspace_package_hasdeps_forwards_verus_args_only_to_roots() {
 
     let workspace_dir = workspace_dir.path().canonicalize().expect("canonical path");
 
-    let args = [BIN_NAME, "focus", "--package", hasdeps, "--", "--verify-module=bar"];
+    let args = [BIN_NAME, "--mcp", "focus", "--package", hasdeps, "--", "--verify-module=bar"];
 
     let plan = plan_execution(workspace_dir.as_path(), args).expect("plan");
     let ExecutionPlan::RunCargo(cargo_plan) = plan else {
@@ -212,7 +212,7 @@ fn partial_verification_selectors_require_focus() {
             "--verify-function",
             "--verify-function=foo",
         ] {
-            let args = [BIN_NAME, command, "--", arg];
+            let args = [BIN_NAME, "--mcp", command, "--", arg];
             let plan = plan_execution(package_dir.path(), args);
             assert!(plan.is_err_and(|err| {
                 err.to_string().contains("Partial verification must use `cargo verus focus`")
@@ -231,7 +231,7 @@ fn focus_accepts_partial_verification_selectors() {
         "--verify-only-module=foo",
         "--verify-function=foo",
     ] {
-        let args = [BIN_NAME, "focus", "--", arg];
+        let args = [BIN_NAME, "--mcp", "focus", "--", arg];
         let plan = plan_execution(package_dir.path(), args);
         assert!(plan.is_ok());
     }

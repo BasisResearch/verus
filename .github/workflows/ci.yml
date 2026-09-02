@@ -191,7 +191,7 @@ jobs:
         run: |
           cargo clean
           CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS=true cargo build --release
-          cargo run --release -p cargo-verus -- build --release --manifest-path vstd/Cargo.toml
+          cargo run --release -p cargo-verus -- --mcp build --release --manifest-path vstd/Cargo.toml
 
       - name: full tests
         working-directory: ./source
@@ -243,7 +243,7 @@ jobs:
         run: |
           cargo clean
           cargo build
-          cargo run -p cargo-verus -- build --manifest-path vstd/Cargo.toml
+          cargo run -p cargo-verus -- --mcp build --manifest-path vstd/Cargo.toml
 
       - name: basic tests
         working-directory: ./source
@@ -293,21 +293,21 @@ jobs:
             "singular")
               hdiutil attach ../Singular-4-3-2_M1.dmg
               DYLD_LIBRARY_PATH=$DYLD_LIBRARY_PATH:/Volumes/Singular4.3.2/Singular.app/Contents/lib VERUS_SINGULAR_PATH=/Volumes/Singular4.3.2/Singular.app/Contents/bin/Singular cargo build --features singular
-              cargo run -p cargo-verus -- build --manifest-path vstd/Cargo.toml
+              cargo run -p cargo-verus -- --mcp build --manifest-path vstd/Cargo.toml
               ;;
             "record-history")
               cargo build --features record-history
-              cargo run -p cargo-verus -- build --manifest-path vstd/Cargo.toml
+              cargo run -p cargo-verus -- --mcp build --manifest-path vstd/Cargo.toml
               ;;
             "no-std")
               cargo build
-              cargo run -p cargo-verus -- build --manifest-path vstd/Cargo.toml --no-default-features --features alloc
+              cargo run -p cargo-verus -- --mcp build --manifest-path vstd/Cargo.toml --no-default-features --features alloc
               cd .. # important to disable the source/.cargo/config.toml
               cargo build --manifest-path source/vstd/Cargo.toml --no-default-features --features alloc
               ;;
             "no-alloc")
               cargo build
-              cargo run -p cargo-verus -- build --manifest-path vstd/Cargo.toml --no-default-features
+              cargo run -p cargo-verus -- --mcp build --manifest-path vstd/Cargo.toml --no-default-features
               cd .. # important to disable the source/.cargo/config.toml
               cargo build --manifest-path source/vstd/Cargo.toml --no-default-features
               ;;

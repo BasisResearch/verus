@@ -76,7 +76,7 @@ Here is a snippet of the reasoning log from Claude Opus 4.5, a very powerful rea
 Let me run Verus to see what the errors are:
 
 ● Run Verus to see initial errors (shell)
-  │ cd /usr/src/work && verus test.rs --rlimit 100 2>&1 | head -200
+  │ cd /usr/src/work && verus --mcp test.rs --rlimit 100 2>&1 | head -200
   └ 46 lines...
 
 Now I need to add proof annotations to help Verus verify this lemma. Let me look at the vstd folder for any useful lemmas:
@@ -84,7 +84,7 @@ Now I need to add proof annotations to help Verus verify this lemma. Let me look
 ... 
 
 ● Run Verus to check proof (shell)
-  │ cd /usr/src/tmp && verus test.rs --rlimit 150 2>&1 | head -400
+  │ cd /usr/src/tmp && verus --mcp test.rs --rlimit 150 2>&1 | head -400
   └ 94 lines...
 
 There are several issues. Let me take a more careful approach by understanding what needs to be proven. Let me simplify the proof and add the necessary assertions more carefully:
@@ -93,7 +93,7 @@ There are several issues. Let me take a more careful approach by understanding w
 ...
 
 ● Run Verus to check proof (shell)
-  │ cd /usr/src/tmp && verus test.rs --rlimit 150 2>&1 | head -400
+  │ cd /usr/src/tmp && verus --mcp test.rs --rlimit 150 2>&1 | head -400
   └ 16 lines...
 
 I see there are issues with imports. Let me look at the file structure more carefully:
@@ -104,7 +104,7 @@ I see there are issues with imports. Let me look at the file structure more care
 This workflow of repeatedly running Verus, reflecting on the resulting Verus error report, and then editing proof annotations accordingly is a good practice for both human developers and LLMs.
 
 **Key points:**
-- Provide a simple command to run Verus (e.g., `verus file.rs`)
+- Provide a simple command to run Verus (e.g., `verus --mcp file.rs`)
 - Let the model see the complete error output, not just success/failure (this is the case by default if you use coding agents)
 - The `--expand-errors` flag can provide even more detailed feedback
 

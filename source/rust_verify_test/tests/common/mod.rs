@@ -550,6 +550,8 @@ pub fn run_cargo_verus_with_target(
     child.env("VERUS_Z3_PATH", z3);
 
     let mut cargo_verus_args = Vec::new();
+    // cargo-verus refuses to run without --mcp (it is meant to be driven by the MCP server).
+    cargo_verus_args.push("--mcp");
     cargo_verus_args.push(args[0]);
     if args.first() != Some(&"new") {
         cargo_verus_args

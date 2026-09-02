@@ -188,7 +188,7 @@ and `#[verifier::external_body]` can be used to mark this boundary.
 We can now compile the program above using the `--compile` option to Verus:
 
 ```
-./target-verus/release/verus --compile ../examples/guide/requires_ensures.rs
+./target-verus/release/verus --mcp --compile ../examples/guide/requires_ensures.rs
 ```
 
 This will produce an executable that prints a message when run:

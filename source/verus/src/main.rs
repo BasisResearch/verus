@@ -79,6 +79,7 @@ fn run() -> Result<std::process::ExitStatus, String> {
         let _bin = args.next().expect("executable in args");
         let mut all_args: Vec<_> = args.collect();
         let mut record = false;
+        let mut mcp = false;
         let mut unpretty_arg = false;
         for i in 0..all_args.len() {
             if all_args[i] == "-Z"
@@ -94,8 +95,17 @@ fn run() -> Result<std::process::ExitStatus, String> {
                 record = true;
                 false
             }
+            "--mcp" => {
+                mcp = true;
+                false
+            }
             _ => true,
         });
+        // When cargo-verus drives this binary as RUSTC_WRAPPER, the arguments come from cargo,
+        // so the gate is bypassed here; cargo-verus enforces its own `--mcp` requirement instead.
+        if !mcp && !via_cargo {
+            return Err("the verus executable is only meant to be invoked by the MCP server, not directly from bash; use the `verus` MCP server's `verify` tool instead (or pass `--mcp` if you really are the MCP server)".to_owned());
+        }
         (all_args, record, unpretty_arg)
     };
 

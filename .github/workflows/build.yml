@@ -73,7 +73,7 @@ jobs:
       - name: create archive
         working-directory: ./source
         run: |
-          ./target-verus/release/verus --version --output-json > ./target-verus/release/version.json
+          ./target-verus/release/verus --mcp --version --output-json > ./target-verus/release/version.json
           cp -R ./target-verus/release "../${{ matrix.release_name }}"
           cd ..
           zip -r "${{ matrix.release_name }}.zip" "./${{ matrix.release_name }}"

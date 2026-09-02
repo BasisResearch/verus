@@ -12,9 +12,15 @@ use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
     styles = clap_cargo::style::CLAP_STYLING,
 )]
 pub struct CargoVerusCli {
+    /// Required: cargo-verus is only meant to be invoked by the Verus MCP server
+    #[arg(long, global = true)]
+    pub mcp: bool,
+
     #[command(subcommand)]
     pub command: VerusSubcommand,
 }
+
+pub const MCP_REQUIRED_MESSAGE: &str = "cargo-verus is only meant to be invoked by the MCP server, not directly from bash; use the `verus` MCP server's tools instead (or pass `--mcp` if you really are the MCP server)";
 
 #[derive(Clone, Debug, Subcommand)]
 pub enum VerusSubcommand {
@@ -201,6 +207,10 @@ impl CargoVerusCli {
     pub fn from_args<'a>(args: impl Iterator<Item = &'a str>) -> Result<Self> {
         let normalized_args = normalize_args(args);
         let mut parsed_cli = CargoVerusCli::parse_from(normalized_args).clap_trailing_args_hotfix();
+
+        if !parsed_cli.mcp {
+            return Err(anyhow!(MCP_REQUIRED_MESSAGE));
+        }
 
         if parsed_cli.has_inadvisable_verus_arg() {
             eprintln!("Args forwarded to Cargo must precede args forwarded to Verus");

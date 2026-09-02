@@ -234,7 +234,7 @@ fn process_target(
         }
 
         log_command(
-            cmd!(sh, "{cargo_verus_binary_path} verus focus")
+            cmd!(sh, "{cargo_verus_binary_path} verus --mcp focus")
                 .args(project.extra_cargo_args.iter().flatten())
                 .args(&cargo_target_args)
                 .arg("--")
@@ -245,7 +245,7 @@ fn process_target(
         .map_err(|e| anyhow!("cannot execute cargo verus on {}: {}", &project.name, e))?
     } else {
         log_command(
-            cmd!(sh, "{verus_binary_path} {target}")
+            cmd!(sh, "{verus_binary_path} --mcp {target}")
                 .args(&verus_args)
                 .into(),
         )

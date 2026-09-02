@@ -12,8 +12,15 @@ The `cargo-verus` binary must be in your `PATH`. It is included in the official
 Check that it is available by running:
 
 ```
-cargo verus --help
+cargo verus --mcp --help
 ```
+
+> **Note:** In this build of Verus, `cargo verus` (like the `verus` binary) refuses to run
+> unless it is given the `--mcp` flag, and prints an error explaining that it is only meant to
+> be invoked by the Verus MCP server rather than directly from a shell. The flag is accepted
+> anywhere on the command line (`cargo verus --mcp verify` or `cargo verus verify --mcp`) and is
+> consumed by `cargo-verus` itself; it is not forwarded to Cargo or to Verus. All examples in
+> this chapter include it.
 
 ## Starting a new project
 
@@ -21,10 +28,10 @@ The fastest way to create a new Verus project is:
 
 ```bash
 # Binary project
-cargo verus new --bin my_project
+cargo verus --mcp new --bin my_project
 
 # Library project
-cargo verus new --lib my_library
+cargo verus --mcp new --lib my_library
 ```
 
 This creates a new directory with a correctly-configured `Cargo.toml`, an initial
@@ -121,8 +128,8 @@ Runs verification on all crates that have `verify = true`, including dependencie
 Does **not** produce a compiled binary.
 
 ```bash
-cargo verus verify              # Verify all of the crates
-cargo verus verify -p my_crate  # Verify only my_crate and its dependencies
+cargo verus --mcp verify              # Verify all of the crates
+cargo verus --mcp verify -p my_crate  # Verify only my_crate and its dependencies
 ```
 
 Use `verify` for day-to-day proof development. Incremental builds mean that only
@@ -139,9 +146,9 @@ by the cached partial results.
 
 ```bash
 # Verify all of the root crates, but not their dependencies
-cargo verus focus
+cargo verus --mcp focus
 # Verify my_crate, but not its dependencies
-cargo verus focus -p my_crate
+cargo verus --mcp focus -p my_crate
 ```
 
 Dependencies are still *built* (so their types are available), but their proofs are
@@ -154,8 +161,8 @@ Verifies all opted-in crates **and** compiles them to native artifacts (librarie
 binaries). Use this when you want to ship a verified binary.
 
 ```bash
-cargo verus build
-cargo verus build --release
+cargo verus --mcp build
+cargo verus --mcp build --release
 ```
 
 Note that Verus-annotated code can also be built with a normal `cargo build` command, if you prefer.
@@ -169,7 +176,7 @@ Arguments are split around `--`:
 - **After `--`**: forwarded to every `verus` invocation
 
 ```bash
-cargo verus verify -p my_crate --release -- --rlimit 60 --expand-errors
+cargo verus --mcp verify -p my_crate --release -- --rlimit 60 --expand-errors
 #                  ^^^^^^^^^^^^^^^^^^^^^    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 #                  Cargo arguments            Verus arguments
 ```
@@ -205,7 +212,7 @@ Use `--fwd-verus-args-to <target>` to narrow or widen the target.
 
 ```bash
 # Only pass --rlimit to the root crate, not to its verified dependencies
-cargo verus verify --fwd-verus-args-to roots -- --rlimit 60
+cargo verus --mcp verify --fwd-verus-args-to roots -- --rlimit 60
 ```
 
 Recall that you can also use the standard `cargo -p <crate_name>` to restrict
@@ -219,10 +226,10 @@ compiled normally and are not passed through the Verus prover.
 
 ```bash
 # Verify the entire workspace
-cargo verus verify --workspace
+cargo verus --mcp verify --workspace
 
 # Verify a single crate and its verified dependencies
-cargo verus verify -p my_crate
+cargo verus --mcp verify -p my_crate
 ```
 
 ## Incremental verification

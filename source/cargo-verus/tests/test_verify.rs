@@ -13,7 +13,7 @@ fn crate_optin_workdir() {
     let verify_crate_prefix = format!("{VERUS_DRIVER_VERIFY}{package_name}-0.1.0-");
     let project_dir = MockPackage::new(package_name).lib().verify(true).materialize();
 
-    let args = [BIN_NAME, "verify"];
+    let args = [BIN_NAME, "--mcp", "verify"];
 
     let plan = plan_execution(project_dir.path(), args).expect("plan");
     let ExecutionPlan::RunCargo(cargo_plan) = plan else {
@@ -35,7 +35,7 @@ fn single_v_verbosity_not_forwarded() {
     let package_name = "foo";
     let project_dir = MockPackage::new(package_name).lib().verify(true).materialize();
 
-    let args = [BIN_NAME, "verify", "-v"];
+    let args = [BIN_NAME, "--mcp", "verify", "-v"];
     let plan = plan_execution(project_dir.path(), args).expect("plan");
     let ExecutionPlan::RunCargo(cargo_plan) = plan else {
         panic!("expected `ExecutionPlan::RunCargo`");
@@ -56,7 +56,7 @@ fn double_v_verbosity_forwarded_to_cargo_and_verus() {
     let package_name = "foo";
     let project_dir = MockPackage::new(package_name).lib().verify(true).materialize();
 
-    let args = [BIN_NAME, "verify", "-vv"];
+    let args = [BIN_NAME, "--mcp", "verify", "-vv"];
     let plan = plan_execution(project_dir.path(), args).expect("plan");
     let ExecutionPlan::RunCargo(cargo_plan) = plan else {
         panic!("expected `ExecutionPlan::RunCargo`");
@@ -77,7 +77,7 @@ fn triple_v_verbosity_forwarded_to_cargo_and_verus() {
     let package_name = "foo";
     let project_dir = MockPackage::new(package_name).lib().verify(true).materialize();
 
-    let args = [BIN_NAME, "verify", "-vvv"];
+    let args = [BIN_NAME, "--mcp", "verify", "-vvv"];
     let plan = plan_execution(project_dir.path(), args).expect("plan");
     let ExecutionPlan::RunCargo(cargo_plan) = plan else {
         panic!("expected `ExecutionPlan::RunCargo`");
@@ -103,7 +103,7 @@ fn crate_optin_manifest() {
     let manifest_path = manifest_path.to_str().expect("manifest path to string");
 
     let temp_dir = tempfile::tempdir().expect("create temp dir");
-    let args = [BIN_NAME, "verify", "--manifest-path", manifest_path];
+    let args = [BIN_NAME, "--mcp", "verify", "--manifest-path", manifest_path];
     let plan = plan_execution(temp_dir.path(), args).expect("plan");
     let ExecutionPlan::RunCargo(cargo_plan) = plan else {
         panic!("expected `ExecutionPlan::RunCargo`");
@@ -122,7 +122,7 @@ fn crate_optout_workdir() {
     let package_name = "foo";
     let package_dir = MockPackage::new(package_name).lib().verify(false).materialize();
 
-    let args = [BIN_NAME, "verify"];
+    let args = [BIN_NAME, "--mcp", "verify"];
 
     let plan = plan_execution(package_dir.path(), args).expect("plan");
     let ExecutionPlan::RunCargo(cargo_plan) = plan else {
@@ -145,7 +145,7 @@ fn crate_optout_manifest() {
     let manifest_path = manifest_path.to_str().expect("manifest path to string");
 
     let temp_dir = tempfile::tempdir().expect("create temp dir");
-    let args = [BIN_NAME, "verify", "--manifest-path", manifest_path];
+    let args = [BIN_NAME, "--mcp", "verify", "--manifest-path", manifest_path];
     let plan = plan_execution(temp_dir.path(), args).expect("plan");
     let ExecutionPlan::RunCargo(cargo_plan) = plan else {
         panic!("expected `ExecutionPlan::RunCargo`");
@@ -164,7 +164,7 @@ fn crate_unset_workdir() {
     let package_name = "foo";
     let package_dir = MockPackage::new(package_name).lib().materialize();
 
-    let args = [BIN_NAME, "verify"];
+    let args = [BIN_NAME, "--mcp", "verify"];
 
     let plan = plan_execution(package_dir.path(), args).expect("plan");
     let ExecutionPlan::RunCargo(cargo_plan) = plan else {
@@ -188,7 +188,7 @@ fn crate_unset_manifest() {
     let manifest_path = manifest_path.to_str().expect("manifest path to string");
 
     let temp_dir = tempfile::tempdir().expect("create temp dir");
-    let args = [BIN_NAME, "verify", "--manifest-path", manifest_path];
+    let args = [BIN_NAME, "--mcp", "verify", "--manifest-path", manifest_path];
     let plan = plan_execution(temp_dir.path(), args).expect("plan");
     let ExecutionPlan::RunCargo(cargo_plan) = plan else {
         panic!("expected `ExecutionPlan::RunCargo`");
@@ -223,7 +223,7 @@ fn workspace_workdir() {
     let verify_unset_prefix = format!("{VERUS_DRIVER_VERIFY}{unset}-0.1.0-");
     let verify_hasdeps_prefix = format!("{VERUS_DRIVER_VERIFY}{hasdeps}-0.1.0-");
 
-    let args = [BIN_NAME, "verify"];
+    let args = [BIN_NAME, "--mcp", "verify"];
 
     let plan = plan_execution(workspace_dir.path(), args).expect("plan");
     let ExecutionPlan::RunCargo(cargo_plan) = plan else {
@@ -266,7 +266,7 @@ fn workspace_manifest() {
     let manifest_path = manifest_path.to_str().expect("manifest path to string");
 
     let temp_dir = tempfile::tempdir().expect("create temp dir");
-    let args = [BIN_NAME, "verify", "--manifest-path", manifest_path];
+    let args = [BIN_NAME, "--mcp", "verify", "--manifest-path", manifest_path];
     let plan = plan_execution(temp_dir.path(), args).expect("plan");
     let ExecutionPlan::RunCargo(cargo_plan) = plan else {
         panic!("expected `ExecutionPlan::RunCargo`");
@@ -308,7 +308,7 @@ fn workspace_manifest_package_optin() {
     let manifest_path = manifest_path.to_str().expect("manifest path to string");
 
     let temp_dir = tempfile::tempdir().expect("create temp dir");
-    let args = [BIN_NAME, "verify", "--manifest-path", manifest_path, "--package", optin];
+    let args = [BIN_NAME, "--mcp", "verify", "--manifest-path", manifest_path, "--package", optin];
     let plan = plan_execution(temp_dir.path(), args).expect("plan");
     let ExecutionPlan::RunCargo(cargo_plan) = plan else {
         panic!("expected `ExecutionPlan::RunCargo`");
@@ -350,7 +350,8 @@ fn workspace_manifest_package_hasdeps() {
     let manifest_path = manifest_path.to_str().expect("manifest path to string");
 
     let temp_dir = tempfile::tempdir().expect("create temp dir");
-    let args = [BIN_NAME, "verify", "--manifest-path", manifest_path, "--package", hasdeps];
+    let args =
+        [BIN_NAME, "--mcp", "verify", "--manifest-path", manifest_path, "--package", hasdeps];
     let plan = plan_execution(temp_dir.path(), args).expect("plan");
     let ExecutionPlan::RunCargo(cargo_plan) = plan else {
         panic!("expected `ExecutionPlan::RunCargo`");
@@ -393,7 +394,8 @@ fn workspace_emits_import_for_transitive_verified_dep() {
     let consumer_args_prefix = format!("{VERUS_DRIVER_ARGS_FOR}{consumer}-0.1.0-");
 
     let temp_dir = tempfile::tempdir().expect("create temp dir");
-    let args = [BIN_NAME, "verify", "--manifest-path", manifest_path, "--package", consumer];
+    let args =
+        [BIN_NAME, "--mcp", "verify", "--manifest-path", manifest_path, "--package", consumer];
     let plan = plan_execution(temp_dir.path(), args).expect("plan");
     let ExecutionPlan::RunCargo(cargo_plan) = plan else {
         panic!("expected `ExecutionPlan::RunCargo`");
@@ -428,7 +430,8 @@ fn workspace_renamed_dependency_import_uses_workspace_alias() {
     let consumer_args_prefix = format!("{VERUS_DRIVER_ARGS_FOR}{consumer}-0.1.0-");
 
     let temp_dir = tempfile::tempdir().expect("create temp dir");
-    let args = [BIN_NAME, "verify", "--manifest-path", manifest_path, "--package", consumer];
+    let args =
+        [BIN_NAME, "--mcp", "verify", "--manifest-path", manifest_path, "--package", consumer];
     let plan = plan_execution(temp_dir.path(), args).expect("plan");
     let ExecutionPlan::RunCargo(cargo_plan) = plan else {
         panic!("expected `ExecutionPlan::RunCargo`");
@@ -444,5 +447,18 @@ fn workspace_renamed_dependency_import_uses_workspace_alias() {
     assert!(
         !driver_args.iter().any(|arg| *arg == package_import),
         "expected alias (not package name) for direct renamed workspace dep, got: {driver_args:?}",
+    );
+}
+
+#[test]
+fn verify_requires_mcp_flag() {
+    let project_dir = MockPackage::new("foo").lib().verify(true).materialize();
+
+    let args = [BIN_NAME, "verify"];
+    let plan = plan_execution(project_dir.path(), args);
+    assert!(
+        plan.is_err_and(|err| err
+            .to_string()
+            .contains("only meant to be invoked by the MCP server"))
     );
 }
