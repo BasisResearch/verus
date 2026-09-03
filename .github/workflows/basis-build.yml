@@ -15,9 +15,14 @@
 
 name: basis-build
 
+# TEMPORARY: ci/basis-build-publish is listed so this branch can publish the
+# releases the benchmark harness needs while the PR waits on review. Releases
+# built from any branch other than main are marked prerelease, so what is
+# published from an unmerged branch is visibly labelled as such. Drop the
+# branch from this list when the PR merges; nothing else needs to change.
 on:
   push:
-    branches: [main]
+    branches: [main, ci/basis-build-publish]
   pull_request:
     types: [opened, synchronize, reopened]
   workflow_dispatch:
@@ -63,9 +68,17 @@ jobs:
         shell: bash
         run: |
           tag="basis-${GITHUB_SHA:0:10}"
+          # Only main publishes a full release; anything else is a prerelease,
+          # so a build from an unmerged branch never claims "Latest".
+          prerelease=()
+          if [ "$GITHUB_REF_NAME" != "main" ]; then
+            prerelease=(--prerelease)
+            echo "publishing from $GITHUB_REF_NAME as a prerelease"
+          fi
           gh release delete -y "$tag" --repo "$GITHUB_REPOSITORY" --cleanup-tag 2>/dev/null || true
           gh release create "$tag" --repo "$GITHUB_REPOSITORY" \
             --target "$GITHUB_SHA" \
+            "${prerelease[@]}" \
             --title "Basis verus build $tag" \
             --notes "$(printf 'Pinned Basis build of Verus at %s.\n\nVersion: %s\nRef: %s\n\n```\n%s\n```' \
                        "$GITHUB_SHA" "${VERUS_VERSION:-unknown}" "$GITHUB_REF_NAME" "$(cat SHA256SUMS)")" \
