@@ -1,0 +1,76 @@
+# Basis fork build: publish the per-commit Verus release the MCP server and the
+# benchmark harness download.
+#
+# build.yml already produces verus-arm64-macos.zip and verus-x86-linux.zip as
+# workflow artifacts. Artifacts expire and need an authenticated API call to
+# fetch, so a consumer cannot pin "the Verus built from commit X" the way it
+# pins cvc5 and z3. This publishes the same zips to a per-commit GitHub release
+# with sha256 sidecars, matching the basis-build workflows on
+# BasisResearch/cvc5 and BasisResearch/z3.
+#
+# The asset is a zip of the whole target-verus/release tree, not a bare binary,
+# because Verus needs its vstd.vir and libraries alongside the executable. That
+# is the one way this differs from the solver forks, whose assets are single
+# static binaries.
+
+name: basis-build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: basis-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    uses: ./.github/workflows/build.yml
+    with:
+      checkout_ref: ${{ github.sha }}
+      is_rolling: false
+
+  publish:
+    if: github.event_name != 'pull_request'
+    needs: [build]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: download all artifacts
+        uses: actions/download-artifact@v8
+
+      - name: checksum
+        shell: bash
+        run: |
+          for name in verus-arm64-macos verus-x86-linux; do
+            test -f "$name/$name.zip" || { echo "missing $name/$name.zip"; exit 1; }
+            ( cd "$name" && shasum -a 256 "$name.zip" > "$name.zip.sha256" )
+            cat "$name/$name.zip.sha256"
+          done
+          cat */*.zip.sha256 > SHA256SUMS
+
+      - name: publish per-commit release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERUS_VERSION: ${{ needs.build.outputs.version }}
+        shell: bash
+        run: |
+          tag="basis-${GITHUB_SHA:0:10}"
+          gh release delete -y "$tag" --repo "$GITHUB_REPOSITORY" --cleanup-tag 2>/dev/null || true
+          gh release create "$tag" --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "Basis verus build $tag" \
+            --notes "$(printf 'Pinned Basis build of Verus at %s.\n\nVersion: %s\nRef: %s\n\n```\n%s\n```' \
+                       "$GITHUB_SHA" "${VERUS_VERSION:-unknown}" "$GITHUB_REF_NAME" "$(cat SHA256SUMS)")" \
+            verus-arm64-macos/verus-arm64-macos.zip \
+            verus-arm64-macos/verus-arm64-macos.zip.sha256 \
+            verus-x86-linux/verus-x86-linux.zip \
+            verus-x86-linux/verus-x86-linux.zip.sha256 \
+            SHA256SUMS
