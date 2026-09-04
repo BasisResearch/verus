@@ -15,14 +15,9 @@
 
 name: basis-build
 
-# TEMPORARY: ci/basis-build-publish is listed so this branch can publish the
-# releases the benchmark harness needs while the PR waits on review. Releases
-# built from any branch other than main are marked prerelease, so what is
-# published from an unmerged branch is visibly labelled as such. Drop the
-# branch from this list when the PR merges; nothing else needs to change.
 on:
   push:
-    branches: [main, ci/basis-build-publish]
+    branches: [main]
   pull_request:
     types: [opened, synchronize, reopened]
   workflow_dispatch:
