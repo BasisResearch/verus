@@ -287,7 +287,7 @@ pub fn run_verus(
     #[cfg(target_os = "windows")]
     std::thread::sleep(std::time::Duration::from_millis(1000));
 
-    let mut verus_args = Vec::new();
+    let mut verus_args = vec!["--mcp".to_string()];
     let mut no_external_by_default = false;
     let mut is_core = false;
     let mut use_internal_test_mode = true;
@@ -478,6 +478,7 @@ pub fn run_verus_raw(args: &[&str], dir: &std::path::Path) -> std::process::Outp
     std::process::Command::new(bin)
         .current_dir(dir)
         .env("VERUS_Z3_PATH", z3)
+        .arg("--mcp")
         .args(args)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())

@@ -106,7 +106,7 @@ After running the build steps above, you can verify an example file.
 From the `source` directory, run:
 
 ```
-vargo run -p rust_verify --release -- ../examples/vectors.rs
+vargo run -p rust_verify --release -- --mcp ../examples/vectors.rs
 ```
 
 This will make sure that the Verus and `vstd` builds are up-to-date, then run the verifier.
@@ -116,13 +116,13 @@ You can also run the verifier directly (skipping the up-to-date check) with:
 on Linux and macOS:
 
 ```
-./target-verus/release/verus ../examples/vectors.rs
+./target-verus/release/verus --mcp ../examples/vectors.rs
 ```
 
 on Windows:
 
 ```
-.\target-verus\release\verus.exe ..\examples\vectors.rs
+.\target-verus\release\verus.exe --mcp ..\examples\vectors.rs
 ```
 
 You should see something like the following, indicating that verification was a success:
@@ -136,14 +136,14 @@ You can also add the `--compile` flag, which tells Verus to compile the Verus co
 on Linux and macOS:
 
 ```
-./target-verus/release/verus ../examples/doubly_linked_xor.rs --compile
+./target-verus/release/verus --mcp ../examples/doubly_linked_xor.rs --compile
 ./doubly_linked_xor
 ```
 
 on Windows:
 
 ```
-.\target-verus\release\verus.exe ..\examples\doubly_linked_xor.rs --compile
+.\target-verus\release\verus.exe --mcp ..\examples\doubly_linked_xor.rs --compile
 .\doubly_linked_xor.exe
 ```
 
