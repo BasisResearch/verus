@@ -201,3 +201,30 @@ fn proxies() {
     assert_eq!(ext["verified"], true);
     assert_eq!(ext["external_body"], true);
 }
+
+#[test]
+fn trait_impl_called_by_upstream() {
+    let code = verus_code! {
+        struct S;
+
+        fn helper() -> u64 {
+            1
+        }
+
+        #[verifier::external]
+        impl core::fmt::Display for S {
+            fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+                let _ = helper();
+                write!(f, "S")
+            }
+        }
+
+        #[verifier::external]
+        fn main() {
+            let _ = S.to_string();
+        }
+    };
+    let (result, report) = reach("trait_impl_called_by_upstream", code, &[]);
+    result.unwrap();
+    assert_eq!(function(&report, "test_crate::helper")["reachable"], true);
+}

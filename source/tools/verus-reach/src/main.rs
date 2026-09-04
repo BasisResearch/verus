@@ -56,6 +56,11 @@ impl Function {
     }
 }
 
+/// Number of leading `::` segments two paths share.
+fn shared_prefix(a: &str, b: &str) -> usize {
+    a.split("::").zip(b.split("::")).take_while(|(x, y)| x == y).count()
+}
+
 fn pct(part: usize, total: usize) -> u64 {
     if total == 0 { 100 } else { (100 * part / total) as u64 }
 }
@@ -102,12 +107,15 @@ fn summary(report: &Report) {
     }
     println!("\nunreachable verified exec functions:");
     for f in unreachable {
-        // A reachable, unverified function with the same name suggests a "verified twin"
+        // A reachable, unverified function with the same name nearby suggests a "verified twin"
         let twin = report
             .functions
             .iter()
-            .find(|g| g.reachable && !g.verified && g.name() == f.name())
-            .map(|g| format!("   (same name reachable: {})", g.def_path))
+            .filter(|g| g.reachable && !g.verified && g.name() == f.name())
+            .map(|g| (shared_prefix(&g.def_path, &f.def_path), g))
+            .filter(|(shared, _)| *shared >= 2)
+            .max_by_key(|(shared, _)| *shared)
+            .map(|(_, g)| format!("   (same name reachable: {})", g.def_path))
             .unwrap_or_default();
         println!("  {}:{}   {}{}", f.span.file, f.span.start_line, f.name(), twin);
     }

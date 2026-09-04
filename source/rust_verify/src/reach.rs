@@ -58,10 +58,9 @@ impl<'a, 'tcx> Visitor<'tcx> for Callees<'a, 'tcx> {
             return;
         }
         match &expr.kind {
-            ExprKind::Path(qpath) => {
-                if let Res::Def(_, def_id) = self.typeck.qpath_res(qpath, expr.hir_id) {
-                    self.targets.push(def_id);
-                }
+            ExprKind::Path(qpath) => self.visit_res(self.typeck.qpath_res(qpath, expr.hir_id)),
+            ExprKind::Struct(qpath, ..) => {
+                self.visit_res(self.typeck.qpath_res(qpath, expr.hir_id))
             }
             ExprKind::Closure(closure) => self.targets.push(closure.def_id.to_def_id()),
             _ => {}
@@ -75,6 +74,12 @@ impl<'a, 'tcx> Visitor<'tcx> for Callees<'a, 'tcx> {
 }
 
 impl<'a, 'tcx> Callees<'a, 'tcx> {
+    fn visit_res(&mut self, res: Res) {
+        if let Res::Def(_, def_id) = res {
+            self.targets.push(def_id);
+        }
+    }
+
     /// Spec clauses (`requires`, `ensures`, ...) and proof blocks. Skipped so
     /// that a `when_used_as_spec` exec function mentioned in a spec does not
     /// count as called.
@@ -121,10 +126,53 @@ fn trait_impls<'tcx>(tcx: TyCtxt<'tcx>) -> HashMap<DefId, Vec<LocalDefId>> {
     impls
 }
 
+/// Maps each local type to the methods of its trait impls. Upstream code
+/// (serde, `format!`, sorting, ...) calls these through the trait, which we
+/// cannot see, so once a type is used all of them count as reachable.
+fn type_trait_impls<'tcx>(tcx: TyCtxt<'tcx>) -> HashMap<LocalDefId, Vec<LocalDefId>> {
+    let mut impls: HashMap<LocalDefId, Vec<LocalDefId>> = HashMap::new();
+    for impl_item in tcx.hir_crate_items(()).impl_items() {
+        let def_id = impl_item.owner_id.def_id;
+        let impl_def = tcx.local_parent(def_id);
+        if tcx.impl_opt_trait_ref(impl_def).is_some() {
+            if let Some(adt) = self_type(tcx, impl_def) {
+                impls.entry(adt).or_default().push(def_id);
+            }
+        }
+    }
+    impls
+}
+
+fn self_type<'tcx>(tcx: TyCtxt<'tcx>, impl_def: LocalDefId) -> Option<LocalDefId> {
+    let ty = tcx.type_of(impl_def).skip_binder().peel_refs();
+    ty.ty_adt_def().and_then(|adt| adt.did().as_local())
+}
+
+/// The local type a definition belongs to: a constructor, variant, or
+/// method of an impl on that type.
+fn type_of_def<'tcx>(tcx: TyCtxt<'tcx>, mut def_id: DefId) -> Option<LocalDefId> {
+    loop {
+        match tcx.def_kind(def_id) {
+            DefKind::Ctor(..) | DefKind::Variant => def_id = tcx.parent(def_id),
+            DefKind::Struct | DefKind::Enum | DefKind::Union => return def_id.as_local(),
+            DefKind::AssocFn | DefKind::AssocConst { .. } => {
+                let parent = tcx.parent(def_id).as_local()?;
+                return match tcx.def_kind(parent) {
+                    DefKind::Impl { .. } => self_type(tcx, parent),
+                    _ => None,
+                };
+            }
+            _ => return None,
+        }
+    }
+}
+
 fn reachable<'tcx>(ctxt: &Context<'tcx>, roots: &[LocalDefId]) -> HashSet<LocalDefId> {
     let tcx = ctxt.tcx;
     let impls = trait_impls(tcx);
+    let type_impls = type_trait_impls(tcx);
     let mut seen: HashSet<LocalDefId> = roots.iter().copied().collect();
+    let mut seen_types: HashSet<LocalDefId> = HashSet::new();
     let mut worklist: Vec<LocalDefId> = roots.to_vec();
     while let Some(def_id) = worklist.pop() {
         if !tcx.hir_maybe_body_owned_by(def_id).is_some() {
@@ -134,6 +182,11 @@ fn reachable<'tcx>(ctxt: &Context<'tcx>, roots: &[LocalDefId]) -> HashSet<LocalD
             let mut next: Vec<LocalDefId> = target.as_local().into_iter().collect();
             if let Some(impl_fns) = impls.get(&target) {
                 next.extend(impl_fns);
+            }
+            if let Some(adt) = type_of_def(tcx, target) {
+                if seen_types.insert(adt) {
+                    next.extend(type_impls.get(&adt).into_iter().flatten());
+                }
             }
             for n in next {
                 if seen.insert(n) {
