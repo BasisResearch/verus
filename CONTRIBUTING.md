@@ -235,7 +235,7 @@ run, from the project root:
 
 ```
 cd source/vstd
-../target-verus/release/verus --crate-type=lib --is-vstd vstd.rs --cfg 'feature="std"' --cfg 'feature="alloc"'
+../target-verus/release/verus --mcp --crate-type=lib --is-vstd vstd.rs --cfg 'feature="std"' --cfg 'feature="alloc"'
 ```
 
 ### Common conventions

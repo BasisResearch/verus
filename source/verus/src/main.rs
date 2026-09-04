@@ -212,6 +212,11 @@ fn run() -> Result<std::process::ExitStatus, String> {
     } else {
         Command::new(verus_root.join(RUST_VERIFY_FILE_NAME))
     };
+    if !via_cargo {
+        // The wrapper consumed the user-facing flag. Forward authorization so
+        // invoking rust_verify directly cannot bypass the same gate.
+        cmd.arg("--mcp");
+    }
 
     let vstd_kind = get_vstd_kind(&args);
     cmd.env("VSTD_KIND", vstd_kind);

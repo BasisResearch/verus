@@ -6,6 +6,28 @@ extern crate rustc_driver;
 extern crate rustc_log;
 extern crate rustc_session;
 
+const MCP_REQUIRED_MESSAGE: &str = "rust_verify is only meant to be invoked by the MCP server, not directly from bash; use the `verus` MCP server's tools instead (or pass `--mcp` if you really are the MCP server)";
+
+fn consume_mcp_flag(args: impl IntoIterator<Item = String>) -> (bool, Vec<String>) {
+    let mut mcp = false;
+    let args = args
+        .into_iter()
+        .filter(|arg| {
+            if arg == "--mcp" {
+                mcp = true;
+                false
+            } else {
+                true
+            }
+        })
+        .collect();
+    (mcp, args)
+}
+
+fn authorize_mcp(mcp: bool, via_cargo: bool) -> Result<(), &'static str> {
+    if mcp || via_cargo { Ok(()) } else { Err(MCP_REQUIRED_MESSAGE) }
+}
+
 #[cfg(target_family = "windows")]
 fn os_setup() -> Result<(), Box<dyn std::error::Error>> {
     // Configure Windows to kill the child SMT process if the parent is killed
@@ -27,10 +49,15 @@ fn os_setup() -> Result<(), Box<dyn std::error::Error>> {
 pub fn main() {
     let mut dep_tracker = rust_verify::cargo_verus_dep_tracker::DepTracker::init();
     let via_cargo = dep_tracker.compare_env(rust_verify::cargo_verus::VERUS_DRIVER_VIA_CARGO, "1");
+    let (mcp, process_args) = consume_mcp_flag(std::env::args());
+    if let Err(message) = authorize_mcp(mcp, via_cargo) {
+        eprintln!("error: {message}");
+        std::process::exit(1);
+    }
     // For now, verus_builtin, vstd, etc. must be rebuilt for each via_cargo crate:
     let via_cargo_rebuild_verus_libs = via_cargo;
 
-    let mut internal_args = std::env::args();
+    let mut internal_args = process_args.clone().into_iter();
     let internal_program = internal_args.next().unwrap();
     let (build_test_mode, has_rustc) = if let Some(first_arg) = internal_args.next() {
         match first_arg.as_str() {
@@ -71,7 +98,8 @@ pub fn main() {
         std::process::exit(1);
     }
 
-    let mut args = if build_test_mode || via_cargo { internal_args } else { std::env::args() };
+    let mut args =
+        if build_test_mode || via_cargo { internal_args } else { process_args.into_iter() };
     let program =
         if build_test_mode || via_cargo { internal_program } else { args.next().unwrap() };
 
@@ -559,5 +587,43 @@ pub fn main() {
         Err(_) => {
             std::process::exit(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MCP_REQUIRED_MESSAGE, authorize_mcp, consume_mcp_flag};
+
+    #[test]
+    fn mcp_flag_is_consumed_before_normal_argument_parsing() {
+        let (mcp, args) =
+            consume_mcp_flag(["rust_verify", "input.rs", "--mcp", "--version"].map(str::to_owned));
+
+        assert!(mcp);
+        assert_eq!(args, ["rust_verify", "input.rs", "--version"]);
+    }
+
+    #[test]
+    fn missing_mcp_flag_is_reported() {
+        let (mcp, args) =
+            consume_mcp_flag(["rust_verify", "input.rs", "--version"].map(str::to_owned));
+
+        assert!(!mcp);
+        assert_eq!(args, ["rust_verify", "input.rs", "--version"]);
+        assert_eq!(authorize_mcp(mcp, false), Err(MCP_REQUIRED_MESSAGE));
+    }
+
+    #[test]
+    fn every_mcp_flag_is_removed() {
+        let (mcp, args) =
+            consume_mcp_flag(["rust_verify", "--mcp", "input.rs", "--mcp"].map(str::to_owned));
+
+        assert!(mcp);
+        assert_eq!(args, ["rust_verify", "input.rs"]);
+    }
+
+    #[test]
+    fn cargo_wrapper_invocation_remains_authorized() {
+        assert_eq!(authorize_mcp(false, true), Ok(()));
     }
 }

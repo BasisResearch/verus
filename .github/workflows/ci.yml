@@ -197,7 +197,7 @@ jobs:
         working-directory: ./source
         run: |
           # check cvc5
-          cargo run --release -p rust_verify -- -V cvc5 ../examples/assorted_demo.rs
+          cargo run --release -p rust_verify -- --mcp -V cvc5 ../examples/assorted_demo.rs
           CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS=true cargo nextest run --release -p air
           CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS=true cargo nextest run --release -p rust_verify_test
 
