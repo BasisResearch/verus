@@ -3247,6 +3247,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "verus-reach"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "verus_builtin"
 version = "0.0.0-2026-08-30-0159"
 

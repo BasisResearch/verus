@@ -127,6 +127,10 @@ pub struct ArgsX {
     pub no_bv_simplify: bool,
     pub no_assert_ids: bool,
     pub provenance: bool,
+    pub reach: Option<String>,
+    pub reach_root: Vec<String>,
+    pub reach_roots_exclude: Vec<String>,
+    pub reach_fail_under: Option<f64>,
 }
 
 impl ArgsX {
@@ -176,6 +180,10 @@ impl ArgsX {
             no_bv_simplify: Default::default(),
             no_assert_ids: Default::default(),
             provenance: Default::default(),
+            reach: Default::default(),
+            reach_root: Default::default(),
+            reach_roots_exclude: Default::default(),
+            reach_fail_under: Default::default(),
         }
     }
 }
@@ -407,6 +415,10 @@ pub fn parse_args_with_imports(
     const OPT_RECORD: &str = "record";
     const OPT_NUM_THREADS: &str = "num-threads";
     const OPT_TRACE: &str = "trace";
+    const OPT_REACH: &str = "reach";
+    const OPT_REACH_ROOT: &str = "reach-root";
+    const OPT_REACH_ROOTS_EXCLUDE: &str = "reach-roots-exclude";
+    const OPT_REACH_FAIL_UNDER: &str = "reach-fail-under";
     const OPT_NO_REPORT_LONG_RUNNING: &str = "no-report-long-running";
 
     const OPT_EXTENDED_MULTI: &str = "V";
@@ -584,6 +596,25 @@ pub fn parse_args_with_imports(
         "INTEGER",
     );
     opts.optflag("", OPT_TRACE, "Print progress information");
+    opts.optopt("", OPT_REACH, "Write which functions are statically reachable from the crate's entry points, as json (render with tools/verus-reach)", "FILE");
+    opts.optmulti(
+        "",
+        OPT_REACH_ROOT,
+        "Add a reachability root (default roots: main, and exported items of library crates)",
+        "PATH",
+    );
+    opts.optmulti(
+        "",
+        OPT_REACH_ROOTS_EXCLUDE,
+        "Remove default reachability roots matching a glob, e.g. 'mycrate::verified::*'",
+        "GLOB",
+    );
+    opts.optopt(
+        "",
+        OPT_REACH_FAIL_UNDER,
+        "Fail if fewer than this percentage of verified exec functions are reachable",
+        "PERCENT",
+    );
     opts.optflag(
         "",
         OPT_NO_REPORT_LONG_RUNNING,
@@ -862,6 +893,14 @@ pub fn parse_args_with_imports(
             .unwrap_or_else(|_| error("expected integer after num_threads".to_string()))
             .unwrap_or(default_num_threads),
         trace: matches.opt_present(OPT_TRACE),
+        reach: matches.opt_str(OPT_REACH),
+        reach_root: matches.opt_strs(OPT_REACH_ROOT),
+        reach_roots_exclude: matches.opt_strs(OPT_REACH_ROOTS_EXCLUDE),
+        reach_fail_under: matches.opt_str(OPT_REACH_FAIL_UNDER).map(|s| {
+            s.parse::<f64>().unwrap_or_else(|_| {
+                error(format!("--{OPT_REACH_FAIL_UNDER} expects a number, got {s}"))
+            })
+        }),
         report_long_running: !matches.opt_present(OPT_NO_REPORT_LONG_RUNNING),
         use_crate_name: extended.contains_key(EXTENDED_USE_CRATE_NAME),
         solver,
