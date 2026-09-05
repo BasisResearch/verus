@@ -65,7 +65,7 @@ fn get_solver_version(
     let output = cmd!(sh, "{solver_path} --version").output()?;
     //dbg!(&output);
     let output_str = String::from_utf8(output.stdout)?;
-    let fmt = format!("{fmt_str} ([0-9.]*) ");
+    let fmt = format!(r"(?m)^{fmt_str} (\S+)");
     let v = Regex::new(&fmt)?
         .captures(&output_str)
         .ok_or_else(|| anyhow!("Failed to find {solver_exe} version"))?
@@ -537,7 +537,7 @@ fn main() -> anyhow::Result<()> {
         Ok(v) => v,
         Err(_) => "unknown".to_string(),
     };
-    let cvc5_version = match get_solver_version(&verus_repo, "cvc5", "This is cvc5 version") {
+    let cvc5_version = match get_solver_version(&verus_repo, "cvc5", "cvc5") {
         Ok(v) => v,
         Err(_) => "unknown".to_string(),
     };
