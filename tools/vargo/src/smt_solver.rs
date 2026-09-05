@@ -37,8 +37,9 @@ impl SmtSolverType {
         match self {
             SmtSolverType::Z3 => Regex::new(r"Z3 version (\d+\.\d+\.\d+) - \d+ bit")
                 .expect("failed to compile Z3 version regex"),
-            SmtSolverType::Cvc5 => Regex::new(r"(?m)^cvc5 (\S+)")
-                .expect("failed to compile cvc5 version regex"),
+            SmtSolverType::Cvc5 => {
+                Regex::new(r"(?m)^cvc5 (\S+)").expect("failed to compile cvc5 version regex")
+            }
         }
     }
 

@@ -578,7 +578,10 @@ fn main() -> anyhow::Result<()> {
     let mut active_projects: Vec<&RunConfigurationProject> = Vec::new();
     for project in run_configuration.projects.iter() {
         if !args.projects.is_empty() && !args.projects.contains(&project.name) {
-            debug!("Skipping project {} (not in --project filter)", project.name);
+            debug!(
+                "Skipping project {} (not in --project filter)",
+                project.name
+            );
             continue;
         }
         if project.ignore && !args.run_ignored {
