@@ -326,7 +326,9 @@ pub mod fold {
         broadcast use group_iset_lemmas_early;
 
         reveal(fold_graph);
-        let _ = trigger_fold_graph(y, a);
+        // An assertion, not `let _`: cvc5's simplifier drops an unused binding and
+        // the trigger term with it.
+        assert(trigger_fold_graph(y, a));
         assert(s == s.insert(a).remove(a));
     }
 
@@ -790,7 +792,9 @@ pub broadcast proof fn lemma_iset_empty_finite<A>()
 {
     let f = |a: A| 0;
     let ub = 0;
-    let _ = trigger_finite(f, ub);
+    // An assertion, not `let _`: cvc5's simplifier drops an unused binding and
+    // the trigger term with it.
+    assert(trigger_finite(f, ub));
 }
 
 /// The result of inserting an element `a` into a finite set `s` is also finite.
@@ -809,7 +813,7 @@ pub broadcast proof fn lemma_iset_insert_finite<A>(s: ISet<A>, a: A)
             f(a2)
         };
     let ub2 = ub + 1;
-    let _ = trigger_finite(f2, ub2);
+    assert(trigger_finite(f2, ub2));
     assert forall|a1, a2|
         #![all_triggers]
         s.insert(a).contains(a1) && s.insert(a).contains(a2) && a1 != a2 implies f2(a1) != f2(
@@ -916,7 +920,9 @@ pub broadcast proof fn lemma_iset_choose_infinite<A>(s: ISet<A>)
 {
     let f = |a: A| 0;
     let ub = 0;
-    let _ = trigger_finite(f, ub);
+    // An assertion, not `let _`: cvc5's simplifier drops an unused binding and
+    // the trigger term with it.
+    assert(trigger_finite(f, ub));
 }
 
 // Trusted axioms about len
