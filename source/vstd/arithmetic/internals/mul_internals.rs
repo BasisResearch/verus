@@ -193,9 +193,15 @@ pub proof fn lemma_mul_induction_auto(x: int, f: spec_fn(int) -> bool)
         f(x),
 {
     broadcast use group_mul_properties_internal;
+    // Discharge lemma_mul_induction's preconditions in their own trigger shape;
+    // cvc5 does not bridge from the is_le-triggered requires on its own.
 
-    assert(forall|i| is_le(0, i) && #[trigger] f(i) ==> f(i + 1));
-    assert(forall|i| is_le(i, 0) && #[trigger] f(i) ==> f(i - 1));
+    assert forall|i: int| i >= 0 && #[trigger] f(i) implies #[trigger] f(add1(i, 1)) by {
+        assert(is_le(0, i));
+    }
+    assert forall|i: int| i <= 0 && #[trigger] f(i) implies #[trigger] f(sub1(i, 1)) by {
+        assert(is_le(i, 0));
+    }
     lemma_mul_induction(f);
 }
 

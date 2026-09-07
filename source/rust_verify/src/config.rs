@@ -298,6 +298,7 @@ pub fn parse_args_with_imports(
     program: &String,
     args: impl Iterator<Item = String>,
     vstd_import: Option<(String, String)>,
+    internal_test_mode: bool,
 ) -> (Args, Vec<String>) {
     const OPT_EXPORT: &str = "export";
     const OPT_IMPORT: &str = "import";
@@ -421,7 +422,7 @@ pub fn parse_args_with_imports(
             EXTENDED_CAPTURE_PROFILES,
             "Always collect prover performance data, but don't generate output reports",
         ),
-        (EXTENDED_CVC5, "Use the cvc5 SMT solver, rather than the default (Z3)"),
+        (EXTENDED_CVC5, "Accepted for compatibility: this fork always uses cvc5"),
         (EXTENDED_ALLOW_INLINE_AIR, "Allow the POTENTIALLY UNSOUND use of inline_air_stmt"),
         (
             EXTENDED_USE_CRATE_NAME,
@@ -654,6 +655,12 @@ pub fn parse_args_with_imports(
         }
     }
 
+    // cvc5 for every real verification run; z3 only for vstd itself (built by
+    // vstd_build or by cargo-verus, which passes --is-vstd) and for Verus's own test
+    // suite (internal test mode), where cvc5 is still far slower on the arithmetic
+    // lemmas. `-V cvc5` stays accepted as a no-op.
+    let solver = if internal_test_mode || is_vstd { SmtSolver::Z3 } else { SmtSolver::Cvc5 };
+
     let args = ArgsX {
         verify_root: matches.opt_present(OPT_VERIFY_ROOT),
         export: matches.opt_str(OPT_EXPORT),
@@ -781,6 +788,17 @@ pub fn parse_args_with_imports(
                     error("--profile and --profile-all are mutually exclusive".to_string())
                 }
             };
+            // The profiler reads a z3 trace file, which cvc5 does not produce.
+            if matches!(solver, SmtSolver::Cvc5)
+                && (matches.opt_present(OPT_PROFILE)
+                    || matches.opt_present(OPT_PROFILE_ALL)
+                    || extended.contains_key(EXTENDED_CAPTURE_PROFILES))
+            {
+                error(
+                    "--profile, --profile-all and -V capture-profiles read a z3 trace; this build verifies with cvc5"
+                        .to_string(),
+                )
+            }
             matches.opt_present(OPT_PROFILE)
         },
         profile_all: {
@@ -825,7 +843,7 @@ pub fn parse_args_with_imports(
         trace: matches.opt_present(OPT_TRACE),
         report_long_running: !matches.opt_present(OPT_NO_REPORT_LONG_RUNNING),
         use_crate_name: extended.contains_key(EXTENDED_USE_CRATE_NAME),
-        solver: if extended.contains_key(EXTENDED_CVC5) { SmtSolver::Cvc5 } else { SmtSolver::Z3 },
+        solver,
         axiom_usage_info: extended.contains_key(EXTENDED_AXIOM_USAGE_INFO),
         check_api_safety: extended.contains_key(EXTENDED_CHECK_API_SAFETY),
         no_bv_simplify: extended.contains_key(EXTENDED_NO_BV_SIMPLIFY),

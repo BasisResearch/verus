@@ -130,8 +130,12 @@ pub fn main() {
 
     let via_cargo = via_cargo.then(|| rust_verify::config::parse_cargo_args(&program, &mut args));
 
-    let (our_args, rustc_args) =
-        rust_verify::config::parse_args_with_imports(&program, args.into_iter(), vstd);
+    let (our_args, rustc_args) = rust_verify::config::parse_args_with_imports(
+        &program,
+        args.into_iter(),
+        vstd,
+        build_test_mode,
+    );
 
     if our_args.version {
         if our_args.output_json {
