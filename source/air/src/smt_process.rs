@@ -105,14 +105,15 @@ impl SmtProcess {
         let mut child = match std::process::Command::new(solver_info.executable())
             .args(match solver {
                 SmtSolver::Z3 => vec!["-smt2", "-in"],
+                // No `--rlimit` here: cvc5's `--rlimit` is a *cumulative* budget for the
+                // whole process, so it starved every function after the first few seconds.
+                // The per-query budget is set in-band before each check-sat (smt_verify.rs).
                 SmtSolver::Cvc5 => vec![
                     "--no-interactive",    // We don't need a human interface
                     "--produce-models",    // Needed for error reporting
                     "--quant-dsplit=none", // Recommended by Andrew Reynolds (@ajreynol)
                     "--no-cbqi",           // Recommended by Andrew Reynolds (@ajreynol)
                     "--user-pat=strict",   // Recommended by Andrew Reynolds (@ajreynol)
-                    "--rlimit",
-                    "1666666", // ~= 5s
                 ],
             })
             .stdin(std::process::Stdio::piped())
