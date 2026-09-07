@@ -261,11 +261,10 @@ impl Context {
 
     pub fn set_rlimit(&mut self, rlimit: u32) {
         self.rlimit = rlimit;
-        if matches!(self.solver, SmtSolver::Z3) {
-            self.air_initial_log.log_set_option("rlimit", &rlimit.to_string());
-            self.air_middle_log.log_set_option("rlimit", &rlimit.to_string());
-            self.air_final_log.log_set_option("rlimit", &rlimit.to_string());
-        }
+        // The AIR logs record the budget in solver units whichever solver runs.
+        self.air_initial_log.log_set_option("rlimit", &rlimit.to_string());
+        self.air_middle_log.log_set_option("rlimit", &rlimit.to_string());
+        self.air_final_log.log_set_option("rlimit", &rlimit.to_string());
     }
 
     pub fn set_single_check_query(&mut self) {

@@ -211,9 +211,18 @@ pub(crate) fn smt_check_assertion<'ctx>(
         context.smt_log.log_assert(&None, &disabled_expr);
     }
 
-    if matches!(context.solver, SmtSolver::Z3) {
-        context.smt_log.log_set_option("rlimit", &context.rlimit.to_string());
-        context.set_z3_param_u32("rlimit", context.rlimit, false);
+    match context.solver {
+        SmtSolver::Z3 => {
+            context.smt_log.log_set_option("rlimit", &context.rlimit.to_string());
+            context.set_z3_param_u32("rlimit", context.rlimit, false);
+        }
+        SmtSolver::Cvc5 => {
+            // `reproducible-resource-limit` (alias of `rlimit-per`) is one of the few
+            // cvc5 options that may be set after initialisation; 0 means no limit.
+            context
+                .smt_log
+                .log_set_option("reproducible-resource-limit", &context.rlimit.to_string());
+        }
     }
 
     context.smt_log.log_word("check-sat");
@@ -266,9 +275,14 @@ pub(crate) fn smt_check_assertion<'ctx>(
         }
     }
 
-    if matches!(context.solver, SmtSolver::Z3) {
-        context.smt_log.log_set_option("rlimit", "0");
-        context.set_z3_param_u32("rlimit", 0, false);
+    match context.solver {
+        SmtSolver::Z3 => {
+            context.smt_log.log_set_option("rlimit", "0");
+            context.set_z3_param_u32("rlimit", 0, false);
+        }
+        SmtSolver::Cvc5 => {
+            context.smt_log.log_set_option("reproducible-resource-limit", "0");
+        }
     }
 
     let unsat = unsat.expect("expected sat/unsat/unknown from SMT solver");

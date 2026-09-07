@@ -46,6 +46,12 @@ use vir::def::{CommandContext, CommandsWithContext, CommandsWithContextX, SnapPo
 use vir::prelude::PreludeConfig;
 
 const RLIMIT_PER_SECOND: f32 = 3000000f32;
+/// cvc5 resource units per second, measured with `--stats-internal` on vstd queries
+/// (cvc5 1.3.5 main@4a9afc6, Apple M-series): ordinary queries run at 180k-230k
+/// units/s, the hard arithmetic lemmas in `arithmetic::div_mod` at 35k-70k. The
+/// old command-line `--rlimit 1666666 // ~= 5s` implied 333k, above even the easy
+/// end. 100k keeps "roughly seconds" honest within a factor of about two either way.
+const CVC5_RLIMIT_PER_SECOND: f32 = 100000f32;
 
 #[derive(Clone, Hash, PartialEq, Eq)]
 pub(crate) struct ProgressBarId(String);
@@ -1125,16 +1131,20 @@ impl Verifier {
         format!("{}{}{}{}", rerun_msg, count_msg, expand_msg, suffix,)
     }
 
-    fn set_rlimit(air_context: &mut air::context::Context, rlimit: f32) {
+    fn set_rlimit(solver: SmtSolver, air_context: &mut air::context::Context, rlimit: f32) {
+        let per_second = match solver {
+            SmtSolver::Z3 => RLIMIT_PER_SECOND,
+            SmtSolver::Cvc5 => CVC5_RLIMIT_PER_SECOND,
+        };
         air_context.set_rlimit(if rlimit == f32::INFINITY {
-            0 // z3 interprets a zero rlimit as infinity
+            0 // both solvers interpret a zero rlimit as infinity
         } else {
-            (rlimit * RLIMIT_PER_SECOND).min(u32::MAX as f32) as u32
+            (rlimit * per_second).min(u32::MAX as f32) as u32
         });
     }
 
     fn set_default_rlimit(&self, air_context: &mut air::context::Context) {
-        Self::set_rlimit(air_context, self.args.rlimit);
+        Self::set_rlimit(self.args.solver, air_context, self.args.rlimit);
     }
 
     fn new_air_context_with_prelude<'m>(
@@ -1590,7 +1600,7 @@ impl Verifier {
                             let iter_curr_smt_rlimit_count =
                                 query_air_context.get_rlimit_count().map(|x| x.1);
                             if let Some(rlimit) = function.x.attrs.rlimit {
-                                Self::set_rlimit(&mut query_air_context, rlimit);
+                                Self::set_rlimit(self.args.solver, &mut query_air_context, rlimit);
                             }
                             let RunCommandQueriesResult {
                                 invalidity: command_invalidity,
