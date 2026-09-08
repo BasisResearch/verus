@@ -373,15 +373,73 @@ pub struct QueryProvenance {
     pub unparsed: Vec<String>,
 }
 
+/// One tag from a solver reply, joined back to source.
+#[derive(serde::Serialize, Clone, Debug, PartialEq, Eq)]
+pub struct ResolvedTag {
+    /// the symbol as it was on the wire
+    pub tag: String,
+    /// requires, type_invariant, fuel, trait_bound, query, axiom, prelude,
+    /// anonymous_axiom, untagged
+    pub kind: String,
+    /// the function, datatype or quantifier that owns it, when known
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub span: Option<String>,
+}
+
+/// One instantiated quantifier, joined back to source.
+#[derive(serde::Serialize, Clone, Debug)]
+pub struct ResolvedInstantiation {
+    pub qid: String,
+    /// prelude, or the function the quantifier was written in
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fun: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub span: Option<String>,
+    /// the tagged assertion the quantifier was sent inside, when known
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inside: Option<ResolvedTag>,
+    pub count: usize,
+    pub vectors: Vec<String>,
+}
+
+/// A query's provenance with every symbol joined to source (`-V provenance`).
+#[derive(serde::Serialize, Clone, Debug)]
+pub struct ResolvedQueryProvenance {
+    pub desc: String,
+    pub span: String,
+    pub round: usize,
+    pub result: String,
+    /// hypotheses (requires, type invariants, fuel, trait bounds) that fed
+    /// some preprocessed assertion
+    pub hypotheses: Vec<ResolvedTag>,
+    /// the tag lists that name the query or a hypothesis, or hold more than
+    /// one tag (a merge or a substitution); singleton axioms are counted, not
+    /// listed
+    pub sources: Vec<Vec<ResolvedTag>>,
+    pub axioms_in_scope: usize,
+    pub instantiations: Vec<ResolvedInstantiation>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub unparsed: Vec<String>,
+}
+
 #[derive(serde::Serialize)]
 pub struct FuncDetails {
     pub obligation_proof_notes: HashSet<String>,
     pub failed_proof_notes: HashSet<String>,
+    /// filled under `-V provenance`
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub provenance: Vec<ResolvedQueryProvenance>,
 }
 
 impl Default for FuncDetails {
     fn default() -> Self {
-        Self { obligation_proof_notes: Default::default(), failed_proof_notes: Default::default() }
+        Self {
+            obligation_proof_notes: Default::default(),
+            failed_proof_notes: Default::default(),
+            provenance: Default::default(),
+        }
     }
 }
 
@@ -389,6 +447,7 @@ impl FuncDetails {
     fn absorb(&mut self, other: Self) {
         self.obligation_proof_notes.extend(other.obligation_proof_notes);
         self.failed_proof_notes.extend(other.failed_proof_notes);
+        self.provenance.extend(other.provenance);
     }
 
     pub fn to_json(&self) -> serde_json::Value {
@@ -1176,6 +1235,126 @@ impl Verifier {
         let expand_msg = if expand_flag { "_expand" } else { "" };
 
         format!("{}{}{}{}", rerun_msg, count_msg, expand_msg, suffix,)
+    }
+
+    /// Join the raw provenance (`func_provenance`) to source through
+    /// `hyp_map`, `qid_map` and `axiom_owners`, into `func_details`.
+    fn resolve_provenance(&mut self, global_ctx: &vir::context::GlobalCtx) {
+        const PRELUDE_QID_PREFIX: &str = "prelude_";
+        let hyp_map = global_ctx.hyp_map.borrow();
+        let qid_map = global_ctx.qid_map.borrow();
+        let axiom_owners = global_ctx.axiom_owners.borrow();
+        let tag_of = |fun: &Fun, symbol: &str| -> ResolvedTag {
+            let mut r = ResolvedTag {
+                tag: symbol.to_string(),
+                kind: String::new(),
+                owner: None,
+                span: None,
+            };
+            match air::def::ProvenanceTag::from_symbol(symbol) {
+                Some(air::def::ProvenanceTag::Hyp(air::def::HypId(k))) => {
+                    match hyp_map.get(fun).and_then(|hs| hs.get(k as usize)) {
+                        Some(info) => {
+                            r.kind = match info.kind {
+                                vir::sst::HypKind::Requires => "requires",
+                                vir::sst::HypKind::TypeInvariant => "type_invariant",
+                                vir::sst::HypKind::Fuel => "fuel",
+                                vir::sst::HypKind::TraitBound => "trait_bound",
+                            }
+                            .to_string();
+                            r.owner = Some(fun_as_friendly_rust_name(fun));
+                            r.span = Some(info.span.as_string.clone());
+                        }
+                        None => r.kind = "hypothesis (unknown id)".to_string(),
+                    }
+                }
+                Some(air::def::ProvenanceTag::Query) => r.kind = "query".to_string(),
+                Some(air::def::ProvenanceTag::Assert(_)) => r.kind = "goal".to_string(),
+                Some(air::def::ProvenanceTag::Axiom(ident)) => {
+                    let ident: &str = &ident;
+                    if let Some(owner) = axiom_owners.get(symbol) {
+                        r.kind = "axiom".to_string();
+                        r.owner = Some(owner.clone());
+                    } else if let Some(info) = qid_map.get(ident) {
+                        r.kind = "axiom".to_string();
+                        r.owner = Some(fun_as_friendly_rust_name(&info.fun));
+                        r.span = info.user.as_ref().map(|u| u.span.as_string.clone());
+                    } else if ident.starts_with(PRELUDE_QID_PREFIX) {
+                        r.kind = "prelude".to_string();
+                    } else if ident.starts_with("anon_") {
+                        r.kind = "anonymous_axiom".to_string();
+                    } else {
+                        r.kind = "axiom".to_string();
+                    }
+                }
+                None => r.kind = "untagged".to_string(),
+            }
+            r
+        };
+        let is_hyp_kind =
+            |k: &str| matches!(k, "requires" | "type_invariant" | "fuel" | "trait_bound");
+        let raw = std::mem::take(&mut self.func_provenance);
+        for (fun, queries) in raw {
+            let mut resolved: Vec<ResolvedQueryProvenance> = Vec::new();
+            for q in queries {
+                let mut hypotheses: Vec<ResolvedTag> = Vec::new();
+                let mut sources: Vec<Vec<ResolvedTag>> = Vec::new();
+                let mut axioms_in_scope = 0usize;
+                for list in q.sources.iter() {
+                    let tags: Vec<ResolvedTag> = list.iter().map(|t| tag_of(&fun, t)).collect();
+                    let interesting = tags.len() > 1
+                        || tags.iter().any(|t| is_hyp_kind(&t.kind) || t.kind == "query");
+                    for t in tags.iter() {
+                        if is_hyp_kind(&t.kind) && !hypotheses.contains(t) {
+                            hypotheses.push(t.clone());
+                        }
+                    }
+                    if interesting {
+                        sources.push(tags);
+                    } else {
+                        axioms_in_scope += 1;
+                    }
+                }
+                let instantiations = q
+                    .instantiations
+                    .iter()
+                    .map(|(qid, vectors)| {
+                        let (fun_name, span, inside) = match qid_map.get(qid) {
+                            Some(info) => (
+                                Some(fun_as_friendly_rust_name(&info.fun)),
+                                info.user.as_ref().map(|u| u.span.as_string.clone()),
+                                info.tag.as_ref().map(|t| tag_of(&fun, &t.to_symbol())),
+                            ),
+                            None => (
+                                qid.starts_with(PRELUDE_QID_PREFIX).then(|| "prelude".to_string()),
+                                None,
+                                None,
+                            ),
+                        };
+                        ResolvedInstantiation {
+                            qid: qid.clone(),
+                            fun: fun_name,
+                            span,
+                            inside,
+                            count: vectors.len(),
+                            vectors: vectors.clone(),
+                        }
+                    })
+                    .collect();
+                resolved.push(ResolvedQueryProvenance {
+                    desc: q.desc,
+                    span: q.span,
+                    round: q.round,
+                    result: q.result,
+                    hypotheses,
+                    sources,
+                    axioms_in_scope,
+                    instantiations,
+                    unparsed: q.unparsed,
+                });
+            }
+            self.func_details.entry(fun).or_default().provenance.extend(resolved);
+        }
     }
 
     fn set_rlimit(solver: SmtSolver, air_context: &mut air::context::Context, rlimit: f32) {
@@ -2582,6 +2761,33 @@ impl Verifier {
                 writeln!(file, "{:#?}", triggers).expect("error writing to trigger log file");
             }
         }
+        // Join the provenance cvc5 reported back to source, per function
+        if self.args.provenance {
+            self.resolve_provenance(&global_ctx);
+            if self.args.log_all {
+                let mut file = self.create_log_file(None, crate::config::PROVENANCE_FILE_SUFFIX)?;
+                let mut by_fun: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
+                let mut funs: Vec<&Fun> = self.func_details.keys().collect();
+                funs.sort();
+                for fun in funs {
+                    let details = &self.func_details[fun];
+                    if details.provenance.is_empty() {
+                        continue;
+                    }
+                    by_fun.insert(
+                        fun_as_friendly_rust_name(fun),
+                        serde_json::to_value(&details.provenance).expect("provenance json"),
+                    );
+                }
+                writeln!(
+                    file,
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::Value::Object(by_fun))
+                        .expect("provenance json")
+                )
+                .expect("error writing to provenance log file");
+            }
+        }
         // Log the provenance joins: qid -> (function, owning tag, span), hyp -> (kind, span)
         if self.args.log_all {
             let mut file = self.create_log_file(None, crate::config::QIDS_FILE_SUFFIX)?;
@@ -2601,25 +2807,6 @@ impl Verifier {
                     span.unwrap_or("-".to_string())
                 )
                 .expect("error writing to qids log file");
-            }
-            if self.args.provenance {
-                let mut file = self.create_log_file(None, crate::config::PROVENANCE_FILE_SUFFIX)?;
-                let mut by_fun: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
-                let mut funs: Vec<&Fun> = self.func_provenance.keys().collect();
-                funs.sort();
-                for fun in funs {
-                    by_fun.insert(
-                        fun_as_friendly_rust_name(fun),
-                        serde_json::to_value(&self.func_provenance[fun]).expect("provenance json"),
-                    );
-                }
-                writeln!(
-                    file,
-                    "{}",
-                    serde_json::to_string_pretty(&serde_json::Value::Object(by_fun))
-                        .expect("provenance json")
-                )
-                .expect("error writing to provenance log file");
             }
             let mut file = self.create_log_file(None, crate::config::HYPS_FILE_SUFFIX)?;
             let hyp_map = global_ctx.hyp_map.borrow();

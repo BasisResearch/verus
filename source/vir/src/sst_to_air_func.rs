@@ -219,6 +219,10 @@ pub(crate) fn broadcast_forall_group_axioms(
         let imply = mk_implies(&fuel_group, &mk_and(&member_fuels));
         let tag = air::def::ProvenanceTag::Axiom(fun_to_air_ident(&ctx.name_ctxt, &group.x.name));
         crate::sst_to_air::record_qid_owner(ctx, &imply, &tag);
+        ctx.global
+            .axiom_owners
+            .borrow_mut()
+            .insert(tag.to_symbol(), crate::ast_util::fun_as_friendly_rust_name(&group.x.name));
         let axiom = Arc::new(DeclX::Axiom(Axiom {
             named: if ctx.global.axiom_usage_info {
                 Some(fun_to_air_ident(&ctx.name_ctxt, &group.x.name))
@@ -1003,6 +1007,10 @@ pub fn func_axioms_to_air(
                     &function.x.name,
                 ));
                 crate::sst_to_air::record_qid_owner(ctx, &fuel_imply, &tag);
+                ctx.global.axiom_owners.borrow_mut().insert(
+                    tag.to_symbol(),
+                    crate::ast_util::fun_as_friendly_rust_name(&function.x.name),
+                );
                 let axiom = Arc::new(DeclX::Axiom(Axiom {
                     named: if ctx.global.axiom_usage_info {
                         Some(fun_to_air_ident(&ctx.name_ctxt, &function.x.name))
