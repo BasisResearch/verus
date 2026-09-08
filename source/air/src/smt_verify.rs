@@ -439,9 +439,11 @@ pub(crate) fn smt_check_assertion<'ctx>(
         }
         ResultDetermination::Undetermined(false) => {
             if context.single_check_query {
-                // one obligation: nothing to localize, report it at the query level
+                // one obligation: nothing to localize, report it at the query level,
+                // but keep the obligation's id when there is exactly one
+                let assert_id = sole_enabled_assert_id(&infos);
                 context.state = ContextState::FoundInvalid(infos, None);
-                ValidityResult::Invalid(None, None, None)
+                ValidityResult::Invalid(None, None, assert_id)
             } else {
                 smt_get_model(context, infos, air_model)
             }
@@ -550,6 +552,17 @@ pub(crate) fn smt_get_rlimit_count(context: &mut Context) -> Result<u64, Validit
     Ok(rlimit_count)
 }
 
+/// The id of the one labelled assertion still enabled in `infos`, when there
+/// is exactly one: the result paths that have no model to localise with can
+/// still name it.
+fn sole_enabled_assert_id(infos: &Vec<AssertionInfo>) -> Option<crate::ast::AssertId> {
+    let mut enabled = infos.iter().filter(|info| !info.disabled);
+    match (enabled.next(), enabled.next()) {
+        (Some(info), None) => info.assert_id.clone(),
+        _ => None,
+    }
+}
+
 fn smt_get_model(
     context: &mut Context,
     mut infos: Vec<AssertionInfo>,
@@ -566,8 +579,9 @@ fn smt_get_model(
 
     if smt_output.iter().any(|line| line.contains("model is not available")) {
         // when we don't use incremental solving, sometime the model is not available when the z3 result is unknown
+        let assert_id = sole_enabled_assert_id(&infos);
         context.state = ContextState::FoundInvalid(infos, None);
-        return ValidityResult::Invalid(None, None, None);
+        return ValidityResult::Invalid(None, None, assert_id);
     };
 
     let model =
