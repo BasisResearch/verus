@@ -60,7 +60,7 @@ impl Only {
 }
 
 fn pct(part: usize, total: usize) -> u64 {
-    if total == 0 { 100 } else { (100 * part / total) as u64 }
+    (100 * part).checked_div(total).map_or(100, |p| p as u64)
 }
 
 fn loc(node: &Node) -> usize {
