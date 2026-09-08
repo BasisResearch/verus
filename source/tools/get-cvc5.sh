@@ -5,7 +5,12 @@
 # the single source of truth shared with rust_verify, vargo and verus-tools-mcp.
 
 manifest="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/tools/common/solvers.toml"
-pin() { sed -n "/^\[$1\]/,/^\[/{s/^$2 *= *\"\([^\"]*\)\".*/\1/p}" "$manifest"; }
+pin() {
+    awk -F'"' -v table="[$1]" -v key="$2" '
+        /^\[/ { in_table = ($0 == table) }
+        in_table && $1 ~ "^" key "[ \t]*=[ \t]*$" { print $2; exit }
+    ' "$manifest"
+}
 
 cvc5_repo="$(pin cvc5 repo)"
 cvc5_tag="$(pin cvc5 tag)"

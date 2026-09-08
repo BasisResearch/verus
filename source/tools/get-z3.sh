@@ -5,7 +5,13 @@
 # still comes from upstream Z3Prover so every platform the build supports
 # gets a binary.
 manifest="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/tools/common/solvers.toml"
-z3_version="$(sed -n '/^\[z3\]/,/^\[/{s/^version *= *"\([^"]*\)".*/\1/p}' "$manifest")"
+pin() {
+    awk -F'"' -v table="[$1]" -v key="$2" '
+        /^\[/ { in_table = ($0 == table) }
+        in_table && $1 ~ "^" key "[ \t]*=[ \t]*$" { print $2; exit }
+    ' "$manifest"
+}
+z3_version="$(pin z3 version)"
 if [ -z "$z3_version" ]; then
     echo "could not read the z3 version from $manifest" >&2
     exit 1
