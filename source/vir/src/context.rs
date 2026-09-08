@@ -803,7 +803,10 @@ impl GlobalCtx {
         self.qid_map.borrow_mut().extend(other.qid_map.into_inner());
         self.hyp_map.borrow_mut().extend(other.hyp_map.into_inner());
         self.axiom_owners.borrow_mut().extend(other.axiom_owners.into_inner());
-        self.air_source_names.borrow_mut().extend(other.air_source_names.into_inner());
+        crate::air_names::merge_source_names(
+            &mut self.air_source_names.borrow_mut(),
+            other.air_source_names.into_inner(),
+        );
         self.chosen_triggers.borrow_mut().extend(other.chosen_triggers.into_inner());
     }
 
@@ -917,7 +920,10 @@ impl Ctx {
         // Hand this module's recorded AIR-symbol names to the crate, so a
         // reader joining solver output to source has them after the module's
         // NameCtxt is gone (see `crate::air_names`).
-        self.global.air_source_names.borrow_mut().extend(self.name_ctxt.source_names());
+        crate::air_names::merge_source_names(
+            &mut self.global.air_source_names.borrow_mut(),
+            self.name_ctxt.source_names(),
+        );
         self.global
     }
 

@@ -33,9 +33,12 @@ pub enum SourceName {
     /// An infix operator, as the source writes it (`+`). Recorded where the
     /// encoder emits the symbol, from the same table `to_user_string` uses.
     Operator(String),
-    /// A range clip the encoder inserted for a target type. The source
-    /// writes a cast, so `(nClip x)` shows as `(x as nat)`.
-    Cast(String),
+    /// Cast targets indexed by the emitted range arguments. A shared head
+    /// such as `uClip` can represent several widths in the same query.
+    Cast {
+        symbol: String,
+        types: HashMap<Vec<String>, String>,
+    },
     Constructor {
         name: String,
         fields: Vec<String>,
@@ -50,8 +53,8 @@ impl SourceName {
             Self::Symbol(name)
             | Self::Field(name)
             | Self::Operator(name)
-            | Self::Cast(name)
             | Self::Constructor { name, .. } => name,
+            Self::Cast { symbol, .. } => symbol,
         }
     }
 
@@ -77,6 +80,21 @@ impl SourceName {
                 format!("{} {{ {} }}", name, fields.join(", "))
             }
         })
+    }
+}
+
+/// Module and worker contexts may record different widths of the same clip.
+/// Merge their range records instead of replacing an entire cast family.
+pub(crate) fn merge_source_names(names: &mut SourceNames, other: SourceNames) {
+    for (symbol, name) in other {
+        match (names.get_mut(&symbol), name) {
+            (Some(SourceName::Cast { types, .. }), SourceName::Cast { types: other, .. }) => {
+                types.extend(other);
+            }
+            (_, name) => {
+                names.insert(symbol, name);
+            }
+        }
     }
 }
 
@@ -166,12 +184,21 @@ fn render_node(names: &SourceNames, node: &Node) -> String {
                         );
                     }
                     // clips take the range arguments first, the value last
-                    Some(SourceName::Cast(ty)) if items.len() > 1 => {
-                        return format!(
-                            "({} as {})",
-                            render_node(names, items.last().unwrap()),
-                            ty
-                        );
+                    Some(SourceName::Cast { types, .. }) if items.len() > 1 => {
+                        let range_args: Option<Vec<String>> = items[1..items.len() - 1]
+                            .iter()
+                            .map(|arg| match arg {
+                                Node::Atom(atom) => Some(atom.clone()),
+                                Node::List(_) => None,
+                            })
+                            .collect();
+                        if let Some(ty) = range_args.as_ref().and_then(|args| types.get(args)) {
+                            return format!(
+                                "({} as {})",
+                                render_node(names, items.last().unwrap()),
+                                ty
+                            );
+                        }
                     }
                     _ => {}
                 }
@@ -253,7 +280,9 @@ mod tests {
         ] {
             names.insert(symbol.to_string(), SourceName::Operator(op.to_string()));
         }
-        names.insert(crate::def::NAT_CLIP.to_string(), SourceName::Cast("nat".to_string()));
+        let ctx = NameCtxt::new();
+        record_cast(&ctx, crate::def::NAT_CLIP, crate::ast::IntRange::Nat, "nat");
+        merge_source_names(&mut names, ctx.source_names());
         for (term, expected) in [
             ("((nClip (Add x y)))", "((x + y) as nat)"),
             ("((I (Mul (Add x y) z)))", "((x + y) * z)"),
@@ -262,6 +291,74 @@ mod tests {
             ("((EucMod (Add x y) z))", "((x + y) % z)"),
         ] {
             assert_eq!(render_vector(&names, term), expected);
+        }
+    }
+
+    fn record_cast(ctx: &NameCtxt, symbol: &str, range: crate::ast::IntRange, typ: &str) {
+        let application = crate::sst_to_air::apply_range_fun(
+            symbol,
+            &range,
+            vec![air::ast_util::str_var("value")],
+        );
+        ctx.record_source_cast(&application, typ);
+    }
+
+    #[test]
+    fn cast_targets_preserve_all_emitted_range_arguments() {
+        use crate::ast::IntRange;
+        use crate::def::{CHAR_CLIP, I_CLIP, NAT_CLIP, U_CLIP};
+        let ctx = NameCtxt::new();
+        for (symbol, range, typ) in [
+            (U_CLIP, IntRange::U(8), "u8"),
+            (U_CLIP, IntRange::U(16), "u16"),
+            (U_CLIP, IntRange::U(64), "u64"),
+            (U_CLIP, IntRange::USize, "usize"),
+            (I_CLIP, IntRange::I(8), "i8"),
+            (I_CLIP, IntRange::I(16), "i16"),
+            (I_CLIP, IntRange::I(64), "i64"),
+            (I_CLIP, IntRange::ISize, "isize"),
+            (NAT_CLIP, IntRange::Nat, "nat"),
+            (CHAR_CLIP, IntRange::Char, "char"),
+        ] {
+            record_cast(&ctx, symbol, range, typ);
+        }
+        for (term, expected) in [
+            ("(uClip 8 value)", "(value as u8)"),
+            ("(uClip 16 value)", "(value as u16)"),
+            ("(uClip 64 value)", "(value as u64)"),
+            ("(uClip SZ value)", "(value as usize)"),
+            ("(iClip 8 value)", "(value as i8)"),
+            ("(iClip 16 value)", "(value as i16)"),
+            ("(iClip 64 value)", "(value as i64)"),
+            ("(iClip SZ value)", "(value as isize)"),
+            ("(nClip value)", "(value as nat)"),
+            ("(charClip value)", "(value as char)"),
+            ("(uClip 8 (iClip 16 value))", "((value as i16) as u8)"),
+            // Do not discard range arguments or guess a target for unrecorded forms.
+            ("(uClip 32 value)", "uClip(32, value)"),
+            ("(uClip value)", "uClip(value)"),
+            ("(uClip (+ 8 8) value)", "uClip(+(8, 8), value)"),
+        ] {
+            assert_eq!(render_term(&ctx.source_names(), term), expected);
+        }
+    }
+
+    #[test]
+    fn cast_ranges_survive_context_merges_in_either_order() {
+        use crate::ast::IntRange;
+        let first = NameCtxt::new();
+        let second = NameCtxt::new();
+        record_cast(&first, crate::def::U_CLIP, IntRange::U(8), "u8");
+        record_cast(&second, crate::def::U_CLIP, IntRange::U(16), "u16");
+        for (mut names, other) in [
+            (first.source_names(), second.source_names()),
+            (second.source_names(), first.source_names()),
+        ] {
+            merge_source_names(&mut names, other);
+            assert_eq!(
+                render_vector(&names, "((uClip 8 value) (uClip 16 value))"),
+                "(value as u8), (value as u16)"
+            );
         }
     }
 

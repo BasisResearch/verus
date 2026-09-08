@@ -454,12 +454,28 @@ impl NameCtxt {
             .insert(symbol.to_string(), crate::air_names::SourceName::Operator(op.to_string()));
     }
 
-    /// An AIR symbol that stands for a cast to a source type.
-    pub(crate) fn record_source_cast(&self, symbol: &str, typ: &str) {
-        self.imp
-            .borrow_mut()
-            .source_names
-            .insert(symbol.to_string(), crate::air_names::SourceName::Cast(typ.to_string()));
+    /// Record the head and range arguments of the cast application we emitted.
+    /// The value is last; the preceding atoms distinguish fixed and pointer widths.
+    pub(crate) fn record_source_cast(&self, application: &air::ast::Expr, typ: &str) {
+        use air::ast::{Constant, ExprX};
+        let ExprX::Apply(symbol, args) = &**application else { return };
+        let Some((_value, range_args)) = args.split_last() else { return };
+        let range_args: Option<Vec<String>> = range_args
+            .iter()
+            .map(|arg| match &**arg {
+                ExprX::Const(Constant::Nat(n)) => Some(n.to_string()),
+                ExprX::Var(name) => Some(name.to_string()),
+                _ => None,
+            })
+            .collect();
+        let Some(range_args) = range_args else { return };
+        let mut imp = self.imp.borrow_mut();
+        let entry = imp.source_names.entry(symbol.to_string()).or_insert_with(|| {
+            crate::air_names::SourceName::Cast { symbol: symbol.to_string(), types: HashMap::new() }
+        });
+        if let crate::air_names::SourceName::Cast { types, .. } = entry {
+            types.insert(range_args, typ.to_string());
+        }
     }
 
     pub(crate) fn record_source_constructor(&self, symbol: &Ident, variant: &crate::ast::Variant) {

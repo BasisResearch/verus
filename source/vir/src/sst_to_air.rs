@@ -1134,8 +1134,9 @@ pub(crate) fn exp_to_expr(ctx: &Ctx, exp: &Exp, expr_ctxt: &ExprCtxt) -> Result<
                 // A clip is the encoder modelling the target type's range; the
                 // source writes a cast, so record it as one. `Clip { Int }`
                 // above emits nothing at all, for the same reason.
-                ctx.name_ctxt.record_source_cast(f_name, &range_to_type_name(&range));
-                apply_range_fun(&f_name, &range, vec![expr])
+                let application = apply_range_fun(&f_name, &range, vec![expr]);
+                ctx.name_ctxt.record_source_cast(&application, &range_to_type_name(&range));
+                application
             }
             UnaryOp::IntToReal => {
                 let expr = exp_to_expr(ctx, e, expr_ctxt)?;
@@ -1380,7 +1381,7 @@ pub(crate) fn exp_to_expr(ctx: &Ctx, exp: &Exp, expr_ctxt: &ExprCtxt) -> Result<
                     return Ok(str_apply(record_op(ctx, crate::def::RMUL, op), &vec![lh, rh]));
                 }
                 BinaryOp::RealArith(crate::ast::RealArithOp::Div) => {
-                    return Ok(str_apply(crate::def::RDIV, &vec![lh, rh]));
+                    return Ok(str_apply(record_op(ctx, crate::def::RDIV, op), &vec![lh, rh]));
                 }
                 BinaryOp::Ne => {
                     let eq = ExprX::Binary(air::ast::BinaryOp::Eq, lh, rh);
