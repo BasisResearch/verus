@@ -150,10 +150,11 @@ fn ghost_code_does_not_call() {
     assert!(!graph.reachable.contains("test_crate::spec_inc"));
 }
 
-/// Specs are used through the contracts and proofs of reachable code:
-/// directly, through other specs, and through the lemmas a proof calls.
+/// Ghost functions are used through the contracts and proofs of reachable
+/// code: directly, through other specs, and through the lemmas a proof
+/// calls.
 #[test]
-fn dead_specs() {
+fn dead_ghost_functions() {
     let code = verus_code! {
         spec fn small(x: u64) -> bool {
             x < 100
@@ -194,7 +195,7 @@ fn dead_specs() {
             }
         }
     };
-    let (result, report) = reach("dead_specs", code);
+    let (result, report) = reach("dead_ghost_functions", code);
     result.unwrap();
     assert_eq!(
         edge_kinds(&report, "test_crate::main", "test_crate::bounded"),
@@ -207,16 +208,15 @@ fn dead_specs() {
     );
 
     let graph = graph_from_main(&report);
-    let spec = |name: &str| node(&report, &format!("test_crate::{name}"));
+    let ghost = |name: &str| node(&report, &format!("test_crate::{name}"));
     for name in ["bounded", "small", "by_lemma", "lemma"] {
-        assert!(graph.is_reachable(spec(name)), "{}", name);
-        assert!(!graph.reachable.contains(&spec(name).id), "{} runs", name);
+        assert!(graph.is_reachable(ghost(name)), "{}", name);
+        assert!(!graph.reachable.contains(&ghost(name).id), "{} runs", name);
     }
     for name in ["dead", "only_by_twin", "twin"] {
-        assert!(!graph.is_reachable(spec(name)), "{}", name);
+        assert!(!graph.is_reachable(ghost(name)), "{}", name);
     }
-    assert!(spec("lemma").is_ghost() && !spec("lemma").is_spec());
-    assert_eq!(graph.spec_coverage(), (3, 5));
+    assert_eq!(graph.ghost_coverage(), (4, 6));
 }
 
 /// The spec accessors `verus!` synthesizes for enum fields are not the
@@ -246,7 +246,7 @@ fn synthesized_enum_accessors_are_not_reported() {
     let (result, report) = reach("enum_accessors", code);
     result.unwrap();
     let specs: Vec<&str> =
-        report.nodes.iter().filter(|n| n.is_spec()).map(|n| n.def_path.as_str()).collect();
+        report.nodes.iter().filter(|n| n.is_ghost()).map(|n| n.def_path.as_str()).collect();
     assert_eq!(specs, vec!["test_crate::E::is_a", "test_crate::n_of"]);
 }
 

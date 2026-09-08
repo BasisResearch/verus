@@ -35,8 +35,7 @@ struct Args {
     /// With --lcov, include only verified exec functions
     #[arg(long, conflicts_with = "only_verified")]
     only_verified_exec: bool,
-    /// With --lcov, include only verified exec and spec functions. Proofs
-    /// carry coverage to the specs they use but are not rows themselves
+    /// With --lcov, include only verified exec, spec, and proof functions
     #[arg(long)]
     only_verified: bool,
 }
@@ -53,7 +52,7 @@ impl Only {
     fn includes(self, node: &Node) -> bool {
         match self {
             Only::All => true,
-            Only::Verified => node.is_verified_exec() || node.is_spec(),
+            Only::Verified => node.is_verified_exec() || node.is_ghost(),
             Only::VerifiedExec => node.is_verified_exec(),
         }
     }
@@ -99,20 +98,20 @@ fn summary(reports: &[Report], graph: &Graph) -> String {
     )
     .unwrap();
     writeln!(out, "(LoC counts every line of the function, including proof blocks)").unwrap();
-    let specs: Vec<&Node> = graph.nodes.values().filter(|n| n.is_spec()).collect();
-    let used = specs.iter().filter(|n| graph.is_reachable(n)).count();
+    let ghosts: Vec<&Node> = graph.nodes.values().filter(|n| n.is_ghost()).collect();
+    let used = ghosts.iter().filter(|n| graph.is_reachable(n)).count();
     writeln!(
         out,
-        "spec functions:          {:>6}   used:      {:>6}  ({}%)",
-        specs.len(),
+        "ghost functions:         {:>6}   used:      {:>6}  ({}%)",
+        ghosts.len(),
         used,
-        pct(used, specs.len())
+        pct(used, ghosts.len())
     )
     .unwrap();
-    writeln!(out, "(a spec is used when a contract or proof of reachable code mentions it)")
+    writeln!(out, "(a ghost function is used when the ghost code of reachable code mentions it)")
         .unwrap();
 
-    // (reachable fns, fns, reachable loc, loc, used specs, specs) per module
+    // (reachable fns, fns, reachable loc, loc, used ghosts, ghosts) per module
     let mut modules: BTreeMap<&str, [usize; 6]> = BTreeMap::new();
     for f in &fns {
         let m = modules.entry(&f.module).or_default();
@@ -123,7 +122,7 @@ fn summary(reports: &[Report], graph: &Graph) -> String {
             m[2] += loc(f);
         }
     }
-    for f in &specs {
+    for f in &ghosts {
         let m = modules.entry(&f.module).or_default();
         m[5] += 1;
         m[4] += graph.is_reachable(f) as usize;
@@ -133,7 +132,7 @@ fn summary(reports: &[Report], graph: &Graph) -> String {
     for (module, [rf, tf, rl, tl, us, ts]) in &modules {
         writeln!(
             out,
-            "  {module:width$}  {rf:>4}/{tf:<4} fns  {rl:>6}/{tl:<6} LoC  {us:>4}/{ts:<4} specs"
+            "  {module:width$}  {rf:>4}/{tf:<4} fns  {rl:>6}/{tl:<6} LoC  {us:>4}/{ts:<4} ghost"
         )
         .unwrap();
     }
@@ -146,9 +145,9 @@ fn summary(reports: &[Report], graph: &Graph) -> String {
         writeln!(out, "  {}:{}   {}", f.span.file, f.span.start_line, f.name()).unwrap();
     }
 
-    let unused: Vec<&Node> = specs.iter().copied().filter(|n| !graph.is_reachable(n)).collect();
+    let unused: Vec<&Node> = ghosts.iter().copied().filter(|n| !graph.is_reachable(n)).collect();
     if !unused.is_empty() {
-        writeln!(out, "\nunused spec functions:").unwrap();
+        writeln!(out, "\nunused ghost functions:").unwrap();
     }
     for f in unused {
         writeln!(out, "  {}:{}   {}", f.span.file, f.span.start_line, f.name()).unwrap();
@@ -239,24 +238,24 @@ mod tests {
         );
         assert!(text.contains("unreachable verified exec functions:\n  x.rs:1   inc\n"), "{text}");
         assert!(
-            text.contains("  lib               2/2    fns       6/6      LoC     1/1    specs"),
+            text.contains("  lib               2/2    fns       6/6      LoC     2/2    ghost"),
             "{text}"
         );
         assert!(
-            text.contains("  lib::verified     0/1    fns       0/3      LoC     0/1    specs"),
+            text.contains("  lib::verified     0/1    fns       0/3      LoC     0/1    ghost"),
             "{text}"
         );
     }
 
     #[test]
-    fn summary_lists_unused_specs() {
+    fn summary_lists_unused_ghost_functions() {
         let (reports, graph) = graph();
         let text = summary(&reports, &graph);
         assert!(
-            text.contains("spec functions:               2   used:           1  (50%)"),
+            text.contains("ghost functions:              3   used:           2  (66%)"),
             "{text}"
         );
-        assert!(text.contains("unused spec functions:\n  x.rs:1   spec_inc\n"), "{text}");
+        assert!(text.contains("unused ghost functions:\n  x.rs:1   spec_inc\n"), "{text}");
     }
 
     #[test]
@@ -274,8 +273,8 @@ mod tests {
         let verified = lcov(&graph, Only::Verified);
         assert!(verified.contains("FNDA:1,lib::spec_wired\n"), "{verified}");
         assert!(verified.contains("FNDA:0,lib::verified::spec_inc\n"), "{verified}");
+        assert!(verified.contains("FNDA:1,lib::lemma\n"), "{verified}");
         assert!(!verified.contains("lib::inc\n"), "{verified}");
-        assert!(!verified.contains("lemma"), "{verified}");
         assert!(lcov(&graph, Only::All).contains("FNDA:1,lib::inc\n"));
     }
 

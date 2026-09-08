@@ -5,8 +5,8 @@
 //! the context of the reference: a call, a contract, or a proof. Edges may
 //! name items in other crates. This library merges the reports of all
 //! crates and computes what is reachable from the chosen roots: which
-//! functions run, and which ghost functions the running code's contracts
-//! and proofs use.
+//! functions run, and which ghost functions (specs and proofs) the running
+//! code's contracts and proofs use.
 
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
@@ -90,14 +90,10 @@ impl Node {
         self.verified && self.mode == "exec" && !self.external_body && !self.proxy
     }
 
-    /// Ghost code: a spec or proof function.
+    /// The ghost functions we want used: spec and proof functions, with or
+    /// without a body.
     pub fn is_ghost(&self) -> bool {
         self.mode != "exec"
-    }
-
-    /// The specs we want used: spec functions, with or without a body.
-    pub fn is_spec(&self) -> bool {
-        self.verified && self.mode == "spec" && !self.proxy
     }
 
     pub fn name(&self) -> &str {
@@ -246,9 +242,9 @@ impl Graph {
         self.count(Node::is_verified_exec)
     }
 
-    /// Spec functions: (used, total)
-    pub fn spec_coverage(&self) -> (usize, usize) {
-        self.count(Node::is_spec)
+    /// Ghost functions: (used, total)
+    pub fn ghost_coverage(&self) -> (usize, usize) {
+        self.count(Node::is_ghost)
     }
 
     fn count(&self, select: fn(&Node) -> bool) -> (usize, usize) {
@@ -317,8 +313,8 @@ pub mod fixture {
 
     /// A library with a wired verified function and a public verified twin
     /// of an unverified one, and a binary whose main calls only the wired
-    /// and unverified ones. The wired function's contract uses one spec;
-    /// the twin's uses another.
+    /// and unverified ones. The wired function's contract uses one spec
+    /// and its body a lemma; the twin's contract uses another spec.
     pub fn lib_and_bin() -> Vec<Report> {
         let lib = report(
             "lib",
@@ -365,8 +361,9 @@ mod tests {
         assert!(!graph.reachable.contains("lib::verified::inc"));
         assert_eq!(graph.coverage(), (2, 3));
         assert!(graph.used.contains("lib::spec_wired"));
+        assert!(graph.used.contains("lib::lemma"));
         assert!(!graph.used.contains("lib::verified::spec_inc"));
-        assert_eq!(graph.spec_coverage(), (1, 2));
+        assert_eq!(graph.ghost_coverage(), (2, 3));
     }
 
     #[test]
@@ -383,6 +380,7 @@ mod tests {
                 spec("lib(bin)::spec_len"),
                 spec("lib(bin)::by_lemma"),
                 spec("lib(bin)::dead"),
+                proof("lib(bin)::lemma"),
             ],
             vec![
                 contract("lib(bin)::main", "lib(bin)::exec_len"),
@@ -398,7 +396,8 @@ mod tests {
         assert!(graph.is_reachable(&graph.nodes["lib(bin)::spec_len"]));
         assert!(graph.is_reachable(&graph.nodes["lib(bin)::by_lemma"]));
         assert!(!graph.is_reachable(&graph.nodes["lib(bin)::dead"]));
-        assert_eq!(graph.spec_coverage(), (2, 3));
+        assert!(graph.is_reachable(&graph.nodes["lib(bin)::lemma"]));
+        assert_eq!(graph.ghost_coverage(), (3, 4));
     }
 
     #[test]
