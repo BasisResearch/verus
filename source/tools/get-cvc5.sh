@@ -1,15 +1,28 @@
 #!/bin/bash -eu
 
-cvc5_tag="basis-4a42bee406"
+# Downloads the pinned Basis cvc5 build into the current directory. The pin
+# (release tag, per-platform asset, sha256) lives in tools/common/solvers.toml,
+# the single source of truth shared with rust_verify, vargo and verus-tools-mcp.
+
+manifest="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/tools/common/solvers.toml"
+pin() {
+    awk -F'"' -v table="[$1]" -v key="$2" '
+        /^\[/ { in_table = ($0 == table) }
+        in_table && $1 ~ "^" key "[ \t]*=[ \t]*$" { print $2; exit }
+    ' "$manifest"
+}
+
+cvc5_repo="$(pin cvc5 repo)"
+cvc5_tag="$(pin cvc5 tag)"
 
 case "$(uname -s)/$(uname -m)" in
     Darwin/arm64)
-        filename="cvc5-arm64-macos"
-        sha256="b5ccae10ca03785ed3cec9794f134b991f5bb0b51f139f8b434a3478c5953c76"
+        filename="$(pin cvc5 asset_arm64_macos)"
+        sha256="$(pin cvc5 sha256_arm64_macos)"
         ;;
     Linux/x86_64)
-        filename="cvc5-x86-linux"
-        sha256="2d8b6cd70545061b9574c2d39ede246f4560e49635ef6028654bcb4a23783907"
+        filename="$(pin cvc5 asset_x86_linux)"
+        sha256="$(pin cvc5 sha256_x86_linux)"
         ;;
     *)
         echo "The pinned Basis cvc5 build supports macOS arm64 and Linux x86_64 only." >&2
@@ -17,7 +30,12 @@ case "$(uname -s)/$(uname -m)" in
         ;;
 esac
 
-url="https://github.com/BasisResearch/cvc5/releases/download/$cvc5_tag/$filename"
+if [ -z "$cvc5_repo" ] || [ -z "$cvc5_tag" ] || [ -z "$filename" ] || [ -z "$sha256" ]; then
+    echo "could not read the cvc5 pin from $manifest" >&2
+    exit 1
+fi
+
+url="https://github.com/$cvc5_repo/releases/download/$cvc5_tag/$filename"
 tmp="cvc5.download"
 trap 'rm -f "$tmp"' EXIT
 

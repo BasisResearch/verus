@@ -6,26 +6,14 @@ extern crate rustc_driver;
 extern crate rustc_log;
 extern crate rustc_session;
 
-const MCP_REQUIRED_MESSAGE: &str = "rust_verify is only meant to be invoked by the MCP server, not directly from bash; use the `verus` MCP server's tools instead (or pass `--mcp` if you really are the MCP server)";
-
-fn consume_mcp_flag(args: impl IntoIterator<Item = String>) -> (bool, Vec<String>) {
-    let mut mcp = false;
-    let args = args
-        .into_iter()
-        .filter(|arg| {
-            if arg == "--mcp" {
-                mcp = true;
-                false
-            } else {
-                true
-            }
-        })
-        .collect();
-    (mcp, args)
-}
-
-fn authorize_mcp(mcp: bool, via_cargo: bool) -> Result<(), &'static str> {
-    if mcp || via_cargo { Ok(()) } else { Err(MCP_REQUIRED_MESSAGE) }
+/// The MCP gate (`--mcp` or `VERUS_MCP_ENABLED`, see `rust_verify::mcp_gate`). A
+/// cargo-driven run is authorized by cargo-verus, which enforces the same gate.
+fn authorize(authorized: bool, via_cargo: bool) -> Result<(), String> {
+    if authorized || via_cargo {
+        Ok(())
+    } else {
+        Err(rust_verify::mcp_gate::refusal("rust_verify"))
+    }
 }
 
 #[cfg(target_family = "windows")]
@@ -49,8 +37,8 @@ fn os_setup() -> Result<(), Box<dyn std::error::Error>> {
 pub fn main() {
     let mut dep_tracker = rust_verify::cargo_verus_dep_tracker::DepTracker::init();
     let via_cargo = dep_tracker.compare_env(rust_verify::cargo_verus::VERUS_DRIVER_VIA_CARGO, "1");
-    let (mcp, process_args) = consume_mcp_flag(std::env::args());
-    if let Err(message) = authorize_mcp(mcp, via_cargo) {
+    let (authorized, process_args) = rust_verify::mcp_gate::consume(std::env::args());
+    if let Err(message) = authorize(authorized, via_cargo) {
         eprintln!("error: {message}");
         std::process::exit(1);
     }
@@ -596,38 +584,41 @@ pub fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{MCP_REQUIRED_MESSAGE, authorize_mcp, consume_mcp_flag};
+    use super::authorize;
+    use rust_verify::mcp_gate::{consume_with, refusal};
 
     #[test]
     fn mcp_flag_is_consumed_before_normal_argument_parsing() {
-        let (mcp, args) =
-            consume_mcp_flag(["rust_verify", "input.rs", "--mcp", "--version"].map(str::to_owned));
+        let (authorized, args) = consume_with(
+            ["rust_verify", "input.rs", "--mcp", "--version"].map(str::to_owned),
+            false,
+        );
 
-        assert!(mcp);
+        assert!(authorized);
         assert_eq!(args, ["rust_verify", "input.rs", "--version"]);
     }
 
     #[test]
-    fn missing_mcp_flag_is_reported() {
-        let (mcp, args) =
-            consume_mcp_flag(["rust_verify", "input.rs", "--version"].map(str::to_owned));
+    fn unauthorized_invocation_is_refused() {
+        let (authorized, args) =
+            consume_with(["rust_verify", "input.rs", "--version"].map(str::to_owned), false);
 
-        assert!(!mcp);
+        assert!(!authorized);
         assert_eq!(args, ["rust_verify", "input.rs", "--version"]);
-        assert_eq!(authorize_mcp(mcp, false), Err(MCP_REQUIRED_MESSAGE));
+        assert_eq!(authorize(authorized, false), Err(refusal("rust_verify")));
     }
 
     #[test]
-    fn every_mcp_flag_is_removed() {
-        let (mcp, args) =
-            consume_mcp_flag(["rust_verify", "--mcp", "input.rs", "--mcp"].map(str::to_owned));
+    fn environment_route_is_indistinguishable_from_the_flag() {
+        let (authorized, args) = consume_with(["rust_verify", "input.rs"].map(str::to_owned), true);
 
-        assert!(mcp);
+        assert!(authorized);
         assert_eq!(args, ["rust_verify", "input.rs"]);
+        assert_eq!(authorize(authorized, false), Ok(()));
     }
 
     #[test]
     fn cargo_wrapper_invocation_remains_authorized() {
-        assert_eq!(authorize_mcp(false, true), Ok(()));
+        assert_eq!(authorize(false, true), Ok(()));
     }
 }

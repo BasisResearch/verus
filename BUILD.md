@@ -95,6 +95,14 @@ cargo build --release
 cargo run --release -p cargo-verus -- --mcp build --release --manifest-path vstd/Cargo.toml
 ```
 
+`verus`, `rust_verify` and `cargo-verus` are meant to be driven by the Verus
+MCP server and refuse to run otherwise. An invocation is authorized by
+`--mcp` on the command line or by `VERUS_MCP_ENABLED` holding a truthy value
+(anything but `0`, `false`, `no`, `off`, empty) in the environment; the two
+are equivalent everywhere below. The MCP server exports `VERUS_MCP_ENABLED=1`
+for its subprocesses, so a `cargo-verus` → `verus` → `rust_verify` chain is
+authorized once; from a plain shell, pass `--mcp` as shown.
+
 The first command builds Verus and its supporting libraries. The second builds and verifies
 `vstd`, and places its required artifacts in `target-verus/release` alongside the other Verus
 artifacts. Omit `--release` from both commands for a debug build, which uses `target-verus/debug`

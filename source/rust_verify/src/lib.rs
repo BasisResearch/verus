@@ -33,6 +33,8 @@ pub mod config;
 
 #[path = "../../../tools/common/consts.rs"]
 pub mod consts;
+#[path = "../../../tools/common/mcp_gate.rs"]
+pub mod mcp_gate;
 
 mod automatic_derive;
 mod boundary_suggestions;

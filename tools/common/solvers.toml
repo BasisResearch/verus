@@ -1,0 +1,40 @@
+# The SMT solver builds this Verus is pinned to: the single source of truth.
+#
+# Every consumer derives from this file, so a bump is one edit:
+#   * tools/common/consts.rs   -> the version strings rust_verify and vargo
+#                                 check a running solver against
+#   * source/tools/get-z3.sh, get-z3.ps1, get-cvc5.sh
+#                              -> what the build scripts download
+#   * `verus --version --output-json`
+#                              -> publishes this table, so verus-tools-mcp
+#                                 downloads and hash-checks exactly these
+#                                 binaries without carrying a copy of the pin
+#
+# Format: flat `key = "value"` pairs under a `[solver]` table, parsed by the
+# few-line reader in consts.rs (no toml crate needed). Keep it that simple.
+#
+# `version` is the string the binary prints (`z3 --version` / `cvc5
+# --version`); `repo`/`tag` name the GitHub release of the Basis fork built
+# by its basis-build workflow, and the asset/sha256 pairs are its stripped
+# per-platform binaries.
+
+[z3]
+# Built from the z3-4.16.0 tag on the fork's `basis` branch.
+version = "4.16.0"
+repo = "BasisResearch/z3"
+tag = "basis-ce02dc1e6e"
+asset_arm64_macos = "z3-arm64-macos"
+sha256_arm64_macos = "8678aff7aae763ab69a5079e95562b6abb637bc5245b1bb6de8986c1de2596ab"
+asset_x86_linux = "z3-x86-linux"
+sha256_x86_linux = "99f5433928fa62adc3a19207d97b14111d62964e26b10b37d286f9e641e0dfbf"
+
+[cvc5]
+# Fork `main` at 4a42bee406: carries `:assert-id` provenance tags through
+# preprocessing and answers `(get-assertion-sources)`.
+version = "1.3.5.dev+main@4a42bee"
+repo = "BasisResearch/cvc5"
+tag = "basis-4a42bee406"
+asset_arm64_macos = "cvc5-arm64-macos"
+sha256_arm64_macos = "b5ccae10ca03785ed3cec9794f134b991f5bb0b51f139f8b434a3478c5953c76"
+asset_x86_linux = "cvc5-x86-linux"
+sha256_x86_linux = "2d8b6cd70545061b9574c2d39ede246f4560e49635ef6028654bcb4a23783907"

@@ -45,8 +45,8 @@ impl SmtSolverType {
 
     fn expected_version(&self) -> String {
         match self {
-            SmtSolverType::Z3 => consts::EXPECTED_Z3_VERSION.to_string(),
-            SmtSolverType::Cvc5 => consts::EXPECTED_CVC5_VERSION.to_string(),
+            SmtSolverType::Z3 => consts::expected_z3_version().to_string(),
+            SmtSolverType::Cvc5 => consts::expected_cvc5_version().to_string(),
         }
     }
 }

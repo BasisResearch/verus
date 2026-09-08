@@ -450,15 +450,29 @@ fn workspace_renamed_dependency_import_uses_workspace_alias() {
     );
 }
 
+/// Without `--mcp`, authorization comes from `VERUS_MCP_ENABLED` alone: a
+/// truthy value plans exactly like the flag, and no value (or a falsy one)
+/// is refused. Both halves live in one test because they toggle a
+/// process-wide variable that parallel tests would otherwise race on.
 #[test]
-fn verify_requires_mcp_flag() {
+fn verify_requires_mcp_flag_or_environment() {
+    const ENV: &str = "VERUS_MCP_ENABLED";
     let project_dir = MockPackage::new("foo").lib().verify(true).materialize();
-
     let args = [BIN_NAME, "verify"];
-    let plan = plan_execution(project_dir.path(), args);
-    assert!(
-        plan.is_err_and(|err| err
-            .to_string()
-            .contains("only meant to be invoked by the MCP server"))
-    );
+    let refused = |plan: anyhow::Result<ExecutionPlan>| {
+        plan.is_err_and(|err| {
+            err.to_string().contains("only meant to be invoked by the MCP server")
+        })
+    };
+
+    // SAFETY: this test owns the variable; nothing else in the suite sets it.
+    unsafe { std::env::set_var(ENV, "1") };
+    let plan = plan_execution(project_dir.path(), args).expect("VERUS_MCP_ENABLED=1 authorizes");
+    assert!(matches!(plan, ExecutionPlan::RunCargo(_)));
+
+    unsafe { std::env::set_var(ENV, "0") };
+    assert!(refused(plan_execution(project_dir.path(), args)), "a falsy value is not set");
+
+    unsafe { std::env::remove_var(ENV) };
+    assert!(refused(plan_execution(project_dir.path(), args)), "unset is not set");
 }

@@ -13,14 +13,13 @@ use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 )]
 pub struct CargoVerusCli {
     /// Required: cargo-verus is only meant to be invoked by the Verus MCP server
+    /// (equivalently, set VERUS_MCP_ENABLED=1 in the environment)
     #[arg(long, global = true)]
     pub mcp: bool,
 
     #[command(subcommand)]
     pub command: VerusSubcommand,
 }
-
-pub const MCP_REQUIRED_MESSAGE: &str = "cargo-verus is only meant to be invoked by the MCP server, not directly from bash; use the `verus` MCP server's tools instead (or pass `--mcp` if you really are the MCP server)";
 
 #[derive(Clone, Debug, Subcommand)]
 pub enum VerusSubcommand {
@@ -208,8 +207,11 @@ impl CargoVerusCli {
         let normalized_args = normalize_args(args);
         let mut parsed_cli = CargoVerusCli::parse_from(normalized_args).clap_trailing_args_hotfix();
 
+        // `--mcp` and VERUS_MCP_ENABLED are the same authorization; fold the
+        // environment in here so nothing downstream can tell them apart.
+        parsed_cli.mcp = parsed_cli.mcp || crate::mcp_gate::env_enabled();
         if !parsed_cli.mcp {
-            return Err(anyhow!(MCP_REQUIRED_MESSAGE));
+            return Err(anyhow!(crate::mcp_gate::refusal(crate::BIN_NAME)));
         }
 
         if parsed_cli.has_inadvisable_verus_arg() {

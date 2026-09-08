@@ -1,4 +1,6 @@
 mod cli;
+#[path = "../../../tools/common/mcp_gate.rs"]
+mod mcp_gate;
 pub mod metadata;
 mod plan;
 mod subcommands;
