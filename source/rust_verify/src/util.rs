@@ -211,6 +211,10 @@ impl Display for VerusBuildInfo {
         writeln!(f, "  Profile: {}", self.profile)?;
         writeln!(f, "  Platform: {}_{}", self.platform_os, self.platform_arch)?;
         writeln!(f, "  Toolchain: {}", self.toolchain)?;
+        // The solver versions this build checks a running solver against
+        // (tools/common/solvers.toml); the MCP server reads these lines.
+        writeln!(f, "  Expected z3: {}", crate::consts::expected_z3_version())?;
+        writeln!(f, "  Expected cvc5: {}", crate::consts::expected_cvc5_version())?;
         Ok(())
     }
 }
@@ -227,6 +231,21 @@ impl VerusBuildInfo {
                 },
                 "toolchain": self.toolchain.to_string(),
                 "commit": self.sha,
+                // The full solver pin manifest (tools/common/solvers.toml), so
+                // a wrapper can fetch and hash-check exactly the solvers this
+                // build expects without carrying its own copy of the pin.
+                "solvers": serde_json::Value::Object(
+                    crate::consts::SOLVERS
+                        .iter()
+                        .map(|solver| {
+                            let pins = crate::consts::solver_pins(solver)
+                                .into_iter()
+                                .map(|(k, v)| (k.to_string(), serde_json::Value::String(v.to_string())))
+                                .collect();
+                            (solver.to_string(), serde_json::Value::Object(pins))
+                        })
+                        .collect(),
+                ),
             }
         })
     }

@@ -5,6 +5,8 @@ use std::{
 
 use yansi::Paint;
 
+#[path = "../../../tools/common/mcp_gate.rs"]
+mod mcp_gate;
 mod record;
 #[cfg(feature = "record-history")]
 mod record_history;
@@ -77,9 +79,8 @@ fn run() -> Result<std::process::ExitStatus, String> {
     let (mut args, record, unpretty_arg) = {
         let mut args = std::env::args().into_iter();
         let _bin = args.next().expect("executable in args");
-        let mut all_args: Vec<_> = args.collect();
+        let (authorized, mut all_args) = mcp_gate::consume(args);
         let mut record = false;
-        let mut mcp = false;
         let mut unpretty_arg = false;
         for i in 0..all_args.len() {
             if all_args[i] == "-Z"
@@ -95,16 +96,12 @@ fn run() -> Result<std::process::ExitStatus, String> {
                 record = true;
                 false
             }
-            "--mcp" => {
-                mcp = true;
-                false
-            }
             _ => true,
         });
         // When cargo-verus drives this binary as RUSTC_WRAPPER, the arguments come from cargo,
-        // so the gate is bypassed here; cargo-verus enforces its own `--mcp` requirement instead.
-        if !mcp && !via_cargo {
-            return Err("the verus executable is only meant to be invoked by the MCP server, not directly from bash; use the `verus` MCP server's `verify` tool instead (or pass `--mcp` if you really are the MCP server)".to_owned());
+        // so the gate is bypassed here; cargo-verus enforces the same gate itself.
+        if !authorized && !via_cargo {
+            return Err(mcp_gate::refusal("the verus executable"));
         }
         (all_args, record, unpretty_arg)
     };
@@ -213,9 +210,10 @@ fn run() -> Result<std::process::ExitStatus, String> {
         Command::new(verus_root.join(RUST_VERIFY_FILE_NAME))
     };
     if !via_cargo {
-        // The wrapper consumed the user-facing flag. Forward authorization so
-        // invoking rust_verify directly cannot bypass the same gate.
-        cmd.arg("--mcp");
+        // The wrapper consumed the user-facing flag. Forward authorization
+        // explicitly (rather than relying on VERUS_MCP_ENABLED being inherited)
+        // so invoking rust_verify directly cannot bypass the same gate.
+        cmd.arg(mcp_gate::FLAG);
     }
 
     let vstd_kind = get_vstd_kind(&args);

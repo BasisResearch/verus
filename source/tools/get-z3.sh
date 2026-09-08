@@ -1,6 +1,15 @@
 #! /bin/bash -eu
 
-z3_version="4.16.0"
+# The z3 version is pinned in tools/common/solvers.toml (the single source of
+# truth shared with rust_verify, vargo and verus-tools-mcp); the release zip
+# still comes from upstream Z3Prover so every platform the build supports
+# gets a binary.
+manifest="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/tools/common/solvers.toml"
+z3_version="$(sed -n '/^\[z3\]/,/^\[/{s/^version *= *"\([^"]*\)".*/\1/p}' "$manifest")"
+if [ -z "$z3_version" ]; then
+    echo "could not read the z3 version from $manifest" >&2
+    exit 1
+fi
 
 # The OS/libc suffix in each release artifact's name is specific to the Z3
 # version (it tracks the platform Z3's CI built that release on), so these

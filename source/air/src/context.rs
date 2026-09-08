@@ -92,6 +92,16 @@ pub enum SmtSolver {
     Cvc5,
 }
 
+impl SmtSolver {
+    /// The solver's executable name, as used in messages.
+    pub fn name(&self) -> &'static str {
+        match self {
+            SmtSolver::Z3 => "z3",
+            SmtSolver::Cvc5 => "cvc5",
+        }
+    }
+}
+
 impl Default for SmtSolver {
     fn default() -> Self {
         SmtSolver::Z3
