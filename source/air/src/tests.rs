@@ -2275,3 +2275,52 @@ fn accessor_identifying_2() {
         )
     )
 }
+
+/// Parse a `check-valid` written with assert ids, print it, and require the
+/// printed form to read back to the same nodes: the `.air` log must carry
+/// the ids and stay a valid AIR input.
+#[test]
+fn assert_id_roundtrip() {
+    let text = r#"(check-valid
+  (declare-const x Int)
+  (block
+    (assume (> x 3))
+    (assert aid_2 ("assertion failed") () (> x 2))
+    (assert aid_5_1 ("assertion failed") () (location aid_5_1_0 ("nested") () (>= x 0)))
+    (assert ("no id keeps the old form") () (> x 1))
+  ))"#;
+    // (a bare `(assert e)` is left out: it reads back with an empty message,
+    // which prints as `("")`, a pre-existing asymmetry unrelated to ids)
+    let mut sise_parser = sise::Parser::new(text);
+    let node = sise::parse_tree(&mut sise_parser).expect("sise");
+    let message_interface = std::sync::Arc::new(crate::messages::AirMessageInterface {});
+    let parser = Parser::new(message_interface.clone());
+    let commands = parser.nodes_to_commands(&[node.clone()]).expect("parses");
+    assert_eq!(commands.len(), 1);
+    let query = match &*commands[0] {
+        CommandX::CheckValid(query) => query.clone(),
+        other => panic!("expected check-valid, got {:?}", other),
+    };
+    // the ids arrived
+    match &*query.assertion {
+        crate::ast::StmtX::Block(stmts) => {
+            let ids: Vec<Option<Vec<u64>>> = stmts
+                .iter()
+                .map(|s| match &**s {
+                    crate::ast::StmtX::Assert(id, _, _, _) => id.as_ref().map(|i| (**i).clone()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                ids,
+                vec![None, Some(vec![2]), Some(vec![5, 1]), None],
+                "ids read back from the assert statements"
+            );
+        }
+        other => panic!("expected block, got {:?}", other),
+    }
+    // and print back to exactly what was read
+    let printer = crate::printer::Printer::new(message_interface.clone(), false, SmtSolver::Cvc5);
+    let printed = printer.query_to_node(&query);
+    assert_eq!(printed, node);
+}

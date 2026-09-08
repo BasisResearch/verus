@@ -424,11 +424,16 @@ impl Printer {
                     nodes!(axiom_location {Node::List(spans)} {filter_nodes} {self.expr_to_node(expr)})
                 }
             }
-            ExprX::LabeledAssertion(_, error, filter, expr) => {
+            ExprX::LabeledAssertion(assert_id, error, filter, expr) => {
                 let spans = vec_map(&self.message_interface.all_msgs(error), |s| {
                     Node::Atom(format!("\"{}\"", s))
                 });
-                if spans.len() == 0 && filter.is_none() {
+                if let Some(id) = assert_id {
+                    // the id is part of the record: always print the full form
+                    let id_node = Node::Atom(crate::def::assert_id_to_symbol(id));
+                    let filter_nodes = self.filter_to_node(filter);
+                    nodes!(location {id_node} {Node::List(spans)} {filter_nodes} {self.expr_to_node(expr)})
+                } else if spans.len() == 0 && filter.is_none() {
                     self.expr_to_node(expr)
                 } else {
                     let filter_nodes = self.filter_to_node(filter);
@@ -527,11 +532,16 @@ impl Printer {
     pub fn stmt_to_node(&self, stmt: &Stmt) -> Node {
         match &**stmt {
             StmtX::Assume(expr) => nodes!(assume {self.expr_to_node(expr)}),
-            StmtX::Assert(_, labels, filter, expr) => {
+            StmtX::Assert(assert_id, labels, filter, expr) => {
                 let spans = vec_map(&self.message_interface.all_msgs(labels), |s| {
                     Node::Atom(format!("\"{}\"", s))
                 });
-                if spans.len() == 0 && filter.is_none() {
+                if let Some(id) = assert_id {
+                    // the id is part of the record: always print the full form
+                    let id_node = Node::Atom(crate::def::assert_id_to_symbol(id));
+                    let filter_nodes = self.filter_to_node(filter);
+                    nodes!(assert {id_node} {Node::List(spans)} {filter_nodes} {self.expr_to_node(expr)})
+                } else if spans.len() == 0 && filter.is_none() {
                     nodes!(assert {self.expr_to_node(expr)})
                 } else {
                     let filter_nodes = self.filter_to_node(filter);
