@@ -1,15 +1,15 @@
 #!/bin/bash -eu
 
-cvc5_tag="basis-4a9afc6b35"
+cvc5_tag="basis-4a42bee406"
 
 case "$(uname -s)/$(uname -m)" in
     Darwin/arm64)
         filename="cvc5-arm64-macos"
-        sha256="705452a629e7f521cd7677f3ff6cf25d853e31b60b78f3ba64b17616795b73b5"
+        sha256="b5ccae10ca03785ed3cec9794f134b991f5bb0b51f139f8b434a3478c5953c76"
         ;;
     Linux/x86_64)
         filename="cvc5-x86-linux"
-        sha256="5a72ef96293db50421449da7f037d1bb0489697844fae657d5a2b7fa357d91fd"
+        sha256="2d8b6cd70545061b9574c2d39ede246f4560e49635ef6028654bcb4a23783907"
         ;;
     *)
         echo "The pinned Basis cvc5 build supports macOS arm64 and Linux x86_64 only." >&2
