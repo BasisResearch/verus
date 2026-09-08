@@ -400,7 +400,17 @@ pub struct ResolvedInstantiation {
     /// the tagged assertion the quantifier was sent inside, when known
     #[serde(skip_serializing_if = "Option::is_none")]
     pub inside: Option<ResolvedTag>,
+    /// Where the quantifier is written, in prose. A reader should show this
+    /// rather than the generated `qid`, which names nothing in the source.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub site: Option<String>,
     pub count: usize,
+    /// The instantiation terms as the source spells them (boxes dropped,
+    /// symbols as they were written), rendered by `vir::air_names` from the
+    /// names the encoders recorded. This is what a reader should show.
+    pub terms: Vec<String>,
+    /// The same terms as the solver sees them. Kept for debugging this
+    /// pipeline; not for display.
     pub vectors: Vec<String>,
 }
 
@@ -1243,6 +1253,23 @@ impl Verifier {
         format!("{}{}{}{}", rerun_msg, count_msg, expand_msg, suffix,)
     }
 
+    /// Where a quantifier is written, in prose, from the assertion that owns
+    /// it and its own span. The generated `:qid` names nothing a reader knows.
+    fn quantifier_site(inside: &Option<ResolvedTag>, span: &Option<String>) -> Option<String> {
+        let kind = inside.as_ref().map(|i| i.kind.as_str()).unwrap_or("");
+        let owner = inside.as_ref().and_then(|i| i.owner.clone());
+        Some(match (kind, owner, span.clone()) {
+            ("requires", _, Some(at)) => format!("the forall in the requires clause at {at}"),
+            ("type_invariant", _, Some(at)) => format!("the forall in the type invariant at {at}"),
+            ("trait_bound", _, Some(at)) => format!("the forall in the trait bound at {at}"),
+            ("axiom", Some(o), _) => format!("the broadcast axiom `{o}`"),
+            ("axiom", None, Some(at)) => format!("the axiom at {at}"),
+            (_, _, Some(at)) => format!("the quantifier at {at}"),
+            (_, Some(o), None) => format!("a quantifier in `{o}`"),
+            _ => return None,
+        })
+    }
+
     /// Join the raw provenance (`func_provenance`) to source through
     /// `hyp_map`, `qid_map` and `axiom_owners`, into `func_details`.
     fn resolve_provenance(&mut self, global_ctx: &vir::context::GlobalCtx) {
@@ -1250,6 +1277,7 @@ impl Verifier {
         let hyp_map = global_ctx.hyp_map.borrow();
         let qid_map = global_ctx.qid_map.borrow();
         let axiom_owners = global_ctx.axiom_owners.borrow();
+        let air_source_names = global_ctx.air_source_names.borrow().clone();
         let tag_of = |fun: &Fun, symbol: &str| -> ResolvedTag {
             let mut r = ResolvedTag {
                 tag: symbol.to_string(),
@@ -1325,6 +1353,17 @@ impl Verifier {
                     .instantiations
                     .iter()
                     .map(|(qid, vectors)| {
+                        let span_short = |s: &Option<String>| -> Option<String> {
+                            s.as_ref().map(|s| {
+                                s.rsplit('/')
+                                    .next()
+                                    .unwrap_or(s)
+                                    .split(" (#")
+                                    .next()
+                                    .unwrap_or(s)
+                                    .to_string()
+                            })
+                        };
                         let (fun_name, span, inside) = match qid_map.get(qid) {
                             Some(info) => (
                                 Some(fun_as_friendly_rust_name(&info.fun)),
@@ -1337,12 +1376,18 @@ impl Verifier {
                                 None,
                             ),
                         };
+                        let site = Self::quantifier_site(&inside, &span_short(&span));
                         ResolvedInstantiation {
                             qid: qid.clone(),
                             fun: fun_name,
                             span,
                             inside,
+                            site,
                             count: vectors.len(),
+                            terms: vectors
+                                .iter()
+                                .map(|v| vir::air_names::render_vector(&air_source_names, v))
+                                .collect(),
                             vectors: vectors.clone(),
                         }
                     })
