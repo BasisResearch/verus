@@ -364,8 +364,8 @@ mod tests {
 
     /// Bitwise operators are emitted through the same recording path as
     /// arithmetic, so they read as source writes them rather than as the
-    /// prelude heads. The clip the encoder wraps the result in stays visible,
-    /// because the source cast is real.
+    /// prelude heads. The clip stays visible to preserve the result's range,
+    /// including the truncation performed by a left shift.
     #[test]
     fn bitwise_operators_read_as_source_writes_them() {
         let mut names = SourceNames::new();

@@ -854,22 +854,75 @@ impl ExprCtxt {
     }
 }
 
-fn clip_bitwise_result(bit_expr: ExprX, exp: &Exp) -> Result<Expr, VirErr> {
+fn clip_bitwise_result(name_ctxt: &NameCtxt, bit_expr: ExprX, exp: &Exp) -> Result<Expr, VirErr> {
     if let TypX::Int(range) = &*undecorate_typ(&exp.typ) {
-        match range {
-            IntRange::I(_) | IntRange::ISize => {
-                return Ok(apply_range_fun(&crate::def::I_CLIP, &range, vec![Arc::new(bit_expr)]));
-            }
-            IntRange::U(_) | IntRange::USize => {
-                return Ok(apply_range_fun(&crate::def::U_CLIP, &range, vec![Arc::new(bit_expr)]));
-            }
+        let symbol = match range {
+            IntRange::I(_) | IntRange::ISize => crate::def::I_CLIP,
+            IntRange::U(_) | IntRange::USize => crate::def::U_CLIP,
             _ => return Ok(Arc::new(bit_expr)),
         };
+        let application = apply_range_fun(symbol, range, vec![Arc::new(bit_expr)]);
+        // Bitwise results emit clips even without an explicit source cast.
+        // Record their ranges here so rendering does not depend on other casts.
+        name_ctxt.record_source_cast(&application, &range_to_type_name(range));
+        Ok(application)
     } else {
         return Err(error(
             &exp.span,
             format!("In translating Bitwise operator, encountered non-integer operand",),
         ));
+    }
+}
+
+#[cfg(test)]
+mod bitwise_provenance_tests {
+    use super::*;
+
+    #[test]
+    fn emitted_clips_render_without_explicit_source_casts() {
+        let name_ctxt = NameCtxt::new();
+        let span = Span {
+            raw_span: Arc::new(()),
+            id: 0,
+            data: vec![],
+            as_string: "bitwise test".to_string(),
+        };
+        let printer = air::printer::Printer::new(
+            Arc::new(air::messages::AirMessageInterface {}),
+            true,
+            air::context::SmtSolver::Cvc5,
+        );
+        let mut emitted = Vec::new();
+        for (range, typ) in [
+            (IntRange::U(8), "u8"),
+            (IntRange::U(16), "u16"),
+            (IntRange::I(8), "i8"),
+            (IntRange::I(16), "i16"),
+            (IntRange::U(64), "u64"),
+            (IntRange::USize, "usize"),
+            (IntRange::I(64), "i64"),
+            (IntRange::ISize, "isize"),
+        ] {
+            let exp = SpannedTyped::new(
+                &span,
+                &Arc::new(TypX::Int(range)),
+                ExpX::Const(crate::ast::Constant::Int(0.into())),
+            );
+            let application =
+                clip_bitwise_result(&name_ctxt, ExprX::Var(str_ident("bitwise_result")), &exp)
+                    .unwrap();
+            let term = air::printer::NodeWriter::new()
+                .node_to_string_indent(&String::new(), &printer.expr_to_node(&application));
+            emitted.push((term, typ));
+        }
+        // Check after every range has been recorded: widths sharing a head
+        // must remain distinct, including architecture-dependent widths.
+        for (term, typ) in emitted {
+            assert_eq!(
+                crate::air_names::render_term(&name_ctxt.source_names(), &term),
+                format!("(bitwise_result as {typ})"),
+            );
+        }
     }
 }
 
@@ -1112,7 +1165,7 @@ pub(crate) fn exp_to_expr(ctx: &Ctx, exp: &Exp, expr_ctxt: &ExprCtxt) -> Result<
                             format!("Verus Internal Error: BitNot: type doesn't match"),
                         ));
                     }
-                    return clip_bitwise_result(bit_expr, e);
+                    return clip_bitwise_result(&ctx.name_ctxt, bit_expr, e);
                 } else {
                     return Ok(Arc::new(bit_expr));
                 }
@@ -1453,13 +1506,10 @@ pub(crate) fn exp_to_expr(ctx: &Ctx, exp: &Exp, expr_ctxt: &ExprCtxt) -> Result<
                         BitwiseOp::Shr => crate::def::BIT_SHR,
                     };
                     let args = vec![box_lh, box_rh];
-                    // `binary_op_str` spells these (`^`, `&`, `|`, `<<`, `>>`);
-                    // the IEEE float heads below are left unrecorded because it
-                    // has no per-operation spelling for them yet.
                     let fname = record_op(ctx, fname, op);
                     let bit_expr = ExprX::Apply(Arc::new(fname.to_string()), Arc::new(args));
 
-                    return clip_bitwise_result(bit_expr, exp);
+                    return clip_bitwise_result(&ctx.name_ctxt, bit_expr, exp);
                 }
                 BinaryOp::IeeeFloat(fop) => {
                     use crate::ast::IeeeFloatBinaryOp;
