@@ -2,7 +2,7 @@
 #[macro_use]
 mod common;
 use common::*;
-use verus_reach::{Graph, Node, Report, Roots};
+use verus_reach::{EdgeKind, Graph, Node, Report, Roots};
 
 /// Runs verus with `--reach` and returns the crate's report.
 fn reach(name: &str, code: String) -> (Result<TestErr, TestErr>, Report) {
@@ -23,7 +23,14 @@ fn node<'a>(report: &'a Report, def_path: &str) -> &'a Node {
 }
 
 fn has_edge(report: &Report, from: &str, to: &str) -> bool {
-    report.edges.iter().any(|(f, t)| f == from && t == to)
+    report.edges.iter().any(|e| e.from == from && e.to == to)
+}
+
+fn edge_kinds(report: &Report, from: &str, to: &str) -> Vec<EdgeKind> {
+    let mut kinds: Vec<EdgeKind> =
+        report.edges.iter().filter(|e| e.from == from && e.to == to).map(|e| e.kind).collect();
+    kinds.sort();
+    kinds
 }
 
 /// The test crate is a library, so `main` is not an entry point; make it the root.
@@ -101,7 +108,8 @@ fn wired() {
     assert!(graph_from_main(&report).is_reachable(node(&report, "test_crate::verified::inc")));
 }
 
-/// A `when_used_as_spec` function mentioned only in ghost code is not called.
+/// A `when_used_as_spec` function mentioned only in ghost code is not
+/// called, but the spec it stands for is used.
 #[test]
 fn ghost_code_does_not_call() {
     let code = verus_code! {
@@ -128,7 +136,141 @@ fn ghost_code_does_not_call() {
     };
     let (result, report) = reach("ghost", code);
     result.unwrap();
-    assert!(!graph_from_main(&report).is_reachable(node(&report, "test_crate::inc")));
+    assert_eq!(
+        edge_kinds(&report, "test_crate::main", "test_crate::inc"),
+        vec![EdgeKind::Contract, EdgeKind::Proof]
+    );
+    assert_eq!(
+        edge_kinds(&report, "test_crate::inc", "test_crate::spec_inc"),
+        vec![EdgeKind::Contract]
+    );
+    let graph = graph_from_main(&report);
+    assert!(!graph.is_reachable(node(&report, "test_crate::inc")));
+    assert!(graph.is_reachable(node(&report, "test_crate::spec_inc")));
+    assert!(!graph.reachable.contains("test_crate::spec_inc"));
+}
+
+/// Specs are used through the contracts and proofs of reachable code:
+/// directly, through other specs, and through the lemmas a proof calls.
+#[test]
+fn dead_specs() {
+    let code = verus_code! {
+        spec fn small(x: u64) -> bool {
+            x < 100
+        }
+
+        spec fn bounded(x: u64) -> bool {
+            small(x) && x > 0
+        }
+
+        spec fn by_lemma(x: u64) -> bool {
+            x < 200
+        }
+
+        proof fn lemma(x: u64)
+            requires bounded(x),
+            ensures by_lemma(x),
+        {
+        }
+
+        spec fn dead(x: u64) -> bool {
+            x > 1
+        }
+
+        spec fn only_by_twin(x: u64) -> bool {
+            x > 2
+        }
+
+        fn twin(x: u64)
+            requires only_by_twin(x), dead(x),
+        {
+        }
+
+        fn main(x: u64)
+            requires bounded(x),
+        {
+            proof {
+                lemma(x);
+            }
+        }
+    };
+    let (result, report) = reach("dead_specs", code);
+    result.unwrap();
+    assert_eq!(
+        edge_kinds(&report, "test_crate::main", "test_crate::bounded"),
+        vec![EdgeKind::Contract]
+    );
+    assert_eq!(edge_kinds(&report, "test_crate::main", "test_crate::lemma"), vec![EdgeKind::Proof]);
+    assert_eq!(
+        edge_kinds(&report, "test_crate::bounded", "test_crate::small"),
+        vec![EdgeKind::Call]
+    );
+
+    let graph = graph_from_main(&report);
+    let spec = |name: &str| node(&report, &format!("test_crate::{name}"));
+    for name in ["bounded", "small", "by_lemma", "lemma"] {
+        assert!(graph.is_reachable(spec(name)), "{}", name);
+        assert!(!graph.reachable.contains(&spec(name).id), "{} runs", name);
+    }
+    for name in ["dead", "only_by_twin", "twin"] {
+        assert!(!graph.is_reachable(spec(name)), "{}", name);
+    }
+    assert!(spec("lemma").is_ghost() && !spec("lemma").is_spec());
+    assert_eq!(graph.spec_coverage(), (3, 5));
+}
+
+/// The spec accessors `verus!` synthesizes for enum fields are not the
+/// user's specs.
+#[test]
+fn synthesized_enum_accessors_are_not_reported() {
+    let code = verus_code! {
+        enum E {
+            A { n: u64 },
+            B(u64),
+        }
+
+        spec fn n_of(e: E) -> u64 {
+            e->A_n
+        }
+
+        impl E {
+            spec fn is_a(self) -> bool {
+                self is A
+            }
+        }
+
+        fn main() {
+            let _ = E::B(1);
+        }
+    };
+    let (result, report) = reach("enum_accessors", code);
+    result.unwrap();
+    let specs: Vec<&str> =
+        report.nodes.iter().filter(|n| n.is_spec()).map(|n| n.def_path.as_str()).collect();
+    assert_eq!(specs, vec!["test_crate::E::is_a", "test_crate::n_of"]);
+}
+
+/// A type invariant is used wherever its type is.
+#[test]
+fn type_invariant_is_used_with_its_type() {
+    let code = verus_code! {
+        struct S {
+            n: u64,
+        }
+
+        #[verifier::type_invariant]
+        spec fn inv(s: S) -> bool {
+            s.n < 10
+        }
+
+        fn main() {
+            let s = S { n: 1 };
+        }
+    };
+    let (result, report) = reach("type_invariant", code);
+    result.unwrap();
+    assert_eq!(edge_kinds(&report, "test_crate::S", "test_crate::inv"), vec![EdgeKind::Contract]);
+    assert!(graph_from_main(&report).is_reachable(node(&report, "test_crate::inv")));
 }
 
 #[test]

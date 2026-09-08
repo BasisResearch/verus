@@ -1,17 +1,18 @@
 //! Static reachability of verified code, across crates.
 //!
 //! `verus --reach DIR` writes one [`Report`] per crate: the crate's functions
-//! with Verus's labels, and the call edges out of every body. Edges may name
-//! items in other crates. This library merges the reports of all crates and
-//! computes what is reachable from the chosen roots.
+//! with Verus's labels, and the edges out of every body, each labeled with
+//! the context of the reference: a call, a contract, or a proof. Edges may
+//! name items in other crates. This library merges the reports of all
+//! crates and computes what is reachable from the chosen roots: which
+//! functions run, and which ghost functions the running code's contracts
+//! and proofs use.
 
-use petgraph::graphmap::DiGraphMap;
-use petgraph::visit::Bfs;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 3;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Report {
@@ -24,9 +25,37 @@ pub struct Report {
     pub main: Option<String>,
     /// The crate's own functions
     pub nodes: Vec<Node>,
-    /// `(from, to)` by id. Either end may be an item this crate does not
-    /// define: a function of another crate, a trait method, a type.
-    pub edges: Vec<(String, String)>,
+    /// By id. Either end may be an item this crate does not define: a
+    /// function of another crate, a trait method, a type.
+    pub edges: Vec<Edge>,
+}
+
+/// The context a body refers to an item in.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[serde(rename_all = "lowercase")]
+pub enum EdgeKind {
+    /// Compiled code: the item is called, constructed, or used as a value
+    Call,
+    /// A `requires`, `ensures`, `recommends`, or `returns` clause, or the
+    /// spec a function stands for in ghost code (`when_used_as_spec`, type
+    /// invariants)
+    Contract,
+    /// Other ghost code: assertions, proof blocks, loop invariants,
+    /// decreases clauses
+    Proof,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Edge {
+    pub from: String,
+    pub to: String,
+    pub kind: EdgeKind,
+}
+
+impl Edge {
+    pub fn new(from: impl Into<String>, to: impl Into<String>, kind: EdgeKind) -> Edge {
+        Edge { from: from.into(), to: to.into(), kind }
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -59,6 +88,16 @@ impl Node {
     /// The functions we want wired in: verified exec code with a real body.
     pub fn is_verified_exec(&self) -> bool {
         self.verified && self.mode == "exec" && !self.external_body && !self.proxy
+    }
+
+    /// Ghost code: a spec or proof function.
+    pub fn is_ghost(&self) -> bool {
+        self.mode != "exec"
+    }
+
+    /// The specs we want used: spec functions, with or without a body.
+    pub fn is_spec(&self) -> bool {
+        self.verified && self.mode == "spec" && !self.proxy
     }
 
     pub fn name(&self) -> &str {
@@ -134,7 +173,11 @@ pub struct Graph {
     /// Every function of every crate, by id
     pub nodes: BTreeMap<String, Node>,
     pub roots: Vec<String>,
+    /// Runs: reached from a root through calls only
     pub reachable: HashSet<String>,
+    /// Used by ghost code: reached from a running function through a
+    /// contract or proof, then through anything
+    pub used: HashSet<String>,
 }
 
 impl Graph {
@@ -164,29 +207,52 @@ impl Graph {
         root_ids.sort();
         root_ids.dedup();
 
-        // One synthetic root pointing at every real root, then a single search
-        let mut graph: DiGraphMap<&str, ()> = DiGraphMap::new();
-        for root in &root_ids {
-            graph.add_edge("", root, ());
+        let mut out: HashMap<&str, Vec<&Edge>> = HashMap::new();
+        for edge in reports.iter().flat_map(|r| r.edges.iter()) {
+            out.entry(&edge.from).or_default().push(edge);
         }
-        for (from, to) in reports.iter().flat_map(|r| r.edges.iter()) {
-            graph.add_edge(from, to, ());
-        }
+
+        // One search in two contexts. A call from running code runs its
+        // target; anything referenced from ghost code, or from something
+        // ghost code reached, is only used.
         let mut reachable = HashSet::new();
-        let mut bfs = Bfs::new(&graph, "");
-        while let Some(id) = bfs.next(&graph) {
-            reachable.insert(id.to_string());
+        let mut used = HashSet::new();
+        let mut queue: VecDeque<(&str, bool)> = VecDeque::new();
+        for root in &root_ids {
+            if reachable.insert(root.clone()) {
+                queue.push_back((root, false));
+            }
         }
-        Ok(Graph { nodes, roots: root_ids, reachable })
+        while let Some((id, ghost)) = queue.pop_front() {
+            for edge in out.get(id).map_or(&[][..], |v| v) {
+                let ghost = ghost || edge.kind != EdgeKind::Call;
+                let set = if ghost { &mut used } else { &mut reachable };
+                if set.insert(edge.to.clone()) {
+                    queue.push_back((&edge.to, ghost));
+                }
+            }
+        }
+        Ok(Graph { nodes, roots: root_ids, reachable, used })
     }
 
+    /// An exec function is reachable when it runs; a ghost function, when
+    /// running code uses it.
     pub fn is_reachable(&self, node: &Node) -> bool {
-        self.reachable.contains(&node.id)
+        self.reachable.contains(&node.id) || (node.is_ghost() && self.used.contains(&node.id))
     }
 
     /// Verified exec functions: (reachable, total)
     pub fn coverage(&self) -> (usize, usize) {
-        let fns = self.nodes.values().filter(|n| n.is_verified_exec());
+        self.count(Node::is_verified_exec)
+    }
+
+    /// Spec functions: (used, total)
+    pub fn spec_coverage(&self) -> (usize, usize) {
+        self.count(Node::is_spec)
+    }
+
+    fn count(&self, select: fn(&Node) -> bool) -> (usize, usize) {
+        let fns = self.nodes.values().filter(|n| select(n));
         let total = fns.clone().count();
         (fns.filter(|n| self.is_reachable(n)).count(), total)
     }
@@ -212,12 +278,26 @@ pub mod fixture {
         }
     }
 
+    pub fn spec(id: &str) -> Node {
+        let mut n = node(id, true, false);
+        n.mode = "spec".into();
+        n
+    }
+
+    pub fn call(from: &str, to: &str) -> Edge {
+        Edge::new(from, to, EdgeKind::Call)
+    }
+
+    pub fn contract(from: &str, to: &str) -> Edge {
+        Edge::new(from, to, EdgeKind::Contract)
+    }
+
     pub fn report(
         krate: &str,
         crate_type: &str,
         main: Option<&str>,
         nodes: Vec<Node>,
-        edges: &[(&str, &str)],
+        edges: Vec<Edge>,
     ) -> Report {
         Report {
             schema_version: SCHEMA_VERSION,
@@ -225,13 +305,14 @@ pub mod fixture {
             crate_type: crate_type.into(),
             main: main.map(String::from),
             nodes,
-            edges: edges.iter().map(|(a, b)| (a.to_string(), b.to_string())).collect(),
+            edges,
         }
     }
 
     /// A library with a wired verified function and a public verified twin
     /// of an unverified one, and a binary whose main calls only the wired
-    /// and unverified ones.
+    /// and unverified ones. The wired function's contract uses one spec;
+    /// the twin's uses another.
     pub fn lib_and_bin() -> Vec<Report> {
         let lib = report(
             "lib",
@@ -242,15 +323,21 @@ pub mod fixture {
                 node("lib::verified::inc", true, true),
                 node("lib::inc", false, true),
                 node("lib::helper", true, false),
+                spec("lib::spec_wired"),
+                spec("lib::verified::spec_inc"),
             ],
-            &[("lib::wired", "lib::helper")],
+            vec![
+                call("lib::wired", "lib::helper"),
+                contract("lib::wired", "lib::spec_wired"),
+                contract("lib::verified::inc", "lib::verified::spec_inc"),
+            ],
         );
         let bin = report(
             "app",
             "bin",
             Some("app(bin)::main"),
             vec![node("app(bin)::main", false, false)],
-            &[("app(bin)::main", "lib::wired"), ("app(bin)::main", "lib::inc")],
+            vec![call("app(bin)::main", "lib::wired"), call("app(bin)::main", "lib::inc")],
         );
         vec![lib, bin]
     }
@@ -269,6 +356,41 @@ mod tests {
         assert!(graph.reachable.contains("lib::helper"));
         assert!(!graph.reachable.contains("lib::verified::inc"));
         assert_eq!(graph.coverage(), (2, 3));
+        assert!(graph.used.contains("lib::spec_wired"));
+        assert!(!graph.used.contains("lib::verified::spec_inc"));
+        assert_eq!(graph.spec_coverage(), (1, 2));
+    }
+
+    #[test]
+    fn ghost_context_uses_but_does_not_run() {
+        // main's contract names a spec, which is defined in terms of an exec
+        // function (`when_used_as_spec`) and a lemma's ensures
+        let lib = report(
+            "lib",
+            "bin",
+            Some("lib(bin)::main"),
+            vec![
+                node("lib(bin)::main", true, false),
+                node("lib(bin)::exec_len", true, false),
+                spec("lib(bin)::spec_len"),
+                spec("lib(bin)::by_lemma"),
+                spec("lib(bin)::dead"),
+            ],
+            vec![
+                contract("lib(bin)::main", "lib(bin)::exec_len"),
+                contract("lib(bin)::exec_len", "lib(bin)::spec_len"),
+                Edge::new("lib(bin)::main", "lib(bin)::lemma", EdgeKind::Proof),
+                contract("lib(bin)::lemma", "lib(bin)::by_lemma"),
+                call("lib(bin)::dead", "lib(bin)::spec_len"),
+            ],
+        );
+        let graph = Graph::new(&[lib], &Roots::default()).unwrap();
+        assert!(!graph.reachable.contains("lib(bin)::exec_len"));
+        assert!(!graph.is_reachable(&graph.nodes["lib(bin)::exec_len"]));
+        assert!(graph.is_reachable(&graph.nodes["lib(bin)::spec_len"]));
+        assert!(graph.is_reachable(&graph.nodes["lib(bin)::by_lemma"]));
+        assert!(!graph.is_reachable(&graph.nodes["lib(bin)::dead"]));
+        assert_eq!(graph.spec_coverage(), (2, 3));
     }
 
     #[test]
@@ -297,7 +419,7 @@ mod tests {
         let mut method = node("lib::verified::impl&%0::fmt", true, true);
         method.def_path = "core::fmt::Display::fmt".into();
         method.module = "lib::verified".into();
-        let lib = report("lib", "lib", None, vec![method], &[]);
+        let lib = report("lib", "lib", None, vec![method], vec![]);
         let roots =
             Roots { add: vec![], exclude: vec![glob::Pattern::new("lib::verified::*").unwrap()] };
         assert!(Graph::new(&[lib], &roots).unwrap().roots.is_empty());
@@ -317,14 +439,14 @@ mod tests {
             "lib",
             None,
             vec![node("lib::impl&%0::fmt", true, false)],
-            &[("core::fmt::Display::fmt", "lib::impl&%0::fmt")],
+            vec![call("core::fmt::Display::fmt", "lib::impl&%0::fmt")],
         );
         let bin = report(
             "app",
             "bin",
             Some("app(bin)::main"),
             vec![node("app(bin)::main", false, false)],
-            &[("app(bin)::main", "core::fmt::Display::fmt")],
+            vec![call("app(bin)::main", "core::fmt::Display::fmt")],
         );
         let graph = Graph::new(&[lib, bin], &Roots::default()).unwrap();
         assert!(graph.reachable.contains("lib::impl&%0::fmt"));

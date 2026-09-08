@@ -82,22 +82,43 @@ fn summary(reports: &[Report], graph: &Graph) -> String {
     )
     .unwrap();
     writeln!(out, "(LoC counts every line of the function, including proof blocks)").unwrap();
+    let specs: Vec<&Node> = graph.nodes.values().filter(|n| n.is_spec()).collect();
+    let used = specs.iter().filter(|n| graph.is_reachable(n)).count();
+    writeln!(
+        out,
+        "spec functions:          {:>6}   used:      {:>6}  ({}%)",
+        specs.len(),
+        used,
+        pct(used, specs.len())
+    )
+    .unwrap();
+    writeln!(out, "(a spec is used when a contract or proof of reachable code mentions it)")
+        .unwrap();
 
-    // (reachable fns, fns, reachable loc, loc) per module
-    let mut modules: BTreeMap<&str, (usize, usize, usize, usize)> = BTreeMap::new();
+    // (reachable fns, fns, reachable loc, loc, used specs, specs) per module
+    let mut modules: BTreeMap<&str, [usize; 6]> = BTreeMap::new();
     for f in &fns {
         let m = modules.entry(&f.module).or_default();
-        m.1 += 1;
-        m.3 += loc(f);
+        m[1] += 1;
+        m[3] += loc(f);
         if graph.is_reachable(f) {
-            m.0 += 1;
-            m.2 += loc(f);
+            m[0] += 1;
+            m[2] += loc(f);
         }
+    }
+    for f in &specs {
+        let m = modules.entry(&f.module).or_default();
+        m[5] += 1;
+        m[4] += graph.is_reachable(f) as usize;
     }
     writeln!(out, "\nby module:").unwrap();
     let width = modules.keys().map(|m| m.len()).max().unwrap_or(0);
-    for (module, (rf, tf, rl, tl)) in &modules {
-        writeln!(out, "  {module:width$}  {rf:>4}/{tf:<4} fns  {rl:>6}/{tl:<6} LoC").unwrap();
+    for (module, [rf, tf, rl, tl, us, ts]) in &modules {
+        writeln!(
+            out,
+            "  {module:width$}  {rf:>4}/{tf:<4} fns  {rl:>6}/{tl:<6} LoC  {us:>4}/{ts:<4} specs"
+        )
+        .unwrap();
     }
 
     let unreachable: Vec<&Node> = fns.iter().copied().filter(|n| !graph.is_reachable(n)).collect();
@@ -117,6 +138,14 @@ fn summary(reports: &[Report], graph: &Graph) -> String {
             .map(|(_, g)| format!("   (same name reachable: {})", g.def_path))
             .unwrap_or_default();
         writeln!(out, "  {}:{}   {}{}", f.span.file, f.span.start_line, f.name(), twin).unwrap();
+    }
+
+    let unused: Vec<&Node> = specs.iter().copied().filter(|n| !graph.is_reachable(n)).collect();
+    if !unused.is_empty() {
+        writeln!(out, "\nunused spec functions:").unwrap();
+    }
+    for f in unused {
+        writeln!(out, "  {}:{}   {}", f.span.file, f.span.start_line, f.name()).unwrap();
     }
     out
 }
@@ -197,8 +226,25 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("  x.rs:1   inc   (same name reachable: lib::inc)"), "{text}");
-        assert!(text.contains("  lib               2/2    fns       6/6      LoC"), "{text}");
-        assert!(text.contains("  lib::verified     0/1    fns       0/3      LoC"), "{text}");
+        assert!(
+            text.contains("  lib               2/2    fns       6/6      LoC     1/1    specs"),
+            "{text}"
+        );
+        assert!(
+            text.contains("  lib::verified     0/1    fns       0/3      LoC     0/1    specs"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn summary_lists_unused_specs() {
+        let (reports, graph) = graph();
+        let text = summary(&reports, &graph);
+        assert!(
+            text.contains("spec functions:               2   used:           1  (50%)"),
+            "{text}"
+        );
+        assert!(text.contains("unused spec functions:\n  x.rs:1   spec_inc\n"), "{text}");
     }
 
     #[test]
@@ -211,6 +257,11 @@ mod tests {
         assert!(text.contains("FNDA:0,lib::verified::inc\n"), "{text}");
         assert!(text.contains("FNF:3\nFNH:2\n"), "{text}");
         assert!(!text.contains("app(bin)::main"), "{text}");
+        assert!(!text.contains("spec_wired"), "{text}");
+
+        let all = lcov(&graph, false);
+        assert!(all.contains("FNDA:1,lib::spec_wired\n"), "{all}");
+        assert!(all.contains("FNDA:0,lib::verified::spec_inc\n"), "{all}");
     }
 
     #[test]

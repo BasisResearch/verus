@@ -2,12 +2,13 @@
 //!
 //! Walks the typed HIR of every body in the crate and writes a report with
 //! the crate's functions, labeled from VIR (mode, verified, external_body,
-//! proxy), and the call edges out of every body. The reports of all crates
-//! are merged and searched by `tools/verus-reach`.
+//! proxy), and the edges out of every body, each labeled with the context
+//! of the reference: compiled code, a contract, or a proof. The reports of
+//! all crates are merged and searched by `tools/verus-reach`.
 
 use crate::attributes::get_ghost_block_opt;
 use crate::context::Context;
-use crate::verus_items::VerusItem;
+use crate::verus_items::{SpecItem, VerusItem};
 use rustc_hir::def::{DefKind, Res};
 use rustc_hir::def_id::{DefId, LOCAL_CRATE, LocalDefId};
 use rustc_hir::intravisit::{self, Visitor};
@@ -15,16 +16,19 @@ use rustc_hir::{BodyId, Expr, ExprKind};
 use rustc_middle::ty::{TyCtxt, TypeckResults};
 use rustc_session::config::CrateType;
 use std::collections::{BTreeSet, HashMap};
-use verus_reach::{Node, Report, SCHEMA_VERSION, Span};
-use vir::ast::{Function, Krate, Mode, Path};
+use verus_reach::{Edge, EdgeKind, Node, Report, SCHEMA_VERSION, Span};
+use vir::ast::{Dt, Function, Krate, Mode, Path, TypX};
 
 /// Collects the definitions used by one body: the functions, constructors,
 /// and consts it names, the methods it calls, and the local types its
-/// expressions have. Closures and consts nested in the body are included.
+/// expressions have, each with the context it appears in. Closures and
+/// consts nested in the body are included.
 struct Callees<'a, 'tcx> {
     ctxt: &'a Context<'tcx>,
     typeck: &'tcx TypeckResults<'tcx>,
-    targets: Vec<DefId>,
+    /// The context of the expression being visited
+    kind: EdgeKind,
+    targets: Vec<(DefId, EdgeKind)>,
 }
 
 impl<'a, 'tcx> Visitor<'tcx> for Callees<'a, 'tcx> {
@@ -36,55 +40,67 @@ impl<'a, 'tcx> Visitor<'tcx> for Callees<'a, 'tcx> {
     }
 
     fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {
-        if self.is_ghost(expr) {
-            return;
+        // Ghost code nested in compiled code changes the context; ghost
+        // code nested in ghost code keeps the outer one
+        let outer = self.kind;
+        if let (EdgeKind::Call, Some(kind)) = (outer, self.ghost_kind(expr)) {
+            self.kind = kind;
         }
         if let ExprKind::Path(qpath) = &expr.kind {
             if let Res::Def(_, def_id) = self.typeck.qpath_res(qpath, expr.hir_id) {
-                self.targets.push(def_id);
+                self.targets.push((def_id, self.kind));
             }
         }
         // Method calls and overloaded operators
         if let Some(def_id) = self.typeck.type_dependent_def_id(expr.hir_id) {
-            self.targets.push(def_id);
+            self.targets.push((def_id, self.kind));
         }
         // A type with an expression of that type counts as used (see `dispatch_edges`)
         if let Some(adt) = self.typeck.expr_ty_opt(expr).and_then(|ty| ty.peel_refs().ty_adt_def())
         {
             if adt.did().is_local() {
-                self.targets.push(adt.did());
+                self.targets.push((adt.did(), self.kind));
             }
         }
         intravisit::walk_expr(self, expr);
+        self.kind = outer;
     }
 }
 
 impl<'a, 'tcx> Callees<'a, 'tcx> {
-    /// Spec clauses (`requires`, `ensures`, ...), assertions, and ghost
-    /// blocks. Skipped so that a `when_used_as_spec` exec function mentioned
-    /// there does not count as called.
-    fn is_ghost(&self, expr: &Expr<'tcx>) -> bool {
+    /// The context an expression opens, if it is ghost code: a spec clause
+    /// (`requires`, `ensures`, ...), an assertion, or a ghost block. What is
+    /// mentioned there is used by the spec, not called; in particular a
+    /// `when_used_as_spec` exec function mentioned there does not run.
+    fn ghost_kind(&self, expr: &Expr<'tcx>) -> Option<EdgeKind> {
         match &expr.kind {
             ExprKind::Call(Expr { kind: ExprKind::Path(qpath), hir_id, .. }, _) => {
-                match self.typeck.qpath_res(qpath, *hir_id) {
-                    Res::Def(_, def_id) => matches!(
-                        self.ctxt.verus_items.id_to_name.get(&def_id),
-                        Some(VerusItem::Spec(_) | VerusItem::Assert(_))
-                    ),
-                    _ => false,
+                let Res::Def(_, def_id) = self.typeck.qpath_res(qpath, *hir_id) else {
+                    return None;
+                };
+                match self.ctxt.verus_items.id_to_name.get(&def_id) {
+                    Some(VerusItem::Spec(
+                        SpecItem::Requires
+                        | SpecItem::Ensures
+                        | SpecItem::Recommends
+                        | SpecItem::Returns,
+                    )) => Some(EdgeKind::Contract),
+                    Some(VerusItem::Spec(_) | VerusItem::Assert(_)) => Some(EdgeKind::Proof),
+                    _ => None,
                 }
             }
             ExprKind::Block(..) => {
-                get_ghost_block_opt(self.ctxt.tcx.hir_attrs(expr.hir_id)).is_some()
+                get_ghost_block_opt(self.ctxt.tcx.hir_attrs(expr.hir_id)).map(|_| EdgeKind::Proof)
             }
-            _ => false,
+            _ => None,
         }
     }
 }
 
-fn callees<'tcx>(ctxt: &Context<'tcx>, def_id: LocalDefId) -> Vec<DefId> {
+fn callees<'tcx>(ctxt: &Context<'tcx>, def_id: LocalDefId) -> Vec<(DefId, EdgeKind)> {
     let tcx = ctxt.tcx;
-    let mut visitor = Callees { ctxt, typeck: tcx.typeck(def_id), targets: vec![] };
+    let mut visitor =
+        Callees { ctxt, typeck: tcx.typeck(def_id), kind: EdgeKind::Call, targets: vec![] };
     visitor.visit_body(tcx.hir_body_owned_by(def_id));
     visitor.targets
 }
@@ -142,8 +158,23 @@ fn has_own_body<'tcx>(tcx: TyCtxt<'tcx>, def_id: LocalDefId) -> bool {
 /// A function written by the user. Macro-generated functions still get
 /// edges, so what they call counts, but they are not reported themselves.
 fn is_user_fn<'tcx>(tcx: TyCtxt<'tcx>, def_id: LocalDefId) -> bool {
-    matches!(tcx.def_kind(def_id), DefKind::Fn | DefKind::AssocFn)
-        && !tcx.source_span(def_id).from_expansion()
+    if !matches!(tcx.def_kind(def_id), DefKind::Fn | DefKind::AssocFn) {
+        return false;
+    }
+    let span = tcx.source_span(def_id);
+    // The `verus!` macro synthesizes spec accessors for every enum field
+    // (`arrow_Variant_field`) with the enum's own span, so they are not
+    // from an expansion; but their span is then also the span of the impl
+    // that holds them, which a written function's never is.
+    let synthesized = tcx.def_kind(tcx.local_parent(def_id)) == DefKind::Impl { of_trait: false }
+        && tcx.source_span(tcx.local_parent(def_id)) == span;
+    !span.from_expansion() && !synthesized
+}
+
+/// A `verus_builtin` item: spec syntax (`requires`, `assert`, `spec_lt`,
+/// ...), not a function anything can reach.
+fn is_builtin<'tcx>(ctxt: &Context<'tcx>, def_id: DefId) -> bool {
+    matches!(ctxt.verus_items.id_to_name.get(&def_id), Some(item) if !matches!(item, VerusItem::Vstd(..)))
 }
 
 fn vir_path<'tcx>(ctxt: &Context<'tcx>, def_id: DefId) -> Option<Path> {
@@ -168,13 +199,16 @@ fn crate_type<'tcx>(tcx: TyCtxt<'tcx>) -> &'static str {
 /// items of an executable are tagged with its crate type, since a package's
 /// binary shares its name with the library.
 fn id_of<'tcx>(ctxt: &Context<'tcx>, def_id: DefId) -> Option<String> {
-    let path = vir_path(ctxt, def_id)?;
+    Some(id_of_path(ctxt, &vir_path(ctxt, def_id)?, def_id.is_local()))
+}
+
+fn id_of_path<'tcx>(ctxt: &Context<'tcx>, path: &Path, local: bool) -> String {
     let mut krate = vir::def::krate_to_string_ignore_stable_id(&path.krate);
-    if def_id.is_local() && crate_type(ctxt.tcx) != "lib" {
+    if local && crate_type(ctxt.tcx) != "lib" {
         krate = format!("{krate}({})", crate_type(ctxt.tcx));
     }
     let segments: Vec<&str> = path.segments.iter().map(|s| s.as_str()).collect();
-    Some(format!("{krate}::{}", segments.join("::")))
+    format!("{krate}::{}", segments.join("::"))
 }
 
 fn span<'tcx>(tcx: TyCtxt<'tcx>, def_id: LocalDefId) -> Span {
@@ -205,6 +239,27 @@ impl<'a> Labels<'a> {
                 .filter_map(|f| f.x.proxy.as_ref().map(|p| (&p.x, f)))
                 .collect(),
         }
+    }
+
+    /// Spec functions that stand for other items in ghost code, which the
+    /// HIR never names: the spec an exec function is read as when
+    /// `when_used_as_spec` says so, and the type invariant of a datatype.
+    fn implied_edges<'tcx>(&self, ctxt: &Context<'tcx>, krate: &Krate) -> Vec<Edge> {
+        let mut edges = vec![];
+        for f in krate.functions.iter() {
+            let id = id_of_path(ctxt, &f.x.name.path, true);
+            if let Some(spec) = &f.x.attrs.autospec {
+                let local = self.by_name.contains_key(&spec.path);
+                edges.push(Edge::new(id, id_of_path(ctxt, &spec.path, local), EdgeKind::Contract));
+            } else if f.x.attrs.is_type_invariant_fn {
+                let typ = f.x.params.first().map(|p| vir::ast_util::undecorate_typ(&p.x.typ));
+                if let Some(TypX::Datatype(Dt::Path(path), ..)) = typ.as_deref() {
+                    let local = krate.datatypes.iter().any(|d| d.x.name == Dt::Path(path.clone()));
+                    edges.push(Edge::new(id_of_path(ctxt, path, local), id, EdgeKind::Contract));
+                }
+            }
+        }
+        edges
     }
 }
 
@@ -241,16 +296,19 @@ pub(crate) fn run<'tcx>(ctxt: &Context<'tcx>, krate: &Krate) -> Result<(), Strin
     let entry = tcx.entry_fn(()).and_then(|(def_id, _)| def_id.as_local());
 
     let mut nodes = vec![];
-    let mut edges: BTreeSet<(String, String)> = BTreeSet::new();
+    let mut edges: BTreeSet<Edge> = BTreeSet::new();
     for def_id in tcx.hir_body_owners() {
         if !has_own_body(tcx, def_id) {
             continue;
         }
         let Some(id) = id_of(ctxt, def_id.to_def_id()) else { continue };
-        for target in callees(ctxt, def_id) {
-            edges.extend(id_of(ctxt, target).map(|t| (id.clone(), t)));
+        for (target, kind) in callees(ctxt, def_id) {
+            if is_builtin(ctxt, target) {
+                continue;
+            }
+            edges.extend(id_of(ctxt, target).map(|t| Edge::new(id.clone(), t, kind)));
             if let Some(adt) = impl_self_type(tcx, target) {
-                edges.extend(id_of(ctxt, adt.to_def_id()).map(|t| (id.clone(), t)));
+                edges.extend(id_of(ctxt, adt.to_def_id()).map(|t| Edge::new(id.clone(), t, kind)));
             }
         }
         if is_user_fn(tcx, def_id) || entry == Some(def_id) {
@@ -259,9 +317,10 @@ pub(crate) fn run<'tcx>(ctxt: &Context<'tcx>, krate: &Krate) -> Result<(), Strin
     }
     for (from, to) in dispatch_edges(tcx) {
         if let (Some(from), Some(to)) = (id_of(ctxt, from), id_of(ctxt, to.to_def_id())) {
-            edges.insert((from, to));
+            edges.insert(Edge::new(from, to, EdgeKind::Call));
         }
     }
+    edges.extend(labels.implied_edges(ctxt, krate));
     nodes.sort_by(|a, b| a.id.cmp(&b.id));
 
     let report = Report {

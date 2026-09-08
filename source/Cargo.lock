@@ -3271,7 +3271,6 @@ dependencies = [
  "clap",
  "glob",
  "lcov",
- "petgraph 0.6.5",
  "serde",
  "serde_json",
 ]
