@@ -42,7 +42,16 @@ fn label_asserts<'ctx>(
             _ => expr.clone(),
         },
         ExprX::LabeledAssertion(assert_id, error, filter, expr) => {
-            let label = Arc::new(PREFIX_LABEL.to_string() + &infos.len().to_string());
+            // %%location_label%%N, and under cvc5 %%location_label%%N_aid_<id>:
+            // the goal's provenance rides on the atom that is already on the
+            // wire. Everything downstream matches the label by this string.
+            let mut label_name = PREFIX_LABEL.to_string() + &infos.len().to_string();
+            if context.emit_assert_ids {
+                if let Some(id) = assert_id {
+                    label_name = label_name + "_" + &crate::def::assert_id_to_symbol(id);
+                }
+            }
+            let label = Arc::new(label_name);
             let decl = Arc::new(DeclX::Const(label.clone(), Arc::new(TypX::Bool)));
             let assertion_info = AssertionInfo {
                 assert_id: assert_id.clone(),

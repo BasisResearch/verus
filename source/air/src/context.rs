@@ -115,6 +115,9 @@ pub struct Context {
     pub(crate) usage_info_enabled: bool,
     pub(crate) check_valid_used: bool,
     pub(crate) solver: SmtSolver,
+    /// Put provenance ids on the wire: goal labels carry their AssertId.
+    /// On by default under cvc5, which reads them back; z3 would only warn.
+    pub(crate) emit_assert_ids: bool,
 }
 
 impl Context {
@@ -181,6 +184,7 @@ impl Context {
             single_check_query: false,
             usage_info_enabled: false,
             check_valid_used: false,
+            emit_assert_ids: matches!(solver, SmtSolver::Cvc5),
             solver,
         };
         context.axiom_infos.push_scope(false);
@@ -252,6 +256,12 @@ impl Context {
 
     pub fn set_expected_solver_version(&mut self, version: String) {
         self.expected_solver_version = Some(version);
+    }
+
+    /// Whether goal labels (and, later, other top-level assertions) carry
+    /// their provenance ids on the wire. Defaults to the solver being cvc5.
+    pub fn set_emit_assert_ids(&mut self, enabled: bool) {
+        self.emit_assert_ids = enabled;
     }
 
     pub fn set_profile_with_logfile_name(&mut self, file_name: String) {
