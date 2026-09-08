@@ -2341,3 +2341,42 @@ fn assert_id_roundtrip() {
     let printed = printer.query_to_node(&query);
     assert_eq!(printed, node);
 }
+
+/// The extra lines provenance mode adds to a check-sat batch: instantiation
+/// dump forms and the tags-only sources reply, in the order cvc5 prints them.
+#[test]
+fn provenance_reply_parses() {
+    let lines: Vec<String> = [
+        "(instantiations prelude_unbox_box_int",
+        "  ( 2 )",
+        "  ( x! )",
+        ")",
+        "(instantiations user_fixture__check_4",
+        "  ( (I 2) )",
+        ")",
+        "((ax_fixture!ax_f_nonneg.) (hyp_1) (hyp_3) (query hyp_2 hyp_0) (query))",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    let info = crate::smt_verify::parse_provenance_lines(&lines);
+    assert_eq!(
+        info.instantiations,
+        vec![
+            ("prelude_unbox_box_int".to_string(), vec!["(2)".to_string(), "(x!)".to_string()]),
+            ("user_fixture__check_4".to_string(), vec!["((I 2))".to_string()]),
+        ]
+    );
+    assert_eq!(info.sources.len(), 5);
+    assert_eq!(info.sources[3], vec!["query", "hyp_2", "hyp_0"]);
+    assert!(info.unparsed.is_empty());
+    // no instantiations: cvc5 prints `none`; an empty reply is empty
+    let info =
+        crate::smt_verify::parse_provenance_lines(&vec!["none".to_string(), "()".to_string()]);
+    assert!(info.instantiations.is_empty() && info.sources.is_empty() && info.unparsed.is_empty());
+    let info = crate::smt_verify::parse_provenance_lines(&vec![]);
+    assert!(info.instantiations.is_empty() && info.sources.is_empty());
+    // something unforeseen is kept, not failed on
+    let info = crate::smt_verify::parse_provenance_lines(&vec!["(surprise 1 2)".to_string()]);
+    assert_eq!(info.unparsed, vec!["(surprise 1 2)".to_string()]);
+}

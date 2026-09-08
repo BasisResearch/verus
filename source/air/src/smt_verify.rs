@@ -273,6 +273,11 @@ pub(crate) fn smt_check_assertion<'ctx>(
     }
 
     context.smt_log.log_word("check-sat");
+    if context.provenance {
+        // in the same batch: the tag lists arrive after the result and the
+        // instantiation dump, before the sentinel
+        context.smt_log.log_get_assertion_sources();
+    }
 
     // Run SMT solver
     let smt_run_start_time = std::time::Instant::now();
@@ -302,6 +307,7 @@ pub(crate) fn smt_check_assertion<'ctx>(
 
     // Process SMT results
     let mut unsat = None;
+    let mut provenance_lines: Vec<String> = Vec::new();
     for line in smt_output {
         if line == "unsat" {
             assert!(unsat == None);
@@ -312,6 +318,10 @@ pub(crate) fn smt_check_assertion<'ctx>(
         } else if line == "unknown" || line == "cvc5 interrupted by timeout." {
             assert!(unsat == None);
             unsat = Some(SmtOutput::Unknown);
+        } else if context.provenance {
+            // the instantiation dump and the sources reply; parsed below, never
+            // an UnexpectedOutput
+            provenance_lines.push(line);
         } else if context.ignore_unexpected_smt {
             diagnostics.report(&context.message_interface.bare(
                 crate::messages::MessageLevel::Warning,
@@ -330,6 +340,10 @@ pub(crate) fn smt_check_assertion<'ctx>(
         SmtSolver::Cvc5 => {
             context.smt_log.log_set_option("reproducible-resource-limit", "0");
         }
+    }
+
+    if context.provenance {
+        context.last_provenance = Some(parse_provenance_lines(&provenance_lines));
     }
 
     let unsat = unsat.expect("expected sat/unsat/unknown from SMT solver");
@@ -433,6 +447,62 @@ pub(crate) fn smt_check_assertion<'ctx>(
             }
         }
     }
+}
+
+/// Parse what provenance mode adds to a `check-sat` batch's output: the
+/// `--dump-instantiations` forms (`(instantiations <qid> (<terms>)...)`,
+/// `(skolem ...)`, or `none`) and the `(get-assertion-sources :tags-only)`
+/// reply (`((<tags>) ...)`). Anything else is kept verbatim in `unparsed`.
+pub(crate) fn parse_provenance_lines(lines: &Vec<String>) -> crate::context::ProvenanceInfo {
+    use sise::TreeNode as Node;
+    let mut info = crate::context::ProvenanceInfo::default();
+    if lines.is_empty() {
+        return info;
+    }
+    let text = format!("({})", lines.join("\n"));
+    let mut parser = sise::Parser::new(text.as_str());
+    let forms = match sise::parse_tree(&mut parser) {
+        Ok(Node::List(forms)) => forms,
+        _ => {
+            info.unparsed = lines.clone();
+            return info;
+        }
+    };
+    for form in forms {
+        match &form {
+            Node::Atom(a) if a == "none" => {}
+            Node::List(items) => match items.first() {
+                Some(Node::Atom(head)) if head == "instantiations" => {
+                    let qid = match items.get(1) {
+                        Some(Node::Atom(q)) => q.clone(),
+                        _ => {
+                            info.unparsed.push(crate::printer::node_to_string(&form));
+                            continue;
+                        }
+                    };
+                    let vectors = items[2..]
+                        .iter()
+                        .map(|v| crate::printer::node_to_string(v))
+                        .collect::<Vec<String>>();
+                    info.instantiations.push((qid, vectors));
+                }
+                Some(Node::Atom(head)) if head == "skolem" => {}
+                Some(Node::List(_)) | None if items.iter().all(|i| matches!(i, Node::List(_))) => {
+                    // the tags-only reply: a list of tag lists
+                    for tags in items.iter() {
+                        if let Node::List(tags) = tags {
+                            info.sources.push(
+                                tags.iter().map(|t| crate::printer::node_to_string(t)).collect(),
+                            );
+                        }
+                    }
+                }
+                _ => info.unparsed.push(crate::printer::node_to_string(&form)),
+            },
+            Node::Atom(_) => info.unparsed.push(crate::printer::node_to_string(&form)),
+        }
+    }
+    info
 }
 
 pub(crate) fn smt_get_rlimit_count(context: &mut Context) -> Result<u64, ValidityResult> {

@@ -47,7 +47,7 @@ const DONE_QUOTED: &str = "\"<<DONE>>\"";
 /// record the source walk reads (theory and SAT proofs stay off; it still
 /// costs resource units during search, which is why the budget is doubled
 /// and the mode is opt-in).
-pub const PROVENANCE_ARGS: &[&str] = &["--proof-mode=pp-only"];
+pub const PROVENANCE_ARGS: &[&str] = &["--proof-mode=pp-only", "--dump-instantiations"];
 
 /// A separate thread writes data to the SMT solver over a pipe.
 /// (Rust's documentation says you need a separate thread; otherwise, it lets the pipes deadlock.)

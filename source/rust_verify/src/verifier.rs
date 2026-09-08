@@ -325,6 +325,9 @@ pub struct Verifier {
 
     /// Details about each function
     pub func_details: HashMap<Fun, FuncDetails>,
+    /// Under `-V provenance`: what cvc5 reported for each query of each
+    /// function, raw (tag symbols and qids), in check order
+    pub func_provenance: HashMap<Fun, Vec<QueryProvenance>>,
     /// Errors to report after verification has run
     deferred_errors: Vec<VirErr>,
 
@@ -351,6 +354,23 @@ pub struct Verifier {
     expand_flag: bool,
 
     error_format: Option<ErrorOutputType>,
+}
+
+/// One `check-sat` under `-V provenance`, as cvc5 reported it. `sources` are
+/// the tag lists of `(get-assertion-sources :tags-only)`, `instantiations`
+/// the `:qid`s the solver instantiated with their vectors. Symbols, not yet
+/// joined to source.
+#[derive(serde::Serialize, Clone, Debug)]
+pub struct QueryProvenance {
+    pub desc: String,
+    pub span: String,
+    /// 0 for the first check of the query, then one per multi-error round
+    pub round: usize,
+    /// "valid", "invalid", "canceled", or the solver's unexpected output
+    pub result: String,
+    pub sources: Vec<Vec<String>>,
+    pub instantiations: Vec<(String, Vec<String>)>,
+    pub unparsed: Vec<String>,
 }
 
 #[derive(serde::Serialize)]
@@ -520,6 +540,7 @@ impl Verifier {
             func_times: HashMap::new(),
 
             func_details: HashMap::new(),
+            func_provenance: HashMap::new(),
             deferred_errors: Vec::new(),
 
             dep_tracker: if via_cargo_args.is_some() { Some(dep_tracker) } else { None },
@@ -569,6 +590,7 @@ impl Verifier {
             func_times: HashMap::new(),
 
             func_details: HashMap::new(),
+            func_provenance: HashMap::new(),
             deferred_errors: Vec::new(),
 
             via_cargo_args: self.via_cargo_args.clone(),
@@ -602,6 +624,9 @@ impl Verifier {
         self.bucket_stats.extend(other.bucket_stats);
         self.func_times.extend(other.func_times);
         self.func_details.absorb_with(other.func_details, |lhs, rhs| lhs.absorb(rhs));
+        for (fun, queries) in other.func_provenance {
+            self.func_provenance.entry(fun).or_default().extend(queries);
+        }
         self.deferred_errors.extend(other.deferred_errors);
     }
 
@@ -844,7 +869,29 @@ impl Verifier {
         let mut invalidity = false;
         let mut timed_out = false;
         let mut used_axioms = None;
+        let mut provenance_round = 0usize;
         loop {
+            if let Some(info) = air_context.take_provenance() {
+                let result_str = match &result {
+                    ValidityResult::Valid(_) => "valid".to_string(),
+                    ValidityResult::Invalid(..) => "invalid".to_string(),
+                    ValidityResult::Canceled => "canceled".to_string(),
+                    ValidityResult::TypeError(e) => format!("type error: {}", e),
+                    ValidityResult::UnexpectedOutput(s) => format!("unexpected output: {}", s),
+                };
+                self.func_provenance.entry(context.fun.clone()).or_default().push(
+                    QueryProvenance {
+                        desc: context.desc.clone(),
+                        span: context.span.as_string.clone(),
+                        round: provenance_round,
+                        result: result_str,
+                        sources: info.sources,
+                        instantiations: info.instantiations,
+                        unparsed: info.unparsed,
+                    },
+                );
+                provenance_round += 1;
+            }
             match result {
                 ValidityResult::Valid(usage_info) => {
                     if (is_check_valid && is_first_check && level == Some(MessageLevel::Error))
@@ -2554,6 +2601,25 @@ impl Verifier {
                     span.unwrap_or("-".to_string())
                 )
                 .expect("error writing to qids log file");
+            }
+            if self.args.provenance {
+                let mut file = self.create_log_file(None, crate::config::PROVENANCE_FILE_SUFFIX)?;
+                let mut by_fun: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
+                let mut funs: Vec<&Fun> = self.func_provenance.keys().collect();
+                funs.sort();
+                for fun in funs {
+                    by_fun.insert(
+                        fun_as_friendly_rust_name(fun),
+                        serde_json::to_value(&self.func_provenance[fun]).expect("provenance json"),
+                    );
+                }
+                writeln!(
+                    file,
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::Value::Object(by_fun))
+                        .expect("provenance json")
+                )
+                .expect("error writing to provenance log file");
             }
             let mut file = self.create_log_file(None, crate::config::HYPS_FILE_SUFFIX)?;
             let hyp_map = global_ctx.hyp_map.borrow();

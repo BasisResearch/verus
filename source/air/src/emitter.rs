@@ -103,6 +103,14 @@ impl Emitter {
         }
     }
 
+    /// `(get-assertion-sources :tags-only)`: cvc5 replies with one tag list per
+    /// preprocessed assertion (provenance mode only).
+    pub fn log_get_assertion_sources(&mut self) {
+        if !self.is_none() {
+            self.log_node(&node!((get-assertion-sources {Node::Atom(":tags-only".to_string())})));
+        }
+    }
+
     pub fn log_get_info(&mut self, param: &str) {
         if !self.is_none() {
             self.log_node(&node!(

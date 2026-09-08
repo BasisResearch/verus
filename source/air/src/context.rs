@@ -42,6 +42,21 @@ pub enum UsageInfo {
     UsedAxioms(Vec<Ident>),
 }
 
+/// What cvc5 reported about one `check-sat` in provenance mode: the tag
+/// lists of `(get-assertion-sources :tags-only)` and the instantiation dump.
+/// Tags are the symbols from the wire (`hyp_3`, `ax_...`, `query`, `?`);
+/// the join back to source happens in Verus.
+#[derive(Debug, Clone, Default)]
+pub struct ProvenanceInfo {
+    /// One entry per distinct tag list with at least one real tag.
+    pub sources: Vec<Vec<String>>,
+    /// Instantiated quantifiers, by `:qid`, with each instantiation vector
+    /// printed as one string.
+    pub instantiations: Vec<(String, Vec<String>)>,
+    /// Reply lines the parser did not recognise, kept rather than failed on.
+    pub unparsed: Vec<String>,
+}
+
 #[derive(Debug)]
 pub enum ValidityResult {
     Valid(UsageInfo),
@@ -126,6 +141,8 @@ pub struct Context {
     /// each query. Off by default; it perturbs the search, so plain runs stay
     /// the verdict of record.
     pub(crate) provenance: bool,
+    /// The provenance of the last `check-sat`, until the caller takes it.
+    pub(crate) last_provenance: Option<ProvenanceInfo>,
 }
 
 impl Context {
@@ -195,6 +212,7 @@ impl Context {
             emit_assert_ids: matches!(solver, SmtSolver::Cvc5),
             anon_axiom_count: 0,
             provenance: false,
+            last_provenance: None,
             solver,
         };
         context.axiom_infos.push_scope(false);
@@ -273,6 +291,12 @@ impl Context {
     /// their provenance ids on the wire. Defaults to the solver being cvc5.
     pub fn set_emit_assert_ids(&mut self, enabled: bool) {
         self.emit_assert_ids = enabled;
+    }
+
+    /// The provenance cvc5 reported for the most recent `check-sat`, if any;
+    /// each call returns it once.
+    pub fn take_provenance(&mut self) -> Option<ProvenanceInfo> {
+        self.last_provenance.take()
     }
 
     /// Turn provenance mode on (cvc5 only; must precede the first query).
