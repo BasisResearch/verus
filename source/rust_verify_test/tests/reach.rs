@@ -6,11 +6,10 @@ use verus_reach::{Graph, Node, Report, Roots};
 
 /// Runs verus with `--reach` and returns the crate's report.
 fn reach(name: &str, code: String) -> (Result<TestErr, TestErr>, Report) {
-    let dir = std::env::temp_dir().join(format!("verus-reach-{name}"));
-    let _ = std::fs::remove_dir_all(&dir);
-    let reach_opt = format!("--reach {}", dir.display());
+    let dir = tempfile::tempdir().unwrap();
+    let reach_opt = format!("--reach {}", dir.path().display());
     let result = verify_one_file(name, code, &[&reach_opt]);
-    let mut reports = verus_reach::load(&[dir]).unwrap();
+    let mut reports = verus_reach::load(&[dir.path().to_path_buf()]).unwrap();
     assert_eq!(reports.len(), 1);
     (result, reports.remove(0))
 }
@@ -27,12 +26,10 @@ fn has_edge(report: &Report, from: &str, to: &str) -> bool {
     report.edges.iter().any(|(f, t)| f == from && t == to)
 }
 
-fn graph(report: &Report, exclude: &[&str]) -> Graph {
-    let roots = Roots {
-        add: vec![],
-        exclude: exclude.iter().map(|g| glob::Pattern::new(g).unwrap()).collect(),
-    };
-    Graph::new(std::slice::from_ref(report), &roots)
+/// The test crate is a library, so `main` is not an entry point; make it the root.
+fn graph_from_main(report: &Report) -> Graph {
+    let roots = Roots { add: vec!["test_crate::main".into()], exclude: vec![] };
+    Graph::new(std::slice::from_ref(report), &roots).unwrap()
 }
 
 fn twin_code() -> String {
@@ -65,14 +62,17 @@ fn twin() {
     let (result, report) = reach("twin", twin_code());
     result.unwrap();
     assert_eq!(report.krate, "test_crate");
-    assert_eq!(report.main.as_deref(), Some("test_crate::main"));
+    assert_eq!(report.crate_type, "lib");
+    assert_eq!(report.main, None);
     let twin = node(&report, "test_crate::verified::inc");
     assert!(twin.verified);
     assert_eq!(twin.mode, "exec");
+    assert_eq!(twin.module, "test_crate::verified");
+    assert!(twin.span.end_line >= twin.span.start_line + 5, "{:?}", twin.span);
     assert!(!node(&report, "test_crate::inc").verified);
     assert!(has_edge(&report, "test_crate::main", "test_crate::inc"));
 
-    let graph = graph(&report, &[]);
+    let graph = graph_from_main(&report);
     assert_eq!(graph.roots, vec!["test_crate::main"]);
     assert!(!graph.is_reachable(twin));
     assert!(graph.is_reachable(node(&report, "test_crate::inc")));
@@ -98,7 +98,37 @@ fn wired() {
     };
     let (result, report) = reach("wired", code);
     result.unwrap();
-    assert!(graph(&report, &[]).is_reachable(node(&report, "test_crate::verified::inc")));
+    assert!(graph_from_main(&report).is_reachable(node(&report, "test_crate::verified::inc")));
+}
+
+/// A `when_used_as_spec` function mentioned only in ghost code is not called.
+#[test]
+fn ghost_code_does_not_call() {
+    let code = verus_code! {
+        spec fn spec_inc(x: u64) -> u64 {
+            (x + 1) as u64
+        }
+
+        #[verifier::when_used_as_spec(spec_inc)]
+        fn inc(x: u64) -> (r: u64)
+            requires x < 100,
+            ensures r == spec_inc(x),
+        {
+            x + 1
+        }
+
+        fn main()
+            requires inc(1) == 2,
+        {
+            assert(inc(1) == 2);
+            proof {
+                let _ = inc(2);
+            }
+        }
+    };
+    let (result, report) = reach("ghost", code);
+    result.unwrap();
+    assert!(!graph_from_main(&report).is_reachable(node(&report, "test_crate::inc")));
 }
 
 #[test]
@@ -129,7 +159,7 @@ fn trait_dispatch() {
     // The call names the trait method; the impl is reached through the dispatch edge
     assert!(has_edge(&report, "test_crate::run", "test_crate::Step::step"));
     assert!(has_edge(&report, "test_crate::Step::step", "test_crate::impl&%0::step"));
-    assert!(graph(&report, &[]).is_reachable(node(&report, "test_crate::S::step")));
+    assert!(graph_from_main(&report).is_reachable(node(&report, "test_crate::S::step")));
 }
 
 #[test]
@@ -159,7 +189,45 @@ fn trait_impl_called_by_upstream() {
     // Using the type reaches its trait impls, which upstream code may call
     assert!(has_edge(&report, "test_crate::main", "test_crate::S"));
     assert!(has_edge(&report, "test_crate::S", "test_crate::impl&%0::fmt"));
-    assert!(graph(&report, &[]).is_reachable(node(&report, "test_crate::helper")));
+    assert!(graph_from_main(&report).is_reachable(node(&report, "test_crate::helper")));
+}
+
+/// The type is only ever named as `Self`, and only constructed inside a
+/// trait impl reached through dispatch.
+#[test]
+fn type_used_through_self() {
+    let code = verus_code! {
+        struct S {
+            n: u64,
+        }
+
+        fn helper() -> u64 {
+            1
+        }
+
+        #[verifier::external]
+        impl Default for S {
+            fn default() -> Self {
+                Self { n: 0 }
+            }
+        }
+
+        #[verifier::external]
+        impl core::fmt::Display for S {
+            fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+                let _ = helper();
+                write!(f, "{}", self.n)
+            }
+        }
+
+        #[verifier::external]
+        fn main() {
+            let _ = S::default().to_string();
+        }
+    };
+    let (result, report) = reach("type_used_through_self", code);
+    result.unwrap();
+    assert!(graph_from_main(&report).is_reachable(node(&report, "test_crate::helper")));
 }
 
 #[test]
@@ -202,14 +270,17 @@ fn exported_roots() {
     };
     let (result, report) = reach("exported_roots", code);
     result.unwrap();
-    assert_eq!(report.main, None);
     assert!(node(&report, "test_crate::verified::inc").exported);
 
-    let all = graph(&report, &[]);
+    let all = Graph::new(std::slice::from_ref(&report), &Roots::default()).unwrap();
     assert_eq!(all.roots, vec!["test_crate::inc", "test_crate::verified::inc"]);
     assert!(all.is_reachable(node(&report, "test_crate::verified::inc")));
 
-    let excluded = graph(&report, &["test_crate::verified::*"]);
+    let roots = Roots {
+        add: vec![],
+        exclude: vec![glob::Pattern::new("test_crate::verified::*").unwrap()],
+    };
+    let excluded = Graph::new(std::slice::from_ref(&report), &roots).unwrap();
     assert_eq!(excluded.roots, vec!["test_crate::inc"]);
     assert!(!excluded.is_reachable(node(&report, "test_crate::verified::inc")));
 }
@@ -256,17 +327,19 @@ fn lib_and_bin() {
     let reach_arg = reach_dir.path().to_str().unwrap();
     let args = ["verify", "--fwd-verus-args-to", "roots", "--", "--reach", reach_arg];
     let run = run_cargo_verus_with_target(&args, &fixture, target_dir.path());
-    assert!(run.status.success());
+    assert!(run.status.success(), "{}", String::from_utf8_lossy(&run.stderr));
 
     let reports = verus_reach::load(&[reach_dir.path().to_path_buf()]).unwrap();
     let mut names: Vec<String> = reports.iter().map(|r| r.file_name()).collect();
     names.sort();
     assert_eq!(names, vec!["reach_lib_bin.bin.json", "reach_lib_bin.lib.json"]);
 
-    let graph = Graph::new(&reports, &Roots::default());
-    assert_eq!(graph.roots, vec!["reach_lib_bin::main"]);
-    let lib = |name: &str| graph.nodes.values().find(|n| n.def_path == name).unwrap();
-    assert!(graph.is_reachable(lib("reach_lib_bin::double")));
-    assert!(graph.is_reachable(lib("reach_lib_bin::Counter::bump")));
-    assert!(!graph.is_reachable(lib("reach_lib_bin::twin::double")));
+    let graph = Graph::new(&reports, &Roots::default()).unwrap();
+    assert_eq!(graph.roots, vec!["reach_lib_bin(bin)::main"]);
+    let by_id = |id: &str| &graph.nodes[id];
+    assert!(graph.is_reachable(by_id("reach_lib_bin::double")));
+    assert!(graph.is_reachable(by_id("reach_lib_bin::impl&%0::bump")));
+    assert!(graph.is_reachable(by_id("reach_lib_bin(bin)::helper")));
+    assert!(!graph.is_reachable(by_id("reach_lib_bin::helper")));
+    assert!(!graph.is_reachable(by_id("reach_lib_bin::twin::double")));
 }

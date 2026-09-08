@@ -8,12 +8,14 @@
 
 use clap::Parser;
 use std::collections::BTreeMap;
+use std::fmt::Write;
 use std::path::PathBuf;
 use verus_reach::{Graph, Node, Report, Roots};
 
 #[derive(Parser)]
 struct Args {
-    /// Report files or directories of reports
+    /// Report files or directories of reports. Clear a directory when
+    /// crates are renamed or removed; old reports are not overwritten.
     #[arg(required = true)]
     reports: Vec<PathBuf>,
     /// Add a root (def path). Defaults: `main` of every executable crate,
@@ -26,7 +28,7 @@ struct Args {
     /// Exit with an error if fewer than this percentage of verified exec
     /// functions are reachable
     #[arg(long)]
-    fail_under: Option<f64>,
+    fail_under: Option<u64>,
     /// Write an LCOV trace file to stdout instead of the summary
     #[arg(long)]
     lcov: bool,
@@ -43,51 +45,48 @@ fn loc(node: &Node) -> usize {
     node.span.end_line - node.span.start_line + 1
 }
 
-fn module(def_path: &str) -> &str {
-    def_path.rfind("::").map_or("", |i| &def_path[..i])
-}
-
-fn name(def_path: &str) -> &str {
-    def_path.rfind("::").map_or(def_path, |i| &def_path[i + 2..])
-}
-
 /// Number of leading `::` segments two paths share.
 fn shared_prefix(a: &str, b: &str) -> usize {
     a.split("::").zip(b.split("::")).take_while(|(x, y)| x == y).count()
 }
 
-fn summary(reports: &[Report], graph: &Graph) {
+fn summary(reports: &[Report], graph: &Graph) -> String {
+    let mut out = String::new();
     let crates: Vec<String> =
         reports.iter().map(|r| format!("{} ({})", r.krate, r.crate_type)).collect();
-    println!("crates: {}", crates.join(", "));
+    writeln!(out, "crates: {}", crates.join(", ")).unwrap();
     let roots: Vec<&str> = graph.roots.iter().map(|id| graph.nodes[id].def_path.as_str()).collect();
     match roots.len() {
-        0..=3 => println!("roots: {}", roots.join(", ")),
-        n => println!("roots: {n} functions"),
+        0..=3 => writeln!(out, "roots: {}", roots.join(", ")).unwrap(),
+        n => writeln!(out, "roots: {n} functions").unwrap(),
     }
 
     let fns: Vec<&Node> = graph.nodes.values().filter(|n| n.is_verified_exec()).collect();
     let reached: Vec<&Node> = fns.iter().copied().filter(|n| graph.is_reachable(n)).collect();
     let total_loc: usize = fns.iter().map(|n| loc(n)).sum();
     let reached_loc: usize = reached.iter().map(|n| loc(n)).sum();
-    println!(
+    writeln!(
+        out,
         "\nverified exec functions: {:>6}   reachable: {:>6}  ({}%)",
         fns.len(),
         reached.len(),
         pct(reached.len(), fns.len())
-    );
-    println!(
+    )
+    .unwrap();
+    writeln!(
+        out,
         "verified exec LoC:       {:>6}   reachable: {:>6}  ({}%)",
         total_loc,
         reached_loc,
         pct(reached_loc, total_loc)
-    );
-    println!("(LoC counts every line of the function, including proof blocks)");
+    )
+    .unwrap();
+    writeln!(out, "(LoC counts every line of the function, including proof blocks)").unwrap();
 
     // (reachable fns, fns, reachable loc, loc) per module
     let mut modules: BTreeMap<&str, (usize, usize, usize, usize)> = BTreeMap::new();
     for f in &fns {
-        let m = modules.entry(module(&f.def_path)).or_default();
+        let m = modules.entry(&f.module).or_default();
         m.1 += 1;
         m.3 += loc(f);
         if graph.is_reachable(f) {
@@ -95,35 +94,34 @@ fn summary(reports: &[Report], graph: &Graph) {
             m.2 += loc(f);
         }
     }
-    println!("\nby module:");
+    writeln!(out, "\nby module:").unwrap();
     let width = modules.keys().map(|m| m.len()).max().unwrap_or(0);
     for (module, (rf, tf, rl, tl)) in &modules {
-        println!("  {module:width$}  {rf:>4}/{tf:<4} fns  {rl:>6}/{tl:<6} LoC");
+        writeln!(out, "  {module:width$}  {rf:>4}/{tf:<4} fns  {rl:>6}/{tl:<6} LoC").unwrap();
     }
 
     let unreachable: Vec<&Node> = fns.iter().copied().filter(|n| !graph.is_reachable(n)).collect();
-    if unreachable.is_empty() {
-        return;
+    if !unreachable.is_empty() {
+        writeln!(out, "\nunreachable verified exec functions:").unwrap();
     }
-    println!("\nunreachable verified exec functions:");
     for f in unreachable {
-        // A reachable, unverified function with the same name nearby suggests a "verified twin"
+        // A reachable, unverified function with the same name in the same
+        // crate suggests a "verified twin"; the closest one is the best guess
         let twin = graph
             .nodes
             .values()
-            .filter(|g| {
-                graph.is_reachable(g) && !g.verified && name(&g.def_path) == name(&f.def_path)
-            })
+            .filter(|g| graph.is_reachable(g) && !g.is_verified_exec() && g.name() == f.name())
             .map(|g| (shared_prefix(&g.def_path, &f.def_path), g))
-            .filter(|(shared, _)| *shared >= 2)
+            .filter(|(shared, _)| *shared >= 1)
             .max_by_key(|(shared, _)| *shared)
             .map(|(_, g)| format!("   (same name reachable: {})", g.def_path))
             .unwrap_or_default();
-        println!("  {}:{}   {}{}", f.span.file, f.span.start_line, name(&f.def_path), twin);
+        writeln!(out, "  {}:{}   {}{}", f.span.file, f.span.start_line, f.name(), twin).unwrap();
     }
+    out
 }
 
-fn lcov(graph: &Graph, only_verified_exec: bool) {
+fn lcov(graph: &Graph, only_verified_exec: bool) -> String {
     use lcov::report::section::{function, line};
     let mut report = lcov::Report::new();
     for n in graph.nodes.values().filter(|n| !only_verified_exec || n.is_verified_exec()) {
@@ -134,16 +132,24 @@ fn lcov(graph: &Graph, only_verified_exec: bool) {
         };
         let section = report.sections.entry(key).or_default();
         section.functions.insert(
-            function::Key { name: n.def_path.clone() },
+            function::Key { name: n.id.clone() },
             function::Value { start_line: Some(n.span.start_line as u32), count: hits },
         );
         for l in n.span.start_line..=n.span.end_line {
             section.lines.entry(line::Key { line: l as u32 }).or_default().count |= hits;
         }
     }
-    for record in report.into_records() {
-        println!("{record}");
-    }
+    report.into_records().map(|record| format!("{record}\n")).collect()
+}
+
+fn below_threshold(graph: &Graph, threshold: u64) -> Option<String> {
+    let (reached, total) = graph.coverage();
+    let pct = pct(reached, total);
+    (pct < threshold).then(|| {
+        format!(
+            "{reached} of {total} verified exec functions reachable ({pct}%), below --fail-under {threshold}"
+        )
+    })
 }
 
 fn fail(msg: String) -> ! {
@@ -162,21 +168,55 @@ fn main() {
             .map(|g| glob::Pattern::new(g).unwrap_or_else(|e| fail(format!("bad glob {g}: {e}"))))
             .collect(),
     };
-    let graph = Graph::new(&reports, &roots);
-    if args.lcov {
-        lcov(&graph, args.only_verified_exec);
-    } else {
-        summary(&reports, &graph);
+    let graph = Graph::new(&reports, &roots).unwrap_or_else(|e| fail(e));
+    let text =
+        if args.lcov { lcov(&graph, args.only_verified_exec) } else { summary(&reports, &graph) };
+    print!("{text}");
+    if let Some(msg) = args.fail_under.and_then(|t| below_threshold(&graph, t)) {
+        fail(msg);
     }
-    if let Some(threshold) = args.fail_under {
-        let fns: Vec<&Node> = graph.nodes.values().filter(|n| n.is_verified_exec()).collect();
-        let reached = fns.iter().filter(|n| graph.is_reachable(n)).count();
-        let pct = if fns.is_empty() { 100.0 } else { 100.0 * reached as f64 / fns.len() as f64 };
-        if pct < threshold {
-            fail(format!(
-                "{reached} of {} verified exec functions reachable ({pct:.0}%), below --fail-under {threshold}",
-                fns.len()
-            ));
-        }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use verus_reach::fixture::lib_and_bin;
+
+    fn graph() -> (Vec<Report>, Graph) {
+        let reports = lib_and_bin();
+        let graph = Graph::new(&reports, &Roots::default()).unwrap();
+        (reports, graph)
+    }
+
+    #[test]
+    fn summary_names_the_twin() {
+        let (reports, graph) = graph();
+        let text = summary(&reports, &graph);
+        assert!(
+            text.contains("verified exec functions:      3   reachable:      2  (66%)"),
+            "{text}"
+        );
+        assert!(text.contains("  x.rs:1   inc   (same name reachable: lib::inc)"), "{text}");
+        assert!(text.contains("  lib               2/2    fns       6/6      LoC"), "{text}");
+        assert!(text.contains("  lib::verified     0/1    fns       0/3      LoC"), "{text}");
+    }
+
+    #[test]
+    fn lcov_marks_hits_by_id() {
+        let (_, graph) = graph();
+        let text = lcov(&graph, true);
+        assert!(text.contains("SF:x.rs\n"), "{text}");
+        assert!(text.contains("FN:1,lib::wired\n"), "{text}");
+        assert!(text.contains("FNDA:1,lib::wired\n"), "{text}");
+        assert!(text.contains("FNDA:0,lib::verified::inc\n"), "{text}");
+        assert!(text.contains("FNF:3\nFNH:2\n"), "{text}");
+        assert!(!text.contains("app(bin)::main"), "{text}");
+    }
+
+    #[test]
+    fn fail_under_uses_the_summary_percentage() {
+        let (_, graph) = graph();
+        assert_eq!(below_threshold(&graph, 66), None);
+        assert!(below_threshold(&graph, 67).unwrap().contains("(66%)"));
     }
 }

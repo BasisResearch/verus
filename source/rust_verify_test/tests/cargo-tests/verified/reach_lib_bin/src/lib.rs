@@ -30,6 +30,13 @@ impl Bump for Counter {
     }
 }
 
+/// Verified, public, and never called by the binary. The binary has its own `helper`.
+pub fn helper(n: u32) -> (r: u32)
+    ensures r == n,
+{
+    n
+}
+
 /// Verified, public, and never called by the binary.
 pub mod twin {
     use vstd::prelude::*;

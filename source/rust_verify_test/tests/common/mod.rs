@@ -335,8 +335,8 @@ pub fn run_verus(
         } else if *option == "--edition 2024" {
             verus_args.push("--edition".to_string());
             verus_args.push("2024".to_string());
-        } else if option.starts_with("--reach") {
-            verus_args.extend(option.split_whitespace().map(|a| a.to_string()));
+        } else if let Some(dir) = option.strip_prefix("--reach ") {
+            verus_args.extend(["--reach".to_string(), dir.to_string()]);
         } else {
             panic!("option '{}' not recognized by test harness", option);
         }
