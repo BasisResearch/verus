@@ -123,6 +123,8 @@ struct LowerStmtState {
     break_versions: HashMap<Ident, Vec<IndexMap<Ident, u32>>>,
     version_decls: HashSet<Ident>,
     all_snapshots: Snapshots,
+    variable_versions: crate::context::VariableVersions,
+    record_versions: bool,
 }
 
 fn lower_stmt(
@@ -141,6 +143,9 @@ fn lower_stmt(
             let n = find_version(&versions, x);
             let typ = types[x].clone();
             versions.insert(x.clone(), n + 1);
+            if state.record_versions {
+                state.variable_versions.insert(rename_var(x, n + 1), (x.to_string(), n + 1));
+            }
             let x = Arc::new(rename_var(x, n + 1));
             if !state.version_decls.contains(&x) {
                 let decl = Arc::new(DeclX::Const(x.clone(), typ));
@@ -219,7 +224,10 @@ fn lower_stmt(
     }
 }
 
-pub(crate) fn lower_query(query: &Query) -> (Query, Snapshots, Vec<Decl>) {
+pub(crate) fn lower_query(
+    query: &Query,
+    record_versions: bool,
+) -> (Query, Snapshots, Vec<Decl>, crate::context::VariableVersions) {
     let QueryX { local, assertion } = &**query;
     let mut decls: Vec<Decl> = Vec::new();
     let mut versions: IndexMap<Ident, u32> = IndexMap::new();
@@ -229,6 +237,7 @@ pub(crate) fn lower_query(query: &Query) -> (Query, Snapshots, Vec<Decl>) {
     let all_snapshots: Snapshots = HashMap::new();
     let mut types: HashMap<Ident, Typ> = HashMap::new();
     let mut local_vars: Vec<Decl> = Vec::new();
+    let mut variable_versions = HashMap::new();
 
     for decl in local.iter() {
         if let DeclX::Axiom(Axiom { named, tag, expr }) = &**decl {
@@ -244,6 +253,9 @@ pub(crate) fn lower_query(query: &Query) -> (Query, Snapshots, Vec<Decl>) {
         if let DeclX::Var(x, t) = &**decl {
             versions.insert(x.clone(), 0);
             types.insert(x.clone(), t.clone());
+            if record_versions {
+                variable_versions.insert(rename_var(x, 0), (x.to_string(), 0));
+            }
             let x = Arc::new(rename_var(x, 0));
             let decl = Arc::new(DeclX::Const(x.clone(), t.clone()));
             decls.push(decl);
@@ -252,8 +264,49 @@ pub(crate) fn lower_query(query: &Query) -> (Query, Snapshots, Vec<Decl>) {
             local_vars.push(decl.clone());
         }
     }
-    let mut state = LowerStmtState { decls, break_versions, version_decls, all_snapshots };
+    let mut state = LowerStmtState {
+        decls,
+        break_versions,
+        version_decls,
+        all_snapshots,
+        variable_versions,
+        record_versions,
+    };
     let assertion = lower_stmt(&mut state, &mut versions, &mut snapshots, &types, assertion);
     let local = Arc::new(state.decls);
-    (Arc::new(QueryX { local, assertion }), state.all_snapshots, local_vars)
+    (
+        Arc::new(QueryX { local, assertion }),
+        state.all_snapshots,
+        local_vars,
+        state.variable_versions,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn records_versions_per_query_at_lowering() {
+        let name = Arc::new("balance@".to_string());
+        let query = |statements| {
+            Arc::new(QueryX {
+                local: Arc::new(vec![Arc::new(DeclX::Var(
+                    name.clone(),
+                    Arc::new(crate::ast::TypX::Int),
+                ))]),
+                assertion: Arc::new(StmtX::Block(Arc::new(statements))),
+            })
+        };
+        let (_, _, _, versions) =
+            lower_query(&query(vec![Arc::new(StmtX::Havoc(name.clone()))]), true);
+        assert_eq!(versions.get("balance@0"), Some(&("balance@".into(), 0)));
+        assert_eq!(versions.get("balance@1"), Some(&("balance@".into(), 1)));
+        let (_, _, _, versions) = lower_query(&query(vec![]), true);
+        assert_eq!(versions.len(), 1);
+        assert!(!versions.contains_key("balance@1"));
+        let (_, _, _, versions) =
+            lower_query(&query(vec![Arc::new(StmtX::Havoc(name.clone()))]), false);
+        assert!(versions.is_empty());
+    }
 }
