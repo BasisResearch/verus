@@ -362,6 +362,37 @@ mod tests {
         }
     }
 
+    /// Bitwise operators are emitted through the same recording path as
+    /// arithmetic, so they read as source writes them rather than as the
+    /// prelude heads. The clip the encoder wraps the result in stays visible,
+    /// because the source cast is real.
+    #[test]
+    fn bitwise_operators_read_as_source_writes_them() {
+        let mut names = SourceNames::new();
+        for (symbol, op) in [
+            (crate::def::BIT_XOR, "^"),
+            (crate::def::BIT_AND, "&"),
+            (crate::def::BIT_OR, "|"),
+            (crate::def::BIT_SHL, "<<"),
+            (crate::def::BIT_SHR, ">>"),
+        ] {
+            names.insert(symbol.to_string(), SourceName::Operator(op.to_string()));
+        }
+        let ctx = NameCtxt::new();
+        record_cast(&ctx, crate::def::U_CLIP, crate::ast::IntRange::U(8), "u8");
+        merge_source_names(&mut names, ctx.source_names());
+        for (term, expected) in [
+            ("(bitxor x y)", "(x ^ y)"),
+            ("(bitand x y)", "(x & y)"),
+            ("(bitor x y)", "(x | y)"),
+            ("(bitshl x y)", "(x << y)"),
+            ("(bitshr x y)", "(x >> y)"),
+            ("(uClip 8 (bitand x y))", "((x & y) as u8)"),
+        ] {
+            assert_eq!(render_term(&names, term), expected);
+        }
+    }
+
     /// `let` is SMT-LIB wire syntax, so it is rendered from its shape rather
     /// than looked up as an encoded name, and its bound body still is.
     #[test]

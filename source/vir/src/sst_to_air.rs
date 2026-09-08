@@ -1453,6 +1453,10 @@ pub(crate) fn exp_to_expr(ctx: &Ctx, exp: &Exp, expr_ctxt: &ExprCtxt) -> Result<
                         BitwiseOp::Shr => crate::def::BIT_SHR,
                     };
                     let args = vec![box_lh, box_rh];
+                    // `binary_op_str` spells these (`^`, `&`, `|`, `<<`, `>>`);
+                    // the IEEE float heads below are left unrecorded because it
+                    // has no per-operation spelling for them yet.
+                    let fname = record_op(ctx, fname, op);
                     let bit_expr = ExprX::Apply(Arc::new(fname.to_string()), Arc::new(args));
 
                     return clip_bitwise_result(bit_expr, exp);
