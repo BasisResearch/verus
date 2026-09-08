@@ -26,9 +26,29 @@ pub struct BndInfoUser {
     pub trigs: Trigs,
 }
 
+/// Why an encoder emitted a quantifier, in the terms source is written in.
+/// Recorded where the binder is built, so a reader never has to classify a
+/// generated `:qid`; the qid names nothing a user wrote and its spelling is
+/// free to change.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum QuantRole {
+    /// A spec function's defining equation
+    Definition,
+    /// One unfolding step of a recursive spec function (costs fuel)
+    DefinitionUnfold,
+    /// A recursive spec function at zero fuel, where unfolding stops
+    DefinitionBase,
+    /// The default fuel every spec function starts a query with
+    FuelDefaults,
+    /// The return type invariant of a function
+    ReturnTypeInvariant,
+}
+
 pub struct BndInfo {
     pub fun: Fun,
     pub user: Option<BndInfoUser>,
+    /// Why this quantifier exists, when the encoder said so.
+    pub role: Option<QuantRole>,
     /// The tagged top-level assertion this quantifier was sent inside, once
     /// known (axiom or hypothesis); `None` for quantifiers in the query body.
     pub tag: Option<air::def::ProvenanceTag>,

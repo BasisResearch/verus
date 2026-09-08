@@ -12,7 +12,7 @@ use crate::def::{
 };
 use crate::messages::{MessageLabel, Span};
 use crate::sst::FuncCheckSst;
-use crate::sst::{BndX, ExpX, Exps, FunctionSst, ParPurpose, ParX, Pars};
+use crate::sst::{BndX, ExpX, Exps, FunctionSst, ParPurpose, ParX, Pars, QuantRole};
 use crate::sst_to_air::{
     ExprCtxt, ExprMode, exp_to_expr, fun_to_air_ident, typ_invariant, typ_to_air, typ_to_ids,
 };
@@ -43,6 +43,7 @@ pub(crate) fn func_bind_trig(
     params: &Pars,
     trig_exprs: &Vec<Expr>,
     opts: Option<FuncBindOpts>,
+    role: Option<QuantRole>,
 ) -> Bind {
     let mut binders: Vec<air::ast::Binder<air::ast::Typ>> = Vec::new();
     if let Some(FuncBindOpts { add_default_ensures: true, .. }) = &opts {
@@ -66,7 +67,7 @@ pub(crate) fn func_bind_trig(
     }
     let trigger: Trigger = Arc::new(trig_exprs.clone());
     let triggers: Triggers = Arc::new(vec![trigger]);
-    let qid = new_internal_qid(ctx, name);
+    let qid = new_internal_qid(ctx, name, role);
     Arc::new(BindX::Quant(Quant::Forall, Arc::new(binders), triggers, qid))
 }
 
@@ -78,8 +79,9 @@ pub(crate) fn func_bind(
     params: &Pars,
     trig_expr: &Expr,
     opts: Option<FuncBindOpts>,
+    role: Option<QuantRole>,
 ) -> Bind {
-    func_bind_trig(ctx, name, typ_params, params, &vec![trig_expr.clone()], opts)
+    func_bind_trig(ctx, name, typ_params, params, &vec![trig_expr.clone()], opts, role)
 }
 
 // arguments for function call f(typ_args, params)
@@ -145,7 +147,15 @@ fn func_def_quant(
         trigs.push(crate::sst_to_air::typ_to_id(ctx, extra_trigger_term));
     }
     Ok(mk_bind_expr(
-        &func_bind_trig(ctx, qid_name.to_string(), typ_params, params, &trigs, opts),
+        &func_bind_trig(
+            ctx,
+            qid_name.to_string(),
+            typ_params,
+            params,
+            &trigs,
+            opts,
+            Some(QuantRole::Definition),
+        ),
         &f_imply,
     ))
 }
@@ -393,8 +403,24 @@ fn func_body_to_air(
         let name_zero = format!("{}_fuel_to_zero", fun_to_air_ident(&ctx.name_ctxt, &rec_name));
         let name_body = format!("{}_fuel_to_body", fun_to_air_ident(&ctx.name_ctxt, &rec_name));
         let opts = Some(FuncBindOpts { add_fuel: true, add_default_ensures: false });
-        let bind_zero = func_bind(ctx, name_zero, &typ_params, pars, &rec_f_fuel, opts);
-        let bind_body = func_bind(ctx, name_body, &typ_params, pars, &rec_f_succ, opts);
+        let bind_zero = func_bind(
+            ctx,
+            name_zero,
+            &typ_params,
+            pars,
+            &rec_f_fuel,
+            opts,
+            Some(QuantRole::DefinitionBase),
+        );
+        let bind_body = func_bind(
+            ctx,
+            name_body,
+            &typ_params,
+            pars,
+            &rec_f_succ,
+            opts,
+            Some(QuantRole::DefinitionUnfold),
+        );
         let implies_body = mk_implies(&mk_and(&def_reqs), &eq_body);
         let forall_zero = mk_bind_expr(&bind_zero, &eq_zero);
         let forall_body = mk_bind_expr(&bind_body, &implies_body);
@@ -951,6 +977,7 @@ pub fn func_axioms_to_air(
                             &function.x.pars,
                             &f_app,
                             opts,
+                            Some(QuantRole::ReturnTypeInvariant),
                         ),
                         &mk_implies(&mk_and(&f_pre), &post),
                     );
