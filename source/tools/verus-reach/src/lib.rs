@@ -284,6 +284,12 @@ pub mod fixture {
         n
     }
 
+    pub fn proof(id: &str) -> Node {
+        let mut n = node(id, true, false);
+        n.mode = "proof".into();
+        n
+    }
+
     pub fn call(from: &str, to: &str) -> Edge {
         Edge::new(from, to, EdgeKind::Call)
     }
@@ -325,10 +331,12 @@ pub mod fixture {
                 node("lib::helper", true, false),
                 spec("lib::spec_wired"),
                 spec("lib::verified::spec_inc"),
+                proof("lib::lemma"),
             ],
             vec![
                 call("lib::wired", "lib::helper"),
                 contract("lib::wired", "lib::spec_wired"),
+                Edge::new("lib::wired", "lib::lemma", EdgeKind::Proof),
                 contract("lib::verified::inc", "lib::verified::spec_inc"),
             ],
         );

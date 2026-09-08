@@ -35,8 +35,8 @@ struct Args {
     /// With --lcov, include only verified exec functions
     #[arg(long, conflicts_with = "only_verified")]
     only_verified_exec: bool,
-    /// With --lcov, include only what Verus checks: verified exec, spec,
-    /// and proof functions
+    /// With --lcov, include only verified exec and spec functions. Proofs
+    /// carry coverage to the specs they use but are not rows themselves
     #[arg(long)]
     only_verified: bool,
 }
@@ -53,9 +53,7 @@ impl Only {
     fn includes(self, node: &Node) -> bool {
         match self {
             Only::All => true,
-            Only::Verified => {
-                node.is_verified_exec() || (node.is_ghost() && node.verified && !node.proxy)
-            }
+            Only::Verified => node.is_verified_exec() || node.is_spec(),
             Only::VerifiedExec => node.is_verified_exec(),
         }
     }
@@ -293,6 +291,7 @@ mod tests {
         assert!(verified.contains("FNDA:1,lib::spec_wired\n"), "{verified}");
         assert!(verified.contains("FNDA:0,lib::verified::spec_inc\n"), "{verified}");
         assert!(!verified.contains("lib::inc\n"), "{verified}");
+        assert!(!verified.contains("lemma"), "{verified}");
         assert!(lcov(&graph, Only::All).contains("FNDA:1,lib::inc\n"));
     }
 
