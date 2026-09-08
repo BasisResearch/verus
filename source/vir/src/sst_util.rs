@@ -1208,7 +1208,22 @@ pub fn binary_op_str(op: &BinaryOp) -> &'static str {
             Shr => ">>",
             Shl(..) => "<<",
         },
-        IeeeFloat(_) => "ieee_float",
+        // Float operations are written in source exactly as integer ones are;
+        // the encoder keeps a separate head per operation, so each has a real
+        // spelling to give.
+        IeeeFloat(o) => match o {
+            crate::ast::IeeeFloatBinaryOp::Add => "+",
+            crate::ast::IeeeFloatBinaryOp::Sub => "-",
+            crate::ast::IeeeFloatBinaryOp::Mul => "*",
+            crate::ast::IeeeFloatBinaryOp::Div => "/",
+            crate::ast::IeeeFloatBinaryOp::Eq => "==",
+            crate::ast::IeeeFloatBinaryOp::InEq(o) => match o {
+                Le => "<=",
+                Ge => ">=",
+                Lt => "<",
+                Gt => ">",
+            },
+        },
         StrGetChar => "ignored", // non-infix; handled by the caller
         Index(..) => "ignored",  // non-infix; handled by the caller
     }

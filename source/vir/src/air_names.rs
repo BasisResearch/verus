@@ -393,6 +393,34 @@ mod tests {
         }
     }
 
+    /// Floats keep a separate encoder head per operation, so each renders as
+    /// source writes it. A shared spelling would have collapsed add and divide
+    /// into one, which is why the table gives them individually.
+    #[test]
+    fn float_operators_keep_one_spelling_each() {
+        let mut names = SourceNames::new();
+        for (symbol, op) in [
+            (crate::def::IEEE_FLOAT_ADD, "+"),
+            (crate::def::IEEE_FLOAT_SUB, "-"),
+            (crate::def::IEEE_FLOAT_MUL, "*"),
+            (crate::def::IEEE_FLOAT_DIV, "/"),
+            (crate::def::IEEE_FLOAT_EQ, "=="),
+            (crate::def::IEEE_FLOAT_LE, "<="),
+            (crate::def::IEEE_FLOAT_LT, "<"),
+        ] {
+            names.insert(symbol.to_string(), SourceName::Operator(op.to_string()));
+        }
+        for (term, expected) in [
+            ("(ieee_float_add x y)", "(x + y)"),
+            ("(ieee_float_div x y)", "(x / y)"),
+            ("(ieee_float_eq x y)", "(x == y)"),
+            ("(ieee_float_le x y)", "(x <= y)"),
+            ("(ieee_float_add (ieee_float_mul x y) z)", "((x * y) + z)"),
+        ] {
+            assert_eq!(render_term(&names, term), expected);
+        }
+    }
+
     /// `let` is SMT-LIB wire syntax, so it is rendered from its shape rather
     /// than looked up as an encoded name, and its bound body still is.
     #[test]

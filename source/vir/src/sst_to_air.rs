@@ -1474,6 +1474,7 @@ pub(crate) fn exp_to_expr(ctx: &Ctx, exp: &Exp, expr_ctxt: &ExprCtxt) -> Result<
                         IeeeFloatBinaryOp::InEq(InequalityOp::Lt) => crate::def::IEEE_FLOAT_LT,
                         IeeeFloatBinaryOp::InEq(InequalityOp::Gt) => crate::def::IEEE_FLOAT_GT,
                     };
+                    let fname = record_op(ctx, fname, op);
                     ExprX::Apply(Arc::new(fname.to_string()), Arc::new(vec![lh, rh]))
                 }
                 _ => {
