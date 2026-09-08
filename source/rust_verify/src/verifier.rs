@@ -2532,6 +2532,44 @@ impl Verifier {
                 writeln!(file, "{:#?}", triggers).expect("error writing to trigger log file");
             }
         }
+        // Log the provenance joins: qid -> (function, owning tag, span), hyp -> (kind, span)
+        if self.args.log_all {
+            let mut file = self.create_log_file(None, crate::config::QIDS_FILE_SUFFIX)?;
+            let qid_map = global_ctx.qid_map.borrow();
+            let mut qids: Vec<&String> = qid_map.keys().collect();
+            qids.sort();
+            for qid in qids {
+                let info = &qid_map[qid];
+                let tag = info.tag.as_ref().map(|t| t.to_symbol()).unwrap_or("-".to_string());
+                let span = info.user.as_ref().map(|u| u.span.as_string.clone());
+                writeln!(
+                    file,
+                    "{}\t{}\t{}\t{}",
+                    qid,
+                    fun_as_friendly_rust_name(&info.fun),
+                    tag,
+                    span.unwrap_or("-".to_string())
+                )
+                .expect("error writing to qids log file");
+            }
+            let mut file = self.create_log_file(None, crate::config::HYPS_FILE_SUFFIX)?;
+            let hyp_map = global_ctx.hyp_map.borrow();
+            let mut funs: Vec<&vir::ast::Fun> = hyp_map.keys().collect();
+            funs.sort();
+            for fun in funs {
+                for (k, info) in hyp_map[fun].iter().enumerate() {
+                    writeln!(
+                        file,
+                        "{}\thyp_{}\t{:?}\t{}",
+                        fun_as_friendly_rust_name(fun),
+                        k,
+                        info.kind,
+                        info.span.as_string
+                    )
+                    .expect("error writing to hyps log file");
+                }
+            }
+        }
         let chosen_triggers = global_ctx.get_chosen_triggers();
         let mut low_confidence_triggers = None;
         for chosen in chosen_triggers {

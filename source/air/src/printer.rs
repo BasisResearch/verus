@@ -379,7 +379,10 @@ impl Printer {
                         if let Some(s) = qid {
                             nodes.push(str_to_node(":qid"));
                             nodes.push(str_to_node(s));
-                            if matches!(self.solver, SmtSolver::Z3) {
+                            // cvc5 does not know :skolemid, so the .smt2 for it omits
+                            // the attribute; the .air log keeps it, since the AIR
+                            // parser requires it next to every :qid
+                            if matches!(self.solver, SmtSolver::Z3) || !self.print_as_smt {
                                 nodes.push(str_to_node(":skolemid"));
                                 nodes.push(str_to_node(&mk_skolem_id(s)));
                             }

@@ -895,6 +895,7 @@ pub(crate) fn new_user_qid(ctx: &Ctx, exp: &Exp) -> Qid {
             let bnd_info = BndInfo {
                 fun: f.current_fun.clone(),
                 user: Some(BndInfoUser { span: exp.span.clone(), trigs: trigs.clone() }),
+                tag: None,
             };
             ctx.global.qid_map.borrow_mut().insert(qid.clone(), bnd_info);
         }
@@ -3025,6 +3026,22 @@ fn byte_string_indices_to_air(ctx: &Ctx, lit: Arc<Vec<u8>>) -> Expr {
     Arc::new(ExprX::Multi(MultiOp::And, Arc::new(facts)))
 }
 
+/// Record, for every `:qid` inside `expr` that `qid_map` knows, that the
+/// quantifier was sent inside the top-level assertion tagged `tag`.
+pub(crate) fn record_qid_owner(ctx: &Ctx, expr: &Expr, tag: &air::def::ProvenanceTag) {
+    let mut qids: Vec<air::ast::Ident> = Vec::new();
+    air::ast_util::quantifier_ids(expr, &mut qids);
+    if qids.is_empty() {
+        return;
+    }
+    let mut qid_map = ctx.global.qid_map.borrow_mut();
+    for qid in qids {
+        if let Some(info) = qid_map.get_mut(&*qid) {
+            info.tag = Some(tag.clone());
+        }
+    }
+}
+
 /// A hypothesis axiom of the current function's query, tagged `hyp_k` with
 /// `k` the next free index for the function, and its source recorded in
 /// `GlobalCtx::hyp_map`. Falls back to an untagged axiom outside a function.
@@ -3036,7 +3053,10 @@ pub(crate) fn mk_hyp_axiom(ctx: &Ctx, span: &Span, kind: crate::sst::HypKind, ex
     let hyps = hyp_map.entry(fun).or_insert_with(Vec::new);
     let id = air::def::HypId(hyps.len() as u64);
     hyps.push(crate::sst::HypInfo { span: span.clone(), kind });
-    air::ast_util::mk_tagged_axiom(air::def::ProvenanceTag::Hyp(id), expr)
+    drop(hyp_map);
+    let tag = air::def::ProvenanceTag::Hyp(id);
+    record_qid_owner(ctx, &expr, &tag);
+    air::ast_util::mk_tagged_axiom(tag, expr)
 }
 
 fn set_fuel(ctx: &Ctx, span: &Span, local: &mut Vec<Decl>, hidden: &Vec<Fun>) {

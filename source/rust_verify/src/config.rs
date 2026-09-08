@@ -35,6 +35,10 @@ pub const SMT_TRANSCRIPT_FILE_SUFFIX: &str = ".smt_transcript";
 pub const PROFILE_FILE_SUFFIX: &str = ".profile";
 pub const SINGULAR_FILE_SUFFIX: &str = ".singular";
 pub const TRIGGERS_FILE_SUFFIX: &str = ".triggers";
+/// `--log-all` side files for the provenance joins: `:qid` -> function,
+/// owning tag, span; and `hyp_k` -> function, kind, span.
+pub const QIDS_FILE_SUFFIX: &str = ".qids";
+pub const HYPS_FILE_SUFFIX: &str = ".hyps";
 pub const IMPL_NAMES_SUFFIX: &str = ".impl_names";
 pub const CALL_GRAPH_FILE_SUFFIX_FULL_INITIAL: &str = "-call-graph-full-initial.dot";
 pub const CALL_GRAPH_FILE_SUFFIX_FULL_SIMPLIFIED: &str = "-call-graph-full-simplified.dot";

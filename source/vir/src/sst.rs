@@ -29,6 +29,9 @@ pub struct BndInfoUser {
 pub struct BndInfo {
     pub fun: Fun,
     pub user: Option<BndInfoUser>,
+    /// The tagged top-level assertion this quantifier was sent inside, once
+    /// known (axiom or hypothesis); `None` for quantifiers in the query body.
+    pub tag: Option<air::def::ProvenanceTag>,
 }
 
 /// What a hypothesis axiom of a function's query is; recorded per `HypId`

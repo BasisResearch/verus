@@ -309,6 +309,59 @@ pub fn mk_unnamed_axiom(expr: Expr) -> Decl {
     Arc::new(DeclX::Axiom(Axiom { named: None, tag: None, expr: expr.clone() }))
 }
 
+/// The `:qid`s of every quantifier, lambda and choose inside `expr`, in
+/// print order. Used to record which tagged assertion a `:qid` lives in.
+pub fn quantifier_ids(expr: &Expr, out: &mut Vec<Ident>) {
+    match &**expr {
+        ExprX::Const(_) | ExprX::Var(_) | ExprX::Old(_, _) => {}
+        ExprX::Apply(_, es) | ExprX::Multi(_, es) | ExprX::Array(es) => {
+            for e in es.iter() {
+                quantifier_ids(e, out);
+            }
+        }
+        ExprX::ApplyFun(_, e, es) => {
+            quantifier_ids(e, out);
+            for e in es.iter() {
+                quantifier_ids(e, out);
+            }
+        }
+        ExprX::Unary(_, e) => quantifier_ids(e, out),
+        ExprX::Binary(_, a, b) => {
+            quantifier_ids(a, out);
+            quantifier_ids(b, out);
+        }
+        ExprX::IfElse(a, b, c) => {
+            quantifier_ids(a, out);
+            quantifier_ids(b, out);
+            quantifier_ids(c, out);
+        }
+        ExprX::Bind(bind, body) => {
+            match &**bind {
+                BindX::Let(binders) => {
+                    for b in binders.iter() {
+                        quantifier_ids(&b.a, out);
+                    }
+                }
+                BindX::Quant(_, _, _, qid) | BindX::Lambda(_, _, qid) => {
+                    if let Some(qid) = qid {
+                        out.push(qid.clone());
+                    }
+                }
+                BindX::Choose(_, _, qid, e) => {
+                    if let Some(qid) = qid {
+                        out.push(qid.clone());
+                    }
+                    quantifier_ids(e, out);
+                }
+            }
+            quantifier_ids(body, out);
+        }
+        ExprX::LabeledAxiom(_, _, e) | ExprX::LabeledAssertion(_, _, _, e) => {
+            quantifier_ids(e, out)
+        }
+    }
+}
+
 /// An unnamed axiom carrying a provenance tag.
 pub fn mk_tagged_axiom(tag: crate::def::ProvenanceTag, expr: Expr) -> Decl {
     Arc::new(DeclX::Axiom(Axiom { named: None, tag: Some(tag), expr }))
