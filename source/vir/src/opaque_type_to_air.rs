@@ -77,7 +77,7 @@ pub fn opaque_types_to_air(ctx: &Ctx, opaque_types: &Vec<OpaqueType>) -> Command
                     Arc::new(vec![self_dcr.clone()]),
                     Arc::new(vec![self_type.clone()]),
                 ]);
-                let qid = new_internal_qid(ctx, name);
+                let qid = new_internal_qid(ctx, name, None);
                 Arc::new(BindX::Quant(air::ast::Quant::Forall, Arc::new(binders), triggers, qid))
             };
             let mut bound_exprs: Vec<air::ast::Expr> = Vec::new();

@@ -589,50 +589,10 @@ impl ExpX {
             }
             Binary(op, e1, e2) => {
                 let (prec_exp, prec_left, prec_right) = op.prec_of_binary_op();
-                use ArithOp::*;
                 use BinaryOp::*;
-                use BitwiseOp::*;
-                use InequalityOp::*;
                 let left = e1.x.to_string_prec(global, prec_left);
                 let right = e2.x.to_string_prec(global, prec_right);
-                let op_str = match op {
-                    And => "&&",
-                    Or => "||",
-                    Xor => "^",
-                    Implies => "==>",
-                    HeightCompare { .. } => "",
-                    Eq => "==",
-                    Ne => "!=",
-                    Inequality(o) => match o {
-                        Le => "<=",
-                        Ge => ">=",
-                        Lt => "<",
-                        Gt => ">",
-                    },
-                    Arith(o) => match o {
-                        Add => "+",
-                        Sub => "-",
-                        Mul => "*",
-                        EuclideanDiv => "/",
-                        EuclideanMod => "%",
-                    },
-                    RealArith(o) => match o {
-                        crate::ast::RealArithOp::Add => "+",
-                        crate::ast::RealArithOp::Sub => "-",
-                        crate::ast::RealArithOp::Mul => "*",
-                        crate::ast::RealArithOp::Div => "/",
-                    },
-                    Bitwise(o) => match o {
-                        BitXor => "^",
-                        BitAnd => "&",
-                        BitOr => "|",
-                        Shr => ">>",
-                        Shl(..) => "<<",
-                    },
-                    IeeeFloat(_) => "ieee_float",
-                    StrGetChar => "ignored", // This is a non-infix BinaryOp, so it needs special handling below
-                    Index(..) => "ignored", // This is a non-infix BinaryOp, so it needs special handling below
-                };
+                let op_str = crate::sst_util::binary_op_str(op);
                 if let BinaryOp::StrGetChar = op {
                     (format!("{}.get_char({})", left, e2.x.to_user_string(global)), prec_exp)
                 } else if let HeightCompare { .. } = op {
@@ -1200,4 +1160,56 @@ pub(crate) fn stm_with_vars_at_pre_state(stm: &Stm, vars: &HashSet<UniqueIdent>)
         ExpX::Var(uid) if vars.contains(uid) => e.new_x(ExpX::VarAt(uid.clone(), VarAt::Pre)),
         _ => e.clone(),
     })
+}
+
+/// How the source writes a binary operator. One definition, used by
+/// `ExpX::to_user_string` for diagnostics and by the AIR encoders, which
+/// record it against the symbol they emit so a reader of solver output can
+/// show `+` rather than `Add` without a second table restating this one.
+/// `""` marks an operator with no infix source spelling.
+pub fn binary_op_str(op: &BinaryOp) -> &'static str {
+    // ArithOp and BinaryOp here are sst's own (unit variants), as imported at
+    // the top of this file; BitwiseOp and InequalityOp come from ast.
+    use ArithOp::*;
+    use BinaryOp::*;
+    use BitwiseOp::*;
+    use InequalityOp::*;
+    match op {
+        And => "&&",
+        Or => "||",
+        Xor => "^",
+        Implies => "==>",
+        HeightCompare { .. } => "",
+        Eq => "==",
+        Ne => "!=",
+        Inequality(o) => match o {
+            Le => "<=",
+            Ge => ">=",
+            Lt => "<",
+            Gt => ">",
+        },
+        Arith(o) => match o {
+            Add => "+",
+            Sub => "-",
+            Mul => "*",
+            EuclideanDiv => "/",
+            EuclideanMod => "%",
+        },
+        RealArith(o) => match o {
+            crate::ast::RealArithOp::Add => "+",
+            crate::ast::RealArithOp::Sub => "-",
+            crate::ast::RealArithOp::Mul => "*",
+            crate::ast::RealArithOp::Div => "/",
+        },
+        Bitwise(o) => match o {
+            BitXor => "^",
+            BitAnd => "&",
+            BitOr => "|",
+            Shr => ">>",
+            Shl(..) => "<<",
+        },
+        IeeeFloat(_) => "ieee_float",
+        StrGetChar => "ignored", // non-infix; handled by the caller
+        Index(..) => "ignored",  // non-infix; handled by the caller
+    }
 }

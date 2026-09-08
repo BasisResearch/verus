@@ -56,6 +56,27 @@ pub struct PostConditionInfo {
     pub kind: PostConditionKind,
 }
 
+/// Record the source spelling of the operator an AIR symbol was emitted for,
+/// taking it from the one table `to_user_string` also uses, and hand the
+/// symbol back. See `crate::air_names`.
+fn record_op<'a>(ctx: &Ctx, symbol: &'a str, op: &BinaryOp) -> &'a str {
+    ctx.name_ctxt.record_source_operator(symbol, crate::sst_util::binary_op_str(op));
+    symbol
+}
+
+/// How the source names the type a clip clips to.
+fn range_to_type_name(range: &IntRange) -> String {
+    match range {
+        IntRange::Int => "int".to_string(),
+        IntRange::Nat => "nat".to_string(),
+        IntRange::Char => "char".to_string(),
+        IntRange::USize => "usize".to_string(),
+        IntRange::ISize => "isize".to_string(),
+        IntRange::U(n) => format!("u{n}"),
+        IntRange::I(n) => format!("i{n}"),
+    }
+}
+
 #[inline(always)]
 pub(crate) fn fun_to_air_ident(name_ctxt: &NameCtxt, fun: &Fun) -> Ident {
     Arc::new(name_ctxt.fun_to_string(fun))
@@ -895,6 +916,7 @@ pub(crate) fn new_user_qid(ctx: &Ctx, exp: &Exp) -> Qid {
             let bnd_info = BndInfo {
                 fun: f.current_fun.clone(),
                 user: Some(BndInfoUser { span: exp.span.clone(), trigs: trigs.clone() }),
+                role: None,
                 tag: None,
             };
             ctx.global.qid_map.borrow_mut().insert(qid.clone(), bnd_info);
@@ -1109,6 +1131,10 @@ pub(crate) fn exp_to_expr(ctx: &Ctx, exp: &Exp, expr_ctxt: &ExprCtxt) -> Result<
                     IntRange::U(_) | IntRange::USize => crate::def::U_CLIP,
                     IntRange::I(_) | IntRange::ISize => crate::def::I_CLIP,
                 };
+                // A clip is the encoder modelling the target type's range; the
+                // source writes a cast, so record it as one. `Clip { Int }`
+                // above emits nothing at all, for the same reason.
+                ctx.name_ctxt.record_source_cast(f_name, &range_to_type_name(&range));
                 apply_range_fun(&f_name, &range, vec![expr])
             }
             UnaryOp::IntToReal => {
@@ -1323,35 +1349,35 @@ pub(crate) fn exp_to_expr(ctx: &Ctx, exp: &Exp, expr_ctxt: &ExprCtxt) -> Result<
                     }
                 }
                 BinaryOp::Arith(ArithOp::Add) if wrap_arith => {
-                    return Ok(str_apply(crate::def::ADD, &vec![lh, rh]));
+                    return Ok(str_apply(record_op(ctx, crate::def::ADD, op), &vec![lh, rh]));
                 }
                 BinaryOp::Arith(ArithOp::Sub) if wrap_arith => {
-                    return Ok(str_apply(crate::def::SUB, &vec![lh, rh]));
+                    return Ok(str_apply(record_op(ctx, crate::def::SUB, op), &vec![lh, rh]));
                 }
                 BinaryOp::Arith(ArithOp::Add) => ExprX::Multi(MultiOp::Add, Arc::new(vec![lh, rh])),
                 BinaryOp::Arith(ArithOp::Sub) => ExprX::Multi(MultiOp::Sub, Arc::new(vec![lh, rh])),
                 BinaryOp::Arith(ArithOp::Mul) if wrap_arith || !has_const => {
-                    return Ok(str_apply(crate::def::MUL, &vec![lh, rh]));
+                    return Ok(str_apply(record_op(ctx, crate::def::MUL, op), &vec![lh, rh]));
                 }
                 BinaryOp::Arith(ArithOp::EuclideanDiv) if wrap_arith || !has_const => {
-                    return Ok(str_apply(crate::def::EUC_DIV, &vec![lh, rh]));
+                    return Ok(str_apply(record_op(ctx, crate::def::EUC_DIV, op), &vec![lh, rh]));
                 }
                 // REVIEW: consider introducing singular_mod more earlier pipeline (e.g. from syntax macro?)
                 BinaryOp::Arith(ArithOp::EuclideanMod) if expr_ctxt.is_singular => {
                     return Ok(str_apply(crate::def::SINGULAR_MOD, &vec![lh, rh]));
                 }
                 BinaryOp::Arith(ArithOp::EuclideanMod) if wrap_arith || !has_const => {
-                    return Ok(str_apply(crate::def::EUC_MOD, &vec![lh, rh]));
+                    return Ok(str_apply(record_op(ctx, crate::def::EUC_MOD, op), &vec![lh, rh]));
                 }
                 BinaryOp::Arith(ArithOp::Mul) => ExprX::Multi(MultiOp::Mul, Arc::new(vec![lh, rh])),
                 BinaryOp::RealArith(crate::ast::RealArithOp::Add) => {
-                    return Ok(str_apply(crate::def::RADD, &vec![lh, rh]));
+                    return Ok(str_apply(record_op(ctx, crate::def::RADD, op), &vec![lh, rh]));
                 }
                 BinaryOp::RealArith(crate::ast::RealArithOp::Sub) => {
-                    return Ok(str_apply(crate::def::RSUB, &vec![lh, rh]));
+                    return Ok(str_apply(record_op(ctx, crate::def::RSUB, op), &vec![lh, rh]));
                 }
                 BinaryOp::RealArith(crate::ast::RealArithOp::Mul) => {
-                    return Ok(str_apply(crate::def::RMUL, &vec![lh, rh]));
+                    return Ok(str_apply(record_op(ctx, crate::def::RMUL, op), &vec![lh, rh]));
                 }
                 BinaryOp::RealArith(crate::ast::RealArithOp::Div) => {
                     return Ok(str_apply(crate::def::RDIV, &vec![lh, rh]));
@@ -3094,7 +3120,7 @@ fn set_fuel(ctx: &Ctx, span: &Span, local: &mut Vec<Decl>, hidden: &Vec<Fun>) {
         let fun_name = fun_as_friendly_rust_name(
             &ctx.fun.as_ref().expect("Missing a current function value").current_fun,
         );
-        let qid = new_internal_qid(ctx, format!("{}_nondefault_fuel", fun_name));
+        let qid = new_internal_qid(ctx, format!("{}_nondefault_fuel", fun_name), None);
         let bind = Arc::new(BindX::Quant(Quant::Forall, binders, triggers, qid));
         let or = Arc::new(ExprX::Multi(air::ast::MultiOp::Or, Arc::new(disjuncts)));
         mk_bind_expr(&bind, &or)

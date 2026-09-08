@@ -30,14 +30,28 @@ pub type SourceNames = HashMap<String, SourceName>;
 #[derive(Clone, Debug)]
 pub enum SourceName {
     Symbol(String),
-    Constructor { name: String, fields: Vec<String>, style: crate::ast::CtorPrintStyle },
+    /// An infix operator, as the source writes it (`+`). Recorded where the
+    /// encoder emits the symbol, from the same table `to_user_string` uses.
+    Operator(String),
+    /// A range clip the encoder inserted for a target type. The source
+    /// writes a cast, so `(nClip x)` shows as `(x as nat)`.
+    Cast(String),
+    Constructor {
+        name: String,
+        fields: Vec<String>,
+        style: crate::ast::CtorPrintStyle,
+    },
     Field(String),
 }
 
 impl SourceName {
     pub fn name(&self) -> &str {
         match self {
-            Self::Symbol(name) | Self::Field(name) | Self::Constructor { name, .. } => name,
+            Self::Symbol(name)
+            | Self::Field(name)
+            | Self::Operator(name)
+            | Self::Cast(name)
+            | Self::Constructor { name, .. } => name,
         }
     }
 
@@ -113,10 +127,37 @@ fn render_node(names: &SourceNames, node: &Node) -> String {
                     }
                 }
             }
-            // `(Add a b)` is `a + b` to the reader
-            if items.len() == 3 {
-                if let Node::Atom(head) = &items[0] {
-                    if let Some(op) = infix_operator(head) {
+            // SMT-LIB's binders are wire syntax rather than encoded names, so
+            // they render structurally: `(let ((x e)) b)` reads `let x = e in b`.
+            if let Some(Node::Atom(head)) = items.first() {
+                if head == "let" && items.len() == 3 {
+                    if let Node::List(bindings) = &items[1] {
+                        let binds: Vec<String> = bindings
+                            .iter()
+                            .filter_map(|b| match b {
+                                Node::List(pair) if pair.len() == 2 => Some(format!(
+                                    "{} = {}",
+                                    render_node(names, &pair[0]),
+                                    render_node(names, &pair[1])
+                                )),
+                                _ => None,
+                            })
+                            .collect();
+                        if !binds.is_empty() && binds.len() == bindings.len() {
+                            return format!(
+                                "let {} in {}",
+                                binds.join(", "),
+                                render_node(names, &items[2])
+                            );
+                        }
+                    }
+                }
+            }
+            // `(Add a b)` is `a + b`, and `(nClip x)` is `x as nat`, from
+            // what the encoders recorded when they emitted those symbols.
+            if let Some(Node::Atom(head)) = items.first() {
+                match names.get(head) {
+                    Some(SourceName::Operator(op)) if items.len() == 3 => {
                         return format!(
                             "({} {} {})",
                             render_node(names, &items[1]),
@@ -124,6 +165,15 @@ fn render_node(names: &SourceNames, node: &Node) -> String {
                             render_node(names, &items[2])
                         );
                     }
+                    // clips take the range arguments first, the value last
+                    Some(SourceName::Cast(ty)) if items.len() > 1 => {
+                        return format!(
+                            "({} as {})",
+                            render_node(names, items.last().unwrap()),
+                            ty
+                        );
+                    }
+                    _ => {}
                 }
             }
             if let Some(Node::Atom(head)) = items.first() {
@@ -157,20 +207,6 @@ fn render_node(names: &SourceNames, node: &Node) -> String {
     }
 }
 
-/// The prelude's arithmetic symbols and how the source writes them. These
-/// are not encoded from a source name, so nothing records them; they are
-/// named constants in [`crate::def`] and mapped here by those constants.
-fn infix_operator(head: &str) -> Option<&'static str> {
-    Some(match head {
-        h if h == crate::def::ADD => "+",
-        h if h == crate::def::SUB => "-",
-        h if h == crate::def::MUL => "*",
-        h if h == crate::def::EUC_DIV => "/",
-        h if h == crate::def::EUC_MOD => "%",
-        _ => return None,
-    })
-}
-
 /// One SMT term, rendered in source spelling: boxes dropped, mangled
 /// symbols replaced by what they were encoded from, applications written
 /// `f(a, b)`. Falls back to the term as given when it does not parse.
@@ -201,10 +237,25 @@ mod tests {
     use crate::def::NameCtxt;
     use std::sync::Arc;
 
+    /// The renderer knows an AIR symbol is an operator only because the
+    /// encoder recorded it as one when it emitted it; there is no table here
+    /// restating that. `sst_to_air::record_op` does the recording in the
+    /// pipeline, from `sst_util::binary_op_str`.
     #[test]
     fn arithmetic_preserves_grouping_through_boxes() {
-        let names = SourceNames::new();
+        let mut names = SourceNames::new();
+        for (symbol, op) in [
+            (crate::def::ADD, "+"),
+            (crate::def::SUB, "-"),
+            (crate::def::MUL, "*"),
+            (crate::def::EUC_DIV, "/"),
+            (crate::def::EUC_MOD, "%"),
+        ] {
+            names.insert(symbol.to_string(), SourceName::Operator(op.to_string()));
+        }
+        names.insert(crate::def::NAT_CLIP.to_string(), SourceName::Cast("nat".to_string()));
         for (term, expected) in [
+            ("((nClip (Add x y)))", "((x + y) as nat)"),
             ("((I (Mul (Add x y) z)))", "((x + y) * z)"),
             ("((I (Sub x (Sub y z))))", "(x - (y - z))"),
             ("((EucDiv x (Mul y z)))", "(x / (y * z))"),
@@ -212,6 +263,22 @@ mod tests {
         ] {
             assert_eq!(render_vector(&names, term), expected);
         }
+    }
+
+    /// `let` is SMT-LIB wire syntax, so it is rendered from its shape rather
+    /// than looked up as an encoded name, and its bound body still is.
+    #[test]
+    fn let_binders_read_as_bindings() {
+        let mut names = SourceNames::new();
+        names.insert(crate::def::ADD.to_string(), SourceName::Operator("+".to_string()));
+        assert_eq!(
+            render_term(&names, "(let ((_let_1 5)) (Add _let_1 _let_1))"),
+            "let _let_1 = 5 in (_let_1 + _let_1)"
+        );
+        assert_eq!(
+            render_term(&names, "(let ((a 1) (b 2)) (Add a b))"),
+            "let a = 1, b = 2 in (a + b)"
+        );
     }
 
     #[test]
