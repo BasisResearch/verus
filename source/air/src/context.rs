@@ -118,6 +118,9 @@ pub struct Context {
     /// Put provenance ids on the wire: goal labels carry their AssertId.
     /// On by default under cvc5, which reads them back; z3 would only warn.
     pub(crate) emit_assert_ids: bool,
+    /// Axioms that arrived without a tag and without a `:qid` to derive one
+    /// from are tagged `ax_anon_<n>` with this counter.
+    pub(crate) anon_axiom_count: u64,
 }
 
 impl Context {
@@ -185,6 +188,7 @@ impl Context {
             usage_info_enabled: false,
             check_valid_used: false,
             emit_assert_ids: matches!(solver, SmtSolver::Cvc5),
+            anon_axiom_count: 0,
             solver,
         };
         context.axiom_infos.push_scope(false);

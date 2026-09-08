@@ -120,10 +120,45 @@ pub(crate) fn smt_add_decl<'ctx>(context: &mut Context, decl: &Decl) {
                     .expect("internal error: duplicate assert_info");
                 smt_add_decl(context, &info.decl);
             }
-            let tag = if context.emit_assert_ids { tag } else { &None };
-            context.smt_log.log_assert(named, tag, &labeled_expr);
+            let tag = if context.emit_assert_ids {
+                match tag {
+                    Some(tag) => Some(tag.clone()),
+                    None => Some(fallback_axiom_tag(context, &expr)),
+                }
+            } else {
+                None
+            };
+            context.smt_log.log_assert(named, &tag, &labeled_expr);
         }
     }
+}
+
+/// The `:qid` of the quantifier an axiom is, or guards: `(forall ...)`, or
+/// `(=> g (forall ...))` as fuel-guarded axioms are.
+fn axiom_qid(expr: &Expr) -> Option<Ident> {
+    match &**expr {
+        ExprX::Bind(bind, _) => match &**bind {
+            BindX::Quant(_, _, _, Some(qid)) => Some(qid.clone()),
+            _ => None,
+        },
+        ExprX::Binary(BinaryOp::Implies, _, rhs) => axiom_qid(rhs),
+        _ => None,
+    }
+}
+
+/// A provenance tag for an axiom the producer did not tag: its quantifier's
+/// `:qid` when it has one (Verus gives nearly every axiom one, and `qid_map`
+/// joins it back to source), else a fresh `ax_anon_<n>`.
+fn fallback_axiom_tag(context: &mut Context, expr: &Expr) -> crate::def::ProvenanceTag {
+    let ident = match axiom_qid(expr) {
+        Some(qid) => qid,
+        None => {
+            let n = context.anon_axiom_count;
+            context.anon_axiom_count += 1;
+            Arc::new(format!("anon_{}", n))
+        }
+    };
+    crate::def::ProvenanceTag::Axiom(ident)
 }
 
 impl SmtSolver {

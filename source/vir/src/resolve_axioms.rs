@@ -316,7 +316,10 @@ fn resolve_datatype_axiom(ctx: &Ctx, dt: &Dt) -> Vec<Command> {
             let expr_ctxt = ExprCtxt::new_mode(ExprMode::Spec);
             let expr = crate::sst_to_air::exp_to_expr(ctx, &forall, &expr_ctxt).unwrap();
 
-            let axiom = Arc::new(DeclX::Axiom(Axiom { named: None, tag: None, expr: expr }));
+            // provenance: the datatype's resolve axiom (it has no :qid to fall back on)
+            let dt_ident = crate::sst_to_air::dt_to_air_ident(&ctx.name_ctxt, dt);
+            let tag = air::def::ProvenanceTag::Axiom(Arc::new(format!("{}resolved", dt_ident)));
+            let axiom = Arc::new(DeclX::Axiom(Axiom { named: None, tag: Some(tag), expr: expr }));
 
             decl_commands.push(Arc::new(CommandX::Global(axiom)));
         }
