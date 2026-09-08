@@ -67,11 +67,6 @@ fn loc(node: &Node) -> usize {
     node.span.end_line - node.span.start_line + 1
 }
 
-/// Number of leading `::` segments two paths share.
-fn shared_prefix(a: &str, b: &str) -> usize {
-    a.split("::").zip(b.split("::")).take_while(|(x, y)| x == y).count()
-}
-
 fn summary(reports: &[Report], graph: &Graph) -> String {
     let mut out = String::new();
     let crates: Vec<String> =
@@ -148,18 +143,7 @@ fn summary(reports: &[Report], graph: &Graph) -> String {
         writeln!(out, "\nunreachable verified exec functions:").unwrap();
     }
     for f in unreachable {
-        // A reachable, unverified function with the same name in the same
-        // crate suggests a "verified twin"; the closest one is the best guess
-        let twin = graph
-            .nodes
-            .values()
-            .filter(|g| graph.is_reachable(g) && !g.is_verified_exec() && g.name() == f.name())
-            .map(|g| (shared_prefix(&g.def_path, &f.def_path), g))
-            .filter(|(shared, _)| *shared >= 1)
-            .max_by_key(|(shared, _)| *shared)
-            .map(|(_, g)| format!("   (same name reachable: {})", g.def_path))
-            .unwrap_or_default();
-        writeln!(out, "  {}:{}   {}{}", f.span.file, f.span.start_line, f.name(), twin).unwrap();
+        writeln!(out, "  {}:{}   {}", f.span.file, f.span.start_line, f.name()).unwrap();
     }
 
     let unused: Vec<&Node> = specs.iter().copied().filter(|n| !graph.is_reachable(n)).collect();
@@ -246,14 +230,14 @@ mod tests {
     }
 
     #[test]
-    fn summary_names_the_twin() {
+    fn summary_lists_unreachable_verified_exec() {
         let (reports, graph) = graph();
         let text = summary(&reports, &graph);
         assert!(
             text.contains("verified exec functions:      3   reachable:      2  (66%)"),
             "{text}"
         );
-        assert!(text.contains("  x.rs:1   inc   (same name reachable: lib::inc)"), "{text}");
+        assert!(text.contains("unreachable verified exec functions:\n  x.rs:1   inc\n"), "{text}");
         assert!(
             text.contains("  lib               2/2    fns       6/6      LoC     1/1    specs"),
             "{text}"
