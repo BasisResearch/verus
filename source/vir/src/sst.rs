@@ -31,6 +31,28 @@ pub struct BndInfo {
     pub user: Option<BndInfoUser>,
 }
 
+/// What a hypothesis axiom of a function's query is; recorded per `HypId`
+/// so `hyp_k` in a solver reply can be shown as source.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HypKind {
+    /// A `requires` clause of the function being verified
+    Requires,
+    /// The type invariant of a parameter or local
+    TypeInvariant,
+    /// The fuel setting for the query (`fuel_defaults`, or the reveal/hide set)
+    Fuel,
+    /// A trait bound of the function's type parameters
+    TraitBound,
+}
+
+/// Source of one hypothesis axiom, keyed in `GlobalCtx::hyp_map` by function
+/// and `HypId` (its index in the function's vector).
+#[derive(Clone, Debug)]
+pub struct HypInfo {
+    pub span: Span,
+    pub kind: HypKind,
+}
+
 // For AssertBy, this records the LocalDecl vars that correspond to the VarBinders
 // (used by sst_elaborate.rs and poly.rs)
 pub type AssertByLocals = Option<Arc<Vec<VarIdent>>>;

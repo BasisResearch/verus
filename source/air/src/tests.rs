@@ -2283,6 +2283,9 @@ fn accessor_identifying_2() {
 fn assert_id_roundtrip() {
     let text = r#"(check-valid
   (declare-const x Int)
+  (axiom hyp_0 (> x 3))
+  (axiom hyp_1 (! (>= x 0) :named req_nonneg))
+  (axiom (< x 100))
   (block
     (assume (> x 3))
     (assert aid_2 ("assertion failed") () (> x 2))
@@ -2301,6 +2304,20 @@ fn assert_id_roundtrip() {
         CommandX::CheckValid(query) => query.clone(),
         other => panic!("expected check-valid, got {:?}", other),
     };
+    // the hypothesis tags arrived on the local axioms
+    let tags: Vec<Option<String>> = query
+        .local
+        .iter()
+        .filter_map(|d| match &**d {
+            crate::ast::DeclX::Axiom(a) => Some(a.tag.as_ref().map(|t| t.to_symbol())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        tags,
+        vec![Some("hyp_0".to_string()), Some("hyp_1".to_string()), None],
+        "tags read back from the axiom declarations"
+    );
     // the ids arrived
     match &*query.assertion {
         crate::ast::StmtX::Block(stmts) => {

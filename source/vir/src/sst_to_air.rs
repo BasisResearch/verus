@@ -2242,7 +2242,12 @@ fn stm_to_stmts(ctx: &Ctx, state: &mut State, stm: &Stm) -> Result<Vec<Stmt>, Vi
             for (x, typ) in typ_inv_vars.iter() {
                 let typ_inv = typ_invariant(ctx, typ, &ident_var(&suffix_local_unique_id(x)));
                 if let Some(expr) = typ_inv {
-                    local.push(mk_unnamed_axiom(expr));
+                    local.push(mk_hyp_axiom(
+                        ctx,
+                        &stm.span,
+                        crate::sst::HypKind::TypeInvariant,
+                        expr,
+                    ));
                 }
             }
 
@@ -2765,7 +2770,7 @@ fn loop_to_stmts(
         for (x, typ) in typ_inv_vars.iter() {
             let typ_inv = typ_invariant(ctx, typ, &ident_var(&suffix_local_unique_id(x)));
             if let Some(expr) = typ_inv {
-                local.push(mk_unnamed_axiom(expr));
+                local.push(mk_hyp_axiom(ctx, &stm.span, crate::sst::HypKind::TypeInvariant, expr));
             }
         }
 
@@ -3020,7 +3025,21 @@ fn byte_string_indices_to_air(ctx: &Ctx, lit: Arc<Vec<u8>>) -> Expr {
     Arc::new(ExprX::Multi(MultiOp::And, Arc::new(facts)))
 }
 
-fn set_fuel(ctx: &Ctx, local: &mut Vec<Decl>, hidden: &Vec<Fun>) {
+/// A hypothesis axiom of the current function's query, tagged `hyp_k` with
+/// `k` the next free index for the function, and its source recorded in
+/// `GlobalCtx::hyp_map`. Falls back to an untagged axiom outside a function.
+pub(crate) fn mk_hyp_axiom(ctx: &Ctx, span: &Span, kind: crate::sst::HypKind, expr: Expr) -> Decl {
+    let Some(fun) = ctx.fun.as_ref().map(|f| f.current_fun.clone()) else {
+        return mk_unnamed_axiom(expr);
+    };
+    let mut hyp_map = ctx.global.hyp_map.borrow_mut();
+    let hyps = hyp_map.entry(fun).or_insert_with(Vec::new);
+    let id = air::def::HypId(hyps.len() as u64);
+    hyps.push(crate::sst::HypInfo { span: span.clone(), kind });
+    air::ast_util::mk_tagged_axiom(air::def::ProvenanceTag::Hyp(id), expr)
+}
+
+fn set_fuel(ctx: &Ctx, span: &Span, local: &mut Vec<Decl>, hidden: &Vec<Fun>) {
     let fuel_expr = if hidden.len() == 0 {
         str_var(&FUEL_DEFAULTS)
     } else {
@@ -3053,7 +3072,7 @@ fn set_fuel(ctx: &Ctx, local: &mut Vec<Decl>, hidden: &Vec<Fun>) {
         let or = Arc::new(ExprX::Multi(air::ast::MultiOp::Or, Arc::new(disjuncts)));
         mk_bind_expr(&bind, &or)
     };
-    local.push(mk_unnamed_axiom(fuel_expr));
+    local.push(mk_hyp_axiom(ctx, span, crate::sst::HypKind::Fuel, fuel_expr));
 }
 
 fn mk_static_prelude(ctx: &Ctx, statics: &Vec<Fun>) -> Vec<Stmt> {
@@ -3132,7 +3151,7 @@ pub(crate) fn body_stm_to_air(
         });
     }
 
-    set_fuel(ctx, &mut local_shared, hidden);
+    set_fuel(ctx, func_span, &mut local_shared, hidden);
 
     let initial_sid = Arc::new("0_entry".to_string());
 
@@ -3156,7 +3175,7 @@ pub(crate) fn body_stm_to_air(
 
     for e in crate::traits::trait_bounds_to_air(ctx, typ_bounds) {
         // The outer query already has this in reqs, but inner queries need it separately:
-        local_shared.push(Arc::new(DeclX::Axiom(air::ast::Axiom { named: None, expr: e })));
+        local_shared.push(mk_hyp_axiom(ctx, func_span, crate::sst::HypKind::TraitBound, e));
     }
 
     let mut local = local_shared.clone();
@@ -3202,7 +3221,12 @@ pub(crate) fn body_stm_to_air(
         for param in params.iter() {
             let typ_inv = typ_invariant(ctx, &param.x.typ, &ident_var(&param.x.name.lower()));
             if let Some(expr) = typ_inv {
-                local.push(mk_unnamed_axiom(expr));
+                local.push(mk_hyp_axiom(
+                    ctx,
+                    &param.span,
+                    crate::sst::HypKind::TypeInvariant,
+                    expr,
+                ));
             }
         }
     }
@@ -3210,7 +3234,7 @@ pub(crate) fn body_stm_to_air(
     for req in reqs.iter() {
         let expr_ctxt = &ExprCtxt::new_mode(ExprMode::BodyPre);
         let e = exp_to_expr(ctx, &req, expr_ctxt)?;
-        local.push(mk_unnamed_axiom(e));
+        local.push(mk_hyp_axiom(ctx, &req.span, crate::sst::HypKind::Requires, e));
     }
 
     if is_integer_ring {

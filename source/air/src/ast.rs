@@ -243,6 +243,8 @@ pub enum StmtX {
 #[derive(Debug)]
 pub struct Axiom {
     pub named: Option<Ident>,
+    /// Provenance tag put on the wire as `:assert-id` (see `def::ProvenanceTag`)
+    pub tag: Option<crate::def::ProvenanceTag>,
     pub expr: Expr,
 }
 

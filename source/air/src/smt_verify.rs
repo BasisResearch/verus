@@ -107,7 +107,7 @@ pub(crate) fn smt_add_decl<'ctx>(context: &mut Context, decl: &Decl) {
             context.smt_log.log_decl(decl);
         }
         DeclX::Var(_, _) => {}
-        DeclX::Axiom(Axiom { named, expr }) => {
+        DeclX::Axiom(Axiom { named, tag, expr }) => {
             let expr = elim_zero_args_expr(expr);
             let mut infos: Vec<AssertionInfo> = Vec::new();
             let mut axiom_infos: Vec<AxiomInfo> = Vec::new();
@@ -120,7 +120,8 @@ pub(crate) fn smt_add_decl<'ctx>(context: &mut Context, decl: &Decl) {
                     .expect("internal error: duplicate assert_info");
                 smt_add_decl(context, &info.decl);
             }
-            context.smt_log.log_assert(named, &labeled_expr);
+            let tag = if context.emit_assert_ids { tag } else { &None };
+            context.smt_log.log_assert(named, tag, &labeled_expr);
         }
     }
 }
@@ -217,7 +218,7 @@ pub(crate) fn smt_check_assertion<'ctx>(
     }
 
     if let Some(disabled_expr) = disabled_expr {
-        context.smt_log.log_assert(&None, &disabled_expr);
+        context.smt_log.log_assert(&None, &None, &disabled_expr);
     }
 
     match context.solver {
@@ -477,7 +478,7 @@ fn smt_get_model(
                 // Disable this label in subsequent check-sat calls to get additional errors
                 info.disabled = true;
                 let disable_label = mk_not(&ident_var(&info.label));
-                context.smt_log.log_assert(&None, &disable_label);
+                context.smt_log.log_assert(&None, &None, &disable_label);
 
                 break;
             }
@@ -567,7 +568,7 @@ pub(crate) fn smt_check_query<'ctx>(
 
     // check assertion
     let not_expr = Arc::new(ExprX::Unary(UnaryOp::Not, labeled_assertion));
-    context.smt_log.log_assert(&None, &not_expr);
+    context.smt_log.log_assert(&None, &None, &not_expr);
 
     let rlimit_count_2 = if matches!(context.solver, SmtSolver::Z3) {
         let rlimit_count = match smt_get_rlimit_count(context) {

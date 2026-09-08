@@ -797,9 +797,9 @@ pub(crate) fn simplify_decl(ctxt: &mut Context, decl: &Decl) -> (Vec<Decl>, Decl
         DeclX::Const(..) => decl.clone(),
         DeclX::Fun(..) => decl.clone(),
         DeclX::Var(..) => decl.clone(),
-        DeclX::Axiom(Axiom { named, expr }) => {
+        DeclX::Axiom(Axiom { named, tag, expr }) => {
             let (_, expr, _) = simplify_expr(ctxt, &mut state, expr);
-            Arc::new(DeclX::Axiom(Axiom { named: named.clone(), expr }))
+            Arc::new(DeclX::Axiom(Axiom { named: named.clone(), tag: tag.clone(), expr }))
         }
     };
     (state.generated_decls, decl)

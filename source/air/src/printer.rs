@@ -510,11 +510,17 @@ impl Printer {
     }
 
     pub fn axiom_to_node(&self, axiom: &Axiom) -> Node {
-        let Axiom { named, expr } = axiom;
-        if let Some(named) = named {
-            nodes!(axiom ({str_to_node("!")} {self.expr_to_node(expr)} {str_to_node(":named")} {str_to_node(named)}))
+        let Axiom { named, tag, expr } = axiom;
+        let body = if let Some(named) = named {
+            nodes!({str_to_node("!")} {self.expr_to_node(expr)} {str_to_node(":named")} {str_to_node(named)})
         } else {
-            nodes!(axiom {self.expr_to_node(expr)})
+            self.expr_to_node(expr)
+        };
+        // a provenance tag prints first: (axiom hyp_1 e)
+        if let Some(tag) = tag {
+            nodes!(axiom {Node::Atom(tag.to_symbol())} {body})
+        } else {
+            nodes!(axiom { body })
         }
     }
 

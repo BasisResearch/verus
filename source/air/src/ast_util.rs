@@ -306,7 +306,12 @@ pub fn mk_sub(e1: &Expr, e2: &Expr) -> Expr {
 }
 
 pub fn mk_unnamed_axiom(expr: Expr) -> Decl {
-    Arc::new(DeclX::Axiom(Axiom { named: None, expr: expr.clone() }))
+    Arc::new(DeclX::Axiom(Axiom { named: None, tag: None, expr: expr.clone() }))
+}
+
+/// An unnamed axiom carrying a provenance tag.
+pub fn mk_tagged_axiom(tag: crate::def::ProvenanceTag, expr: Expr) -> Decl {
+    Arc::new(DeclX::Axiom(Axiom { named: None, tag: Some(tag), expr }))
 }
 
 pub fn mk_bit_vec<S: ToString>(n: S, w: u32) -> Expr {

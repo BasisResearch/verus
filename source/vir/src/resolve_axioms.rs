@@ -316,7 +316,7 @@ fn resolve_datatype_axiom(ctx: &Ctx, dt: &Dt) -> Vec<Command> {
             let expr_ctxt = ExprCtxt::new_mode(ExprMode::Spec);
             let expr = crate::sst_to_air::exp_to_expr(ctx, &forall, &expr_ctxt).unwrap();
 
-            let axiom = Arc::new(DeclX::Axiom(Axiom { named: None, expr: expr }));
+            let axiom = Arc::new(DeclX::Axiom(Axiom { named: None, tag: None, expr: expr }));
 
             decl_commands.push(Arc::new(CommandX::Global(axiom)));
         }

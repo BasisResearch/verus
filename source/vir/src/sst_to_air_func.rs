@@ -223,6 +223,7 @@ pub(crate) fn broadcast_forall_group_axioms(
             } else {
                 None
             },
+            tag: None,
             expr: imply,
         }));
 
@@ -1002,6 +1003,7 @@ pub fn func_axioms_to_air(
                     } else {
                         None
                     },
+                    tag: None,
                     expr: fuel_imply,
                 }));
                 decl_commands.push(Arc::new(CommandX::Global(axiom)));
