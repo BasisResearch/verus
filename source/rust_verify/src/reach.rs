@@ -1,9 +1,9 @@
-//! Static reachability of verified code.
+//! Static reachability of verified code: the per-crate extraction.
 //!
-//! Walks the typed HIR to build a call graph, marks everything reachable from
-//! the crate's entry points, and joins that with what Verus knows about each
-//! function (mode, verified, external_body, proxy). The result is written as
-//! JSON; rendering is done by `tools/verus-reach`.
+//! Walks the typed HIR of every body in the crate and writes a report with
+//! the crate's functions, labeled from VIR (mode, verified, external_body,
+//! proxy), and the call edges out of every body. The reports of all crates
+//! are merged and searched by `tools/verus-reach`.
 
 use crate::attributes::{GhostBlockAttr, get_ghost_block_opt};
 use crate::context::Context;
@@ -11,41 +11,14 @@ use crate::verus_items::VerusItem;
 use rustc_hir::def::{DefKind, Res};
 use rustc_hir::def_id::{CRATE_DEF_ID, DefId, LOCAL_CRATE, LocalDefId};
 use rustc_hir::intravisit::{self, Visitor};
-use rustc_hir::{Expr, ExprKind};
+use rustc_hir::{BodyId, Expr, ExprKind};
 use rustc_middle::ty::{TyCtxt, TypeckResults};
-use rustc_session::config::CrateType;
-use serde::Serialize;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap};
+use verus_reach::{Node, Report, SCHEMA_VERSION, Span};
 use vir::ast::{Function, Krate, Mode, Path};
 
-#[derive(Serialize)]
-struct Report {
-    schema_version: u32,
-    #[serde(rename = "crate")]
-    krate: String,
-    roots: Vec<String>,
-    functions: Vec<FunctionReport>,
-}
-
-#[derive(Serialize)]
-struct FunctionReport {
-    def_path: String,
-    span: SpanReport,
-    mode: String,
-    verified: bool,
-    external_body: bool,
-    proxy: bool,
-    reachable: bool,
-}
-
-#[derive(Serialize)]
-struct SpanReport {
-    file: String,
-    start_line: usize,
-    end_line: usize,
-}
-
-/// Collects the definitions referenced by one HIR body.
+/// Collects the definitions referenced by one body, including the bodies of
+/// closures and inline consts nested in it.
 struct Callees<'a, 'tcx> {
     ctxt: &'a Context<'tcx>,
     typeck: &'tcx TypeckResults<'tcx>,
@@ -53,6 +26,13 @@ struct Callees<'a, 'tcx> {
 }
 
 impl<'a, 'tcx> Visitor<'tcx> for Callees<'a, 'tcx> {
+    fn visit_nested_body(&mut self, id: BodyId) {
+        let tcx = self.ctxt.tcx;
+        let outer = std::mem::replace(&mut self.typeck, tcx.typeck(tcx.hir_body_owner_def_id(id)));
+        self.visit_body(tcx.hir_body(id));
+        self.typeck = outer;
+    }
+
     fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {
         if self.is_ghost(expr) {
             return;
@@ -62,7 +42,6 @@ impl<'a, 'tcx> Visitor<'tcx> for Callees<'a, 'tcx> {
             ExprKind::Struct(qpath, ..) => {
                 self.visit_res(self.typeck.qpath_res(qpath, expr.hir_id))
             }
-            ExprKind::Closure(closure) => self.targets.push(closure.def_id.to_def_id()),
             _ => {}
         }
         // Method calls and overloaded operators
@@ -88,12 +67,10 @@ impl<'a, 'tcx> Callees<'a, 'tcx> {
         match &expr.kind {
             ExprKind::Call(Expr { kind: ExprKind::Path(qpath), hir_id, .. }, _) => {
                 match self.typeck.qpath_res(qpath, *hir_id) {
-                    Res::Def(_, def_id) => {
-                        matches!(
-                            self.ctxt.verus_items.id_to_name.get(&def_id),
-                            Some(VerusItem::Spec(_))
-                        )
-                    }
+                    Res::Def(_, def_id) => matches!(
+                        self.ctxt.verus_items.id_to_name.get(&def_id),
+                        Some(VerusItem::Spec(_))
+                    ),
                     _ => false,
                 }
             }
@@ -107,40 +84,9 @@ impl<'a, 'tcx> Callees<'a, 'tcx> {
 
 fn callees<'tcx>(ctxt: &Context<'tcx>, def_id: LocalDefId) -> Vec<DefId> {
     let tcx = ctxt.tcx;
-    let body = tcx.hir_body_owned_by(def_id);
     let mut visitor = Callees { ctxt, typeck: tcx.typeck(def_id), targets: vec![] };
-    visitor.visit_body(body);
+    visitor.visit_body(tcx.hir_body_owned_by(def_id));
     visitor.targets
-}
-
-/// Maps each trait method to the local impls of it. A call to a trait method
-/// is treated as a call to every impl, since HIR does not tell us which one runs.
-fn trait_impls<'tcx>(tcx: TyCtxt<'tcx>) -> HashMap<DefId, Vec<LocalDefId>> {
-    let mut impls: HashMap<DefId, Vec<LocalDefId>> = HashMap::new();
-    for impl_item in tcx.hir_crate_items(()).impl_items() {
-        let def_id = impl_item.owner_id.def_id;
-        if let Some(trait_item) = tcx.associated_item(def_id).trait_item_def_id() {
-            impls.entry(trait_item).or_default().push(def_id);
-        }
-    }
-    impls
-}
-
-/// Maps each local type to the methods of its trait impls. Upstream code
-/// (serde, `format!`, sorting, ...) calls these through the trait, which we
-/// cannot see, so once a type is used all of them count as reachable.
-fn type_trait_impls<'tcx>(tcx: TyCtxt<'tcx>) -> HashMap<LocalDefId, Vec<LocalDefId>> {
-    let mut impls: HashMap<LocalDefId, Vec<LocalDefId>> = HashMap::new();
-    for impl_item in tcx.hir_crate_items(()).impl_items() {
-        let def_id = impl_item.owner_id.def_id;
-        let impl_def = tcx.local_parent(def_id);
-        if tcx.impl_opt_trait_ref(impl_def).is_some() {
-            if let Some(adt) = self_type(tcx, impl_def) {
-                impls.entry(adt).or_default().push(def_id);
-            }
-        }
-    }
-    impls
 }
 
 fn self_type<'tcx>(tcx: TyCtxt<'tcx>, impl_def: LocalDefId) -> Option<LocalDefId> {
@@ -167,35 +113,22 @@ fn type_of_def<'tcx>(tcx: TyCtxt<'tcx>, mut def_id: DefId) -> Option<LocalDefId>
     }
 }
 
-fn reachable<'tcx>(ctxt: &Context<'tcx>, roots: &[LocalDefId]) -> HashSet<LocalDefId> {
+/// Edges that stand in for dispatch we cannot see. A call to a trait method
+/// may run any local impl of it. Upstream code (serde, `format!`, sorting,
+/// ...) may call any trait impl of a local type once the type is used.
+fn dispatch_edges<'tcx>(ctxt: &Context<'tcx>) -> Vec<(DefId, LocalDefId)> {
     let tcx = ctxt.tcx;
-    let impls = trait_impls(tcx);
-    let type_impls = type_trait_impls(tcx);
-    let mut seen: HashSet<LocalDefId> = roots.iter().copied().collect();
-    let mut seen_types: HashSet<LocalDefId> = HashSet::new();
-    let mut worklist: Vec<LocalDefId> = roots.to_vec();
-    while let Some(def_id) = worklist.pop() {
-        if !tcx.hir_maybe_body_owned_by(def_id).is_some() {
-            continue;
-        }
-        for target in callees(ctxt, def_id) {
-            let mut next: Vec<LocalDefId> = target.as_local().into_iter().collect();
-            if let Some(impl_fns) = impls.get(&target) {
-                next.extend(impl_fns);
-            }
-            if let Some(adt) = type_of_def(tcx, target) {
-                if seen_types.insert(adt) {
-                    next.extend(type_impls.get(&adt).into_iter().flatten());
-                }
-            }
-            for n in next {
-                if seen.insert(n) {
-                    worklist.push(n);
-                }
+    let mut edges = vec![];
+    for impl_item in tcx.hir_crate_items(()).impl_items() {
+        let def_id = impl_item.owner_id.def_id;
+        if let Some(trait_item) = tcx.associated_item(def_id).trait_item_def_id() {
+            edges.push((trait_item, def_id));
+            if let Some(adt) = self_type(tcx, tcx.local_parent(def_id)) {
+                edges.push((adt.to_def_id(), def_id));
             }
         }
     }
-    seen
+    edges
 }
 
 /// A function written by the user (not generated by a macro).
@@ -204,150 +137,133 @@ fn is_user_fn<'tcx>(tcx: TyCtxt<'tcx>, def_id: LocalDefId) -> bool {
         && !tcx.source_span(def_id).from_expansion()
 }
 
-fn def_path<'tcx>(ctxt: &Context<'tcx>, def_id: LocalDefId) -> Option<Path> {
-    crate::rust_to_vir_base::def_id_to_vir_path_option(
-        ctxt.tcx,
-        Some(&ctxt.verus_items),
-        def_id.to_def_id(),
+fn has_own_body<'tcx>(tcx: TyCtxt<'tcx>, def_id: LocalDefId) -> bool {
+    matches!(
+        tcx.def_kind(def_id),
+        DefKind::Fn
+            | DefKind::AssocFn
+            | DefKind::Const { .. }
+            | DefKind::AssocConst { .. }
+            | DefKind::Static { .. }
     )
 }
 
-/// Glob match where `*` matches any substring.
-fn glob_matches(pattern: &str, name: &str) -> bool {
-    let mut rest = name;
-    let parts: Vec<&str> = pattern.split('*').collect();
-    for (i, part) in parts.iter().enumerate() {
-        let first = i == 0;
-        let last = i == parts.len() - 1;
-        match (first, last) {
-            (true, true) => return rest == *part,
-            (true, false) => {
-                if !rest.starts_with(part) {
-                    return false;
-                }
-                rest = &rest[part.len()..];
-            }
-            (false, true) => return rest.ends_with(part),
-            (false, false) => match rest.find(part) {
-                Some(pos) => rest = &rest[pos + part.len()..],
-                None => return false,
-            },
-        }
-    }
-    true
+fn vir_path<'tcx>(ctxt: &Context<'tcx>, def_id: DefId) -> Option<Path> {
+    crate::rust_to_vir_base::def_id_to_vir_path_option(ctxt.tcx, Some(&ctxt.verus_items), def_id)
 }
 
-/// Default roots: `main`, and every exported item of a library crate.
-/// `--reach-root` adds roots; `--reach-roots-exclude` removes default ones.
-fn roots<'tcx>(ctxt: &Context<'tcx>, names: &HashMap<LocalDefId, String>) -> Vec<LocalDefId> {
-    let tcx = ctxt.tcx;
-    let args = &ctxt.cmd_line_args;
-    let is_lib = !tcx.crate_types().contains(&CrateType::Executable);
-    let exported = tcx.effective_visibilities(());
-    let mut roots = vec![];
-    for (&def_id, name) in names {
-        if args.reach_root.contains(name) {
-            roots.push(def_id);
-            continue;
-        }
-        let is_main = tcx.local_parent(def_id) == CRATE_DEF_ID
-            && tcx.item_name(def_id.to_def_id()).as_str() == "main";
-        let is_default = is_main || (is_lib && exported.is_exported(def_id));
-        if is_default && !args.reach_roots_exclude.iter().any(|g| glob_matches(g, name)) {
-            roots.push(def_id);
-        }
-    }
-    roots
+/// Canonical name, the same from every crate that refers to the item.
+fn id_of<'tcx>(ctxt: &Context<'tcx>, def_id: DefId) -> Option<String> {
+    let path = vir_path(ctxt, def_id)?;
+    let krate = vir::def::krate_to_string_ignore_stable_id(&path.krate);
+    let segments: Vec<&str> = path.segments.iter().map(|s| s.as_str()).collect();
+    Some(format!("{krate}::{}", segments.join("::")))
 }
 
-fn span_report<'tcx>(tcx: TyCtxt<'tcx>, def_id: LocalDefId) -> SpanReport {
+fn span<'tcx>(tcx: TyCtxt<'tcx>, def_id: LocalDefId) -> Span {
     let source_map = tcx.sess.source_map();
     let span = tcx.source_span(def_id);
     let lo = source_map.lookup_char_pos(span.lo());
     let hi = source_map.lookup_char_pos(span.hi());
     let file = source_map.filename_for_diagnostics(&lo.file.name).to_string();
-    SpanReport { file, start_line: lo.line, end_line: hi.line }
+    Span { file, start_line: lo.line, end_line: hi.line }
 }
 
-/// Runs the analysis and writes the JSON report.
-/// Returns an error message if the report cannot be written or the
-/// `--reach-fail-under` threshold is not met.
+/// Labels come from VIR: a function is verified iff Verus built a VIR function for it.
+struct Labels<'a> {
+    by_name: HashMap<&'a Path, &'a Function>,
+    by_proxy: HashMap<&'a Path, &'a Function>,
+}
+
+impl<'a> Labels<'a> {
+    fn new(krate: &'a Krate) -> Labels<'a> {
+        let functions = krate.functions.iter();
+        Labels {
+            by_name: functions.clone().map(|f| (&f.x.name.path, f)).collect(),
+            by_proxy: functions.filter_map(|f| f.x.proxy.as_ref().map(|p| (&p.x, f))).collect(),
+        }
+    }
+}
+
+fn node<'tcx>(ctxt: &Context<'tcx>, labels: &Labels, def_id: LocalDefId, id: String) -> Node {
+    let tcx = ctxt.tcx;
+    let path = vir_path(ctxt, def_id.to_def_id()).expect("path of a named function");
+    let (function, proxy) = match (labels.by_name.get(&path), labels.by_proxy.get(&path)) {
+        (Some(f), _) => (Some(*f), false),
+        (None, Some(f)) => (Some(*f), true),
+        (None, None) => (None, false),
+    };
+    let mode = function.map(|f| f.x.mode).unwrap_or(Mode::Exec);
+    // The target of an `assume_specification` has a spec but an unchecked body
+    let external_body =
+        function.map_or(false, |f| f.x.attrs.is_external_body || (!proxy && f.x.proxy.is_some()));
+    Node {
+        id,
+        def_path: vir::ast_util::path_as_friendly_rust_name(&path),
+        span: span(tcx, def_id),
+        mode: format!("{mode}"),
+        verified: function.is_some(),
+        external_body,
+        proxy,
+        exported: tcx.effective_visibilities(()).is_exported(def_id),
+    }
+}
+
+/// Writes this crate's report to the `--reach` directory.
 pub(crate) fn run<'tcx>(ctxt: &Context<'tcx>, krate: &Krate) -> Result<(), String> {
     let tcx = ctxt.tcx;
-    let args = &ctxt.cmd_line_args;
+    let labels = Labels::new(krate);
 
-    // Local functions, named the way Verus names them
-    let mut names: HashMap<LocalDefId, String> = HashMap::new();
-    let mut paths: HashMap<LocalDefId, Path> = HashMap::new();
+    let mut nodes = vec![];
+    let mut edges: BTreeSet<(String, String)> = BTreeSet::new();
+    let mut main = None;
     for def_id in tcx.hir_body_owners() {
-        if is_user_fn(tcx, def_id) {
-            if let Some(path) = def_path(ctxt, def_id) {
-                names.insert(def_id, vir::ast_util::path_as_friendly_rust_name(&path));
-                paths.insert(def_id, path);
+        if !has_own_body(tcx, def_id) {
+            continue;
+        }
+        let Some(id) = id_of(ctxt, def_id.to_def_id()) else { continue };
+        for target in callees(ctxt, def_id) {
+            edges.extend(id_of(ctxt, target).map(|t| (id.clone(), t)));
+            if let Some(adt) = type_of_def(tcx, target) {
+                edges.extend(id_of(ctxt, adt.to_def_id()).map(|t| (id.clone(), t)));
             }
         }
-    }
-
-    let roots = roots(ctxt, &names);
-    let reachable = reachable(ctxt, &roots);
-
-    // Labels come from VIR: a function is verified iff Verus built a VIR function for it.
-    let verified: HashMap<&Path, &Function> =
-        krate.functions.iter().map(|f| (&f.x.name.path, f)).collect();
-    let proxies: HashMap<&Path, &Function> =
-        krate.functions.iter().filter_map(|f| f.x.proxy.as_ref().map(|p| (&p.x, f))).collect();
-
-    let mut functions = vec![];
-    for (def_id, path) in &paths {
-        let (function, proxy) = match (verified.get(path), proxies.get(path)) {
-            (Some(f), _) => (Some(*f), false),
-            (None, Some(f)) => (Some(*f), true),
-            (None, None) => (None, false),
-        };
-        let mode = function.map(|f| f.x.mode).unwrap_or(Mode::Exec);
-        // The target of an `assume_specification` has a spec but an unchecked body
-        let external_body =
-            function.map(|f| f.x.attrs.is_external_body || (!proxy && f.x.proxy.is_some()));
-        functions.push(FunctionReport {
-            def_path: names[def_id].clone(),
-            span: span_report(tcx, *def_id),
-            mode: format!("{mode}"),
-            verified: function.is_some(),
-            external_body: external_body.unwrap_or(false),
-            proxy,
-            reachable: reachable.contains(def_id),
-        });
-    }
-    functions.sort_by(|a, b| a.def_path.cmp(&b.def_path));
-
-    let mut root_names: Vec<String> = roots.iter().map(|r| names[r].clone()).collect();
-    root_names.sort();
-    let report = Report {
-        schema_version: 1,
-        krate: tcx.crate_name(LOCAL_CRATE).to_string(),
-        roots: root_names,
-        functions,
-    };
-
-    let output = args.reach.as_ref().expect("--reach");
-    let json = serde_json::to_string_pretty(&report).expect("serialize reach report");
-    std::fs::write(output, json).map_err(|e| format!("could not write {output}: {e}"))?;
-
-    if let Some(threshold) = args.reach_fail_under {
-        let counted: Vec<&FunctionReport> = report
-            .functions
-            .iter()
-            .filter(|f| f.verified && f.mode == "exec" && !f.external_body && !f.proxy)
-            .collect();
-        let reached = counted.iter().filter(|f| f.reachable).count();
-        let pct =
-            if counted.is_empty() { 100.0 } else { 100.0 * reached as f64 / counted.len() as f64 };
-        if pct < threshold {
-            return Err(format!(
-                "{reached} of {} verified exec functions reachable ({pct:.0}%), below --reach-fail-under {threshold}",
-                counted.len()
-            ));
+        if is_user_fn(tcx, def_id) {
+            if tcx.local_parent(def_id) == CRATE_DEF_ID
+                && tcx.item_name(def_id.to_def_id()).as_str() == "main"
+            {
+                main = Some(id.clone());
+            }
+            nodes.push(node(ctxt, &labels, def_id, id));
         }
     }
-    Ok(())
+    for (from, to) in dispatch_edges(ctxt) {
+        if let (Some(from), Some(to)) = (id_of(ctxt, from), id_of(ctxt, to.to_def_id())) {
+            edges.insert((from, to));
+        }
+    }
+    nodes.sort_by(|a, b| a.id.cmp(&b.id));
+
+    let crate_type = if tcx.sess.opts.test {
+        "test"
+    } else if tcx.crate_types().contains(&rustc_session::config::CrateType::Executable) {
+        "bin"
+    } else {
+        "lib"
+    };
+    let report = Report {
+        schema_version: SCHEMA_VERSION,
+        krate: tcx.crate_name(LOCAL_CRATE).to_string(),
+        crate_type: crate_type.to_string(),
+        main,
+        nodes,
+        edges: edges.into_iter().collect(),
+    };
+
+    let dir = std::path::Path::new(ctxt.cmd_line_args.reach.as_ref().expect("--reach"));
+    let path = dir.join(report.file_name());
+    let json = serde_json::to_string_pretty(&report).expect("serialize reach report");
+    std::fs::create_dir_all(dir)
+        .and_then(|()| std::fs::write(&path, json))
+        .map_err(|e| format!("could not write {}: {e}", path.display()))
 }

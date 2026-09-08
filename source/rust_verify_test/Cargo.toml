@@ -10,12 +10,14 @@ air = { workspace = true }
 vir = { workspace = true }
 
 [dev-dependencies]
+glob = { workspace = true }
 regex = { workspace = true }
 rust_verify_test_macros = { workspace = true }
 serde_json = { workspace = true }
 serde = { workspace = true }
 tempfile = { workspace = true }
 toml = { workspace = true }
+verus-reach = { workspace = true }
 yansi = { workspace = true }
 
 [features]
