@@ -264,9 +264,11 @@ pub(crate) fn smt_check_assertion<'ctx>(
         SmtSolver::Cvc5 => {
             // `reproducible-resource-limit` (alias of `rlimit-per`) is one of the few
             // cvc5 options that may be set after initialisation; 0 means no limit.
-            context
-                .smt_log
-                .log_set_option("reproducible-resource-limit", &context.rlimit.to_string());
+            // Provenance mode spends more of the budget on proof bookkeeping during
+            // search (measured on toydb), so it gets twice as much.
+            let budget =
+                if context.provenance { context.rlimit.saturating_mul(2) } else { context.rlimit };
+            context.smt_log.log_set_option("reproducible-resource-limit", &budget.to_string());
         }
     }
 
@@ -601,9 +603,11 @@ pub(crate) fn smt_check_query<'ctx>(
         smt_add_decl(context, &info.decl);
     }
 
-    // check assertion
+    // check assertion; the negated query is the one assertion every goal lives in
     let not_expr = Arc::new(ExprX::Unary(UnaryOp::Not, labeled_assertion));
-    context.smt_log.log_assert(&None, &None, &not_expr);
+    let query_tag =
+        if context.emit_assert_ids { Some(crate::def::ProvenanceTag::Query) } else { None };
+    context.smt_log.log_assert(&None, &query_tag, &not_expr);
 
     let rlimit_count_2 = if matches!(context.solver, SmtSolver::Z3) {
         let rlimit_count = match smt_get_rlimit_count(context) {

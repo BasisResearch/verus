@@ -38,6 +38,8 @@ pub const ASSERT_ID_PREFIX: &str = "aid_";
 pub const AXIOM_TAG_PREFIX: &str = "ax_";
 /// Prefix of a hypothesis tag: `hyp_7` is `HypId(7)`.
 pub const HYP_TAG_PREFIX: &str = "hyp_";
+/// The tag of the negated query assertion, which holds every goal.
+pub const QUERY_TAG: &str = "query";
 
 /// Identifies one hypothesis (`requires` clause or straight-line `assume`)
 /// within a query; minted per function in `ast_to_sst`.
@@ -53,6 +55,8 @@ pub enum ProvenanceTag {
     Axiom(Ident),
     /// A hypothesis of the function being checked.
     Hyp(HypId),
+    /// The negated query itself: the one assertion all the goals live in.
+    Query,
 }
 
 /// `[3, 1, 2]` -> `aid_3_1_2`. An empty id prints as `aid_`.
@@ -92,6 +96,7 @@ impl ProvenanceTag {
                 format!("{}{}", AXIOM_TAG_PREFIX, sanitize_symbol(ident))
             }
             ProvenanceTag::Hyp(HypId(n)) => format!("{}{}", HYP_TAG_PREFIX, n),
+            ProvenanceTag::Query => QUERY_TAG.to_string(),
         }
     }
 
@@ -100,6 +105,9 @@ impl ProvenanceTag {
     /// input, and prelude axioms are untagged until they are given tags).
     /// An axiom identifier that contained `:` comes back sanitised.
     pub fn from_symbol(s: &str) -> Option<ProvenanceTag> {
+        if s == QUERY_TAG {
+            return Some(ProvenanceTag::Query);
+        }
         if let Some(id) = symbol_to_assert_id(s) {
             return Some(ProvenanceTag::Assert(id));
         }
@@ -157,6 +165,7 @@ mod provenance_tests {
             ProvenanceTag::Hyp(HypId(7)),
             ProvenanceTag::Axiom(Arc::new("fixture!ax_f_nonneg.".to_string())),
             ProvenanceTag::Axiom(Arc::new("fuel%vstd!seq.axiom_seq_len.".to_string())),
+            ProvenanceTag::Query,
         ];
         for t in tags.iter() {
             let s = t.to_symbol();
@@ -165,6 +174,7 @@ mod provenance_tests {
         assert_eq!(tags[0].to_symbol(), "aid_5_0");
         assert_eq!(tags[1].to_symbol(), "hyp_7");
         assert_eq!(tags[2].to_symbol(), "ax_fixture!ax_f_nonneg.");
+        assert_eq!(tags[4].to_symbol(), "query");
     }
 
     #[test]

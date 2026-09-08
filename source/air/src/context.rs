@@ -121,6 +121,11 @@ pub struct Context {
     /// Axioms that arrived without a tag and without a `:qid` to derive one
     /// from are tagged `ax_anon_<n>` with this counter.
     pub(crate) anon_axiom_count: u64,
+    /// Provenance mode (`-V provenance`): cvc5 runs with preprocessing
+    /// proofs, twice the per-query budget, and is asked for the sources of
+    /// each query. Off by default; it perturbs the search, so plain runs stay
+    /// the verdict of record.
+    pub(crate) provenance: bool,
 }
 
 impl Context {
@@ -189,6 +194,7 @@ impl Context {
             check_valid_used: false,
             emit_assert_ids: matches!(solver, SmtSolver::Cvc5),
             anon_axiom_count: 0,
+            provenance: false,
             solver,
         };
         context.axiom_infos.push_scope(false);
@@ -205,7 +211,8 @@ impl Context {
         // Only start the smt process if there are queries to run
         if self.smt_process.is_none() {
             let transcript_log = self.smt_transcript_log.take();
-            self.smt_process = Some(SmtProcess::launch(&self.solver, transcript_log));
+            self.smt_process =
+                Some(SmtProcess::launch(&self.solver, transcript_log, self.provenance));
         }
         self.smt_process.as_mut().unwrap()
     }
@@ -266,6 +273,15 @@ impl Context {
     /// their provenance ids on the wire. Defaults to the solver being cvc5.
     pub fn set_emit_assert_ids(&mut self, enabled: bool) {
         self.emit_assert_ids = enabled;
+    }
+
+    /// Turn provenance mode on (cvc5 only; must precede the first query).
+    /// Under it the solver is launched with `--proof-mode=pp-only`, each
+    /// query runs with twice the budget, and the sources are requested.
+    pub fn set_provenance(&mut self, enabled: bool) {
+        assert!(matches!(self.state, ContextState::NotStarted));
+        assert!(!enabled || matches!(self.solver, SmtSolver::Cvc5));
+        self.provenance = enabled;
     }
 
     pub fn set_profile_with_logfile_name(&mut self, file_name: String) {
@@ -422,6 +438,12 @@ impl Context {
                     self.log_set_z3_param("trace_file_name", &profile_logfile_name);
                 }
                 self.blank_line();
+                if self.provenance {
+                    self.comment(&format!(
+                        "provenance mode: cvc5 args {}",
+                        crate::smt_process::PROVENANCE_ARGS.join(" ")
+                    ));
+                }
                 self.comment("AIR prelude");
                 self.smt_log.log_node(&node!((declare-sort {str_to_node(crate::def::FUNCTION)} 0)));
                 self.blank_line();

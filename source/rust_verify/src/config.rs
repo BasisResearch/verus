@@ -123,6 +123,7 @@ pub struct ArgsX {
     pub check_api_safety: bool,
     pub no_bv_simplify: bool,
     pub no_assert_ids: bool,
+    pub provenance: bool,
 }
 
 impl ArgsX {
@@ -171,6 +172,7 @@ impl ArgsX {
             check_api_safety: Default::default(),
             no_bv_simplify: Default::default(),
             no_assert_ids: Default::default(),
+            provenance: Default::default(),
         }
     }
 }
@@ -417,6 +419,7 @@ pub fn parse_args_with_imports(
     const EXTENDED_CHECK_API_SAFETY: &str = "check-api-safety";
     const EXTENDED_NO_BV_SIMPLIFY: &str = "no-bv-simplify";
     const EXTENDED_NO_ASSERT_IDS: &str = "no-assert-ids";
+    const EXTENDED_PROVENANCE: &str = "provenance";
     const EXTENDED_KEYS: &[(&str, &str)] = &[
         (EXTENDED_IGNORE_UNEXPECTED_SMT, "Ignore unexpected SMT output"),
         (EXTENDED_DEBUG, "Enable debugging of proof failures"),
@@ -433,6 +436,10 @@ pub fn parse_args_with_imports(
         (
             EXTENDED_NO_ASSERT_IDS,
             "Do not put provenance ids (:assert-id, labelled goal names) on the wire to cvc5",
+        ),
+        (
+            EXTENDED_PROVENANCE,
+            "Provenance mode: run cvc5 with preprocessing proofs and twice the rlimit, and record which hypotheses, axioms and quantifiers each query used (diagnostic; verdicts may differ from a plain run)",
         ),
         (EXTENDED_ALLOW_INLINE_AIR, "Allow the POTENTIALLY UNSOUND use of inline_air_stmt"),
         (
@@ -859,7 +866,18 @@ pub fn parse_args_with_imports(
         check_api_safety: extended.contains_key(EXTENDED_CHECK_API_SAFETY),
         no_bv_simplify: extended.contains_key(EXTENDED_NO_BV_SIMPLIFY),
         no_assert_ids: extended.contains_key(EXTENDED_NO_ASSERT_IDS),
+        provenance: extended.contains_key(EXTENDED_PROVENANCE),
     };
+
+    if args.provenance && !matches!(args.solver, SmtSolver::Cvc5) {
+        error(
+            "-V provenance requires cvc5 (it is unavailable for vstd and internal test mode)"
+                .to_string(),
+        );
+    }
+    if args.provenance && args.no_assert_ids {
+        error("-V provenance and -V no-assert-ids exclude each other".to_string());
+    }
 
     if args.compile && args.no_erasure_check {
         error("--compile and --no-erasure-check are mutually exclusive".to_string())

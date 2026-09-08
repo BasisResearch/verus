@@ -1164,6 +1164,9 @@ impl Verifier {
         if self.args.no_assert_ids {
             air_context.set_emit_assert_ids(false);
         }
+        if self.args.provenance {
+            air_context.set_provenance(true);
+        }
         air_context.set_ignore_unexpected_smt(self.args.ignore_unexpected_smt);
         air_context.set_debug(self.args.debugger);
         if let Some(profile_file_name) = profile_file_name {
