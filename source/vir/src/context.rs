@@ -70,6 +70,14 @@ pub struct GlobalCtx {
     pub(crate) warning_ctx: Arc<WarningCtx>,
     /// Connects quantifier identifiers to the original expression
     pub qid_map: RefCell<HashMap<String, BndInfo>>,
+    /// Per function, the hypothesis axioms of its queries in `HypId` order
+    /// (`hyp_k` is `hyp_map[fun][k]`)
+    pub hyp_map: RefCell<HashMap<Fun, Vec<crate::sst::HypInfo>>>,
+    /// Tag symbol -> owner (friendly name) for the axioms vir tags explicitly:
+    /// a function's broadcast, definition and fuel-group axioms, a
+    /// datatype's resolve axiom. Axioms tagged from a `:qid` join through
+    /// `qid_map` instead.
+    pub axiom_owners: RefCell<HashMap<String, String>>,
     pub(crate) rlimit: f32,
     pub(crate) interpreter_log: Arc<std::sync::Mutex<Option<File>>>,
     pub(crate) func_call_graph_log: Arc<std::sync::Mutex<Option<FuncCallGraphLogFiles>>>,
@@ -714,6 +722,8 @@ impl GlobalCtx {
             }
         }
         let qid_map = RefCell::new(HashMap::new());
+        let hyp_map = RefCell::new(HashMap::new());
+        let axiom_owners = RefCell::new(HashMap::new());
 
         let datatype_graph = crate::recursive_types::build_datatype_graph(krate, &mut span_infos);
 
@@ -731,6 +741,8 @@ impl GlobalCtx {
             trait_impl_to_extensions,
             warning_ctx,
             qid_map,
+            hyp_map,
+            axiom_owners,
             rlimit,
             interpreter_log,
             arch: krate.arch.word_bits,
@@ -748,6 +760,8 @@ impl GlobalCtx {
         let chosen_triggers: std::cell::RefCell<Vec<ChosenTriggers>> =
             std::cell::RefCell::new(Vec::new());
         let qid_map = RefCell::new(HashMap::new());
+        let hyp_map = RefCell::new(HashMap::new());
+        let axiom_owners = RefCell::new(HashMap::new());
 
         GlobalCtx {
             chosen_triggers,
@@ -763,6 +777,8 @@ impl GlobalCtx {
             trait_impl_to_extensions: self.trait_impl_to_extensions.clone(),
             warning_ctx: self.warning_ctx.clone(),
             qid_map,
+            hyp_map,
+            axiom_owners,
             rlimit: self.rlimit,
             interpreter_log,
             arch: self.arch,
@@ -778,6 +794,8 @@ impl GlobalCtx {
 
     pub fn merge(&mut self, other: Self) {
         self.qid_map.borrow_mut().extend(other.qid_map.into_inner());
+        self.hyp_map.borrow_mut().extend(other.hyp_map.into_inner());
+        self.axiom_owners.borrow_mut().extend(other.axiom_owners.into_inner());
         self.chosen_triggers.borrow_mut().extend(other.chosen_triggers.into_inner());
     }
 

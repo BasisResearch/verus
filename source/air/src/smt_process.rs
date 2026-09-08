@@ -43,6 +43,12 @@ pub struct SmtProcess {
 const DONE: &str = "<<DONE>>";
 const DONE_QUOTED: &str = "\"<<DONE>>\"";
 
+/// Extra cvc5 arguments in provenance mode. `pp-only` keeps the preprocessing
+/// record the source walk reads (theory and SAT proofs stay off; it still
+/// costs resource units during search, which is why the budget is doubled
+/// and the mode is opt-in).
+pub const PROVENANCE_ARGS: &[&str] = &["--proof-mode=pp-only", "--dump-instantiations"];
+
 /// A separate thread writes data to the SMT solver over a pipe.
 /// (Rust's documentation says you need a separate thread; otherwise, it lets the pipes deadlock.)
 pub(crate) fn writer_thread(requests: Receiver<Vec<u8>>, mut smt_pipe_stdin: ChildStdin) {
@@ -100,22 +106,31 @@ fn reader_thread(
 }
 
 impl SmtProcess {
-    pub fn launch(solver: &SmtSolver, transcript_log: Option<Box<dyn std::io::Write>>) -> Self {
+    pub fn launch(
+        solver: &SmtSolver,
+        transcript_log: Option<Box<dyn std::io::Write>>,
+        provenance: bool,
+    ) -> Self {
         let solver_info = SolverInfo::new(solver);
+        let mut args: Vec<&str> = match solver {
+            SmtSolver::Z3 => vec!["-smt2", "-in"],
+            // No `--rlimit` here: cvc5's `--rlimit` is a *cumulative* budget for the
+            // whole process, so it starved every function after the first few seconds.
+            // The per-query budget is set in-band before each check-sat (smt_verify.rs).
+            SmtSolver::Cvc5 => vec![
+                "--no-interactive",    // We don't need a human interface
+                "--produce-models",    // Needed for error reporting
+                "--quant-dsplit=none", // Recommended by Andrew Reynolds (@ajreynol)
+                "--no-cbqi",           // Recommended by Andrew Reynolds (@ajreynol)
+                "--user-pat=strict",   // Recommended by Andrew Reynolds (@ajreynol)
+            ],
+        };
+        if provenance {
+            assert!(matches!(solver, SmtSolver::Cvc5));
+            args.extend_from_slice(PROVENANCE_ARGS);
+        }
         let mut child = match std::process::Command::new(solver_info.executable())
-            .args(match solver {
-                SmtSolver::Z3 => vec!["-smt2", "-in"],
-                // No `--rlimit` here: cvc5's `--rlimit` is a *cumulative* budget for the
-                // whole process, so it starved every function after the first few seconds.
-                // The per-query budget is set in-band before each check-sat (smt_verify.rs).
-                SmtSolver::Cvc5 => vec![
-                    "--no-interactive",    // We don't need a human interface
-                    "--produce-models",    // Needed for error reporting
-                    "--quant-dsplit=none", // Recommended by Andrew Reynolds (@ajreynol)
-                    "--no-cbqi",           // Recommended by Andrew Reynolds (@ajreynol)
-                    "--user-pat=strict",   // Recommended by Andrew Reynolds (@ajreynol)
-                ],
-            })
+            .args(args)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .spawn()

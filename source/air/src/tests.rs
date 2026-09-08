@@ -2275,3 +2275,108 @@ fn accessor_identifying_2() {
         )
     )
 }
+
+/// Parse a `check-valid` written with assert ids, print it, and require the
+/// printed form to read back to the same nodes: the `.air` log must carry
+/// the ids and stay a valid AIR input.
+#[test]
+fn assert_id_roundtrip() {
+    let text = r#"(check-valid
+  (declare-const x Int)
+  (axiom hyp_0 (> x 3))
+  (axiom hyp_1 (! (>= x 0) :named req_nonneg))
+  (axiom (< x 100))
+  (block
+    (assume (> x 3))
+    (assert aid_2 ("assertion failed") () (> x 2))
+    (assert aid_5_1 ("assertion failed") () (location aid_5_1_0 ("nested") () (>= x 0)))
+    (assert ("no id keeps the old form") () (> x 1))
+  ))"#;
+    // (a bare `(assert e)` is left out: it reads back with an empty message,
+    // which prints as `("")`, a pre-existing asymmetry unrelated to ids)
+    let mut sise_parser = sise::Parser::new(text);
+    let node = sise::parse_tree(&mut sise_parser).expect("sise");
+    let message_interface = std::sync::Arc::new(crate::messages::AirMessageInterface {});
+    let parser = Parser::new(message_interface.clone());
+    let commands = parser.nodes_to_commands(&[node.clone()]).expect("parses");
+    assert_eq!(commands.len(), 1);
+    let query = match &*commands[0] {
+        CommandX::CheckValid(query) => query.clone(),
+        other => panic!("expected check-valid, got {:?}", other),
+    };
+    // the hypothesis tags arrived on the local axioms
+    let tags: Vec<Option<String>> = query
+        .local
+        .iter()
+        .filter_map(|d| match &**d {
+            crate::ast::DeclX::Axiom(a) => Some(a.tag.as_ref().map(|t| t.to_symbol())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        tags,
+        vec![Some("hyp_0".to_string()), Some("hyp_1".to_string()), None],
+        "tags read back from the axiom declarations"
+    );
+    // the ids arrived
+    match &*query.assertion {
+        crate::ast::StmtX::Block(stmts) => {
+            let ids: Vec<Option<Vec<u64>>> = stmts
+                .iter()
+                .map(|s| match &**s {
+                    crate::ast::StmtX::Assert(id, _, _, _) => id.as_ref().map(|i| (**i).clone()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                ids,
+                vec![None, Some(vec![2]), Some(vec![5, 1]), None],
+                "ids read back from the assert statements"
+            );
+        }
+        other => panic!("expected block, got {:?}", other),
+    }
+    // and print back to exactly what was read
+    let printer = crate::printer::Printer::new(message_interface.clone(), false, SmtSolver::Cvc5);
+    let printed = printer.query_to_node(&query);
+    assert_eq!(printed, node);
+}
+
+/// The extra lines provenance mode adds to a check-sat batch: instantiation
+/// dump forms and the tags-only sources reply, in the order cvc5 prints them.
+#[test]
+fn provenance_reply_parses() {
+    let lines: Vec<String> = [
+        "(instantiations prelude_unbox_box_int",
+        "  ( 2 )",
+        "  ( x! )",
+        ")",
+        "(instantiations user_fixture__check_4",
+        "  ( (I 2) )",
+        ")",
+        "((ax_fixture!ax_f_nonneg.) (hyp_1) (hyp_3) (query hyp_2 hyp_0) (query))",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    let info = crate::smt_verify::parse_provenance_lines(&lines);
+    assert_eq!(
+        info.instantiations,
+        vec![
+            ("prelude_unbox_box_int".to_string(), vec!["(2)".to_string(), "(x!)".to_string()]),
+            ("user_fixture__check_4".to_string(), vec!["((I 2))".to_string()]),
+        ]
+    );
+    assert_eq!(info.sources.len(), 5);
+    assert_eq!(info.sources[3], vec!["query", "hyp_2", "hyp_0"]);
+    assert!(info.unparsed.is_empty());
+    // no instantiations: cvc5 prints `none`; an empty reply is empty
+    let info =
+        crate::smt_verify::parse_provenance_lines(&vec!["none".to_string(), "()".to_string()]);
+    assert!(info.instantiations.is_empty() && info.sources.is_empty() && info.unparsed.is_empty());
+    let info = crate::smt_verify::parse_provenance_lines(&vec![]);
+    assert!(info.instantiations.is_empty() && info.sources.is_empty());
+    // something unforeseen is kept, not failed on
+    let info = crate::smt_verify::parse_provenance_lines(&vec!["(surprise 1 2)".to_string()]);
+    assert_eq!(info.unparsed, vec!["(surprise 1 2)".to_string()]);
+}

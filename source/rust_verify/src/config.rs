@@ -35,6 +35,13 @@ pub const SMT_TRANSCRIPT_FILE_SUFFIX: &str = ".smt_transcript";
 pub const PROFILE_FILE_SUFFIX: &str = ".profile";
 pub const SINGULAR_FILE_SUFFIX: &str = ".singular";
 pub const TRIGGERS_FILE_SUFFIX: &str = ".triggers";
+/// `--log-all` side files for the provenance joins: `:qid` -> function,
+/// owning tag, span; and `hyp_k` -> function, kind, span.
+pub const QIDS_FILE_SUFFIX: &str = ".qids";
+pub const HYPS_FILE_SUFFIX: &str = ".hyps";
+/// `--log-all` under `-V provenance`: per function, what cvc5 reported for
+/// each query (tags, instantiations), as JSON.
+pub const PROVENANCE_FILE_SUFFIX: &str = ".provenance.json";
 pub const IMPL_NAMES_SUFFIX: &str = ".impl_names";
 pub const CALL_GRAPH_FILE_SUFFIX_FULL_INITIAL: &str = "-call-graph-full-initial.dot";
 pub const CALL_GRAPH_FILE_SUFFIX_FULL_SIMPLIFIED: &str = "-call-graph-full-simplified.dot";
@@ -118,6 +125,8 @@ pub struct ArgsX {
     pub axiom_usage_info: bool,
     pub check_api_safety: bool,
     pub no_bv_simplify: bool,
+    pub no_assert_ids: bool,
+    pub provenance: bool,
 }
 
 impl ArgsX {
@@ -165,6 +174,8 @@ impl ArgsX {
             axiom_usage_info: Default::default(),
             check_api_safety: Default::default(),
             no_bv_simplify: Default::default(),
+            no_assert_ids: Default::default(),
+            provenance: Default::default(),
         }
     }
 }
@@ -410,6 +421,8 @@ pub fn parse_args_with_imports(
     const EXTENDED_AXIOM_USAGE_INFO: &str = "axiom-usage-info";
     const EXTENDED_CHECK_API_SAFETY: &str = "check-api-safety";
     const EXTENDED_NO_BV_SIMPLIFY: &str = "no-bv-simplify";
+    const EXTENDED_NO_ASSERT_IDS: &str = "no-assert-ids";
+    const EXTENDED_PROVENANCE: &str = "provenance";
     const EXTENDED_KEYS: &[(&str, &str)] = &[
         (EXTENDED_IGNORE_UNEXPECTED_SMT, "Ignore unexpected SMT output"),
         (EXTENDED_DEBUG, "Enable debugging of proof failures"),
@@ -423,6 +436,14 @@ pub fn parse_args_with_imports(
             "Always collect prover performance data, but don't generate output reports",
         ),
         (EXTENDED_CVC5, "Accepted for compatibility: this fork always uses cvc5"),
+        (
+            EXTENDED_NO_ASSERT_IDS,
+            "Do not put provenance ids (:assert-id, labelled goal names) on the wire to cvc5",
+        ),
+        (
+            EXTENDED_PROVENANCE,
+            "Provenance mode: run cvc5 with preprocessing proofs and twice the rlimit, and record which hypotheses, axioms and quantifiers each query used (diagnostic; verdicts may differ from a plain run)",
+        ),
         (EXTENDED_ALLOW_INLINE_AIR, "Allow the POTENTIALLY UNSOUND use of inline_air_stmt"),
         (
             EXTENDED_USE_CRATE_NAME,
@@ -847,7 +868,19 @@ pub fn parse_args_with_imports(
         axiom_usage_info: extended.contains_key(EXTENDED_AXIOM_USAGE_INFO),
         check_api_safety: extended.contains_key(EXTENDED_CHECK_API_SAFETY),
         no_bv_simplify: extended.contains_key(EXTENDED_NO_BV_SIMPLIFY),
+        no_assert_ids: extended.contains_key(EXTENDED_NO_ASSERT_IDS),
+        provenance: extended.contains_key(EXTENDED_PROVENANCE),
     };
+
+    if args.provenance && !matches!(args.solver, SmtSolver::Cvc5) {
+        error(
+            "-V provenance requires cvc5 (it is unavailable for vstd and internal test mode)"
+                .to_string(),
+        );
+    }
+    if args.provenance && args.no_assert_ids {
+        error("-V provenance and -V no-assert-ids exclude each other".to_string());
+    }
 
     if args.compile && args.no_erasure_check {
         error("--compile and --no-erasure-check are mutually exclusive".to_string())

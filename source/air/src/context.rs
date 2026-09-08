@@ -42,6 +42,21 @@ pub enum UsageInfo {
     UsedAxioms(Vec<Ident>),
 }
 
+/// What cvc5 reported about one `check-sat` in provenance mode: the tag
+/// lists of `(get-assertion-sources :tags-only)` and the instantiation dump.
+/// Tags are the symbols from the wire (`hyp_3`, `ax_...`, `query`, `?`);
+/// the join back to source happens in Verus.
+#[derive(Debug, Clone, Default)]
+pub struct ProvenanceInfo {
+    /// One entry per distinct tag list with at least one real tag.
+    pub sources: Vec<Vec<String>>,
+    /// Instantiated quantifiers, by `:qid`, with each instantiation vector
+    /// printed as one string.
+    pub instantiations: Vec<(String, Vec<String>)>,
+    /// Reply lines the parser did not recognise, kept rather than failed on.
+    pub unparsed: Vec<String>,
+}
+
 #[derive(Debug)]
 pub enum ValidityResult {
     Valid(UsageInfo),
@@ -115,6 +130,19 @@ pub struct Context {
     pub(crate) usage_info_enabled: bool,
     pub(crate) check_valid_used: bool,
     pub(crate) solver: SmtSolver,
+    /// Put provenance ids on the wire: goal labels carry their AssertId.
+    /// On by default under cvc5, which reads them back; z3 would only warn.
+    pub(crate) emit_assert_ids: bool,
+    /// Axioms that arrived without a tag and without a `:qid` to derive one
+    /// from are tagged `ax_anon_<n>` with this counter.
+    pub(crate) anon_axiom_count: u64,
+    /// Provenance mode (`-V provenance`): cvc5 runs with preprocessing
+    /// proofs, twice the per-query budget, and is asked for the sources of
+    /// each query. Off by default; it perturbs the search, so plain runs stay
+    /// the verdict of record.
+    pub(crate) provenance: bool,
+    /// The provenance of the last `check-sat`, until the caller takes it.
+    pub(crate) last_provenance: Option<ProvenanceInfo>,
 }
 
 impl Context {
@@ -181,6 +209,10 @@ impl Context {
             single_check_query: false,
             usage_info_enabled: false,
             check_valid_used: false,
+            emit_assert_ids: matches!(solver, SmtSolver::Cvc5),
+            anon_axiom_count: 0,
+            provenance: false,
+            last_provenance: None,
             solver,
         };
         context.axiom_infos.push_scope(false);
@@ -197,7 +229,8 @@ impl Context {
         // Only start the smt process if there are queries to run
         if self.smt_process.is_none() {
             let transcript_log = self.smt_transcript_log.take();
-            self.smt_process = Some(SmtProcess::launch(&self.solver, transcript_log));
+            self.smt_process =
+                Some(SmtProcess::launch(&self.solver, transcript_log, self.provenance));
         }
         self.smt_process.as_mut().unwrap()
     }
@@ -252,6 +285,27 @@ impl Context {
 
     pub fn set_expected_solver_version(&mut self, version: String) {
         self.expected_solver_version = Some(version);
+    }
+
+    /// Whether goal labels (and, later, other top-level assertions) carry
+    /// their provenance ids on the wire. Defaults to the solver being cvc5.
+    pub fn set_emit_assert_ids(&mut self, enabled: bool) {
+        self.emit_assert_ids = enabled;
+    }
+
+    /// The provenance cvc5 reported for the most recent `check-sat`, if any;
+    /// each call returns it once.
+    pub fn take_provenance(&mut self) -> Option<ProvenanceInfo> {
+        self.last_provenance.take()
+    }
+
+    /// Turn provenance mode on (cvc5 only; must precede the first query).
+    /// Under it the solver is launched with `--proof-mode=pp-only`, each
+    /// query runs with twice the budget, and the sources are requested.
+    pub fn set_provenance(&mut self, enabled: bool) {
+        assert!(matches!(self.state, ContextState::NotStarted));
+        assert!(!enabled || matches!(self.solver, SmtSolver::Cvc5));
+        self.provenance = enabled;
     }
 
     pub fn set_profile_with_logfile_name(&mut self, file_name: String) {
@@ -408,6 +462,12 @@ impl Context {
                     self.log_set_z3_param("trace_file_name", &profile_logfile_name);
                 }
                 self.blank_line();
+                if self.provenance {
+                    self.comment(&format!(
+                        "provenance mode: cvc5 args {}",
+                        crate::smt_process::PROVENANCE_ARGS.join(" ")
+                    ));
+                }
                 self.comment("AIR prelude");
                 self.smt_log.log_node(&node!((declare-sort {str_to_node(crate::def::FUNCTION)} 0)));
                 self.blank_line();

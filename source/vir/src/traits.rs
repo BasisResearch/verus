@@ -1071,7 +1071,8 @@ pub fn trait_bound_axioms(ctx: &Ctx, traits: &Vec<Trait>) -> Commands {
             );
             let imply = air::ast_util::mk_implies(&tr_bound, &air::ast_util::mk_and(&typ_bounds));
             let forall = mk_bind_expr(&bind, &imply);
-            let axiom = Arc::new(DeclX::Axiom(air::ast::Axiom { named: None, expr: forall }));
+            let axiom =
+                Arc::new(DeclX::Axiom(air::ast::Axiom { named: None, tag: None, expr: forall }));
             commands.push(Arc::new(CommandX::Global(axiom)));
         }
     }

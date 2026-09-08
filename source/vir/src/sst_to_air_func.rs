@@ -217,12 +217,19 @@ pub(crate) fn broadcast_forall_group_axioms(
     if member_fuels.len() > 0 {
         // (axiom (=> (fuel_bool_default fuel%group) (and ... (fuel_bool_default fuel%member) ...)))
         let imply = mk_implies(&fuel_group, &mk_and(&member_fuels));
+        let tag = air::def::ProvenanceTag::Axiom(fun_to_air_ident(&ctx.name_ctxt, &group.x.name));
+        crate::sst_to_air::record_qid_owner(ctx, &imply, &tag);
+        ctx.global
+            .axiom_owners
+            .borrow_mut()
+            .insert(tag.to_symbol(), crate::ast_util::fun_as_friendly_rust_name(&group.x.name));
         let axiom = Arc::new(DeclX::Axiom(Axiom {
             named: if ctx.global.axiom_usage_info {
                 Some(fun_to_air_ident(&ctx.name_ctxt, &group.x.name))
             } else {
                 None
             },
+            tag: Some(tag),
             expr: imply,
         }));
 
@@ -995,13 +1002,22 @@ pub fn func_axioms_to_air(
                     let fuel_bool = str_apply(FUEL_BOOL, &vec![ident_var(&id_fuel)]);
                     mk_implies(&fuel_bool, &expr)
                 };
-                // let axiom = mk_unnamed_axiom(fuel_imply);
+                let tag = air::def::ProvenanceTag::Axiom(fun_to_air_ident(
+                    &ctx.name_ctxt,
+                    &function.x.name,
+                ));
+                crate::sst_to_air::record_qid_owner(ctx, &fuel_imply, &tag);
+                ctx.global.axiom_owners.borrow_mut().insert(
+                    tag.to_symbol(),
+                    crate::ast_util::fun_as_friendly_rust_name(&function.x.name),
+                );
                 let axiom = Arc::new(DeclX::Axiom(Axiom {
                     named: if ctx.global.axiom_usage_info {
                         Some(fun_to_air_ident(&ctx.name_ctxt, &function.x.name))
                     } else {
                         None
                     },
+                    tag: Some(tag),
                     expr: fuel_imply,
                 }));
                 decl_commands.push(Arc::new(CommandX::Global(axiom)));

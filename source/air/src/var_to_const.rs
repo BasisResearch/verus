@@ -231,9 +231,10 @@ pub(crate) fn lower_query(query: &Query) -> (Query, Snapshots, Vec<Decl>) {
     let mut local_vars: Vec<Decl> = Vec::new();
 
     for decl in local.iter() {
-        if let DeclX::Axiom(Axiom { named, expr }) = &**decl {
+        if let DeclX::Axiom(Axiom { named, tag, expr }) = &**decl {
             let decl_x = DeclX::Axiom(Axiom {
                 named: named.clone(),
+                tag: tag.clone(),
                 expr: lower_expr(&versions, &snapshots, expr),
             });
             decls.push(Arc::new(decl_x));

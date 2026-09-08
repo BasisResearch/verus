@@ -207,6 +207,20 @@ impl Parser {
                         let expr = self.node_to_expr(e)?;
                         return Ok(Arc::new(ExprX::LabeledAssertion(None, error, filter, expr)));
                     }
+                    [Node::Atom(s), Node::Atom(id), Node::List(nodes), Node::List(filter), e]
+                        if s == "location"
+                            && filter.len() <= 1
+                            && crate::def::symbol_to_assert_id(id).is_some() =>
+                    {
+                        let assert_id = crate::def::symbol_to_assert_id(id);
+                        let error =
+                            self.message_interface.from_labels(&self.nodes_to_labels(nodes)?);
+                        let filter = self.nodes_to_filter(filter)?;
+                        let expr = self.node_to_expr(e)?;
+                        return Ok(Arc::new(ExprX::LabeledAssertion(
+                            assert_id, error, filter, expr,
+                        )));
+                    }
                     [Node::Atom(s), Node::List(nodes), Node::List(filter), e]
                         if s == "axiom_location" && filter.len() <= 1 =>
                     {
@@ -680,6 +694,18 @@ impl Parser {
                     let expr = self.node_to_expr(&e)?;
                     Ok(Arc::new(StmtX::Assert(None, error, filter, expr)))
                 }
+                [Node::Atom(s), Node::Atom(id), Node::List(nodes), Node::List(filter), e]
+                    if s == "assert"
+                        && filter.len() <= 1
+                        && crate::def::symbol_to_assert_id(id).is_some() =>
+                {
+                    let assert_id = crate::def::symbol_to_assert_id(id);
+                    let labels = self.nodes_to_labels(nodes)?;
+                    let error = self.message_interface.from_labels(&labels);
+                    let filter = self.nodes_to_filter(filter)?;
+                    let expr = self.node_to_expr(&e)?;
+                    Ok(Arc::new(StmtX::Assert(assert_id, error, filter, expr)))
+                }
                 [Node::Atom(s), e] if s == "deadend" => {
                     let stmt = self.node_to_stmt(&e)?;
                     Ok(Arc::new(StmtX::DeadEnd(stmt)))
@@ -707,6 +733,23 @@ impl Parser {
 
     fn nodes_to_stmts(&self, nodes: &[Node]) -> Result<Stmts, String> {
         map_nodes_to_vec(nodes, &|n| self.node_to_stmt(n))
+    }
+
+    /// The body of an `(axiom ...)`: either an expression or
+    /// `(! <expr> :named <name>)`.
+    fn node_to_axiom_body(&self, axiom_node: &Node) -> Result<(Option<Ident>, Expr), String> {
+        let (e, named) = match axiom_node {
+            Node::List(nodes) if nodes.len() >= 2 => match &nodes[0] {
+                Node::Atom(s) if s == "!" => {
+                    let named = self.nodes_to_named(&nodes[2..])?;
+                    (&nodes[1], named)
+                }
+                _ => (axiom_node, None),
+            },
+            _ => (axiom_node, None),
+        };
+        let expr = self.node_to_expr(e)?;
+        Ok((named, expr))
     }
 
     fn node_to_decl(&self, node: &Node) -> Result<Decl, String> {
@@ -792,18 +835,15 @@ impl Parser {
                     Ok(Arc::new(DeclX::Var(Arc::new(x.clone()), typ)))
                 }
                 [Node::Atom(s), axiom_node] if s == "axiom" => {
-                    let (e, named) = match &axiom_node {
-                        Node::List(nodes) if nodes.len() >= 2 => match &nodes[0] {
-                            Node::Atom(s) if s == "!" => {
-                                let named = self.nodes_to_named(&nodes[2..])?;
-                                (&nodes[1], named)
-                            }
-                            _ => (axiom_node, None),
-                        },
-                        _ => (axiom_node, None),
-                    };
-                    let expr = self.node_to_expr(e)?;
-                    Ok(Arc::new(DeclX::Axiom(Axiom { named, expr })))
+                    let (named, expr) = self.node_to_axiom_body(axiom_node)?;
+                    Ok(Arc::new(DeclX::Axiom(Axiom { named, tag: None, expr })))
+                }
+                [Node::Atom(s), Node::Atom(t), axiom_node]
+                    if s == "axiom" && crate::def::ProvenanceTag::from_symbol(t).is_some() =>
+                {
+                    let tag = crate::def::ProvenanceTag::from_symbol(t);
+                    let (named, expr) = self.node_to_axiom_body(axiom_node)?;
+                    Ok(Arc::new(DeclX::Axiom(Axiom { named, tag, expr })))
                 }
                 _ => Err(format!("expected declaration, found: {}", node_to_string(node))),
             },

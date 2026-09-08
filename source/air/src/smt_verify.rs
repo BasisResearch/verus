@@ -42,7 +42,16 @@ fn label_asserts<'ctx>(
             _ => expr.clone(),
         },
         ExprX::LabeledAssertion(assert_id, error, filter, expr) => {
-            let label = Arc::new(PREFIX_LABEL.to_string() + &infos.len().to_string());
+            // %%location_label%%N, and under cvc5 %%location_label%%N_aid_<id>:
+            // the goal's provenance rides on the atom that is already on the
+            // wire. Everything downstream matches the label by this string.
+            let mut label_name = PREFIX_LABEL.to_string() + &infos.len().to_string();
+            if context.emit_assert_ids {
+                if let Some(id) = assert_id {
+                    label_name = label_name + "_" + &crate::def::assert_id_to_symbol(id);
+                }
+            }
+            let label = Arc::new(label_name);
             let decl = Arc::new(DeclX::Const(label.clone(), Arc::new(TypX::Bool)));
             let assertion_info = AssertionInfo {
                 assert_id: assert_id.clone(),
@@ -98,7 +107,7 @@ pub(crate) fn smt_add_decl<'ctx>(context: &mut Context, decl: &Decl) {
             context.smt_log.log_decl(decl);
         }
         DeclX::Var(_, _) => {}
-        DeclX::Axiom(Axiom { named, expr }) => {
+        DeclX::Axiom(Axiom { named, tag, expr }) => {
             let expr = elim_zero_args_expr(expr);
             let mut infos: Vec<AssertionInfo> = Vec::new();
             let mut axiom_infos: Vec<AxiomInfo> = Vec::new();
@@ -111,9 +120,45 @@ pub(crate) fn smt_add_decl<'ctx>(context: &mut Context, decl: &Decl) {
                     .expect("internal error: duplicate assert_info");
                 smt_add_decl(context, &info.decl);
             }
-            context.smt_log.log_assert(named, &labeled_expr);
+            let tag = if context.emit_assert_ids {
+                match tag {
+                    Some(tag) => Some(tag.clone()),
+                    None => Some(fallback_axiom_tag(context, &expr)),
+                }
+            } else {
+                None
+            };
+            context.smt_log.log_assert(named, &tag, &labeled_expr);
         }
     }
+}
+
+/// The `:qid` of the quantifier an axiom is, or guards: `(forall ...)`, or
+/// `(=> g (forall ...))` as fuel-guarded axioms are.
+fn axiom_qid(expr: &Expr) -> Option<Ident> {
+    match &**expr {
+        ExprX::Bind(bind, _) => match &**bind {
+            BindX::Quant(_, _, _, Some(qid)) => Some(qid.clone()),
+            _ => None,
+        },
+        ExprX::Binary(BinaryOp::Implies, _, rhs) => axiom_qid(rhs),
+        _ => None,
+    }
+}
+
+/// A provenance tag for an axiom the producer did not tag: its quantifier's
+/// `:qid` when it has one (Verus gives nearly every axiom one, and `qid_map`
+/// joins it back to source), else a fresh `ax_anon_<n>`.
+fn fallback_axiom_tag(context: &mut Context, expr: &Expr) -> crate::def::ProvenanceTag {
+    let ident = match axiom_qid(expr) {
+        Some(qid) => qid,
+        None => {
+            let n = context.anon_axiom_count;
+            context.anon_axiom_count += 1;
+            Arc::new(format!("anon_{}", n))
+        }
+    };
+    crate::def::ProvenanceTag::Axiom(ident)
 }
 
 impl SmtSolver {
@@ -208,7 +253,7 @@ pub(crate) fn smt_check_assertion<'ctx>(
     }
 
     if let Some(disabled_expr) = disabled_expr {
-        context.smt_log.log_assert(&None, &disabled_expr);
+        context.smt_log.log_assert(&None, &None, &disabled_expr);
     }
 
     match context.solver {
@@ -219,13 +264,20 @@ pub(crate) fn smt_check_assertion<'ctx>(
         SmtSolver::Cvc5 => {
             // `reproducible-resource-limit` (alias of `rlimit-per`) is one of the few
             // cvc5 options that may be set after initialisation; 0 means no limit.
-            context
-                .smt_log
-                .log_set_option("reproducible-resource-limit", &context.rlimit.to_string());
+            // Provenance mode spends more of the budget on proof bookkeeping during
+            // search (measured on toydb), so it gets twice as much.
+            let budget =
+                if context.provenance { context.rlimit.saturating_mul(2) } else { context.rlimit };
+            context.smt_log.log_set_option("reproducible-resource-limit", &budget.to_string());
         }
     }
 
     context.smt_log.log_word("check-sat");
+    if context.provenance {
+        // in the same batch: the tag lists arrive after the result and the
+        // instantiation dump, before the sentinel
+        context.smt_log.log_get_assertion_sources();
+    }
 
     // Run SMT solver
     let smt_run_start_time = std::time::Instant::now();
@@ -255,6 +307,7 @@ pub(crate) fn smt_check_assertion<'ctx>(
 
     // Process SMT results
     let mut unsat = None;
+    let mut provenance_lines: Vec<String> = Vec::new();
     for line in smt_output {
         if line == "unsat" {
             assert!(unsat == None);
@@ -265,6 +318,10 @@ pub(crate) fn smt_check_assertion<'ctx>(
         } else if line == "unknown" || line == "cvc5 interrupted by timeout." {
             assert!(unsat == None);
             unsat = Some(SmtOutput::Unknown);
+        } else if context.provenance {
+            // the instantiation dump and the sources reply; parsed below, never
+            // an UnexpectedOutput
+            provenance_lines.push(line);
         } else if context.ignore_unexpected_smt {
             diagnostics.report(&context.message_interface.bare(
                 crate::messages::MessageLevel::Warning,
@@ -283,6 +340,10 @@ pub(crate) fn smt_check_assertion<'ctx>(
         SmtSolver::Cvc5 => {
             context.smt_log.log_set_option("reproducible-resource-limit", "0");
         }
+    }
+
+    if context.provenance {
+        context.last_provenance = Some(parse_provenance_lines(&provenance_lines));
     }
 
     let unsat = unsat.expect("expected sat/unsat/unknown from SMT solver");
@@ -378,14 +439,72 @@ pub(crate) fn smt_check_assertion<'ctx>(
         }
         ResultDetermination::Undetermined(false) => {
             if context.single_check_query {
-                // one obligation: nothing to localize, report it at the query level
+                // one obligation: nothing to localize, report it at the query level,
+                // but keep the obligation's id when there is exactly one
+                let assert_id = sole_enabled_assert_id(&infos);
                 context.state = ContextState::FoundInvalid(infos, None);
-                ValidityResult::Invalid(None, None, None)
+                ValidityResult::Invalid(None, None, assert_id)
             } else {
                 smt_get_model(context, infos, air_model)
             }
         }
     }
+}
+
+/// Parse what provenance mode adds to a `check-sat` batch's output: the
+/// `--dump-instantiations` forms (`(instantiations <qid> (<terms>)...)`,
+/// `(skolem ...)`, or `none`) and the `(get-assertion-sources :tags-only)`
+/// reply (`((<tags>) ...)`). Anything else is kept verbatim in `unparsed`.
+pub(crate) fn parse_provenance_lines(lines: &Vec<String>) -> crate::context::ProvenanceInfo {
+    use sise::TreeNode as Node;
+    let mut info = crate::context::ProvenanceInfo::default();
+    if lines.is_empty() {
+        return info;
+    }
+    let text = format!("({})", lines.join("\n"));
+    let mut parser = sise::Parser::new(text.as_str());
+    let forms = match sise::parse_tree(&mut parser) {
+        Ok(Node::List(forms)) => forms,
+        _ => {
+            info.unparsed = lines.clone();
+            return info;
+        }
+    };
+    for form in forms {
+        match &form {
+            Node::Atom(a) if a == "none" => {}
+            Node::List(items) => match items.first() {
+                Some(Node::Atom(head)) if head == "instantiations" => {
+                    let qid = match items.get(1) {
+                        Some(Node::Atom(q)) => q.clone(),
+                        _ => {
+                            info.unparsed.push(crate::printer::node_to_string(&form));
+                            continue;
+                        }
+                    };
+                    let vectors = items[2..]
+                        .iter()
+                        .map(|v| crate::printer::node_to_string(v))
+                        .collect::<Vec<String>>();
+                    info.instantiations.push((qid, vectors));
+                }
+                Some(Node::Atom(head)) if head == "skolem" => {}
+                Some(Node::List(_)) | None if items.iter().all(|i| matches!(i, Node::List(_))) => {
+                    // the tags-only reply: a list of tag lists
+                    for tags in items.iter() {
+                        if let Node::List(tags) = tags {
+                            info.sources.push(
+                                tags.iter().map(|t| crate::printer::node_to_string(t)).collect(),
+                            );
+                        }
+                    }
+                }
+                _ => info.unparsed.push(crate::printer::node_to_string(&form)),
+            },
+            Node::Atom(_) => info.unparsed.push(crate::printer::node_to_string(&form)),
+        }
+    }
+    info
 }
 
 pub(crate) fn smt_get_rlimit_count(context: &mut Context) -> Result<u64, ValidityResult> {
@@ -433,6 +552,17 @@ pub(crate) fn smt_get_rlimit_count(context: &mut Context) -> Result<u64, Validit
     Ok(rlimit_count)
 }
 
+/// The id of the one labelled assertion still enabled in `infos`, when there
+/// is exactly one: the result paths that have no model to localise with can
+/// still name it.
+fn sole_enabled_assert_id(infos: &Vec<AssertionInfo>) -> Option<crate::ast::AssertId> {
+    let mut enabled = infos.iter().filter(|info| !info.disabled);
+    match (enabled.next(), enabled.next()) {
+        (Some(info), None) => info.assert_id.clone(),
+        _ => None,
+    }
+}
+
 fn smt_get_model(
     context: &mut Context,
     mut infos: Vec<AssertionInfo>,
@@ -449,8 +579,9 @@ fn smt_get_model(
 
     if smt_output.iter().any(|line| line.contains("model is not available")) {
         // when we don't use incremental solving, sometime the model is not available when the z3 result is unknown
+        let assert_id = sole_enabled_assert_id(&infos);
         context.state = ContextState::FoundInvalid(infos, None);
-        return ValidityResult::Invalid(None, None, None);
+        return ValidityResult::Invalid(None, None, assert_id);
     };
 
     let model =
@@ -468,7 +599,7 @@ fn smt_get_model(
                 // Disable this label in subsequent check-sat calls to get additional errors
                 info.disabled = true;
                 let disable_label = mk_not(&ident_var(&info.label));
-                context.smt_log.log_assert(&None, &disable_label);
+                context.smt_log.log_assert(&None, &None, &disable_label);
 
                 break;
             }
@@ -556,9 +687,11 @@ pub(crate) fn smt_check_query<'ctx>(
         smt_add_decl(context, &info.decl);
     }
 
-    // check assertion
+    // check assertion; the negated query is the one assertion every goal lives in
     let not_expr = Arc::new(ExprX::Unary(UnaryOp::Not, labeled_assertion));
-    context.smt_log.log_assert(&None, &not_expr);
+    let query_tag =
+        if context.emit_assert_ids { Some(crate::def::ProvenanceTag::Query) } else { None };
+    context.smt_log.log_assert(&None, &query_tag, &not_expr);
 
     let rlimit_count_2 = if matches!(context.solver, SmtSolver::Z3) {
         let rlimit_count = match smt_get_rlimit_count(context) {
