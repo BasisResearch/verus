@@ -54,6 +54,7 @@ itertools = "0.15.0"
 # kuchikiki has a shakey maintainability story, would be great to remove
 # it is transitively using an old version of html5ever and of rand (which has as security advisory)
 kuchikiki = "0.8.2"
+lcov = "0.8"
 num-bigint = { version = "0.5.1", features = ["serde"] }
 num-format = "0.4.4"
 num-traits= "0.2.16"

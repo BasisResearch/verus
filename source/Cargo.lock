@@ -1444,6 +1444,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "lcov"
+version = "0.8.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4dab4f1d99e0dd8008da0d3452bb71ce08e1645465c2accc124bcb599c6b3143"
+dependencies = [
+ "thiserror 2.0.19",
+]
+
+[[package]]
 name = "libbz2-rs-sys"
 version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3261,6 +3270,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "glob",
+ "lcov",
  "petgraph 0.6.5",
  "serde",
  "serde_json",

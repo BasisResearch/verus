@@ -1,39 +1,17 @@
 //! Renders the reports written by `verus --reach DIR`.
 //!
-//!   verus-reach summary DIR...     text summary (default)
-//!   verus-reach lcov DIR...        LCOV, for grcov, genhtml, Codecov, IDE gutters
+//!   verus-reach DIR...            text summary
+//!   verus-reach --lcov DIR...     LCOV, for grcov, genhtml, Codecov, IDE gutters
 //!
 //! Pass every crate's report (a directory of them, or files) so that calls
 //! across crates are followed.
 
-use clap::{Parser, Subcommand};
+use clap::Parser;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use verus_reach::{Graph, Node, Report, Roots};
 
 #[derive(Parser)]
-struct Cli {
-    #[command(subcommand)]
-    command: Option<Command>,
-    #[command(flatten)]
-    args: Args,
-}
-
-#[derive(Subcommand)]
-enum Command {
-    /// Text summary
-    Summary(Args),
-    /// LCOV trace file on stdout
-    Lcov {
-        #[command(flatten)]
-        args: Args,
-        /// Emit only verified exec functions
-        #[arg(long)]
-        only_verified_exec: bool,
-    },
-}
-
-#[derive(clap::Args, Clone)]
 struct Args {
     /// Report files or directories of reports
     #[arg(required = true)]
@@ -49,6 +27,12 @@ struct Args {
     /// functions are reachable
     #[arg(long)]
     fail_under: Option<f64>,
+    /// Write an LCOV trace file to stdout instead of the summary
+    #[arg(long)]
+    lcov: bool,
+    /// With --lcov, include only verified exec functions
+    #[arg(long)]
+    only_verified_exec: bool,
 }
 
 fn pct(part: usize, total: usize) -> u64 {
@@ -140,33 +124,25 @@ fn summary(reports: &[Report], graph: &Graph) {
 }
 
 fn lcov(graph: &Graph, only_verified_exec: bool) {
-    let mut by_file: BTreeMap<&str, Vec<&Node>> = BTreeMap::new();
-    for n in graph.nodes.values() {
-        if !only_verified_exec || n.is_verified_exec() {
-            by_file.entry(&n.span.file).or_default().push(n);
+    use lcov::report::section::{function, line};
+    let mut report = lcov::Report::new();
+    for n in graph.nodes.values().filter(|n| !only_verified_exec || n.is_verified_exec()) {
+        let hits = graph.is_reachable(n) as u64;
+        let key = lcov::report::section::Key {
+            test_name: String::new(),
+            source_file: PathBuf::from(&n.span.file),
+        };
+        let section = report.sections.entry(key).or_default();
+        section.functions.insert(
+            function::Key { name: n.def_path.clone() },
+            function::Value { start_line: Some(n.span.start_line as u32), count: hits },
+        );
+        for l in n.span.start_line..=n.span.end_line {
+            section.lines.entry(line::Key { line: l as u32 }).or_default().count |= hits;
         }
     }
-    for (file, fns) in by_file {
-        println!("TN:");
-        println!("SF:{file}");
-        for f in &fns {
-            println!("FN:{},{}", f.span.start_line, f.def_path);
-            println!("FNDA:{},{}", graph.is_reachable(f) as u8, f.def_path);
-        }
-        println!("FNF:{}", fns.len());
-        println!("FNH:{}", fns.iter().filter(|f| graph.is_reachable(f)).count());
-        let mut lines: BTreeMap<usize, u8> = BTreeMap::new();
-        for f in &fns {
-            for line in f.span.start_line..=f.span.end_line {
-                *lines.entry(line).or_default() |= graph.is_reachable(f) as u8;
-            }
-        }
-        for (line, hit) in &lines {
-            println!("DA:{line},{hit}");
-        }
-        println!("LF:{}", lines.len());
-        println!("LH:{}", lines.values().filter(|h| **h > 0).count());
-        println!("end_of_record");
+    for record in report.into_records() {
+        println!("{record}");
     }
 }
 
@@ -176,12 +152,7 @@ fn fail(msg: String) -> ! {
 }
 
 fn main() {
-    let cli = Cli::parse();
-    let (args, command) = match cli.command {
-        Some(Command::Summary(args)) => (args, None),
-        Some(Command::Lcov { args, only_verified_exec }) => (args, Some(only_verified_exec)),
-        None => (cli.args, None),
-    };
+    let args = Args::parse();
     let reports = verus_reach::load(&args.reports).unwrap_or_else(|e| fail(e));
     let roots = Roots {
         add: args.roots,
@@ -192,9 +163,10 @@ fn main() {
             .collect(),
     };
     let graph = Graph::new(&reports, &roots);
-    match command {
-        Some(only_verified_exec) => lcov(&graph, only_verified_exec),
-        None => summary(&reports, &graph),
+    if args.lcov {
+        lcov(&graph, args.only_verified_exec);
+    } else {
+        summary(&reports, &graph);
     }
     if let Some(threshold) = args.fail_under {
         let fns: Vec<&Node> = graph.nodes.values().filter(|n| n.is_verified_exec()).collect();
