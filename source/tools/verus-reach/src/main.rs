@@ -33,8 +33,32 @@ struct Args {
     #[arg(long)]
     lcov: bool,
     /// With --lcov, include only verified exec functions
-    #[arg(long)]
+    #[arg(long, conflicts_with = "only_verified")]
     only_verified_exec: bool,
+    /// With --lcov, include only what Verus checks: verified exec, spec,
+    /// and proof functions
+    #[arg(long)]
+    only_verified: bool,
+}
+
+/// Which functions an LCOV trace covers.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Only {
+    All,
+    Verified,
+    VerifiedExec,
+}
+
+impl Only {
+    fn includes(self, node: &Node) -> bool {
+        match self {
+            Only::All => true,
+            Only::Verified => {
+                node.is_verified_exec() || (node.is_ghost() && node.verified && !node.proxy)
+            }
+            Only::VerifiedExec => node.is_verified_exec(),
+        }
+    }
 }
 
 fn pct(part: usize, total: usize) -> u64 {
@@ -150,10 +174,10 @@ fn summary(reports: &[Report], graph: &Graph) -> String {
     out
 }
 
-fn lcov(graph: &Graph, only_verified_exec: bool) -> String {
+fn lcov(graph: &Graph, only: Only) -> String {
     use lcov::report::section::{function, line};
     let mut report = lcov::Report::new();
-    for n in graph.nodes.values().filter(|n| !only_verified_exec || n.is_verified_exec()) {
+    for n in graph.nodes.values().filter(|n| only.includes(n)) {
         let hits = graph.is_reachable(n) as u64;
         let key = lcov::report::section::Key {
             test_name: String::new(),
@@ -198,8 +222,14 @@ fn main() {
             .collect(),
     };
     let graph = Graph::new(&reports, &roots).unwrap_or_else(|e| fail(e));
-    let text =
-        if args.lcov { lcov(&graph, args.only_verified_exec) } else { summary(&reports, &graph) };
+    let only = if args.only_verified_exec {
+        Only::VerifiedExec
+    } else if args.only_verified {
+        Only::Verified
+    } else {
+        Only::All
+    };
+    let text = if args.lcov { lcov(&graph, only) } else { summary(&reports, &graph) };
     print!("{text}");
     if let Some(msg) = args.fail_under.and_then(|t| below_threshold(&graph, t)) {
         fail(msg);
@@ -250,7 +280,7 @@ mod tests {
     #[test]
     fn lcov_marks_hits_by_id() {
         let (_, graph) = graph();
-        let text = lcov(&graph, true);
+        let text = lcov(&graph, Only::VerifiedExec);
         assert!(text.contains("SF:x.rs\n"), "{text}");
         assert!(text.contains("FN:1,lib::wired\n"), "{text}");
         assert!(text.contains("FNDA:1,lib::wired\n"), "{text}");
@@ -259,9 +289,11 @@ mod tests {
         assert!(!text.contains("app(bin)::main"), "{text}");
         assert!(!text.contains("spec_wired"), "{text}");
 
-        let all = lcov(&graph, false);
-        assert!(all.contains("FNDA:1,lib::spec_wired\n"), "{all}");
-        assert!(all.contains("FNDA:0,lib::verified::spec_inc\n"), "{all}");
+        let verified = lcov(&graph, Only::Verified);
+        assert!(verified.contains("FNDA:1,lib::spec_wired\n"), "{verified}");
+        assert!(verified.contains("FNDA:0,lib::verified::spec_inc\n"), "{verified}");
+        assert!(!verified.contains("lib::inc\n"), "{verified}");
+        assert!(lcov(&graph, Only::All).contains("FNDA:1,lib::inc\n"));
     }
 
     #[test]
