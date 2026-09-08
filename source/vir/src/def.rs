@@ -394,7 +394,7 @@ struct NameCtxtImpl {
     /// so a decoder cannot exist, and a reader that guesses at the spelling
     /// drifts the moment the spelling changes. Recording the forward
     /// direction is exact and cannot drift.
-    source_names: HashMap<String, String>,
+    source_names: crate::air_names::SourceNames,
 }
 
 impl NameCtxtImpl {
@@ -438,17 +438,50 @@ impl NameCtxt {
     /// (what the user wrote), and hand `mangled` back. Call this at the
     /// point of encoding; see `NameCtxtImpl::source_names`.
     pub(crate) fn record_source_name(&self, mangled: String, source: String) -> String {
-        self.imp.borrow_mut().source_names.insert(mangled.clone(), source);
+        self.imp
+            .borrow_mut()
+            .source_names
+            .entry(mangled.clone())
+            .or_insert(crate::air_names::SourceName::Symbol(source));
         mangled
+    }
+
+    pub(crate) fn record_source_constructor(&self, symbol: &Ident, variant: &crate::ast::Variant) {
+        self.imp.borrow_mut().source_names.insert(
+            symbol.to_string(),
+            crate::air_names::SourceName::Constructor {
+                name: variant.name.to_string(),
+                fields: variant.fields.iter().map(|f| f.name.to_string()).collect(),
+                style: variant.ctor_style,
+            },
+        );
+    }
+
+    /// Lower a source variable and record its spelling at the encoding boundary.
+    pub(crate) fn var_ident(&self, ident: &VarIdent) -> Ident {
+        use crate::ast::VarIdentDisambiguate as D;
+        let mangled = unique_var_name(ident.0.to_string(), ident.1);
+        let source = match ident.1 {
+            D::AirLocal
+            | D::VirTemp(_)
+            | D::ExpandErrorsDecl(_)
+            | D::BitVectorToAirDecl(_)
+            | D::ResInfTemp(_) => return Arc::new(mangled),
+            D::VirRenumbered { id, .. } if id != 0 => {
+                format!("{} (binding {id})", ident.0)
+            }
+            _ => ident.0.to_string(),
+        };
+        Arc::new(self.record_source_name(mangled, source))
     }
 
     /// The source name of an AIR symbol, if this context minted it.
     pub fn source_name(&self, mangled: &str) -> Option<String> {
-        self.imp.borrow().source_names.get(mangled).cloned()
+        self.imp.borrow().source_names.get(mangled).map(|n| n.name().to_string())
     }
 
     /// Every (AIR symbol, source name) pair minted so far.
-    pub fn source_names(&self) -> HashMap<String, String> {
+    pub fn source_names(&self) -> crate::air_names::SourceNames {
         self.imp.borrow().source_names.clone()
     }
 }
@@ -869,7 +902,8 @@ pub fn encode_dt_as_path(dt: &Dt) -> Path {
 impl NameCtxt {
     pub fn variant_ident(&self, dt: &Dt, variant: &str) -> Ident {
         let path = encode_dt_as_path(dt);
-        Arc::new(format!("{}{}{}", self.path_to_string(&path), VARIANT_SEPARATOR, variant))
+        let mangled = format!("{}{}{}", self.path_to_string(&path), VARIANT_SEPARATOR, variant);
+        Arc::new(self.record_source_name(mangled, variant.to_string()))
     }
 
     pub fn is_variant_ident(&self, datatype: &Dt, variant: &str) -> Ident {
@@ -883,14 +917,19 @@ impl NameCtxt {
         field: &Ident,
         internal: bool,
     ) -> Ident {
-        Arc::new(format!(
+        let mangled = format!(
             "{}{}{}{}{}",
             self.path_to_string(path),
             VARIANT_SEPARATOR,
             variant.as_str(),
             if internal { VARIANT_FIELD_INTERNAL_SEPARATOR } else { VARIANT_FIELD_SEPARATOR },
             field.as_str()
-        ))
+        );
+        self.imp
+            .borrow_mut()
+            .source_names
+            .insert(mangled.clone(), crate::air_names::SourceName::Field(field.to_string()));
+        Arc::new(mangled)
     }
 
     pub fn variant_field_ident(&self, datatype: &Path, variant: &Ident, field: &Ident) -> Ident {

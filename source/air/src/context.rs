@@ -14,7 +14,7 @@ use crate::smt_verify::ReportLongRunning;
 use crate::typecheck::Typing;
 use sise::TreeNode as Node;
 use std::any::Any;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -48,6 +48,8 @@ pub enum UsageInfo {
 /// the join back to source happens in Verus.
 #[derive(Debug, Clone, Default)]
 pub struct ProvenanceInfo {
+    /// SSA symbol -> original AIR variable and assignment version, recorded by lowering.
+    pub variable_versions: VariableVersions,
     /// One entry per distinct tag list with at least one real tag.
     pub sources: Vec<Vec<String>>,
     /// Instantiated quantifiers, by `:qid`, with each instantiation vector
@@ -56,6 +58,8 @@ pub struct ProvenanceInfo {
     /// Reply lines the parser did not recognise, kept rather than failed on.
     pub unparsed: Vec<String>,
 }
+
+pub type VariableVersions = HashMap<String, (String, u32)>;
 
 #[derive(Debug)]
 pub enum ValidityResult {
@@ -153,6 +157,7 @@ pub struct Context {
     pub(crate) provenance: bool,
     /// The provenance of the last `check-sat`, until the caller takes it.
     pub(crate) last_provenance: Option<ProvenanceInfo>,
+    variable_versions: VariableVersions,
 }
 
 impl Context {
@@ -223,6 +228,7 @@ impl Context {
             anon_axiom_count: 0,
             provenance: false,
             last_provenance: None,
+            variable_versions: HashMap::new(),
             solver,
         };
         context.axiom_infos.push_scope(false);
@@ -306,7 +312,10 @@ impl Context {
     /// The provenance cvc5 reported for the most recent `check-sat`, if any;
     /// each call returns it once.
     pub fn take_provenance(&mut self) -> Option<ProvenanceInfo> {
-        self.last_provenance.take()
+        self.last_provenance.take().map(|mut info| {
+            info.variable_versions = self.variable_versions.clone();
+            info
+        })
     }
 
     /// Turn provenance mode on (cvc5 only; must precede the first query).
@@ -538,7 +547,9 @@ impl Context {
             Ok(query) => query,
             Err(err) => return ValidityResult::TypeError(err),
         };
-        let (query, snapshots, local_vars) = crate::var_to_const::lower_query(&query);
+        let (query, snapshots, local_vars, variable_versions) =
+            crate::var_to_const::lower_query(&query, self.provenance);
+        self.variable_versions = variable_versions;
         self.air_middle_log.log_query(&query);
         let query = crate::block_to_assert::lower_query(message_interface, &query);
         self.air_final_log.log_query(&query);

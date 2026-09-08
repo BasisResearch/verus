@@ -36,6 +36,7 @@ fn datatype_to_air(ctx: &Ctx, datatype: &crate::ast::Datatype) -> air::ast::Data
             fields.push(ident_binder(&id, &typ_to_air(ctx, &field.a.0)));
         }
         let id = ctx.name_ctxt.variant_ident(&datatype.x.name, &variant.name);
+        ctx.name_ctxt.record_source_constructor(&id, variant);
         variants.push(ident_binder(&id, &Arc::new(fields)));
     }
     Arc::new(air::ast::BinderX {

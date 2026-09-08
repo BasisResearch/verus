@@ -80,7 +80,7 @@ pub struct GlobalCtx {
     pub axiom_owners: RefCell<HashMap<String, String>>,
     /// AIR symbol -> source name, recorded by the encoders as they encode
     /// (see `crate::air_names`), collected here from each module's NameCtxt.
-    pub air_source_names: RefCell<HashMap<String, String>>,
+    pub air_source_names: RefCell<crate::air_names::SourceNames>,
     pub(crate) rlimit: f32,
     pub(crate) interpreter_log: Arc<std::sync::Mutex<Option<File>>>,
     pub(crate) func_call_graph_log: Arc<std::sync::Mutex<Option<FuncCallGraphLogFiles>>>,

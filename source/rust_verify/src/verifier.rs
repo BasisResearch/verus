@@ -362,6 +362,8 @@ pub struct Verifier {
 /// joined to source.
 #[derive(serde::Serialize, Clone, Debug)]
 pub struct QueryProvenance {
+    #[serde(skip)]
+    pub variable_versions: air::context::VariableVersions,
     pub desc: String,
     pub span: String,
     /// 0 for the first check of the query, then one per multi-error round
@@ -956,6 +958,7 @@ impl Verifier {
                         result: result_str,
                         sources: info.sources,
                         instantiations: info.instantiations,
+                        variable_versions: info.variable_versions,
                         unparsed: info.unparsed,
                     },
                 );
@@ -1259,9 +1262,11 @@ impl Verifier {
         let kind = inside.as_ref().map(|i| i.kind.as_str()).unwrap_or("");
         let owner = inside.as_ref().and_then(|i| i.owner.clone());
         Some(match (kind, owner, span.clone()) {
-            ("requires", _, Some(at)) => format!("the forall in the requires clause at {at}"),
-            ("type_invariant", _, Some(at)) => format!("the forall in the type invariant at {at}"),
-            ("trait_bound", _, Some(at)) => format!("the forall in the trait bound at {at}"),
+            ("requires", _, Some(at)) => format!("the quantifier in the requires clause at {at}"),
+            ("type_invariant", _, Some(at)) => {
+                format!("the quantifier in the type invariant at {at}")
+            }
+            ("trait_bound", _, Some(at)) => format!("the quantifier in the trait bound at {at}"),
             ("axiom", Some(o), _) => format!("the broadcast axiom `{o}`"),
             ("axiom", None, Some(at)) => format!("the axiom at {at}"),
             (_, _, Some(at)) => format!("the quantifier at {at}"),
@@ -1331,6 +1336,18 @@ impl Verifier {
         for (fun, queries) in raw {
             let mut resolved: Vec<ResolvedQueryProvenance> = Vec::new();
             for q in queries {
+                // SSA versions are query-local. Preserve assignment identity in the display.
+                let mut source_names = std::borrow::Cow::Borrowed(&air_source_names);
+                for (symbol, (base, version)) in &q.variable_versions {
+                    if let Some(name) = vir::air_names::source_symbol(&source_names, base) {
+                        source_names.to_mut().insert(
+                            symbol.clone(),
+                            vir::air_names::SourceName::Symbol(format!(
+                                "{name} (version {version})"
+                            )),
+                        );
+                    }
+                }
                 let mut hypotheses: Vec<ResolvedTag> = Vec::new();
                 let mut sources: Vec<Vec<ResolvedTag>> = Vec::new();
                 let mut axioms_in_scope = 0usize;
@@ -1386,7 +1403,7 @@ impl Verifier {
                             count: vectors.len(),
                             terms: vectors
                                 .iter()
-                                .map(|v| vir::air_names::render_vector(&air_source_names, v))
+                                .map(|v| vir::air_names::render_vector(&source_names, v))
                                 .collect(),
                             vectors: vectors.clone(),
                         }
