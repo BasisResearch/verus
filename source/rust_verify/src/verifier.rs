@@ -658,6 +658,7 @@ impl Verifier {
                 provenance: self.args.provenance,
                 spinoff_all: self.args.spinoff_all,
                 multiple_errors: self.args.multiple_errors,
+                smt_options: self.args.smt_options.clone(),
                 input_files: std::mem::take(&mut self.resident_inputs),
             },
         )

@@ -901,11 +901,39 @@ pub fn parse_args_with_imports(
         && (!matches!(args.solver, SmtSolver::Cvc5)
             || args.no_verify
             || args.compile
-            || !args.smt_options.is_empty()
             || args.debugger
             || args.allow_inline_air)
     {
-        error("--resident requires cvc5 verification; --no-verify, compilation, custom SMT options, debugger and inline AIR are not integrated with resident rechecking".to_string());
+        error("--resident requires cvc5 verification; --no-verify, compilation, debugger and inline AIR are not integrated with resident rechecking".to_string());
+    }
+    if args.resident {
+        for (option, value) in &args.smt_options {
+            // These are emitted as SMT atoms. A setting must not introduce
+            // commands or change the scope discipline of retained queries.
+            if option.is_empty()
+                || !option.bytes().all(|c| c.is_ascii_alphanumeric() || b"-_.".contains(&c))
+                || value.is_empty()
+                || !value.bytes().all(|c| c.is_ascii_graphic() && !b"();\"|\\".contains(&c))
+            {
+                error(
+                    "resident SMT options require a name and a single unquoted ASCII value"
+                        .to_string(),
+                );
+            }
+            let conflict = match (option.as_str(), value.as_str()) {
+                ("incremental", "false") => Some("rechecks require incremental solving"),
+                ("global-declarations", "true") => {
+                    Some("rechecks require declarations to leave scope on pop")
+                }
+                ("single_check_query", "true") => {
+                    Some("rechecks require reusable AIR query scopes")
+                }
+                _ => None,
+            };
+            if let Some(reason) = conflict {
+                error(format!("--resident cannot use --smt-option {option}={value}: {reason}"));
+            }
+        }
     }
     let resident_socket = cfg!(unix) && std::env::var_os("VERUS_RESIDENT_SOCKET").is_some();
     if args.resident

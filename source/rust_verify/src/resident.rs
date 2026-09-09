@@ -15,6 +15,10 @@
 //! bit-vector solvers remain prelude-free but use incremental query scopes.
 //! Checked provenance describes round zero, matching the result and assertion
 //! ID. Diagnostics can include further rounds requested by `--multiple-errors`.
+//!
+//! `ready.smt_options` echoes the ordered name/value pairs already applied at
+//! solver startup. Rechecks preserve those settings in the original contexts;
+//! only the recorded per-query resource budget is set again before a check.
 
 use crate::buckets::BucketId;
 use crate::commands::{QueryOp, Style};
@@ -199,6 +203,9 @@ pub(crate) struct SessionInfo {
     /// recheck looks for as many as the original invocation did.
     pub(crate) multiple_errors: u32,
     pub(crate) input_files: Vec<String>,
+    /// The ordered startup settings. They already live in every retained
+    /// solver and must not be reapplied after initialization.
+    pub(crate) smt_options: Vec<(String, String)>,
 }
 
 #[derive(Serialize)]
@@ -211,6 +218,7 @@ enum Response<'a> {
         invocation_succeeded: bool,
         provenance: bool,
         spinoff_all: bool,
+        smt_options: &'a [(String, String)],
         input_files: &'a [String],
         buckets: &'a [BucketDescription],
     },
@@ -525,6 +533,7 @@ impl Server {
                 invocation_succeeded,
                 provenance: self.info.provenance,
                 spinoff_all: self.info.spinoff_all,
+                smt_options: &self.info.smt_options,
                 input_files: &self.info.input_files,
                 buckets: &buckets,
             },
@@ -908,6 +917,7 @@ mod tests {
                 spinoff_all: false,
                 multiple_errors: 2,
                 input_files: Vec::new(),
+                smt_options: Vec::new(),
             },
         );
         let input = format!("{}\n{{\"command\":\"list\"}}\n", " ".repeat(65537));
