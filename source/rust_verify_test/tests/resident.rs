@@ -245,6 +245,44 @@ fn resident_rejects_unsupported_modes() {
     }
 }
 
+// Compilation reports a failed recommends check as a warning, so a recheck of
+// the retained query reports one too. `invalid` is the right AIR verdict for an
+// unproved recommendation; only its severity was wrong.
+#[test]
+fn resident_recheck_keeps_recommends_at_warning_severity() {
+    let source = r#"
+        use vstd::prelude::*;
+        verus! {
+            spec fn positive(x: int) -> int
+                recommends x > 0,
+            {
+                x
+            }
+
+            spec(checked) fn warning_only() -> int {
+                positive(0)
+            }
+        }
+    "#;
+    let mut worker = Worker::start(source, &[]);
+    let ready = worker.receive();
+    // A warning is not an error, so the original invocation still succeeded.
+    assert_eq!(ready["invocation_succeeded"], true, "{}", worker.stderr());
+    let query = ready["buckets"][0]["queries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|query| query["kind"] == "recommends")
+        .unwrap_or_else(|| panic!("no recommends query: {}", ready))["id"]
+        .clone();
+    let checked = worker.send(
+        json!({"command": "check", "session": ready["session"], "bucket": 0, "query": query}),
+    );
+    assert_eq!(checked["result"], "invalid", "{}", checked);
+    assert_eq!(checked["diagnostics"][0]["level"], "warning", "{}", checked);
+    worker.finish(true);
+}
+
 // A specialised prover in a function the filter excludes is not this session's
 // problem: its query is neither checked nor retained, so preparation must
 // still succeed. Without the filter, the same file is rejected (above).
