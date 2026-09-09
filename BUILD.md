@@ -110,6 +110,8 @@ instead.
 
 # Running the Verifier
 
+For the experimental resident query protocol, see [RESIDENT.md](RESIDENT.md).
+
 After running the build steps above, you can verify an example file.
 From the `source` directory, run:
 

@@ -54,6 +54,7 @@ mod hir_hide_reveal_rewrite;
 mod import_export;
 pub mod profiler;
 mod reach;
+mod resident;
 mod resolve_traits;
 pub mod reveal_hide;
 mod rust_intrinsics_to_vir;

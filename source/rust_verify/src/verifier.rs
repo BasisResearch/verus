@@ -1760,12 +1760,24 @@ impl Verifier {
         // Insert initial bucket context.
         self.run_command_batches(bucket_id, reporter, &mut air_context, &bucket_context);
 
+        let mut resident = self.args.resident.then(crate::resident::Session::new);
+
         let bucket = self.get_bucket(bucket_id);
         let mut opgen = OpGenerator::new(ctx, krate, bucket.clone());
         while let Some(mut function_opgen) = opgen.next()? {
             let diagnostics_to_report: std::cell::RefCell<
                 Option<PanicOnDropVec<(Message, MessageLevel)>>,
             > = std::cell::RefCell::new(Some(PanicOnDropVec::new(Vec::new())));
+            let resident_error = |message: &str| {
+                // These errors can interrupt an operation sequence before its
+                // usual diagnostic flush. Drain the guard before returning.
+                if let Some(messages) = diagnostics_to_report.take() {
+                    for (message, level) in messages.into_inner() {
+                        reporter.report_as(&message.to_any(), level);
+                    }
+                }
+                vir::messages::error_bare(message)
+            };
             let mut flush_diagnostics_to_report = false;
             loop {
                 let mut next_op = None;
@@ -1807,6 +1819,11 @@ impl Verifier {
                 match &op.kind {
                     OpKind::Context(_context_op, commands) => {
                         let batch = CommandBatch::new(op.to_air_comment(), commands.clone());
+                        if let Some(session) = &mut resident {
+                            session
+                                .push_context(&mut air_context, commands.clone())
+                                .map_err(&resident_error)?;
+                        }
                         self.run_command_batch(bucket_id, reporter, &mut air_context, &batch);
                         bucket_context.push(batch);
                     }
@@ -1844,6 +1861,13 @@ impl Verifier {
                             if is_recommend && cmds.skip_recommends {
                                 continue;
                             }
+                            if resident.is_some()
+                                && cmds.prover_choice != vir::def::ProverChoice::DefaultProver
+                            {
+                                return Err(resident_error(
+                                    "--resident does not support specialised prover queries",
+                                ));
+                            }
                             if cmds.prover_choice == vir::def::ProverChoice::Singular {
                                 #[cfg(not(feature = "singular"))]
                                 panic!(
@@ -1856,6 +1880,12 @@ impl Verifier {
                                 || (cmds.prover_choice == vir::def::ProverChoice::BitVector)
                                 || *profile_rerun
                                 || self.args.spinoff_all;
+
+                            if resident.is_some() && do_spinoff {
+                                return Err(resident_error(
+                                    "--resident does not support spinoff prover queries",
+                                ));
+                            }
 
                             let profile_file_name = if *profile_rerun
                                 || ((self.args.profile_all || self.args.capture_profiles)
@@ -1924,6 +1954,22 @@ impl Verifier {
                                 query_air_context.get_rlimit_count().map(|x| x.1);
                             if let Some(rlimit) = function.x.attrs.rlimit {
                                 Self::set_rlimit(self.args.solver, &mut query_air_context, rlimit);
+                            }
+                            if let Some(session) = &mut resident {
+                                if self
+                                    .user_filter
+                                    .as_ref()
+                                    .unwrap()
+                                    .includes_function(&function.x.name)
+                                {
+                                    session
+                                        .record_query(
+                                            cmds.clone(),
+                                            query_op,
+                                            function.x.attrs.rlimit.unwrap_or(self.args.rlimit),
+                                        )
+                                        .map_err(&resident_error)?;
+                                }
                             }
                             let RunCommandQueriesResult {
                                 invalidity: command_invalidity,
@@ -2202,6 +2248,14 @@ impl Verifier {
 
         ctx.fun = None;
 
+        if let Some(session) = resident {
+            session
+                .serve(&mut air_context, bucket_id.friendly_name(), |context, rlimit| {
+                    Self::set_rlimit(SmtSolver::Cvc5, context, rlimit);
+                })
+                .map_err(|err| vir::messages::error_bare(format!("resident session: {err}")))?;
+        }
+
         let (time_smt_init, time_smt_run) = air_context.get_time();
         let rlimit_count = air_context.get_rlimit_count();
 
@@ -2406,6 +2460,11 @@ impl Verifier {
         let buckets = crate::buckets::get_buckets(&krate, &modules_to_verify);
         let buckets = user_filter.filter_buckets(buckets);
         let bucket_ids: Vec<BucketId> = buckets.iter().map(|p| p.0.clone()).collect();
+        if self.args.resident && bucket_ids.len() != 1 {
+            return Err(VerifyErr::Vir(vir::messages::error_bare(
+                "--resident requires exactly one bucket; select one module or function",
+            )));
+        }
         self.buckets = buckets.into_iter().collect();
 
         let time_verify_sequential_end = Instant::now();
@@ -3750,6 +3809,7 @@ impl VerifierCallbacksEraseMacro {
             self.verifier.encountered_vir_error = true;
         }
         if !self.verifier.args.output_json
+            && !self.verifier.args.resident
             && !self.verifier.args.no_verify
             && !self.verifier.encountered_error
             && !self.verifier.encountered_vir_error
