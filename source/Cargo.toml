@@ -18,6 +18,7 @@ members = [
   "tools/bump_crate_versions",
   "tools/internals_interface",
   "tools/line_count",
+  "tools/verus-reach",
 ]
 exclude = [
   "vstd",
@@ -39,6 +40,7 @@ console = { version = "0.16", default-features = false, features = ["ansi-parsin
 convert_case = "0.4"
 crates_io_api = "0.12.0"
 getopts = { git = "https://github.com/utaal/getopts.git", branch = "parse-partial" }
+glob = "0.3"
 git2 = { version = "0.21", default-features = false, features = [] }
 hex = "0.4.3"
 html5ever = "0.26" # TODO: kuchikiki depends on 0.26
@@ -52,6 +54,7 @@ itertools = "0.15.0"
 # kuchikiki has a shakey maintainability story, would be great to remove
 # it is transitively using an old version of html5ever and of rand (which has as security advisory)
 kuchikiki = "0.8.2"
+lcov = "0.8"
 num-bigint = { version = "0.5.1", features = ["serde"] }
 num-format = "0.4.4"
 num-traits= "0.2.16"
@@ -91,6 +94,7 @@ rustc_mir_build_verus = { path = "rustc_mir_build", package = "rustc_mir_build" 
 rust_verify_test_macros = { path = "rust_verify_test_macros" }
 verus_prettyplease = { version = "=0.0.0-2026-08-09-0044", path = "../dependencies/prettyplease" }
 verus_syn = { version = "=0.0.0-2026-08-02-0125", path = "../dependencies/syn", features = ["full", "visit", "visit-mut", "extra-traits"] }
+verus-reach = { path = "tools/verus-reach" }
 vir-macros = { path = "vir_macros" }
 vir = { path = "vir" }
 

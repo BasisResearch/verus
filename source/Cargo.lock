@@ -936,6 +936,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "glob"
+version = "0.3.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e4eba85ea1d0a966a983acd07deee566e67395d2d96b6fb39e62b5a833f1eb0b"
+
+[[package]]
 name = "hashbrown"
 version = "0.12.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1435,6 +1441,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6e14eda50a3494b3bf7b9ce51c52434a761e383d7238ce1dd5dcec2fbc13e9fb"
 dependencies = [
  "hashbrown 0.14.5",
+]
+
+[[package]]
+name = "lcov"
+version = "0.8.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4dab4f1d99e0dd8008da0d3452bb71ce08e1645465c2accc124bcb599c6b3143"
+dependencies = [
+ "thiserror 2.0.19",
 ]
 
 [[package]]
@@ -2351,6 +2366,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "sise",
+ "verus-reach",
  "vir",
  "win32job",
 ]
@@ -2360,12 +2376,14 @@ name = "rust_verify_test"
 version = "0.1.0"
 dependencies = [
  "air",
+ "glob",
  "regex",
  "rust_verify_test_macros",
  "serde",
  "serde_json",
  "tempfile",
  "toml",
+ "verus-reach",
  "vir",
  "yansi",
 ]
@@ -3244,6 +3262,17 @@ dependencies = [
  "win32job",
  "yansi",
  "zip",
+]
+
+[[package]]
+name = "verus-reach"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "glob",
+ "lcov",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

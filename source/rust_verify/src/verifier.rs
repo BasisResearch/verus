@@ -3076,6 +3076,12 @@ impl Verifier {
         let time2 = Instant::now();
         let vir_crate = vir::ast_sort::sort_krate(&vir_crate);
         self.current_crate_modules = Some(vir_crate.modules.clone());
+
+        if self.args.reach.is_some() {
+            if let Err(msg) = crate::reach::run(&ctxt, &vir_crate) {
+                self.deferred_errors.push(error(msg));
+            }
+        }
         self.crate_items = Some(Arc::new(crate_items));
 
         // Export crate if requested.

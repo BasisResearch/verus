@@ -127,6 +127,7 @@ pub struct ArgsX {
     pub no_bv_simplify: bool,
     pub no_assert_ids: bool,
     pub provenance: bool,
+    pub reach: Option<String>,
 }
 
 impl ArgsX {
@@ -176,6 +177,7 @@ impl ArgsX {
             no_bv_simplify: Default::default(),
             no_assert_ids: Default::default(),
             provenance: Default::default(),
+            reach: Default::default(),
         }
     }
 }
@@ -407,6 +409,7 @@ pub fn parse_args_with_imports(
     const OPT_RECORD: &str = "record";
     const OPT_NUM_THREADS: &str = "num-threads";
     const OPT_TRACE: &str = "trace";
+    const OPT_REACH: &str = "reach";
     const OPT_NO_REPORT_LONG_RUNNING: &str = "no-report-long-running";
 
     const OPT_EXTENDED_MULTI: &str = "V";
@@ -584,6 +587,7 @@ pub fn parse_args_with_imports(
         "INTEGER",
     );
     opts.optflag("", OPT_TRACE, "Print progress information");
+    opts.optopt("", OPT_REACH, "Write this crate's functions and call edges as json into DIR, for the static reachability report of tools/verus-reach", "DIR");
     opts.optflag(
         "",
         OPT_NO_REPORT_LONG_RUNNING,
@@ -862,6 +866,7 @@ pub fn parse_args_with_imports(
             .unwrap_or_else(|_| error("expected integer after num_threads".to_string()))
             .unwrap_or(default_num_threads),
         trace: matches.opt_present(OPT_TRACE),
+        reach: matches.opt_str(OPT_REACH),
         report_long_running: !matches.opt_present(OPT_NO_REPORT_LONG_RUNNING),
         use_crate_name: extended.contains_key(EXTENDED_USE_CRATE_NAME),
         solver,

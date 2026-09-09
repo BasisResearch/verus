@@ -335,6 +335,8 @@ pub fn run_verus(
         } else if *option == "--edition 2024" {
             verus_args.push("--edition".to_string());
             verus_args.push("2024".to_string());
+        } else if let Some(dir) = option.strip_prefix("--reach ") {
+            verus_args.extend(["--reach".to_string(), dir.to_string()]);
         } else {
             panic!("option '{}' not recognized by test harness", option);
         }
@@ -549,6 +551,12 @@ pub fn run_cargo_verus_with_target(
         });
     let z3 = path::absolute(z3).expect("Failed to find absolute path for Z3 executable");
     child.env("VERUS_Z3_PATH", z3);
+    if let Ok(cvc5) = std::env::var("VERUS_CVC5_PATH") {
+        let cvc5 = std::path::PathBuf::from(cvc5);
+        let cvc5 =
+            if cvc5.is_relative() { std::path::PathBuf::from("..").join(cvc5) } else { cvc5 };
+        child.env("VERUS_CVC5_PATH", path::absolute(cvc5).expect("absolute path for cvc5"));
+    }
 
     let mut cargo_verus_args = Vec::new();
     // cargo-verus refuses to run without --mcp (it is meant to be driven by the MCP server).
