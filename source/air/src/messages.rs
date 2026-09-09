@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 pub type ArcDynMessage = Arc<dyn Any + Send + Sync>;
 pub type ArcDynMessageLabel = Arc<dyn Any + Send + Sync>;
 
-pub trait MessageInterface {
+pub trait MessageInterface: Send + Sync {
     fn empty(&self) -> ArcDynMessage;
     fn message_label_from_air_span(&self, air_span: &str, note: &str) -> ArcDynMessage;
     fn all_msgs(&self, message: &ArcDynMessage) -> Vec<String>;

@@ -291,6 +291,9 @@ pub struct FunctionSmtStats {
 }
 
 pub struct Verifier {
+    resident_buckets: Vec<crate::resident::RetainedBucket>,
+    resident_prepared: bool,
+    resident_inputs: Vec<String>,
     /// this is the actual number of threads used for verification. This will be set to the
     /// minimum of the requested threads and the number of buckets to verify
     pub num_threads: usize,
@@ -356,90 +359,9 @@ pub struct Verifier {
     error_format: Option<ErrorOutputType>,
 }
 
-/// One `check-sat` under `-V provenance`, as cvc5 reported it. `sources` are
-/// the tag lists of `(get-assertion-sources :tags-only)`, `instantiations`
-/// the `:qid`s the solver instantiated with their vectors. Symbols, not yet
-/// joined to source.
-#[derive(serde::Serialize, Clone, Debug)]
-pub struct QueryProvenance {
-    #[serde(skip)]
-    pub variable_versions: air::context::VariableVersions,
-    pub desc: String,
-    pub span: String,
-    /// 0 for the first check of the query, then one per multi-error round
-    pub round: usize,
-    /// "valid", "invalid", "canceled", or the solver's unexpected output
-    pub result: String,
-    pub sources: Vec<Vec<String>>,
-    pub instantiations: Vec<(String, Vec<String>)>,
-    pub unparsed: Vec<String>,
-}
-
-/// One tag from a solver reply, joined back to source.
-#[derive(serde::Serialize, Clone, Debug, PartialEq, Eq)]
-pub struct ResolvedTag {
-    /// the symbol as it was on the wire
-    pub tag: String,
-    /// requires, type_invariant, fuel, trait_bound, query, axiom, prelude,
-    /// anonymous_axiom, untagged
-    pub kind: String,
-    /// the function, datatype or quantifier that owns it, when known
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub owner: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub span: Option<String>,
-}
-
-/// One instantiated quantifier, joined back to source.
-#[derive(serde::Serialize, Clone, Debug)]
-pub struct ResolvedInstantiation {
-    pub qid: String,
-    /// prelude, or the function the quantifier was written in
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub fun: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub span: Option<String>,
-    /// the tagged assertion the quantifier was sent inside, when known
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub inside: Option<ResolvedTag>,
-    /// Where the quantifier is written, in prose. A reader should show this
-    /// rather than the generated `qid`, which names nothing in the source.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub site: Option<String>,
-    /// Why the quantifier exists, as the encoder that emitted it said. A
-    /// reader classifies an instantiation from this, never by matching on
-    /// `qid`, which is generated and names nothing a user wrote.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub role: Option<&'static str>,
-    pub count: usize,
-    /// The instantiation terms as the source spells them (boxes dropped,
-    /// symbols as they were written), rendered by `vir::air_names` from the
-    /// names the encoders recorded. This is what a reader should show.
-    pub terms: Vec<String>,
-    /// The same terms as the solver sees them. Kept for debugging this
-    /// pipeline; not for display.
-    pub vectors: Vec<String>,
-}
-
-/// A query's provenance with every symbol joined to source (`-V provenance`).
-#[derive(serde::Serialize, Clone, Debug)]
-pub struct ResolvedQueryProvenance {
-    pub desc: String,
-    pub span: String,
-    pub round: usize,
-    pub result: String,
-    /// hypotheses (requires, type invariants, fuel, trait bounds) that fed
-    /// some preprocessed assertion
-    pub hypotheses: Vec<ResolvedTag>,
-    /// the tag lists that name the query or a hypothesis, or hold more than
-    /// one tag (a merge or a substitution); singleton axioms are counted, not
-    /// listed
-    pub sources: Vec<Vec<ResolvedTag>>,
-    pub axioms_in_scope: usize,
-    pub instantiations: Vec<ResolvedInstantiation>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub unparsed: Vec<String>,
-}
+pub use crate::provenance::{
+    QueryProvenance, ResolvedInstantiation, ResolvedQueryProvenance, ResolvedTag,
+};
 
 #[derive(serde::Serialize)]
 pub struct FuncDetails {
@@ -597,6 +519,9 @@ impl Verifier {
         Verifier {
             num_threads: 1,
             encountered_error: false,
+            resident_buckets: Vec::new(),
+            resident_prepared: false,
+            resident_inputs: Vec::new(),
             encountered_vir_error: false,
             count_verified: 0,
             count_errors: 0,
@@ -647,6 +572,9 @@ impl Verifier {
         Verifier {
             num_threads: 1,
             encountered_error: self.encountered_error,
+            resident_buckets: Vec::new(),
+            resident_prepared: false,
+            resident_inputs: Vec::new(),
             encountered_vir_error: false,
             count_verified: 0,
             count_errors: 0,
@@ -692,6 +620,7 @@ impl Verifier {
 
     /// merges two verifiers by summing up times and verified stats from other into self.
     pub fn merge(&mut self, other: Self) {
+        self.resident_buckets.extend(other.resident_buckets);
         self.count_verified += other.count_verified;
         self.count_errors += other.count_errors;
         self.func_fails.extend(other.func_fails);
@@ -704,6 +633,23 @@ impl Verifier {
             self.func_provenance.entry(fun).or_default().extend(queries);
         }
         self.deferred_errors.extend(other.deferred_errors);
+    }
+
+    /// Enter the protocol only after the compiler driver has returned and all
+    /// selected buckets have finished lowering. Even failed/partial invocations
+    /// relinquish their children here, before main can call process::exit.
+    pub fn serve_resident(&mut self, invocation_succeeded: bool) -> std::io::Result<()> {
+        let buckets = std::mem::take(&mut self.resident_buckets);
+        if !self.resident_prepared {
+            return Ok(());
+        }
+        self.resident_prepared = false;
+        crate::resident::Server::new(buckets)
+            .with_modes(self.args.provenance, self.args.spinoff_all)
+            .with_input_files(std::mem::take(&mut self.resident_inputs))
+            .serve(invocation_succeeded, |context, rlimit| {
+                Self::set_rlimit(SmtSolver::Cvc5, context, rlimit);
+            })
     }
 
     fn get_bucket<'a>(&'a self, bucket_id: &BucketId) -> &'a Bucket {
@@ -1194,13 +1140,11 @@ impl Verifier {
         assign_map: &HashMap<*const vir::messages::Span, HashSet<Arc<String>>>,
         snap_map: &Vec<(vir::messages::Span, SnapPos)>,
         bucket_id: &BucketId,
-        function_name: &Fun,
         comment: &str,
         desc_prefix: Option<&str>,
         default_prover_failed_assert_ids: &mut Vec<AssertId>,
+        includes_function: bool,
     ) -> RunCommandQueriesResult {
-        let user_filter = self.user_filter.as_ref().unwrap();
-        let includes_function = user_filter.includes_function(function_name);
         if !includes_function {
             return RunCommandQueriesResult {
                 invalidity: false,
@@ -1261,190 +1205,15 @@ impl Verifier {
         format!("{}{}{}{}", rerun_msg, count_msg, expand_msg, suffix,)
     }
 
-    /// Where a quantifier is written, in prose, from the assertion that owns
-    /// it and its own span. The generated `:qid` names nothing a reader knows.
-    /// The wire spelling of a recorded role. Kept beside the enum so adding
-    /// a variant forces a spelling rather than silently dropping it.
-    fn role_name(role: &vir::sst::QuantRole) -> &'static str {
-        use vir::sst::QuantRole::*;
-        match role {
-            Definition => "definition",
-            DefinitionUnfold => "definition_unfold",
-            DefinitionBase => "definition_base",
-            FuelDefaults => "fuel_defaults",
-            ReturnTypeInvariant => "return_type_invariant",
-        }
-    }
-
-    fn quantifier_site(inside: &Option<ResolvedTag>, span: &Option<String>) -> Option<String> {
-        let kind = inside.as_ref().map(|i| i.kind.as_str()).unwrap_or("");
-        let owner = inside.as_ref().and_then(|i| i.owner.clone());
-        Some(match (kind, owner, span.clone()) {
-            ("requires", _, Some(at)) => format!("the quantifier in the requires clause at {at}"),
-            ("type_invariant", _, Some(at)) => {
-                format!("the quantifier in the type invariant at {at}")
-            }
-            ("trait_bound", _, Some(at)) => format!("the quantifier in the trait bound at {at}"),
-            ("axiom", Some(o), _) => format!("the broadcast axiom `{o}`"),
-            ("axiom", None, Some(at)) => format!("the axiom at {at}"),
-            (_, _, Some(at)) => format!("the quantifier at {at}"),
-            (_, Some(o), None) => format!("a quantifier in `{o}`"),
-            _ => return None,
-        })
-    }
-
-    /// Join the raw provenance (`func_provenance`) to source through
-    /// `hyp_map`, `qid_map` and `axiom_owners`, into `func_details`.
+    /// Resolve batch replies with the same owned metadata used by resident checks.
     fn resolve_provenance(&mut self, global_ctx: &vir::context::GlobalCtx) {
-        const PRELUDE_QID_PREFIX: &str = "prelude_";
-        /// The prelude writes this one by hand, so it has no `qid_map` entry.
-        const FUEL_DEFAULTS_QID: &str = "prelude_fuel_defaults";
-        let hyp_map = global_ctx.hyp_map.borrow();
-        let qid_map = global_ctx.qid_map.borrow();
-        let axiom_owners = global_ctx.axiom_owners.borrow();
-        let air_source_names = global_ctx.air_source_names.borrow().clone();
-        let tag_of = |fun: &Fun, symbol: &str| -> ResolvedTag {
-            let mut r = ResolvedTag {
-                tag: symbol.to_string(),
-                kind: String::new(),
-                owner: None,
-                span: None,
-            };
-            match air::def::ProvenanceTag::from_symbol(symbol) {
-                Some(air::def::ProvenanceTag::Hyp(air::def::HypId(k))) => {
-                    match hyp_map.get(fun).and_then(|hs| hs.get(k as usize)) {
-                        Some(info) => {
-                            r.kind = match info.kind {
-                                vir::sst::HypKind::Requires => "requires",
-                                vir::sst::HypKind::TypeInvariant => "type_invariant",
-                                vir::sst::HypKind::Fuel => "fuel",
-                                vir::sst::HypKind::TraitBound => "trait_bound",
-                            }
-                            .to_string();
-                            r.owner = Some(fun_as_friendly_rust_name(fun));
-                            r.span = Some(info.span.as_string.clone());
-                        }
-                        None => r.kind = "hypothesis (unknown id)".to_string(),
-                    }
-                }
-                Some(air::def::ProvenanceTag::Query) => r.kind = "query".to_string(),
-                Some(air::def::ProvenanceTag::Assert(_)) => r.kind = "goal".to_string(),
-                Some(air::def::ProvenanceTag::Axiom(ident)) => {
-                    let ident: &str = &ident;
-                    if let Some(owner) = axiom_owners.get(symbol) {
-                        r.kind = "axiom".to_string();
-                        r.owner = Some(owner.clone());
-                    } else if let Some(info) = qid_map.get(ident) {
-                        r.kind = "axiom".to_string();
-                        r.owner = Some(fun_as_friendly_rust_name(&info.fun));
-                        r.span = info.user.as_ref().map(|u| u.span.as_string.clone());
-                    } else if ident.starts_with(PRELUDE_QID_PREFIX) {
-                        r.kind = "prelude".to_string();
-                    } else if ident.starts_with("anon_") {
-                        r.kind = "anonymous_axiom".to_string();
-                    } else {
-                        r.kind = "axiom".to_string();
-                    }
-                }
-                None => r.kind = "untagged".to_string(),
-            }
-            r
-        };
-        let is_hyp_kind =
-            |k: &str| matches!(k, "requires" | "type_invariant" | "fuel" | "trait_bound");
-        let raw = std::mem::take(&mut self.func_provenance);
-        for (fun, queries) in raw {
-            let mut resolved: Vec<ResolvedQueryProvenance> = Vec::new();
-            for q in queries {
-                // SSA versions are query-local. Preserve assignment identity in the display.
-                let mut source_names = std::borrow::Cow::Borrowed(&air_source_names);
-                for (symbol, (base, version)) in &q.variable_versions {
-                    if let Some(name) = vir::air_names::source_symbol(&source_names, base) {
-                        source_names.to_mut().insert(
-                            symbol.clone(),
-                            vir::air_names::SourceName::Symbol(format!(
-                                "{name} (version {version})"
-                            )),
-                        );
-                    }
-                }
-                let mut hypotheses: Vec<ResolvedTag> = Vec::new();
-                let mut sources: Vec<Vec<ResolvedTag>> = Vec::new();
-                let mut axioms_in_scope = 0usize;
-                for list in q.sources.iter() {
-                    let tags: Vec<ResolvedTag> = list.iter().map(|t| tag_of(&fun, t)).collect();
-                    let interesting = tags.len() > 1
-                        || tags.iter().any(|t| is_hyp_kind(&t.kind) || t.kind == "query");
-                    for t in tags.iter() {
-                        if is_hyp_kind(&t.kind) && !hypotheses.contains(t) {
-                            hypotheses.push(t.clone());
-                        }
-                    }
-                    if interesting {
-                        sources.push(tags);
-                    } else {
-                        axioms_in_scope += 1;
-                    }
-                }
-                let instantiations = q
-                    .instantiations
-                    .iter()
-                    .map(|(qid, vectors)| {
-                        let span_short = |s: &Option<String>| -> Option<String> {
-                            s.as_ref().map(|s| {
-                                s.rsplit('/')
-                                    .next()
-                                    .unwrap_or(s)
-                                    .split(" (#")
-                                    .next()
-                                    .unwrap_or(s)
-                                    .to_string()
-                            })
-                        };
-                        let (fun_name, span, inside, role) = match qid_map.get(qid) {
-                            Some(info) => (
-                                Some(fun_as_friendly_rust_name(&info.fun)),
-                                info.user.as_ref().map(|u| u.span.as_string.clone()),
-                                info.tag.as_ref().map(|t| tag_of(&fun, &t.to_symbol())),
-                                info.role.as_ref().map(Self::role_name),
-                            ),
-                            None => (
-                                qid.starts_with(PRELUDE_QID_PREFIX).then(|| "prelude".to_string()),
-                                None,
-                                None,
-                                (qid.as_str() == FUEL_DEFAULTS_QID).then_some("fuel_defaults"),
-                            ),
-                        };
-                        let site = Self::quantifier_site(&inside, &span_short(&span));
-                        ResolvedInstantiation {
-                            qid: qid.clone(),
-                            fun: fun_name,
-                            span,
-                            inside,
-                            site,
-                            role,
-                            count: vectors.len(),
-                            terms: vectors
-                                .iter()
-                                .map(|v| vir::air_names::render_vector(&source_names, v))
-                                .collect(),
-                            vectors: vectors.clone(),
-                        }
-                    })
-                    .collect();
-                resolved.push(ResolvedQueryProvenance {
-                    desc: q.desc,
-                    span: q.span,
-                    round: q.round,
-                    result: q.result,
-                    hypotheses,
-                    sources,
-                    axioms_in_scope,
-                    instantiations,
-                    unparsed: q.unparsed,
-                });
-            }
-            self.func_details.entry(fun).or_default().provenance.extend(resolved);
+        let symbols = crate::provenance::Symbols::capture(
+            global_ctx,
+            global_ctx.air_source_names.borrow().clone(),
+        );
+        for (fun, queries) in std::mem::take(&mut self.func_provenance) {
+            let resolved = queries.into_iter().map(|query| symbols.resolve(&fun, query));
+            self.func_details.entry(fun.clone()).or_default().provenance.extend(resolved);
         }
     }
 
@@ -1760,12 +1529,25 @@ impl Verifier {
         // Insert initial bucket context.
         self.run_command_batches(bucket_id, reporter, &mut air_context, &bucket_context);
 
+        let mut resident = self.args.resident.then(crate::resident::QueryJournal::new);
+        let mut resident_spinoffs = Vec::new();
+
         let bucket = self.get_bucket(bucket_id);
         let mut opgen = OpGenerator::new(ctx, krate, bucket.clone());
         while let Some(mut function_opgen) = opgen.next()? {
             let diagnostics_to_report: std::cell::RefCell<
                 Option<PanicOnDropVec<(Message, MessageLevel)>>,
             > = std::cell::RefCell::new(Some(PanicOnDropVec::new(Vec::new())));
+            let resident_error = |message: &str| {
+                // These errors can interrupt an operation sequence before its
+                // usual diagnostic flush. Drain the guard before returning.
+                if let Some(messages) = diagnostics_to_report.take() {
+                    for (message, level) in messages.into_inner() {
+                        reporter.report_as(&message.to_any(), level);
+                    }
+                }
+                vir::messages::error_bare(message)
+            };
             let mut flush_diagnostics_to_report = false;
             loop {
                 let mut next_op = None;
@@ -1807,6 +1589,11 @@ impl Verifier {
                 match &op.kind {
                     OpKind::Context(_context_op, commands) => {
                         let batch = CommandBatch::new(op.to_air_comment(), commands.clone());
+                        if let Some(session) = &mut resident {
+                            session
+                                .push_context(&mut air_context, commands.clone())
+                                .map_err(&resident_error)?;
+                        }
                         self.run_command_batch(bucket_id, reporter, &mut air_context, &batch);
                         bucket_context.push(batch);
                     }
@@ -1817,14 +1604,7 @@ impl Verifier {
                         profile_rerun,
                         func_check_sst,
                     } => {
-                        let level = match query_op {
-                            QueryOp::SpecTermination => MessageLevel::Error,
-                            QueryOp::Body(Style::Normal) => MessageLevel::Error,
-                            QueryOp::Body(Style::RecommendsFollowupFromError) => MessageLevel::Note,
-                            QueryOp::Body(Style::RecommendsChecked) => MessageLevel::Warning,
-                            QueryOp::Body(Style::Expanded) => MessageLevel::Note,
-                            QueryOp::Body(Style::CheckApiSafety) => MessageLevel::Error,
-                        };
+                        let level = query_op.message_level();
                         let function = &op.get_function();
                         let is_recommend = query_op.is_recommend();
                         self.expand_flag = query_op.is_expanded();
@@ -1840,9 +1620,25 @@ impl Verifier {
                             air::context::SmtSolver::Z3 => Some(0),
                             air::context::SmtSolver::Cvc5 => None,
                         };
+                        // One filter decision drives retention, checking and
+                        // the unsupported-query guards below. A resident
+                        // session can therefore neither offer obligations that
+                        // this run never checked, nor refuse to prepare over a
+                        // query it was never asked to retain: a filtered-out
+                        // function may use any prover it likes.
+                        let includes_function =
+                            self.user_filter.as_ref().unwrap().includes_function(&function.x.name);
+                        let retain_queries = resident.is_some() && includes_function;
                         for cmds in commands_with_context_list.iter() {
                             if is_recommend && cmds.skip_recommends {
                                 continue;
+                            }
+                            if retain_queries
+                                && cmds.prover_choice != vir::def::ProverChoice::DefaultProver
+                            {
+                                return Err(resident_error(
+                                    "--resident does not support specialised prover queries",
+                                ));
                             }
                             if cmds.prover_choice == vir::def::ProverChoice::Singular {
                                 #[cfg(not(feature = "singular"))]
@@ -1850,12 +1646,15 @@ impl Verifier {
                                     "Found singular command when Verus is compiled without Singular feature"
                                 );
                             }
-                            let mut spinoff_z3_context;
+                            let mut spinoff_z3_context = None;
                             let do_spinoff = (cmds.prover_choice
                                 == vir::def::ProverChoice::Nonlinear)
                                 || (cmds.prover_choice == vir::def::ProverChoice::BitVector)
                                 || *profile_rerun
                                 || self.args.spinoff_all;
+
+                            let mut spinoff_journal = (retain_queries && do_spinoff)
+                                .then(crate::resident::QueryJournal::new);
 
                             let profile_file_name = if *profile_rerun
                                 || ((self.args.profile_all || self.args.capture_profiles)
@@ -1892,30 +1691,29 @@ impl Verifier {
                                 } else {
                                     "spinoff_all"
                                 };
-                                spinoff_z3_context = self.new_air_context_with_bucket_context(
-                                    message_interface.clone(),
-                                    function_opgen.ctx(),
-                                    reporter,
-                                    bucket_id,
-                                    Some((&(function.x.name).path, spinoff_context_counter)),
-                                    &bucket_context,
-                                    is_recommend,
-                                    &cmds.context.span,
-                                    profile_file_name.as_ref(),
-                                    spinoff_reason,
-                                    cmds.prover_choice,
-                                )?;
+                                let spinoff = spinoff_z3_context.insert(
+                                    self.new_air_context_with_bucket_context(
+                                        message_interface.clone(),
+                                        function_opgen.ctx(),
+                                        reporter,
+                                        bucket_id,
+                                        Some((&(function.x.name).path, spinoff_context_counter)),
+                                        &bucket_context,
+                                        is_recommend,
+                                        &cmds.context.span,
+                                        profile_file_name.as_ref(),
+                                        spinoff_reason,
+                                        cmds.prover_choice,
+                                    )?,
+                                );
                                 // for bitvector, only one query, no push/pop
                                 if cmds.prover_choice == vir::def::ProverChoice::BitVector {
-                                    spinoff_z3_context.set_single_check_query();
+                                    spinoff.set_single_check_query();
                                 }
                                 // Apply prover-specific SMT tuning.
-                                self.apply_per_query_smt_options(
-                                    &mut spinoff_z3_context,
-                                    cmds.prover_choice,
-                                );
+                                self.apply_per_query_smt_options(spinoff, cmds.prover_choice);
                                 spinoff_context_counter += 1;
-                                &mut spinoff_z3_context
+                                spinoff
                             } else {
                                 &mut air_context
                             };
@@ -1924,6 +1722,19 @@ impl Verifier {
                                 query_air_context.get_rlimit_count().map(|x| x.1);
                             if let Some(rlimit) = function.x.attrs.rlimit {
                                 Self::set_rlimit(self.args.solver, &mut query_air_context, rlimit);
+                            }
+                            if let Some(session) = spinoff_journal
+                                .as_mut()
+                                .or(resident.as_mut())
+                                .filter(|_| includes_function)
+                            {
+                                session
+                                    .record_query(
+                                        cmds.clone(),
+                                        query_op,
+                                        function.x.attrs.rlimit.unwrap_or(self.args.rlimit),
+                                    )
+                                    .map_err(&resident_error)?;
                             }
                             let RunCommandQueriesResult {
                                 invalidity: command_invalidity,
@@ -1940,10 +1751,10 @@ impl Verifier {
                                 &HashMap::new(),
                                 &snap_map,
                                 bucket_id,
-                                &function.x.name,
                                 &op.to_air_comment(),
                                 None,
                                 &mut default_prover_failed_assert_ids,
+                                includes_function,
                             );
                             func_curr_smt_time +=
                                 query_air_context.get_time().1 - iter_curr_smt_time;
@@ -2073,6 +1884,14 @@ impl Verifier {
                                     );
                                     flush_diagnostics_to_report = true;
                                 }
+                            }
+                            if let Some(journal) = spinoff_journal {
+                                resident_spinoffs.push(crate::resident::SolverState::new(
+                                    spinoff_z3_context
+                                        .take()
+                                        .expect("spinoff journal has a solver"),
+                                    journal,
+                                ));
                             }
                         }
 
@@ -2204,6 +2023,18 @@ impl Verifier {
 
         let (time_smt_init, time_smt_run) = air_context.get_time();
         let rlimit_count = air_context.get_rlimit_count();
+
+        if let Some(journal) = resident {
+            self.resident_buckets.push(crate::resident::RetainedBucket::new(
+                bucket_id.clone(),
+                air_context,
+                journal,
+                resident_spinoffs,
+                self.args.provenance.then(|| {
+                    crate::provenance::Symbols::capture(&ctx.global, ctx.name_ctxt.source_names())
+                }),
+            ));
+        }
 
         Ok(VerifyBucketOut {
             time_smt_init: time_smt_init + spunoff_time_smt_init,
@@ -2970,6 +2801,7 @@ impl Verifier {
             reporter.report(&note(&span, msg).to_any());
         }
 
+        self.resident_prepared = self.args.resident;
         Ok(())
     }
 
@@ -3749,7 +3581,29 @@ impl VerifierCallbacksEraseMacro {
             reporter.report_as(&err.to_any(), MessageLevel::Error);
             self.verifier.encountered_vir_error = true;
         }
+        if self.verifier.args.resident {
+            let mut files = std::collections::BTreeSet::new();
+            for file in compiler.sess.source_map().files().iter() {
+                if matches!(*file.external_src.borrow(), rustc_span::ExternalSource::Unneeded) {
+                    if let rustc_span::FileName::Real(name) = &file.name {
+                        if let Some(path) = name.local_path() {
+                            files.insert(path.to_path_buf());
+                        }
+                    }
+                }
+            }
+            for file in compiler.sess.file_depinfo.lock().iter() {
+                files.insert(std::path::PathBuf::from(file.as_str()));
+            }
+            self.verifier.resident_inputs = files
+                .into_iter()
+                .map(|path| {
+                    std::path::absolute(&path).unwrap_or(path).to_string_lossy().into_owned()
+                })
+                .collect();
+        }
         if !self.verifier.args.output_json
+            && !self.verifier.args.resident
             && !self.verifier.args.no_verify
             && !self.verifier.encountered_error
             && !self.verifier.encountered_vir_error

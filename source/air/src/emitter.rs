@@ -13,7 +13,7 @@ pub(crate) struct Emitter {
     /// buffer for data to be sent across pipe to Z3 process
     pipe_buffer: Option<Vec<u8>>,
     /// log file
-    log: Option<Box<dyn std::io::Write>>,
+    log: Option<Box<dyn std::io::Write + Send>>,
     /// string of space characters representing current indentation level
     current_indent: String,
 }
@@ -23,7 +23,7 @@ impl Emitter {
         message_interface: std::sync::Arc<dyn crate::messages::MessageInterface>,
         use_pipe: bool,
         print_as_smt: bool,
-        writer: Option<Box<dyn std::io::Write>>,
+        writer: Option<Box<dyn std::io::Write + Send>>,
         solver: SmtSolver,
     ) -> Self {
         let pipe_buffer = if use_pipe { Some(Vec::new()) } else { None };
@@ -36,7 +36,7 @@ impl Emitter {
         }
     }
 
-    pub fn set_log(&mut self, writer: Option<Box<dyn std::io::Write>>) {
+    pub fn set_log(&mut self, writer: Option<Box<dyn std::io::Write + Send>>) {
         self.log = writer;
     }
 

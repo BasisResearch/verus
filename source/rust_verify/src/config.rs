@@ -128,6 +128,8 @@ pub struct ArgsX {
     pub no_assert_ids: bool,
     pub provenance: bool,
     pub reach: Option<String>,
+    /// Serve retained AIR queries over stdin/stdout after compilation.
+    pub resident: bool,
 }
 
 impl ArgsX {
@@ -178,6 +180,7 @@ impl ArgsX {
             no_assert_ids: Default::default(),
             provenance: Default::default(),
             reach: Default::default(),
+            resident: false,
         }
     }
 }
@@ -328,6 +331,7 @@ pub fn parse_args_with_imports(
     const OPT_TIME: &str = "time";
     const OPT_TIME_EXPANDED: &str = "time-expanded";
     const OPT_OUTPUT_JSON: &str = "output-json";
+    const OPT_RESIDENT: &str = "resident";
     const OPT_RLIMIT: &str = "rlimit";
     const OPT_SMT_OPTION: &str = "smt-option";
     const OPT_MULTIPLE_ERRORS: &str = "multiple-errors";
@@ -511,6 +515,11 @@ pub fn parse_args_with_imports(
     opts.optflag("", OPT_TIME, "Measure and report time taken");
     opts.optflag("", OPT_TIME_EXPANDED, "Measure and report time taken with module breakdown");
     opts.optflag("", OPT_OUTPUT_JSON, "Emit verification results and timing as json");
+    opts.optflag(
+        "",
+        OPT_RESIDENT,
+        "Serve retained cvc5 buckets and queries over JSON lines on stdin/stdout",
+    );
     opts.optopt(
         "",
         OPT_RLIMIT,
@@ -875,6 +884,7 @@ pub fn parse_args_with_imports(
         no_bv_simplify: extended.contains_key(EXTENDED_NO_BV_SIMPLIFY),
         no_assert_ids: extended.contains_key(EXTENDED_NO_ASSERT_IDS),
         provenance: extended.contains_key(EXTENDED_PROVENANCE),
+        resident: matches.opt_present(OPT_RESIDENT),
     };
 
     if args.provenance && !matches!(args.solver, SmtSolver::Cvc5) {
@@ -885,6 +895,24 @@ pub fn parse_args_with_imports(
     }
     if args.provenance && args.no_assert_ids {
         error("-V provenance and -V no-assert-ids exclude each other".to_string());
+    }
+
+    if args.resident
+        && (!matches!(args.solver, SmtSolver::Cvc5)
+            || args.no_verify
+            || args.compile
+            || !args.smt_options.is_empty()
+            || args.debugger
+            || args.allow_inline_air)
+    {
+        error("--resident requires cvc5 verification; --no-verify, compilation, custom SMT options, debugger and inline AIR are not integrated with resident rechecking".to_string());
+    }
+    let resident_socket = cfg!(unix) && std::env::var_os("VERUS_RESIDENT_SOCKET").is_some();
+    if args.resident
+        && !resident_socket
+        && (args.output_json || args.time || args.time_expanded || args.trace)
+    {
+        error("--resident uses stdout for its protocol; JSON, timing and trace output require a separate VERUS_RESIDENT_SOCKET transport".to_string());
     }
 
     if args.compile && args.no_erasure_check {
