@@ -586,6 +586,63 @@ fn resident_socket_closes_on_eof() {
     worker.finish(false);
 }
 
+// A recheck looks for as many errors as the original invocation did. With the
+// default --multiple-errors of 2, a function with two failing assertions
+// reports both, and says so when it stopped looking.
+#[test]
+fn resident_recheck_reports_as_many_errors_as_the_batch_run() {
+    let source = r#"
+        use vstd::prelude::*;
+        verus! {
+            proof fn two_failures(x: int) {
+                assert(x > 0);
+                assert(x < 0);
+            }
+        }
+    "#;
+    let mut worker = Worker::start(source, &[]);
+    let ready = worker.receive();
+    let query = query_id(&ready, "::two_failures");
+    let checked = worker.send(
+        json!({"command": "check", "session": ready["session"], "bucket": 0, "query": query}),
+    );
+    assert_eq!(checked["result"], "invalid", "{}", checked);
+    let diagnostics = checked["diagnostics"].as_array().unwrap();
+    let failures = diagnostics.iter().filter(|d| d["level"] == "error").count();
+    assert_eq!(failures, 2, "{}", checked);
+    assert!(
+        diagnostics.iter().any(|d| d["level"] == "note"
+            && d["message"].as_str().unwrap().contains("not all errors may have been reported")),
+        "{}",
+        checked
+    );
+    worker.finish(false);
+}
+
+// Preparation that fails after the driver returns still tells the caller, so
+// an empty stdout is never mistaken for a crash.
+#[test]
+fn resident_reports_that_no_session_is_available() {
+    let source = "use vstd::prelude::*; verus! { proof fn f(x: u32) { assert(x & 0 == 0) by(bit_vector); } }";
+    let mut worker = Worker::start(source, &[]);
+    let reply = worker.receive();
+    assert_eq!(reply["event"], "error", "{}", reply);
+    assert!(reply["message"].as_str().unwrap().contains("no session is available"), "{}", reply);
+    worker.finish(false);
+}
+
+// An oversized frame closes the session, and says so first.
+#[test]
+fn resident_reports_an_oversized_request_before_closing() {
+    let mut worker = Worker::start(SOURCE, &[]);
+    assert_eq!(worker.receive()["event"], "ready");
+    worker.raw(&format!("{}\n", "x".repeat(70000)));
+    let reply = worker.receive();
+    assert_eq!(reply["event"], "error", "{}", reply);
+    assert!(reply["message"].as_str().unwrap().contains("64 KiB"), "{}", reply);
+    worker.finish(false);
+}
+
 #[test]
 fn resident_rejects_incomplete_preparation_cleanly() {
     for (source, expected) in [
@@ -600,6 +657,15 @@ fn resident_rejects_incomplete_preparation_cleanly() {
     ] {
         for threads in ["1", "2"] {
             let mut worker = Worker::start(source, &["--num-threads", threads]);
+            // No catalogue is published, and the caller is told that rather
+            // than left to infer it from an empty stdout.
+            let reply = worker.receive();
+            assert_eq!(reply["event"], "error", "{}", reply);
+            assert!(
+                reply["message"].as_str().unwrap().contains("no session is available"),
+                "{}",
+                reply
+            );
             worker.finish(false);
             assert!(worker.stderr().contains(expected), "{}", worker.stderr());
             assert!(!worker.stderr().contains("panicked"), "{}", worker.stderr());
