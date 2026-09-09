@@ -115,6 +115,17 @@ impl Worker {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert!(self.replies.recv_timeout(Duration::from_secs(1)).is_err());
+        self.assert_solvers_gone();
+    }
+
+    fn assert_solvers_gone(&self) {
+        if let Ok(launches) = fs::read_to_string(self.dir.path().join("launches")) {
+            for pid in launches.lines() {
+                let alive =
+                    Command::new("kill").args(["-0", pid]).output().unwrap().status.success();
+                assert!(!alive, "solver {} survived shutdown", pid);
+            }
+        }
     }
 }
 
@@ -126,7 +137,7 @@ impl Drop for Worker {
 }
 
 fn query_id(ready: &Value, name: &str) -> Value {
-    ready["queries"]
+    ready["buckets"][0]["queries"]
         .as_array()
         .unwrap()
         .iter()
@@ -140,10 +151,12 @@ fn resident_rechecks_preserve_query_scopes_and_solver_process() {
     let mut worker = Worker::start(SOURCE, &[]);
     let ready = worker.receive();
     assert_eq!(ready["event"], "ready");
+    assert_eq!(ready["protocol"], 2);
+    assert_eq!(ready["invocation_succeeded"], false);
     assert_eq!(ready["process_id"], worker.child.id());
     let session = ready["session"].clone();
     let listed = worker.send(json!({"command": "list"}));
-    assert_eq!(listed["queries"], ready["queries"]);
+    assert_eq!(listed["buckets"], ready["buckets"]);
     for (name, expected) in [
         ("::failing", "invalid"),
         ("::passing", "valid"),
@@ -152,7 +165,8 @@ fn resident_rechecks_preserve_query_scopes_and_solver_process() {
         ("::failing", "invalid"),
     ] {
         let query = query_id(&ready, name);
-        let result = worker.send(json!({"command": "check", "session": session, "query": query}));
+        let result = worker
+            .send(json!({"command": "check", "session": session, "bucket": 0, "query": query}));
         assert_eq!(result["event"], "checked");
         assert_eq!(result["session"], session);
         assert_eq!(result["query"], query);
@@ -164,6 +178,7 @@ fn resident_rechecks_preserve_query_scopes_and_solver_process() {
         }
     }
     assert_eq!(worker.send(json!({"command": "close", "session": session}))["event"], "closed");
+    worker.assert_solvers_gone();
     // The original fixture fails verification; successful rechecks do not
     // overwrite the original crate result or process exit status.
     worker.finish(false);
@@ -190,16 +205,18 @@ fn resident_rejects_bad_requests_and_accepts_eof() {
     worker.raw("not json\n");
     assert_eq!(worker.receive()["event"], "error");
     for request in [
-        json!({"command": "check", "session": "stale", "query": 0}),
+        json!({"command": "check", "session": "stale", "bucket": 0, "query": 0}),
         json!({"command": "close", "session": "stale"}),
-        json!({"command": "check", "session": session, "query": 99999}),
-        json!({"command": "check", "session": session, "query": -1}),
-        json!({"command": "check", "session": session, "query": 0, "assertion": "false"}),
+        json!({"command": "check", "session": session, "bucket": 0, "query": 99999}),
+        json!({"command": "check", "session": session, "bucket": 0, "query": -1}),
+        json!({"command": "check", "session": session, "bucket": 0, "query": 0, "assertion": "false"}),
+        json!({"command": "check", "session": session, "bucket": 99999, "query": 0}),
+        json!({"command": "check", "session": session, "query": 0}),
     ] {
         assert_eq!(worker.send(request)["event"], "error");
     }
     assert_eq!(
-        worker.send(json!({"command": "check", "session": session, "query": 0}))["result"],
+        worker.send(json!({"command": "check", "session": session, "bucket": 0, "query": 0}))["result"],
         "valid"
     );
     worker.finish(true);
@@ -208,7 +225,6 @@ fn resident_rejects_bad_requests_and_accepts_eof() {
 #[test]
 fn resident_rejects_unsupported_modes() {
     for options in [
-        vec!["--num-threads", "2"],
         vec!["--output-json"],
         vec!["--smt-option", "global-declarations=true"],
         vec!["-V", "provenance"],
@@ -221,20 +237,148 @@ fn resident_rejects_unsupported_modes() {
 }
 
 #[test]
-fn resident_rejects_multiple_buckets_and_specialised_queries_cleanly() {
+fn resident_rejects_incomplete_preparation_cleanly() {
     for (source, expected) in [
         (
-            "use vstd::prelude::*; verus! { mod a { proof fn f() {} } mod b { proof fn g() {} } }",
-            "--resident requires exactly one bucket",
+            "use vstd::prelude::*; verus! { proof fn broken() { missing(); } }",
+            "cannot find function",
         ),
         (
-            "use vstd::prelude::*; verus! { proof fn f(x: u32) { assert(x & 0 == 0) by(bit_vector); } }",
+            "use vstd::prelude::*; verus! { mod a { proof fn ok() {} } mod b { use super::*; proof fn f(x: u32) { assert(x & 0 == 0) by(bit_vector); } } }",
             "--resident does not support specialised prover queries",
         ),
     ] {
-        let mut worker = Worker::start(source, &[]);
-        worker.finish(false);
-        assert!(worker.stderr().contains(expected), "{}", worker.stderr());
-        assert!(!worker.stderr().contains("panicked"), "{}", worker.stderr());
+        for threads in ["1", "2"] {
+            let mut worker = Worker::start(source, &["--num-threads", threads]);
+            worker.finish(false);
+            assert!(worker.stderr().contains(expected), "{}", worker.stderr());
+            assert!(!worker.stderr().contains("panicked"), "{}", worker.stderr());
+        }
     }
+}
+
+const MULTI_BUCKET_SOURCE: &str = r#"
+use vstd::prelude::*;
+verus! {
+    mod a {
+        use super::*;
+        spec fn value() -> int { 1 }
+        proof fn check() { assert(value() == 1); }
+    }
+    mod b {
+        use super::*;
+        spec fn value() -> int { 2 }
+        proof fn check() { assert(value() == 1); }
+        proof fn extra() {}
+    }
+}
+"#;
+
+#[test]
+fn resident_routes_all_buckets_after_serial_and_parallel_preparation() {
+    let mut catalogue = None;
+    for threads in ["1", "2"] {
+        let mut worker = Worker::start(MULTI_BUCKET_SOURCE, &["--num-threads", threads]);
+        let ready = worker.receive();
+        let session = &ready["session"];
+        let buckets = ready["buckets"].as_array().unwrap();
+        assert_eq!(buckets.len(), 2);
+        assert_eq!(buckets[0]["name"], "module a");
+        assert_eq!(buckets[1]["name"], "module b");
+        // Both modules have query ordinal zero. Its meaning is bucket-local.
+        for (bucket, expected) in [(0, "valid"), (1, "invalid"), (0, "valid"), (1, "invalid")] {
+            let result = worker.send(
+                json!({"command": "check", "session": session, "bucket": bucket, "query": 0}),
+            );
+            assert_eq!(result["bucket"], bucket);
+            assert_eq!(result["result"], expected);
+        }
+        let extra = buckets[1]["queries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|query| query["function"].as_str().unwrap().ends_with("::extra"))
+            .unwrap()["id"]
+            .clone();
+        assert_eq!(
+            worker
+                .send(json!({"command": "check", "session": session, "bucket": 0, "query": extra}))
+                ["event"],
+            "error"
+        );
+        assert_eq!(
+            worker
+                .send(json!({"command": "check", "session": session, "bucket": 1, "query": extra}))
+                ["result"],
+            "valid"
+        );
+        // Stable catalogue despite different worker completion order. Source
+        // span filenames contain temporary directories, so compare identities.
+        let identities: Vec<_> = buckets
+            .iter()
+            .map(|bucket| {
+                (
+                    bucket["id"].clone(),
+                    bucket["name"].clone(),
+                    bucket["queries"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|query| {
+                            (query["id"].clone(), query["function"].clone(), query["kind"].clone())
+                        })
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect();
+        if let Some(previous) = &catalogue {
+            assert_eq!(previous, &identities);
+        }
+        catalogue = Some(identities);
+        assert_eq!(worker.send(json!({"command": "close", "session": session}))["event"], "closed");
+        worker.assert_solvers_gone();
+        worker.finish(false);
+        let launches = fs::read_to_string(worker.dir.path().join("launches")).unwrap();
+        assert_eq!(launches.lines().count(), 2);
+        eprintln!(
+            "{threads} compilation threads: two buckets, two solver launches, five rechecks, all children closed"
+        );
+    }
+}
+
+#[test]
+fn resident_filters_buckets_and_closes_all_on_eof() {
+    let mut worker = Worker::start(MULTI_BUCKET_SOURCE, &["--verify-module", "a"]);
+    let ready = worker.receive();
+    assert_eq!(ready["buckets"].as_array().unwrap().len(), 1);
+    assert_eq!(ready["buckets"][0]["name"], "module a");
+    assert_eq!(ready["invocation_succeeded"], true);
+    worker.finish(true);
+
+    let mut worker = Worker::start(MULTI_BUCKET_SOURCE, &["--num-threads", "2"]);
+    assert_eq!(worker.receive()["buckets"].as_array().unwrap().len(), 2);
+    worker.finish(false);
+}
+
+#[test]
+fn resident_retains_function_buckets_alongside_module_buckets() {
+    let source = r#"
+        use vstd::prelude::*;
+        verus! {
+            proof fn regular() {}
+            #[verifier::spinoff_prover]
+            proof fn isolated() {}
+        }
+    "#;
+    let mut worker = Worker::start(source, &["--num-threads", "2"]);
+    let ready = worker.receive();
+    let buckets = ready["buckets"].as_array().unwrap();
+    assert_eq!(buckets.len(), 2);
+    assert_eq!(buckets[0]["name"], "root module");
+    assert!(buckets[1]["name"].as_str().unwrap().contains("function fixture::isolated"));
+    for bucket in buckets {
+        assert_eq!(worker.send(json!({"command": "check", "session": ready["session"], "bucket": bucket["id"], "query": 0}))["result"], "valid");
+    }
+    worker.finish(true);
+    assert_eq!(fs::read_to_string(worker.dir.path().join("launches")).unwrap().lines().count(), 2);
 }

@@ -37,7 +37,7 @@ pub struct SmtProcess {
         Option<(BufReader<ChildStdout>, Receiver<(BufReader<ChildStdout>, Vec<String>)>)>,
     recv_requests: Sender<BufReader<ChildStdout>>,
     child: Child,
-    transcript_log: Option<Box<dyn std::io::Write>>,
+    transcript_log: Option<Box<dyn std::io::Write + Send>>,
 }
 
 const DONE: &str = "<<DONE>>";
@@ -108,7 +108,7 @@ fn reader_thread(
 impl SmtProcess {
     pub fn launch(
         solver: &SmtSolver,
-        transcript_log: Option<Box<dyn std::io::Write>>,
+        transcript_log: Option<Box<dyn std::io::Write + Send>>,
         provenance: bool,
     ) -> Self {
         let solver_info = SolverInfo::new(solver);
@@ -172,7 +172,7 @@ impl SmtProcess {
         }
     }
 
-    pub(crate) fn set_transcript_log(&mut self, writer: Box<dyn std::io::Write>) {
+    pub(crate) fn set_transcript_log(&mut self, writer: Box<dyn std::io::Write + Send>) {
         self.transcript_log = Some(writer);
     }
 

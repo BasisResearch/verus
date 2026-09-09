@@ -128,7 +128,7 @@ pub struct ArgsX {
     pub no_assert_ids: bool,
     pub provenance: bool,
     pub reach: Option<String>,
-    /// Serve retained AIR queries over stdin/stdout for one verification bucket.
+    /// Serve retained AIR queries over stdin/stdout after compilation.
     pub resident: bool,
 }
 
@@ -518,7 +518,7 @@ pub fn parse_args_with_imports(
     opts.optflag(
         "",
         OPT_RESIDENT,
-        "Serve retained queries for one cvc5 bucket over JSON lines on stdin/stdout",
+        "Serve retained cvc5 buckets and queries over JSON lines on stdin/stdout",
     );
     opts.optopt(
         "",
@@ -873,7 +873,7 @@ pub fn parse_args_with_imports(
         num_threads: matches
             .opt_get::<usize>(OPT_NUM_THREADS)
             .unwrap_or_else(|_| error("expected integer after num_threads".to_string()))
-            .unwrap_or(if matches.opt_present(OPT_RESIDENT) { 1 } else { default_num_threads }),
+            .unwrap_or(default_num_threads),
         trace: matches.opt_present(OPT_TRACE),
         reach: matches.opt_str(OPT_REACH),
         report_long_running: !matches.opt_present(OPT_NO_REPORT_LONG_RUNNING),
@@ -899,7 +899,6 @@ pub fn parse_args_with_imports(
 
     if args.resident
         && (!matches!(args.solver, SmtSolver::Cvc5)
-            || args.num_threads != 1
             || args.no_verify
             || args.compile
             || args.output_json
@@ -915,7 +914,7 @@ pub fn parse_args_with_imports(
             || args.profile_all
             || args.capture_profiles)
     {
-        error("--resident requires ordinary cvc5 verification with one thread; compilation, JSON/timing/trace output, custom SMT options, debugger, inline AIR, spinoff-all, provenance and profiling are unsupported".to_string());
+        error("--resident requires ordinary cvc5 verification; compilation, JSON/timing/trace output, custom SMT options, debugger, inline AIR, spinoff-all, provenance and profiling are unsupported".to_string());
     }
 
     if args.compile && args.no_erasure_check {

@@ -291,6 +291,8 @@ pub struct FunctionSmtStats {
 }
 
 pub struct Verifier {
+    resident_buckets: Vec<crate::resident::RetainedBucket>,
+    resident_prepared: bool,
     /// this is the actual number of threads used for verification. This will be set to the
     /// minimum of the requested threads and the number of buckets to verify
     pub num_threads: usize,
@@ -597,6 +599,8 @@ impl Verifier {
         Verifier {
             num_threads: 1,
             encountered_error: false,
+            resident_buckets: Vec::new(),
+            resident_prepared: false,
             encountered_vir_error: false,
             count_verified: 0,
             count_errors: 0,
@@ -647,6 +651,8 @@ impl Verifier {
         Verifier {
             num_threads: 1,
             encountered_error: self.encountered_error,
+            resident_buckets: Vec::new(),
+            resident_prepared: false,
             encountered_vir_error: false,
             count_verified: 0,
             count_errors: 0,
@@ -692,6 +698,7 @@ impl Verifier {
 
     /// merges two verifiers by summing up times and verified stats from other into self.
     pub fn merge(&mut self, other: Self) {
+        self.resident_buckets.extend(other.resident_buckets);
         self.count_verified += other.count_verified;
         self.count_errors += other.count_errors;
         self.func_fails.extend(other.func_fails);
@@ -704,6 +711,20 @@ impl Verifier {
             self.func_provenance.entry(fun).or_default().extend(queries);
         }
         self.deferred_errors.extend(other.deferred_errors);
+    }
+
+    /// Enter the protocol only after the compiler driver has returned and all
+    /// selected buckets have finished lowering. Even failed/partial invocations
+    /// relinquish their children here, before main can call process::exit.
+    pub fn serve_resident(&mut self, invocation_succeeded: bool) -> std::io::Result<()> {
+        let buckets = std::mem::take(&mut self.resident_buckets);
+        if !self.resident_prepared {
+            return Ok(());
+        }
+        self.resident_prepared = false;
+        crate::resident::Server::new(buckets).serve(invocation_succeeded, |context, rlimit| {
+            Self::set_rlimit(SmtSolver::Cvc5, context, rlimit);
+        })
     }
 
     fn get_bucket<'a>(&'a self, bucket_id: &BucketId) -> &'a Bucket {
@@ -1760,7 +1781,7 @@ impl Verifier {
         // Insert initial bucket context.
         self.run_command_batches(bucket_id, reporter, &mut air_context, &bucket_context);
 
-        let mut resident = self.args.resident.then(crate::resident::Session::new);
+        let mut resident = self.args.resident.then(crate::resident::QueryJournal::new);
 
         let bucket = self.get_bucket(bucket_id);
         let mut opgen = OpGenerator::new(ctx, krate, bucket.clone());
@@ -2248,16 +2269,16 @@ impl Verifier {
 
         ctx.fun = None;
 
-        if let Some(session) = resident {
-            session
-                .serve(&mut air_context, bucket_id.friendly_name(), |context, rlimit| {
-                    Self::set_rlimit(SmtSolver::Cvc5, context, rlimit);
-                })
-                .map_err(|err| vir::messages::error_bare(format!("resident session: {err}")))?;
-        }
-
         let (time_smt_init, time_smt_run) = air_context.get_time();
         let rlimit_count = air_context.get_rlimit_count();
+
+        if let Some(journal) = resident {
+            self.resident_buckets.push(crate::resident::RetainedBucket::new(
+                bucket_id.clone(),
+                air_context,
+                journal,
+            ));
+        }
 
         Ok(VerifyBucketOut {
             time_smt_init: time_smt_init + spunoff_time_smt_init,
@@ -2460,11 +2481,6 @@ impl Verifier {
         let buckets = crate::buckets::get_buckets(&krate, &modules_to_verify);
         let buckets = user_filter.filter_buckets(buckets);
         let bucket_ids: Vec<BucketId> = buckets.iter().map(|p| p.0.clone()).collect();
-        if self.args.resident && bucket_ids.len() != 1 {
-            return Err(VerifyErr::Vir(vir::messages::error_bare(
-                "--resident requires exactly one bucket; select one module or function",
-            )));
-        }
         self.buckets = buckets.into_iter().collect();
 
         let time_verify_sequential_end = Instant::now();
@@ -3029,6 +3045,7 @@ impl Verifier {
             reporter.report(&note(&span, msg).to_any());
         }
 
+        self.resident_prepared = self.args.resident;
         Ok(())
     }
 

@@ -160,7 +160,7 @@ pub fn main() {
     let verifier =
         rust_verify::verifier::Verifier::new(our_args, via_cargo, via_cargo_compile, dep_tracker);
 
-    let (verifier, stats, status) = rust_verify::driver::run(
+    let (mut verifier, stats, mut status) = rust_verify::driver::run(
         verifier,
         rustc_args,
         verus_root,
@@ -169,6 +169,12 @@ pub fn main() {
 
     let total_time_1 = std::time::Instant::now();
     let total_time = total_time_1 - total_time_0;
+
+    let invocation_succeeded = status.is_ok() && verifier.count_errors == 0;
+    if let Err(error) = verifier.serve_resident(invocation_succeeded) {
+        eprintln!("error: resident session: {error}");
+        status = Err(());
+    }
 
     let times_ms_json_data = if verifier.args.time {
         fn compute_total(

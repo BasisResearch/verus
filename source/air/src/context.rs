@@ -133,7 +133,7 @@ pub struct Context {
     pub(crate) air_middle_log: Emitter,
     pub(crate) air_final_log: Emitter,
     pub(crate) smt_log: Emitter,
-    pub(crate) smt_transcript_log: Option<Box<dyn std::io::Write>>,
+    pub(crate) smt_transcript_log: Option<Box<dyn std::io::Write + Send>>,
     pub(crate) time_smt_init: Duration,
     pub(crate) time_smt_run: Duration,
     pub(crate) rlimit_count: Option<(u64, u64)>,
@@ -251,23 +251,23 @@ impl Context {
         self.smt_process.as_mut().unwrap()
     }
 
-    pub fn set_air_initial_log(&mut self, writer: Box<dyn std::io::Write>) {
+    pub fn set_air_initial_log(&mut self, writer: Box<dyn std::io::Write + Send>) {
         self.air_initial_log.set_log(Some(writer));
     }
 
-    pub fn set_air_middle_log(&mut self, writer: Box<dyn std::io::Write>) {
+    pub fn set_air_middle_log(&mut self, writer: Box<dyn std::io::Write + Send>) {
         self.air_middle_log.set_log(Some(writer));
     }
 
-    pub fn set_air_final_log(&mut self, writer: Box<dyn std::io::Write>) {
+    pub fn set_air_final_log(&mut self, writer: Box<dyn std::io::Write + Send>) {
         self.air_final_log.set_log(Some(writer));
     }
 
-    pub fn set_smt_log(&mut self, writer: Box<dyn std::io::Write>) {
+    pub fn set_smt_log(&mut self, writer: Box<dyn std::io::Write + Send>) {
         self.smt_log.set_log(Some(writer));
     }
 
-    pub fn set_smt_transcript_log(&mut self, writer: Box<dyn std::io::Write>) {
+    pub fn set_smt_transcript_log(&mut self, writer: Box<dyn std::io::Write + Send>) {
         if let Some(smt_process) = &mut self.smt_process {
             smt_process.set_transcript_log(writer);
         } else {

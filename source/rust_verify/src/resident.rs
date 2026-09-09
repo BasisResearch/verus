@@ -1,8 +1,9 @@
-//! Recheck retained AIR queries against their original bucket context.
+//! Serve retained AIR queries after compilation, with one solver per bucket.
 //!
 //! This driver serves one immutable compilation over JSON lines. It never reads
 //! replacement source or accepts new assertions from its caller.
 
+use crate::buckets::BucketId;
 use crate::commands::{QueryOp, Style};
 use air::ast::{CommandX, Commands, Query};
 use air::context::{Context, QueryContext, ValidityResult};
@@ -10,6 +11,7 @@ use air::messages::{ArcDynMessage, Diagnostics, MessageLevel};
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::io::{self, BufRead, Read, Write};
+use std::sync::Mutex;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use vir::ast_util::fun_as_friendly_rust_name;
 use vir::def::{CommandContext, CommandsWithContext};
@@ -18,6 +20,10 @@ use vir::messages::{MessageX, VirMessageInterface};
 #[derive(Clone, Copy, Deserialize, Serialize)]
 #[serde(transparent)]
 struct QueryId(usize);
+
+#[derive(Clone, Copy, Deserialize, Serialize)]
+#[serde(transparent)]
+struct BucketIndex(usize);
 
 struct RetainedQuery {
     query: Query,
@@ -56,7 +62,7 @@ impl QueryKind {
 /// Every journal entry has its own AIR/SMT scope. `applied` is the length of
 /// the prefix currently asserted. A query can run only at its recorded prefix,
 /// so declarations and axioms introduced later cannot affect an earlier query.
-pub(crate) struct Session {
+pub(crate) struct QueryJournal {
     contexts: Vec<Commands>,
     queries: Vec<RetainedQuery>,
     applied: usize,
@@ -66,11 +72,11 @@ pub(crate) struct Session {
 #[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]
 enum Request {
     List,
-    Check { session: String, query: QueryId },
+    Check { session: String, bucket: BucketIndex, query: QueryId },
     Close { session: String },
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 struct QueryDescription {
     id: QueryId,
     function: String,
@@ -80,21 +86,67 @@ struct QueryDescription {
 }
 
 #[derive(Serialize)]
+struct BucketDescription {
+    id: BucketIndex,
+    name: String,
+    queries: Vec<QueryDescription>,
+}
+
+/// Owned solver state transferred from compilation workers to the server.
+/// The mutex keeps context restoration, checking and query cleanup atomic and
+/// marks the bucket poisoned if a check panics. Poisoned state is never reused.
+pub(crate) struct RetainedBucket {
+    id: BucketId,
+    queries: Vec<QueryDescription>,
+    state: Mutex<BucketState>,
+}
+
+struct BucketState {
+    air: Context,
+    journal: QueryJournal,
+}
+
+impl RetainedBucket {
+    pub(crate) fn new(id: BucketId, air: Context, journal: QueryJournal) -> Self {
+        let queries = journal
+            .queries
+            .iter()
+            .enumerate()
+            .map(|(id, query)| QueryDescription {
+                id: QueryId(id),
+                function: fun_as_friendly_rust_name(&query.context.fun),
+                description: query.context.desc.clone(),
+                kind: query.kind,
+                span: query.context.span.as_string.clone(),
+            })
+            .collect();
+        Self { id, queries, state: Mutex::new(BucketState { air, journal }) }
+    }
+}
+
+/// One invocation owns every selected bucket. Only this layer owns protocol
+/// I/O; compiler workers finish and return their contexts before it starts.
+pub(crate) struct Server {
+    buckets: Vec<RetainedBucket>,
+}
+
+#[derive(Serialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 enum Response<'a> {
     Ready {
         protocol: u32,
         session: &'a str,
-        bucket: &'a str,
         process_id: u32,
-        queries: &'a [QueryDescription],
+        invocation_succeeded: bool,
+        buckets: &'a [BucketDescription],
     },
     Queries {
         session: &'a str,
-        queries: &'a [QueryDescription],
+        buckets: &'a [BucketDescription],
     },
     Checked {
         session: &'a str,
+        bucket: BucketIndex,
         query: QueryId,
         result: QueryResult,
         assert_id: Option<Vec<u64>>,
@@ -178,7 +230,7 @@ fn send(output: &mut impl Write, response: &Response<'_>) -> io::Result<()> {
     output.flush()
 }
 
-impl Session {
+impl QueryJournal {
     pub(crate) fn new() -> Self {
         Self { contexts: Vec::new(), queries: Vec::new(), applied: 0 }
     }
@@ -239,49 +291,66 @@ impl Session {
         }
         Ok(())
     }
+}
+
+impl Server {
+    pub(crate) fn new(mut buckets: Vec<RetainedBucket>) -> Self {
+        // Compilation can finish in any order. Protocol ordinals follow the
+        // verifier's bucket identity, not worker completion order.
+        buckets.sort_by(|left, right| left.id.cmp(&right.id));
+        Self { buckets }
+    }
 
     pub(crate) fn serve(
         mut self,
-        air: &mut Context,
-        bucket: String,
+        invocation_succeeded: bool,
         set_rlimit: impl Fn(&mut Context, f32),
     ) -> io::Result<()> {
         let stamp = SystemTime::now().duration_since(UNIX_EPOCH).map_err(io::Error::other)?;
         let session = format!("{}-{}", std::process::id(), stamp.as_nanos());
         let input = io::stdin();
         let output = io::stdout();
-        self.run(air, &bucket, &session, input.lock(), output.lock(), set_rlimit)
+        self.run(&session, invocation_succeeded, input.lock(), output.lock(), set_rlimit)
+    }
+
+    fn shutdown(&mut self) -> io::Result<()> {
+        for bucket in &mut self.buckets {
+            let state =
+                bucket.state.get_mut().map_err(|_| io::Error::other("resident bucket poisoned"))?;
+            state.journal.restore_prefix(&mut state.air, 0)?;
+        }
+        // Dropping AIR contexts closes and waits for every solver. A closed
+        // acknowledgement is sent only after all children have exited.
+        self.buckets.clear();
+        Ok(())
     }
 
     fn run(
         &mut self,
-        air: &mut Context,
-        bucket: &str,
         session: &str,
+        invocation_succeeded: bool,
         mut input: impl BufRead,
         mut output: impl Write,
         set_rlimit: impl Fn(&mut Context, f32),
     ) -> io::Result<()> {
-        let queries: Vec<_> = self
-            .queries
+        let buckets: Vec<_> = self
+            .buckets
             .iter()
             .enumerate()
-            .map(|(id, query)| QueryDescription {
-                id: QueryId(id),
-                function: fun_as_friendly_rust_name(&query.context.fun),
-                description: query.context.desc.clone(),
-                kind: query.kind,
-                span: query.context.span.as_string.clone(),
+            .map(|(id, bucket)| BucketDescription {
+                id: BucketIndex(id),
+                name: bucket.id.friendly_name(),
+                queries: bucket.queries.clone(),
             })
             .collect();
         send(
             &mut output,
             &Response::Ready {
-                protocol: 1,
+                protocol: 2,
                 session,
-                bucket,
                 process_id: std::process::id(),
-                queries: &queries,
+                invocation_succeeded,
+                buckets: &buckets,
             },
         )?;
         loop {
@@ -289,7 +358,7 @@ impl Session {
             // an oversized request as a second request.
             let mut line = String::new();
             if input.by_ref().take(65537).read_line(&mut line)? == 0 {
-                self.restore_prefix(air, 0)?;
+                self.shutdown()?;
                 return Ok(());
             }
             if line.len() > 65536 {
@@ -307,7 +376,7 @@ impl Session {
             };
             match request {
                 Request::List => {
-                    send(&mut output, &Response::Queries { session, queries: &queries })?
+                    send(&mut output, &Response::Queries { session, buckets: &buckets })?
                 }
                 Request::Check { session: requested, .. }
                 | Request::Close { session: requested }
@@ -319,18 +388,28 @@ impl Session {
                     )?;
                 }
                 Request::Close { .. } => {
-                    self.restore_prefix(air, 0)?;
+                    self.shutdown()?;
                     send(&mut output, &Response::Closed { session })?;
                     return Ok(());
                 }
-                Request::Check { query: id, .. } => {
-                    let Some(query) = self.queries.get(id.0) else {
-                        send(&mut output, &Response::Error { message: "unknown query" })?;
+                Request::Check { bucket: bucket_id, query: id, .. } => {
+                    let Some(bucket) = self.buckets.get(bucket_id.0) else {
+                        send(&mut output, &Response::Error { message: "unknown bucket" })?;
                         continue;
                     };
-                    let prefix = query.prefix;
-                    self.restore_prefix(air, prefix)?;
-                    let query = &self.queries[id.0];
+                    // Check both coordinates before locking or mutating solver state.
+                    if bucket.queries.get(id.0).is_none() {
+                        send(&mut output, &Response::Error { message: "unknown query" })?;
+                        continue;
+                    }
+                    let mut state = bucket
+                        .state
+                        .lock()
+                        .map_err(|_| io::Error::other("resident bucket poisoned"))?;
+                    let BucketState { air, journal } = &mut *state;
+                    let prefix = journal.queries[id.0].prefix;
+                    journal.restore_prefix(air, prefix)?;
+                    let query = &journal.queries[id.0];
                     set_rlimit(air, query.rlimit);
                     let diagnostics = QueryDiagnostics::default();
                     let start = Instant::now();
@@ -361,6 +440,7 @@ impl Session {
                         &mut output,
                         &Response::Checked {
                             session,
+                            bucket: bucket_id,
                             query: id,
                             result,
                             assert_id,
@@ -397,7 +477,7 @@ mod tests {
         let base = commands("(declare-const x Int)");
         let later = commands("(declare-const y Int) (axiom (= x y)) (axiom (= y 0))");
         let query = commands("(check-valid (assert (= x 0)))");
-        let mut session = Session::new();
+        let mut session = QueryJournal::new();
         for command in base.iter() {
             if let CommandX::Global(decl) = &**command {
                 air.global(decl).unwrap();
@@ -430,13 +510,11 @@ mod tests {
 
     #[test]
     fn oversized_request_closes_without_parsing_its_suffix() {
-        let mut air = Context::new(Arc::new(VirMessageInterface {}), SmtSolver::Cvc5);
-        let mut session = Session::new();
+        let mut session = Server::new(Vec::new());
         let input = format!("{}\n{{\"command\":\"list\"}}\n", " ".repeat(65537));
         let mut output = Vec::new();
-        let error = session
-            .run(&mut air, "test", "test", input.as_bytes(), &mut output, |_, _| {})
-            .unwrap_err();
+        let error =
+            session.run("test", true, input.as_bytes(), &mut output, |_, _| {}).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert_eq!(String::from_utf8(output).unwrap().lines().count(), 1);
     }
