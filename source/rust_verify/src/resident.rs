@@ -285,13 +285,12 @@ impl QueryDiagnostics {
                 .collect(),
         });
     }
-}
 
-impl QueryDiagnostics {
-    /// A note about the reply itself rather than about any one assertion.
-    fn note(&self, message: String, span: &str) {
+    /// A diagnostic about the query as a whole rather than about one assertion
+    /// the solver named: no labels, and the query's own span.
+    fn bare(&self, level: DiagnosticLevel, message: String, span: &str) {
         self.0.borrow_mut().push(SourceDiagnostic {
-            level: DiagnosticLevel::Note,
+            level,
             message,
             spans: vec![span.to_owned()],
             labels: Vec::new(),
@@ -324,10 +323,6 @@ fn send(output: &mut impl Write, response: &Response<'_>) -> io::Result<()> {
     output.flush()
 }
 
-/// End the session, telling the caller why before the pipe closes. Without a
-/// final frame the only signal is EOF, which a caller cannot tell apart from
-/// an orderly shutdown. A failure to send is discarded: the error being
-/// reported is the one worth returning.
 /// Tell a caller that no session is coming, over whichever transport it is
 /// waiting on. Preparation can fail after the compiler driver has returned,
 /// and the summary line is suppressed under `--resident`, so without this the
@@ -343,6 +338,10 @@ pub(crate) fn report_unavailable(reason: &str) -> io::Result<()> {
     send(&mut io::stdout().lock(), &response)
 }
 
+/// End the session, telling the caller why before the pipe closes. Without a
+/// final frame the only signal is EOF, which a caller cannot tell apart from
+/// an orderly shutdown. A failure to send is discarded: the error being
+/// reported is the one worth returning.
 fn fatal<T>(output: &mut impl Write, error: io::Error) -> io::Result<T> {
     let message = error.to_string();
     let _ = send(output, &Response::Error { message: &message });
@@ -623,7 +622,47 @@ impl Server {
                                 break;
                             }
                             ValidityResult::Canceled => {
+                                // On the first round the verdict carries this.
+                                // On a later one the verdict is already
+                                // `invalid`, so without the diagnostic the
+                                // caller cannot tell a complete error list from
+                                // one the rlimit cut short. The batch run
+                                // reports it on every round, and so does this.
+                                // It omits the batch's `--profile` hint, which
+                                // is a rerun the caller of a session does not
+                                // make.
+                                diagnostics.bare(
+                                    level.into(),
+                                    format!(
+                                        "{}: Resource limit (rlimit) exceeded",
+                                        query.context.desc
+                                    ),
+                                    &query.context.span.as_string,
+                                );
                                 verdict.get_or_insert(QueryResult::ResourceLimit);
+                                break;
+                            }
+                            // A failure the solver gave no model for cannot be
+                            // localised any further: `check_valid_again` panics
+                            // on it rather than reporting it, so this must stop
+                            // where `check_result_validity` stops.
+                            ValidityResult::Invalid(None, error, id)
+                            | ValidityResult::Invalid(_, error @ None, id) => {
+                                match error {
+                                    Some(error) => diagnostics.record(&error, level),
+                                    // Nothing came back to describe the
+                                    // failure. Name the obligation, as the
+                                    // batch run does.
+                                    None => diagnostics.bare(
+                                        level.into(),
+                                        query.context.desc.clone(),
+                                        &query.context.span.as_string,
+                                    ),
+                                }
+                                if verdict.is_none() {
+                                    verdict = Some(QueryResult::Invalid);
+                                    assert_id = id.map(|id| (*id).clone());
+                                }
                                 break;
                             }
                             ValidityResult::Invalid(_, error, id) => {
@@ -659,11 +698,18 @@ impl Server {
                         }
                     }
                     let result = verdict.expect("every path out of the loop sets a verdict");
+                    // The batch run guards this on the level and the counter
+                    // alone, so at `--multiple-errors 0`, where the counter
+                    // starts spent, it says the search was cut short even for a
+                    // query that passed. Requiring a failure is a deliberate
+                    // departure: a caller diffing a session against that run
+                    // sees the note only where errors were actually withheld.
                     if matches!(result, QueryResult::Invalid)
                         && level == MessageLevel::Error
                         && checks_remaining == 0
                     {
-                        diagnostics.note(
+                        diagnostics.bare(
+                            DiagnosticLevel::Note,
                             format!(
                                 "{}: not all errors may have been reported; rerun with a higher value for --multiple-errors to find other potential errors in this function",
                                 query.context.desc

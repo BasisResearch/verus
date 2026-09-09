@@ -586,9 +586,10 @@ fn resident_socket_closes_on_eof() {
     worker.finish(false);
 }
 
-// A recheck looks for as many errors as the original invocation did. With the
-// default --multiple-errors of 2, a function with two failing assertions
-// reports both, and says so when it stopped looking.
+// A recheck looks for as many errors as the original invocation did, and says
+// so when it stopped looking before running out of them. The limit comes from
+// the invocation, so a function with two failing assertions reports a different
+// number under each setting of --multiple-errors.
 #[test]
 fn resident_recheck_reports_as_many_errors_as_the_batch_run() {
     let source = r#"
@@ -600,23 +601,29 @@ fn resident_recheck_reports_as_many_errors_as_the_batch_run() {
             }
         }
     "#;
-    let mut worker = Worker::start(source, &[]);
-    let ready = worker.receive();
-    let query = query_id(&ready, "::two_failures");
-    let checked = worker.send(
-        json!({"command": "check", "session": ready["session"], "bucket": 0, "query": query}),
-    );
-    assert_eq!(checked["result"], "invalid", "{}", checked);
-    let diagnostics = checked["diagnostics"].as_array().unwrap();
-    let failures = diagnostics.iter().filter(|d| d["level"] == "error").count();
-    assert_eq!(failures, 2, "{}", checked);
-    assert!(
-        diagnostics.iter().any(|d| d["level"] == "note"
-            && d["message"].as_str().unwrap().contains("not all errors may have been reported")),
-        "{}",
-        checked
-    );
-    worker.finish(false);
+    // Options, errors expected, and whether the search was cut short.
+    for (options, failures, truncated) in [
+        (&[][..], 2, true),                          // the default of 2
+        (&["--multiple-errors", "0"][..], 1, true),  // the first failure only
+        (&["--multiple-errors", "3"][..], 2, false), // more headroom than errors
+    ] {
+        let mut worker = Worker::start(source, options);
+        let ready = worker.receive();
+        let query = query_id(&ready, "::two_failures");
+        let checked = worker.send(
+            json!({"command": "check", "session": ready["session"], "bucket": 0, "query": query}),
+        );
+        assert_eq!(checked["result"], "invalid", "{:?} {}", options, checked);
+        let diagnostics = checked["diagnostics"].as_array().unwrap();
+        let reported = diagnostics.iter().filter(|d| d["level"] == "error").count();
+        assert_eq!(reported, failures, "{:?} {}", options, checked);
+        let note = diagnostics.iter().any(|d| {
+            d["level"] == "note"
+                && d["message"].as_str().unwrap().contains("not all errors may have been reported")
+        });
+        assert_eq!(note, truncated, "{:?} {}", options, checked);
+        worker.finish(false);
+    }
 }
 
 // Preparation that fails after the driver returns still tells the caller, so
