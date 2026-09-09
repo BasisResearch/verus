@@ -212,13 +212,18 @@ fn resident_rejects_bad_requests_and_accepts_eof() {
         json!({"command": "check", "session": session, "bucket": 0, "query": 0, "assertion": "false"}),
         json!({"command": "check", "session": session, "bucket": 99999, "query": 0}),
         json!({"command": "check", "session": session, "query": 0}),
+        json!({"command": "list", "session": "stale"}),
     ] {
         assert_eq!(worker.send(request)["event"], "error");
     }
-    assert_eq!(
-        worker.send(json!({"command": "check", "session": session, "bucket": 0, "query": 0}))["result"],
-        "valid"
-    );
+    // A session token is optional on list, and honoured when one is sent.
+    assert_eq!(worker.send(json!({"command": "list"}))["event"], "queries");
+    assert_eq!(worker.send(json!({"command": "list", "session": session}))["event"], "queries");
+    let checked =
+        worker.send(json!({"command": "check", "session": session, "bucket": 0, "query": 0}));
+    assert_eq!(checked["result"], "valid");
+    // Restoration is reported apart from the check it precedes.
+    assert!(checked["restore_ms"].is_number(), "{}", checked);
     worker.finish(true);
 }
 

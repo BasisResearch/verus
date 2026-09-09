@@ -1215,13 +1215,11 @@ impl Verifier {
         assign_map: &HashMap<*const vir::messages::Span, HashSet<Arc<String>>>,
         snap_map: &Vec<(vir::messages::Span, SnapPos)>,
         bucket_id: &BucketId,
-        function_name: &Fun,
         comment: &str,
         desc_prefix: Option<&str>,
         default_prover_failed_assert_ids: &mut Vec<AssertId>,
+        includes_function: bool,
     ) -> RunCommandQueriesResult {
-        let user_filter = self.user_filter.as_ref().unwrap();
-        let includes_function = user_filter.includes_function(function_name);
         if !includes_function {
             return RunCommandQueriesResult {
                 invalidity: false,
@@ -1878,6 +1876,11 @@ impl Verifier {
                             air::context::SmtSolver::Z3 => Some(0),
                             air::context::SmtSolver::Cvc5 => None,
                         };
+                        // One filter decision drives both retention and
+                        // checking, so a resident session cannot come to offer
+                        // obligations that this run never checked.
+                        let includes_function =
+                            self.user_filter.as_ref().unwrap().includes_function(&function.x.name);
                         for cmds in commands_with_context_list.iter() {
                             if is_recommend && cmds.skip_recommends {
                                 continue;
@@ -1977,12 +1980,7 @@ impl Verifier {
                                 Self::set_rlimit(self.args.solver, &mut query_air_context, rlimit);
                             }
                             if let Some(session) = &mut resident {
-                                if self
-                                    .user_filter
-                                    .as_ref()
-                                    .unwrap()
-                                    .includes_function(&function.x.name)
-                                {
+                                if includes_function {
                                     session
                                         .record_query(
                                             cmds.clone(),
@@ -2007,10 +2005,10 @@ impl Verifier {
                                 &HashMap::new(),
                                 &snap_map,
                                 bucket_id,
-                                &function.x.name,
                                 &op.to_air_comment(),
                                 None,
                                 &mut default_prover_failed_assert_ids,
+                                includes_function,
                             );
                             func_curr_smt_time +=
                                 query_air_context.get_time().1 - iter_curr_smt_time;

@@ -59,19 +59,27 @@ impl QueryKind {
 
 /// A journal of bucket declarations and queries from one compilation.
 ///
-/// Every journal entry has its own AIR/SMT scope. `applied` is the length of
+/// Each journal entry has its own AIR/SMT scope. `applied` is the length of
 /// the prefix currently asserted. A query can run only at its recorded prefix,
 /// so declarations and axioms introduced later cannot affect an earlier query.
+///
+/// One entry holds every declaration batch sharing a scope. A scope is only
+/// worth opening where some query can ask to return to it, so batches with no
+/// query recorded between them are grouped. Scope depth and replay work then
+/// follow the number of retained queries rather than the number of declaration
+/// batches, which is roughly the size of the pruned call graph.
 pub(crate) struct QueryJournal {
-    contexts: Vec<Commands>,
+    contexts: Vec<Vec<Commands>>,
     queries: Vec<RetainedQuery>,
     applied: usize,
+    /// Whether a query has been recorded since the open scope began.
+    recorded_in_scope: bool,
 }
 
 #[derive(Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]
 enum Request {
-    List,
+    List { session: Option<String> },
     Check { session: String, bucket: BucketIndex, query: QueryId },
     Close { session: String },
 }
@@ -152,6 +160,7 @@ enum Response<'a> {
         assert_id: Option<Vec<u64>>,
         diagnostics: Vec<SourceDiagnostic>,
         elapsed_ms: u128,
+        restore_ms: u128,
     },
     Error {
         message: &'a str,
@@ -232,10 +241,10 @@ fn send(output: &mut impl Write, response: &Response<'_>) -> io::Result<()> {
 
 impl QueryJournal {
     pub(crate) fn new() -> Self {
-        Self { contexts: Vec::new(), queries: Vec::new(), applied: 0 }
+        Self { contexts: Vec::new(), queries: Vec::new(), applied: 0, recorded_in_scope: false }
     }
 
-    /// Begin a scope before the verifier emits the next declaration batch.
+    /// Retain the next declaration batch, opening a scope when one is needed.
     pub(crate) fn push_context(
         &mut self,
         air: &mut Context,
@@ -245,9 +254,15 @@ impl QueryJournal {
             return Err("resident context batches must contain only declarations");
         }
         debug_assert_eq!(self.applied, self.contexts.len());
-        air.push();
-        self.contexts.push(commands);
-        self.applied += 1;
+        // No recorded prefix can fall inside a run of batches that no query
+        // separates, so such a run needs no scope boundary between its parts.
+        if self.recorded_in_scope || self.contexts.is_empty() {
+            air.push();
+            self.contexts.push(Vec::new());
+            self.applied += 1;
+            self.recorded_in_scope = false;
+        }
+        self.contexts.last_mut().expect("scope opened above").push(commands);
         Ok(())
     }
 
@@ -270,6 +285,9 @@ impl QueryJournal {
                     rlimit,
                     kind: QueryKind::from_op(op),
                 });
+                // The next declaration batch must start a scope: this query
+                // can ask to return to the prefix that ends here.
+                self.recorded_in_scope = true;
             }
         }
         Ok(())
@@ -282,12 +300,17 @@ impl QueryJournal {
         }
         while self.applied < prefix {
             air.push();
-            for command in self.contexts[self.applied].iter() {
-                if let CommandX::Global(decl) = &**command {
-                    air.global(decl).map_err(|error| io::Error::other(error.to_string()))?;
+            // Count the scope before replaying into it, so that a failure part
+            // way through still leaves `applied` describing the real depth.
+            let scope = self.applied;
+            self.applied += 1;
+            for batch in self.contexts[scope].iter() {
+                for command in batch.iter() {
+                    if let CommandX::Global(decl) = &**command {
+                        air.global(decl).map_err(|error| io::Error::other(error.to_string()))?;
+                    }
                 }
             }
-            self.applied += 1;
         }
         Ok(())
     }
@@ -375,10 +398,8 @@ impl Server {
                 }
             };
             match request {
-                Request::List => {
-                    send(&mut output, &Response::Queries { session, buckets: &buckets })?
-                }
-                Request::Check { session: requested, .. }
+                Request::List { session: Some(requested) }
+                | Request::Check { session: requested, .. }
                 | Request::Close { session: requested }
                     if requested != session =>
                 {
@@ -386,6 +407,9 @@ impl Server {
                         &mut output,
                         &Response::Error { message: "session does not match this compilation" },
                     )?;
+                }
+                Request::List { .. } => {
+                    send(&mut output, &Response::Queries { session, buckets: &buckets })?
                 }
                 Request::Close { .. } => {
                     self.shutdown()?;
@@ -408,7 +432,11 @@ impl Server {
                         .map_err(|_| io::Error::other("resident bucket poisoned"))?;
                     let BucketState { air, journal } = &mut *state;
                     let prefix = journal.queries[id.0].prefix;
+                    // Restoration replays declarations through AIR and the
+                    // solver, so it is timed apart from the check itself.
+                    let restore_start = Instant::now();
                     journal.restore_prefix(air, prefix)?;
+                    let restore_ms = restore_start.elapsed().as_millis();
                     let query = &journal.queries[id.0];
                     set_rlimit(air, query.rlimit);
                     let diagnostics = QueryDiagnostics::default();
@@ -446,6 +474,7 @@ impl Server {
                             assert_id,
                             diagnostics: diagnostics.0.into_inner(),
                             elapsed_ms: start.elapsed().as_millis(),
+                            restore_ms,
                         },
                     )?;
                 }
@@ -503,6 +532,72 @@ mod tests {
                 assert!(matches!(result, ValidityResult::Valid(_)), "{result:?}");
             } else {
                 assert!(matches!(result, ValidityResult::Invalid(..)), "{result:?}");
+            }
+            air.finish_query();
+        }
+    }
+
+    /// Apply a declaration batch the way the verifier does: retain it, then
+    /// let AIR assert it into the scope the journal just chose.
+    fn apply(journal: &mut QueryJournal, air: &mut Context, batch: &Commands) {
+        journal.push_context(air, batch.clone()).unwrap();
+        for command in batch.iter() {
+            if let CommandX::Global(decl) = &**command {
+                air.global(decl).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn declaration_batches_share_a_scope_until_a_query_pins_one() {
+        let mut air = Context::new(Arc::new(VirMessageInterface {}), SmtSolver::Cvc5);
+        air.set_z3_param("air_recommended_options", "true");
+        let diagnostics = QueryDiagnostics::default();
+        let base = commands("(declare-const x Int)");
+        let first = commands("(declare-const y Int) (axiom (= y 0))");
+        let second = commands("(declare-const z Int) (axiom (= z y))");
+        let third = commands("(axiom (= x 5))");
+        let mut journal = QueryJournal::new();
+        for command in base.iter() {
+            if let CommandX::Global(decl) = &**command {
+                air.global(decl).unwrap();
+            }
+        }
+
+        apply(&mut journal, &mut air, &first);
+        apply(&mut journal, &mut air, &second);
+        // No query separates these batches, so they share a single scope.
+        assert_eq!(journal.applied, 1);
+        assert_eq!(journal.contexts.len(), 1);
+        assert_eq!(journal.contexts[0].len(), 2);
+
+        // Stands in for record_query, which pins the prefix ending here.
+        journal.recorded_in_scope = true;
+        apply(&mut journal, &mut air, &third);
+        assert_eq!(journal.applied, 2);
+        assert_eq!(journal.contexts.len(), 2);
+
+        // Grouping keeps both batches on the pinned side of the boundary, and
+        // leaves the batch recorded after it on the other.
+        let grouped = commands("(check-valid (assert (= z 0)))");
+        let later = commands("(check-valid (assert (= x 5)))");
+        for (prefix, query, valid) in
+            [(2, &later, true), (1, &later, false), (1, &grouped, true), (2, &grouped, true)]
+        {
+            journal.restore_prefix(&mut air, prefix).unwrap();
+            let result = air.command(
+                &VirMessageInterface {},
+                &diagnostics,
+                &query[0],
+                QueryContext::default(),
+            );
+            if valid {
+                assert!(matches!(result, ValidityResult::Valid(_)), "prefix {prefix}: {result:?}");
+            } else {
+                assert!(
+                    matches!(result, ValidityResult::Invalid(..)),
+                    "prefix {prefix}: {result:?}"
+                );
             }
             air.finish_query();
         }

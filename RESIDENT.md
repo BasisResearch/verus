@@ -29,7 +29,8 @@ of this shape (session, process ID and spans vary):
 {"event":"ready","protocol":2,"session":"123-456","process_id":123,"invocation_succeeded":true,"buckets":[{"id":0,"name":"root module","queries":[{"id":0,"function":"input::passing","description":"function body check","kind":"body","span":"path/to/input.rs:2:10: 2:22 (#0)"}]}]}
 ```
 
-Send the returned session token with every check and close request:
+Send the returned session token with every check and close request. It is
+optional on `list`, and checked when supplied:
 
 ```json
 {"command":"list"}
@@ -41,7 +42,7 @@ Their corresponding responses are:
 
 ```json
 {"event":"queries","session":"123-456","buckets":[{"id":0,"name":"root module","queries":[{"id":0,"function":"input::passing","description":"function body check","kind":"body","span":"path/to/input.rs:2:10: 2:22 (#0)"}]}]}
-{"event":"checked","session":"123-456","bucket":0,"query":0,"result":"valid","assert_id":null,"diagnostics":[],"elapsed_ms":0}
+{"event":"checked","session":"123-456","bucket":0,"query":0,"result":"valid","assert_id":null,"diagnostics":[],"elapsed_ms":0,"restore_ms":0}
 {"event":"closed","session":"123-456"}
 ```
 
@@ -61,7 +62,10 @@ a promise that cvc5 returned `sat`. A failed assertion carries its
 source spans and labels. This slice reports the first failing assertion
 from each recheck. It does not rerun Verus's diagnostic expansion loop.
 `elapsed_ms` includes AIR checking/lowering and solver work, after context
-restoration; it is not an end-to-end request timing.
+restoration; it is not an end-to-end request timing. `restore_ms` covers the
+restoration that preceded it, which is the cost of moving between prefixes
+rather than of the obligation itself. Neither includes time the caller spends
+holding the pipe.
 
 Unknown buckets/queries, wrong sessions, malformed JSON and unknown fields produce
 an `error` response without running a query. Requests are limited to 64 KiB
@@ -70,6 +74,10 @@ EOF closes every bucket without a response. `closed` is acknowledged only
 after all solver processes have exited. Requests run serially; there is
 no in-band cancellation command. A caller must discard the session after
 a process or protocol failure.
+
+A caller must drain stderr for the lifetime of the session. Diagnostics from
+the original invocation and any later warnings go there, and a full stderr
+pipe blocks the worker mid-request.
 
 ## Context and result boundaries
 
@@ -86,9 +94,15 @@ log sinks have explicit thread-safety bounds so workers can transfer their
 contexts without unsafe code. No declarations are shared between buckets.
 
 Each query retains the declaration prefix and resource limit used during
-initial verification. Later declaration batches occupy separate AIR/SMT
-scopes. Moving backwards pops those scopes; moving forwards replays the
-retained batches. Each recheck also opens and closes its own query scope.
+initial verification. Declaration batches occupy AIR/SMT scopes, but a scope
+opens only where a retained query can return to it: consecutive batches that
+no query separates share one. Scope depth and replay cost therefore follow the
+number of retained queries, not the number of declaration batches, which is
+roughly the size of the pruned call graph. On a three-function file importing
+`vstd`, grouping takes the retained scopes from 86 to 4. Moving backwards pops
+those scopes; moving forwards replays the retained batches, re-running each
+declaration through AIR typechecking and the solver, so a jump still costs the
+declarations between the two prefixes. Each recheck also opens and closes its own query scope.
 This preserves the logical context even when query order changes. Solver
 search history can still affect resource-sensitive outcomes.
 
@@ -125,7 +139,9 @@ cargo test --release -p rust_verify_test --test resident
 These require the normal Verus build and configured cvc5. The subprocess
 tests run on Unix. They check repeated passing/failing queries, one solver
 per active bucket, serial/parallel preparation, stable bucket addresses,
-filters, balanced scopes, request rejection, EOF and shutdown of every child.
-An AIR test checks that later axioms cannot prove an
-earlier query after their context is removed, including repeated removal
-and redeclaration of names.
+filters, balanced scopes, request rejection, optional session tokens on
+`list`, EOF and shutdown of every child.
+Two AIR tests cover the journal: later axioms cannot prove an earlier query
+after their context is removed, including repeated removal and redeclaration
+of names; and grouped declaration batches stay on the pinned side of a scope
+boundary while a batch recorded after a query does not.
