@@ -1337,6 +1337,10 @@ impl Verifier {
         let bitvector = prover_choice == vir::def::ProverChoice::BitVector;
         if !bitvector {
             air_context.set_z3_param("air_recommended_options", "true");
+        } else if self.args.resident {
+            // Retained bit-vector queries keep their prelude-free solver,
+            // but need scoped declarations and repeated check-sat calls.
+            air_context.set_z3_param("incremental", "true");
         }
         self.set_default_rlimit(&mut air_context);
         for (option, value) in self.args.smt_options.iter() {
@@ -1648,10 +1652,10 @@ impl Verifier {
                                 continue;
                             }
                             if retain_queries
-                                && cmds.prover_choice != vir::def::ProverChoice::DefaultProver
+                                && cmds.prover_choice == vir::def::ProverChoice::Singular
                             {
                                 return Err(resident_error(
-                                    "--resident does not support specialised prover queries",
+                                    "--resident does not support Singular queries",
                                 ));
                             }
                             if cmds.prover_choice == vir::def::ProverChoice::Singular {
@@ -1720,8 +1724,11 @@ impl Verifier {
                                         cmds.prover_choice,
                                     )?,
                                 );
-                                // for bitvector, only one query, no push/pop
-                                if cmds.prover_choice == vir::def::ProverChoice::BitVector {
+                                // Ordinary bit-vector verification is one-shot.
+                                // A retained context uses AIR's scoped query path.
+                                if cmds.prover_choice == vir::def::ProverChoice::BitVector
+                                    && !retain_queries
+                                {
                                     spinoff.set_single_check_query();
                                 }
                                 // Apply prover-specific SMT tuning.

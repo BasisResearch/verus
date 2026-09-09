@@ -9,6 +9,12 @@
 //! `ready.input_files` lists local source and explicit compiler dependencies,
 //! including imported VIR files, for the MCP caller's snapshot coverage check.
 //! It does not enumerate undeclared external reads by macros or build scripts.
+//!
+//! The catalogue names each query's `prover`: `default`, `nonlinear`, or
+//! `bit_vector`. Specialised queries keep their original separate solvers;
+//! bit-vector solvers remain prelude-free but use incremental query scopes.
+//! Checked provenance describes round zero, matching the result and assertion
+//! ID. Diagnostics can include further rounds requested by `--multiple-errors`.
 
 use crate::buckets::BucketId;
 use crate::commands::{QueryOp, Style};
@@ -38,6 +44,7 @@ struct RetainedQuery {
     prefix: usize,
     rlimit: f32,
     kind: QueryKind,
+    prover: vir::def::ProverChoice,
     /// The severity the original invocation reports a failure of this query
     /// at, read from the same `QueryOp` the verifier reads. A recheck of a
     /// recommends query stays a warning.
@@ -101,6 +108,7 @@ struct QueryDescription {
     function: String,
     description: String,
     kind: QueryKind,
+    prover: &'static str,
     span: String,
 }
 
@@ -158,6 +166,12 @@ impl RetainedBucket {
                     function: fun_as_friendly_rust_name(&query.context.fun),
                     description: query.context.desc.clone(),
                     kind: query.kind,
+                    prover: match query.prover {
+                        vir::def::ProverChoice::DefaultProver => "default",
+                        vir::def::ProverChoice::Nonlinear => "nonlinear",
+                        vir::def::ProverChoice::BitVector => "bit_vector",
+                        vir::def::ProverChoice::Singular => "singular",
+                    },
                     span: query.context.span.as_string.clone(),
                 });
                 addresses.push((solver, local));
@@ -393,6 +407,7 @@ impl QueryJournal {
                     prefix: self.applied,
                     rlimit,
                     kind: QueryKind::from_op(op),
+                    prover: commands.prover_choice,
                     level: op.message_level(),
                 });
                 // The next declaration batch must start a scope: this query
@@ -607,6 +622,9 @@ impl Server {
                         &query.query,
                         QueryContext::default(),
                     );
+                    // The response describes round zero. Later error searches
+                    // replace AIR's provenance, even when their verdict differs.
+                    let first_provenance = air.take_provenance();
                     // Ask for further errors exactly as far as the original
                     // invocation did, so rechecking a function with several
                     // failing assertions reports the same ones rather than
@@ -688,6 +706,7 @@ impl Server {
                                     only_check_earlier,
                                     QueryContext::default(),
                                 );
+                                drop(air.take_provenance());
                             }
                             ValidityResult::TypeError(error) => {
                                 return fatal(&mut output, io::Error::other(error.to_string()));
@@ -717,7 +736,7 @@ impl Server {
                             &query.context.span.as_string,
                         );
                     }
-                    let provenance = air.take_provenance().and_then(|info| {
+                    let provenance = first_provenance.and_then(|info| {
                         bucket.symbols.as_ref().map(|symbols| {
                             symbols.resolve(
                                 &query.context.fun,
