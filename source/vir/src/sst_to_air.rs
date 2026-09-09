@@ -56,6 +56,27 @@ pub struct PostConditionInfo {
     pub kind: PostConditionKind,
 }
 
+/// Record the source spelling of the operator an AIR symbol was emitted for,
+/// taking it from the one table `to_user_string` also uses, and hand the
+/// symbol back. See `crate::air_names`.
+fn record_op<'a>(ctx: &Ctx, symbol: &'a str, op: &BinaryOp) -> &'a str {
+    ctx.name_ctxt.record_source_operator(symbol, crate::sst_util::binary_op_str(op));
+    symbol
+}
+
+/// How the source names the type a clip clips to.
+fn range_to_type_name(range: &IntRange) -> String {
+    match range {
+        IntRange::Int => "int".to_string(),
+        IntRange::Nat => "nat".to_string(),
+        IntRange::Char => "char".to_string(),
+        IntRange::USize => "usize".to_string(),
+        IntRange::ISize => "isize".to_string(),
+        IntRange::U(n) => format!("u{n}"),
+        IntRange::I(n) => format!("i{n}"),
+    }
+}
+
 #[inline(always)]
 pub(crate) fn fun_to_air_ident(name_ctxt: &NameCtxt, fun: &Fun) -> Ident {
     Arc::new(name_ctxt.fun_to_string(fun))
@@ -833,22 +854,75 @@ impl ExprCtxt {
     }
 }
 
-fn clip_bitwise_result(bit_expr: ExprX, exp: &Exp) -> Result<Expr, VirErr> {
+fn clip_bitwise_result(name_ctxt: &NameCtxt, bit_expr: ExprX, exp: &Exp) -> Result<Expr, VirErr> {
     if let TypX::Int(range) = &*undecorate_typ(&exp.typ) {
-        match range {
-            IntRange::I(_) | IntRange::ISize => {
-                return Ok(apply_range_fun(&crate::def::I_CLIP, &range, vec![Arc::new(bit_expr)]));
-            }
-            IntRange::U(_) | IntRange::USize => {
-                return Ok(apply_range_fun(&crate::def::U_CLIP, &range, vec![Arc::new(bit_expr)]));
-            }
+        let symbol = match range {
+            IntRange::I(_) | IntRange::ISize => crate::def::I_CLIP,
+            IntRange::U(_) | IntRange::USize => crate::def::U_CLIP,
             _ => return Ok(Arc::new(bit_expr)),
         };
+        let application = apply_range_fun(symbol, range, vec![Arc::new(bit_expr)]);
+        // Bitwise results emit clips even without an explicit source cast.
+        // Record their ranges here so rendering does not depend on other casts.
+        name_ctxt.record_source_cast(&application, &range_to_type_name(range));
+        Ok(application)
     } else {
         return Err(error(
             &exp.span,
             format!("In translating Bitwise operator, encountered non-integer operand",),
         ));
+    }
+}
+
+#[cfg(test)]
+mod bitwise_provenance_tests {
+    use super::*;
+
+    #[test]
+    fn emitted_clips_render_without_explicit_source_casts() {
+        let name_ctxt = NameCtxt::new();
+        let span = Span {
+            raw_span: Arc::new(()),
+            id: 0,
+            data: vec![],
+            as_string: "bitwise test".to_string(),
+        };
+        let printer = air::printer::Printer::new(
+            Arc::new(air::messages::AirMessageInterface {}),
+            true,
+            air::context::SmtSolver::Cvc5,
+        );
+        let mut emitted = Vec::new();
+        for (range, typ) in [
+            (IntRange::U(8), "u8"),
+            (IntRange::U(16), "u16"),
+            (IntRange::I(8), "i8"),
+            (IntRange::I(16), "i16"),
+            (IntRange::U(64), "u64"),
+            (IntRange::USize, "usize"),
+            (IntRange::I(64), "i64"),
+            (IntRange::ISize, "isize"),
+        ] {
+            let exp = SpannedTyped::new(
+                &span,
+                &Arc::new(TypX::Int(range)),
+                ExpX::Const(crate::ast::Constant::Int(0.into())),
+            );
+            let application =
+                clip_bitwise_result(&name_ctxt, ExprX::Var(str_ident("bitwise_result")), &exp)
+                    .unwrap();
+            let term = air::printer::NodeWriter::new()
+                .node_to_string_indent(&String::new(), &printer.expr_to_node(&application));
+            emitted.push((term, typ));
+        }
+        // Check after every range has been recorded: widths sharing a head
+        // must remain distinct, including architecture-dependent widths.
+        for (term, typ) in emitted {
+            assert_eq!(
+                crate::air_names::render_term(&name_ctxt.source_names(), &term),
+                format!("(bitwise_result as {typ})"),
+            );
+        }
     }
 }
 
@@ -895,6 +969,7 @@ pub(crate) fn new_user_qid(ctx: &Ctx, exp: &Exp) -> Qid {
             let bnd_info = BndInfo {
                 fun: f.current_fun.clone(),
                 user: Some(BndInfoUser { span: exp.span.clone(), trigs: trigs.clone() }),
+                role: None,
                 tag: None,
             };
             ctx.global.qid_map.borrow_mut().insert(qid.clone(), bnd_info);
@@ -1090,7 +1165,7 @@ pub(crate) fn exp_to_expr(ctx: &Ctx, exp: &Exp, expr_ctxt: &ExprCtxt) -> Result<
                             format!("Verus Internal Error: BitNot: type doesn't match"),
                         ));
                     }
-                    return clip_bitwise_result(bit_expr, e);
+                    return clip_bitwise_result(&ctx.name_ctxt, bit_expr, e);
                 } else {
                     return Ok(Arc::new(bit_expr));
                 }
@@ -1109,7 +1184,12 @@ pub(crate) fn exp_to_expr(ctx: &Ctx, exp: &Exp, expr_ctxt: &ExprCtxt) -> Result<
                     IntRange::U(_) | IntRange::USize => crate::def::U_CLIP,
                     IntRange::I(_) | IntRange::ISize => crate::def::I_CLIP,
                 };
-                apply_range_fun(&f_name, &range, vec![expr])
+                // A clip is the encoder modelling the target type's range; the
+                // source writes a cast, so record it as one. `Clip { Int }`
+                // above emits nothing at all, for the same reason.
+                let application = apply_range_fun(&f_name, &range, vec![expr]);
+                ctx.name_ctxt.record_source_cast(&application, &range_to_type_name(&range));
+                application
             }
             UnaryOp::IntToReal => {
                 let expr = exp_to_expr(ctx, e, expr_ctxt)?;
@@ -1323,38 +1403,38 @@ pub(crate) fn exp_to_expr(ctx: &Ctx, exp: &Exp, expr_ctxt: &ExprCtxt) -> Result<
                     }
                 }
                 BinaryOp::Arith(ArithOp::Add) if wrap_arith => {
-                    return Ok(str_apply(crate::def::ADD, &vec![lh, rh]));
+                    return Ok(str_apply(record_op(ctx, crate::def::ADD, op), &vec![lh, rh]));
                 }
                 BinaryOp::Arith(ArithOp::Sub) if wrap_arith => {
-                    return Ok(str_apply(crate::def::SUB, &vec![lh, rh]));
+                    return Ok(str_apply(record_op(ctx, crate::def::SUB, op), &vec![lh, rh]));
                 }
                 BinaryOp::Arith(ArithOp::Add) => ExprX::Multi(MultiOp::Add, Arc::new(vec![lh, rh])),
                 BinaryOp::Arith(ArithOp::Sub) => ExprX::Multi(MultiOp::Sub, Arc::new(vec![lh, rh])),
                 BinaryOp::Arith(ArithOp::Mul) if wrap_arith || !has_const => {
-                    return Ok(str_apply(crate::def::MUL, &vec![lh, rh]));
+                    return Ok(str_apply(record_op(ctx, crate::def::MUL, op), &vec![lh, rh]));
                 }
                 BinaryOp::Arith(ArithOp::EuclideanDiv) if wrap_arith || !has_const => {
-                    return Ok(str_apply(crate::def::EUC_DIV, &vec![lh, rh]));
+                    return Ok(str_apply(record_op(ctx, crate::def::EUC_DIV, op), &vec![lh, rh]));
                 }
                 // REVIEW: consider introducing singular_mod more earlier pipeline (e.g. from syntax macro?)
                 BinaryOp::Arith(ArithOp::EuclideanMod) if expr_ctxt.is_singular => {
                     return Ok(str_apply(crate::def::SINGULAR_MOD, &vec![lh, rh]));
                 }
                 BinaryOp::Arith(ArithOp::EuclideanMod) if wrap_arith || !has_const => {
-                    return Ok(str_apply(crate::def::EUC_MOD, &vec![lh, rh]));
+                    return Ok(str_apply(record_op(ctx, crate::def::EUC_MOD, op), &vec![lh, rh]));
                 }
                 BinaryOp::Arith(ArithOp::Mul) => ExprX::Multi(MultiOp::Mul, Arc::new(vec![lh, rh])),
                 BinaryOp::RealArith(crate::ast::RealArithOp::Add) => {
-                    return Ok(str_apply(crate::def::RADD, &vec![lh, rh]));
+                    return Ok(str_apply(record_op(ctx, crate::def::RADD, op), &vec![lh, rh]));
                 }
                 BinaryOp::RealArith(crate::ast::RealArithOp::Sub) => {
-                    return Ok(str_apply(crate::def::RSUB, &vec![lh, rh]));
+                    return Ok(str_apply(record_op(ctx, crate::def::RSUB, op), &vec![lh, rh]));
                 }
                 BinaryOp::RealArith(crate::ast::RealArithOp::Mul) => {
-                    return Ok(str_apply(crate::def::RMUL, &vec![lh, rh]));
+                    return Ok(str_apply(record_op(ctx, crate::def::RMUL, op), &vec![lh, rh]));
                 }
                 BinaryOp::RealArith(crate::ast::RealArithOp::Div) => {
-                    return Ok(str_apply(crate::def::RDIV, &vec![lh, rh]));
+                    return Ok(str_apply(record_op(ctx, crate::def::RDIV, op), &vec![lh, rh]));
                 }
                 BinaryOp::Ne => {
                     let eq = ExprX::Binary(air::ast::BinaryOp::Eq, lh, rh);
@@ -1426,9 +1506,10 @@ pub(crate) fn exp_to_expr(ctx: &Ctx, exp: &Exp, expr_ctxt: &ExprCtxt) -> Result<
                         BitwiseOp::Shr => crate::def::BIT_SHR,
                     };
                     let args = vec![box_lh, box_rh];
+                    let fname = record_op(ctx, fname, op);
                     let bit_expr = ExprX::Apply(Arc::new(fname.to_string()), Arc::new(args));
 
-                    return clip_bitwise_result(bit_expr, exp);
+                    return clip_bitwise_result(&ctx.name_ctxt, bit_expr, exp);
                 }
                 BinaryOp::IeeeFloat(fop) => {
                     use crate::ast::IeeeFloatBinaryOp;
@@ -1443,6 +1524,7 @@ pub(crate) fn exp_to_expr(ctx: &Ctx, exp: &Exp, expr_ctxt: &ExprCtxt) -> Result<
                         IeeeFloatBinaryOp::InEq(InequalityOp::Lt) => crate::def::IEEE_FLOAT_LT,
                         IeeeFloatBinaryOp::InEq(InequalityOp::Gt) => crate::def::IEEE_FLOAT_GT,
                     };
+                    let fname = record_op(ctx, fname, op);
                     ExprX::Apply(Arc::new(fname.to_string()), Arc::new(vec![lh, rh]))
                 }
                 _ => {
@@ -3094,7 +3176,7 @@ fn set_fuel(ctx: &Ctx, span: &Span, local: &mut Vec<Decl>, hidden: &Vec<Fun>) {
         let fun_name = fun_as_friendly_rust_name(
             &ctx.fun.as_ref().expect("Missing a current function value").current_fun,
         );
-        let qid = new_internal_qid(ctx, format!("{}_nondefault_fuel", fun_name));
+        let qid = new_internal_qid(ctx, format!("{}_nondefault_fuel", fun_name), None);
         let bind = Arc::new(BindX::Quant(Quant::Forall, binders, triggers, qid));
         let or = Arc::new(ExprX::Multi(air::ast::MultiOp::Or, Arc::new(disjuncts)));
         mk_bind_expr(&bind, &or)

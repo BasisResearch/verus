@@ -406,6 +406,11 @@ pub struct ResolvedInstantiation {
     /// rather than the generated `qid`, which names nothing in the source.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub site: Option<String>,
+    /// Why the quantifier exists, as the encoder that emitted it said. A
+    /// reader classifies an instantiation from this, never by matching on
+    /// `qid`, which is generated and names nothing a user wrote.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub role: Option<&'static str>,
     pub count: usize,
     /// The instantiation terms as the source spells them (boxes dropped,
     /// symbols as they were written), rendered by `vir::air_names` from the
@@ -1258,6 +1263,19 @@ impl Verifier {
 
     /// Where a quantifier is written, in prose, from the assertion that owns
     /// it and its own span. The generated `:qid` names nothing a reader knows.
+    /// The wire spelling of a recorded role. Kept beside the enum so adding
+    /// a variant forces a spelling rather than silently dropping it.
+    fn role_name(role: &vir::sst::QuantRole) -> &'static str {
+        use vir::sst::QuantRole::*;
+        match role {
+            Definition => "definition",
+            DefinitionUnfold => "definition_unfold",
+            DefinitionBase => "definition_base",
+            FuelDefaults => "fuel_defaults",
+            ReturnTypeInvariant => "return_type_invariant",
+        }
+    }
+
     fn quantifier_site(inside: &Option<ResolvedTag>, span: &Option<String>) -> Option<String> {
         let kind = inside.as_ref().map(|i| i.kind.as_str()).unwrap_or("");
         let owner = inside.as_ref().and_then(|i| i.owner.clone());
@@ -1279,6 +1297,8 @@ impl Verifier {
     /// `hyp_map`, `qid_map` and `axiom_owners`, into `func_details`.
     fn resolve_provenance(&mut self, global_ctx: &vir::context::GlobalCtx) {
         const PRELUDE_QID_PREFIX: &str = "prelude_";
+        /// The prelude writes this one by hand, so it has no `qid_map` entry.
+        const FUEL_DEFAULTS_QID: &str = "prelude_fuel_defaults";
         let hyp_map = global_ctx.hyp_map.borrow();
         let qid_map = global_ctx.qid_map.borrow();
         let axiom_owners = global_ctx.axiom_owners.borrow();
@@ -1381,16 +1401,18 @@ impl Verifier {
                                     .to_string()
                             })
                         };
-                        let (fun_name, span, inside) = match qid_map.get(qid) {
+                        let (fun_name, span, inside, role) = match qid_map.get(qid) {
                             Some(info) => (
                                 Some(fun_as_friendly_rust_name(&info.fun)),
                                 info.user.as_ref().map(|u| u.span.as_string.clone()),
                                 info.tag.as_ref().map(|t| tag_of(&fun, &t.to_symbol())),
+                                info.role.as_ref().map(Self::role_name),
                             ),
                             None => (
                                 qid.starts_with(PRELUDE_QID_PREFIX).then(|| "prelude".to_string()),
                                 None,
                                 None,
+                                (qid.as_str() == FUEL_DEFAULTS_QID).then_some("fuel_defaults"),
                             ),
                         };
                         let site = Self::quantifier_site(&inside, &span_short(&span));
@@ -1400,6 +1422,7 @@ impl Verifier {
                             span,
                             inside,
                             site,
+                            role,
                             count: vectors.len(),
                             terms: vectors
                                 .iter()

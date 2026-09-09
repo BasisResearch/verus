@@ -30,14 +30,31 @@ pub type SourceNames = HashMap<String, SourceName>;
 #[derive(Clone, Debug)]
 pub enum SourceName {
     Symbol(String),
-    Constructor { name: String, fields: Vec<String>, style: crate::ast::CtorPrintStyle },
+    /// An infix operator, as the source writes it (`+`). Recorded where the
+    /// encoder emits the symbol, from the same table `to_user_string` uses.
+    Operator(String),
+    /// Cast targets indexed by the emitted range arguments. A shared head
+    /// such as `uClip` can represent several widths in the same query.
+    Cast {
+        symbol: String,
+        types: HashMap<Vec<String>, String>,
+    },
+    Constructor {
+        name: String,
+        fields: Vec<String>,
+        style: crate::ast::CtorPrintStyle,
+    },
     Field(String),
 }
 
 impl SourceName {
     pub fn name(&self) -> &str {
         match self {
-            Self::Symbol(name) | Self::Field(name) | Self::Constructor { name, .. } => name,
+            Self::Symbol(name)
+            | Self::Field(name)
+            | Self::Operator(name)
+            | Self::Constructor { name, .. } => name,
+            Self::Cast { symbol, .. } => symbol,
         }
     }
 
@@ -63,6 +80,21 @@ impl SourceName {
                 format!("{} {{ {} }}", name, fields.join(", "))
             }
         })
+    }
+}
+
+/// Module and worker contexts may record different widths of the same clip.
+/// Merge their range records instead of replacing an entire cast family.
+pub(crate) fn merge_source_names(names: &mut SourceNames, other: SourceNames) {
+    for (symbol, name) in other {
+        match (names.get_mut(&symbol), name) {
+            (Some(SourceName::Cast { types, .. }), SourceName::Cast { types: other, .. }) => {
+                types.extend(other);
+            }
+            (_, name) => {
+                names.insert(symbol, name);
+            }
+        }
     }
 }
 
@@ -113,10 +145,37 @@ fn render_node(names: &SourceNames, node: &Node) -> String {
                     }
                 }
             }
-            // `(Add a b)` is `a + b` to the reader
-            if items.len() == 3 {
-                if let Node::Atom(head) = &items[0] {
-                    if let Some(op) = infix_operator(head) {
+            // SMT-LIB's binders are wire syntax rather than encoded names, so
+            // they render structurally: `(let ((x e)) b)` reads `let x = e in b`.
+            if let Some(Node::Atom(head)) = items.first() {
+                if head == "let" && items.len() == 3 {
+                    if let Node::List(bindings) = &items[1] {
+                        let binds: Vec<String> = bindings
+                            .iter()
+                            .filter_map(|b| match b {
+                                Node::List(pair) if pair.len() == 2 => Some(format!(
+                                    "{} = {}",
+                                    render_node(names, &pair[0]),
+                                    render_node(names, &pair[1])
+                                )),
+                                _ => None,
+                            })
+                            .collect();
+                        if !binds.is_empty() && binds.len() == bindings.len() {
+                            return format!(
+                                "let {} in {}",
+                                binds.join(", "),
+                                render_node(names, &items[2])
+                            );
+                        }
+                    }
+                }
+            }
+            // `(Add a b)` is `a + b`, and `(nClip x)` is `x as nat`, from
+            // what the encoders recorded when they emitted those symbols.
+            if let Some(Node::Atom(head)) = items.first() {
+                match names.get(head) {
+                    Some(SourceName::Operator(op)) if items.len() == 3 => {
                         return format!(
                             "({} {} {})",
                             render_node(names, &items[1]),
@@ -124,6 +183,24 @@ fn render_node(names: &SourceNames, node: &Node) -> String {
                             render_node(names, &items[2])
                         );
                     }
+                    // clips take the range arguments first, the value last
+                    Some(SourceName::Cast { types, .. }) if items.len() > 1 => {
+                        let range_args: Option<Vec<String>> = items[1..items.len() - 1]
+                            .iter()
+                            .map(|arg| match arg {
+                                Node::Atom(atom) => Some(atom.clone()),
+                                Node::List(_) => None,
+                            })
+                            .collect();
+                        if let Some(ty) = range_args.as_ref().and_then(|args| types.get(args)) {
+                            return format!(
+                                "({} as {})",
+                                render_node(names, items.last().unwrap()),
+                                ty
+                            );
+                        }
+                    }
+                    _ => {}
                 }
             }
             if let Some(Node::Atom(head)) = items.first() {
@@ -157,20 +234,6 @@ fn render_node(names: &SourceNames, node: &Node) -> String {
     }
 }
 
-/// The prelude's arithmetic symbols and how the source writes them. These
-/// are not encoded from a source name, so nothing records them; they are
-/// named constants in [`crate::def`] and mapped here by those constants.
-fn infix_operator(head: &str) -> Option<&'static str> {
-    Some(match head {
-        h if h == crate::def::ADD => "+",
-        h if h == crate::def::SUB => "-",
-        h if h == crate::def::MUL => "*",
-        h if h == crate::def::EUC_DIV => "/",
-        h if h == crate::def::EUC_MOD => "%",
-        _ => return None,
-    })
-}
-
 /// One SMT term, rendered in source spelling: boxes dropped, mangled
 /// symbols replaced by what they were encoded from, applications written
 /// `f(a, b)`. Falls back to the term as given when it does not parse.
@@ -201,10 +264,27 @@ mod tests {
     use crate::def::NameCtxt;
     use std::sync::Arc;
 
+    /// The renderer knows an AIR symbol is an operator only because the
+    /// encoder recorded it as one when it emitted it; there is no table here
+    /// restating that. `sst_to_air::record_op` does the recording in the
+    /// pipeline, from `sst_util::binary_op_str`.
     #[test]
     fn arithmetic_preserves_grouping_through_boxes() {
-        let names = SourceNames::new();
+        let mut names = SourceNames::new();
+        for (symbol, op) in [
+            (crate::def::ADD, "+"),
+            (crate::def::SUB, "-"),
+            (crate::def::MUL, "*"),
+            (crate::def::EUC_DIV, "/"),
+            (crate::def::EUC_MOD, "%"),
+        ] {
+            names.insert(symbol.to_string(), SourceName::Operator(op.to_string()));
+        }
+        let ctx = NameCtxt::new();
+        record_cast(&ctx, crate::def::NAT_CLIP, crate::ast::IntRange::Nat, "nat");
+        merge_source_names(&mut names, ctx.source_names());
         for (term, expected) in [
+            ("((nClip (Add x y)))", "((x + y) as nat)"),
             ("((I (Mul (Add x y) z)))", "((x + y) * z)"),
             ("((I (Sub x (Sub y z))))", "(x - (y - z))"),
             ("((EucDiv x (Mul y z)))", "(x / (y * z))"),
@@ -212,6 +292,149 @@ mod tests {
         ] {
             assert_eq!(render_vector(&names, term), expected);
         }
+    }
+
+    fn record_cast(ctx: &NameCtxt, symbol: &str, range: crate::ast::IntRange, typ: &str) {
+        let application = crate::sst_to_air::apply_range_fun(
+            symbol,
+            &range,
+            vec![air::ast_util::str_var("value")],
+        );
+        ctx.record_source_cast(&application, typ);
+    }
+
+    #[test]
+    fn cast_targets_preserve_all_emitted_range_arguments() {
+        use crate::ast::IntRange;
+        use crate::def::{CHAR_CLIP, I_CLIP, NAT_CLIP, U_CLIP};
+        let ctx = NameCtxt::new();
+        for (symbol, range, typ) in [
+            (U_CLIP, IntRange::U(8), "u8"),
+            (U_CLIP, IntRange::U(16), "u16"),
+            (U_CLIP, IntRange::U(64), "u64"),
+            (U_CLIP, IntRange::USize, "usize"),
+            (I_CLIP, IntRange::I(8), "i8"),
+            (I_CLIP, IntRange::I(16), "i16"),
+            (I_CLIP, IntRange::I(64), "i64"),
+            (I_CLIP, IntRange::ISize, "isize"),
+            (NAT_CLIP, IntRange::Nat, "nat"),
+            (CHAR_CLIP, IntRange::Char, "char"),
+        ] {
+            record_cast(&ctx, symbol, range, typ);
+        }
+        for (term, expected) in [
+            ("(uClip 8 value)", "(value as u8)"),
+            ("(uClip 16 value)", "(value as u16)"),
+            ("(uClip 64 value)", "(value as u64)"),
+            ("(uClip SZ value)", "(value as usize)"),
+            ("(iClip 8 value)", "(value as i8)"),
+            ("(iClip 16 value)", "(value as i16)"),
+            ("(iClip 64 value)", "(value as i64)"),
+            ("(iClip SZ value)", "(value as isize)"),
+            ("(nClip value)", "(value as nat)"),
+            ("(charClip value)", "(value as char)"),
+            ("(uClip 8 (iClip 16 value))", "((value as i16) as u8)"),
+            // Do not discard range arguments or guess a target for unrecorded forms.
+            ("(uClip 32 value)", "uClip(32, value)"),
+            ("(uClip value)", "uClip(value)"),
+            ("(uClip (+ 8 8) value)", "uClip(+(8, 8), value)"),
+        ] {
+            assert_eq!(render_term(&ctx.source_names(), term), expected);
+        }
+    }
+
+    #[test]
+    fn cast_ranges_survive_context_merges_in_either_order() {
+        use crate::ast::IntRange;
+        let first = NameCtxt::new();
+        let second = NameCtxt::new();
+        record_cast(&first, crate::def::U_CLIP, IntRange::U(8), "u8");
+        record_cast(&second, crate::def::U_CLIP, IntRange::U(16), "u16");
+        for (mut names, other) in [
+            (first.source_names(), second.source_names()),
+            (second.source_names(), first.source_names()),
+        ] {
+            merge_source_names(&mut names, other);
+            assert_eq!(
+                render_vector(&names, "((uClip 8 value) (uClip 16 value))"),
+                "(value as u8), (value as u16)"
+            );
+        }
+    }
+
+    /// Bitwise operators are emitted through the same recording path as
+    /// arithmetic, so they read as source writes them rather than as the
+    /// prelude heads. The clip stays visible to preserve the result's range,
+    /// including the truncation performed by a left shift.
+    #[test]
+    fn bitwise_operators_read_as_source_writes_them() {
+        let mut names = SourceNames::new();
+        for (symbol, op) in [
+            (crate::def::BIT_XOR, "^"),
+            (crate::def::BIT_AND, "&"),
+            (crate::def::BIT_OR, "|"),
+            (crate::def::BIT_SHL, "<<"),
+            (crate::def::BIT_SHR, ">>"),
+        ] {
+            names.insert(symbol.to_string(), SourceName::Operator(op.to_string()));
+        }
+        let ctx = NameCtxt::new();
+        record_cast(&ctx, crate::def::U_CLIP, crate::ast::IntRange::U(8), "u8");
+        merge_source_names(&mut names, ctx.source_names());
+        for (term, expected) in [
+            ("(bitxor x y)", "(x ^ y)"),
+            ("(bitand x y)", "(x & y)"),
+            ("(bitor x y)", "(x | y)"),
+            ("(bitshl x y)", "(x << y)"),
+            ("(bitshr x y)", "(x >> y)"),
+            ("(uClip 8 (bitand x y))", "((x & y) as u8)"),
+        ] {
+            assert_eq!(render_term(&names, term), expected);
+        }
+    }
+
+    /// Floats keep a separate encoder head per operation, so each renders as
+    /// source writes it. A shared spelling would have collapsed add and divide
+    /// into one, which is why the table gives them individually.
+    #[test]
+    fn float_operators_keep_one_spelling_each() {
+        let mut names = SourceNames::new();
+        for (symbol, op) in [
+            (crate::def::IEEE_FLOAT_ADD, "+"),
+            (crate::def::IEEE_FLOAT_SUB, "-"),
+            (crate::def::IEEE_FLOAT_MUL, "*"),
+            (crate::def::IEEE_FLOAT_DIV, "/"),
+            (crate::def::IEEE_FLOAT_EQ, "=="),
+            (crate::def::IEEE_FLOAT_LE, "<="),
+            (crate::def::IEEE_FLOAT_LT, "<"),
+        ] {
+            names.insert(symbol.to_string(), SourceName::Operator(op.to_string()));
+        }
+        for (term, expected) in [
+            ("(ieee_float_add x y)", "(x + y)"),
+            ("(ieee_float_div x y)", "(x / y)"),
+            ("(ieee_float_eq x y)", "(x == y)"),
+            ("(ieee_float_le x y)", "(x <= y)"),
+            ("(ieee_float_add (ieee_float_mul x y) z)", "((x * y) + z)"),
+        ] {
+            assert_eq!(render_term(&names, term), expected);
+        }
+    }
+
+    /// `let` is SMT-LIB wire syntax, so it is rendered from its shape rather
+    /// than looked up as an encoded name, and its bound body still is.
+    #[test]
+    fn let_binders_read_as_bindings() {
+        let mut names = SourceNames::new();
+        names.insert(crate::def::ADD.to_string(), SourceName::Operator("+".to_string()));
+        assert_eq!(
+            render_term(&names, "(let ((_let_1 5)) (Add _let_1 _let_1))"),
+            "let _let_1 = 5 in (_let_1 + _let_1)"
+        );
+        assert_eq!(
+            render_term(&names, "(let ((a 1) (b 2)) (Add a b))"),
+            "let a = 1, b = 2 in (a + b)"
+        );
     }
 
     #[test]

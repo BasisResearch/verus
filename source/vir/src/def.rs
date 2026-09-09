@@ -446,6 +446,38 @@ impl NameCtxt {
         mangled
     }
 
+    /// An AIR symbol that stands for an infix source operator.
+    pub(crate) fn record_source_operator(&self, symbol: &str, op: &str) {
+        self.imp
+            .borrow_mut()
+            .source_names
+            .insert(symbol.to_string(), crate::air_names::SourceName::Operator(op.to_string()));
+    }
+
+    /// Record the head and range arguments of the cast application we emitted.
+    /// The value is last; the preceding atoms distinguish fixed and pointer widths.
+    pub(crate) fn record_source_cast(&self, application: &air::ast::Expr, typ: &str) {
+        use air::ast::{Constant, ExprX};
+        let ExprX::Apply(symbol, args) = &**application else { return };
+        let Some((_value, range_args)) = args.split_last() else { return };
+        let range_args: Option<Vec<String>> = range_args
+            .iter()
+            .map(|arg| match &**arg {
+                ExprX::Const(Constant::Nat(n)) => Some(n.to_string()),
+                ExprX::Var(name) => Some(name.to_string()),
+                _ => None,
+            })
+            .collect();
+        let Some(range_args) = range_args else { return };
+        let mut imp = self.imp.borrow_mut();
+        let entry = imp.source_names.entry(symbol.to_string()).or_insert_with(|| {
+            crate::air_names::SourceName::Cast { symbol: symbol.to_string(), types: HashMap::new() }
+        });
+        if let crate::air_names::SourceName::Cast { types, .. } = entry {
+            types.insert(range_args, typ.to_string());
+        }
+    }
+
     pub(crate) fn record_source_constructor(&self, symbol: &Ident, variant: &crate::ast::Variant) {
         self.imp.borrow_mut().source_names.insert(
             symbol.to_string(),
@@ -515,7 +547,7 @@ impl NameCtxt {
             CrateId::Internal => s,
             krate => self.krate_to_string(krate) + KRATE_SEPARATOR + &s,
         };
-        self.record_source_name(mangled, crate::ast_util::path_as_friendly_rust_name(path))
+        self.record_source_name(mangled, source_name_of_path(path))
     }
 
     pub fn fun_to_string(&self, fun: &Fun) -> String {
@@ -854,7 +886,34 @@ pub fn prefix_no_unwind_when(ident: &Ident) -> Ident {
     Arc::new(PREFIX_NO_UNWIND_WHEN.to_string() + ident)
 }
 
+/// Markers that `prefix_path` buries inside a path's last segment, paired
+/// with how that variant reads in source. Stripping at the symbol start
+/// cannot see these, so they are undone from the structured path instead.
+/// `prefix_path` asserts its prefix is listed, so the set stays exhaustive
+/// by construction.
+pub const AIR_PATH_SEGMENT_PREFIXES: &[(&str, &str)] = &[(PREFIX_RECURSIVE, "recursive variant")];
+
+/// How a path reads in source, with any segment marker undone.
+fn source_name_of_path(path: &Path) -> String {
+    if let Some(last) = path.segments.last() {
+        for (prefix, note) in AIR_PATH_SEGMENT_PREFIXES {
+            if let Some(bare) = last.strip_prefix(*prefix) {
+                let mut segments: Vec<Ident> = (*path.segments).clone();
+                *segments.last_mut().expect("path last segment") = Arc::new(bare.to_string());
+                let bare = PathX { krate: path.krate.clone(), segments: Arc::new(segments) };
+                let friendly = crate::ast_util::path_as_friendly_rust_name(&Arc::new(bare));
+                return format!("{friendly} ({note})");
+            }
+        }
+    }
+    crate::ast_util::path_as_friendly_rust_name(path)
+}
+
 fn prefix_path(prefix: String, path: &Path) -> Path {
+    debug_assert!(
+        AIR_PATH_SEGMENT_PREFIXES.iter().any(|(p, _)| *p == prefix),
+        "prefix_path prefix {prefix} is missing from AIR_PATH_SEGMENT_PREFIXES"
+    );
     let mut segments: Vec<Ident> = (*path.segments).clone();
     let last: &mut Ident = segments.last_mut().expect("path last segment");
     *last = Arc::new(prefix + &**last);
@@ -1017,7 +1076,11 @@ pub fn new_user_qid_name(fun_name: &str, q_count: u64) -> String {
 }
 
 // Generate a unique internal quantifier ID
-pub fn new_internal_qid(ctx: &crate::context::Ctx, name: String) -> Option<Ident> {
+pub fn new_internal_qid(
+    ctx: &crate::context::Ctx,
+    name: String,
+    role: Option<crate::sst::QuantRole>,
+) -> Option<Ident> {
     // In SMTLIB, unquoted attribute values cannot contain colons,
     // and sise cannot handle quoting with vertical bars
     let name = str::replace(&name, ":", "_");
@@ -1025,7 +1088,8 @@ pub fn new_internal_qid(ctx: &crate::context::Ctx, name: String) -> Option<Ident
     let qid = format!("{}{}_definition", air::profiler::INTERNAL_QUANT_PREFIX, name);
 
     if let Some(fun) = ctx.fun.as_ref() {
-        let bnd_info = crate::sst::BndInfo { fun: fun.current_fun.clone(), user: None, tag: None };
+        let bnd_info =
+            crate::sst::BndInfo { fun: fun.current_fun.clone(), user: None, role, tag: None };
         ctx.global.qid_map.borrow_mut().insert(qid.clone(), bnd_info);
     }
 

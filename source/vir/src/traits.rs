@@ -1068,6 +1068,7 @@ pub fn trait_bound_axioms(ctx: &Ctx, traits: &Vec<Trait>) -> Commands {
                 &Arc::new(vec![]),
                 &trigs,
                 None,
+                None,
             );
             let imply = air::ast_util::mk_implies(&tr_bound, &air::ast_util::mk_and(&typ_bounds));
             let forall = mk_bind_expr(&bind, &imply);
@@ -1142,6 +1143,7 @@ pub(crate) fn dyn_spec_fn_axiom(
             &function.x.typ_params,
             &function.x.pars,
             &lhs,
+            None,
             None,
         ),
         &f_eq,
@@ -1356,6 +1358,7 @@ pub fn trait_impl_to_air(ctx: &Ctx, imp: &TraitImpl) -> Commands {
         &typ_params,
         &Arc::new(vec![]),
         &trigs,
+        None,
         None,
     );
     let mut req_bounds = trait_bounds_to_air(ctx, &typ_bounds);
