@@ -4,9 +4,11 @@
 use serde_json::{Value, json};
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
+use std::net::Shutdown;
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
@@ -26,87 +28,141 @@ verus! {
 }
 "#;
 
+/// The harness's write half of the worker's protocol channel.
+///
+/// Ending a session means EOF at the worker, and the two transports reach that
+/// differently, so the write half cannot just be a `Write`. Taking `self` by
+/// value keeps a closed endpoint from being written to again, which also means
+/// this trait is not object safe: `Worker` takes it as a type parameter rather
+/// than boxing it.
+trait Endpoint: Write {
+    fn close(self);
+}
+
+impl Endpoint for ChildStdin {
+    /// Dropping the pipe closes the worker's stdin.
+    fn close(self) {}
+}
+
+impl Endpoint for UnixStream {
+    /// The reader thread holds a `try_clone` of this same connection, so
+    /// dropping this handle closes nothing and the worker would wait forever.
+    /// A session ended with `close` has already gone; the shutdown then fails
+    /// having reached the state it wanted, and `finish` asserts on the exit
+    /// that actually matters.
+    fn close(self) {
+        let _ = self.shutdown(Shutdown::Write);
+    }
+}
+
 // Keep the protocol subprocess bounded even when a regression stops it from
 // producing a reply. stderr goes to a file so diagnostics cannot fill a pipe.
-struct Worker {
+struct Worker<E: Endpoint> {
     child: Child,
-    input: Option<Box<dyn Write>>,
+    input: Option<E>,
     replies: Receiver<String>,
     dir: TempDir,
 }
 
-impl Worker {
-    fn start(source: &str, options: &[&str]) -> Self {
-        Self::start_transport(source, options, false)
-    }
+/// Everything both transports set up before they diverge.
+struct Spawned {
+    child: Child,
+    dir: TempDir,
+    listener: Option<UnixListener>,
+}
 
-    fn start_transport(source: &str, options: &[&str], socket: bool) -> Self {
-        let dir = tempfile::tempdir().unwrap();
-        let socket_path = dir.path().join("worker.sock");
-        let listener =
-            socket.then(|| std::os::unix::net::UnixListener::bind(&socket_path).unwrap());
-        fs::write(dir.path().join("fixture.rs"), source).unwrap();
-        let current = std::env::current_exe().unwrap();
-        let binary = current.parent().unwrap().parent().unwrap().join("rust_verify");
-        let solver = PathBuf::from(std::env::var_os("VERUS_CVC5_PATH").expect("cvc5 path"));
-        let solver = fs::canonicalize(solver).unwrap();
-        let wrapper = dir.path().join("solver.sh");
-        fs::write(
+impl Worker<ChildStdin> {
+    fn start(source: &str, options: &[&str]) -> Self {
+        let Spawned { mut child, dir, .. } = spawn(source, options, false);
+        let input = child.stdin.take().unwrap();
+        let stdout = child.stdout.take().unwrap();
+        Self::assemble(child, dir, input, Box::new(stdout))
+    }
+}
+
+impl Worker<UnixStream> {
+    fn start_socket(source: &str, options: &[&str]) -> Self {
+        let Spawned { mut child, dir, listener } = spawn(source, options, true);
+        let stream = accept(listener.expect("socket transport binds a listener"), &mut child, &dir);
+        let input = stream.try_clone().unwrap();
+        Self::assemble(child, dir, input, Box::new(stream))
+    }
+}
+
+/// Wait for the worker to dial back, failing fast if it dies while we wait.
+fn accept(listener: UnixListener, child: &mut Child, dir: &TempDir) -> UnixStream {
+    listener.set_nonblocking(true).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        match listener.accept() {
+            Ok((stream, _)) => {
+                stream.set_nonblocking(false).unwrap();
+                return stream;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                assert!(
+                    child.try_wait().unwrap().is_none(),
+                    "{}",
+                    fs::read_to_string(dir.path().join("stderr")).unwrap()
+                );
+                if Instant::now() >= deadline {
+                    child.kill().unwrap();
+                    child.wait().unwrap();
+                    panic!("socket startup timeout");
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(e) => panic!("socket accept: {}", e),
+        }
+    }
+}
+
+fn spawn(source: &str, options: &[&str], socket: bool) -> Spawned {
+    let dir = tempfile::tempdir().unwrap();
+    let socket_path = dir.path().join("worker.sock");
+    let listener = socket.then(|| UnixListener::bind(&socket_path).unwrap());
+    fs::write(dir.path().join("fixture.rs"), source).unwrap();
+    let current = std::env::current_exe().unwrap();
+    let binary = current.parent().unwrap().parent().unwrap().join("rust_verify");
+    let solver = PathBuf::from(std::env::var_os("VERUS_CVC5_PATH").expect("cvc5 path"));
+    let solver = fs::canonicalize(solver).unwrap();
+    let wrapper = dir.path().join("solver.sh");
+    fs::write(
             &wrapper,
             "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$$\" >> \"$RESIDENT_LAUNCH_LOG\"\nexec \"$RESIDENT_SOLVER\" \"$@\"\n",
         )
         .unwrap();
-        fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o700)).unwrap();
-        let mut command = Command::new(binary);
+    fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o700)).unwrap();
+    let mut command = Command::new(binary);
+    command
+        .args(["--mcp", "-V", "cvc5", "--resident", "--crate-type=lib"])
+        .arg(dir.path().join("fixture.rs"))
+        .args(["--log-all", "--log-dir"])
+        .arg(dir.path().join("logs"))
+        .args(options)
+        .env("VERUS_CVC5_PATH", wrapper)
+        .env("RESIDENT_SOLVER", solver)
+        .env("RESIDENT_LAUNCH_LOG", dir.path().join("launches"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(fs::File::create(dir.path().join("stderr")).unwrap());
+    if socket {
         command
-            .args(["--mcp", "-V", "cvc5", "--resident", "--crate-type=lib"])
-            .arg(dir.path().join("fixture.rs"))
-            .args(["--log-all", "--log-dir"])
-            .arg(dir.path().join("logs"))
-            .args(options)
-            .env("VERUS_CVC5_PATH", wrapper)
-            .env("RESIDENT_SOLVER", solver)
-            .env("RESIDENT_LAUNCH_LOG", dir.path().join("launches"))
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(fs::File::create(dir.path().join("stderr")).unwrap());
-        if socket {
-            command
-                .env("VERUS_RESIDENT_SOCKET", &socket_path)
-                .stdin(Stdio::null())
-                .stdout(fs::File::create(dir.path().join("stdout")).unwrap());
-        }
-        let mut child = command.spawn().unwrap();
-        let (input, stdout): (Box<dyn Write>, Box<dyn std::io::Read + Send>) =
-            if let Some(listener) = listener {
-                listener.set_nonblocking(true).unwrap();
-                let deadline = Instant::now() + Duration::from_secs(60);
-                let stream = loop {
-                    match listener.accept() {
-                        Ok((stream, _)) => {
-                            stream.set_nonblocking(false).unwrap();
-                            break stream;
-                        }
-                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                            assert!(
-                                child.try_wait().unwrap().is_none(),
-                                "{}",
-                                fs::read_to_string(dir.path().join("stderr")).unwrap()
-                            );
-                            if Instant::now() >= deadline {
-                                child.kill().unwrap();
-                                child.wait().unwrap();
-                                panic!("socket startup timeout");
-                            }
-                            std::thread::sleep(Duration::from_millis(10));
-                        }
-                        Err(e) => panic!("socket accept: {}", e),
-                    }
-                };
-                (Box::new(stream.try_clone().unwrap()), Box::new(stream))
-            } else {
-                (Box::new(child.stdin.take().unwrap()), Box::new(child.stdout.take().unwrap()))
-            };
+            .env("VERUS_RESIDENT_SOCKET", &socket_path)
+            .stdin(Stdio::null())
+            .stdout(fs::File::create(dir.path().join("stdout")).unwrap());
+    }
+    let child = command.spawn().unwrap();
+    Spawned { child, dir, listener }
+}
+
+impl<E: Endpoint> Worker<E> {
+    fn assemble(
+        child: Child,
+        dir: TempDir,
+        input: E,
+        stdout: Box<dyn std::io::Read + Send>,
+    ) -> Self {
         let (sender, replies) = mpsc::channel();
         std::thread::spawn(move || {
             for line in BufReader::new(stdout).lines() {
@@ -145,7 +201,9 @@ impl Worker {
     }
 
     fn finish(&mut self, success: bool) {
-        self.input.take();
+        if let Some(input) = self.input.take() {
+            input.close();
+        }
         let deadline = Instant::now() + Duration::from_secs(60);
         loop {
             if let Some(status) = self.child.try_wait().unwrap() {
@@ -170,7 +228,7 @@ impl Worker {
     }
 }
 
-impl Drop for Worker {
+impl<E: Endpoint> Drop for Worker<E> {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
@@ -354,7 +412,7 @@ fn resident_ignores_specialised_provers_in_filtered_out_functions() {
 
 #[test]
 fn resident_socket_separates_output_and_reports_inputs() {
-    let mut worker = Worker::start_transport(SOURCE, &["--output-json", "--time"], true);
+    let mut worker = Worker::start_socket(SOURCE, &["--output-json", "--time"]);
     let ready = worker.receive();
     assert_eq!(ready["event"], "ready");
     assert!(
@@ -378,6 +436,16 @@ fn resident_socket_separates_output_and_reports_inputs() {
     let output: Value =
         serde_json::from_str(&stdout).expect("ordinary JSON output remains separate");
     assert!(output.is_object());
+}
+
+// EOF releases every bucket over either transport. The socket needs a real
+// shutdown to produce it: the reader thread holds a second handle on the same
+// connection, so dropping the write half closes nothing.
+#[test]
+fn resident_socket_closes_on_eof() {
+    let mut worker = Worker::start_socket(SOURCE, &[]);
+    assert_eq!(worker.receive()["event"], "ready");
+    worker.finish(false);
 }
 
 #[test]
