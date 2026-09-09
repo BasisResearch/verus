@@ -2,6 +2,13 @@
 //!
 //! This driver serves one immutable compilation over JSON lines. It never reads
 //! replacement source or accepts new assertions from its caller.
+//!
+//! On Unix, `VERUS_RESIDENT_SOCKET` selects a Unix socket pathname instead of
+//! stdin/stdout. This supports Cargo's closed compiler stdin and keeps normal
+//! JSON/timing/trace output separate. The caller drains stdout and stderr.
+//! `ready.input_files` lists local source and explicit compiler dependencies,
+//! including imported VIR files, for the MCP caller's snapshot coverage check.
+//! It does not enumerate undeclared external reads by macros or build scripts.
 
 use crate::buckets::BucketId;
 use crate::commands::{QueryOp, Style};
@@ -140,6 +147,7 @@ impl RetainedBucket {
 /// I/O; compiler workers finish and return their contexts before it starts.
 pub(crate) struct Server {
     buckets: Vec<RetainedBucket>,
+    input_files: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -150,6 +158,7 @@ enum Response<'a> {
         session: &'a str,
         process_id: u32,
         invocation_succeeded: bool,
+        input_files: &'a [String],
         buckets: &'a [BucketDescription],
     },
     Queries {
@@ -368,7 +377,12 @@ impl Server {
         // Compilation can finish in any order. Protocol ordinals follow the
         // verifier's bucket identity, not worker completion order.
         buckets.sort_by(|left, right| left.id.cmp(&right.id));
-        Self { buckets }
+        Self { buckets, input_files: Vec::new() }
+    }
+
+    pub(crate) fn with_input_files(mut self, input_files: Vec<String>) -> Self {
+        self.input_files = input_files;
+        self
     }
 
     pub(crate) fn serve(
@@ -378,6 +392,17 @@ impl Server {
     ) -> io::Result<()> {
         let stamp = SystemTime::now().duration_since(UNIX_EPOCH).map_err(io::Error::other)?;
         let session = format!("{}-{}", std::process::id(), stamp.as_nanos());
+        #[cfg(unix)]
+        if let Some(path) = std::env::var_os("VERUS_RESIDENT_SOCKET") {
+            let stream = std::os::unix::net::UnixStream::connect(path)?;
+            return self.run(
+                &session,
+                invocation_succeeded,
+                io::BufReader::new(stream.try_clone()?),
+                stream,
+                set_rlimit,
+            );
+        }
         let input = io::stdin();
         let output = io::stdout();
         self.run(&session, invocation_succeeded, input.lock(), output.lock(), set_rlimit)
@@ -420,6 +445,7 @@ impl Server {
                 session,
                 process_id: std::process::id(),
                 invocation_succeeded,
+                input_files: &self.input_files,
                 buckets: &buckets,
             },
         )?;

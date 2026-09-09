@@ -293,6 +293,7 @@ pub struct FunctionSmtStats {
 pub struct Verifier {
     resident_buckets: Vec<crate::resident::RetainedBucket>,
     resident_prepared: bool,
+    resident_inputs: Vec<String>,
     /// this is the actual number of threads used for verification. This will be set to the
     /// minimum of the requested threads and the number of buckets to verify
     pub num_threads: usize,
@@ -601,6 +602,7 @@ impl Verifier {
             encountered_error: false,
             resident_buckets: Vec::new(),
             resident_prepared: false,
+            resident_inputs: Vec::new(),
             encountered_vir_error: false,
             count_verified: 0,
             count_errors: 0,
@@ -653,6 +655,7 @@ impl Verifier {
             encountered_error: self.encountered_error,
             resident_buckets: Vec::new(),
             resident_prepared: false,
+            resident_inputs: Vec::new(),
             encountered_vir_error: false,
             count_verified: 0,
             count_errors: 0,
@@ -722,9 +725,11 @@ impl Verifier {
             return Ok(());
         }
         self.resident_prepared = false;
-        crate::resident::Server::new(buckets).serve(invocation_succeeded, |context, rlimit| {
-            Self::set_rlimit(SmtSolver::Cvc5, context, rlimit);
-        })
+        crate::resident::Server::new(buckets)
+            .with_input_files(std::mem::take(&mut self.resident_inputs))
+            .serve(invocation_succeeded, |context, rlimit| {
+                Self::set_rlimit(SmtSolver::Cvc5, context, rlimit);
+            })
     }
 
     fn get_bucket<'a>(&'a self, bucket_id: &BucketId) -> &'a Bucket {
@@ -3817,6 +3822,27 @@ impl VerifierCallbacksEraseMacro {
         for err in std::mem::take(&mut self.verifier.deferred_errors) {
             reporter.report_as(&err.to_any(), MessageLevel::Error);
             self.verifier.encountered_vir_error = true;
+        }
+        if self.verifier.args.resident {
+            let mut files = std::collections::BTreeSet::new();
+            for file in compiler.sess.source_map().files().iter() {
+                if matches!(*file.external_src.borrow(), rustc_span::ExternalSource::Unneeded) {
+                    if let rustc_span::FileName::Real(name) = &file.name {
+                        if let Some(path) = name.local_path() {
+                            files.insert(path.to_path_buf());
+                        }
+                    }
+                }
+            }
+            for file in compiler.sess.file_depinfo.lock().iter() {
+                files.insert(std::path::PathBuf::from(file.as_str()));
+            }
+            self.verifier.resident_inputs = files
+                .into_iter()
+                .map(|path| {
+                    std::path::absolute(&path).unwrap_or(path).to_string_lossy().into_owned()
+                })
+                .collect();
         }
         if !self.verifier.args.output_json
             && !self.verifier.args.resident

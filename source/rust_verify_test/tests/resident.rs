@@ -6,7 +6,7 @@ use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
@@ -30,14 +30,21 @@ verus! {
 // producing a reply. stderr goes to a file so diagnostics cannot fill a pipe.
 struct Worker {
     child: Child,
-    input: Option<ChildStdin>,
+    input: Option<Box<dyn Write>>,
     replies: Receiver<String>,
     dir: TempDir,
 }
 
 impl Worker {
     fn start(source: &str, options: &[&str]) -> Self {
+        Self::start_transport(source, options, false)
+    }
+
+    fn start_transport(source: &str, options: &[&str], socket: bool) -> Self {
         let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("worker.sock");
+        let listener =
+            socket.then(|| std::os::unix::net::UnixListener::bind(&socket_path).unwrap());
         fs::write(dir.path().join("fixture.rs"), source).unwrap();
         let current = std::env::current_exe().unwrap();
         let binary = current.parent().unwrap().parent().unwrap().join("rust_verify");
@@ -50,7 +57,8 @@ impl Worker {
         )
         .unwrap();
         fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o700)).unwrap();
-        let mut child = Command::new(binary)
+        let mut command = Command::new(binary);
+        command
             .args(["--mcp", "-V", "cvc5", "--resident", "--crate-type=lib"])
             .arg(dir.path().join("fixture.rs"))
             .args(["--log-all", "--log-dir"])
@@ -61,11 +69,44 @@ impl Worker {
             .env("RESIDENT_LAUNCH_LOG", dir.path().join("launches"))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(fs::File::create(dir.path().join("stderr")).unwrap())
-            .spawn()
-            .unwrap();
-        let input = child.stdin.take();
-        let stdout = child.stdout.take().unwrap();
+            .stderr(fs::File::create(dir.path().join("stderr")).unwrap());
+        if socket {
+            command
+                .env("VERUS_RESIDENT_SOCKET", &socket_path)
+                .stdin(Stdio::null())
+                .stdout(fs::File::create(dir.path().join("stdout")).unwrap());
+        }
+        let mut child = command.spawn().unwrap();
+        let (input, stdout): (Box<dyn Write>, Box<dyn std::io::Read + Send>) =
+            if let Some(listener) = listener {
+                listener.set_nonblocking(true).unwrap();
+                let deadline = Instant::now() + Duration::from_secs(60);
+                let stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => {
+                            stream.set_nonblocking(false).unwrap();
+                            break stream;
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(
+                                child.try_wait().unwrap().is_none(),
+                                "{}",
+                                fs::read_to_string(dir.path().join("stderr")).unwrap()
+                            );
+                            if Instant::now() >= deadline {
+                                child.kill().unwrap();
+                                child.wait().unwrap();
+                                panic!("socket startup timeout");
+                            }
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(e) => panic!("socket accept: {}", e),
+                    }
+                };
+                (Box::new(stream.try_clone().unwrap()), Box::new(stream))
+            } else {
+                (Box::new(child.stdin.take().unwrap()), Box::new(child.stdout.take().unwrap()))
+            };
         let (sender, replies) = mpsc::channel();
         std::thread::spawn(move || {
             for line in BufReader::new(stdout).lines() {
@@ -74,7 +115,7 @@ impl Worker {
                 }
             }
         });
-        Self { child, input, replies, dir }
+        Self { child, input: Some(input), replies, dir }
     }
 
     fn receive(&self) -> Value {
@@ -240,7 +281,7 @@ fn resident_rejects_unsupported_modes() {
     ] {
         let mut worker = Worker::start(SOURCE, &options);
         worker.finish(false);
-        assert!(worker.stderr().contains("--resident requires"), "{}", worker.stderr());
+        assert!(worker.stderr().contains("--resident"), "{}", worker.stderr());
         assert!(!worker.dir.path().join("launches").exists());
     }
 }
@@ -309,6 +350,34 @@ fn resident_ignores_specialised_provers_in_filtered_out_functions() {
         .send(json!({"command": "check", "session": ready["session"], "bucket": 0, "query": 0}));
     assert_eq!(checked["result"], "valid");
     worker.finish(true);
+}
+
+#[test]
+fn resident_socket_separates_output_and_reports_inputs() {
+    let mut worker = Worker::start_transport(SOURCE, &["--output-json", "--time"], true);
+    let ready = worker.receive();
+    assert_eq!(ready["event"], "ready");
+    assert!(
+        ready["input_files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p.as_str().unwrap().ends_with("fixture.rs")),
+        "{}",
+        ready
+    );
+    let session = ready["session"].clone();
+    let query = query_id(&ready, "::passing");
+    assert_eq!(
+        worker.send(json!({"command":"check", "session":session,"bucket":0,"query":query}))["result"],
+        "valid"
+    );
+    assert_eq!(worker.send(json!({"command":"close", "session":session}))["event"], "closed");
+    worker.finish(false);
+    let stdout = fs::read_to_string(worker.dir.path().join("stdout")).unwrap();
+    let output: Value =
+        serde_json::from_str(&stdout).expect("ordinary JSON output remains separate");
+    assert!(output.is_object());
 }
 
 #[test]

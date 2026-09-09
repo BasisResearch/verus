@@ -901,11 +901,7 @@ pub fn parse_args_with_imports(
         && (!matches!(args.solver, SmtSolver::Cvc5)
             || args.no_verify
             || args.compile
-            || args.output_json
-            || args.time
-            || args.time_expanded
             || !args.smt_options.is_empty()
-            || args.trace
             || args.debugger
             || args.allow_inline_air
             || args.spinoff_all
@@ -914,7 +910,14 @@ pub fn parse_args_with_imports(
             || args.profile_all
             || args.capture_profiles)
     {
-        error("--resident requires ordinary cvc5 verification; --no-verify, compilation, JSON/timing/trace output, custom SMT options, debugger, inline AIR, spinoff-all, provenance and profiling are unsupported".to_string());
+        error("--resident requires cvc5 verification; --no-verify, compilation, custom SMT options, debugger, inline AIR, spinoff-all, provenance and profiling are not integrated with resident rechecking".to_string());
+    }
+    let resident_socket = cfg!(unix) && std::env::var_os("VERUS_RESIDENT_SOCKET").is_some();
+    if args.resident
+        && !resident_socket
+        && (args.output_json || args.time || args.time_expanded || args.trace)
+    {
+        error("--resident uses stdout for its protocol; JSON, timing and trace output require a separate VERUS_RESIDENT_SOCKET transport".to_string());
     }
 
     if args.compile && args.no_erasure_check {
