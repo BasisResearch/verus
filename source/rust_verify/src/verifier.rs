@@ -641,15 +641,29 @@ impl Verifier {
     pub fn serve_resident(&mut self, invocation_succeeded: bool) -> std::io::Result<()> {
         let buckets = std::mem::take(&mut self.resident_buckets);
         if !self.resident_prepared {
+            // Dropping the buckets releases every solver. Tell a waiting
+            // caller that no catalogue is coming; the reason is on stderr.
+            drop(buckets);
+            if self.args.resident {
+                return crate::resident::report_unavailable(
+                    "resident preparation did not complete; no session is available",
+                );
+            }
             return Ok(());
         }
         self.resident_prepared = false;
-        crate::resident::Server::new(buckets)
-            .with_modes(self.args.provenance, self.args.spinoff_all)
-            .with_input_files(std::mem::take(&mut self.resident_inputs))
-            .serve(invocation_succeeded, |context, rlimit| {
-                Self::set_rlimit(SmtSolver::Cvc5, context, rlimit);
-            })
+        crate::resident::Server::new(
+            buckets,
+            crate::resident::SessionInfo {
+                provenance: self.args.provenance,
+                spinoff_all: self.args.spinoff_all,
+                multiple_errors: self.args.multiple_errors,
+                input_files: std::mem::take(&mut self.resident_inputs),
+            },
+        )
+        .serve(invocation_succeeded, |context, rlimit| {
+            Self::set_rlimit(SmtSolver::Cvc5, context, rlimit);
+        })
     }
 
     fn get_bucket<'a>(&'a self, bucket_id: &BucketId) -> &'a Bucket {
