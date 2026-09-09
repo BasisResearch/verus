@@ -905,12 +905,9 @@ pub fn parse_args_with_imports(
             || args.debugger
             || args.allow_inline_air
             || args.spinoff_all
-            || args.provenance
-            || args.profile
-            || args.profile_all
-            || args.capture_profiles)
+            || args.provenance)
     {
-        error("--resident requires cvc5 verification; --no-verify, compilation, custom SMT options, debugger, inline AIR, spinoff-all, provenance and profiling are not integrated with resident rechecking".to_string());
+        error("--resident requires cvc5 verification; --no-verify, compilation, custom SMT options, debugger, inline AIR, spinoff-all and provenance are not integrated with resident rechecking".to_string());
     }
     let resident_socket = cfg!(unix) && std::env::var_os("VERUS_RESIDENT_SOCKET").is_some();
     if args.resident
