@@ -53,6 +53,7 @@ mod fn_call_to_vir;
 mod hir_hide_reveal_rewrite;
 mod import_export;
 pub mod profiler;
+mod provenance;
 mod reach;
 mod resident;
 mod resolve_traits;

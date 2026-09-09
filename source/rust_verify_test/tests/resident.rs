@@ -300,6 +300,144 @@ fn resident_rechecks_preserve_query_scopes_and_solver_process() {
     eprintln!("one verifier process, one cvc5 launch, {checks} checks, balanced scopes");
 }
 
+/// Each spawned context must survive initial verification and be reused even
+/// when checks alternate between termination, body and failed queries.
+#[test]
+fn resident_spinoff_all_reuses_original_solvers() {
+    for eof in [false, true] {
+        let mut worker = Worker::start(SOURCE, &["-V", "spinoff-all"]);
+        let ready = worker.receive();
+        assert_eq!(ready["spinoff_all"], true);
+        let launches = fs::read_to_string(worker.dir.path().join("launches")).unwrap();
+        assert!(launches.lines().count() >= 3, "{}", launches);
+        for (name, expected) in [
+            ("::passing", "valid"),
+            ("::failing", "invalid"),
+            ("::recursive", "valid"),
+            ("::failing", "invalid"),
+            ("::passing", "valid"),
+        ] {
+            let result = worker.send(json!({
+                "command": "check", "session": ready["session"],
+                "bucket": 0, "query": query_id(&ready, name),
+            }));
+            assert_eq!(result["result"], expected, "{result}");
+            assert!(result["provenance"].is_null());
+        }
+        if !eof {
+            assert_eq!(
+                worker.send(json!({"command":"close","session":ready["session"]}))["event"],
+                "closed"
+            );
+            worker.assert_solvers_gone();
+        }
+        worker.finish(false);
+        worker.assert_solvers_gone();
+        assert_eq!(fs::read_to_string(worker.dir.path().join("launches")).unwrap(), launches);
+    }
+}
+
+/// Identical local hypothesis and quantifier ordinals in different buckets
+/// must resolve through that bucket's source maps after the compiler exits.
+#[test]
+fn resident_provenance_keeps_bucket_symbols_with_and_without_spinoff() {
+    let module = r#"
+        use super::*;
+        pub uninterp spec fn f(i: int) -> int;
+        pub uninterp spec fn g(i: int) -> int;
+        pub broadcast proof fn ax_f_nonneg(i: int)
+            ensures #[trigger] f(i) >= 0,
+        { admit(); }
+        proof fn check(x: int, y: int)
+            requires x > 3, y == f(x),
+                forall|j: int| 0 <= j < x ==> #[trigger] g(j) >= j,
+        {
+            broadcast use ax_f_nonneg;
+            assert(x > 2);
+            assert(y >= 1);
+            assert(g(2) >= 2);
+        }
+        proof fn passing(x: int) requires x > 3, { assert(x > 2); }
+    "#;
+    let source =
+        format!("use vstd::prelude::*; verus! {{ mod a {{{module}}} mod b {{{module}}} }}");
+    for threads in ["1", "2"] {
+        for spinoff in [false, true] {
+            let mut options = vec!["-V", "provenance", "--num-threads", threads];
+            if spinoff {
+                options.extend(["-V", "spinoff-all"]);
+            }
+            let mut worker = Worker::start(&source, &options);
+            let ready = worker.receive();
+            assert_eq!(ready["provenance"], true, "{ready}");
+            assert_eq!(ready["spinoff_all"], spinoff);
+            let buckets = ready["buckets"].as_array().unwrap();
+            assert_eq!(buckets.len(), 2, "{ready}");
+            let launches = fs::read_to_string(worker.dir.path().join("launches")).unwrap();
+            for (bucket, name, expected) in [
+                (1, "check", "invalid"),
+                (0, "passing", "valid"),
+                (0, "check", "invalid"),
+                (1, "passing", "valid"),
+                (1, "check", "invalid"),
+            ] {
+                let function = format!("::{}::{name}", if bucket == 0 { "a" } else { "b" });
+                let query = buckets[bucket]["queries"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|q| {
+                        q["function"].as_str().unwrap().ends_with(&function) && q["kind"] == "body"
+                    })
+                    .unwrap();
+                let checked = worker.send(json!({"command":"check", "session":ready["session"], "bucket":bucket, "query":query["id"]}));
+                assert_eq!(checked["result"], expected, "{checked}");
+                let provenance = &checked["provenance"];
+                assert_eq!(provenance["result"], expected, "{checked}");
+                assert_eq!(provenance["round"], 0);
+                assert_eq!(provenance["span"], query["span"]);
+                let requires: Vec<_> = provenance["hypotheses"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|h| h["kind"] == "requires")
+                    .collect();
+                assert!(!requires.is_empty(), "{}", checked);
+                for hyp in requires {
+                    assert!(hyp["owner"].as_str().unwrap().ends_with(&function), "{}", hyp);
+                    assert!(hyp["span"].as_str().unwrap().contains("fixture.rs"), "{}", hyp);
+                }
+                if name == "check" {
+                    let axiom = format!("::{}::ax_f_nonneg", if bucket == 0 { "a" } else { "b" });
+                    let instantiations = provenance["instantiations"].as_array().unwrap();
+                    let inst = instantiations
+                        .iter()
+                        .find(|i| i["fun"].as_str().is_some_and(|f| f.ends_with(&axiom)))
+                        .unwrap_or_else(|| panic!("no broadcast axiom: {}", checked));
+                    assert!(inst["site"].as_str().unwrap().contains(&axiom), "{}", inst);
+                    assert_eq!(inst["inside"]["owner"], inst["fun"]);
+                    assert!(
+                        inst["terms"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .any(|t| t.as_str().unwrap().contains("x")),
+                        "{}",
+                        inst
+                    );
+                }
+            }
+            assert_eq!(
+                worker.send(json!({"command":"close", "session":ready["session"]}))["event"],
+                "closed"
+            );
+            worker.finish(false);
+            worker.assert_solvers_gone();
+            assert_eq!(fs::read_to_string(worker.dir.path().join("launches")).unwrap(), launches);
+        }
+    }
+}
+
 #[test]
 fn resident_rejects_bad_requests_and_accepts_eof() {
     let mut worker = Worker::start("use vstd::prelude::*; verus! { proof fn passing() {} }", &[]);
@@ -335,7 +473,7 @@ fn resident_rejects_unsupported_modes() {
     for options in [
         vec!["--output-json"],
         vec!["--smt-option", "global-declarations=true"],
-        vec!["-V", "provenance"],
+        vec!["--no-verify"],
     ] {
         let mut worker = Worker::start(SOURCE, &options);
         worker.finish(false);

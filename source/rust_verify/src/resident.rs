@@ -1,4 +1,4 @@
-//! Serve retained AIR queries after compilation, with one solver per bucket.
+//! Serve retained AIR queries after compilation in their original solvers.
 //!
 //! This driver serves one immutable compilation over JSON lines. It never reads
 //! replacement source or accepts new assertions from its caller.
@@ -117,29 +117,53 @@ struct BucketDescription {
 pub(crate) struct RetainedBucket {
     id: BucketId,
     queries: Vec<QueryDescription>,
-    state: Mutex<BucketState>,
+    /// Catalogue ordinal -> original solver and its local query ordinal.
+    addresses: Vec<(usize, usize)>,
+    state: Mutex<Vec<SolverState>>,
+    symbols: Option<crate::provenance::Symbols>,
 }
 
-struct BucketState {
+pub(crate) struct SolverState {
     air: Context,
     journal: QueryJournal,
 }
 
+impl SolverState {
+    pub(crate) fn new(air: Context, journal: QueryJournal) -> Self {
+        Self { air, journal }
+    }
+}
+
 impl RetainedBucket {
-    pub(crate) fn new(id: BucketId, air: Context, journal: QueryJournal) -> Self {
-        let queries = journal
-            .queries
-            .iter()
-            .enumerate()
-            .map(|(id, query)| QueryDescription {
-                id: QueryId(id),
-                function: fun_as_friendly_rust_name(&query.context.fun),
-                description: query.context.desc.clone(),
-                kind: query.kind,
-                span: query.context.span.as_string.clone(),
-            })
-            .collect();
-        Self { id, queries, state: Mutex::new(BucketState { air, journal }) }
+    pub(crate) fn new(
+        id: BucketId,
+        air: Context,
+        journal: QueryJournal,
+        mut spinoffs: Vec<SolverState>,
+        symbols: Option<crate::provenance::Symbols>,
+    ) -> Self {
+        let mut states = Vec::new();
+        // Spinoff queries already own their declaration context. The unused
+        // primary context need not stay alive when every query was spun off.
+        if !journal.queries.is_empty() || spinoffs.is_empty() {
+            states.push(SolverState::new(air, journal));
+        }
+        states.append(&mut spinoffs);
+        let mut queries = Vec::new();
+        let mut addresses = Vec::new();
+        for (solver, state) in states.iter().enumerate() {
+            for (local, query) in state.journal.queries.iter().enumerate() {
+                queries.push(QueryDescription {
+                    id: QueryId(queries.len()),
+                    function: fun_as_friendly_rust_name(&query.context.fun),
+                    description: query.context.desc.clone(),
+                    kind: query.kind,
+                    span: query.context.span.as_string.clone(),
+                });
+                addresses.push((solver, local));
+            }
+        }
+        Self { id, queries, addresses, state: Mutex::new(states), symbols }
     }
 }
 
@@ -148,6 +172,8 @@ impl RetainedBucket {
 pub(crate) struct Server {
     buckets: Vec<RetainedBucket>,
     input_files: Vec<String>,
+    provenance: bool,
+    spinoff_all: bool,
 }
 
 #[derive(Serialize)]
@@ -158,6 +184,8 @@ enum Response<'a> {
         session: &'a str,
         process_id: u32,
         invocation_succeeded: bool,
+        provenance: bool,
+        spinoff_all: bool,
         input_files: &'a [String],
         buckets: &'a [BucketDescription],
     },
@@ -174,6 +202,7 @@ enum Response<'a> {
         diagnostics: Vec<SourceDiagnostic>,
         elapsed_ms: u128,
         restore_ms: u128,
+        provenance: Option<&'a crate::provenance::ResolvedQueryProvenance>,
     },
     Error {
         message: &'a str,
@@ -377,7 +406,13 @@ impl Server {
         // Compilation can finish in any order. Protocol ordinals follow the
         // verifier's bucket identity, not worker completion order.
         buckets.sort_by(|left, right| left.id.cmp(&right.id));
-        Self { buckets, input_files: Vec::new() }
+        Self { buckets, input_files: Vec::new(), provenance: false, spinoff_all: false }
+    }
+
+    pub(crate) fn with_modes(mut self, provenance: bool, spinoff_all: bool) -> Self {
+        self.provenance = provenance;
+        self.spinoff_all = spinoff_all;
+        self
     }
 
     pub(crate) fn with_input_files(mut self, input_files: Vec<String>) -> Self {
@@ -412,7 +447,9 @@ impl Server {
         for bucket in &mut self.buckets {
             let state =
                 bucket.state.get_mut().map_err(|_| io::Error::other("resident bucket poisoned"))?;
-            state.journal.restore_prefix(&mut state.air, 0)?;
+            for solver in state {
+                solver.journal.restore_prefix(&mut solver.air, 0)?;
+            }
         }
         // Dropping AIR contexts closes and waits for every solver. A closed
         // acknowledgement is sent only after all children have exited.
@@ -445,6 +482,8 @@ impl Server {
                 session,
                 process_id: std::process::id(),
                 invocation_succeeded,
+                provenance: self.provenance,
+                spinoff_all: self.spinoff_all,
                 input_files: &self.input_files,
                 buckets: &buckets,
             },
@@ -503,8 +542,9 @@ impl Server {
                         .state
                         .lock()
                         .map_err(|_| io::Error::other("resident bucket poisoned"))?;
-                    let BucketState { air, journal } = &mut *state;
-                    let prefix = journal.queries[id.0].prefix;
+                    let (solver, local) = bucket.addresses[id.0];
+                    let SolverState { air, journal } = &mut state[solver];
+                    let prefix = journal.queries[local].prefix;
                     // Restoration replays declarations through AIR and the
                     // solver, so it is timed apart from the check itself.
                     let restore_start = Instant::now();
@@ -512,7 +552,7 @@ impl Server {
                         return fatal(&mut output, error);
                     }
                     let restore_ms = restore_start.elapsed().as_millis();
-                    let query = &journal.queries[id.0];
+                    let query = &journal.queries[local];
                     // The severity the original invocation would have reported
                     // this failure at, so a recommends recheck stays a warning.
                     let level = query.level;
@@ -541,6 +581,28 @@ impl Server {
                             return fatal(&mut output, io::Error::other(error));
                         }
                     };
+                    let provenance = air.take_provenance().and_then(|info| {
+                        bucket.symbols.as_ref().map(|symbols| {
+                            symbols.resolve(
+                                &query.context.fun,
+                                crate::provenance::QueryProvenance {
+                                    desc: query.context.desc.clone(),
+                                    span: query.context.span.as_string.clone(),
+                                    round: 0,
+                                    result: match result {
+                                        QueryResult::Valid => "valid",
+                                        QueryResult::Invalid => "invalid",
+                                        QueryResult::ResourceLimit => "canceled",
+                                    }
+                                    .to_owned(),
+                                    sources: info.sources,
+                                    instantiations: info.instantiations,
+                                    variable_versions: info.variable_versions,
+                                    unparsed: info.unparsed,
+                                },
+                            )
+                        })
+                    });
                     air.finish_query();
                     send(
                         &mut output,
@@ -553,6 +615,7 @@ impl Server {
                             diagnostics: diagnostics.0.into_inner(),
                             elapsed_ms: start.elapsed().as_millis(),
                             restore_ms,
+                            provenance: provenance.as_ref(),
                         },
                     )?;
                 }
