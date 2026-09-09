@@ -59,13 +59,18 @@ and API safety queries. A function can contribute several queries.
 `invalid` means the verifier did not establish the obligation; it is not
 a promise that cvc5 returned `sat`. A failed assertion carries its
 `assert_id` when available, plus diagnostics with message, severity,
-source spans and labels. This slice reports the first failing assertion
-from each recheck. It does not rerun Verus's diagnostic expansion loop.
+source spans and labels. Severity is `error`, `warning` or `note`, and is the
+level the original invocation reports that query at, so a failed recommends
+check stays a warning on recheck. This slice reports the first failing
+assertion from each recheck. It does not rerun Verus's diagnostic expansion
+loop.
 `elapsed_ms` includes AIR checking/lowering and solver work, after context
 restoration; it is not an end-to-end request timing. `restore_ms` covers the
 restoration that preceded it, which is the cost of moving between prefixes
-rather than of the obligation itself. Neither includes time the caller spends
-holding the pipe.
+rather than of the obligation itself. Restoration flushes the replayed
+declarations to the solver before the clock stops, so `restore_ms` includes
+the solver's share of the replay and not only AIR's. Neither field includes
+time the caller spends holding the pipe.
 
 Unknown buckets/queries, wrong sessions, malformed JSON and unknown fields produce
 an `error` response without running a query. Requests are limited to 64 KiB
@@ -125,7 +130,10 @@ Separate function buckets created by `#[verifier::spinoff_prover]` are
 supported alongside module buckets. This slice rejects specialised query
 provers (bit-vector, nonlinear and Singular), spinoff-all,
 custom SMT options, provenance, profiling, compilation, debugger, inline
-AIR and conflicting stdout modes. Ordinary invocations are unchanged.
+AIR and conflicting stdout modes. The rejection follows the same filter
+decision as retention, so a specialised prover in a function the filter
+excludes leaves preparation alone: its query is neither checked nor retained.
+Ordinary invocations are unchanged.
 Solver export/replay, cross-edit retraction and MCP lifecycle management
 remain separate work.
 
@@ -140,7 +148,8 @@ These require the normal Verus build and configured cvc5. The subprocess
 tests run on Unix. They check repeated passing/failing queries, one solver
 per active bucket, serial/parallel preparation, stable bucket addresses,
 filters, balanced scopes, request rejection, optional session tokens on
-`list`, EOF and shutdown of every child.
+`list`, EOF and shutdown of every child. One test pins that a specialised
+prover in a filtered-out function does not abort preparation.
 Two AIR tests cover the journal: later axioms cannot prove an earlier query
 after their context is removed, including repeated removal and redeclaration
 of names; and grouped declaration batches stay on the pinned side of a scope

@@ -172,7 +172,11 @@ fn resident_rechecks_preserve_query_scopes_and_solver_process() {
         assert_eq!(result["query"], query);
         assert_eq!(result["result"], expected);
         if expected == "invalid" {
-            assert!(!result["diagnostics"].as_array().unwrap().is_empty());
+            let diagnostics = result["diagnostics"].as_array().unwrap();
+            assert!(!diagnostics.is_empty());
+            // Severity is the level the original invocation reports at, spelled
+            // the way every other enum in the protocol is spelled.
+            assert_eq!(diagnostics[0]["level"], "error", "{}", result);
             assert!(result["assert_id"].is_array());
             assert!(result.to_string().contains("fixture.rs"));
         }
@@ -239,6 +243,34 @@ fn resident_rejects_unsupported_modes() {
         assert!(worker.stderr().contains("--resident requires"), "{}", worker.stderr());
         assert!(!worker.dir.path().join("launches").exists());
     }
+}
+
+// A specialised prover in a function the filter excludes is not this session's
+// problem: its query is neither checked nor retained, so preparation must
+// still succeed. Without the filter, the same file is rejected (above).
+#[test]
+fn resident_ignores_specialised_provers_in_filtered_out_functions() {
+    let source = r#"
+        use vstd::prelude::*;
+        verus! {
+            mod a {
+                use super::*;
+                proof fn plain() { assert(1int + 1 == 2); }
+                proof fn bits(x: u32) { assert(x & 0 == 0) by(bit_vector); }
+            }
+        }
+    "#;
+    let mut worker =
+        Worker::start(source, &["--verify-only-module", "a", "--verify-function", "plain"]);
+    let ready = worker.receive();
+    assert_eq!(ready["event"], "ready", "{}", worker.stderr());
+    let queries = ready["buckets"][0]["queries"].as_array().unwrap();
+    assert_eq!(queries.len(), 1, "{}", ready);
+    assert!(queries[0]["function"].as_str().unwrap().ends_with("::plain"), "{}", ready);
+    let checked = worker
+        .send(json!({"command": "check", "session": ready["session"], "bucket": 0, "query": 0}));
+    assert_eq!(checked["result"], "valid");
+    worker.finish(true);
 }
 
 #[test]

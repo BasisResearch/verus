@@ -914,7 +914,7 @@ pub fn parse_args_with_imports(
             || args.profile_all
             || args.capture_profiles)
     {
-        error("--resident requires ordinary cvc5 verification; compilation, JSON/timing/trace output, custom SMT options, debugger, inline AIR, spinoff-all, provenance and profiling are unsupported".to_string());
+        error("--resident requires ordinary cvc5 verification; --no-verify, compilation, JSON/timing/trace output, custom SMT options, debugger, inline AIR, spinoff-all, provenance and profiling are unsupported".to_string());
     }
 
     if args.compile && args.no_erasure_check {

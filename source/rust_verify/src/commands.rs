@@ -38,6 +38,24 @@ pub enum QueryOp {
     Body(Style),
 }
 
+impl QueryOp {
+    /// The severity at which a failure of this query is reported. Every
+    /// consumer reads the level from here: a failed recommends check is a
+    /// warning wherever it is reported, so a resident recheck of a retained
+    /// query cannot promote it to an error.
+    pub fn message_level(&self) -> air::messages::MessageLevel {
+        use air::messages::MessageLevel;
+        match self {
+            QueryOp::SpecTermination => MessageLevel::Error,
+            QueryOp::Body(Style::Normal) => MessageLevel::Error,
+            QueryOp::Body(Style::RecommendsFollowupFromError) => MessageLevel::Note,
+            QueryOp::Body(Style::RecommendsChecked) => MessageLevel::Warning,
+            QueryOp::Body(Style::Expanded) => MessageLevel::Note,
+            QueryOp::Body(Style::CheckApiSafety) => MessageLevel::Error,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub enum OpKind {
     /// Something that declares axioms, which will be in scope for later proof ops.

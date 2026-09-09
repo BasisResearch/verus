@@ -1853,14 +1853,7 @@ impl Verifier {
                         profile_rerun,
                         func_check_sst,
                     } => {
-                        let level = match query_op {
-                            QueryOp::SpecTermination => MessageLevel::Error,
-                            QueryOp::Body(Style::Normal) => MessageLevel::Error,
-                            QueryOp::Body(Style::RecommendsFollowupFromError) => MessageLevel::Note,
-                            QueryOp::Body(Style::RecommendsChecked) => MessageLevel::Warning,
-                            QueryOp::Body(Style::Expanded) => MessageLevel::Note,
-                            QueryOp::Body(Style::CheckApiSafety) => MessageLevel::Error,
-                        };
+                        let level = query_op.message_level();
                         let function = &op.get_function();
                         let is_recommend = query_op.is_recommend();
                         self.expand_flag = query_op.is_expanded();
@@ -1876,16 +1869,20 @@ impl Verifier {
                             air::context::SmtSolver::Z3 => Some(0),
                             air::context::SmtSolver::Cvc5 => None,
                         };
-                        // One filter decision drives both retention and
-                        // checking, so a resident session cannot come to offer
-                        // obligations that this run never checked.
+                        // One filter decision drives retention, checking and
+                        // the unsupported-query guards below. A resident
+                        // session can therefore neither offer obligations that
+                        // this run never checked, nor refuse to prepare over a
+                        // query it was never asked to retain: a filtered-out
+                        // function may use any prover it likes.
                         let includes_function =
                             self.user_filter.as_ref().unwrap().includes_function(&function.x.name);
+                        let retain_queries = resident.is_some() && includes_function;
                         for cmds in commands_with_context_list.iter() {
                             if is_recommend && cmds.skip_recommends {
                                 continue;
                             }
-                            if resident.is_some()
+                            if retain_queries
                                 && cmds.prover_choice != vir::def::ProverChoice::DefaultProver
                             {
                                 return Err(resident_error(
@@ -1905,7 +1902,7 @@ impl Verifier {
                                 || *profile_rerun
                                 || self.args.spinoff_all;
 
-                            if resident.is_some() && do_spinoff {
+                            if retain_queries && do_spinoff {
                                 return Err(resident_error(
                                     "--resident does not support spinoff prover queries",
                                 ));
@@ -1979,16 +1976,14 @@ impl Verifier {
                             if let Some(rlimit) = function.x.attrs.rlimit {
                                 Self::set_rlimit(self.args.solver, &mut query_air_context, rlimit);
                             }
-                            if let Some(session) = &mut resident {
-                                if includes_function {
-                                    session
-                                        .record_query(
-                                            cmds.clone(),
-                                            query_op,
-                                            function.x.attrs.rlimit.unwrap_or(self.args.rlimit),
-                                        )
-                                        .map_err(&resident_error)?;
-                                }
+                            if let Some(session) = resident.as_mut().filter(|_| includes_function) {
+                                session
+                                    .record_query(
+                                        cmds.clone(),
+                                        query_op,
+                                        function.x.attrs.rlimit.unwrap_or(self.args.rlimit),
+                                    )
+                                    .map_err(&resident_error)?;
                             }
                             let RunCommandQueriesResult {
                                 invalidity: command_invalidity,

@@ -31,6 +31,10 @@ struct RetainedQuery {
     prefix: usize,
     rlimit: f32,
     kind: QueryKind,
+    /// The severity the original invocation reports a failure of this query
+    /// at, read from the same `QueryOp` the verifier reads. A recheck of a
+    /// recommends query stays a warning.
+    level: MessageLevel,
 }
 
 #[derive(Clone, Copy, Serialize)]
@@ -178,9 +182,29 @@ enum QueryResult {
     ResourceLimit,
 }
 
+/// `air::messages::MessageLevel` serialises its Rust variant names, and the
+/// protocol spells every other enum in snake case.
+#[derive(Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum DiagnosticLevel {
+    Error,
+    Warning,
+    Note,
+}
+
+impl From<MessageLevel> for DiagnosticLevel {
+    fn from(level: MessageLevel) -> Self {
+        match level {
+            MessageLevel::Error => Self::Error,
+            MessageLevel::Warning => Self::Warning,
+            MessageLevel::Note => Self::Note,
+        }
+    }
+}
+
 #[derive(Serialize)]
 struct SourceDiagnostic {
-    level: MessageLevel,
+    level: DiagnosticLevel,
     message: String,
     spans: Vec<String>,
     labels: Vec<SourceLabel>,
@@ -199,7 +223,7 @@ impl QueryDiagnostics {
     fn record(&self, message: &ArcDynMessage, level: MessageLevel) {
         let message = message.downcast_ref::<MessageX>().expect("VIR diagnostic message");
         self.0.borrow_mut().push(SourceDiagnostic {
-            level,
+            level: level.into(),
             message: message.note.clone(),
             spans: message.spans.iter().map(|span| span.as_string.clone()).collect(),
             labels: message
@@ -237,6 +261,16 @@ fn send(output: &mut impl Write, response: &Response<'_>) -> io::Result<()> {
     serde_json::to_writer(&mut *output, response)?;
     writeln!(output)?;
     output.flush()
+}
+
+/// End the session, telling the caller why before the pipe closes. Without a
+/// final frame the only signal is EOF, which a caller cannot tell apart from
+/// an orderly shutdown. A failure to send is discarded: the error being
+/// reported is the one worth returning.
+fn fatal<T>(output: &mut impl Write, error: io::Error) -> io::Result<T> {
+    let message = error.to_string();
+    let _ = send(output, &Response::Error { message: &message });
+    Err(error)
 }
 
 impl QueryJournal {
@@ -284,6 +318,7 @@ impl QueryJournal {
                     prefix: self.applied,
                     rlimit,
                     kind: QueryKind::from_op(op),
+                    level: op.message_level(),
                 });
                 // The next declaration batch must start a scope: this query
                 // can ask to return to the prefix that ends here.
@@ -311,6 +346,18 @@ impl QueryJournal {
                     }
                 }
             }
+        }
+        // `push`, `pop` and `global` only fill the pipe buffer, so without this
+        // the solver's share of the replay would be charged to the query that
+        // follows. Flushing here also surfaces a solver complaint about a
+        // replayed declaration as a restoration failure rather than as
+        // unexpected output from the next check.
+        let output = air.flush_commands();
+        if !output.is_empty() {
+            return Err(io::Error::other(format!(
+                "solver rejected the restored context: {}",
+                output.join(" ")
+            )));
         }
         Ok(())
     }
@@ -435,9 +482,14 @@ impl Server {
                     // Restoration replays declarations through AIR and the
                     // solver, so it is timed apart from the check itself.
                     let restore_start = Instant::now();
-                    journal.restore_prefix(air, prefix)?;
+                    if let Err(error) = journal.restore_prefix(air, prefix) {
+                        return fatal(&mut output, error);
+                    }
                     let restore_ms = restore_start.elapsed().as_millis();
                     let query = &journal.queries[id.0];
+                    // The severity the original invocation would have reported
+                    // this failure at, so a recommends recheck stays a warning.
+                    let level = query.level;
                     set_rlimit(air, query.rlimit);
                     let diagnostics = QueryDiagnostics::default();
                     let start = Instant::now();
@@ -451,16 +503,16 @@ impl Server {
                         ValidityResult::Valid(_) => (QueryResult::Valid, None),
                         ValidityResult::Invalid(_, error, id) => {
                             if let Some(error) = error {
-                                diagnostics.report(&error);
+                                diagnostics.record(&error, level);
                             }
                             (QueryResult::Invalid, id.map(|id| (*id).clone()))
                         }
                         ValidityResult::Canceled => (QueryResult::ResourceLimit, None),
                         ValidityResult::TypeError(error) => {
-                            return Err(io::Error::other(error.to_string()));
+                            return fatal(&mut output, io::Error::other(error.to_string()));
                         }
                         ValidityResult::UnexpectedOutput(error) => {
-                            return Err(io::Error::other(error));
+                            return fatal(&mut output, io::Error::other(error));
                         }
                     };
                     air.finish_query();

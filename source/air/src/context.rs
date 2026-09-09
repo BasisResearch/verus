@@ -251,6 +251,23 @@ impl Context {
         self.smt_process.as_mut().unwrap()
     }
 
+    /// Send everything buffered since the last solver interaction and wait for
+    /// the solver to acknowledge it, returning whatever it printed.
+    ///
+    /// `push`, `pop` and `global` only append to the pipe buffer; the solver
+    /// does not see them until a query flushes it. A caller that needs to
+    /// attribute the cost of those commands separately from the query that
+    /// follows must flush them itself. Returns nothing before the solver has
+    /// started, leaving the buffer intact: an unstarted context has no pending
+    /// work worth launching one for.
+    pub fn flush_commands(&mut self) -> Vec<String> {
+        if self.smt_process.is_none() {
+            return Vec::new();
+        }
+        let smt_data = self.smt_log.take_pipe_data();
+        self.get_smt_process().send_commands(smt_data)
+    }
+
     pub fn set_air_initial_log(&mut self, writer: Box<dyn std::io::Write + Send>) {
         self.air_initial_log.set_log(Some(writer));
     }
