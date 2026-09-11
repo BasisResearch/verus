@@ -111,6 +111,50 @@ impl Emitter {
         }
     }
 
+    /// `(save-instantiations k)`: cvc5 keeps the instantiations of the current
+    /// scope under `k` after it pops.
+    pub fn log_save_instantiations(&mut self, key: &str) {
+        if !self.is_none() {
+            self.log_node(&node!((save-instantiations {Node::Atom(key.to_string())})));
+        }
+    }
+
+    /// `(restore-instantiations k [:only])`: cvc5 replays what `k` saved into
+    /// the current scope, for each quantifier this scope asserts. With
+    /// `:only` no other instantiation happens in that scope.
+    pub fn log_restore_instantiations(&mut self, key: &str, only: bool) {
+        if !self.is_none() {
+            let mut items = vec![
+                Node::Atom("restore-instantiations".to_string()),
+                Node::Atom(key.to_string()),
+            ];
+            if only {
+                items.push(Node::Atom(":only".to_string()));
+            }
+            self.log_node(&Node::List(items));
+        }
+    }
+
+    /// `(export-instantiations k)`: cvc5 replies with an
+    /// `import-instantiations` command carrying what `k` saved.
+    pub fn log_export_instantiations(&mut self, key: &str) {
+        if !self.is_none() {
+            self.log_node(&node!((export-instantiations {Node::Atom(key.to_string())})));
+        }
+    }
+
+    /// Text already in SMT-LIB syntax, sent as is: an imported certificate.
+    pub fn log_raw(&mut self, text: &str) {
+        if let Some(w) = &mut self.pipe_buffer {
+            writeln!(w, "{}", text).unwrap();
+            w.flush().unwrap();
+        }
+        if let Some(w) = &mut self.log {
+            writeln!(w, "{}{}", self.current_indent, text).unwrap();
+            w.flush().unwrap();
+        }
+    }
+
     pub fn log_get_info(&mut self, param: &str) {
         if !self.is_none() {
             self.log_node(&node!(

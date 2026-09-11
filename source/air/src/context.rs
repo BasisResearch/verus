@@ -157,6 +157,18 @@ pub struct Context {
     pub(crate) provenance: bool,
     /// The provenance of the last `check-sat`, until the caller takes it.
     pub(crate) last_provenance: Option<ProvenanceInfo>,
+    /// Whether this solver may save and restore instantiations across
+    /// rechecks of a query (cvc5 only, fixed at launch).
+    pub(crate) instantiation_replay: bool,
+    /// The key under which the next query's scope restores saved
+    /// instantiations, and whether they are the only ones allowed (cvc5
+    /// only).
+    pub(crate) restore_instantiations: Option<(String, bool)>,
+    /// The keys this solver has saved instantiations under.
+    pub(crate) saved_instantiations: HashSet<String>,
+    /// An `import-instantiations` command to send before the next query's
+    /// first `check-sat`, once its declarations are in scope (cvc5 only).
+    pub(crate) import_instantiations: Option<String>,
     variable_versions: VariableVersions,
 }
 
@@ -228,6 +240,10 @@ impl Context {
             anon_axiom_count: 0,
             provenance: false,
             last_provenance: None,
+            instantiation_replay: false,
+            restore_instantiations: None,
+            saved_instantiations: HashSet::new(),
+            import_instantiations: None,
             variable_versions: HashMap::new(),
             solver,
         };
@@ -246,7 +262,12 @@ impl Context {
         if self.smt_process.is_none() {
             let transcript_log = self.smt_transcript_log.take();
             self.smt_process =
-                Some(SmtProcess::launch(&self.solver, transcript_log, self.provenance));
+                Some(SmtProcess::launch(
+                    &self.solver,
+                    transcript_log,
+                    self.provenance,
+                    self.instantiation_replay,
+                ));
         }
         self.smt_process.as_mut().unwrap()
     }
@@ -342,6 +363,63 @@ impl Context {
         assert!(matches!(self.state, ContextState::NotStarted));
         assert!(!enabled || matches!(self.solver, SmtSolver::Cvc5));
         self.provenance = enabled;
+    }
+
+    /// Allow saving and restoring instantiations (cvc5 only; must precede the
+    /// first query). The solver is launched with `--no-fresh-declarations`,
+    /// so a recheck's re-declared constants are the ones its saved
+    /// instantiations mention.
+    pub fn set_instantiation_replay(&mut self, enabled: bool) {
+        assert!(matches!(self.state, ContextState::NotStarted));
+        assert!(!enabled || matches!(self.solver, SmtSolver::Cvc5));
+        self.instantiation_replay = enabled;
+    }
+
+    pub fn instantiation_replay(&self) -> bool {
+        self.instantiation_replay
+    }
+
+    /// Restore the instantiations saved under `key` in the next query's scope
+    /// (cvc5 only). cvc5 replays each saved term vector through its own
+    /// instantiation path, and only for quantifiers that scope asserts, so a
+    /// key that saved nothing, or saved for another query, is harmless. With
+    /// `only`, no other instantiation happens in that scope, so the solver
+    /// answers unsat or unknown from the restored instances alone.
+    pub fn set_restore_instantiations(&mut self, key: Option<String>, only: bool) {
+        assert!(key.is_none() || matches!(self.solver, SmtSolver::Cvc5));
+        self.restore_instantiations = key.map(|key| (key, only));
+    }
+
+    /// Whether this solver has saved instantiations under `key`.
+    pub fn has_saved_instantiations(&self, key: &str) -> bool {
+        self.saved_instantiations.contains(key)
+    }
+
+    /// Send `command`, an `import-instantiations` command another solver
+    /// exported, in the next query's scope just before its first `check-sat`,
+    /// where the query's declarations are in scope (cvc5 only). cvc5 skips an
+    /// entry naming a symbol it has not declared.
+    pub fn set_import_instantiations(&mut self, command: Option<String>) {
+        assert!(command.is_none() || matches!(self.solver, SmtSolver::Cvc5));
+        self.import_instantiations = command;
+    }
+
+    /// Ask the solver for what `key` saved, as an `import-instantiations`
+    /// command, and return its reply lines (cvc5 only). Flushes: call it
+    /// after `save_instantiations` and before `finish_query`.
+    pub fn export_instantiations(&mut self, key: &str) -> Vec<String> {
+        assert!(matches!(self.solver, SmtSolver::Cvc5));
+        self.smt_log.log_export_instantiations(key);
+        self.flush_commands()
+    }
+
+    /// Save the current query's instantiations under `key` before
+    /// `finish_query` pops its scope (cvc5 only). Call only after the solver
+    /// answered the query: cvc5 rejects a save with no result to save from.
+    pub fn save_instantiations(&mut self, key: &str) {
+        assert!(matches!(self.solver, SmtSolver::Cvc5));
+        self.smt_log.log_save_instantiations(key);
+        self.saved_instantiations.insert(key.to_owned());
     }
 
     pub fn set_profile_with_logfile_name(&mut self, file_name: String) {

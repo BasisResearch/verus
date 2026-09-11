@@ -1268,6 +1268,16 @@ impl Verifier {
         if self.args.provenance {
             air_context.set_provenance(true);
         }
+        // Experimental: resident rechecks first try the instantiations the
+        // previous check of the same query made (see resident.rs). Not under
+        // provenance, which describes the ordinary search.
+        if self.args.resident
+            && !self.args.provenance
+            && matches!(self.args.solver, air::context::SmtSolver::Cvc5)
+            && std::env::var_os("VERUS_RESIDENT_INST_REPLAY").is_some()
+        {
+            air_context.set_instantiation_replay(true);
+        }
         air_context.set_ignore_unexpected_smt(self.args.ignore_unexpected_smt);
         air_context.set_debug(self.args.debugger);
         if let Some(profile_file_name) = profile_file_name {

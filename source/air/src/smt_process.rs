@@ -110,6 +110,7 @@ impl SmtProcess {
         solver: &SmtSolver,
         transcript_log: Option<Box<dyn std::io::Write + Send>>,
         provenance: bool,
+        instantiation_replay: bool,
     ) -> Self {
         let solver_info = SolverInfo::new(solver);
         let mut args: Vec<&str> = match solver {
@@ -128,6 +129,16 @@ impl SmtProcess {
         if provenance {
             assert!(matches!(solver, SmtSolver::Cvc5));
             args.extend_from_slice(PROVENANCE_ARGS);
+        }
+        if instantiation_replay {
+            assert!(matches!(solver, SmtSolver::Cvc5));
+            // A recheck re-declares the query's local constants. Saved
+            // instantiations apply to them only if each name keeps its node.
+            args.push("--no-fresh-declarations");
+            // With proofs, an unsat check saves only the instantiations its
+            // refutation used. The full set is no certificate: replayed
+            // alone it answered slower than an ordinary recheck.
+            args.push("--produce-proofs");
         }
         let mut child = match std::process::Command::new(solver_info.executable())
             .args(args)

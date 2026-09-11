@@ -131,6 +131,9 @@ pub(crate) struct RetainedBucket {
     queries: Vec<QueryDescription>,
     /// Catalogue ordinal -> original solver and its local query ordinal.
     addresses: Vec<(usize, usize)>,
+    /// Catalogue ordinal -> the name its instantiation certificate is saved
+    /// and exported under, the same for the same query in a later compilation.
+    cert_keys: Vec<String>,
     state: Mutex<Vec<SolverState>>,
     symbols: Option<crate::provenance::Symbols>,
 }
@@ -163,11 +166,24 @@ impl RetainedBucket {
         states.append(&mut spinoffs);
         let mut queries = Vec::new();
         let mut addresses = Vec::new();
+        let mut cert_keys = Vec::new();
+        let mut repeats = std::collections::HashMap::new();
         for (solver, state) in states.iter().enumerate() {
             for (local, query) in state.journal.queries.iter().enumerate() {
+                let function = fun_as_friendly_rust_name(&query.context.fun);
+                let repeat = repeats
+                    .entry(certificate_key(&function, query.kind, &query.context.desc, 0))
+                    .or_insert(0);
+                cert_keys.push(certificate_key(
+                    &function,
+                    query.kind,
+                    &query.context.desc,
+                    *repeat,
+                ));
+                *repeat += 1;
                 queries.push(QueryDescription {
                     id: QueryId(queries.len()),
-                    function: fun_as_friendly_rust_name(&query.context.fun),
+                    function,
                     description: query.context.desc.clone(),
                     kind: query.kind,
                     prover: match query.prover {
@@ -181,7 +197,42 @@ impl RetainedBucket {
                 addresses.push((solver, local));
             }
         }
-        Self { id, queries, addresses, state: Mutex::new(states), symbols }
+        Self { id, queries, addresses, cert_keys, state: Mutex::new(states), symbols }
+    }
+}
+
+/// The name a query's instantiation certificate goes by: FNV-1a over its
+/// function, kind and description, and its position among the queries that
+/// share all three. Spans are left out, so an edit elsewhere in the crate, or
+/// in the function's own body, keeps the name.
+fn certificate_key(function: &str, kind: QueryKind, description: &str, repeat: usize) -> String {
+    let kind = serde_json::to_string(&kind).unwrap_or_default();
+    let repeat = repeat.to_string();
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for part in [function, kind.as_str(), description, repeat.as_str()] {
+        for byte in part.bytes().chain(std::iter::once(0)) {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    format!("c{hash:016x}")
+}
+
+/// Export what `key` saved to `<dir>/<key>.smt2`, where a later session's
+/// solver can import it. Written beside and renamed into place, so a reader
+/// never sees half a file; a failure only costs a later session its
+/// certificate.
+fn write_certificate(air: &mut Context, dir: &std::path::Path, key: &str) {
+    let lines = air.export_instantiations(key);
+    if lines.iter().any(|line| line.starts_with("(error")) {
+        return;
+    }
+    let text: Vec<&str> =
+        lines.iter().map(String::as_str).filter(|line| !line.starts_with(';')).collect();
+    let path = dir.join(format!("{key}.smt2"));
+    let partial = dir.join(format!("{key}.smt2.partial"));
+    if std::fs::write(&partial, text.join("\n")).is_ok() {
+        let _ = std::fs::rename(&partial, &path);
     }
 }
 
@@ -539,6 +590,8 @@ impl Server {
             },
         )?;
         let multiple_errors = self.info.multiple_errors;
+        // Where certificates outlive this session, if replay is on.
+        let cert_dir = std::env::var_os("VERUS_RESIDENT_INST_DIR").map(std::path::PathBuf::from);
         loop {
             // A framing failure closes the session. Never interpret a suffix of
             // an oversized request as a second request. Say so before closing:
@@ -623,14 +676,62 @@ impl Server {
                     // this failure at, so a recommends recheck stays a warning.
                     let level = query.level;
                     set_rlimit(air, query.rlimit);
+                    // With replay on, each check saves its instantiations
+                    // under the query's certificate key.
+                    let replay_key =
+                        air.instantiation_replay().then(|| bucket.cert_keys[id.0].clone());
                     let diagnostics = QueryDiagnostics::default();
                     let start = Instant::now();
-                    let mut outcome = air.check_valid(
-                        &VirMessageInterface {},
-                        &diagnostics,
-                        &query.query,
-                        QueryContext::default(),
-                    );
+                    // Certificate first: once this query has saved
+                    // instantiations, here or in an earlier session's
+                    // exported certificate, check with them alone. `:only`
+                    // lets no strategy run, so the solver answers from the
+                    // replayed instances, each an instance of a formula this
+                    // scope asserts, and a valid answer is sound. Any other
+                    // answer is discarded, with its diagnostics, before the
+                    // ordinary check.
+                    let mut certified = None;
+                    let certificate = replay_key.as_ref().and_then(|key| {
+                        if air.has_saved_instantiations(key) {
+                            return Some((key.clone(), None));
+                        }
+                        let path = cert_dir.as_ref()?.join(format!("{key}.smt2"));
+                        std::fs::read_to_string(path).ok().map(|text| (key.clone(), Some(text)))
+                    });
+                    if let Some((key, import)) = certificate {
+                        air.set_restore_instantiations(Some(key), true);
+                        air.set_import_instantiations(import);
+                        let attempt = air.check_valid(
+                            &VirMessageInterface {},
+                            &QueryDiagnostics::default(),
+                            &query.query,
+                            QueryContext::default(),
+                        );
+                        air.set_restore_instantiations(None, false);
+                        air.set_import_instantiations(None);
+                        drop(air.take_provenance());
+                        match attempt {
+                            ValidityResult::Valid(usage) => {
+                                certified = Some(ValidityResult::Valid(usage))
+                            }
+                            ValidityResult::TypeError(error) => {
+                                return fatal(&mut output, io::Error::other(error.to_string()));
+                            }
+                            ValidityResult::UnexpectedOutput(error) => {
+                                return fatal(&mut output, io::Error::other(error));
+                            }
+                            _ => air.finish_query(),
+                        }
+                    }
+                    let mut outcome = match certified {
+                        Some(outcome) => outcome,
+                        None => air.check_valid(
+                            &VirMessageInterface {},
+                            &diagnostics,
+                            &query.query,
+                            QueryContext::default(),
+                        ),
+                    };
                     // The response describes round zero. Later error searches
                     // replace AIR's provenance, even when their verdict differs.
                     let first_provenance = air.take_provenance();
@@ -767,6 +868,14 @@ impl Server {
                             )
                         })
                     });
+                    // Every path here came from a solver answer, so the save
+                    // has a result to read from.
+                    if let Some(key) = &replay_key {
+                        air.save_instantiations(key);
+                        if let Some(dir) = &cert_dir {
+                            write_certificate(air, dir, key);
+                        }
+                    }
                     air.finish_query();
                     send(
                         &mut output,

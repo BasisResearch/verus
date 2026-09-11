@@ -273,6 +273,10 @@ pub(crate) fn smt_check_assertion<'ctx>(
         }
     }
 
+    // Only the query's first check imports: later rounds share its scope.
+    if let Some(command) = context.import_instantiations.take() {
+        context.smt_log.log_raw(&command);
+    }
     context.smt_log.log_word("check-sat");
     if context.provenance {
         // in the same batch: the tag lists arrive after the result and the
@@ -649,6 +653,9 @@ pub(crate) fn smt_check_query<'ctx>(
     if !context.single_check_query {
         context.smt_log.log_push();
         context.push_name_scope();
+        if let Some((key, only)) = &context.restore_instantiations {
+            context.smt_log.log_restore_instantiations(key, *only);
+        }
     }
 
     let rlimit_count_1 = if matches!(context.solver, SmtSolver::Z3) {
