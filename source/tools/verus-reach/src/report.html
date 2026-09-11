@@ -61,6 +61,12 @@ header .meta dd { margin: 0; overflow-wrap: anywhere; }
 .tile .v { font-size: 1.7rem; font-weight: 500; line-height: 1.1; }
 .tile .s { font-size: 0.82rem; color: var(--muted); }
 .tile .v.hi { color: var(--good); } .tile .v.med { color: var(--warn); } .tile .v.lo { color: var(--bad); }
+.scope { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; font-size: 0.85rem; }
+.scope .seg { display: inline-flex; border: 1px solid var(--line); border-radius: 5px; overflow: hidden; }
+.scope button { font: inherit; font-size: 0.82rem; padding: 4px 12px; border: 0; background: var(--surface); color: var(--ink); cursor: pointer; }
+.scope button + button { border-left: 1px solid var(--line); }
+.scope button[aria-pressed="true"] { background: var(--accent); color: var(--accent-ink); }
+.scope button:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
 .legend { display: flex; flex-wrap: wrap; gap: 8px 18px; font-size: 0.82rem; color: var(--muted); }
 .legend span::before { content: ""; display: inline-block; width: 12px; height: 12px; border-radius: 2px; margin-right: 6px; vertical-align: -1px; border: 1px solid var(--line); }
 .legend .vr::before { background: var(--good-bg); border-color: var(--good); }
@@ -137,7 +143,16 @@ table.cov tbody tr:hover td { background: color-mix(in srgb, var(--accent) 6%, t
   var STATE_LABEL = { vr: "verified, reachable", vd: "verified, dead", ur: "reachable, unverified", uu: "unreachable, unverified" };
   var STATE_ORDER = { vd: 0, ur: 1, vr: 2, uu: 3 };
 
-  function stats(fns) {
+  // What the counts range over: every function, or exec functions only.
+  // Reachability itself never changes: spec and proof functions still carry
+  // the edges the tool followed; they just leave the numerators and
+  // denominators.
+  var scope = "all";
+  try { scope = localStorage.getItem("verus-reach-scope") === "exec" ? "exec" : "all"; } catch (e) {}
+  function inScope(f) { return scope === "all" || f.mode === "exec"; }
+
+  function stats(all) {
+    var fns = all.filter(inScope);
     var s = { verified: 0, vreach: 0, reach: 0, fns: fns.length, exec: [0, 0], spec: [0, 0], proof: [0, 0] };
     fns.forEach(function (f) {
       if (f.reachable) s.reach++;
@@ -148,18 +163,22 @@ table.cov tbody tr:hover td { background: color-mix(in srgb, var(--accent) 6%, t
         if (m) { m[1]++; if (f.reachable) m[0]++; }
       }
     });
-    s.cov = pct(s.vreach, s.verified);
-    s.dead = s.verified ? 100 - s.cov : null;
+    s.dead = pct(s.verified - s.vreach, s.verified);
     s.share = pct(s.vreach, s.reach);
     s.all = pct(s.vreach, s.fns);
     return s;
   }
 
-  var FILES = (DATA.files || [DATA.file]).map(function (f) {
-    return { path: f.path, href: f.href, functions: f.functions, source: f.source, s: stats(f.functions) };
-  });
-  var TOTAL = DATA.total ? DATA.total : stats([].concat.apply([], FILES.map(function (f) { return f.functions; })));
-  var VERIFIED_FILES = FILES.filter(function (f) { return f.s.verified > 0; });
+  var FILES, TOTAL, VERIFIED_FILES;
+  function compute() {
+    FILES = (DATA.files || [DATA.file]).map(function (f) {
+      return { path: f.path, href: f.href, functions: f.functions, source: f.source, s: stats(f.functions) };
+    });
+    var totals = DATA.totals || null;
+    TOTAL = totals ? totals[scope] : stats([].concat.apply([], FILES.map(function (f) { return f.functions; })));
+    VERIFIED_FILES = FILES.filter(function (f) { return f.s.verified > 0; });
+  }
+  compute();
 
   // ---- rendering helpers
   function barCell(p, cls, a, b) {
@@ -224,7 +243,7 @@ table.cov tbody tr:hover td { background: color-mix(in srgb, var(--accent) 6%, t
   }
 
   function header() {
-    var modes = ["exec", "spec", "proof"].map(function (m) {
+    var modes = (scope === "all" ? ["exec", "spec", "proof"] : ["exec"]).map(function (m) {
       return m + " " + (TOTAL[m][1] - TOTAL[m][0]) + "/" + TOTAL[m][1];
     }).join(" · ");
     var roots = DATA.roots.length > 6 ? DATA.roots.length + " functions" : DATA.roots.join(", ");
@@ -232,6 +251,10 @@ table.cov tbody tr:hover td { background: color-mix(in srgb, var(--accent) 6%, t
       '<dt>Crates</dt><dd>' + esc(DATA.crates.join(", ")) + '</dd>' +
       '<dt>Roots</dt><dd class="mono">' + esc(roots) + '</dd>' +
       '<dt>Sources</dt><dd class="mono">' + esc(DATA.src_root) + '</dd></dl></header>';
+    h += '<div class="scope"><span class="label">Counting</span><span class="seg">' +
+      '<button type="button" id="scope-all" data-scope="all" aria-pressed="' + (scope === "all") + '">exec + ghost</button>' +
+      '<button type="button" id="scope-exec" data-scope="exec" aria-pressed="' + (scope === "exec") + '">exec only</button></span>' +
+      '<span class="muted">' + (scope === "all" ? "spec and proof functions count as verified code" : "spec and proof functions are left out of every count; reachability is unchanged") + '</span></div>';
     h += '<div class="tiles">' +
       tile("Dead verified", TOTAL.dead, bandInv(TOTAL.dead), (TOTAL.verified - TOTAL.vreach) + " of " + TOTAL.verified + " verified functions nothing reaches · " + modes) +
       tile("Verified share of reachable code", TOTAL.share, band(TOTAL.share), TOTAL.vreach + " of " + TOTAL.reach + " reachable functions are verified") +
@@ -353,6 +376,14 @@ table.cov tbody tr:hover td { background: color-mix(in srgb, var(--accent) 6%, t
   }
   function render() {
     document.getElementById("app").innerHTML = header() + (DATA.page === "file" ? viewFile() : viewFiles());
+    document.querySelectorAll("button[data-scope]").forEach(function (b) {
+      b.addEventListener("click", function () {
+        scope = b.getAttribute("data-scope");
+        try { localStorage.setItem("verus-reach-scope", scope); } catch (e) {}
+        compute();
+        render();
+      });
+    });
     document.querySelectorAll("th[data-key]").forEach(function (th) {
       var go = function () {
         var k = th.getAttribute("data-key");
