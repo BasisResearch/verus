@@ -13,6 +13,7 @@
   --good: #2e7d4f; --good-bg: #dff0e5; --warn: #b7791f; --warn-bg: #f6ead2;
   --bad: #b93a32; --bad-bg: #f6dfdd; --unv: #3d63b8; --unv-bg: #dfe6f6;
   --gutter: #f0f3f1;
+  --kw: #7a3e9d; --vk: #1f6f8b; --str: #9a4b1e; --com: #7a8580; --num: #1d5fa5; --attr: #8a6d1f; --mac: #a04a2f; --ty: #2f5f8f; --lt: #a04a2f;
   color-scheme: light;
 }
 @media (prefers-color-scheme: dark) {
@@ -22,6 +23,7 @@
     --good: #5fc084; --good-bg: #1d3b2a; --warn: #e0a84a; --warn-bg: #3f3117;
     --bad: #ee7a70; --bad-bg: #44231f; --unv: #86a4ee; --unv-bg: #22304f;
     --gutter: #161d1a;
+    --kw: #c792ea; --vk: #6fc3dc; --str: #e6a06b; --com: #7f8c86; --num: #82aaff; --attr: #d6c27a; --mac: #f0917f; --ty: #89b4e8; --lt: #f0917f;
     color-scheme: dark;
   }
 }
@@ -31,6 +33,7 @@
   --good: #5fc084; --good-bg: #1d3b2a; --warn: #e0a84a; --warn-bg: #3f3117;
   --bad: #ee7a70; --bad-bg: #44231f; --unv: #86a4ee; --unv-bg: #22304f;
   --gutter: #161d1a;
+  --kw: #c792ea; --vk: #6fc3dc; --str: #e6a06b; --com: #7f8c86; --num: #82aaff; --attr: #d6c27a; --mac: #f0917f; --ty: #89b4e8; --lt: #f0917f;
   color-scheme: dark;
 }
 * { box-sizing: border-box; }
@@ -71,20 +74,23 @@ nav.crumbs .here { font-weight: 600; }
 .tablewrap { overflow-x: auto; }
 table.cov { width: 100%; border-collapse: collapse; font-size: 0.88rem; }
 table.cov th, table.cov td { padding: 7px 12px; text-align: left; border-bottom: 1px solid var(--line); white-space: nowrap; vertical-align: middle; }
+table.cov th + th, table.cov td + td { border-left: 1px solid var(--line); }
 table.cov th { font-size: 0.72rem; letter-spacing: 0.05em; text-transform: uppercase; color: var(--muted); font-weight: 500; background: var(--gutter); cursor: pointer; user-select: none; }
 table.cov th.sorted { color: var(--ink); }
 table.cov th .dir { font-size: 0.65rem; margin-left: 4px; }
 table.cov td.num, table.cov th.num { text-align: right; }
-table.cov tr.total td { font-weight: 600; background: var(--gutter); }
+table.cov td.metric, table.cov th.metric { text-align: left; width: 1%; }
+table.cov tfoot td { font-weight: 600; background: var(--gutter); border-top: 2px solid var(--line); }
+table.cov tbody tr:nth-child(even) td { background: color-mix(in srgb, var(--gutter) 50%, transparent); }
 table.cov td.name { width: 100%; white-space: normal; overflow-wrap: anywhere; }
 table.cov tbody tr:hover td { background: color-mix(in srgb, var(--accent) 6%, transparent); }
-.cell { display: flex; align-items: center; gap: 10px; justify-content: flex-end; }
-.bar { width: 110px; height: 9px; background: var(--line); border-radius: 2px; overflow: hidden; flex: none; }
+.cell { display: grid; grid-template-columns: 96px 4.5ch 10ch; align-items: center; gap: 10px; }
+.bar { width: 96px; height: 9px; background: var(--line); border-radius: 2px; overflow: hidden; }
 .bar i { display: block; height: 100%; background: var(--muted); }
 .bar i.hi { background: var(--good); } .bar i.med { background: var(--warn); } .bar i.lo { background: var(--bad); }
-.pct { min-width: 3.5ch; text-align: right; }
+.pct { text-align: right; }
 .pct.hi { color: var(--good); } .pct.med { color: var(--warn); } .pct.lo { color: var(--bad); }
-.frac { color: var(--muted); font-size: 0.8rem; min-width: 8ch; text-align: right; }
+.frac { color: var(--muted); font-size: 0.8rem; text-align: right; }
 .state { display: inline-block; padding: 1px 7px; border-radius: 3px; font-size: 0.75rem; font-weight: 500; border: 1px solid var(--line); }
 .state.vr { background: var(--good-bg); color: var(--good); border-color: transparent; }
 .state.vd { background: var(--bad-bg); color: var(--bad); border-color: transparent; }
@@ -101,9 +107,12 @@ table.cov tbody tr:hover td { background: color-mix(in srgb, var(--accent) 6%, t
 .section { display: flex; flex-direction: column; gap: 10px; }
 .section-head { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; flex-wrap: wrap; }
 .note { font-size: 0.85rem; color: var(--muted); }
+.t-kw { color: var(--kw); } .t-vk { color: var(--vk); font-weight: 500; } .t-str { color: var(--str); } .t-com { color: var(--com); font-style: italic; }
+.t-num { color: var(--num); } .t-attr { color: var(--attr); } .t-mac { color: var(--mac); } .t-ty { color: var(--ty); } .t-lt { color: var(--lt); }
 @media (max-width: 640px) {
   body { padding-inline: 16px; }
-  .bar { width: 70px; }
+  .cell { grid-template-columns: 60px 4.5ch 10ch; }
+  .bar { width: 60px; }
   header .meta { grid-template-columns: 1fr; }
 }
 @media (prefers-reduced-motion: no-preference) { .bar i { transition: width 240ms ease-out; } }
@@ -169,27 +178,20 @@ table.cov tbody tr:hover td { background: color-mix(in srgb, var(--accent) 6%, t
   }
 
   // ---- rendering helpers
-  function barCell(p, a, b) {
-    var cls = band(p);
+  function barCell(p, cls, a, b) {
     return '<div class="cell"><span class="bar"><i class="' + cls + '" style="width:' + (p === null ? 0 : p) + '%"></i></span>' +
       '<span class="pct ' + cls + '">' + (p === null ? "–" : p + "%") + '</span>' +
       '<span class="frac">' + a + " / " + b + '</span></div>';
   }
-  function deadCell(p) {
-    var cls = bandInv(p);
-    return '<span class="pct ' + cls + '">' + (p === null ? "–" : p + "%") + '</span>';
-  }
 
   var COLS = [
-    { key: "name", label: "Name", cls: "name" },
-    { key: "cov", label: "Verified reachable", title: "reachable verified / verified", num: true,
-      cell: function (s) { return barCell(s.cov, s.vreach, s.verified); } },
-    { key: "dead", label: "Dead verified", title: "unreachable verified / verified", num: true,
-      cell: function (s) { return deadCell(s.dead); } },
-    { key: "share", label: "Verified share", title: "reachable verified / reachable", num: true,
-      cell: function (s) { return barCell(s.share, s.vreach, s.reach); } },
-    { key: "loc", label: "Verified LoC reachable", title: "lines of reachable verified functions / lines of verified functions", num: true,
-      cell: function (s) { return barCell(s.loc, s.vreachloc, s.vloc); } },
+    { key: "name", label: "Name" },
+    { key: "dead", label: "Dead verified", title: "verified functions nothing reaches / verified functions", metric: true,
+      cell: function (s) { return barCell(s.dead, bandInv(s.dead), s.verified - s.vreach, s.verified); } },
+    { key: "share", label: "Verified share", title: "reachable verified functions / reachable functions", metric: true,
+      cell: function (s) { return barCell(s.share, band(s.share), s.vreach, s.reach); } },
+    { key: "loc", label: "Verified LoC reachable", title: "lines of reachable verified functions / lines of verified functions", metric: true,
+      cell: function (s) { return barCell(s.loc, band(s.loc), s.vreachloc, s.vloc); } },
     { key: "fns", label: "Functions", num: true, cell: function (s) { return s.fns; } }
   ];
 
@@ -206,22 +208,22 @@ table.cov tbody tr:hover td { background: color-mix(in srgb, var(--accent) 6%, t
 
   function table(rows, link) {
     var h = '<div class="panel"><div class="tablewrap"><table class="cov"><thead><tr>';
+    var cls = function (c) { return (c.num ? "num " : c.metric ? "metric " : "name "); };
     COLS.forEach(function (c) {
       var sorted = sort.key === c.key;
-      h += '<th tabindex="0" data-key="' + c.key + '" class="' + (c.num ? "num " : "") + (sorted ? "sorted" : "") + '"' +
+      h += '<th tabindex="0" data-key="' + c.key + '" class="' + cls(c) + (sorted ? "sorted" : "") + '"' +
         (c.title ? ' title="' + esc(c.title) + '"' : "") + '>' + c.label +
         (sorted ? '<span class="dir">' + (sort.dir > 0 ? "▲" : "▼") + '</span>' : "") + '</th>';
     });
     h += '</tr></thead><tbody>';
-    h += '<tr class="total"><td class="name">Total</td>';
-    COLS.slice(1).forEach(function (c) { h += '<td class="num">' + c.cell(TOTAL) + '</td>'; });
-    h += '</tr>';
     sortRows(rows).forEach(function (r) {
       h += '<tr><td class="name"><a href="' + link(r) + '">' + esc(r.name) + '</a></td>';
-      COLS.slice(1).forEach(function (c) { h += '<td class="num">' + c.cell(r.s) + '</td>'; });
+      COLS.slice(1).forEach(function (c) { h += '<td class="' + cls(c) + '">' + c.cell(r.s) + '</td>'; });
       h += '</tr>';
     });
-    return h + '</tbody></table></div></div>';
+    h += '</tbody><tfoot><tr><td class="name">Total</td>';
+    COLS.slice(1).forEach(function (c) { h += '<td class="' + cls(c) + '">' + c.cell(TOTAL) + '</td>'; });
+    return h + '</tr></tfoot></table></div></div>';
   }
 
   function crumbs(parts) {
@@ -235,7 +237,7 @@ table.cov tbody tr:hover td { background: color-mix(in srgb, var(--accent) 6%, t
 
   function header() {
     var modes = ["exec", "spec", "proof"].map(function (m) {
-      return m + " " + TOTAL[m][0] + "/" + TOTAL[m][1];
+      return m + " " + (TOTAL[m][1] - TOTAL[m][0]) + "/" + TOTAL[m][1];
     }).join(" · ");
     var roots = DATA.roots.length > 6 ? DATA.roots.length + " functions" : DATA.roots.join(", ");
     var h = '<header><h1>' + esc(DATA.title) + '</h1><dl class="meta">' +
@@ -243,8 +245,7 @@ table.cov tbody tr:hover td { background: color-mix(in srgb, var(--accent) 6%, t
       '<dt>Roots</dt><dd class="mono">' + esc(roots) + '</dd>' +
       '<dt>Sources</dt><dd class="mono">' + esc(DATA.src_root) + '</dd></dl></header>';
     h += '<div class="tiles">' +
-      tile("Verified reachable", TOTAL.cov, band(TOTAL.cov), TOTAL.vreach + " of " + TOTAL.verified + " verified functions · " + modes) +
-      tile("Dead verified", TOTAL.dead, bandInv(TOTAL.dead), (TOTAL.verified - TOTAL.vreach) + " verified functions nothing reaches") +
+      tile("Dead verified", TOTAL.dead, bandInv(TOTAL.dead), (TOTAL.verified - TOTAL.vreach) + " of " + TOTAL.verified + " verified functions nothing reaches · " + modes) +
       tile("Verified share of reachable code", TOTAL.share, band(TOTAL.share), TOTAL.vreach + " of " + TOTAL.reach + " reachable functions are verified") +
       tile("Verified LoC reachable", TOTAL.loc, band(TOTAL.loc), TOTAL.vreachloc + " of " + TOTAL.vloc + " lines, proof blocks included") +
       '</div>';
@@ -304,12 +305,68 @@ table.cov tbody tr:hover td { background: color-mix(in srgb, var(--accent) 6%, t
       for (var l = fn.start; l <= fn.end && l <= lines.length; l++) if (!mark[l]) mark[l] = fn;
     });
     h += '<div class="section"><div class="section-head"><h2>Source</h2><span class="note">' + lines.length + ' lines</span></div><div class="panel src">';
+    var hl = { block: false, str: false, raw: null };
     lines.forEach(function (text, i) {
       var n = i + 1, fn = mark[n], st = fn ? state(fn) : "";
       h += '<div class="ln ' + st + '" id="L' + n + '"' + (fn ? ' title="' + esc(fn.name) + ": " + STATE_LABEL[st] + '"' : "") + '>' +
-        '<span class="n">' + n + '</span><span class="c">' + esc(text) + '</span></div>';
+        '<span class="n">' + n + '</span><span class="c">' + highlight(text, hl) + '</span></div>';
     });
     return h + '</div></div>';
+  }
+  // ---- Rust and Verus syntax, one line at a time; `st` carries block
+  // comments and strings that continue onto the next line
+  var RUST_KW = {};
+  ("as async await break const continue crate dyn else enum extern false fn for if impl in let loop match mod move mut " +
+   "pub ref return self Self static struct super trait true type unsafe use where while").split(" ").forEach(function (k) { RUST_KW[k] = 1; });
+  var VERUS_KW = {};
+  ("spec proof exec requires ensures recommends returns invariant invariant_except_break decreases assert assume forall exists " +
+   "choose ghost tracked broadcast by implies opens_invariants no_unwind int nat via trigger calc axiom uninterp reveal hide " +
+   "invariant_ensures default_ensures unwind").split(" ").forEach(function (k) { VERUS_KW[k] = 1; });
+  function tok(cls, text) { return '<span class="t-' + cls + '">' + esc(text) + '</span>'; }
+  function highlight(line, st) {
+    var out = "", i = 0, m, rest;
+    while (i < line.length) {
+      rest = line.slice(i);
+      if (st.block) {
+        var e = rest.indexOf("*/");
+        if (e < 0) { out += tok("com", rest); break; }
+        out += tok("com", rest.slice(0, e + 2)); i += e + 2; st.block = false; continue;
+      }
+      if (st.raw !== null) {
+        var close = rest.indexOf('"' + st.raw);
+        if (close < 0) { out += tok("str", rest); break; }
+        out += tok("str", rest.slice(0, close + 1 + st.raw.length)); i += close + 1 + st.raw.length; st.raw = null; continue;
+      }
+      if (st.str) {
+        m = /^(?:[^"\\]|\\.)*"/.exec(rest);
+        if (!m) { out += tok("str", rest); break; }
+        out += tok("str", m[0]); i += m[0].length; st.str = false; continue;
+      }
+      if (rest.slice(0, 2) === "//") { out += tok("com", rest); break; }
+      if (rest.slice(0, 2) === "/*") { st.block = true; continue; }
+      if ((m = /^b?r(#*)"/.exec(rest))) { st.raw = m[1]; out += tok("str", m[0]); i += m[0].length; continue; }
+      if ((m = /^b?"(?:[^"\\]|\\.)*"/.exec(rest))) { out += tok("str", m[0]); i += m[0].length; continue; }
+      if ((m = /^b?"/.exec(rest))) { st.str = true; out += tok("str", m[0]); i += m[0].length; continue; }
+      if ((m = /^b?'(?:[^'\\]|\\.)'/.exec(rest))) { out += tok("str", m[0]); i += m[0].length; continue; }
+      if ((m = /^'[A-Za-z_][A-Za-z0-9_]*/.exec(rest))) { out += tok("lt", m[0]); i += m[0].length; continue; }
+      if ((m = /^#!?\[[^\]]*\]?/.exec(rest))) { out += tok("attr", m[0]); i += m[0].length; continue; }
+      if ((m = /^(?:0x[0-9a-fA-F_]+|0b[01_]+|0o[0-7_]+|\d[\d_]*(?:\.\d[\d_]*)?(?:[eE][+-]?\d+)?)(?:[iu](?:8|16|32|64|128|size)|f32|f64|int|nat)?/.exec(rest))) {
+        out += tok("num", m[0]); i += m[0].length; continue;
+      }
+      if ((m = /^(open|closed)(?=\s+(?:spec|proof|exec)\b)/.exec(rest))) { out += tok("vk", m[0]); i += m[0].length; continue; }
+      if ((m = /^[A-Za-z_][A-Za-z0-9_]*!?/.exec(rest))) {
+        var w = m[0];
+        if (w.slice(-1) === "!") out += tok("mac", w);
+        else if (RUST_KW[w]) out += tok("kw", w);
+        else if (VERUS_KW[w]) out += tok("vk", w);
+        else if (/^[A-Z]/.test(w)) out += tok("ty", w);
+        else out += esc(w);
+        i += w.length; continue;
+      }
+      if ((m = /^(?:==>|<==>|=~=|=~~=|&&&|\|\|\|)/.exec(rest))) { out += tok("vk", m[0]); i += m[0].length; continue; }
+      out += esc(rest[0]); i++;
+    }
+    return out;
   }
   function notFound(what) { return crumbs([{ label: "All directories", href: "#/" }]) + '<p class="note">No such entry: ' + esc(what) + '</p>'; }
 
