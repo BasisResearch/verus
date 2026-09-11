@@ -3,10 +3,10 @@
 //!   verus-reach DIR...            text summary
 //!   verus-reach --lcov DIR...     LCOV, for grcov, genhtml, Codecov, IDE gutters
 //!   verus-reach --html DIR...     a self-contained page like genhtml's:
-//!                                 directories, files, and sources, rated
-//!                                 by the share of verified functions
-//!                                 nothing reaches and the share of
-//!                                 reachable functions that are verified
+//!                                 the files with verified code and their
+//!                                 sources, rated by the share of verified
+//!                                 functions nothing reaches and the share
+//!                                 of reachable functions that are verified
 //!
 //! Pass every crate's report (a directory of them, or files) so that calls
 //! across crates are followed.
