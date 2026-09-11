@@ -15,10 +15,12 @@ const TEMPLATE: &str = include_str!("report.html");
 /// read from `src`, the directory the crate was compiled from (paths in the
 /// reports are relative to it); a file that is not there gets no source
 /// view. Proxies are left out: an `assume_specification` stands for another
-/// function's spec and is not code.
+/// function's spec and is not code. So are the helpers `reveal` synthesizes,
+/// which the user never wrote.
 pub fn data(reports: &[Report], graph: &Graph, src: &Path, title: &str) -> Value {
     let mut files: BTreeMap<&str, Vec<Value>> = BTreeMap::new();
-    for n in graph.nodes.values().filter(|n| !n.proxy) {
+    let synthesized = |n: &verus_reach::Node| n.name().ends_with("__VERUS_REVEAL_INTERNAL__");
+    for n in graph.nodes.values().filter(|n| !n.proxy && !synthesized(n)) {
         files.entry(&n.span.file).or_default().push(json!({
             "name": n.name(),
             "path": n.def_path,
