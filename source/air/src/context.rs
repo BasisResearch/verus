@@ -166,6 +166,9 @@ pub struct Context {
     pub(crate) restore_instantiations: Option<(String, bool)>,
     /// The keys this solver has saved instantiations under.
     pub(crate) saved_instantiations: HashSet<String>,
+    /// An `import-instantiations` command to send before the next query's
+    /// first `check-sat`, once its declarations are in scope (cvc5 only).
+    pub(crate) import_instantiations: Option<String>,
     variable_versions: VariableVersions,
 }
 
@@ -240,6 +243,7 @@ impl Context {
             instantiation_replay: false,
             restore_instantiations: None,
             saved_instantiations: HashSet::new(),
+            import_instantiations: None,
             variable_versions: HashMap::new(),
             solver,
         };
@@ -389,6 +393,24 @@ impl Context {
     /// Whether this solver has saved instantiations under `key`.
     pub fn has_saved_instantiations(&self, key: &str) -> bool {
         self.saved_instantiations.contains(key)
+    }
+
+    /// Send `command`, an `import-instantiations` command another solver
+    /// exported, in the next query's scope just before its first `check-sat`,
+    /// where the query's declarations are in scope (cvc5 only). cvc5 skips an
+    /// entry naming a symbol it has not declared.
+    pub fn set_import_instantiations(&mut self, command: Option<String>) {
+        assert!(command.is_none() || matches!(self.solver, SmtSolver::Cvc5));
+        self.import_instantiations = command;
+    }
+
+    /// Ask the solver for what `key` saved, as an `import-instantiations`
+    /// command, and return its reply lines (cvc5 only). Flushes: call it
+    /// after `save_instantiations` and before `finish_query`.
+    pub fn export_instantiations(&mut self, key: &str) -> Vec<String> {
+        assert!(matches!(self.solver, SmtSolver::Cvc5));
+        self.smt_log.log_export_instantiations(key);
+        self.flush_commands()
     }
 
     /// Save the current query's instantiations under `key` before

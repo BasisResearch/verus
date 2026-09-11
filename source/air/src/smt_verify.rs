@@ -273,6 +273,10 @@ pub(crate) fn smt_check_assertion<'ctx>(
         }
     }
 
+    // Only the query's first check imports: later rounds share its scope.
+    if let Some(command) = context.import_instantiations.take() {
+        context.smt_log.log_raw(&command);
+    }
     context.smt_log.log_word("check-sat");
     if context.provenance {
         // in the same batch: the tag lists arrive after the result and the

@@ -359,13 +359,58 @@ fn resident_instantiation_replay_keeps_verdicts() {
         let path = entry.unwrap().path();
         if path.extension().is_some_and(|ext| ext == "smt2") {
             let log = fs::read_to_string(path).unwrap();
-            saves += log.matches("(save-instantiations q").count();
+            saves += log.matches("(save-instantiations c").count();
             restores += log.matches(":only)").count();
         }
     }
     // One save per check; a certificate attempt for the three rechecks of a
     // query that had already been checked in this session.
     assert_eq!((saves, restores), (checks.len(), 3));
+}
+
+/// A certificate exported by one session is imported by the next, a fresh
+/// compilation and solver, before its first check of the same query: the
+/// passing query keeps its verdict, and the failing query's certificate does
+/// not turn its failure into a pass.
+#[test]
+#[ignore = "needs a cvc5 with save-instantiations"]
+fn resident_instantiation_certificates_survive_a_new_session() {
+    let certificates = tempfile::tempdir().unwrap();
+    let dir = certificates.path().to_str().unwrap().to_owned();
+    let envs = [("VERUS_RESIDENT_INST_REPLAY", "1"), ("VERUS_RESIDENT_INST_DIR", dir.as_str())];
+    let run = |checks: &[(&str, &str)]| {
+        let mut worker = Worker::start_with_env(SOURCE, &["-V", "no-solver-version-check"], &envs);
+        let ready = worker.receive();
+        assert_eq!(ready["event"], "ready");
+        let session = ready["session"].clone();
+        for (name, expected) in checks {
+            let query = query_id(&ready, name);
+            let result = worker
+                .send(json!({"command": "check", "session": session, "bucket": 0, "query": query}));
+            assert_eq!(result["event"], "checked", "{result}");
+            assert_eq!(result["result"], *expected, "{result}");
+        }
+        assert_eq!(worker.send(json!({"command": "close", "session": session}))["event"], "closed");
+        worker.finish(false);
+        let mut imports = 0;
+        for entry in fs::read_dir(worker.dir.path().join("logs")).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().is_some_and(|ext| ext == "smt2") {
+                imports += fs::read_to_string(path).unwrap().matches("(import-instantiations c").count();
+            }
+        }
+        imports
+    };
+    assert_eq!(run(&[("::passing", "valid"), ("::failing", "invalid")]), 0);
+    let exported: Vec<_> = fs::read_dir(certificates.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .collect();
+    assert_eq!(exported.len(), 2, "{exported:?}");
+    assert!(exported.iter().all(|name| name.starts_with('c') && name.ends_with(".smt2")));
+    // A new session: the solver has saved nothing, so each first check
+    // imports the file the previous session exported.
+    assert_eq!(run(&[("::passing", "valid"), ("::failing", "invalid")]), 2);
 }
 
 /// Each spawned context must survive initial verification and be reused even
