@@ -2,7 +2,7 @@
 //!
 //!   verus-reach DIR...            text summary
 //!   verus-reach --lcov DIR...     LCOV, for grcov, genhtml, Codecov, IDE gutters
-//!   verus-reach --html DIR...     a self-contained page like genhtml's:
+//!   verus-reach --html OUT DIR...  a directory of pages like genhtml's:
 //!                                 the files with verified code and their
 //!                                 sources, rated by the share of verified
 //!                                 functions nothing reaches and the share
@@ -39,9 +39,10 @@ struct Args {
     /// Write an LCOV trace file to stdout instead of the summary
     #[arg(long, conflicts_with = "html")]
     lcov: bool,
-    /// Write a self-contained HTML report to stdout instead of the summary
-    #[arg(long)]
-    html: bool,
+    /// Write an HTML report into this directory (index.html and a page per
+    /// file) instead of printing the summary
+    #[arg(long, value_name = "OUT")]
+    html: Option<PathBuf>,
     /// With --html, the directory the crates were compiled from, where the
     /// source files named by the reports are read for the source views
     #[arg(long, default_value = ".")]
@@ -216,14 +217,13 @@ fn main() {
     } else {
         Only::All
     };
-    let text = if args.lcov {
-        lcov(&graph, only)
-    } else if args.html {
-        html::render(&reports, &graph, &args.src, &args.title)
+    if let Some(out) = &args.html {
+        html::write(&reports, &graph, &args.src, &args.title, out).unwrap_or_else(|e| fail(e));
+        eprintln!("verus-reach: wrote {}", out.join("index.html").display());
     } else {
-        summary(&reports, &graph)
-    };
-    print!("{text}");
+        let text = if args.lcov { lcov(&graph, only) } else { summary(&reports, &graph) };
+        print!("{text}");
+    }
     if let Some(msg) = args.fail_under.and_then(|t| below_threshold(&graph, t)) {
         fail(msg);
     }
