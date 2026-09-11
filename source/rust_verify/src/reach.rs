@@ -266,7 +266,7 @@ impl<'a> Labels<'a> {
 fn node<'tcx>(ctxt: &Context<'tcx>, labels: &Labels, def_id: LocalDefId, id: String) -> Node {
     let tcx = ctxt.tcx;
     let path = vir_path(ctxt, def_id.to_def_id()).expect("path of a named function");
-    let (function, proxy, mut external_body) = match labels.by_name.get(&path) {
+    let (function, mut proxy, mut external_body) = match labels.by_name.get(&path) {
         // The target of an `assume_specification` has a spec but an unchecked body
         Some(f) => (Some(*f), false, f.x.proxy.is_some()),
         None => match labels.by_proxy_path.get(&path) {
@@ -274,6 +274,10 @@ fn node<'tcx>(ctxt: &Context<'tcx>, labels: &Labels, def_id: LocalDefId, id: Str
             None => (None, false, false),
         },
     };
+    // The twin `verus!` gives a `const fn` for its use in spec code (see
+    // `fixup_unerased_proxy_path`) shares the span of the function it
+    // stands for and is not code of its own
+    proxy |= path.last_segment().starts_with("VERUS_UNERASED_PROXY__");
     external_body |= function.map_or(false, |f| f.x.attrs.is_external_body);
     let module = tcx.parent_module_from_def_id(def_id).to_def_id();
     Node {

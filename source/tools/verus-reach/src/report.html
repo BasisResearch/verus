@@ -80,7 +80,7 @@ table.cov th.sorted { color: var(--ink); }
 table.cov th .dir { font-size: 0.65rem; margin-left: 4px; }
 table.cov td.num, table.cov th.num { text-align: right; }
 table.cov td.metric, table.cov th.metric { text-align: left; width: 1%; }
-table.cov tfoot td { font-weight: 600; background: var(--gutter); border-top: 2px solid var(--line); }
+table.cov tfoot td { font-weight: 600; background: var(--gutter); border-top: 2px solid var(--line); white-space: normal; }
 table.cov tbody tr:nth-child(even) td { background: color-mix(in srgb, var(--gutter) 50%, transparent); }
 table.cov td.name { width: 100%; white-space: normal; overflow-wrap: anywhere; }
 table.cov tbody tr:hover td { background: color-mix(in srgb, var(--accent) 6%, transparent); }
@@ -103,7 +103,7 @@ table.cov tbody tr:hover td { background: color-mix(in srgb, var(--accent) 6%, t
 .ln .c { padding-inline: 14px; flex: 1; }
 .ln.vr .c { background: var(--good-bg); } .ln.vd .c { background: var(--bad-bg); } .ln.ur .c { background: var(--unv-bg); }
 .ln.vr .n { box-shadow: inset 3px 0 var(--good); } .ln.vd .n { box-shadow: inset 3px 0 var(--bad); } .ln.ur .n { box-shadow: inset 3px 0 var(--unv); }
-.ln.hit .c { outline: 2px solid var(--accent); outline-offset: -2px; }
+.ln:target .c { outline: 2px solid var(--accent); outline-offset: -2px; }
 .section { display: flex; flex-direction: column; gap: 10px; }
 .section-head { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; flex-wrap: wrap; }
 .note { font-size: 0.85rem; color: var(--muted); }
@@ -155,17 +155,11 @@ table.cov tbody tr:hover td { background: color-mix(in srgb, var(--accent) 6%, t
     return s;
   }
 
-  var FILES = DATA.files.map(function (f) {
-    return { path: f.path, functions: f.functions, source: f.source, s: stats(f.functions) };
+  var FILES = (DATA.files || [DATA.file]).map(function (f) {
+    return { path: f.path, href: f.href, functions: f.functions, source: f.source, s: stats(f.functions) };
   });
-  var FILE_BY_PATH = {};
-  FILES.forEach(function (f) { FILE_BY_PATH[f.path] = f; });
-  var ALL_FNS = [].concat.apply([], FILES.map(function (f) { return f.functions; }));
-  var TOTAL = stats(ALL_FNS);
-  // The listing: files with verified code. The others only hold reachable
-  // unverified code and count toward the project-wide share above the table.
+  var TOTAL = DATA.total ? DATA.total : stats([].concat.apply([], FILES.map(function (f) { return f.functions; })));
   var VERIFIED_FILES = FILES.filter(function (f) { return f.s.verified > 0; });
-  var LISTED = stats([].concat.apply([], VERIFIED_FILES.map(function (f) { return f.functions; })));
 
   // ---- rendering helpers
   function barCell(p, cls, a, b) {
@@ -196,7 +190,7 @@ table.cov tbody tr:hover td { background: color-mix(in srgb, var(--accent) 6%, t
     });
   }
 
-  function table(rows, link, total) {
+  function table(rows, link, total, totalLabel) {
     var h = '<div class="panel"><div class="tablewrap"><table class="cov"><thead><tr>';
     var cls = function (c) { return (c.num ? "num " : c.metric ? "metric " : "name "); };
     COLS.forEach(function (c) {
@@ -213,7 +207,7 @@ table.cov tbody tr:hover td { background: color-mix(in srgb, var(--accent) 6%, t
     });
     h += '</tbody>';
     if (total) {
-      h += '<tfoot><tr><td class="name">Total</td>';
+      h += '<tfoot><tr><td class="name">' + esc(totalLabel) + '</td>';
       COLS.slice(1).forEach(function (c) { h += '<td class="' + cls(c) + '">' + c.cell(total) + '</td>'; });
       h += '</tr></tfoot>';
     }
@@ -240,8 +234,8 @@ table.cov tbody tr:hover td { background: color-mix(in srgb, var(--accent) 6%, t
       '<dt>Sources</dt><dd class="mono">' + esc(DATA.src_root) + '</dd></dl></header>';
     h += '<div class="tiles">' +
       tile("Dead verified", TOTAL.dead, bandInv(TOTAL.dead), (TOTAL.verified - TOTAL.vreach) + " of " + TOTAL.verified + " verified functions nothing reaches · " + modes) +
-      tile("Verified share of reachable code", TOTAL.share, band(TOTAL.share), TOTAL.vreach + " of " + TOTAL.reach + " reachable functions across all " + FILES.length + " files are verified") +
-      tile("Verified reachable of all functions", TOTAL.all, band(TOTAL.all), TOTAL.vreach + " of " + TOTAL.fns + " functions across all " + FILES.length + " files are verified and reachable") +
+      tile("Verified share of reachable code", TOTAL.share, band(TOTAL.share), TOTAL.vreach + " of " + TOTAL.reach + " reachable functions are verified") +
+      tile("Verified reachable of all functions", TOTAL.all, band(TOTAL.all), TOTAL.vreach + " of " + TOTAL.fns + " functions are verified and reachable") +
       '</div>';
     h += '<div class="legend"><span class="vr">verified and reachable</span><span class="vd">verified but nothing reaches it</span>' +
       '<span class="ur">reachable but unverified</span><span class="uu">neither</span>' +
@@ -254,21 +248,19 @@ table.cov tbody tr:hover td { background: color-mix(in srgb, var(--accent) 6%, t
 
   // ---- views
   function viewFiles() {
-    var rows = VERIFIED_FILES.map(function (f) { return { name: f.path, s: f.s, path: f.path }; });
-    var others = FILES.length - VERIFIED_FILES.length;
-    return crumbs([{ label: "Files with verified code" }]) +
-      '<div class="section"><div class="section-head"><h2>Files with verified code</h2><span class="note">' +
-      VERIFIED_FILES.length + ' files, ' + LISTED.verified + ' verified functions' +
-      (others ? '; ' + others + ' other files hold reachable code but nothing verified' : '') + '</span></div>' +
-      table(rows, function (r) { return "#/f/" + encodeURIComponent(r.path); }, LISTED) + '</div>';
+    var rows = VERIFIED_FILES.map(function (f) { return { name: f.path, s: f.s, href: f.href }; });
+    var others = DATA.file_count - VERIFIED_FILES.length;
+    var totalLabel = "Total, all " + DATA.file_count + " files";
+    return '<div class="section"><div class="section-head"><h2>Files with verified code</h2><span class="note">' +
+      VERIFIED_FILES.length + ' of ' + DATA.file_count + ' files' +
+      (others ? '; the other ' + others + ' hold reachable code but nothing verified and count only in the totals' : '') + '</span></div>' +
+      table(rows, function (r) { return encodeURI(r.href); }, TOTAL, totalLabel) + '</div>';
   }
-  function viewFile(path) {
-    var f = FILE_BY_PATH[path];
-    if (!f) return notFound(path);
-    var h = crumbs([{ label: "Files with verified code", href: "#/" }, { label: f.path }]);
+  function viewFile() {
+    var f = FILES[0];
+    var h = crumbs([{ label: "Files with verified code", href: DATA.up + "/index.html" }, { label: f.path }]);
     h += '<div class="section"><div class="section-head"><h2>' + esc(f.path) + '</h2></div>' +
-      table([{ name: f.path, s: f.s }], function () { return "#/f/" + encodeURIComponent(path); }, null) + '</div>';
-
+      table([{ name: f.path, s: f.s, href: "" }], function () { return "#"; }, TOTAL, "Total, all " + DATA.file_count + " files") + '</div>';
     var fns = f.functions.slice().sort(function (a, b) {
       return STATE_ORDER[state(a)] - STATE_ORDER[state(b)] || a.start - b.start;
     });
@@ -276,7 +268,7 @@ table.cov tbody tr:hover td { background: color-mix(in srgb, var(--accent) 6%, t
       '<div class="panel"><div class="tablewrap"><table class="cov"><thead><tr><th>Function</th><th>Mode</th><th class="num">Lines</th><th>State</th></tr></thead><tbody>';
     fns.forEach(function (fn) {
       var st = state(fn);
-      h += '<tr><td class="name mono">' + (f.source ? '<a href="#/f/' + encodeURIComponent(path) + '/L' + fn.start + '">' : '') + esc(fn.name) + (f.source ? '</a>' : '') +
+      h += '<tr><td class="name mono">' + (f.source ? '<a href="#L' + fn.start + '">' : '') + esc(fn.name) + (f.source ? '</a>' : '') +
         ' <span class="mode">' + esc(fn.path) + '</span></td>' +
         '<td><span class="mode">' + esc(fn.mode) + '</span></td>' +
         '<td class="num">' + fn.start + (fn.end > fn.start ? "–" + fn.end : "") + '</td>' +
@@ -291,7 +283,8 @@ table.cov tbody tr:hover td { background: color-mix(in srgb, var(--accent) 6%, t
     var lines = f.source.split("\n");
     if (lines.length && lines[lines.length - 1] === "") lines.pop();
     var mark = new Array(lines.length + 1);
-    f.functions.forEach(function (fn) {
+    var painted = f.functions.slice().sort(function (a, b) { return (b.verified - a.verified) || (b.reachable - a.reachable); });
+    painted.forEach(function (fn) {
       for (var l = fn.start; l <= fn.end && l <= lines.length; l++) if (!mark[l]) mark[l] = fn;
     });
     h += '<div class="section"><div class="section-head"><h2>Source</h2><span class="note">' + lines.length + ' lines</span></div><div class="panel src">';
@@ -358,14 +351,8 @@ table.cov tbody tr:hover td { background: color-mix(in srgb, var(--accent) 6%, t
     }
     return out;
   }
-  function notFound(what) { return crumbs([{ label: "Files with verified code", href: "#/" }]) + '<p class="note">No such file: ' + esc(what) + '</p>'; }
-
   function render() {
-    var hash = location.hash || "#/";
-    var m, body, lineTarget = null;
-    if ((m = /^#\/f\/(.+?)(?:\/L(\d+))?$/.exec(hash))) { body = viewFile(decodeURIComponent(m[1])); lineTarget = m[2]; }
-    else body = viewFiles();
-    document.getElementById("app").innerHTML = header() + body;
+    document.getElementById("app").innerHTML = header() + (DATA.page === "file" ? viewFile() : viewFiles());
     document.querySelectorAll("th[data-key]").forEach(function (th) {
       var go = function () {
         var k = th.getAttribute("data-key");
@@ -375,15 +362,9 @@ table.cov tbody tr:hover td { background: color-mix(in srgb, var(--accent) 6%, t
       th.addEventListener("click", go);
       th.addEventListener("keydown", function (e) { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); go(); } });
     });
-    if (lineTarget) {
-      var el = document.getElementById("L" + lineTarget);
-      if (el) { el.scrollIntoView({ block: "center" }); el.classList.add("hit"); }
-    } else {
-      window.scrollTo(0, 0);
-    }
   }
-  window.addEventListener("hashchange", render);
   render();
+  if (location.hash) { var el = document.getElementById(location.hash.slice(1)); if (el) el.scrollIntoView({ block: "center" }); }
 })();
 </script>
 </body>

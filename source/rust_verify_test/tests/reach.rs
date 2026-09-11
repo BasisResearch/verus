@@ -456,6 +456,33 @@ fn proxies() {
     assert!(!ext.is_verified_exec());
 }
 
+/// `verus!` splits a `const fn` in two: the erased item that runs, and a
+/// `VERUS_UNERASED_PROXY__` twin holding its ghost code, at the same span.
+/// Verus labels the erased item; the twin is not code of its own.
+#[test]
+fn const_fn_twin_is_a_proxy() {
+    let code = verus_code! {
+        const fn is_lt(a: u64, b: u64) -> (r: bool)
+            ensures r == (a < b),
+        {
+            a < b
+        }
+
+        fn main() {
+            let _ = is_lt(1, 2);
+        }
+    };
+    let (result, report) = reach("const_fn_twin", code);
+    result.unwrap();
+    let is_lt = node(&report, "test_crate::is_lt");
+    assert!(is_lt.is_verified_exec(), "{:#?}", is_lt);
+    assert!(graph_from_main(&report).is_reachable(is_lt));
+    let twin = node(&report, "test_crate::VERUS_UNERASED_PROXY__is_lt");
+    assert!(twin.proxy, "{:#?}", twin);
+    assert!(!twin.is_verified_exec());
+    assert_eq!(twin.span.start_line, is_lt.span.start_line);
+}
+
 /// A library crate and a binary crate: the binary's `main` is the root, and
 /// only the library functions it calls are reachable.
 #[test]
