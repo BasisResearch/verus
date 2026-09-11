@@ -151,6 +151,7 @@ table.cov tbody tr:hover td { background: color-mix(in srgb, var(--accent) 6%, t
     s.cov = pct(s.vreach, s.verified);
     s.dead = s.verified ? 100 - s.cov : null;
     s.share = pct(s.vreach, s.reach);
+    s.all = pct(s.vreach, s.fns);
     return s;
   }
 
@@ -179,6 +180,8 @@ table.cov tbody tr:hover td { background: color-mix(in srgb, var(--accent) 6%, t
       cell: function (s) { return barCell(s.dead, bandInv(s.dead), s.verified - s.vreach, s.verified); } },
     { key: "share", label: "Verified share", title: "reachable verified functions / reachable functions", metric: true,
       cell: function (s) { return barCell(s.share, band(s.share), s.vreach, s.reach); } },
+    { key: "all", label: "Verified reachable of all", title: "reachable verified functions / all functions in the file", metric: true,
+      cell: function (s) { return barCell(s.all, band(s.all), s.vreach, s.fns); } },
     { key: "fns", label: "Functions", num: true, cell: function (s) { return s.fns; } }
   ];
 
@@ -238,6 +241,7 @@ table.cov tbody tr:hover td { background: color-mix(in srgb, var(--accent) 6%, t
     h += '<div class="tiles">' +
       tile("Dead verified", TOTAL.dead, bandInv(TOTAL.dead), (TOTAL.verified - TOTAL.vreach) + " of " + TOTAL.verified + " verified functions nothing reaches · " + modes) +
       tile("Verified share of reachable code", TOTAL.share, band(TOTAL.share), TOTAL.vreach + " of " + TOTAL.reach + " reachable functions across all " + FILES.length + " files are verified") +
+      tile("Verified reachable of all functions", TOTAL.all, band(TOTAL.all), TOTAL.vreach + " of " + TOTAL.fns + " functions across all " + FILES.length + " files are verified and reachable") +
       '</div>';
     h += '<div class="legend"><span class="vr">verified and reachable</span><span class="vd">verified but nothing reaches it</span>' +
       '<span class="ur">reachable but unverified</span><span class="uu">neither</span>' +
