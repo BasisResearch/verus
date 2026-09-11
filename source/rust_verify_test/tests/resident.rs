@@ -73,7 +73,11 @@ struct Spawned {
 
 impl Worker<ChildStdin> {
     fn start(source: &str, options: &[&str]) -> Self {
-        let Spawned { mut child, dir, .. } = spawn(source, options, false);
+        Self::start_with_solver(source, options, DEFAULT_SOLVER_WRAPPER)
+    }
+
+    fn start_with_solver(source: &str, options: &[&str], solver_wrapper: &str) -> Self {
+        let Spawned { mut child, dir, .. } = spawn(source, options, false, solver_wrapper);
         let input = child.stdin.take().unwrap();
         let stdout = child.stdout.take().unwrap();
         Self::assemble(child, dir, input, Box::new(stdout))
@@ -82,7 +86,8 @@ impl Worker<ChildStdin> {
 
 impl Worker<UnixStream> {
     fn start_socket(source: &str, options: &[&str]) -> Self {
-        let Spawned { mut child, dir, listener } = spawn(source, options, true);
+        let Spawned { mut child, dir, listener } =
+            spawn(source, options, true, DEFAULT_SOLVER_WRAPPER);
         let stream = accept(listener.expect("socket transport binds a listener"), &mut child, &dir);
         let input = stream.try_clone().unwrap();
         Self::assemble(child, dir, input, Box::new(stream))
@@ -117,7 +122,9 @@ fn accept(listener: UnixListener, child: &mut Child, dir: &TempDir) -> UnixStrea
     }
 }
 
-fn spawn(source: &str, options: &[&str], socket: bool) -> Spawned {
+const DEFAULT_SOLVER_WRAPPER: &str = "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$$\" >> \"$RESIDENT_LAUNCH_LOG\"\nexec \"$RESIDENT_SOLVER\" \"$@\"\n";
+
+fn spawn(source: &str, options: &[&str], socket: bool, solver_wrapper: &str) -> Spawned {
     let dir = tempfile::tempdir().unwrap();
     let socket_path = dir.path().join("worker.sock");
     let listener = socket.then(|| UnixListener::bind(&socket_path).unwrap());
@@ -127,11 +134,7 @@ fn spawn(source: &str, options: &[&str], socket: bool) -> Spawned {
     let solver = PathBuf::from(std::env::var_os("VERUS_CVC5_PATH").expect("cvc5 path"));
     let solver = fs::canonicalize(solver).unwrap();
     let wrapper = dir.path().join("solver.sh");
-    fs::write(
-            &wrapper,
-            "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$$\" >> \"$RESIDENT_LAUNCH_LOG\"\nexec \"$RESIDENT_SOLVER\" \"$@\"\n",
-        )
-        .unwrap();
+    fs::write(&wrapper, solver_wrapper).unwrap();
     fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o700)).unwrap();
     let mut command = Command::new(binary);
     command
@@ -439,6 +442,57 @@ fn resident_provenance_keeps_bucket_symbols_with_and_without_spinoff() {
 }
 
 #[test]
+fn resident_provenance_describes_the_first_error_round() {
+    let source =
+        "use vstd::prelude::*; verus! { proof fn check(x: int) { assert(x > 0); assert(x > 1); } }";
+    // Tag each real solver round in the provenance parser's lossless
+    // `unparsed` field. Ordinary fixtures can yield identical source sets
+    // across rounds, hiding replacement of the first round by the last.
+    let wrapper = r#"#!/bin/sh
+set -eu
+"$RESIDENT_SOLVER" "$@" | awk '
+/^(sat|unsat|unknown)$/ {
+    ++round;
+    print round > (ENVIRON["RESIDENT_LAUNCH_LOG"] ".rounds");
+    close(ENVIRON["RESIDENT_LAUNCH_LOG"] ".rounds");
+    print "resident-round-" round;
+}
+{ print; fflush(); }
+'
+"#;
+    for errors in ["0", "2"] {
+        let mut worker = Worker::start_with_solver(
+            source,
+            &["-V", "provenance", "--multiple-errors", errors],
+            wrapper,
+        );
+        let ready = worker.receive();
+        for _ in 0..2 {
+            let previous: usize = fs::read_to_string(worker.dir.path().join("launches.rounds"))
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap();
+            let checked = worker.send(
+                json!({"command":"check", "session":ready["session"], "bucket":0, "query":0}),
+            );
+            assert_eq!(checked["result"], "invalid");
+            assert_eq!(checked["provenance"]["round"], 0);
+            assert_eq!(
+                checked["provenance"]["unparsed"],
+                json!([format!("resident-round-{}", previous + 1)]),
+                "additional error searches must not replace round-zero provenance"
+            );
+        }
+        assert_eq!(
+            worker.send(json!({"command":"close", "session":ready["session"]}))["event"],
+            "closed"
+        );
+        worker.finish(false);
+    }
+}
+
+#[test]
 fn resident_rejects_bad_requests_and_accepts_eof() {
     let mut worker = Worker::start("use vstd::prelude::*; verus! { proof fn passing() {} }", &[]);
     let ready = worker.receive();
@@ -520,9 +574,8 @@ fn resident_recheck_keeps_recommends_at_warning_severity() {
     worker.finish(true);
 }
 
-// A specialised prover in a function the filter excludes is not this session's
-// problem: its query is neither checked nor retained, so preparation must
-// still succeed. Without the filter, the same file is rejected (above).
+// Filtering excludes specialised queries and their separate solver contexts
+// from the catalogue alongside ordinary queries.
 #[test]
 fn resident_ignores_specialised_provers_in_filtered_out_functions() {
     let source = r#"
@@ -586,6 +639,70 @@ fn resident_socket_closes_on_eof() {
     worker.finish(false);
 }
 
+// A recheck looks for as many errors as the original invocation did, and says
+// so when it stopped looking before running out of them. The limit comes from
+// the invocation, so a function with two failing assertions reports a different
+// number under each setting of --multiple-errors.
+#[test]
+fn resident_recheck_reports_as_many_errors_as_the_batch_run() {
+    let source = r#"
+        use vstd::prelude::*;
+        verus! {
+            proof fn two_failures(x: int) {
+                assert(x > 0);
+                assert(x < 0);
+            }
+        }
+    "#;
+    // Options, errors expected, and whether the search was cut short.
+    for (options, failures, truncated) in [
+        (&[][..], 2, true),                          // the default of 2
+        (&["--multiple-errors", "0"][..], 1, true),  // the first failure only
+        (&["--multiple-errors", "3"][..], 2, false), // more headroom than errors
+    ] {
+        let mut worker = Worker::start(source, options);
+        let ready = worker.receive();
+        let query = query_id(&ready, "::two_failures");
+        let checked = worker.send(
+            json!({"command": "check", "session": ready["session"], "bucket": 0, "query": query}),
+        );
+        assert_eq!(checked["result"], "invalid", "{:?} {}", options, checked);
+        let diagnostics = checked["diagnostics"].as_array().unwrap();
+        let reported = diagnostics.iter().filter(|d| d["level"] == "error").count();
+        assert_eq!(reported, failures, "{:?} {}", options, checked);
+        let note = diagnostics.iter().any(|d| {
+            d["level"] == "note"
+                && d["message"].as_str().unwrap().contains("not all errors may have been reported")
+        });
+        assert_eq!(note, truncated, "{:?} {}", options, checked);
+        worker.finish(false);
+    }
+}
+
+// Preparation that fails after the driver returns still tells the caller, so
+// an empty stdout is never mistaken for a crash.
+#[test]
+fn resident_reports_that_no_session_is_available() {
+    let source = "use vstd::prelude::*; verus! { proof fn f() { missing(); } }";
+    let mut worker = Worker::start_socket(source, &[]);
+    let reply = worker.receive();
+    assert_eq!(reply["event"], "error", "{}", reply);
+    assert!(reply["message"].as_str().unwrap().contains("no session is available"), "{}", reply);
+    worker.finish(false);
+}
+
+// An oversized frame closes the session, and says so first.
+#[test]
+fn resident_reports_an_oversized_request_before_closing() {
+    let mut worker = Worker::start(SOURCE, &[]);
+    assert_eq!(worker.receive()["event"], "ready");
+    worker.raw(&format!("{}\n", "x".repeat(70000)));
+    let reply = worker.receive();
+    assert_eq!(reply["event"], "error", "{}", reply);
+    assert!(reply["message"].as_str().unwrap().contains("64 KiB"), "{}", reply);
+    worker.finish(false);
+}
+
 #[test]
 fn resident_rejects_incomplete_preparation_cleanly() {
     for (source, expected) in [
@@ -594,16 +711,163 @@ fn resident_rejects_incomplete_preparation_cleanly() {
             "cannot find function",
         ),
         (
-            "use vstd::prelude::*; verus! { mod a { proof fn ok() {} } mod b { use super::*; proof fn f(x: u32) { assert(x & 0 == 0) by(bit_vector); } } }",
-            "--resident does not support specialised prover queries",
+            "use vstd::prelude::*; verus! { mod a { proof fn ok() {} } mod b { use super::*; proof fn f(x: int) by(integer_ring) ensures x * x == x * x, {} } }",
+            "singular",
         ),
     ] {
         for threads in ["1", "2"] {
             let mut worker = Worker::start(source, &["--num-threads", threads]);
+            // No catalogue is published, and the caller is told that rather
+            // than left to infer it from an empty stdout.
+            let reply = worker.receive();
+            assert_eq!(reply["event"], "error", "{}", reply);
+            assert!(
+                reply["message"].as_str().unwrap().contains("no session is available"),
+                "{}",
+                reply
+            );
             worker.finish(false);
-            assert!(worker.stderr().contains(expected), "{}", worker.stderr());
+            assert!(worker.stderr().to_lowercase().contains(expected), "{}", worker.stderr());
             assert!(!worker.stderr().contains("panicked"), "{}", worker.stderr());
         }
+    }
+}
+
+#[test]
+fn resident_specialised_preparation_matches_ordinary_verification() {
+    let source = include_str!("fixtures/resident_specialised.rs");
+    for provenance in [false, true] {
+        let mut options = vec!["--output-json"];
+        if provenance {
+            options.extend(["-V", "provenance"]);
+        }
+        let mut worker = Worker::start_socket(source, &options);
+        let ready = worker.receive();
+        assert_eq!(ready["event"], "ready");
+        assert_eq!(
+            worker.send(json!({"command":"close", "session":ready["session"]}))["event"],
+            "closed"
+        );
+        worker.finish(false);
+        let retained: Value =
+            serde_json::from_str(&fs::read_to_string(worker.dir.path().join("stdout")).unwrap())
+                .unwrap();
+        let current = std::env::current_exe().unwrap();
+        let ordinary =
+            Command::new(current.parent().unwrap().parent().unwrap().join("rust_verify"))
+                .args(["--mcp", "-V", "cvc5", "--crate-type=lib"])
+                .arg(worker.dir.path().join("fixture.rs"))
+                .args(&options)
+                .output()
+                .unwrap();
+        assert!(!ordinary.status.success());
+        let ordinary: Value = serde_json::from_slice(&ordinary.stdout).unwrap();
+        assert_eq!(retained["verification-results"]["errors"], 2);
+        assert_eq!(retained["verification-results"], ordinary["verification-results"]);
+    }
+}
+
+#[test]
+fn resident_specialised_queries_reuse_scoped_solvers() {
+    let source = include_str!("fixtures/resident_specialised.rs");
+    for (threads, provenance, spinoff) in [
+        ("1", false, false),
+        ("2", false, false),
+        ("2", true, false),
+        ("2", false, true),
+        ("2", true, true),
+    ] {
+        let mut options = vec!["--num-threads", threads];
+        if provenance {
+            options.extend(["-V", "provenance"]);
+        }
+        if spinoff {
+            options.extend(["-V", "spinoff-all"]);
+        }
+        let mut worker = Worker::start(source, &options);
+        let ready = worker.receive();
+        assert_eq!(ready["event"], "ready");
+        assert_eq!(ready["invocation_succeeded"], false);
+        let buckets = ready["buckets"].as_array().unwrap();
+        assert_eq!(buckets.len(), 2);
+        let launches = fs::read_to_string(worker.dir.path().join("launches")).unwrap();
+        let mut queries = Vec::new();
+        for bucket in buckets {
+            for query in bucket["queries"].as_array().unwrap() {
+                let function = query["function"].as_str().unwrap();
+                let prover = query["prover"].as_str().unwrap();
+                if prover == "default" {
+                    continue;
+                }
+                let expected_prover =
+                    if function.contains("::bits_") { "bit_vector" } else { "nonlinear" };
+                assert_eq!(prover, expected_prover);
+                queries.push((bucket["id"].clone(), query));
+            }
+        }
+        assert!(queries.len() >= 9, "{}", ready);
+        // Reverse the initial order, cross buckets, then repeat forwards.
+        for (bucket, query) in queries.iter().rev().chain(queries.iter()) {
+            let checked = worker.send(json!({"command":"check", "session":ready["session"], "bucket":bucket, "query":query["id"]}));
+            let expected = if query["function"].as_str().unwrap().ends_with("_bad") {
+                "invalid"
+            } else {
+                "valid"
+            };
+            assert_eq!(checked["result"], expected, "{checked}");
+            assert_eq!(!checked["provenance"].is_null(), provenance);
+            if provenance {
+                assert_eq!(checked["provenance"]["span"], query["span"]);
+                assert_eq!(checked["provenance"]["result"], expected);
+            }
+            if expected == "invalid" {
+                if query["prover"] != "bit_vector" {
+                    assert!(checked["assert_id"].is_array(), "{}", checked);
+                }
+                let diagnostics = checked["diagnostics"].as_array().unwrap();
+                assert!(!diagnostics.is_empty(), "{}", checked);
+                assert_eq!(diagnostics[0]["level"], "error");
+                assert!(diagnostics[0].to_string().contains("fixture.rs"));
+            }
+        }
+        if !provenance && spinoff {
+            // EOF owns the same cleanup obligation as an explicit close.
+            worker.finish(false);
+        } else {
+            assert_eq!(
+                worker.send(json!({"command":"close", "session":ready["session"]}))["event"],
+                "closed"
+            );
+            worker.finish(false);
+        }
+        worker.assert_solvers_gone();
+        assert_eq!(fs::read_to_string(worker.dir.path().join("launches")).unwrap(), launches);
+        let mut bitvector_logs = 0;
+        let mut nonlinear_logs = 0;
+        for entry in fs::read_dir(worker.dir.path().join("logs")).unwrap() {
+            let path = entry.unwrap().path();
+            if !path.extension().is_some_and(|ext| ext == "smt2") {
+                continue;
+            }
+            let log = fs::read_to_string(path).unwrap();
+            if log.contains("query spun off because: bitvector") {
+                bitvector_logs += 1;
+                assert!(
+                    !log.contains("(declare-sort Poly"),
+                    "bit-vector context must be prelude-free"
+                );
+                assert!(log.contains("(set-option :incremental true)"));
+                assert!(!log.contains("(set-option :single_check_query true)"));
+            } else if log.contains("query spun off because: nonlinear") {
+                nonlinear_logs += 1;
+            } else {
+                continue;
+            }
+            assert!(log.matches("(check-sat)").count() >= 3);
+            assert_eq!(log.matches("(push").count(), log.matches("(pop").count());
+        }
+        assert!(bitvector_logs >= 5);
+        assert!(nonlinear_logs >= 4);
     }
 }
 

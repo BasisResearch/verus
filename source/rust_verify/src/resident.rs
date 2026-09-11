@@ -9,6 +9,12 @@
 //! `ready.input_files` lists local source and explicit compiler dependencies,
 //! including imported VIR files, for the MCP caller's snapshot coverage check.
 //! It does not enumerate undeclared external reads by macros or build scripts.
+//!
+//! The catalogue names each query's `prover`: `default`, `nonlinear`, or
+//! `bit_vector`. Specialised queries keep their original separate solvers;
+//! bit-vector solvers remain prelude-free but use incremental query scopes.
+//! Checked provenance describes round zero, matching the result and assertion
+//! ID. Diagnostics can include further rounds requested by `--multiple-errors`.
 
 use crate::buckets::BucketId;
 use crate::commands::{QueryOp, Style};
@@ -38,6 +44,7 @@ struct RetainedQuery {
     prefix: usize,
     rlimit: f32,
     kind: QueryKind,
+    prover: vir::def::ProverChoice,
     /// The severity the original invocation reports a failure of this query
     /// at, read from the same `QueryOp` the verifier reads. A recheck of a
     /// recommends query stays a warning.
@@ -101,6 +108,7 @@ struct QueryDescription {
     function: String,
     description: String,
     kind: QueryKind,
+    prover: &'static str,
     span: String,
 }
 
@@ -158,6 +166,12 @@ impl RetainedBucket {
                     function: fun_as_friendly_rust_name(&query.context.fun),
                     description: query.context.desc.clone(),
                     kind: query.kind,
+                    prover: match query.prover {
+                        vir::def::ProverChoice::DefaultProver => "default",
+                        vir::def::ProverChoice::Nonlinear => "nonlinear",
+                        vir::def::ProverChoice::BitVector => "bit_vector",
+                        vir::def::ProverChoice::Singular => "singular",
+                    },
                     span: query.context.span.as_string.clone(),
                 });
                 addresses.push((solver, local));
@@ -171,9 +185,20 @@ impl RetainedBucket {
 /// I/O; compiler workers finish and return their contexts before it starts.
 pub(crate) struct Server {
     buckets: Vec<RetainedBucket>,
-    input_files: Vec<String>,
-    provenance: bool,
-    spinoff_all: bool,
+    info: SessionInfo,
+}
+
+/// What a session reports about the invocation behind it, and the settings a
+/// recheck has to reproduce. Passed whole rather than assembled by builders:
+/// each field has to come from the invocation, so none of them has a default
+/// that would be right to fall back to.
+pub(crate) struct SessionInfo {
+    pub(crate) provenance: bool,
+    pub(crate) spinoff_all: bool,
+    /// How many errors one query may report, as `--multiple-errors` set it. A
+    /// recheck looks for as many as the original invocation did.
+    pub(crate) multiple_errors: u32,
+    pub(crate) input_files: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -274,6 +299,17 @@ impl QueryDiagnostics {
                 .collect(),
         });
     }
+
+    /// A diagnostic about the query as a whole rather than about one assertion
+    /// the solver named: no labels, and the query's own span.
+    fn bare(&self, level: DiagnosticLevel, message: String, span: &str) {
+        self.0.borrow_mut().push(SourceDiagnostic {
+            level,
+            message,
+            spans: vec![span.to_owned()],
+            labels: Vec::new(),
+        });
+    }
 }
 
 impl Diagnostics for QueryDiagnostics {
@@ -299,6 +335,21 @@ fn send(output: &mut impl Write, response: &Response<'_>) -> io::Result<()> {
     serde_json::to_writer(&mut *output, response)?;
     writeln!(output)?;
     output.flush()
+}
+
+/// Tell a caller that no session is coming, over whichever transport it is
+/// waiting on. Preparation can fail after the compiler driver has returned,
+/// and the summary line is suppressed under `--resident`, so without this the
+/// caller sees an empty stdout, or a socket that never accepts, and cannot
+/// tell that apart from a crash. The reason itself has already gone to stderr.
+pub(crate) fn report_unavailable(reason: &str) -> io::Result<()> {
+    let response = Response::Error { message: reason };
+    #[cfg(unix)]
+    if let Some(path) = std::env::var_os("VERUS_RESIDENT_SOCKET") {
+        let mut stream = std::os::unix::net::UnixStream::connect(path)?;
+        return send(&mut stream, &response);
+    }
+    send(&mut io::stdout().lock(), &response)
 }
 
 /// End the session, telling the caller why before the pipe closes. Without a
@@ -356,6 +407,7 @@ impl QueryJournal {
                     prefix: self.applied,
                     rlimit,
                     kind: QueryKind::from_op(op),
+                    prover: commands.prover_choice,
                     level: op.message_level(),
                 });
                 // The next declaration batch must start a scope: this query
@@ -402,22 +454,11 @@ impl QueryJournal {
 }
 
 impl Server {
-    pub(crate) fn new(mut buckets: Vec<RetainedBucket>) -> Self {
+    pub(crate) fn new(mut buckets: Vec<RetainedBucket>, info: SessionInfo) -> Self {
         // Compilation can finish in any order. Protocol ordinals follow the
         // verifier's bucket identity, not worker completion order.
         buckets.sort_by(|left, right| left.id.cmp(&right.id));
-        Self { buckets, input_files: Vec::new(), provenance: false, spinoff_all: false }
-    }
-
-    pub(crate) fn with_modes(mut self, provenance: bool, spinoff_all: bool) -> Self {
-        self.provenance = provenance;
-        self.spinoff_all = spinoff_all;
-        self
-    }
-
-    pub(crate) fn with_input_files(mut self, input_files: Vec<String>) -> Self {
-        self.input_files = input_files;
-        self
+        Self { buckets, info }
     }
 
     pub(crate) fn serve(
@@ -482,25 +523,34 @@ impl Server {
                 session,
                 process_id: std::process::id(),
                 invocation_succeeded,
-                provenance: self.provenance,
-                spinoff_all: self.spinoff_all,
-                input_files: &self.input_files,
+                provenance: self.info.provenance,
+                spinoff_all: self.info.spinoff_all,
+                input_files: &self.info.input_files,
                 buckets: &buckets,
             },
         )?;
+        let multiple_errors = self.info.multiple_errors;
         loop {
             // A framing failure closes the session. Never interpret a suffix of
-            // an oversized request as a second request.
+            // an oversized request as a second request. Say so before closing:
+            // a caller cannot tell a silent close apart from an orderly one.
             let mut line = String::new();
-            if input.by_ref().take(65537).read_line(&mut line)? == 0 {
-                self.shutdown()?;
-                return Ok(());
+            match input.by_ref().take(65537).read_line(&mut line) {
+                Ok(0) => {
+                    self.shutdown()?;
+                    return Ok(());
+                }
+                Ok(_) => {}
+                Err(error) => return fatal(&mut output, error),
             }
             if line.len() > 65536 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "resident request exceeds 64 KiB",
-                ));
+                return fatal(
+                    &mut output,
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "resident request exceeds 64 KiB including its newline",
+                    ),
+                );
             }
             let request = match serde_json::from_str::<Request>(&line) {
                 Ok(request) => request,
@@ -524,7 +574,9 @@ impl Server {
                     send(&mut output, &Response::Queries { session, buckets: &buckets })?
                 }
                 Request::Close { .. } => {
-                    self.shutdown()?;
+                    if let Err(error) = self.shutdown() {
+                        return fatal(&mut output, error);
+                    }
                     send(&mut output, &Response::Closed { session })?;
                     return Ok(());
                 }
@@ -538,10 +590,15 @@ impl Server {
                         send(&mut output, &Response::Error { message: "unknown query" })?;
                         continue;
                     }
-                    let mut state = bucket
-                        .state
-                        .lock()
-                        .map_err(|_| io::Error::other("resident bucket poisoned"))?;
+                    let mut state = match bucket.state.lock() {
+                        Ok(state) => state,
+                        Err(_) => {
+                            return fatal(
+                                &mut output,
+                                io::Error::other("resident bucket poisoned"),
+                            );
+                        }
+                    };
                     let (solver, local) = bucket.addresses[id.0];
                     let SolverState { air, journal } = &mut state[solver];
                     let prefix = journal.queries[local].prefix;
@@ -559,29 +616,127 @@ impl Server {
                     set_rlimit(air, query.rlimit);
                     let diagnostics = QueryDiagnostics::default();
                     let start = Instant::now();
-                    let result = air.check_valid(
+                    let mut outcome = air.check_valid(
                         &VirMessageInterface {},
                         &diagnostics,
                         &query.query,
                         QueryContext::default(),
                     );
-                    let (result, assert_id) = match result {
-                        ValidityResult::Valid(_) => (QueryResult::Valid, None),
-                        ValidityResult::Invalid(_, error, id) => {
-                            if let Some(error) = error {
-                                diagnostics.record(&error, level);
+                    // The response describes round zero. Later error searches
+                    // replace AIR's provenance, even when their verdict differs.
+                    let first_provenance = air.take_provenance();
+                    // Ask for further errors exactly as far as the original
+                    // invocation did, so rechecking a function with several
+                    // failing assertions reports the same ones rather than
+                    // only the first. Mirrors `check_result_validity`.
+                    let mut checks_remaining = multiple_errors;
+                    let mut only_check_earlier = false;
+                    let mut verdict = None;
+                    let mut assert_id = None;
+                    loop {
+                        match outcome {
+                            ValidityResult::Valid(_) => {
+                                verdict.get_or_insert(QueryResult::Valid);
+                                break;
                             }
-                            (QueryResult::Invalid, id.map(|id| (*id).clone()))
+                            ValidityResult::Canceled => {
+                                // On the first round the verdict carries this.
+                                // On a later one the verdict is already
+                                // `invalid`, so without the diagnostic the
+                                // caller cannot tell a complete error list from
+                                // one the rlimit cut short. The batch run
+                                // reports it on every round, and so does this.
+                                // It omits the batch's `--profile` hint, which
+                                // is a rerun the caller of a session does not
+                                // make.
+                                diagnostics.bare(
+                                    level.into(),
+                                    format!(
+                                        "{}: Resource limit (rlimit) exceeded",
+                                        query.context.desc
+                                    ),
+                                    &query.context.span.as_string,
+                                );
+                                verdict.get_or_insert(QueryResult::ResourceLimit);
+                                break;
+                            }
+                            // A failure the solver gave no model for cannot be
+                            // localised any further: `check_valid_again` panics
+                            // on it rather than reporting it, so this must stop
+                            // where `check_result_validity` stops.
+                            ValidityResult::Invalid(None, error, id)
+                            | ValidityResult::Invalid(_, error @ None, id) => {
+                                match error {
+                                    Some(error) => diagnostics.record(&error, level),
+                                    // Nothing came back to describe the
+                                    // failure. Name the obligation, as the
+                                    // batch run does.
+                                    None => diagnostics.bare(
+                                        level.into(),
+                                        query.context.desc.clone(),
+                                        &query.context.span.as_string,
+                                    ),
+                                }
+                                if verdict.is_none() {
+                                    verdict = Some(QueryResult::Invalid);
+                                    assert_id = id.map(|id| (*id).clone());
+                                }
+                                break;
+                            }
+                            ValidityResult::Invalid(_, error, id) => {
+                                if let Some(error) = error {
+                                    diagnostics.record(&error, level);
+                                }
+                                // Later rounds only add diagnostics: the
+                                // verdict and the reported assertion stay
+                                // those of the first failure.
+                                if verdict.is_none() {
+                                    verdict = Some(QueryResult::Invalid);
+                                    assert_id = id.map(|id| (*id).clone());
+                                }
+                                if multiple_errors == 0 {
+                                    break;
+                                }
+                                if !only_check_earlier {
+                                    checks_remaining -= 1;
+                                    only_check_earlier = checks_remaining == 0;
+                                }
+                                outcome = air.check_valid_again(
+                                    &diagnostics,
+                                    only_check_earlier,
+                                    QueryContext::default(),
+                                );
+                                drop(air.take_provenance());
+                            }
+                            ValidityResult::TypeError(error) => {
+                                return fatal(&mut output, io::Error::other(error.to_string()));
+                            }
+                            ValidityResult::UnexpectedOutput(error) => {
+                                return fatal(&mut output, io::Error::other(error));
+                            }
                         }
-                        ValidityResult::Canceled => (QueryResult::ResourceLimit, None),
-                        ValidityResult::TypeError(error) => {
-                            return fatal(&mut output, io::Error::other(error.to_string()));
-                        }
-                        ValidityResult::UnexpectedOutput(error) => {
-                            return fatal(&mut output, io::Error::other(error));
-                        }
-                    };
-                    let provenance = air.take_provenance().and_then(|info| {
+                    }
+                    let result = verdict.expect("every path out of the loop sets a verdict");
+                    // The batch run guards this on the level and the counter
+                    // alone, so at `--multiple-errors 0`, where the counter
+                    // starts spent, it says the search was cut short even for a
+                    // query that passed. Requiring a failure is a deliberate
+                    // departure: a caller diffing a session against that run
+                    // sees the note only where errors were actually withheld.
+                    if matches!(result, QueryResult::Invalid)
+                        && level == MessageLevel::Error
+                        && checks_remaining == 0
+                    {
+                        diagnostics.bare(
+                            DiagnosticLevel::Note,
+                            format!(
+                                "{}: not all errors may have been reported; rerun with a higher value for --multiple-errors to find other potential errors in this function",
+                                query.context.desc
+                            ),
+                            &query.context.span.as_string,
+                        );
+                    }
+                    let provenance = first_provenance.and_then(|info| {
                         bucket.symbols.as_ref().map(|symbols| {
                             symbols.resolve(
                                 &query.context.fun,
@@ -746,12 +901,25 @@ mod tests {
 
     #[test]
     fn oversized_request_closes_without_parsing_its_suffix() {
-        let mut session = Server::new(Vec::new());
+        let mut session = Server::new(
+            Vec::new(),
+            SessionInfo {
+                provenance: false,
+                spinoff_all: false,
+                multiple_errors: 2,
+                input_files: Vec::new(),
+            },
+        );
         let input = format!("{}\n{{\"command\":\"list\"}}\n", " ".repeat(65537));
         let mut output = Vec::new();
         let error =
             session.run("test", true, input.as_bytes(), &mut output, |_, _| {}).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-        assert_eq!(String::from_utf8(output).unwrap().lines().count(), 1);
+        // `ready`, then the refusal. The suffix of the oversized line is never
+        // taken for a second request, so no `queries` reply appears.
+        let output = String::from_utf8(output).unwrap();
+        assert_eq!(output.lines().count(), 2, "{output}");
+        assert!(!output.contains("\"queries\""), "{output}");
+        assert!(output.lines().nth(1).unwrap().contains("64 KiB"), "{output}");
     }
 }
