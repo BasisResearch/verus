@@ -217,6 +217,8 @@ fn dead_ghost_functions() {
         assert!(!graph.is_reachable(ghost(name)), "{}", name);
     }
     assert_eq!(graph.ghost_coverage(), (4, 6));
+    assert_eq!(graph.exec_coverage(), (1, 2));
+    assert_eq!(graph.coverage(), (5, 8));
 }
 
 /// The spec accessors `verus!` synthesizes for enum fields are not the

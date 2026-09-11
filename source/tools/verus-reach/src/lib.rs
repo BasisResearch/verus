@@ -6,7 +6,8 @@
 //! name items in other crates. This library merges the reports of all
 //! crates and computes what is reachable from the chosen roots: which
 //! functions run, and which ghost functions (specs and proofs) the running
-//! code's contracts and proofs use.
+//! code's contracts and proofs use. Coverage is the share of verified
+//! functions, exec and ghost alike, that are reachable.
 
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
@@ -85,6 +86,12 @@ pub struct Span {
 }
 
 impl Node {
+    /// The functions coverage counts: verified exec code with a real body,
+    /// and every spec and proof function.
+    pub fn is_verified(&self) -> bool {
+        self.is_verified_exec() || self.is_ghost()
+    }
+
     /// The functions we want wired in: verified exec code with a real body.
     pub fn is_verified_exec(&self) -> bool {
         self.verified && self.mode == "exec" && !self.external_body && !self.proxy
@@ -237,8 +244,13 @@ impl Graph {
         self.reachable.contains(&node.id) || (node.is_ghost() && self.used.contains(&node.id))
     }
 
-    /// Verified exec functions: (reachable, total)
+    /// Verified functions, exec and ghost: (reachable, total)
     pub fn coverage(&self) -> (usize, usize) {
+        self.count(Node::is_verified)
+    }
+
+    /// Verified exec functions: (reachable, total)
+    pub fn exec_coverage(&self) -> (usize, usize) {
         self.count(Node::is_verified_exec)
     }
 
@@ -359,11 +371,13 @@ mod tests {
         assert!(graph.reachable.contains("lib::wired"));
         assert!(graph.reachable.contains("lib::helper"));
         assert!(!graph.reachable.contains("lib::verified::inc"));
-        assert_eq!(graph.coverage(), (2, 3));
+        assert_eq!(graph.exec_coverage(), (2, 3));
         assert!(graph.used.contains("lib::spec_wired"));
         assert!(graph.used.contains("lib::lemma"));
         assert!(!graph.used.contains("lib::verified::spec_inc"));
         assert_eq!(graph.ghost_coverage(), (2, 3));
+        // Coverage counts exec, spec, and proof functions alike
+        assert_eq!(graph.coverage(), (4, 6));
     }
 
     #[test]
