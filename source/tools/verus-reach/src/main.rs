@@ -2,13 +2,16 @@
 //!
 //!   verus-reach DIR...            text summary
 //!   verus-reach --lcov DIR...     LCOV, for grcov, genhtml, Codecov, IDE gutters
-//!   verus-reach --html DIR...     a page with two per-file metrics: the
-//!                                 share of verified functions nothing
-//!                                 reaches, and the share of reachable
-//!                                 functions that are verified
+//!   verus-reach --html DIR...     a self-contained page like genhtml's:
+//!                                 directories, files, and sources, rated
+//!                                 by the share of verified functions
+//!                                 nothing reaches and the share of
+//!                                 reachable functions that are verified
 //!
 //! Pass every crate's report (a directory of them, or files) so that calls
 //! across crates are followed.
+
+mod html;
 
 use clap::Parser;
 use std::collections::BTreeMap;
@@ -36,10 +39,16 @@ struct Args {
     /// Write an LCOV trace file to stdout instead of the summary
     #[arg(long, conflicts_with = "html")]
     lcov: bool,
-    /// Write an HTML page of per-file metrics to stdout instead of the
-    /// summary
+    /// Write a self-contained HTML report to stdout instead of the summary
     #[arg(long)]
     html: bool,
+    /// With --html, the directory the crates were compiled from, where the
+    /// source files named by the reports are read for the source views
+    #[arg(long, default_value = ".")]
+    src: PathBuf,
+    /// With --html, the title of the report
+    #[arg(long, default_value = "verus-reach")]
+    title: String,
     /// With --lcov, include only verified exec functions
     #[arg(long, conflicts_with = "only_verified")]
     only_verified_exec: bool,
@@ -173,105 +182,6 @@ fn lcov(graph: &Graph, only: Only) -> String {
     report.into_records().map(|record| format!("{record}\n")).collect()
 }
 
-/// The function counts of one file behind the per-file metrics.
-#[derive(Default, Clone, Copy)]
-struct Counts {
-    /// Verified functions
-    verified: usize,
-    /// Verified functions something reaches
-    verified_reachable: usize,
-    /// Functions something reaches, verified or not
-    reachable: usize,
-}
-
-impl Counts {
-    fn add(&mut self, node: &Node, graph: &Graph) {
-        // A proxy stands for another function's spec; it is not code
-        if node.proxy {
-            return;
-        }
-        let reachable = graph.is_reachable(node);
-        self.verified += node.is_verified() as usize;
-        self.verified_reachable += (node.is_verified() && reachable) as usize;
-        self.reachable += reachable as usize;
-    }
-
-    fn dead(&self) -> usize {
-        self.verified - self.verified_reachable
-    }
-
-    /// Verified functions nothing reaches, as a share of verified
-    /// functions: 1 minus the coverage
-    fn dead_pct(&self) -> Option<u64> {
-        ratio(self.dead(), self.verified)
-    }
-
-    /// Verified functions as a share of reachable functions
-    fn verified_pct(&self) -> Option<u64> {
-        ratio(self.verified_reachable, self.reachable)
-    }
-}
-
-/// None when there is nothing to divide by
-fn ratio(part: usize, total: usize) -> Option<u64> {
-    (total > 0).then(|| (100 * part / total) as u64)
-}
-
-fn escape(text: &str) -> String {
-    text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
-}
-
-fn html(graph: &Graph) -> String {
-    let mut files: BTreeMap<&str, Counts> = BTreeMap::new();
-    let mut total = Counts::default();
-    for n in graph.nodes.values() {
-        files.entry(&n.span.file).or_default().add(n, graph);
-        total.add(n, graph);
-    }
-    let mut out = String::new();
-    out.push_str(
-        "<!DOCTYPE html>\n<html>\n<head>\n<meta charset=\"utf-8\">\n<title>verus-reach</title>\n\
-         <style>\n\
-         body { font-family: sans-serif; margin: 2em; }\n\
-         table { border-collapse: collapse; }\n\
-         th, td { padding: 0.3em 1em; border-bottom: 1px solid #ddd; text-align: right; }\n\
-         th:first-child, td:first-child { text-align: left; }\n\
-         th { vertical-align: bottom; }\n\
-         tr.total td { font-weight: bold; border-top: 2px solid #888; }\n\
-         </style>\n</head>\n<body>\n",
-    );
-    out.push_str(
-        "<p>A function is <b>verified</b> when Verus checks it: exec code with a real body, and \
-         every spec and proof function. It is <b>reachable</b> when it runs from a root or when \
-         the ghost code of reachable code mentions it.</p>\n",
-    );
-    out.push_str(
-        "<table>\n<tr><th>file</th><th>verified</th><th>reachable<br>verified</th>\
-         <th>dead verified<br>(unreachable / verified)</th>\
-         <th>reachable</th><th>verified share<br>(reachable verified / reachable)</th></tr>\n",
-    );
-    let row = |out: &mut String, class: &str, name: &str, c: &Counts| {
-        let pct = |p: Option<u64>| p.map_or("-".to_string(), |p| format!("{p}%"));
-        writeln!(
-            out,
-            "<tr{class}><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
-            escape(name),
-            c.verified,
-            c.verified_reachable,
-            pct(c.dead_pct()),
-            c.reachable,
-            pct(c.verified_pct()),
-        )
-        .unwrap();
-    };
-    for (file, counts) in &files {
-        row(&mut out, "", file, counts);
-    }
-    row(&mut out, " class=\"total\"", "total", &total);
-    out.push_str("</table>\n</body>\n</html>\n");
-    out
-}
-
 fn below_threshold(graph: &Graph, threshold: u64) -> Option<String> {
     let (reached, total) = graph.coverage();
     let pct = pct(reached, total);
@@ -309,7 +219,7 @@ fn main() {
     let text = if args.lcov {
         lcov(&graph, only)
     } else if args.html {
-        html(&graph)
+        html::render(&reports, &graph, &args.src, &args.title)
     } else {
         summary(&reports, &graph)
     };
@@ -383,38 +293,6 @@ mod tests {
         assert!(verified.contains("FNDA:1,lib::lemma\n"), "{verified}");
         assert!(!verified.contains("lib::inc\n"), "{verified}");
         assert!(lcov(&graph, Only::All).contains("FNDA:1,lib::inc\n"));
-    }
-
-    #[test]
-    fn html_rates_each_file() {
-        // Put the library's public twin and its spec in a file of their own
-        let mut reports = lib_and_bin();
-        for n in reports[0].nodes.iter_mut().filter(|n| n.module == "lib::verified") {
-            n.span.file = "verified.rs".into();
-        }
-        let graph = Graph::new(&reports, &Roots::default()).unwrap();
-        let text = html(&graph);
-        // x.rs: wired, helper, spec_wired, lemma verified and reached; inc and
-        // main reached but unverified
-        assert!(
-            text.contains(
-                "<tr><td>x.rs</td><td>4</td><td>4</td><td>0%</td><td>6</td><td>66%</td></tr>"
-            ),
-            "{text}"
-        );
-        // verified.rs: inc and spec_inc verified, nothing reached
-        assert!(
-            text.contains(
-                "<tr><td>verified.rs</td><td>2</td><td>0</td><td>100%</td><td>0</td><td>-</td></tr>"
-            ),
-            "{text}"
-        );
-        assert!(
-            text.contains(
-                "<tr class=\"total\"><td>total</td><td>6</td><td>4</td><td>33%</td><td>6</td><td>66%</td></tr>"
-            ),
-            "{text}"
-        );
     }
 
     #[test]

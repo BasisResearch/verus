@@ -3274,6 +3274,7 @@ dependencies = [
  "lcov",
  "serde",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]
