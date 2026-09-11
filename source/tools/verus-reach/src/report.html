@@ -1,0 +1,344 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>__TITLE__</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+:root {
+  --bg: #f6f8f7; --surface: #ffffff; --ink: #1c2522; --muted: #60706a; --line: #d8dfdb;
+  --accent: #1f6f8b; --accent-ink: #ffffff;
+  --good: #2e7d4f; --good-bg: #dff0e5; --warn: #b7791f; --warn-bg: #f6ead2;
+  --bad: #b93a32; --bad-bg: #f6dfdd; --unv: #3d63b8; --unv-bg: #dfe6f6;
+  --gutter: #f0f3f1;
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #131917; --surface: #1b2320; --ink: #e5ebe8; --muted: #96a59e; --line: #2c3733;
+    --accent: #6fc3dc; --accent-ink: #0f1a1e;
+    --good: #5fc084; --good-bg: #1d3b2a; --warn: #e0a84a; --warn-bg: #3f3117;
+    --bad: #ee7a70; --bad-bg: #44231f; --unv: #86a4ee; --unv-bg: #22304f;
+    --gutter: #161d1a;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #131917; --surface: #1b2320; --ink: #e5ebe8; --muted: #96a59e; --line: #2c3733;
+  --accent: #6fc3dc; --accent-ink: #0f1a1e;
+  --good: #5fc084; --good-bg: #1d3b2a; --warn: #e0a84a; --warn-bg: #3f3117;
+  --bad: #ee7a70; --bad-bg: #44231f; --unv: #86a4ee; --unv-bg: #22304f;
+  --gutter: #161d1a;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0; padding-inline: 24px; padding-block: 28px 48px;
+  background: var(--bg); color: var(--ink);
+  font-family: "IBM Plex Sans", "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  font-size: 14px; line-height: 1.5;
+}
+.wrap { max-width: 1160px; margin: 0 auto; display: flex; flex-direction: column; gap: 22px; }
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+a:focus-visible, th:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+h1 { font-size: 1.45rem; font-weight: 600; margin: 0; text-wrap: balance; }
+h2 { font-size: 1.05rem; font-weight: 600; margin: 0; }
+.mono, .num, td.num, .src { font-family: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-variant-numeric: tabular-nums; }
+.muted { color: var(--muted); }
+.label { font-size: 0.72rem; letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted); font-weight: 500; }
+header { display: flex; flex-direction: column; gap: 10px; }
+header .meta { display: grid; grid-template-columns: max-content 1fr; gap: 2px 14px; font-size: 0.85rem; }
+header .meta dt { color: var(--muted); }
+header .meta dd { margin: 0; overflow-wrap: anywhere; }
+.tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; }
+.tile { background: var(--surface); border: 1px solid var(--line); border-radius: 6px; padding: 12px 14px; display: flex; flex-direction: column; gap: 4px; }
+.tile .v { font-size: 1.7rem; font-weight: 500; line-height: 1.1; }
+.tile .s { font-size: 0.82rem; color: var(--muted); }
+.tile .v.hi { color: var(--good); } .tile .v.med { color: var(--warn); } .tile .v.lo { color: var(--bad); }
+.legend { display: flex; flex-wrap: wrap; gap: 8px 18px; font-size: 0.82rem; color: var(--muted); }
+.legend span::before { content: ""; display: inline-block; width: 12px; height: 12px; border-radius: 2px; margin-right: 6px; vertical-align: -1px; border: 1px solid var(--line); }
+.legend .vr::before { background: var(--good-bg); border-color: var(--good); }
+.legend .vd::before { background: var(--bad-bg); border-color: var(--bad); }
+.legend .ur::before { background: var(--unv-bg); border-color: var(--unv); }
+.legend .uu::before { background: var(--surface); }
+nav.crumbs { font-size: 0.9rem; display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+nav.crumbs .sep { color: var(--muted); }
+nav.crumbs .here { font-weight: 600; }
+.panel { background: var(--surface); border: 1px solid var(--line); border-radius: 6px; overflow: hidden; }
+.tablewrap { overflow-x: auto; }
+table.cov { width: 100%; border-collapse: collapse; font-size: 0.88rem; }
+table.cov th, table.cov td { padding: 7px 12px; text-align: left; border-bottom: 1px solid var(--line); white-space: nowrap; vertical-align: middle; }
+table.cov th { font-size: 0.72rem; letter-spacing: 0.05em; text-transform: uppercase; color: var(--muted); font-weight: 500; background: var(--gutter); cursor: pointer; user-select: none; }
+table.cov th.sorted { color: var(--ink); }
+table.cov th .dir { font-size: 0.65rem; margin-left: 4px; }
+table.cov td.num, table.cov th.num { text-align: right; }
+table.cov tr.total td { font-weight: 600; background: var(--gutter); }
+table.cov td.name { width: 100%; white-space: normal; overflow-wrap: anywhere; }
+table.cov tbody tr:hover td { background: color-mix(in srgb, var(--accent) 6%, transparent); }
+.cell { display: flex; align-items: center; gap: 10px; justify-content: flex-end; }
+.bar { width: 110px; height: 9px; background: var(--line); border-radius: 2px; overflow: hidden; flex: none; }
+.bar i { display: block; height: 100%; background: var(--muted); }
+.bar i.hi { background: var(--good); } .bar i.med { background: var(--warn); } .bar i.lo { background: var(--bad); }
+.pct { min-width: 3.5ch; text-align: right; }
+.pct.hi { color: var(--good); } .pct.med { color: var(--warn); } .pct.lo { color: var(--bad); }
+.frac { color: var(--muted); font-size: 0.8rem; min-width: 8ch; text-align: right; }
+.state { display: inline-block; padding: 1px 7px; border-radius: 3px; font-size: 0.75rem; font-weight: 500; border: 1px solid var(--line); }
+.state.vr { background: var(--good-bg); color: var(--good); border-color: transparent; }
+.state.vd { background: var(--bad-bg); color: var(--bad); border-color: transparent; }
+.state.ur { background: var(--unv-bg); color: var(--unv); border-color: transparent; }
+.state.uu { color: var(--muted); }
+.mode { font-size: 0.78rem; color: var(--muted); }
+.src { font-size: 12.5px; line-height: 1.6; overflow-x: auto; }
+.ln { display: flex; white-space: pre; min-width: max-content; }
+.ln .n { flex: none; width: 6ch; text-align: right; padding-right: 10px; color: var(--muted); user-select: none; background: var(--gutter); border-right: 1px solid var(--line); }
+.ln .c { padding-inline: 14px; flex: 1; }
+.ln.vr .c { background: var(--good-bg); } .ln.vd .c { background: var(--bad-bg); } .ln.ur .c { background: var(--unv-bg); }
+.ln.vr .n { box-shadow: inset 3px 0 var(--good); } .ln.vd .n { box-shadow: inset 3px 0 var(--bad); } .ln.ur .n { box-shadow: inset 3px 0 var(--unv); }
+.ln.hit .c { outline: 2px solid var(--accent); outline-offset: -2px; }
+.section { display: flex; flex-direction: column; gap: 10px; }
+.section-head { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; flex-wrap: wrap; }
+.note { font-size: 0.85rem; color: var(--muted); }
+@media (max-width: 640px) {
+  body { padding-inline: 16px; }
+  .bar { width: 70px; }
+  header .meta { grid-template-columns: 1fr; }
+}
+@media (prefers-reduced-motion: no-preference) { .bar i { transition: width 240ms ease-out; } }
+</style>
+</head>
+<body>
+<div class="wrap" id="app"></div>
+<script id="reach-data" type="application/json">__DATA__</script>
+<script>
+(function () {
+  "use strict";
+  var DATA = JSON.parse(document.getElementById("reach-data").textContent);
+  var HI = 90, MED = 75; // genhtml's default high/medium limits
+
+  function esc(s) {
+    return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+  }
+  function pct(a, b) { return b ? Math.floor(100 * a / b) : null; }
+  function band(p) { return p === null ? "" : p >= HI ? "hi" : p >= MED ? "med" : "lo"; }
+  function bandInv(p) { return p === null ? "" : p <= 100 - HI ? "hi" : p <= 100 - MED ? "med" : "lo"; }
+  function state(f) { return f.verified ? (f.reachable ? "vr" : "vd") : (f.reachable ? "ur" : "uu"); }
+  var STATE_LABEL = { vr: "verified, reachable", vd: "verified, dead", ur: "reachable, unverified", uu: "unreachable, unverified" };
+  var STATE_ORDER = { vd: 0, ur: 1, vr: 2, uu: 3 };
+
+  function stats(fns) {
+    var s = { verified: 0, vreach: 0, reach: 0, vloc: 0, vreachloc: 0, fns: fns.length,
+              exec: [0, 0], spec: [0, 0], proof: [0, 0] };
+    fns.forEach(function (f) {
+      var loc = f.end - f.start + 1;
+      if (f.reachable) s.reach++;
+      if (f.verified) {
+        s.verified++; s.vloc += loc;
+        if (f.reachable) { s.vreach++; s.vreachloc += loc; }
+        var m = s[f.mode];
+        if (m) { m[1]++; if (f.reachable) m[0]++; }
+      }
+    });
+    s.cov = pct(s.vreach, s.verified);
+    s.dead = s.verified ? 100 - s.cov : null;
+    s.share = pct(s.vreach, s.reach);
+    s.loc = pct(s.vreachloc, s.vloc);
+    return s;
+  }
+
+  function dirOf(path) { var i = path.lastIndexOf("/"); return i < 0 ? "." : path.slice(0, i); }
+  function baseOf(path) { var i = path.lastIndexOf("/"); return i < 0 ? path : path.slice(i + 1); }
+
+  var FILES = DATA.files.map(function (f) {
+    return { path: f.path, dir: dirOf(f.path), base: baseOf(f.path), functions: f.functions, source: f.source, s: stats(f.functions) };
+  });
+  var FILE_BY_PATH = {};
+  FILES.forEach(function (f) { FILE_BY_PATH[f.path] = f; });
+  var ALL_FNS = [].concat.apply([], FILES.map(function (f) { return f.functions; }));
+  var TOTAL = stats(ALL_FNS);
+
+  function dirs() {
+    var byDir = {};
+    FILES.forEach(function (f) { (byDir[f.dir] = byDir[f.dir] || []).push(f); });
+    return Object.keys(byDir).sort().map(function (d) {
+      var fns = [].concat.apply([], byDir[d].map(function (f) { return f.functions; }));
+      return { name: d, files: byDir[d], s: stats(fns) };
+    });
+  }
+
+  // ---- rendering helpers
+  function barCell(p, a, b) {
+    var cls = band(p);
+    return '<div class="cell"><span class="bar"><i class="' + cls + '" style="width:' + (p === null ? 0 : p) + '%"></i></span>' +
+      '<span class="pct ' + cls + '">' + (p === null ? "–" : p + "%") + '</span>' +
+      '<span class="frac">' + a + " / " + b + '</span></div>';
+  }
+  function deadCell(p) {
+    var cls = bandInv(p);
+    return '<span class="pct ' + cls + '">' + (p === null ? "–" : p + "%") + '</span>';
+  }
+
+  var COLS = [
+    { key: "name", label: "Name", cls: "name" },
+    { key: "cov", label: "Verified reachable", title: "reachable verified / verified", num: true,
+      cell: function (s) { return barCell(s.cov, s.vreach, s.verified); } },
+    { key: "dead", label: "Dead verified", title: "unreachable verified / verified", num: true,
+      cell: function (s) { return deadCell(s.dead); } },
+    { key: "share", label: "Verified share", title: "reachable verified / reachable", num: true,
+      cell: function (s) { return barCell(s.share, s.vreach, s.reach); } },
+    { key: "loc", label: "Verified LoC reachable", title: "lines of reachable verified functions / lines of verified functions", num: true,
+      cell: function (s) { return barCell(s.loc, s.vreachloc, s.vloc); } },
+    { key: "fns", label: "Functions", num: true, cell: function (s) { return s.fns; } }
+  ];
+
+  var sort = { key: "name", dir: 1 };
+  function sortRows(rows) {
+    var k = sort.key;
+    return rows.slice().sort(function (x, y) {
+      var a = k === "name" ? x.name : x.s[k], b = k === "name" ? y.name : y.s[k];
+      if (a === null) a = -1; if (b === null) b = -1;
+      var c = a < b ? -1 : a > b ? 1 : 0;
+      return c ? c * sort.dir : (x.name < y.name ? -1 : 1);
+    });
+  }
+
+  function table(rows, link) {
+    var h = '<div class="panel"><div class="tablewrap"><table class="cov"><thead><tr>';
+    COLS.forEach(function (c) {
+      var sorted = sort.key === c.key;
+      h += '<th tabindex="0" data-key="' + c.key + '" class="' + (c.num ? "num " : "") + (sorted ? "sorted" : "") + '"' +
+        (c.title ? ' title="' + esc(c.title) + '"' : "") + '>' + c.label +
+        (sorted ? '<span class="dir">' + (sort.dir > 0 ? "▲" : "▼") + '</span>' : "") + '</th>';
+    });
+    h += '</tr></thead><tbody>';
+    h += '<tr class="total"><td class="name">Total</td>';
+    COLS.slice(1).forEach(function (c) { h += '<td class="num">' + c.cell(TOTAL) + '</td>'; });
+    h += '</tr>';
+    sortRows(rows).forEach(function (r) {
+      h += '<tr><td class="name"><a href="' + link(r) + '">' + esc(r.name) + '</a></td>';
+      COLS.slice(1).forEach(function (c) { h += '<td class="num">' + c.cell(r.s) + '</td>'; });
+      h += '</tr>';
+    });
+    return h + '</tbody></table></div></div>';
+  }
+
+  function crumbs(parts) {
+    var h = '<nav class="crumbs">';
+    parts.forEach(function (p, i) {
+      if (i) h += '<span class="sep">›</span>';
+      h += p.href ? '<a href="' + p.href + '">' + esc(p.label) + '</a>' : '<span class="here">' + esc(p.label) + '</span>';
+    });
+    return h + '</nav>';
+  }
+
+  function header() {
+    var modes = ["exec", "spec", "proof"].map(function (m) {
+      return m + " " + TOTAL[m][0] + "/" + TOTAL[m][1];
+    }).join(" · ");
+    var roots = DATA.roots.length > 6 ? DATA.roots.length + " functions" : DATA.roots.join(", ");
+    var h = '<header><h1>' + esc(DATA.title) + '</h1><dl class="meta">' +
+      '<dt>Crates</dt><dd>' + esc(DATA.crates.join(", ")) + '</dd>' +
+      '<dt>Roots</dt><dd class="mono">' + esc(roots) + '</dd>' +
+      '<dt>Sources</dt><dd class="mono">' + esc(DATA.src_root) + '</dd></dl></header>';
+    h += '<div class="tiles">' +
+      tile("Verified reachable", TOTAL.cov, band(TOTAL.cov), TOTAL.vreach + " of " + TOTAL.verified + " verified functions · " + modes) +
+      tile("Dead verified", TOTAL.dead, bandInv(TOTAL.dead), (TOTAL.verified - TOTAL.vreach) + " verified functions nothing reaches") +
+      tile("Verified share of reachable code", TOTAL.share, band(TOTAL.share), TOTAL.vreach + " of " + TOTAL.reach + " reachable functions are verified") +
+      tile("Verified LoC reachable", TOTAL.loc, band(TOTAL.loc), TOTAL.vreachloc + " of " + TOTAL.vloc + " lines, proof blocks included") +
+      '</div>';
+    h += '<div class="legend"><span class="vr">verified and reachable</span><span class="vd">verified but nothing reaches it</span>' +
+      '<span class="ur">reachable but unverified</span><span class="uu">neither</span>' +
+      '<span class="muted">bars: green ≥ ' + HI + '%, amber ≥ ' + MED + '%, red below (genhtml limits)</span></div>';
+    return h;
+  }
+  function tile(k, p, cls, sub) {
+    return '<div class="tile"><span class="label">' + k + '</span><span class="v num ' + cls + '">' + (p === null ? "–" : p + "%") + '</span><span class="s">' + esc(sub) + '</span></div>';
+  }
+
+  // ---- views
+  function viewDirs() {
+    var rows = dirs().map(function (d) { return { name: d.name, s: d.s }; });
+    return crumbs([{ label: "All directories" }]) +
+      '<div class="section"><div class="section-head"><h2>Directories</h2><span class="note">' + FILES.length + ' files, ' + ALL_FNS.length + ' functions</span></div>' +
+      table(rows, function (r) { return "#/d/" + encodeURIComponent(r.name); }) + '</div>';
+  }
+  function viewDir(dir) {
+    var rows = FILES.filter(function (f) { return f.dir === dir; }).map(function (f) { return { name: f.base, s: f.s, path: f.path }; });
+    if (!rows.length) return notFound(dir);
+    return crumbs([{ label: "All directories", href: "#/" }, { label: dir }]) +
+      '<div class="section"><div class="section-head"><h2>Files in ' + esc(dir) + '</h2></div>' +
+      table(rows, function (r) { return "#/f/" + encodeURIComponent(r.path); }) + '</div>';
+  }
+  function viewFile(path) {
+    var f = FILE_BY_PATH[path];
+    if (!f) return notFound(path);
+    var h = crumbs([{ label: "All directories", href: "#/" }, { label: f.dir, href: "#/d/" + encodeURIComponent(f.dir) }, { label: f.base }]);
+    h += '<div class="section"><div class="section-head"><h2>' + esc(f.path) + '</h2></div>' +
+      table([{ name: f.base, s: f.s }], function () { return "#/f/" + encodeURIComponent(path); }) + '</div>';
+
+    var fns = f.functions.slice().sort(function (a, b) {
+      return STATE_ORDER[state(a)] - STATE_ORDER[state(b)] || a.start - b.start;
+    });
+    h += '<div class="section"><div class="section-head"><h2>Functions</h2><span class="note">dead and unverified first, then by line</span></div>' +
+      '<div class="panel"><div class="tablewrap"><table class="cov"><thead><tr><th>Function</th><th>Mode</th><th class="num">Lines</th><th>State</th></tr></thead><tbody>';
+    fns.forEach(function (fn) {
+      var st = state(fn);
+      h += '<tr><td class="name mono">' + (f.source ? '<a href="#/f/' + encodeURIComponent(path) + '/L' + fn.start + '">' : '') + esc(fn.name) + (f.source ? '</a>' : '') +
+        ' <span class="mode">' + esc(fn.path) + '</span></td>' +
+        '<td><span class="mode">' + esc(fn.mode) + '</span></td>' +
+        '<td class="num">' + fn.start + (fn.end > fn.start ? "–" + fn.end : "") + '</td>' +
+        '<td><span class="state ' + st + '">' + STATE_LABEL[st] + '</span></td></tr>';
+    });
+    h += '</tbody></table></div></div></div>';
+
+    if (f.source === null) {
+      h += '<p class="note">Source not found under ' + esc(DATA.src_root) + '; run with --src pointing at the directory the crate was compiled from.</p>';
+      return h;
+    }
+    var lines = f.source.split("\n");
+    if (lines.length && lines[lines.length - 1] === "") lines.pop();
+    var mark = new Array(lines.length + 1);
+    f.functions.forEach(function (fn) {
+      for (var l = fn.start; l <= fn.end && l <= lines.length; l++) if (!mark[l]) mark[l] = fn;
+    });
+    h += '<div class="section"><div class="section-head"><h2>Source</h2><span class="note">' + lines.length + ' lines</span></div><div class="panel src">';
+    lines.forEach(function (text, i) {
+      var n = i + 1, fn = mark[n], st = fn ? state(fn) : "";
+      h += '<div class="ln ' + st + '" id="L' + n + '"' + (fn ? ' title="' + esc(fn.name) + ": " + STATE_LABEL[st] + '"' : "") + '>' +
+        '<span class="n">' + n + '</span><span class="c">' + esc(text) + '</span></div>';
+    });
+    return h + '</div></div>';
+  }
+  function notFound(what) { return crumbs([{ label: "All directories", href: "#/" }]) + '<p class="note">No such entry: ' + esc(what) + '</p>'; }
+
+  function render() {
+    var hash = location.hash || "#/";
+    var m, body, lineTarget = null;
+    if ((m = /^#\/d\/(.+)$/.exec(hash))) body = viewDir(decodeURIComponent(m[1]));
+    else if ((m = /^#\/f\/(.+?)(?:\/L(\d+))?$/.exec(hash))) { body = viewFile(decodeURIComponent(m[1])); lineTarget = m[2]; }
+    else body = viewDirs();
+    document.getElementById("app").innerHTML = header() + body;
+    document.querySelectorAll("th[data-key]").forEach(function (th) {
+      var go = function () {
+        var k = th.getAttribute("data-key");
+        if (sort.key === k) sort.dir = -sort.dir; else { sort.key = k; sort.dir = k === "name" ? 1 : -1; }
+        render();
+      };
+      th.addEventListener("click", go);
+      th.addEventListener("keydown", function (e) { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); go(); } });
+    });
+    if (lineTarget) {
+      var el = document.getElementById("L" + lineTarget);
+      if (el) { el.scrollIntoView({ block: "center" }); el.classList.add("hit"); }
+    } else {
+      window.scrollTo(0, 0);
+    }
+  }
+  window.addEventListener("hashchange", render);
+  render();
+})();
+</script>
+</body>
+</html>
