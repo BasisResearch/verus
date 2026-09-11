@@ -1,7 +1,7 @@
 //! The `--html` report: one self-contained page in the shape of genhtml's
-//! output. A directory overview, a file table per directory, and a source
-//! view per file with every line tinted by the state of the function it
-//! belongs to. The page carries its data as JSON and renders itself; the
+//! output. A table of the files with verified code, and a source view per
+//! file with every line tinted by the state of the function it belongs
+//! to. The page carries its data as JSON and renders itself; the
 //! template is `report.html`.
 
 use serde_json::{Value, json};

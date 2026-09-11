@@ -138,14 +138,12 @@ table.cov tbody tr:hover td { background: color-mix(in srgb, var(--accent) 6%, t
   var STATE_ORDER = { vd: 0, ur: 1, vr: 2, uu: 3 };
 
   function stats(fns) {
-    var s = { verified: 0, vreach: 0, reach: 0, vloc: 0, vreachloc: 0, fns: fns.length,
-              exec: [0, 0], spec: [0, 0], proof: [0, 0] };
+    var s = { verified: 0, vreach: 0, reach: 0, fns: fns.length, exec: [0, 0], spec: [0, 0], proof: [0, 0] };
     fns.forEach(function (f) {
-      var loc = f.end - f.start + 1;
       if (f.reachable) s.reach++;
       if (f.verified) {
-        s.verified++; s.vloc += loc;
-        if (f.reachable) { s.vreach++; s.vreachloc += loc; }
+        s.verified++;
+        if (f.reachable) s.vreach++;
         var m = s[f.mode];
         if (m) { m[1]++; if (f.reachable) m[0]++; }
       }
@@ -153,29 +151,20 @@ table.cov tbody tr:hover td { background: color-mix(in srgb, var(--accent) 6%, t
     s.cov = pct(s.vreach, s.verified);
     s.dead = s.verified ? 100 - s.cov : null;
     s.share = pct(s.vreach, s.reach);
-    s.loc = pct(s.vreachloc, s.vloc);
     return s;
   }
 
-  function dirOf(path) { var i = path.lastIndexOf("/"); return i < 0 ? "." : path.slice(0, i); }
-  function baseOf(path) { var i = path.lastIndexOf("/"); return i < 0 ? path : path.slice(i + 1); }
-
   var FILES = DATA.files.map(function (f) {
-    return { path: f.path, dir: dirOf(f.path), base: baseOf(f.path), functions: f.functions, source: f.source, s: stats(f.functions) };
+    return { path: f.path, functions: f.functions, source: f.source, s: stats(f.functions) };
   });
   var FILE_BY_PATH = {};
   FILES.forEach(function (f) { FILE_BY_PATH[f.path] = f; });
   var ALL_FNS = [].concat.apply([], FILES.map(function (f) { return f.functions; }));
   var TOTAL = stats(ALL_FNS);
-
-  function dirs() {
-    var byDir = {};
-    FILES.forEach(function (f) { (byDir[f.dir] = byDir[f.dir] || []).push(f); });
-    return Object.keys(byDir).sort().map(function (d) {
-      var fns = [].concat.apply([], byDir[d].map(function (f) { return f.functions; }));
-      return { name: d, files: byDir[d], s: stats(fns) };
-    });
-  }
+  // The listing: files with verified code. The others only hold reachable
+  // unverified code and count toward the project-wide share above the table.
+  var VERIFIED_FILES = FILES.filter(function (f) { return f.s.verified > 0; });
+  var LISTED = stats([].concat.apply([], VERIFIED_FILES.map(function (f) { return f.functions; })));
 
   // ---- rendering helpers
   function barCell(p, cls, a, b) {
@@ -190,8 +179,6 @@ table.cov tbody tr:hover td { background: color-mix(in srgb, var(--accent) 6%, t
       cell: function (s) { return barCell(s.dead, bandInv(s.dead), s.verified - s.vreach, s.verified); } },
     { key: "share", label: "Verified share", title: "reachable verified functions / reachable functions", metric: true,
       cell: function (s) { return barCell(s.share, band(s.share), s.vreach, s.reach); } },
-    { key: "loc", label: "Verified LoC reachable", title: "lines of reachable verified functions / lines of verified functions", metric: true,
-      cell: function (s) { return barCell(s.loc, band(s.loc), s.vreachloc, s.vloc); } },
     { key: "fns", label: "Functions", num: true, cell: function (s) { return s.fns; } }
   ];
 
@@ -206,7 +193,7 @@ table.cov tbody tr:hover td { background: color-mix(in srgb, var(--accent) 6%, t
     });
   }
 
-  function table(rows, link) {
+  function table(rows, link, total) {
     var h = '<div class="panel"><div class="tablewrap"><table class="cov"><thead><tr>';
     var cls = function (c) { return (c.num ? "num " : c.metric ? "metric " : "name "); };
     COLS.forEach(function (c) {
@@ -221,9 +208,13 @@ table.cov tbody tr:hover td { background: color-mix(in srgb, var(--accent) 6%, t
       COLS.slice(1).forEach(function (c) { h += '<td class="' + cls(c) + '">' + c.cell(r.s) + '</td>'; });
       h += '</tr>';
     });
-    h += '</tbody><tfoot><tr><td class="name">Total</td>';
-    COLS.slice(1).forEach(function (c) { h += '<td class="' + cls(c) + '">' + c.cell(TOTAL) + '</td>'; });
-    return h + '</tr></tfoot></table></div></div>';
+    h += '</tbody>';
+    if (total) {
+      h += '<tfoot><tr><td class="name">Total</td>';
+      COLS.slice(1).forEach(function (c) { h += '<td class="' + cls(c) + '">' + c.cell(total) + '</td>'; });
+      h += '</tr></tfoot>';
+    }
+    return h + '</table></div></div>';
   }
 
   function crumbs(parts) {
@@ -246,8 +237,7 @@ table.cov tbody tr:hover td { background: color-mix(in srgb, var(--accent) 6%, t
       '<dt>Sources</dt><dd class="mono">' + esc(DATA.src_root) + '</dd></dl></header>';
     h += '<div class="tiles">' +
       tile("Dead verified", TOTAL.dead, bandInv(TOTAL.dead), (TOTAL.verified - TOTAL.vreach) + " of " + TOTAL.verified + " verified functions nothing reaches · " + modes) +
-      tile("Verified share of reachable code", TOTAL.share, band(TOTAL.share), TOTAL.vreach + " of " + TOTAL.reach + " reachable functions are verified") +
-      tile("Verified LoC reachable", TOTAL.loc, band(TOTAL.loc), TOTAL.vreachloc + " of " + TOTAL.vloc + " lines, proof blocks included") +
+      tile("Verified share of reachable code", TOTAL.share, band(TOTAL.share), TOTAL.vreach + " of " + TOTAL.reach + " reachable functions across all " + FILES.length + " files are verified") +
       '</div>';
     h += '<div class="legend"><span class="vr">verified and reachable</span><span class="vd">verified but nothing reaches it</span>' +
       '<span class="ur">reachable but unverified</span><span class="uu">neither</span>' +
@@ -259,25 +249,21 @@ table.cov tbody tr:hover td { background: color-mix(in srgb, var(--accent) 6%, t
   }
 
   // ---- views
-  function viewDirs() {
-    var rows = dirs().map(function (d) { return { name: d.name, s: d.s }; });
-    return crumbs([{ label: "All directories" }]) +
-      '<div class="section"><div class="section-head"><h2>Directories</h2><span class="note">' + FILES.length + ' files, ' + ALL_FNS.length + ' functions</span></div>' +
-      table(rows, function (r) { return "#/d/" + encodeURIComponent(r.name); }) + '</div>';
-  }
-  function viewDir(dir) {
-    var rows = FILES.filter(function (f) { return f.dir === dir; }).map(function (f) { return { name: f.base, s: f.s, path: f.path }; });
-    if (!rows.length) return notFound(dir);
-    return crumbs([{ label: "All directories", href: "#/" }, { label: dir }]) +
-      '<div class="section"><div class="section-head"><h2>Files in ' + esc(dir) + '</h2></div>' +
-      table(rows, function (r) { return "#/f/" + encodeURIComponent(r.path); }) + '</div>';
+  function viewFiles() {
+    var rows = VERIFIED_FILES.map(function (f) { return { name: f.path, s: f.s, path: f.path }; });
+    var others = FILES.length - VERIFIED_FILES.length;
+    return crumbs([{ label: "Files with verified code" }]) +
+      '<div class="section"><div class="section-head"><h2>Files with verified code</h2><span class="note">' +
+      VERIFIED_FILES.length + ' files, ' + LISTED.verified + ' verified functions' +
+      (others ? '; ' + others + ' other files hold reachable code but nothing verified' : '') + '</span></div>' +
+      table(rows, function (r) { return "#/f/" + encodeURIComponent(r.path); }, LISTED) + '</div>';
   }
   function viewFile(path) {
     var f = FILE_BY_PATH[path];
     if (!f) return notFound(path);
-    var h = crumbs([{ label: "All directories", href: "#/" }, { label: f.dir, href: "#/d/" + encodeURIComponent(f.dir) }, { label: f.base }]);
+    var h = crumbs([{ label: "Files with verified code", href: "#/" }, { label: f.path }]);
     h += '<div class="section"><div class="section-head"><h2>' + esc(f.path) + '</h2></div>' +
-      table([{ name: f.base, s: f.s }], function () { return "#/f/" + encodeURIComponent(path); }) + '</div>';
+      table([{ name: f.path, s: f.s }], function () { return "#/f/" + encodeURIComponent(path); }, null) + '</div>';
 
     var fns = f.functions.slice().sort(function (a, b) {
       return STATE_ORDER[state(a)] - STATE_ORDER[state(b)] || a.start - b.start;
@@ -368,14 +354,13 @@ table.cov tbody tr:hover td { background: color-mix(in srgb, var(--accent) 6%, t
     }
     return out;
   }
-  function notFound(what) { return crumbs([{ label: "All directories", href: "#/" }]) + '<p class="note">No such entry: ' + esc(what) + '</p>'; }
+  function notFound(what) { return crumbs([{ label: "Files with verified code", href: "#/" }]) + '<p class="note">No such file: ' + esc(what) + '</p>'; }
 
   function render() {
     var hash = location.hash || "#/";
     var m, body, lineTarget = null;
-    if ((m = /^#\/d\/(.+)$/.exec(hash))) body = viewDir(decodeURIComponent(m[1]));
-    else if ((m = /^#\/f\/(.+?)(?:\/L(\d+))?$/.exec(hash))) { body = viewFile(decodeURIComponent(m[1])); lineTarget = m[2]; }
-    else body = viewDirs();
+    if ((m = /^#\/f\/(.+?)(?:\/L(\d+))?$/.exec(hash))) { body = viewFile(decodeURIComponent(m[1])); lineTarget = m[2]; }
+    else body = viewFiles();
     document.getElementById("app").innerHTML = header() + body;
     document.querySelectorAll("th[data-key]").forEach(function (th) {
       var go = function () {
