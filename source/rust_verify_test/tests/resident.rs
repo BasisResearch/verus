@@ -536,6 +536,94 @@ fn resident_rejects_unsupported_modes() {
     }
 }
 
+#[test]
+fn resident_custom_options_survive_bucket_switches_and_spinoffs() {
+    let settings = [
+        ("random-seed", "7"),
+        ("random-seed", "17"),
+        ("mbqi", "false"),
+        ("tlimit-per", "10000"),
+        // Verus's per-query budget overrides this, in batch and resident mode.
+        ("rlimit-per", "1"),
+    ];
+    let arguments: Vec<_> =
+        settings.iter().map(|(name, value)| format!("{name}={value}")).collect();
+    for provenance in [false, true] {
+        for spinoff in [false, true] {
+            let mut options = vec!["--num-threads", "2"];
+            for argument in &arguments {
+                options.extend(["--smt-option", argument.as_str()]);
+            }
+            if provenance {
+                options.extend(["-V", "provenance"]);
+            }
+            if spinoff {
+                options.extend(["-V", "spinoff-all"]);
+            }
+            let mut worker = Worker::start(MULTI_BUCKET_SOURCE, &options);
+            let ready = worker.receive();
+            assert_eq!(ready["event"], "ready");
+            assert_eq!(ready["smt_options"], json!(settings));
+            assert_eq!(ready["invocation_succeeded"], false);
+            assert_eq!(ready["buckets"].as_array().unwrap().len(), 2);
+            let launches = fs::read_to_string(worker.dir.path().join("launches")).unwrap();
+            for (bucket, expected) in [(1, "invalid"), (0, "valid"), (1, "invalid"), (0, "valid")] {
+                let checked = worker.send(json!({"command":"check", "session":ready["session"], "bucket":bucket, "query":0}));
+                assert_eq!(checked["result"], expected, "{checked}");
+                assert_eq!(!checked["provenance"].is_null(), provenance);
+            }
+            assert_eq!(
+                worker.send(json!({"command":"close", "session":ready["session"]}))["event"],
+                "closed"
+            );
+            worker.finish(false);
+            worker.assert_solvers_gone();
+            assert_eq!(fs::read_to_string(worker.dir.path().join("launches")).unwrap(), launches);
+            let mut solver_logs = 0;
+            for entry in fs::read_dir(worker.dir.path().join("logs")).unwrap() {
+                let path = entry.unwrap().path();
+                if path.extension().is_some_and(|ext| ext == "smt2") {
+                    solver_logs += 1;
+                    let log = fs::read_to_string(&path).unwrap();
+                    let mut previous = 0;
+                    for (name, value) in settings {
+                        let command = format!("(set-option :{name} {value})");
+                        assert_eq!(
+                            log.matches(&command).count(),
+                            1,
+                            "{}: {command}",
+                            path.display()
+                        );
+                        let position = log.find(&command).unwrap();
+                        assert!(position >= previous);
+                        previous = position;
+                    }
+                    if let Some(check) = log.find("(check-sat)") {
+                        assert!(previous < check);
+                    }
+                }
+            }
+            assert!(solver_logs >= 2);
+        }
+    }
+}
+
+#[test]
+fn resident_rejects_options_that_break_scopes_or_smuggle_commands() {
+    for setting in [
+        "incremental=false",
+        "global-declarations=true",
+        "single_check_query=true",
+        "random-seed=7) (assert false",
+        "incremental false) (set-option :random-seed=7",
+    ] {
+        let mut worker = Worker::start(SOURCE, &["--smt-option", setting]);
+        worker.finish(false);
+        assert!(worker.stderr().contains("resident"), "{}", worker.stderr());
+        assert!(!worker.dir.path().join("launches").exists());
+    }
+}
+
 // Compilation reports a failed recommends check as a warning, so a recheck of
 // the retained query reports one too. `invalid` is the right AIR verdict for an
 // unproved recommendation; only its severity was wrong.
