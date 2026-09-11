@@ -623,14 +623,53 @@ impl Server {
                     // this failure at, so a recommends recheck stays a warning.
                     let level = query.level;
                     set_rlimit(air, query.rlimit);
+                    // With replay on, each check saves its instantiations
+                    // under the query's ordinal in this solver.
+                    let replay_key = air.instantiation_replay().then(|| format!("q{local}"));
                     let diagnostics = QueryDiagnostics::default();
                     let start = Instant::now();
-                    let mut outcome = air.check_valid(
-                        &VirMessageInterface {},
-                        &diagnostics,
-                        &query.query,
-                        QueryContext::default(),
-                    );
+                    // Certificate first: once this query has saved
+                    // instantiations, check with them alone. `:only` lets no
+                    // strategy run, so the solver answers from the replayed
+                    // instances, each an instance of a formula this scope
+                    // asserts, and a valid answer is sound. Any other answer
+                    // is discarded, with its diagnostics, before the
+                    // ordinary check.
+                    let mut certified = None;
+                    if let Some(key) =
+                        replay_key.as_ref().filter(|key| air.has_saved_instantiations(key))
+                    {
+                        air.set_restore_instantiations(Some(key.clone()), true);
+                        let attempt = air.check_valid(
+                            &VirMessageInterface {},
+                            &QueryDiagnostics::default(),
+                            &query.query,
+                            QueryContext::default(),
+                        );
+                        air.set_restore_instantiations(None, false);
+                        drop(air.take_provenance());
+                        match attempt {
+                            ValidityResult::Valid(usage) => {
+                                certified = Some(ValidityResult::Valid(usage))
+                            }
+                            ValidityResult::TypeError(error) => {
+                                return fatal(&mut output, io::Error::other(error.to_string()));
+                            }
+                            ValidityResult::UnexpectedOutput(error) => {
+                                return fatal(&mut output, io::Error::other(error));
+                            }
+                            _ => air.finish_query(),
+                        }
+                    }
+                    let mut outcome = match certified {
+                        Some(outcome) => outcome,
+                        None => air.check_valid(
+                            &VirMessageInterface {},
+                            &diagnostics,
+                            &query.query,
+                            QueryContext::default(),
+                        ),
+                    };
                     // The response describes round zero. Later error searches
                     // replace AIR's provenance, even when their verdict differs.
                     let first_provenance = air.take_provenance();
@@ -767,6 +806,11 @@ impl Server {
                             )
                         })
                     });
+                    // Every path here came from a solver answer, so the save
+                    // has a result to read from.
+                    if let Some(key) = &replay_key {
+                        air.save_instantiations(key);
+                    }
                     air.finish_query();
                     send(
                         &mut output,

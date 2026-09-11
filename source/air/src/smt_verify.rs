@@ -649,6 +649,9 @@ pub(crate) fn smt_check_query<'ctx>(
     if !context.single_check_query {
         context.smt_log.log_push();
         context.push_name_scope();
+        if let Some((key, only)) = &context.restore_instantiations {
+            context.smt_log.log_restore_instantiations(key, *only);
+        }
     }
 
     let rlimit_count_1 = if matches!(context.solver, SmtSolver::Z3) {

@@ -76,8 +76,16 @@ impl Worker<ChildStdin> {
         Self::start_with_solver(source, options, DEFAULT_SOLVER_WRAPPER)
     }
 
+    fn start_with_env(source: &str, options: &[&str], envs: &[(&str, &str)]) -> Self {
+        let Spawned { mut child, dir, .. } =
+            spawn(source, options, false, DEFAULT_SOLVER_WRAPPER, envs);
+        let input = child.stdin.take().unwrap();
+        let stdout = child.stdout.take().unwrap();
+        Self::assemble(child, dir, input, Box::new(stdout))
+    }
+
     fn start_with_solver(source: &str, options: &[&str], solver_wrapper: &str) -> Self {
-        let Spawned { mut child, dir, .. } = spawn(source, options, false, solver_wrapper);
+        let Spawned { mut child, dir, .. } = spawn(source, options, false, solver_wrapper, &[]);
         let input = child.stdin.take().unwrap();
         let stdout = child.stdout.take().unwrap();
         Self::assemble(child, dir, input, Box::new(stdout))
@@ -87,7 +95,7 @@ impl Worker<ChildStdin> {
 impl Worker<UnixStream> {
     fn start_socket(source: &str, options: &[&str]) -> Self {
         let Spawned { mut child, dir, listener } =
-            spawn(source, options, true, DEFAULT_SOLVER_WRAPPER);
+            spawn(source, options, true, DEFAULT_SOLVER_WRAPPER, &[]);
         let stream = accept(listener.expect("socket transport binds a listener"), &mut child, &dir);
         let input = stream.try_clone().unwrap();
         Self::assemble(child, dir, input, Box::new(stream))
@@ -124,7 +132,13 @@ fn accept(listener: UnixListener, child: &mut Child, dir: &TempDir) -> UnixStrea
 
 const DEFAULT_SOLVER_WRAPPER: &str = "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$$\" >> \"$RESIDENT_LAUNCH_LOG\"\nexec \"$RESIDENT_SOLVER\" \"$@\"\n";
 
-fn spawn(source: &str, options: &[&str], socket: bool, solver_wrapper: &str) -> Spawned {
+fn spawn(
+    source: &str,
+    options: &[&str],
+    socket: bool,
+    solver_wrapper: &str,
+    envs: &[(&str, &str)],
+) -> Spawned {
     let dir = tempfile::tempdir().unwrap();
     let socket_path = dir.path().join("worker.sock");
     let listener = socket.then(|| UnixListener::bind(&socket_path).unwrap());
@@ -146,6 +160,7 @@ fn spawn(source: &str, options: &[&str], socket: bool, solver_wrapper: &str) -> 
         .env("VERUS_CVC5_PATH", wrapper)
         .env("RESIDENT_SOLVER", solver)
         .env("RESIDENT_LAUNCH_LOG", dir.path().join("launches"))
+        .envs(envs.iter().copied())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(fs::File::create(dir.path().join("stderr")).unwrap());
@@ -301,6 +316,56 @@ fn resident_rechecks_preserve_query_scopes_and_solver_process() {
     }
     assert!(checks >= 8, "expected initial checks and five resident rechecks, got {}", checks);
     eprintln!("one verifier process, one cvc5 launch, {checks} checks, balanced scopes");
+}
+
+/// With instantiation replay, every resident check saves its instantiations,
+/// and a recheck of a query with saved ones first tries them alone
+/// (`:only`), falling back to the ordinary check unless that proves the
+/// query. Replayed instances are instances of asserted quantifiers, so no
+/// verdict may change, including the failing query's.
+///
+/// Needs a cvc5 with `save-instantiations` (BasisResearch cvc5 branch
+/// `s2/inst-replay`), which the pinned release lacks; run it with
+/// `VERUS_CVC5_PATH` pointing there and `--ignored`.
+#[test]
+#[ignore = "needs a cvc5 with save-instantiations"]
+fn resident_instantiation_replay_keeps_verdicts() {
+    let mut worker = Worker::start_with_env(
+        SOURCE,
+        &["-V", "no-solver-version-check"],
+        &[("VERUS_RESIDENT_INST_REPLAY", "1")],
+    );
+    let ready = worker.receive();
+    assert_eq!(ready["event"], "ready");
+    let session = ready["session"].clone();
+    let checks = [
+        ("::failing", "invalid"),
+        ("::passing", "valid"),
+        ("::failing", "invalid"),
+        ("::passing", "valid"),
+        ("::passing", "valid"),
+    ];
+    for (name, expected) in checks {
+        let query = query_id(&ready, name);
+        let result = worker
+            .send(json!({"command": "check", "session": session, "bucket": 0, "query": query}));
+        assert_eq!(result["event"], "checked", "{result}");
+        assert_eq!(result["result"], expected, "{result}");
+    }
+    assert_eq!(worker.send(json!({"command": "close", "session": session}))["event"], "closed");
+    worker.finish(false);
+    let (mut saves, mut restores) = (0, 0);
+    for entry in fs::read_dir(worker.dir.path().join("logs")).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().is_some_and(|ext| ext == "smt2") {
+            let log = fs::read_to_string(path).unwrap();
+            saves += log.matches("(save-instantiations q").count();
+            restores += log.matches(":only)").count();
+        }
+    }
+    // One save per check; a certificate attempt for the three rechecks of a
+    // query that had already been checked in this session.
+    assert_eq!((saves, restores), (checks.len(), 3));
 }
 
 /// Each spawned context must survive initial verification and be reused even
