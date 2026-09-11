@@ -23,14 +23,17 @@ jobs:
   build:
     strategy:
       matrix:
-        build: [macos, linux]
+        build: [macos-arm64, linux-x86, linux-arm64]
         include:
-          - build: macos
+          - build: macos-arm64
             os: macos-14
             release_name: verus-arm64-macos
-          - build: linux
+          - build: linux-x86
             os: ubuntu-24.04
             release_name: verus-x86-linux
+          - build: linux-arm64
+            os: ubuntu-24.04-arm
+            release_name: verus-arm64-linux
 
     runs-on: ${{ matrix.os }}
 
