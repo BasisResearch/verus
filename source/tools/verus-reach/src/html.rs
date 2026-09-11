@@ -25,7 +25,7 @@ impl<'a> View<'a> {
         match self.dynamic {
             Some(d) if n.is_verified_exec() => d.true_reachable.contains(&n.id),
             Some(d) => d.static_reachable(self.graph, n),
-            None => self.graph.is_reachable(n),
+            None => self.graph.is_reachable_any(n),
         }
     }
 
@@ -33,7 +33,7 @@ impl<'a> View<'a> {
     fn nodes(&self) -> Vec<&'a Node> {
         match self.dynamic {
             Some(d) => d.nodes(self.graph).collect(),
-            None => self.graph.nodes.values().collect(),
+            None => self.graph.counted().collect(),
         }
     }
 }

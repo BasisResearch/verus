@@ -121,8 +121,8 @@ fn summary(reports: &[Report], graph: &Graph) -> String {
         n => writeln!(out, "roots: {n} functions").unwrap(),
     }
 
-    let fns: Vec<&Node> = graph.nodes.values().filter(|n| n.is_verified()).collect();
-    let reached: Vec<&Node> = fns.iter().copied().filter(|n| graph.is_reachable(n)).collect();
+    let fns: Vec<&Node> = graph.counted().filter(|n| n.is_verified()).collect();
+    let reached: Vec<&Node> = fns.iter().copied().filter(|n| graph.is_reachable_any(n)).collect();
     writeln!(
         out,
         "\nverified functions: {:>6}   reachable: {:>6}  ({}%)",
@@ -158,7 +158,7 @@ fn summary(reports: &[Report], graph: &Graph) -> String {
     let mut modules: BTreeMap<&str, [usize; 8]> = BTreeMap::new();
     for f in &fns {
         let m = modules.entry(&f.module).or_default();
-        let hit = graph.is_reachable(f) as usize;
+        let hit = graph.is_reachable_any(f) as usize;
         m[0] += hit;
         m[1] += 1;
         m[2] += hit * loc(f);
@@ -177,7 +177,8 @@ fn summary(reports: &[Report], graph: &Graph) -> String {
         .unwrap();
     }
 
-    let unreachable: Vec<&Node> = fns.iter().copied().filter(|n| !graph.is_reachable(n)).collect();
+    let unreachable: Vec<&Node> =
+        fns.iter().copied().filter(|n| !graph.is_reachable_any(n)).collect();
     if !unreachable.is_empty() {
         writeln!(out, "\nunreachable verified functions:").unwrap();
     }
@@ -191,8 +192,8 @@ fn summary(reports: &[Report], graph: &Graph) -> String {
 fn lcov(graph: &Graph, only: Only) -> String {
     use lcov::report::section::{function, line};
     let mut report = lcov::Report::new();
-    for n in graph.nodes.values().filter(|n| only.includes(n)) {
-        let hits = graph.is_reachable(n) as u64;
+    for n in graph.counted().filter(|n| only.includes(n)) {
+        let hits = graph.is_reachable_any(n) as u64;
         let key = lcov::report::section::Key {
             test_name: String::new(),
             source_file: PathBuf::from(&n.span.file),

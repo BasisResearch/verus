@@ -159,6 +159,21 @@ fn load_file(path: &Path) -> Result<Report, String> {
     Ok(report)
 }
 
+/// See [`Graph::canonical`]: a `krate(test)::path` id stands for
+/// `krate::path` or `krate(bin)::path` when a report defines that id.
+fn canonical_ids(nodes: &BTreeMap<String, Node>) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    for id in nodes.keys() {
+        let canonical = id
+            .split_once("(test)::")
+            .map(|(krate, rest)| [format!("{krate}::{rest}"), format!("{krate}(bin)::{rest}")])
+            .and_then(|candidates| candidates.into_iter().find(|c| nodes.contains_key(c)))
+            .unwrap_or_else(|| id.clone());
+        map.insert(id.clone(), canonical);
+    }
+    map
+}
+
 /// How to pick the roots of the reachability analysis.
 #[derive(Default)]
 pub struct Roots {
@@ -181,6 +196,11 @@ pub struct Graph {
     pub nodes: BTreeMap<String, Node>,
     /// Every edge of every crate
     edges: Vec<Edge>,
+    /// Id → the id the function is counted under. A crate compiled both
+    /// normally and in test mode (a library and its unit tests) reports its
+    /// functions twice, under `krate::` and `krate(test)::` ids; the copies
+    /// are the same source, so the non-test one stands for both.
+    pub canonical: HashMap<String, String>,
     pub roots: Vec<String>,
     /// Runs: reached from a root through calls only
     pub reachable: HashSet<String>,
@@ -242,11 +262,26 @@ impl Graph {
             }
         }
         let edges = reports.iter().flat_map(|r| r.edges.iter().cloned()).collect();
-        Ok(Graph { nodes, edges, roots: root_ids, reachable, used })
+        let canonical = canonical_ids(&nodes);
+        Ok(Graph { nodes, edges, canonical, roots: root_ids, reachable, used })
     }
 
     pub fn edges(&self) -> &[Edge] {
         &self.edges
+    }
+
+    /// The functions counted once: the canonical copy of each
+    pub fn counted(&self) -> impl Iterator<Item = &Node> + '_ {
+        self.nodes.values().filter(move |n| self.canonical.get(&n.id) == Some(&n.id))
+    }
+
+    /// Reachable through any copy of the function
+    pub fn is_reachable_any(&self, node: &Node) -> bool {
+        let canon = self.canonical.get(&node.id).unwrap_or(&node.id);
+        self.canonical
+            .iter()
+            .filter(|(_, c)| *c == canon)
+            .any(|(id, _)| self.nodes.get(id).map_or(false, |n| self.is_reachable(n)))
     }
 
     /// An exec function is reachable when it runs; a ghost function, when

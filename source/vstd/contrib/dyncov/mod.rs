@@ -143,8 +143,10 @@ fn install_atexit() {
 
 /// A process that is killed (a test cluster's server, a fuzz target on a
 /// timeout) never reaches `atexit`; a background thread flushes the
-/// counters every `VERUS_DYNCOV_FLUSH_SECS` seconds (default 2, 0 to
-/// disable) so that at most that much of the run is lost.
+/// counters every `VERUS_DYNCOV_FLUSH_SECS` seconds (default 1, 0 to
+/// disable) so that at most that much of the run is lost, and on SIGTERM
+/// it flushes and exits, so a harness that terminates instead of killing
+/// loses nothing.
 fn install_periodic_flush() {
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
@@ -152,28 +154,62 @@ fn install_periodic_flush() {
             return;
         }
         let secs: u64 =
-            std::env::var("VERUS_DYNCOV_FLUSH_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(2);
-        if secs == 0 {
-            return;
-        }
+            std::env::var("VERUS_DYNCOV_FLUSH_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(1);
+        install_term_handler();
         let _ = std::thread::Builder::new().name("dyncov-flush".into()).spawn(move || {
+            let tick = std::time::Duration::from_millis(10);
+            let mut waited = std::time::Duration::ZERO;
             loop {
-                std::thread::sleep(std::time::Duration::from_secs(secs));
-                flush();
+                std::thread::sleep(tick);
+                waited += tick;
+                if TERM_REQUESTED.load(std::sync::atomic::Ordering::SeqCst) {
+                    // Asked to stop: write the counters, then die the way
+                    // the signal would have made us
+                    flush();
+                    std::process::exit(143);
+                }
+                if secs > 0 && waited >= std::time::Duration::from_secs(secs) {
+                    waited = std::time::Duration::ZERO;
+                    flush();
+                }
             }
         });
     });
 }
 
+static TERM_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// SIGTERM (Unix) sets a flag the flush thread acts on: a process that a
+/// harness stops with SIGTERM instead of SIGKILL keeps its profile. The
+/// handler itself only stores the flag, which is async-signal-safe.
+#[cfg(unix)]
+fn install_term_handler() {
+    extern "C" {
+        fn signal(signum: i32, handler: usize) -> usize;
+    }
+    extern "C" fn on_term(_: i32) {
+        TERM_REQUESTED.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+    const SIGTERM: i32 = 15;
+    // SAFETY: `signal` is provided by the C runtime std links against; the
+    // handler is an `extern "C" fn` that only stores an atomic.
+    unsafe {
+        signal(SIGTERM, on_term as usize);
+    }
+}
+
+#[cfg(not(unix))]
+fn install_term_handler() {}
+
 /// Flushes from the calling thread when the counters have been changing
-/// and `VERUS_DYNCOV_FLUSH_MS` (default 250) has passed since the last
+/// and `VERUS_DYNCOV_FLUSH_MS` (default 100) has passed since the last
 /// flush: a busy process that is then killed loses at most that much.
 fn flush_on_activity() {
     use std::sync::atomic::{AtomicU64, Ordering};
     static CALLS: AtomicU64 = AtomicU64::new(0);
     static LAST: AtomicU64 = AtomicU64::new(0);
     static INTERVAL: RwLock<Option<u64>> = RwLock::new(None);
-    if CALLS.fetch_add(1, Ordering::Relaxed) % 256 != 0 {
+    if CALLS.fetch_add(1, Ordering::Relaxed) % 16 != 0 {
         return;
     }
     let interval = {
@@ -187,7 +223,7 @@ fn flush_on_activity() {
                     std::env::var("VERUS_DYNCOV_FLUSH_MS")
                         .ok()
                         .and_then(|s| s.parse().ok())
-                        .unwrap_or(250)
+                        .unwrap_or(100)
                 };
                 *INTERVAL.write().unwrap_or_else(|e| e.into_inner()) = Some(v);
                 v

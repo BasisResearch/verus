@@ -176,30 +176,6 @@ pub struct Exclusion {
     pub tainted: u64,
 }
 
-/// A crate compiled both normally and in test mode (a library and its
-/// unit tests) reports its functions twice, under `krate::` and
-/// `krate(test)::` ids. The copies are the same source, so the reporter
-/// counts them once: each id maps to a canonical one, the non-test copy
-/// when there is one.
-pub fn canonical_ids(graph: &Graph) -> HashMap<String, String> {
-    let mut by_span: HashMap<(&str, usize, &str), Vec<&Node>> = HashMap::new();
-    for n in graph.nodes.values() {
-        by_span.entry((n.span.file.as_str(), n.span.start_line, n.name())).or_default().push(n);
-    }
-    let mut map = HashMap::new();
-    for nodes in by_span.values() {
-        let canonical = nodes
-            .iter()
-            .min_by_key(|n| (n.id.contains("(test)::"), n.id.as_str()))
-            .map(|n| n.id.clone())
-            .unwrap();
-        for n in nodes {
-            map.insert(n.id.clone(), canonical.clone());
-        }
-    }
-    map
-}
-
 /// The dynamic sets, over the static graph.
 pub struct Dynamic {
     /// Id → canonical id (see [`canonical_ids`])
@@ -258,7 +234,7 @@ impl Dynamic {
                 .max_by_key(|n| n.span.start_line)
         };
 
-        let canonical = canonical_ids(graph);
+        let canonical = graph.canonical.clone();
         let mut profiled: BTreeMap<String, FnProfile> = BTreeMap::new();
         let mut unmatched = vec![];
         let mut key_to_id: HashMap<String, String> = HashMap::new();
@@ -346,15 +322,12 @@ impl Dynamic {
 
     /// The nodes counted once: every canonical node
     pub fn nodes<'a>(&'a self, graph: &'a Graph) -> impl Iterator<Item = &'a Node> + 'a {
-        graph.nodes.values().filter(move |n| self.canonical.get(&n.id) == Some(&n.id))
+        graph.counted()
     }
 
     /// Statically reachable through any of its copies
     pub fn static_reachable(&self, graph: &Graph, node: &Node) -> bool {
-        self.canonical
-            .iter()
-            .filter(|(_, c)| **c == node.id)
-            .any(|(id, _)| graph.nodes.get(id).map_or(false, |n| graph.is_reachable(n)))
+        graph.is_reachable_any(node)
     }
 
     /// The hit count LCOV shows: calls with a precondition that was not

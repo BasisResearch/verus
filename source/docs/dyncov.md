@@ -32,10 +32,12 @@ function the tests call is in S as well as in D.
 
 The instrumented program writes one JSON profile per process to
 `$VERUS_DYNCOV_OUT` (a directory, or a file prefix) when it exits,
-including through `std::process::exit`, and while it runs every
-`VERUS_DYNCOV_FLUSH_SECS` seconds (default 2) and, when busy, every
-`VERUS_DYNCOV_FLUSH_MS` milliseconds (default 250), so that a process that
-gets killed (a test cluster's server) loses at most that much; a test binary is one
+including through `std::process::exit` and on SIGTERM (the profile is
+written, then the process exits), and while it runs every
+`VERUS_DYNCOV_FLUSH_SECS` seconds (default 1) and, when busy, every
+`VERUS_DYNCOV_FLUSH_MS` milliseconds (default 100), so that a process that
+gets SIGKILLed (a test cluster's server) loses at most that much; stop such
+processes with SIGTERM to lose nothing; a test binary is one
 process per run, and the reporter sums every profile it is given.
 Long-running programs and fuzz targets can also call
 `vstd::contrib::dyncov::flush()` themselves.
