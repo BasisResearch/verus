@@ -116,7 +116,7 @@ pub fn write(
             "page": "file",
             "up": up,
             "file": { "path": file, "href": "", "functions": functions, "source": source },
-            "total": total(&files, graph),
+            "totals": { "all": total(&files, graph, |_| true), "exec": total(&files, graph, |n| n.mode == "exec") },
         }));
         write(&rel, page(data, &format!("{file} · {title}")))?;
     }
@@ -124,9 +124,10 @@ pub fn write(
     write(Path::new("index.html"), page(data, title))
 }
 
-/// The run's totals, the one denominator every page shows
-fn total(files: &BTreeMap<&str, Vec<&Node>>, graph: &Graph) -> Value {
-    let all: Vec<&Node> = files.values().flatten().copied().collect();
+/// The run's totals over the functions `scope` selects, the one
+/// denominator every page shows
+fn total(files: &BTreeMap<&str, Vec<&Node>>, graph: &Graph, scope: fn(&Node) -> bool) -> Value {
+    let all: Vec<&Node> = files.values().flatten().copied().filter(|n| scope(n)).collect();
     let fns = all.len();
     let verified = all.iter().filter(|n| n.is_verified()).count();
     let reach = all.iter().filter(|n| graph.is_reachable(n)).count();
@@ -194,13 +195,24 @@ mod tests {
         assert_eq!(by_name("wired")["reachable"], true);
         assert_eq!(by_name("spec_inc")["reachable"], false);
         // 6 verified, 4 reachable; main and inc reachable but unverified
-        assert_eq!(x["total"]["verified"], 6);
-        assert_eq!(x["total"]["vreach"], 4);
-        assert_eq!(x["total"]["reach"], 6);
-        assert_eq!(x["total"]["fns"], 8);
-        assert_eq!(x["total"]["dead"], 33);
-        assert_eq!(x["total"]["share"], 66);
-        assert_eq!(x["total"]["proof"], json!([1, 1]));
+        let all = &x["totals"]["all"];
+        assert_eq!(all["verified"], 6);
+        assert_eq!(all["vreach"], 4);
+        assert_eq!(all["reach"], 6);
+        assert_eq!(all["fns"], 8);
+        assert_eq!(all["dead"], 33);
+        assert_eq!(all["share"], 66);
+        assert_eq!(all["proof"], json!([1, 1]));
+        // Exec only: wired, helper, verified::inc verified; inc and main not
+        let exec = &x["totals"]["exec"];
+        assert_eq!(exec["fns"], 5);
+        assert_eq!(exec["verified"], 3);
+        assert_eq!(exec["vreach"], 2);
+        assert_eq!(exec["reach"], 4);
+        assert_eq!(exec["dead"], 33);
+        assert_eq!(exec["share"], 50);
+        assert_eq!(exec["all"], 40);
+        assert_eq!(exec["proof"], json!([0, 0]));
         assert!(!out.path().join("src/src/main.rs.html").exists());
     }
 
