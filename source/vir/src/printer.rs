@@ -136,12 +136,42 @@ impl<A: ToDebugSNode> ToDebugSNode for std::sync::Arc<A> {
     }
 }
 
+/// A string as a quoted atom. Inside the quotes an atom may hold printable
+/// ASCII, with `"` and `\` escaped; control characters are spelled out.
+fn string_atom(s: &str) -> String {
+    let mut atom = String::from("\"");
+    for c in s.chars() {
+        match c {
+            '"' => atom.push_str("\\\""),
+            '\\' => atom.push_str("\\\\"),
+            '\n' => atom.push_str("\\n"),
+            '\t' => atom.push_str("\\t"),
+            '\r' => atom.push_str("\\r"),
+            ' '..='~' => atom.push(c),
+            _ => atom.push_str(&format!("\\x{:02x}", c as u32)),
+        }
+    }
+    atom.push('"');
+    atom
+}
+
 impl ToDebugSNode for String {
     fn to_node(&self, _opts: &ToDebugSNodeOpts) -> Node {
         Node::Atom(match self.is_ascii() {
-            true => format!("\"{}\"", self.replace("\n", "\\n")),
+            true => string_atom(self),
             false => "non_ascii_string".to_string(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn strings_with_quotes_and_control_characters_are_valid_atoms() {
+        let s = "if [ ! -z \"$(cat x)\" ]; then\n\texit 0; fi \\ \u{1}";
+        let atom = super::string_atom(s);
+        assert!(sise::check_atom(&atom), "{atom}");
+        assert_eq!(atom, "\"if [ ! -z \\\"$(cat x)\\\" ]; then\\n\\texit 0; fi \\\\ \\x01\"");
     }
 }
 
