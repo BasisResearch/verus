@@ -19,6 +19,7 @@ members = [
   "tools/internals_interface",
   "tools/line_count",
   "tools/verus-reach",
+  "tools/dyncov-runtime-tests",
 ]
 exclude = [
   "vstd",

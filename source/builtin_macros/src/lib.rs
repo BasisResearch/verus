@@ -158,6 +158,25 @@ pub(crate) fn cfg_erase() -> EraseGhost {
     EraseGhost::EraseAll
 }
 
+/// Whether `--cfg verus_dyncov` is set on the crate being compiled: the
+/// `verus!` macro then instruments exec code for dynamic coverage.
+#[cfg(verus_keep_ghost)]
+pub(crate) fn cfg_dyncov() -> bool {
+    static CFG_DYNCOV: OnceLock<bool> = OnceLock::new();
+    *CFG_DYNCOV.get_or_init(|| {
+        let ts: proc_macro::TokenStream = quote::quote! { ::core::cfg!(verus_dyncov) }.into();
+        match ts.expand_expr() {
+            Ok(name) => name.to_string() == "true",
+            Err(_) => false,
+        }
+    })
+}
+
+#[cfg(not(verus_keep_ghost))]
+pub(crate) fn cfg_dyncov() -> bool {
+    false
+}
+
 #[derive(Clone, Copy)]
 enum VstdKind {
     /// The current crate is vstd.

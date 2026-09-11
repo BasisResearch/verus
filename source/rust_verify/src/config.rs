@@ -115,6 +115,9 @@ pub struct ArgsX {
     pub spinoff_all: bool,
     pub vstd: Vstd,
     pub compile: bool,
+    /// Compile with dynamic coverage instrumentation (`--cfg verus_dyncov`,
+    /// LLVM coverage); implies `compile`
+    pub dyncov: bool,
     pub solver_version_check: bool,
     pub version: bool,
     pub num_threads: usize,
@@ -167,6 +170,7 @@ impl ArgsX {
             spinoff_all: Default::default(),
             vstd: Vstd::Imported,
             compile: Default::default(),
+            dyncov: Default::default(),
             solver_version_check: Default::default(),
             version: Default::default(),
             num_threads: Default::default(),
@@ -409,6 +413,7 @@ pub fn parse_args_with_imports(
     const OPT_PROFILE: &str = "profile";
     const OPT_PROFILE_ALL: &str = "profile-all";
     const OPT_COMPILE: &str = "compile";
+    const OPT_DYNCOV: &str = "dyncov";
     const OPT_VERSION: &str = "version";
     const OPT_RECORD: &str = "record";
     const OPT_NUM_THREADS: &str = "num-threads";
@@ -588,6 +593,7 @@ pub fn parse_args_with_imports(
     );
     opts.optflag("", OPT_PROFILE_ALL, "Always collect and report prover performance data");
     opts.optflag("", OPT_COMPILE, "Run Rustc compiler after verification");
+    opts.optflag("", OPT_DYNCOV, "Compile (as --compile) with dynamic verified coverage: contracts are evaluated at run time and counted, and LLVM coverage is enabled; run the program with VERUS_DYNCOV_OUT set, then verus-reach --dynamic");
     opts.optopt(
         "",
         OPT_NUM_THREADS,
@@ -866,7 +872,8 @@ pub fn parse_args_with_imports(
             extended.contains_key(EXTENDED_CAPTURE_PROFILES)
         },
         spinoff_all: extended.contains_key(EXTENDED_SPINOFF_ALL),
-        compile: matches.opt_present(OPT_COMPILE),
+        compile: matches.opt_present(OPT_COMPILE) || matches.opt_present(OPT_DYNCOV),
+        dyncov: matches.opt_present(OPT_DYNCOV),
         vstd,
         solver_version_check: !extended.contains_key(EXTENDED_NO_SOLVER_VERSION_CHECK),
         version: matches.opt_present(OPT_VERSION),

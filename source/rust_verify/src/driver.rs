@@ -168,12 +168,20 @@ pub(crate) fn run_with_erase_macro_compile(
     mut rustc_args: Vec<String>,
     do_compile: bool,
     vstd: Vstd,
+    dyncov: bool,
 ) -> Result<(), ()> {
     let mut callbacks = CompilerCallbacksEraseMacro {
         do_compile,
         override_stability: matches!(vstd, Vstd::IsCore | Vstd::ImportedViaCore),
     };
     rustc_args.extend(["--cfg", "verus_only", "--cfg", "verus_keep_ghost"].map(|s| s.to_string()));
+    if dyncov {
+        // The `verus!` macro instruments contracts; LLVM counts the rest
+        rustc_args.extend(
+            ["--cfg", "verus_dyncov", "-C", "instrument-coverage", "-Z", "coverage-options=branch"]
+                .map(|s| s.to_string()),
+        );
+    }
     if matches!(vstd, Vstd::IsCore | Vstd::ImportedViaCore) {
         rustc_args.extend(["--cfg", "verus_verify_core"].map(|s| s.to_string()));
     } else if vstd == Vstd::NoVstd {
@@ -340,7 +348,12 @@ pub fn run(
             Ok(())
         } else {
             let do_compile = verifier.compile || verifier.via_cargo_args.is_some();
-            run_with_erase_macro_compile(rustc_args, do_compile, verifier.args.vstd)
+            run_with_erase_macro_compile(
+                rustc_args,
+                do_compile,
+                verifier.args.vstd,
+                verifier.args.dyncov,
+            )
         };
 
     let time2 = Instant::now();

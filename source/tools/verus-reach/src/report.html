@@ -141,6 +141,7 @@ table.cov tbody tr:hover td { background: color-mix(in srgb, var(--accent) 6%, t
   function bandInv(p) { return p === null ? "" : p <= 100 - HI ? "hi" : p <= 100 - MED ? "med" : "lo"; }
   function state(f) { return f.verified ? (f.reachable ? "vr" : "vd") : (f.reachable ? "ur" : "uu"); }
   var STATE_LABEL = { vr: "verified, reachable", vd: "verified, dead", ur: "reachable, unverified", uu: "unreachable, unverified" };
+  if (DATA.dynamic) STATE_LABEL = { vr: "verified, true reachable", vd: "verified, not true reachable", ur: "reachable, unverified", uu: "unreachable, unverified" };
   var STATE_ORDER = { vd: 0, ur: 1, vr: 2, uu: 3 };
 
   // What the counts range over: every function, or exec functions only.
@@ -250,7 +251,9 @@ table.cov tbody tr:hover td { background: color-mix(in srgb, var(--accent) 6%, t
     var h = '<header><h1>' + esc(DATA.title) + '</h1><dl class="meta">' +
       '<dt>Crates</dt><dd>' + esc(DATA.crates.join(", ")) + '</dd>' +
       '<dt>Roots</dt><dd class="mono">' + esc(roots) + '</dd>' +
-      '<dt>Sources</dt><dd class="mono">' + esc(DATA.src_root) + '</dd></dl></header>';
+      '<dt>Sources</dt><dd class="mono">' + esc(DATA.src_root) + '</dd>' +
+      (DATA.dynamic ? '<dt>Dynamic</dt><dd>a verified exec function is reachable only when it is <b>true verified reachable</b>: it ran on the workload, its precondition was never false, and it was never tainted by a false trusted ensures or assume; spec and proof functions and unverified code keep their static reachability</dd>' : '') +
+      '</dl></header>';
     h += '<div class="scope"><span class="label">Counting</span><span class="seg">' +
       '<button type="button" id="scope-all" data-scope="all" aria-pressed="' + (scope === "all") + '">exec + ghost</button>' +
       '<button type="button" id="scope-exec" data-scope="exec" aria-pressed="' + (scope === "exec") + '">exec only</button></span>' +
@@ -295,7 +298,7 @@ table.cov tbody tr:hover td { background: color-mix(in srgb, var(--accent) 6%, t
         ' <span class="mode">' + esc(fn.path) + '</span></td>' +
         '<td><span class="mode">' + esc(fn.mode) + '</span></td>' +
         '<td class="num">' + fn.start + (fn.end > fn.start ? "–" + fn.end : "") + '</td>' +
-        '<td><span class="state ' + st + '">' + STATE_LABEL[st] + '</span></td></tr>';
+        '<td><span class="state ' + st + '">' + STATE_LABEL[st] + '</span>' + (fn.dynamic ? ' <span class="muted">' + esc(fn.dynamic) + '</span>' : '') + '</td></tr>';
     });
     h += '</tbody></table></div></div></div>';
 

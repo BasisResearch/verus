@@ -1,0 +1,19 @@
+[package]
+name = "dyncov-runtime-tests"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Hosts the unit tests of `vstd::contrib::dyncov`, which cannot be run
+# through vstd's own build (vstd is compiled by Verus, not `cargo test`).
+# The runtime is included by path and is written to depend on nothing but
+# std and verus_builtin.
+
+[dependencies]
+verus_builtin = { path = "../../builtin" }
+
+[lib]
+path = "src/lib.rs"
+
+[lints]
+workspace = true

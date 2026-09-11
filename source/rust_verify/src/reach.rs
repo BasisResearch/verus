@@ -337,7 +337,17 @@ pub(crate) fn run<'tcx>(ctxt: &Context<'tcx>, krate: &Krate) -> Result<(), Strin
     };
 
     let dir = std::path::Path::new(ctxt.cmd_line_args.reach.as_ref().expect("--reach"));
-    let path = dir.join(report.file_name());
+    // A package's library and its binaries share a crate name, and in test
+    // mode also a crate type; the crate root's file stem tells them apart
+    let mut file_name = report.file_name();
+    if report.crate_type == "test" {
+        if let Some(stem) = tcx.sess.local_crate_source_file().and_then(|f| {
+            f.local_path().and_then(|p| p.file_stem().map(|s| s.to_string_lossy().into_owned()))
+        }) {
+            file_name = format!("{}.test-{stem}.json", report.krate);
+        }
+    }
+    let path = dir.join(file_name);
     let json = serde_json::to_string_pretty(&report).expect("serialize reach report");
     std::fs::create_dir_all(dir)
         .and_then(|()| std::fs::write(&path, json))

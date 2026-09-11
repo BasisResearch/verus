@@ -7,7 +7,11 @@
 //! crates and computes what is reachable from the chosen roots: which
 //! functions run, and which ghost functions (specs and proofs) the running
 //! code's contracts and proofs use. Coverage is the share of verified
-//! functions, exec and ghost alike, that are reachable.
+//! functions, exec and ghost alike, that are reachable. [`dyncov`] joins
+//! the run-time profiles of an instrumented build (`verus --dyncov`) with
+//! these reports.
+
+pub mod dyncov;
 
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
@@ -175,6 +179,8 @@ impl Roots {
 pub struct Graph {
     /// Every function of every crate, by id
     pub nodes: BTreeMap<String, Node>,
+    /// Every edge of every crate
+    edges: Vec<Edge>,
     pub roots: Vec<String>,
     /// Runs: reached from a root through calls only
     pub reachable: HashSet<String>,
@@ -235,7 +241,12 @@ impl Graph {
                 }
             }
         }
-        Ok(Graph { nodes, roots: root_ids, reachable, used })
+        let edges = reports.iter().flat_map(|r| r.edges.iter().cloned()).collect();
+        Ok(Graph { nodes, edges, roots: root_ids, reachable, used })
+    }
+
+    pub fn edges(&self) -> &[Edge] {
+        &self.edges
     }
 
     /// An exec function is reachable when it runs; a ghost function, when

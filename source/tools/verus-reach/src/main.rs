@@ -7,6 +7,13 @@
 //!                                 sources, rated by the share of verified
 //!                                 functions nothing reaches and the share
 //!                                 of reachable functions that are verified
+//!   verus-reach --dynamic PROFILES DIR...
+//!                                 the same, joined with the profiles of a
+//!                                 `verus --dyncov` run: a verified exec
+//!                                 function counts as reachable only when
+//!                                 it ran with its precondition holding and
+//!                                 untainted (add --diff, --spec-report,
+//!                                 --lcov, --html)
 //!
 //! Pass every crate's report (a directory of them, or files) so that calls
 //! across crates are followed.
@@ -15,8 +22,10 @@ mod html;
 
 use clap::Parser;
 use std::collections::BTreeMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fmt::Write;
 use std::path::PathBuf;
+use verus_reach::dyncov::{Dynamic, Violation};
 use verus_reach::{Graph, Node, Report, Roots};
 
 #[derive(Parser)]
@@ -56,6 +65,23 @@ struct Args {
     /// With --lcov, include only verified exec, spec, and proof functions
     #[arg(long)]
     only_verified: bool,
+    /// Dynamic coverage: profiles written by a `verus --dyncov` build
+    /// (files, or directories of `dyncov*.json`). The summary, --lcov and
+    /// --fail-under then report true verified reachable functions
+    #[arg(long = "dynamic", value_name = "PROFILE", value_delimiter = ',')]
+    dynamic: Vec<PathBuf>,
+    /// With --dynamic, an `llvm-cov export` JSON of the same run, to also
+    /// count the executed functions that are not verified
+    #[arg(long, requires = "dynamic")]
+    llvm_export: Option<PathBuf>,
+    /// With --dynamic, list the differences between the static and dynamic
+    /// sets instead of the summary
+    #[arg(long, requires = "dynamic")]
+    diff: bool,
+    /// With --dynamic, list every contract clause with its verdict counts
+    /// instead of the summary
+    #[arg(long, requires = "dynamic")]
+    spec_report: bool,
 }
 
 /// Which functions an LCOV trace covers.
@@ -183,6 +209,328 @@ fn lcov(graph: &Graph, only: Only) -> String {
     report.into_records().map(|record| format!("{record}\n")).collect()
 }
 
+fn dynamic_summary(
+    reports: &[Report],
+    graph: &Graph,
+    dynamic: &Dynamic,
+    llvm: Option<&BTreeSet<String>>,
+) -> String {
+    let mut out = String::new();
+    let crates: Vec<String> =
+        reports.iter().map(|r| format!("{} ({})", r.krate, r.crate_type)).collect();
+    writeln!(out, "crates: {}", crates.join(", ")).unwrap();
+    let fns: Vec<&Node> = dynamic.nodes(graph).filter(|n| n.is_verified_exec()).collect();
+    let v = fns.len();
+    let s = fns.iter().filter(|n| dynamic.static_reachable(graph, n)).count();
+    let d = dynamic.called.len();
+    let t = dynamic.true_reachable.len();
+    writeln!(out, "\nverified exec functions (V):        {v:>6}").unwrap();
+    writeln!(out, "statically reachable (S):           {s:>6}  ({}% of V)", pct(s, v)).unwrap();
+    writeln!(out, "called (D):                         {d:>6}  ({}% of V)", pct(d, v)).unwrap();
+    writeln!(out, "true verified reachable (T):        {t:>6}  ({}% of V)", pct(t, v)).unwrap();
+    writeln!(
+        out,
+        "(T: called, precondition never false, never tainted by a false trusted ensures or assume)"
+    )
+    .unwrap();
+    if let Some(executed) = llvm {
+        let all = graph.nodes.len();
+        writeln!(out, "executed functions (LLVM, any mode): {:>5} of {all}", executed.len())
+            .unwrap();
+    }
+
+    // (S, D, T, V) per module
+    let mut modules: BTreeMap<&str, [usize; 4]> = BTreeMap::new();
+    for f in &fns {
+        let m = modules.entry(&f.module).or_default();
+        m[3] += 1;
+        m[0] += dynamic.static_reachable(graph, f) as usize;
+        m[1] += dynamic.called.contains(&f.id) as usize;
+        m[2] += dynamic.true_reachable.contains(&f.id) as usize;
+    }
+    writeln!(out, "\nby module:").unwrap();
+    let width = modules.keys().map(|m| m.len()).max().unwrap_or(0);
+    for (module, [s, d, t, v]) in &modules {
+        writeln!(out, "  {module:width$}  S {s:>4}/{v:<4} D {d:>4}/{v:<4} T {t:>4}/{v:<4}")
+            .unwrap();
+    }
+
+    let not_true: Vec<&Node> =
+        fns.iter().copied().filter(|n| !dynamic.true_reachable.contains(&n.id)).collect();
+    if !not_true.is_empty() {
+        writeln!(out, "\nverified exec functions not in T:").unwrap();
+    }
+    for f in not_true {
+        let why = if let Some(ex) = dynamic.excluded.get(&f.id) {
+            let mut parts = vec![];
+            if !ex.violations.is_empty() {
+                parts.push(format!("precondition false at {} call site(s)", ex.violations.len()));
+            }
+            if ex.tainted > 0 {
+                parts.push(format!("tainted {} time(s)", ex.tainted));
+            }
+            parts.join(", ")
+        } else if dynamic.static_reachable(graph, f) {
+            "statically reachable, never called".to_string()
+        } else {
+            "unreachable".to_string()
+        };
+        writeln!(out, "  {}:{}   {}   ({why})", f.span.file, f.span.start_line, f.name()).unwrap();
+    }
+    out.push_str(&trust_findings(graph, dynamic));
+    out.push_str(&diagnostics(graph, dynamic, llvm));
+    out
+}
+
+fn trust_findings(graph: &Graph, dynamic: &Dynamic) -> String {
+    let mut out = String::new();
+    let trusted: Vec<(&Node, &verus_reach::dyncov::FnProfile)> = dynamic
+        .profiled
+        .iter()
+        .filter_map(|(id, f)| graph.nodes.get(id).map(|n| (n, f)))
+        .filter(|(n, f)| n.external_body && f.post.iter().sum::<u64>() > 0)
+        .collect();
+    if !trusted.is_empty() || !dynamic.trust_violations.is_empty() {
+        writeln!(out, "\ntrust findings:").unwrap();
+    }
+    for (n, f) in trusted {
+        writeln!(
+            out,
+            "  {}:{}   {}   ensures [true {}, unknown {}, false {}]",
+            n.span.file,
+            n.span.start_line,
+            n.name(),
+            f.post[0],
+            f.post[1],
+            f.post[2]
+        )
+        .unwrap();
+    }
+    for (source, count) in &dynamic.trust_violations {
+        let name = graph.nodes.get(source).map_or(source.clone(), |n| {
+            format!("{}:{}   {}", n.span.file, n.span.start_line, n.name())
+        });
+        writeln!(out, "  violated {count} time(s): {name}").unwrap();
+    }
+    for (site, counts) in &dynamic.assumes {
+        writeln!(
+            out,
+            "  {site}   [true {}, unknown {}, false {}]",
+            counts[0], counts[1], counts[2]
+        )
+        .unwrap();
+    }
+    out
+}
+
+fn diagnostics(graph: &Graph, dynamic: &Dynamic, llvm: Option<&BTreeSet<String>>) -> String {
+    let mut out = String::new();
+    let missed: Vec<&String> = dynamic
+        .called
+        .iter()
+        .filter(|id| !dynamic.static_reachable(graph, &graph.nodes[*id]))
+        .collect();
+    let mut lines = vec![];
+    for id in &dynamic.unmatched {
+        lines.push(format!("profile id matches no static function: {id}"));
+    }
+    for id in missed {
+        let n = &graph.nodes[id];
+        lines.push(format!(
+            "called but not statically reachable from the roots (a workload root the static graph lacks, e.g. a test, or a missed static edge): {}:{}   {}",
+            n.span.file,
+            n.span.start_line,
+            n.name()
+        ));
+    }
+    for (id, v) in &dynamic.lowering_disagreements {
+        if let Violation::LoweringDisagreement { site, caller, count } = v {
+            let n = &graph.nodes[id];
+            lines.push(format!(
+                "LOWERING DISAGREEMENT: {} precondition false {count} time(s) at {site} in verified {caller}",
+                n.name()
+            ));
+        }
+    }
+    if let Some(executed) = llvm {
+        for id in &dynamic.called {
+            if !executed.contains(id) {
+                let n = &graph.nodes[id];
+                lines.push(format!(
+                    "counted by dyncov but not by LLVM: {}:{}   {}",
+                    n.span.file,
+                    n.span.start_line,
+                    n.name()
+                ));
+            }
+        }
+    }
+    if !lines.is_empty() {
+        writeln!(out, "\ndiagnostics:").unwrap();
+        for l in lines {
+            writeln!(out, "  {l}").unwrap();
+        }
+    }
+    out
+}
+
+fn dynamic_diff(graph: &Graph, dynamic: &Dynamic) -> String {
+    let mut out = String::new();
+    let mut callers: HashMap<&str, Vec<&str>> = HashMap::new();
+    fn canon<'a>(dynamic: &'a Dynamic, id: &'a str) -> &'a str {
+        dynamic.canonical.get(id).map_or(id, |c| c.as_str())
+    }
+    for edge in graph.edges() {
+        if edge.kind == verus_reach::EdgeKind::Call {
+            callers.entry(canon(dynamic, &edge.to)).or_default().push(canon(dynamic, &edge.from));
+        }
+    }
+    let fns: Vec<&Node> = dynamic.nodes(graph).filter(|n| n.is_verified_exec()).collect();
+    let loc = |n: &Node| format!("{}:{}   {}", n.span.file, n.span.start_line, n.name());
+
+    let s_not_d: Vec<&Node> = fns
+        .iter()
+        .copied()
+        .filter(|n| dynamic.static_reachable(graph, n) && !dynamic.called.contains(&n.id))
+        .collect();
+    let (gap, over): (Vec<&Node>, Vec<&Node>) = s_not_d.into_iter().partition(|n| {
+        callers.get(n.id.as_str()).map_or(false, |cs| {
+            cs.iter().any(|c| dynamic.called.contains(*c) || graph.roots.iter().any(|r| r == c))
+        })
+    });
+    writeln!(
+        out,
+        "S \\ D, never called with an executed static caller (workload gap): {}",
+        gap.len()
+    )
+    .unwrap();
+    for n in gap {
+        writeln!(out, "  {}", loc(n)).unwrap();
+    }
+    writeln!(out, "\nS \\ D, never called and no executed static caller (likely static over-approximation): {}", over.len()).unwrap();
+    for n in over {
+        writeln!(out, "  {}", loc(n)).unwrap();
+    }
+    let violated: Vec<(&Node, &verus_reach::dyncov::Exclusion)> = dynamic
+        .excluded
+        .iter()
+        .filter(|(_, ex)| !ex.violations.is_empty())
+        .map(|(id, ex)| (&graph.nodes[id], ex))
+        .collect();
+    writeln!(out, "\nD \\ T, precondition violated: {}", violated.len()).unwrap();
+    for (n, ex) in violated {
+        writeln!(out, "  {}", loc(n)).unwrap();
+        for v in &ex.violations {
+            if let Violation::Violation { site, caller, count } = v {
+                writeln!(
+                    out,
+                    "      {count} time(s) at {site} in {}",
+                    caller.as_deref().unwrap_or("unknown caller")
+                )
+                .unwrap();
+            }
+        }
+    }
+    let tainted: Vec<(&Node, u64)> = dynamic
+        .excluded
+        .iter()
+        .filter(|(_, ex)| ex.tainted > 0)
+        .map(|(id, ex)| (&graph.nodes[id], ex.tainted))
+        .collect();
+    writeln!(out, "\nD \\ T, tainted: {}", tainted.len()).unwrap();
+    for (n, count) in tainted {
+        writeln!(out, "  {}   {count} time(s)", loc(n)).unwrap();
+    }
+    if !dynamic.trust_violations.is_empty() {
+        writeln!(out, "  sources:").unwrap();
+        for (source, count) in &dynamic.trust_violations {
+            let name = graph.nodes.get(source).map_or(source.clone(), |n| loc(n));
+            writeln!(out, "      {name}   false {count} time(s)").unwrap();
+        }
+    }
+    let d_not_s: Vec<&Node> = fns
+        .iter()
+        .copied()
+        .filter(|n| dynamic.called.contains(&n.id) && !dynamic.static_reachable(graph, n))
+        .collect();
+    writeln!(
+        out,
+        "\nD \\ S, called but not statically reachable from the roots (workload roots the static graph lacks, or missed static edges): {}",
+        d_not_s.len()
+    )
+    .unwrap();
+    for n in d_not_s {
+        writeln!(out, "  {}", loc(n)).unwrap();
+    }
+    out
+}
+
+fn spec_report(graph: &Graph, dynamic: &Dynamic) -> String {
+    let mut out = String::new();
+    writeln!(out, "contract clauses, [true, unknown, false] per evaluation:").unwrap();
+    for (id, f) in &dynamic.profiled {
+        let Some(n) = graph.nodes.get(id) else { continue };
+        if f.clauses.is_empty() && f.pre_unknown_reasons.is_empty() {
+            continue;
+        }
+        writeln!(out, "  {}:{}   {}   calls {}", n.span.file, n.span.start_line, n.name(), f.calls)
+            .unwrap();
+        for (clause, c) in &f.clauses {
+            writeln!(out, "      {clause:<8} [{}, {}, {}]", c[0], c[1], c[2]).unwrap();
+        }
+        for (reason, count) in &f.pre_unknown_reasons {
+            writeln!(out, "      requires unknown: {reason} ({count})").unwrap();
+        }
+        for (reason, count) in &f.post_unknown_reasons {
+            writeln!(out, "      ensures unknown: {reason} ({count})").unwrap();
+        }
+    }
+    out
+}
+
+fn dynamic_lcov(graph: &Graph, dynamic: &Dynamic, only: Only) -> String {
+    use lcov::report::section::{function, line};
+    let mut report = lcov::Report::new();
+    for n in dynamic.nodes(graph).filter(|n| only.includes(n)) {
+        let hits = if n.is_verified_exec() {
+            dynamic.hits(n)
+        } else if n.is_ghost() {
+            dynamic.static_reachable(graph, n) as u64
+        } else {
+            dynamic.profiled.get(&n.id).map_or(0, |f| f.calls)
+        };
+        let key = lcov::report::section::Key {
+            test_name: String::new(),
+            source_file: PathBuf::from(&n.span.file),
+        };
+        let section = report.sections.entry(key).or_default();
+        section.functions.insert(
+            function::Key { name: n.id.clone() },
+            function::Value { start_line: Some(n.span.start_line as u32), count: hits },
+        );
+        for l in n.span.start_line..=n.span.end_line {
+            let entry = section.lines.entry(line::Key { line: l as u32 }).or_default();
+            entry.count = entry.count.max(hits);
+        }
+        // Each contract clause is a branch point on its own line: branch 0
+        // is the clause holding, branch 1 the clause failing, branch 2 the
+        // clause being unknown
+        if let Some(f) = dynamic.profiled.get(&n.id) {
+            for (i, (clause, counts)) in f.clauses.iter().enumerate() {
+                let Some((_, line)) = clause.split_once('@') else { continue };
+                let Ok(line) = line.parse::<u32>() else { continue };
+                for (branch, taken) in [(0, counts[0]), (1, counts[2]), (2, counts[1])] {
+                    section.branches.insert(
+                        lcov::report::section::branch::Key { line, block: i as u32, branch },
+                        lcov::report::section::branch::Value { taken: Some(taken) },
+                    );
+                }
+            }
+        }
+    }
+    report.into_records().map(|record| format!("{record}\n")).collect()
+}
+
 fn below_threshold(graph: &Graph, threshold: u64) -> Option<String> {
     let (reached, total) = graph.coverage();
     let pct = pct(reached, total);
@@ -217,8 +565,52 @@ fn main() {
     } else {
         Only::All
     };
+    if !args.dynamic.is_empty() {
+        let profile = verus_reach::dyncov::load_profiles(&args.dynamic).unwrap_or_else(|e| fail(e));
+        let dynamic = Dynamic::new(&graph, &profile);
+        let llvm = args.llvm_export.as_ref().map(|path| {
+            let text = std::fs::read_to_string(path)
+                .unwrap_or_else(|e| fail(format!("{}: {e}", path.display())));
+            let json: serde_json::Value = serde_json::from_str(&text)
+                .unwrap_or_else(|e| fail(format!("{}: {e}", path.display())));
+            verus_reach::dyncov::llvm_executed(&graph, &json).unwrap_or_else(|e| fail(e))
+        });
+        if let Some(out) = &args.html {
+            html::write(&reports, &graph, Some(&dynamic), &args.src, &args.title, out)
+                .unwrap_or_else(|e| fail(e));
+            eprintln!("verus-reach: wrote {}", out.join("index.html").display());
+        } else {
+            let text = if args.lcov {
+                dynamic_lcov(&graph, &dynamic, only)
+            } else if args.diff {
+                dynamic_diff(&graph, &dynamic)
+            } else if args.spec_report {
+                spec_report(&graph, &dynamic)
+            } else {
+                dynamic_summary(&reports, &graph, &dynamic, llvm.as_ref())
+            };
+            print!("{text}");
+        }
+        if !dynamic.lowering_disagreements.is_empty() {
+            fail(format!(
+                "{} lowering disagreement(s): a precondition Verus proved was observed false (see diagnostics)",
+                dynamic.lowering_disagreements.len()
+            ));
+        }
+        if let Some(threshold) = args.fail_under {
+            let (t, v) = dynamic.coverage(&graph);
+            let pct = pct(t, v);
+            if pct < threshold {
+                fail(format!(
+                    "{t} of {v} verified exec functions true verified reachable ({pct}%), below --fail-under {threshold}"
+                ));
+            }
+        }
+        return;
+    }
     if let Some(out) = &args.html {
-        html::write(&reports, &graph, &args.src, &args.title, out).unwrap_or_else(|e| fail(e));
+        html::write(&reports, &graph, None, &args.src, &args.title, out)
+            .unwrap_or_else(|e| fail(e));
         eprintln!("verus-reach: wrote {}", out.join("index.html").display());
     } else {
         let text = if args.lcov { lcov(&graph, only) } else { summary(&reports, &graph) };

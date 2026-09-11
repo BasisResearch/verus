@@ -8,7 +8,35 @@
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use verus_reach::dyncov::Dynamic;
 use verus_reach::{Graph, Node, Report};
+
+/// How a function's reachability is judged: statically, or, with the
+/// profiles of a `verus --dyncov` run, dynamically for verified exec code
+/// (in T: called, precondition never false, never tainted) and statically
+/// through any copy of the function for everything else.
+pub struct View<'a> {
+    pub graph: &'a Graph,
+    pub dynamic: Option<&'a Dynamic>,
+}
+
+impl<'a> View<'a> {
+    fn reachable(&self, n: &Node) -> bool {
+        match self.dynamic {
+            Some(d) if n.is_verified_exec() => d.true_reachable.contains(&n.id),
+            Some(d) => d.static_reachable(self.graph, n),
+            None => self.graph.is_reachable(n),
+        }
+    }
+
+    /// The nodes counted once (a crate's test build duplicates its functions)
+    fn nodes(&self) -> Vec<&'a Node> {
+        match self.dynamic {
+            Some(d) => d.nodes(self.graph).collect(),
+            None => self.graph.nodes.values().collect(),
+        }
+    }
+}
 
 const TEMPLATE: &str = include_str!("report.html");
 
@@ -22,16 +50,45 @@ fn synthesized(n: &Node) -> bool {
         || n.name().ends_with("__VERUS_REVEAL_INTERNAL__")
 }
 
-fn function(n: &Node, graph: &Graph) -> Value {
-    json!({
+fn function(n: &Node, view: &View) -> Value {
+    let mut f = json!({
         "name": n.name(),
         "path": n.def_path,
         "mode": n.mode,
         "start": n.span.start_line,
         "end": n.span.end_line,
         "verified": n.is_verified(),
-        "reachable": graph.is_reachable(n),
-    })
+        "reachable": view.reachable(n),
+    });
+    if let Some(d) = view.dynamic {
+        if n.is_verified_exec() {
+            let p = d.profiled.get(&n.id);
+            let mut why = if d.static_reachable(view.graph, n) {
+                "statically reachable".to_string()
+            } else {
+                "statically unreachable".to_string()
+            };
+            match p {
+                Some(p) => {
+                    why.push_str(&format!(", called {} time(s)", p.calls));
+                    if p.pre.iter().sum::<u64>() > 0 {
+                        why.push_str(&format!(
+                            ", precondition true {} / unknown {} / false {}",
+                            p.pre[0], p.pre[1], p.pre[2]
+                        ));
+                    }
+                }
+                None => why.push_str(", never called"),
+            }
+            if let Some(ex) = d.excluded.get(&n.id) {
+                if ex.tainted > 0 {
+                    why.push_str(&format!(", tainted {} time(s)", ex.tainted));
+                }
+            }
+            f["dynamic"] = json!(why);
+        }
+    }
+    f
 }
 
 /// Where a file's page goes, under the output directory
@@ -50,9 +107,9 @@ fn page_path(file: &str) -> PathBuf {
 }
 
 /// The functions of every file, by file, with the labels the pages need
-pub fn files<'a>(graph: &'a Graph) -> BTreeMap<&'a str, Vec<&'a Node>> {
+pub fn files<'a>(view: &View<'a>) -> BTreeMap<&'a str, Vec<&'a Node>> {
     let mut files: BTreeMap<&str, Vec<&Node>> = BTreeMap::new();
-    for n in graph.nodes.values().filter(|n| !synthesized(n)) {
+    for n in view.nodes().into_iter().filter(|n| !synthesized(n)) {
         files.entry(&n.span.file).or_default().push(n);
     }
     files
@@ -72,11 +129,13 @@ fn page(data: Value, title: &str) -> String {
 pub fn write(
     reports: &[Report],
     graph: &Graph,
+    dynamic: Option<&Dynamic>,
     src: &Path,
     title: &str,
     out: &Path,
 ) -> Result<(), String> {
-    let files = files(graph);
+    let view = View { graph, dynamic };
+    let files = files(&view);
     let crates: Vec<String> =
         reports.iter().map(|r| format!("{} ({})", r.krate, r.crate_type)).collect();
     let roots: Vec<&str> = graph.roots.iter().map(|id| graph.nodes[id].def_path.as_str()).collect();
@@ -86,6 +145,7 @@ pub fn write(
         "roots": roots,
         "src_root": src.display().to_string(),
         "file_count": files.len(),
+        "dynamic": dynamic.is_some(),
     });
     let with = |mut extra: Value| {
         for (k, v) in common.as_object().unwrap() {
@@ -103,7 +163,7 @@ pub fn write(
 
     let mut index_files = vec![];
     for (file, nodes) in &files {
-        let functions: Vec<Value> = nodes.iter().map(|n| function(n, graph)).collect();
+        let functions: Vec<Value> = nodes.iter().map(|n| function(n, &view)).collect();
         let rel = page_path(file);
         index_files
             .push(json!({ "path": file, "href": rel.to_string_lossy(), "functions": functions }));
@@ -116,7 +176,7 @@ pub fn write(
             "page": "file",
             "up": up,
             "file": { "path": file, "href": "", "functions": functions, "source": source },
-            "totals": { "all": total(&files, graph, |_| true), "exec": total(&files, graph, |n| n.mode == "exec") },
+            "totals": { "all": total(&files, &view, |_| true), "exec": total(&files, &view, |n| n.mode == "exec") },
         }));
         write(&rel, page(data, &format!("{file} · {title}")))?;
     }
@@ -126,15 +186,15 @@ pub fn write(
 
 /// The run's totals over the functions `scope` selects, the one
 /// denominator every page shows
-fn total(files: &BTreeMap<&str, Vec<&Node>>, graph: &Graph, scope: fn(&Node) -> bool) -> Value {
+fn total(files: &BTreeMap<&str, Vec<&Node>>, view: &View, scope: fn(&Node) -> bool) -> Value {
     let all: Vec<&Node> = files.values().flatten().copied().filter(|n| scope(n)).collect();
     let fns = all.len();
     let verified = all.iter().filter(|n| n.is_verified()).count();
-    let reach = all.iter().filter(|n| graph.is_reachable(n)).count();
-    let vreach = all.iter().filter(|n| n.is_verified() && graph.is_reachable(n)).count();
+    let reach = all.iter().filter(|n| view.reachable(n)).count();
+    let vreach = all.iter().filter(|n| n.is_verified() && view.reachable(n)).count();
     let mode = |m: &str| {
         let of = all.iter().filter(|n| n.is_verified() && n.mode == m);
-        json!([of.clone().filter(|n| graph.is_reachable(n)).count(), of.count()])
+        json!([of.clone().filter(|n| view.reachable(n)).count(), of.count()])
     };
     let pct = |a: usize, b: usize| (b > 0).then(|| (100 * a / b) as u64);
     json!({
@@ -172,7 +232,7 @@ mod tests {
         let src = tempfile::tempdir().unwrap();
         std::fs::write(src.path().join("x.rs"), "fn a() {}\n").unwrap();
         let out = tempfile::tempdir().unwrap();
-        write(&reports, &graph2, src.path(), "t", out.path()).unwrap();
+        write(&reports, &graph2, None, src.path(), "t", out.path()).unwrap();
 
         let index = data(&std::fs::read_to_string(out.path().join("index.html")).unwrap());
         assert_eq!(index["page"], "index");
@@ -232,8 +292,35 @@ mod tests {
             vec![],
         );
         let graph = Graph::new(&[lib], &Roots::default()).unwrap();
-        let names: Vec<&str> = files(&graph)["x.rs"].iter().map(|n| n.name()).collect();
+        let view = View { graph: &graph, dynamic: None };
+        let names: Vec<&str> = files(&view)["x.rs"].iter().map(|n| n.name()).collect();
         assert_eq!(names, vec!["is_lt"]);
+    }
+
+    #[test]
+    fn dynamic_view_counts_only_true_verified_reachable_exec() {
+        // wired is statically reachable and called with its pre true;
+        // helper is reachable but never called; ghost reachability is static
+        let (reports, graph) = graph();
+        let mut profile = verus_reach::dyncov::Profile { schema_version: 1, ..Default::default() };
+        profile.functions.insert(
+            "x.rs:1:wired".into(),
+            verus_reach::dyncov::FnProfile { calls: 2, pre: [2, 0, 0], ..Default::default() },
+        );
+        let dynamic = Dynamic::new(&graph, &profile);
+        let view = View { graph: &graph, dynamic: Some(&dynamic) };
+        let by = |name: &str| graph.nodes.values().find(|n| n.name() == name).unwrap();
+        assert!(view.reachable(by("wired")));
+        assert!(!view.reachable(by("helper")));
+        assert!(view.reachable(by("spec_wired")));
+        let f = function(by("wired"), &view);
+        assert_eq!(f["reachable"], true);
+        assert!(f["dynamic"].as_str().unwrap().contains("called 2 time(s), precondition true 2"));
+        let src = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        write(&reports, &graph, Some(&dynamic), src.path(), "t", out.path()).unwrap();
+        let index = data(&std::fs::read_to_string(out.path().join("index.html")).unwrap());
+        assert_eq!(index["dynamic"], true);
     }
 
     #[test]

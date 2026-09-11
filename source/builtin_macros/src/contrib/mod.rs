@@ -1,4 +1,5 @@
 pub mod auto_spec;
+pub mod dyncov;
 pub mod exec_spec;
 pub mod hooks;
 pub mod set_build;

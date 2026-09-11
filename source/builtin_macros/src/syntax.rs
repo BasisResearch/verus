@@ -108,6 +108,8 @@ pub(crate) struct Visitor {
     inside_impl: Option<Box<(Generics, Box<Type>)>>,
     // A place to put items that are emitted while visiting
     additional_items: Vec<Item>,
+    // Dynamic coverage instrumentation (`--cfg verus_dyncov`), when active
+    dyncov: Option<crate::contrib::dyncov::State>,
 }
 
 // For exec "let pat = init" declarations, recursively find Tracked(x), Ghost(x), x in pat
@@ -1821,6 +1823,15 @@ impl Visitor {
 
     fn visit_items_prefilter(&mut self, items: &mut Vec<Item>) {
         crate::contrib::contrib_preprocess_items(items);
+        if let Some(state) = self.dyncov.as_mut() {
+            let mut extra = crate::contrib::dyncov::twins_for_items(state, items);
+            if state.mod_depth == 0 {
+                extra.extend(
+                    items.iter().filter_map(|i| crate::contrib::dyncov::view_impl(state, i)),
+                );
+            }
+            items.extend(extra);
+        }
         self.visit_items_make_unerased_proxies(items);
         crate::syntax_trait::expand_extension_traits(self.erase_ghost.erase_all(), items);
 
@@ -2326,6 +2337,11 @@ impl Visitor {
 
     fn visit_impl_items_prefilter(&mut self, items: &mut Vec<ImplItem>, for_trait: bool) {
         crate::contrib::contrib_preprocess_impl_items(items);
+        if let (Some(state), Some(imp)) = (self.dyncov.as_mut(), self.inside_impl.as_ref()) {
+            let (generics, self_ty) = &**imp;
+            let extra = crate::contrib::dyncov::twins_for_impl(state, self_ty, generics, items);
+            self.additional_items.extend(extra);
+        }
         self.visit_impl_items_make_unerased_proxies(items, for_trait);
 
         if self.erase_ghost.erase_all() {
@@ -2466,6 +2482,48 @@ fn chain_count(expr: &Expr) -> u32 {
 const ILLEGAL_CALLEES: &[&str] = &["forall", "exists", "choose"];
 
 impl Visitor {
+    /// The impl's `Self` type as the dyncov lowering needs it: its name,
+    /// and its tokens when it can be named from a free function.
+    fn dyncov_self_ty(&self) -> Option<(String, Option<TokenStream>)> {
+        let imp = self.inside_impl.as_ref()?;
+        let (generics, self_ty) = &**imp;
+        let name = crate::contrib::dyncov::self_type_name(self_ty)?;
+        Some((name, generics.params.is_empty().then(|| self_ty.to_token_stream())))
+    }
+
+    /// Captures an exec function's contracts before `visit_fn` erases
+    /// them, and records its parameters for `assume` lowering.
+    fn dyncov_enter_fn(
+        &mut self,
+        sig: &Signature,
+        attrs: &[Attribute],
+        has_body: bool,
+    ) -> Option<crate::contrib::dyncov::Contracts> {
+        let state = self.dyncov.as_mut()?;
+        if self.inside_external_code > 0 || !crate::contrib::dyncov::wrappable(sig, attrs, has_body)
+        {
+            state.fn_params = vec![];
+            return None;
+        }
+        state.fn_params = crate::contrib::dyncov::params_of(sig);
+        Some(crate::contrib::dyncov::capture(sig, attrs))
+    }
+
+    fn dyncov_wrap(
+        &mut self,
+        sig: &Signature,
+        vis: Option<&Visibility>,
+        attrs: &mut Vec<Attribute>,
+        block: &mut Block,
+        contracts: crate::contrib::dyncov::Contracts,
+        is_main: bool,
+    ) {
+        let self_ty = self.dyncov_self_ty();
+        let Some(state) = self.dyncov.as_mut() else { return };
+        crate::contrib::dyncov::wrap(state, sig, vis, attrs, block, contracts, self_ty, is_main);
+        state.fn_params = vec![];
+    }
+
     fn inside_pat_or_type(&self) -> bool {
         self.inside_pat + self.inside_type > 0
     }
@@ -3185,6 +3243,17 @@ impl Visitor {
         let Expr::Assume(_) = expr else {
             return false;
         };
+        if self.inside_ghost == 0 && self.inside_external_code == 0 && !self.inside_const {
+            if let Some(state) = self.dyncov.as_ref() {
+                let Expr::Assume(assume) = take_expr(expr) else { unreachable!() };
+                *expr = crate::contrib::dyncov::lower_assume(
+                    state,
+                    &assume.expr,
+                    self.dyncov_self_ty(),
+                );
+                return true;
+            }
+        }
 
         self.inside_ghost += 1;
         self.visit_expr_with_arith(expr, InsideArith::None);
@@ -4668,6 +4737,7 @@ impl VisitMut for Visitor {
         if self.rustdoc {
             crate::rustdoc::process_item_fn(fun);
         }
+        let dyncov = self.dyncov_enter_fn(&fun.sig, &fun.attrs, fun.semi_token.is_none());
         let stmts = self.visit_fn(
             &mut fun.attrs,
             Some(&fun.vis),
@@ -4686,6 +4756,19 @@ impl VisitMut for Visitor {
         if is_external_code {
             self.inside_external_code -= 1;
         }
+        if let Some(contracts) = dyncov {
+            let is_main = fun.sig.ident == "main"
+                && fun.sig.inputs.is_empty()
+                && self.dyncov.as_ref().map_or(false, |s| s.mod_depth == 0);
+            self.dyncov_wrap(
+                &fun.sig,
+                Some(&fun.vis),
+                &mut fun.attrs,
+                &mut fun.block,
+                contracts,
+                is_main,
+            );
+        }
     }
 
     fn visit_impl_item_fn_mut(&mut self, method: &mut ImplItemFn) {
@@ -4693,6 +4776,7 @@ impl VisitMut for Visitor {
             crate::rustdoc::process_impl_item_method(method);
         }
 
+        let dyncov = self.dyncov_enter_fn(&method.sig, &method.attrs, method.semi_token.is_none());
         let stmts = self.visit_fn(
             &mut method.attrs,
             Some(&method.vis),
@@ -4711,10 +4795,21 @@ impl VisitMut for Visitor {
         if is_external_code {
             self.inside_external_code -= 1;
         }
+        if let Some(contracts) = dyncov {
+            self.dyncov_wrap(
+                &method.sig,
+                Some(&method.vis),
+                &mut method.attrs,
+                &mut method.block,
+                contracts,
+                false,
+            );
+        }
     }
 
     fn visit_trait_item_fn_mut(&mut self, method: &mut TraitItemFn) {
         let is_spec_method = method.sig.ident.to_string().starts_with(VERUS_SPEC);
+        let dyncov = self.dyncov_enter_fn(&method.sig, &method.attrs, method.default.is_some());
         let mut stmts =
             self.visit_fn(&mut method.attrs, None, &mut method.sig, method.semi_token, true, true);
         if let Some(block) = &mut method.default {
@@ -4740,6 +4835,9 @@ impl VisitMut for Visitor {
         visit_trait_item_fn_mut(self, method);
         if is_external_code {
             self.inside_external_code -= 1;
+        }
+        if let (Some(contracts), Some(block)) = (dyncov, method.default.as_mut()) {
+            self.dyncov_wrap(&method.sig, None, &mut method.attrs, block, contracts, false);
         }
     }
 
@@ -5005,6 +5103,9 @@ impl VisitMut for Visitor {
 
     fn visit_item_mod_mut(&mut self, item: &mut ItemMod) {
         item.attrs.push(mk_verus_attr(item.span(), quote! { verus_macro }));
+        if let Some(state) = self.dyncov.as_mut() {
+            state.mod_depth += 1;
+        }
         if let Some((_, items)) = &mut item.content {
             self.visit_items_prefilter(items);
         }
@@ -5013,16 +5114,30 @@ impl VisitMut for Visitor {
         if let Some((_, items)) = &mut item.content {
             self.visit_items_post(items);
         }
+        if let Some(state) = self.dyncov.as_mut() {
+            state.mod_depth -= 1;
+        }
     }
 
     fn visit_item_impl_mut(&mut self, imp: &mut ItemImpl) {
         let impl_info = (imp.generics.clone(), imp.self_ty.clone());
         let outer_impl = self.inside_impl.replace(Box::new(impl_info));
+        let outer_trait = self.dyncov.as_mut().map(|state| {
+            std::mem::replace(
+                &mut state.impl_trait,
+                imp.trait_
+                    .as_ref()
+                    .and_then(|(_, p, _)| p.segments.last().map(|s| s.ident.to_string())),
+            )
+        });
         imp.attrs.push(mk_verus_attr(imp.span(), quote! { verus_macro }));
         self.visit_impl_items_prefilter(&mut imp.items, imp.trait_.is_some());
         self.filter_attrs(&mut imp.attrs);
         verus_syn::visit_mut::visit_item_impl_mut(self, imp);
         self.inside_impl = outer_impl;
+        if let (Some(state), Some(t)) = (self.dyncov.as_mut(), outer_trait) {
+            state.impl_trait = t;
+        }
     }
 
     fn visit_item_trait_mut(&mut self, tr: &mut ItemTrait) {
@@ -5350,6 +5465,7 @@ pub(crate) fn rewrite_items_inner(
         rustdoc: env_rustdoc(),
         inside_impl: None,
         additional_items: Vec::new(),
+        dyncov: dyncov_state(erase_ghost, true),
     };
     visitor.visit_items_prefilter(items);
     let mut index = 0;
@@ -5363,11 +5479,31 @@ pub(crate) fn rewrite_items_inner(
         index += 1;
     }
     visitor.visit_items_post(items);
+    if let Some(state) = visitor.dyncov.as_mut() {
+        items.extend(state.finish());
+    }
     let mut new_stream = TokenStream::new();
     for item in items {
         item.to_tokens(&mut new_stream);
     }
     proc_macro::TokenStream::from(new_stream)
+}
+
+/// Dynamic coverage is a variant of the erase mode; it needs vstd.
+fn dyncov_state(
+    erase_ghost: EraseGhost,
+    with_table: bool,
+) -> Option<crate::contrib::dyncov::State> {
+    // vstd's own exec code is not instrumented: it is not part of the
+    // static report of a user crate, and its contracts are not lowered
+    if erase_ghost == EraseGhost::Erase
+        && crate::cfg_dyncov()
+        && matches!(vstd_kind(), VstdKind::Imported)
+    {
+        Some(crate::contrib::dyncov::State::new(with_table))
+    } else {
+        None
+    }
 }
 
 pub(crate) fn rewrite_impl_items(
@@ -5392,6 +5528,7 @@ pub(crate) fn rewrite_impl_items(
         rustdoc: env_rustdoc(),
         inside_impl: None,
         additional_items: Vec::new(),
+        dyncov: dyncov_state(erase_ghost, false),
     };
     visitor.visit_impl_items_prefilter(&mut items.items, for_trait);
     for mut item in &mut items.items {
@@ -5428,6 +5565,7 @@ pub(crate) fn rewrite_expr(
         rustdoc: env_rustdoc(),
         inside_impl: None,
         additional_items: Vec::new(),
+        dyncov: dyncov_state(erase_ghost, false),
     };
     visitor.visit_expr_mut(&mut expr);
     expr.to_tokens(&mut new_stream);
@@ -5462,6 +5600,7 @@ pub(crate) fn rewrite_proof_decl(
         rustdoc: env_rustdoc(),
         inside_impl: None,
         additional_items: Vec::new(),
+        dyncov: dyncov_state(erase_ghost, false),
     };
     for mut ss in stmts {
         match ss {
@@ -5518,6 +5657,7 @@ pub(crate) fn rewrite_expr_node(erase_ghost: EraseGhost, inside_ghost: bool, exp
         rustdoc: env_rustdoc(),
         inside_impl: None,
         additional_items: Vec::new(),
+        dyncov: dyncov_state(erase_ghost, false),
     };
     visitor.visit_expr_mut(expr);
 }
@@ -5710,6 +5850,7 @@ pub(crate) fn sig_specs_attr(
         rustdoc: env_rustdoc(),
         inside_impl: None,
         additional_items: Vec::new(),
+        dyncov: dyncov_state(erase_ghost, false),
     };
 
     if let Some(pat) = &ret_pat {
@@ -5752,6 +5893,7 @@ pub(crate) fn while_loop_spec_attr(
         rustdoc: env_rustdoc(),
         inside_impl: None,
         additional_items: Vec::new(),
+        dyncov: dyncov_state(erase_ghost, false),
     };
     let mut spec_attr = spec_attr;
     visitor.visit_loop_spec(&mut spec_attr);
@@ -5787,6 +5929,7 @@ pub(crate) fn for_loop_spec_attr(
         rustdoc: env_rustdoc(),
         inside_impl: None,
         additional_items: Vec::new(),
+        dyncov: dyncov_state(erase_ghost, false),
     };
     let mut spec_attr = spec_attr;
     visitor.visit_loop_spec(&mut spec_attr);
@@ -5848,6 +5991,7 @@ pub(crate) fn proof_block(
         rustdoc: env_rustdoc(),
         inside_impl: None,
         additional_items: Vec::new(),
+        dyncov: dyncov_state(erase_ghost, false),
     };
     visitor.visit_block_mut(&mut invoke);
     invoke.to_tokens(&mut new_stream);
@@ -5875,6 +6019,7 @@ pub(crate) fn proof_macro_exprs(
         rustdoc: env_rustdoc(),
         inside_impl: None,
         additional_items: Vec::new(),
+        dyncov: dyncov_state(erase_ghost, false),
     };
     for element in &mut invoke.elements.elements {
         match element {
@@ -5908,6 +6053,7 @@ pub(crate) fn inv_au_macro_exprs(
         rustdoc: env_rustdoc(),
         inside_impl: None,
         additional_items: Vec::new(),
+        dyncov: dyncov_state(erase_ghost, false),
     };
 
     invoke
@@ -5952,6 +6098,7 @@ pub(crate) fn proof_macro_explicit_exprs(
         rustdoc: env_rustdoc(),
         inside_impl: None,
         additional_items: Vec::new(),
+        dyncov: dyncov_state(erase_ghost, false),
     };
     for element in &mut invoke.elements.elements {
         match element {
