@@ -659,6 +659,7 @@ impl Verifier {
                 spinoff_all: self.args.spinoff_all,
                 multiple_errors: self.args.multiple_errors,
                 smt_options: self.args.smt_options.clone(),
+                instantiation_replay: self.instantiation_replay(),
                 input_files: std::mem::take(&mut self.resident_inputs),
             },
         )
@@ -1248,6 +1249,17 @@ impl Verifier {
         Self::set_rlimit(self.args.solver, air_context, self.args.rlimit);
     }
 
+    /// Experimental: resident rechecks first try the instantiations the
+    /// previous check of the same query made (see resident.rs). Its solvers
+    /// run with proofs and twice the rlimit, as under provenance. Not under
+    /// provenance, which describes the ordinary search.
+    fn instantiation_replay(&self) -> bool {
+        self.args.resident
+            && !self.args.provenance
+            && matches!(self.args.solver, air::context::SmtSolver::Cvc5)
+            && std::env::var_os("VERUS_RESIDENT_INST_REPLAY").is_some()
+    }
+
     fn new_air_context_with_prelude<'m>(
         &mut self,
         ctx: &vir::context::Ctx,
@@ -1267,6 +1279,9 @@ impl Verifier {
         }
         if self.args.provenance {
             air_context.set_provenance(true);
+        }
+        if self.instantiation_replay() {
+            air_context.set_instantiation_replay(true);
         }
         air_context.set_ignore_unexpected_smt(self.args.ignore_unexpected_smt);
         air_context.set_debug(self.args.debugger);

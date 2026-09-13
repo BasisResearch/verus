@@ -29,12 +29,13 @@ asset_x86_linux = "z3-x86-linux"
 sha256_x86_linux = "99f5433928fa62adc3a19207d97b14111d62964e26b10b37d286f9e641e0dfbf"
 
 [cvc5]
-# Fork `main` at 4a42bee406: carries `:assert-id` provenance tags through
-# preprocessing and answers `(get-assertion-sources)`.
-version = "1.3.5.dev+main@4a42bee"
+# Fork `main` at 77ab13ff5b: carries `:assert-id` provenance tags through
+# preprocessing, answers `(get-assertion-sources)`, and saves, restores,
+# exports and imports quantifier instantiations (resident certificates).
+version = "1.3.5.dev+main@77ab13f"
 repo = "BasisResearch/cvc5"
-tag = "basis-4a42bee406"
+tag = "basis-77ab13ff5b"
 asset_arm64_macos = "cvc5-arm64-macos"
-sha256_arm64_macos = "b5ccae10ca03785ed3cec9794f134b991f5bb0b51f139f8b434a3478c5953c76"
+sha256_arm64_macos = "5020f6ec22aaaf4c6db2641d18ff33278e8d9ba4f15077ca72cc8328ea616bfd"
 asset_x86_linux = "cvc5-x86-linux"
-sha256_x86_linux = "2d8b6cd70545061b9574c2d39ede246f4560e49635ef6028654bcb4a23783907"
+sha256_x86_linux = "43f6a0ea4a1970b9b1a33d86224574993ad40ece1f80b0b4dbf1a32f7dd05916"

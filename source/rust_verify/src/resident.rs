@@ -24,11 +24,13 @@ use crate::buckets::BucketId;
 use crate::commands::{QueryOp, Style};
 use air::ast::{CommandX, Commands, Query};
 use air::context::{Context, QueryContext, ValidityResult};
+use air::instantiations::ImportInstantiations;
 use air::messages::{ArcDynMessage, Diagnostics, MessageLevel};
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::io::{self, BufRead, Read, Write};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use vir::ast_util::fun_as_friendly_rust_name;
 use vir::def::{CommandContext, CommandsWithContext};
@@ -131,6 +133,9 @@ pub(crate) struct RetainedBucket {
     queries: Vec<QueryDescription>,
     /// Catalogue ordinal -> original solver and its local query ordinal.
     addresses: Vec<(usize, usize)>,
+    /// Catalogue ordinal -> the name its instantiation certificate is saved
+    /// and exported under, the same for the same query in a later compilation.
+    cert_keys: Vec<String>,
     state: Mutex<Vec<SolverState>>,
     symbols: Option<crate::provenance::Symbols>,
 }
@@ -163,11 +168,24 @@ impl RetainedBucket {
         states.append(&mut spinoffs);
         let mut queries = Vec::new();
         let mut addresses = Vec::new();
+        let mut cert_keys = Vec::new();
+        let mut repeats = std::collections::HashMap::new();
         for (solver, state) in states.iter().enumerate() {
             for (local, query) in state.journal.queries.iter().enumerate() {
+                let function = fun_as_friendly_rust_name(&query.context.fun);
+                let repeat = repeats
+                    .entry(certificate_key(&function, query.kind, &query.context.desc, 0))
+                    .or_insert(0);
+                cert_keys.push(certificate_key(
+                    &function,
+                    query.kind,
+                    &query.context.desc,
+                    *repeat,
+                ));
+                *repeat += 1;
                 queries.push(QueryDescription {
                     id: QueryId(queries.len()),
-                    function: fun_as_friendly_rust_name(&query.context.fun),
+                    function,
                     description: query.context.desc.clone(),
                     kind: query.kind,
                     prover: match query.prover {
@@ -181,7 +199,71 @@ impl RetainedBucket {
                 addresses.push((solver, local));
             }
         }
-        Self { id, queries, addresses, state: Mutex::new(states), symbols }
+        Self { id, queries, addresses, cert_keys, state: Mutex::new(states), symbols }
+    }
+}
+
+/// The name a query's instantiation certificate goes by: FNV-1a over its
+/// function, kind and description, and its position among the queries that
+/// share all three. Spans are left out, so an edit elsewhere in the crate, or
+/// in the function's own body, keeps the name.
+fn certificate_key(function: &str, kind: QueryKind, description: &str, repeat: usize) -> String {
+    let kind = serde_json::to_string(&kind).unwrap_or_default();
+    let repeat = repeat.to_string();
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for part in [function, kind.as_str(), description, repeat.as_str()] {
+        for byte in part.bytes().chain(std::iter::once(0)) {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    format!("c{hash:016x}")
+}
+
+/// The most a certificate file may hold for it to be read.
+const MAX_CERTIFICATE_BYTES: u64 = 64 << 20;
+
+/// The text of the certificate at `path`, if it is a regular file of at most
+/// `MAX_CERTIFICATE_BYTES`. The directory is shared, so anything may sit at
+/// that name. On unix the file is opened without blocking, so a FIFO there
+/// cannot stall the server, and its type is checked on the open handle, so it
+/// cannot be swapped between the check and the read.
+fn read_certificate(path: &std::path::Path) -> Option<String> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::custom_flags(
+        &mut options,
+        libc::O_NONBLOCK | libc::O_NOCTTY,
+    );
+    let file = options.open(path).ok()?;
+    let metadata = file.metadata().ok()?;
+    if !metadata.is_file() || metadata.len() > MAX_CERTIFICATE_BYTES {
+        return None;
+    }
+    // The file may grow after the check, so the read is capped too.
+    let mut text = String::new();
+    file.take(MAX_CERTIFICATE_BYTES + 1).read_to_string(&mut text).ok()?;
+    (text.len() as u64 <= MAX_CERTIFICATE_BYTES).then_some(text)
+}
+
+/// Export what `key` saved to `<dir>/<key>.smt2`, where a later session's
+/// solver can import it. Only a certificate that names an instance is written.
+/// It goes to a file no other writer uses, then is renamed into place, so a
+/// reader never sees half a file, nor two sessions' writes interleaved. A
+/// failure only costs a later session its certificate.
+fn write_certificate(air: &mut Context, dir: &std::path::Path, key: &str) {
+    static WRITES: AtomicUsize = AtomicUsize::new(0);
+    let Some(certificate) = air.export_instantiations(key) else {
+        return;
+    };
+    let path = dir.join(format!("{key}.smt2"));
+    let write = WRITES.fetch_add(1, Ordering::Relaxed);
+    let partial = dir.join(format!("{key}.smt2.{}-{write}.partial", std::process::id()));
+    if std::fs::write(&partial, certificate.to_text()).is_err()
+        || std::fs::rename(&partial, &path).is_err()
+    {
+        let _ = std::fs::remove_file(&partial);
     }
 }
 
@@ -206,6 +288,9 @@ pub(crate) struct SessionInfo {
     /// The ordered startup settings. They already live in every retained
     /// solver and must not be reapplied after initialization.
     pub(crate) smt_options: Vec<(String, String)>,
+    /// Whether ordinary cvc5 solvers were launched for instantiation replay
+    /// (`VERUS_RESIDENT_INST_REPLAY`), so rechecks try certificates first.
+    pub(crate) instantiation_replay: bool,
 }
 
 #[derive(Serialize)]
@@ -219,6 +304,7 @@ enum Response<'a> {
         provenance: bool,
         spinoff_all: bool,
         smt_options: &'a [(String, String)],
+        instantiation_replay: bool,
         input_files: &'a [String],
         buckets: &'a [BucketDescription],
     },
@@ -236,6 +322,8 @@ enum Response<'a> {
         elapsed_ms: u128,
         restore_ms: u128,
         provenance: Option<&'a crate::provenance::ResolvedQueryProvenance>,
+        /// Present when this check tried a certificate before searching.
+        certificate: Option<CertificateAttempt>,
     },
     Error {
         message: &'a str,
@@ -243,6 +331,25 @@ enum Response<'a> {
     Closed {
         session: &'a str,
     },
+}
+
+/// Where a tried certificate came from: this solver's own save from an earlier
+/// check, or a file an earlier session exported.
+#[derive(Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum CertificateSource {
+    Session,
+    Imported,
+}
+
+/// A certificate attempt: `closed` when the restored instances alone proved
+/// the query, otherwise the verdict comes from the ordinary check that
+/// followed. `elapsed_ms` is the attempt alone and is part of the check's.
+#[derive(Clone, Copy, Serialize)]
+struct CertificateAttempt {
+    source: CertificateSource,
+    closed: bool,
+    elapsed_ms: u128,
 }
 
 #[derive(Serialize)]
@@ -534,11 +641,14 @@ impl Server {
                 provenance: self.info.provenance,
                 spinoff_all: self.info.spinoff_all,
                 smt_options: &self.info.smt_options,
+                instantiation_replay: self.info.instantiation_replay,
                 input_files: &self.info.input_files,
                 buckets: &buckets,
             },
         )?;
         let multiple_errors = self.info.multiple_errors;
+        // Where certificates outlive this session, if replay is on.
+        let cert_dir = std::env::var_os("VERUS_RESIDENT_INST_DIR").map(std::path::PathBuf::from);
         loop {
             // A framing failure closes the session. Never interpret a suffix of
             // an oversized request as a second request. Say so before closing:
@@ -623,14 +733,76 @@ impl Server {
                     // this failure at, so a recommends recheck stays a warning.
                     let level = query.level;
                     set_rlimit(air, query.rlimit);
+                    // With replay on, each check saves its instantiations
+                    // under the query's certificate key.
+                    let replay_key =
+                        air.instantiation_replay().then(|| bucket.cert_keys[id.0].clone());
                     let diagnostics = QueryDiagnostics::default();
                     let start = Instant::now();
-                    let mut outcome = air.check_valid(
-                        &VirMessageInterface {},
-                        &diagnostics,
-                        &query.query,
-                        QueryContext::default(),
-                    );
+                    // Certificate first: once this query has saved
+                    // instantiations, here or in an earlier session's
+                    // exported certificate, check with them alone. `:only`
+                    // lets no strategy run, so the solver answers from the
+                    // replayed instances, each an instance of a formula this
+                    // scope asserts, and a valid answer is sound. Any other
+                    // answer is discarded, with its diagnostics, before the
+                    // ordinary check.
+                    let mut certified = None;
+                    let mut attempted = None;
+                    let certificate = replay_key.as_ref().and_then(|key| {
+                        if air.has_saved_instantiations(key) {
+                            return Some((key.clone(), None));
+                        }
+                        // A file that is not exactly a certificate for this
+                        // key is never sent: it could assert anything.
+                        let path = cert_dir.as_ref()?.join(format!("{key}.smt2"));
+                        let text = read_certificate(&path)?;
+                        let import = ImportInstantiations::parse(&text, key)?;
+                        Some((key.clone(), Some(import)))
+                    });
+                    if let Some((key, import)) = certificate {
+                        let source = match import {
+                            Some(_) => CertificateSource::Imported,
+                            None => CertificateSource::Session,
+                        };
+                        air.set_restore_instantiations(Some(key), true);
+                        air.set_import_instantiations(import);
+                        let attempt = air.check_valid(
+                            &VirMessageInterface {},
+                            &QueryDiagnostics::default(),
+                            &query.query,
+                            QueryContext::default(),
+                        );
+                        air.set_restore_instantiations(None, false);
+                        air.set_import_instantiations(None);
+                        drop(air.take_provenance());
+                        match attempt {
+                            ValidityResult::Valid(usage) => {
+                                certified = Some(ValidityResult::Valid(usage))
+                            }
+                            ValidityResult::TypeError(error) => {
+                                return fatal(&mut output, io::Error::other(error.to_string()));
+                            }
+                            ValidityResult::UnexpectedOutput(error) => {
+                                return fatal(&mut output, io::Error::other(error));
+                            }
+                            _ => air.finish_query(),
+                        }
+                        attempted = Some(CertificateAttempt {
+                            source,
+                            closed: certified.is_some(),
+                            elapsed_ms: start.elapsed().as_millis(),
+                        });
+                    }
+                    let mut outcome = match certified {
+                        Some(outcome) => outcome,
+                        None => air.check_valid(
+                            &VirMessageInterface {},
+                            &diagnostics,
+                            &query.query,
+                            QueryContext::default(),
+                        ),
+                    };
                     // The response describes round zero. Later error searches
                     // replace AIR's provenance, even when their verdict differs.
                     let first_provenance = air.take_provenance();
@@ -767,6 +939,19 @@ impl Server {
                             )
                         })
                     });
+                    // Only a proof is worth keeping. A failed check's instances
+                    // are no certificate, and saving them would replace one
+                    // that still closes the query once the failing edit is
+                    // undone. Every path here came from a solver answer, so
+                    // the save has a result to read from.
+                    if let Some(key) =
+                        replay_key.as_ref().filter(|_| matches!(result, QueryResult::Valid))
+                    {
+                        air.save_instantiations(key);
+                        if let Some(dir) = &cert_dir {
+                            write_certificate(air, dir, key);
+                        }
+                    }
                     air.finish_query();
                     send(
                         &mut output,
@@ -780,6 +965,7 @@ impl Server {
                             elapsed_ms: start.elapsed().as_millis(),
                             restore_ms,
                             provenance: provenance.as_ref(),
+                            certificate: attempted,
                         },
                     )?;
                 }
@@ -918,6 +1104,7 @@ mod tests {
                 multiple_errors: 2,
                 input_files: Vec::new(),
                 smt_options: Vec::new(),
+                instantiation_replay: false,
             },
         );
         let input = format!("{}\n{{\"command\":\"list\"}}\n", " ".repeat(65537));

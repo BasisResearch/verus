@@ -1,5 +1,6 @@
 use crate::ast::{Decl, Expr, Ident, Query};
 use crate::context::SmtSolver;
+use crate::instantiations::ImportInstantiations;
 use crate::printer::{NodeWriter, Printer, macro_push_node};
 use crate::{node, nodes};
 use sise::TreeNode as Node;
@@ -108,6 +109,44 @@ impl Emitter {
     pub fn log_get_assertion_sources(&mut self) {
         if !self.is_none() {
             self.log_node(&node!((get-assertion-sources {Node::Atom(":tags-only".to_string())})));
+        }
+    }
+
+    /// `(save-instantiations k)`: cvc5 keeps the instantiations of the current
+    /// scope under `k` after it pops.
+    pub fn log_save_instantiations(&mut self, key: &str) {
+        if !self.is_none() {
+            self.log_node(&node!((save-instantiations {Node::Atom(key.to_string())})));
+        }
+    }
+
+    /// `(restore-instantiations k [:only])`: cvc5 replays what `k` saved into
+    /// the current scope, for each quantifier this scope asserts. With
+    /// `:only` no other instantiation happens in that scope.
+    pub fn log_restore_instantiations(&mut self, key: &str, only: bool) {
+        if !self.is_none() {
+            let mut items =
+                vec![Node::Atom("restore-instantiations".to_string()), Node::Atom(key.to_string())];
+            if only {
+                items.push(Node::Atom(":only".to_string()));
+            }
+            self.log_node(&Node::List(items));
+        }
+    }
+
+    /// `(export-instantiations k)`: cvc5 replies with an
+    /// `import-instantiations` command carrying what `k` saved.
+    pub fn log_export_instantiations(&mut self, key: &str) {
+        if !self.is_none() {
+            self.log_node(&node!((export-instantiations {Node::Atom(key.to_string())})));
+        }
+    }
+
+    /// `(import-instantiations k ...)`: a certificate another solver exported,
+    /// already validated by `ImportInstantiations::parse`.
+    pub fn log_import_instantiations(&mut self, certificate: &ImportInstantiations) {
+        if !self.is_none() {
+            self.log_node(&certificate.to_node());
         }
     }
 
