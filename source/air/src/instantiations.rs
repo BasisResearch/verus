@@ -37,8 +37,8 @@ enum Token<'a> {
 }
 
 /// SMT-LIB tokens of `text`, skipping whitespace and `;` comments, or `None`
-/// at anything else: a quoted `|symbol|`, an unterminated string, or a
-/// character no simple symbol contains.
+/// at anything else: a quoted `|symbol|`, an unterminated string, a string
+/// with a byte cvc5's lexer rejects, or a character no simple symbol contains.
 fn tokenize(text: &str) -> Option<Vec<Token<'_>>> {
     let is_symbol_char = |c: char| c.is_ascii_alphanumeric() || "~!@$%^&*_-+=<>.?/:".contains(c);
     let mut tokens = Vec::new();
@@ -53,7 +53,9 @@ fn tokenize(text: &str) -> Option<Vec<Token<'_>>> {
             rest = &rest[1..];
         } else if c == '"' {
             // A literal ends at a quote not followed by another: `""` is an
-            // escaped quote inside it.
+            // escaped quote inside it. cvc5 fails the whole command at any
+            // byte other than printable ASCII, space, tab, CR or LF, before
+            // it reaches the rows it would skip, so such a literal is refused.
             let bytes = rest.as_bytes();
             let mut end = 1;
             loop {
@@ -61,7 +63,8 @@ fn tokenize(text: &str) -> Option<Vec<Token<'_>>> {
                     None => return None,
                     Some(b'"') if bytes.get(end + 1) == Some(&b'"') => end += 2,
                     Some(b'"') => break,
-                    Some(_) => end += 1,
+                    Some(b' '..=b'~' | b'\t' | b'\r' | b'\n') => end += 1,
+                    Some(_) => return None,
                 }
             }
             tokens.push(Token::Literal(&rest[..=end]));
@@ -190,6 +193,11 @@ mod tests {
             format!("(import-instantiations {KEY} a)"),
             format!("(import-instantiations {KEY} |a b|)"),
             format!("(import-instantiations {KEY} \"(a)\" :skolems (\"s\"))"),
+            // Literals with a byte cvc5's lexer rejects.
+            format!("(import-instantiations {KEY} \"\u{e9}\")"),
+            format!("(import-instantiations {KEY} \"(a \u{1})\")"),
+            format!("(import-instantiations {KEY} \"(a \u{7f})\")"),
+            format!("(import-instantiations {KEY} :skolems (\"\u{0}\") \"(a)\")"),
         ];
         for text in rejected {
             assert_eq!(ImportInstantiations::parse(&text, KEY), None, "{text}");

@@ -220,6 +220,33 @@ fn certificate_key(function: &str, kind: QueryKind, description: &str, repeat: u
     format!("c{hash:016x}")
 }
 
+/// The most a certificate file may hold for it to be read.
+const MAX_CERTIFICATE_BYTES: u64 = 64 << 20;
+
+/// The text of the certificate at `path`, if it is a regular file of at most
+/// `MAX_CERTIFICATE_BYTES`. The directory is shared, so anything may sit at
+/// that name. On unix the file is opened without blocking, so a FIFO there
+/// cannot stall the server, and its type is checked on the open handle, so it
+/// cannot be swapped between the check and the read.
+fn read_certificate(path: &std::path::Path) -> Option<String> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::custom_flags(
+        &mut options,
+        libc::O_NONBLOCK | libc::O_NOCTTY,
+    );
+    let file = options.open(path).ok()?;
+    let metadata = file.metadata().ok()?;
+    if !metadata.is_file() || metadata.len() > MAX_CERTIFICATE_BYTES {
+        return None;
+    }
+    // The file may grow after the check, so the read is capped too.
+    let mut text = String::new();
+    file.take(MAX_CERTIFICATE_BYTES + 1).read_to_string(&mut text).ok()?;
+    (text.len() as u64 <= MAX_CERTIFICATE_BYTES).then_some(text)
+}
+
 /// Export what `key` saved to `<dir>/<key>.smt2`, where a later session's
 /// solver can import it. Only a certificate that names an instance is written.
 /// It goes to a file no other writer uses, then is renamed into place, so a
@@ -729,7 +756,7 @@ impl Server {
                         // A file that is not exactly a certificate for this
                         // key is never sent: it could assert anything.
                         let path = cert_dir.as_ref()?.join(format!("{key}.smt2"));
-                        let text = std::fs::read_to_string(path).ok()?;
+                        let text = read_certificate(&path)?;
                         let import = ImportInstantiations::parse(&text, key)?;
                         Some((key.clone(), Some(import)))
                     });

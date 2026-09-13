@@ -2357,6 +2357,7 @@ dependencies = [
  "indexmap 2.14.0",
  "indicatif",
  "internals_interface",
+ "libc",
  "num-bigint 0.5.1",
  "num-format",
  "regex",

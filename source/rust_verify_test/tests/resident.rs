@@ -479,9 +479,10 @@ fn resident_instantiation_certificates_survive_a_new_session() {
 /// A file in the certificate directory reaches a solver only if it is exactly
 /// a certificate for its query's key. Anything else is ignored: the check
 /// searches as usual and the session survives. A planted `(assert false)`
-/// must not prove the broken assertion, and a truncated file must not stop
-/// the solver. A passing check then replaces the file with a certificate the
-/// next session imports.
+/// must not prove the broken assertion, and a truncated file, a literal cvc5
+/// cannot lex, or a FIFO must not stop the solver or stall the server. A
+/// passing check then replaces the file with a certificate the next session
+/// imports.
 #[test]
 fn resident_instantiation_certificates_ignore_foreign_files() {
     let certificates = tempfile::tempdir().unwrap();
@@ -498,11 +499,20 @@ fn resident_instantiation_certificates_ignore_foreign_files() {
         format!("(import-instantiations {key} \"(a)\")\n(assert false)"),
         format!("(import-instantiations {key} \"(abc"),
         "xyz".to_owned(),
+        format!("(import-instantiations {key} \"\u{e9}\")"),
+        format!("(import-instantiations {key} \"(a \u{1})\")"),
     ];
     for text in &planted {
         fs::write(path, text).unwrap();
         assert_eq!(check_session(&broken, &envs, &[("::passing", "invalid", None)]), 0, "{text}");
         assert_eq!(&fs::read_to_string(path).unwrap(), text);
+    }
+    #[cfg(unix)]
+    {
+        fs::remove_file(path).unwrap();
+        assert!(std::process::Command::new("mkfifo").arg(path).status().unwrap().success());
+        assert_eq!(check_session(&broken, &envs, &[("::passing", "invalid", None)]), 0);
+        fs::remove_file(path).unwrap();
     }
     assert_eq!(check_session(SOURCE, &envs, &[("::passing", "valid", None)]), 0);
     assert_eq!(check_session(SOURCE, &envs, &[("::passing", "valid", Some(true))]), 1);
