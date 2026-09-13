@@ -261,13 +261,12 @@ impl Context {
         // Only start the smt process if there are queries to run
         if self.smt_process.is_none() {
             let transcript_log = self.smt_transcript_log.take();
-            self.smt_process =
-                Some(SmtProcess::launch(
-                    &self.solver,
-                    transcript_log,
-                    self.provenance,
-                    self.instantiation_replay,
-                ));
+            self.smt_process = Some(SmtProcess::launch(
+                &self.solver,
+                transcript_log,
+                self.provenance,
+                self.instantiation_replay,
+            ));
         }
         self.smt_process.as_mut().unwrap()
     }

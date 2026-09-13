@@ -322,35 +322,37 @@ fn resident_rechecks_preserve_query_scopes_and_solver_process() {
 /// and a recheck of a query with saved ones first tries them alone
 /// (`:only`), falling back to the ordinary check unless that proves the
 /// query. Replayed instances are instances of asserted quantifiers, so no
-/// verdict may change, including the failing query's.
-///
-/// Needs a cvc5 with `save-instantiations` (BasisResearch cvc5 branch
-/// `s2/inst-replay`), which the pinned release lacks; run it with
-/// `VERUS_CVC5_PATH` pointing there and `--ignored`.
+/// verdict may change, including the failing query's. The reply says which
+/// checks tried a certificate and whether it closed the query.
 #[test]
-#[ignore = "needs a cvc5 with save-instantiations"]
 fn resident_instantiation_replay_keeps_verdicts() {
-    let mut worker = Worker::start_with_env(
-        SOURCE,
-        &["-V", "no-solver-version-check"],
-        &[("VERUS_RESIDENT_INST_REPLAY", "1")],
-    );
+    let mut worker = Worker::start_with_env(SOURCE, &[], &[("VERUS_RESIDENT_INST_REPLAY", "1")]);
     let ready = worker.receive();
     assert_eq!(ready["event"], "ready");
+    assert_eq!(ready["instantiation_replay"], true);
     let session = ready["session"].clone();
+    // (query, verdict, certificate closed it), the last `None` when no
+    // certificate was tried.
     let checks = [
-        ("::failing", "invalid"),
-        ("::passing", "valid"),
-        ("::failing", "invalid"),
-        ("::passing", "valid"),
-        ("::passing", "valid"),
+        ("::failing", "invalid", None),
+        ("::passing", "valid", None),
+        ("::failing", "invalid", Some(false)),
+        ("::passing", "valid", Some(true)),
+        ("::passing", "valid", Some(true)),
     ];
-    for (name, expected) in checks {
+    for (name, expected, closed) in checks {
         let query = query_id(&ready, name);
         let result = worker
             .send(json!({"command": "check", "session": session, "bucket": 0, "query": query}));
         assert_eq!(result["event"], "checked", "{result}");
         assert_eq!(result["result"], expected, "{result}");
+        match closed {
+            None => assert!(result["certificate"].is_null(), "{}", result),
+            Some(closed) => {
+                assert_eq!(result["certificate"]["source"], "session", "{result}");
+                assert_eq!(result["certificate"]["closed"], closed, "{result}");
+            }
+        }
     }
     assert_eq!(worker.send(json!({"command": "close", "session": session}))["event"], "closed");
     worker.finish(false);
@@ -373,22 +375,30 @@ fn resident_instantiation_replay_keeps_verdicts() {
 /// passing query keeps its verdict, and the failing query's certificate does
 /// not turn its failure into a pass.
 #[test]
-#[ignore = "needs a cvc5 with save-instantiations"]
 fn resident_instantiation_certificates_survive_a_new_session() {
     let certificates = tempfile::tempdir().unwrap();
     let dir = certificates.path().to_str().unwrap().to_owned();
     let envs = [("VERUS_RESIDENT_INST_REPLAY", "1"), ("VERUS_RESIDENT_INST_DIR", dir.as_str())];
-    let run = |checks: &[(&str, &str)]| {
-        let mut worker = Worker::start_with_env(SOURCE, &["-V", "no-solver-version-check"], &envs);
+    // (query, verdict, certificate closed it), the last `None` when no
+    // certificate was tried.
+    let run = |checks: &[(&str, &str, Option<bool>)]| {
+        let mut worker = Worker::start_with_env(SOURCE, &[], &envs);
         let ready = worker.receive();
         assert_eq!(ready["event"], "ready");
         let session = ready["session"].clone();
-        for (name, expected) in checks {
+        for (name, expected, closed) in checks {
             let query = query_id(&ready, name);
             let result = worker
                 .send(json!({"command": "check", "session": session, "bucket": 0, "query": query}));
             assert_eq!(result["event"], "checked", "{result}");
             assert_eq!(result["result"], *expected, "{result}");
+            match closed {
+                None => assert!(result["certificate"].is_null(), "{}", result),
+                Some(closed) => {
+                    assert_eq!(result["certificate"]["source"], "imported", "{result}");
+                    assert_eq!(result["certificate"]["closed"], *closed, "{result}");
+                }
+            }
         }
         assert_eq!(worker.send(json!({"command": "close", "session": session}))["event"], "closed");
         worker.finish(false);
@@ -396,12 +406,13 @@ fn resident_instantiation_certificates_survive_a_new_session() {
         for entry in fs::read_dir(worker.dir.path().join("logs")).unwrap() {
             let path = entry.unwrap().path();
             if path.extension().is_some_and(|ext| ext == "smt2") {
-                imports += fs::read_to_string(path).unwrap().matches("(import-instantiations c").count();
+                imports +=
+                    fs::read_to_string(path).unwrap().matches("(import-instantiations c").count();
             }
         }
         imports
     };
-    assert_eq!(run(&[("::passing", "valid"), ("::failing", "invalid")]), 0);
+    assert_eq!(run(&[("::passing", "valid", None), ("::failing", "invalid", None)]), 0);
     let exported: Vec<_> = fs::read_dir(certificates.path())
         .unwrap()
         .map(|entry| entry.unwrap().file_name().into_string().unwrap())
@@ -410,7 +421,10 @@ fn resident_instantiation_certificates_survive_a_new_session() {
     assert!(exported.iter().all(|name| name.starts_with('c') && name.ends_with(".smt2")));
     // A new session: the solver has saved nothing, so each first check
     // imports the file the previous session exported.
-    assert_eq!(run(&[("::passing", "valid"), ("::failing", "invalid")]), 2);
+    assert_eq!(
+        run(&[("::passing", "valid", Some(true)), ("::failing", "invalid", Some(false))]),
+        2
+    );
 }
 
 /// Each spawned context must survive initial verification and be reused even

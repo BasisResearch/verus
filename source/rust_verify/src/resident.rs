@@ -257,6 +257,9 @@ pub(crate) struct SessionInfo {
     /// The ordered startup settings. They already live in every retained
     /// solver and must not be reapplied after initialization.
     pub(crate) smt_options: Vec<(String, String)>,
+    /// Whether ordinary cvc5 solvers were launched for instantiation replay
+    /// (`VERUS_RESIDENT_INST_REPLAY`), so rechecks try certificates first.
+    pub(crate) instantiation_replay: bool,
 }
 
 #[derive(Serialize)]
@@ -270,6 +273,7 @@ enum Response<'a> {
         provenance: bool,
         spinoff_all: bool,
         smt_options: &'a [(String, String)],
+        instantiation_replay: bool,
         input_files: &'a [String],
         buckets: &'a [BucketDescription],
     },
@@ -287,6 +291,8 @@ enum Response<'a> {
         elapsed_ms: u128,
         restore_ms: u128,
         provenance: Option<&'a crate::provenance::ResolvedQueryProvenance>,
+        /// Present when this check tried a certificate before searching.
+        certificate: Option<CertificateAttempt>,
     },
     Error {
         message: &'a str,
@@ -294,6 +300,25 @@ enum Response<'a> {
     Closed {
         session: &'a str,
     },
+}
+
+/// Where a tried certificate came from: this solver's own save from an earlier
+/// check, or a file an earlier session exported.
+#[derive(Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum CertificateSource {
+    Session,
+    Imported,
+}
+
+/// A certificate attempt: `closed` when the restored instances alone proved
+/// the query, otherwise the verdict comes from the ordinary check that
+/// followed. `elapsed_ms` is the attempt alone and is part of the check's.
+#[derive(Clone, Copy, Serialize)]
+struct CertificateAttempt {
+    source: CertificateSource,
+    closed: bool,
+    elapsed_ms: u128,
 }
 
 #[derive(Serialize)]
@@ -585,6 +610,7 @@ impl Server {
                 provenance: self.info.provenance,
                 spinoff_all: self.info.spinoff_all,
                 smt_options: &self.info.smt_options,
+                instantiation_replay: self.info.instantiation_replay,
                 input_files: &self.info.input_files,
                 buckets: &buckets,
             },
@@ -691,6 +717,7 @@ impl Server {
                     // answer is discarded, with its diagnostics, before the
                     // ordinary check.
                     let mut certified = None;
+                    let mut attempted = None;
                     let certificate = replay_key.as_ref().and_then(|key| {
                         if air.has_saved_instantiations(key) {
                             return Some((key.clone(), None));
@@ -699,6 +726,10 @@ impl Server {
                         std::fs::read_to_string(path).ok().map(|text| (key.clone(), Some(text)))
                     });
                     if let Some((key, import)) = certificate {
+                        let source = match import {
+                            Some(_) => CertificateSource::Imported,
+                            None => CertificateSource::Session,
+                        };
                         air.set_restore_instantiations(Some(key), true);
                         air.set_import_instantiations(import);
                         let attempt = air.check_valid(
@@ -722,6 +753,11 @@ impl Server {
                             }
                             _ => air.finish_query(),
                         }
+                        attempted = Some(CertificateAttempt {
+                            source,
+                            closed: certified.is_some(),
+                            elapsed_ms: start.elapsed().as_millis(),
+                        });
                     }
                     let mut outcome = match certified {
                         Some(outcome) => outcome,
@@ -889,6 +925,7 @@ impl Server {
                             elapsed_ms: start.elapsed().as_millis(),
                             restore_ms,
                             provenance: provenance.as_ref(),
+                            certificate: attempted,
                         },
                     )?;
                 }
@@ -1027,6 +1064,7 @@ mod tests {
                 multiple_errors: 2,
                 input_files: Vec::new(),
                 smt_options: Vec::new(),
+                instantiation_replay: false,
             },
         );
         let input = format!("{}\n{{\"command\":\"list\"}}\n", " ".repeat(65537));

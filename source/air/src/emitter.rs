@@ -124,10 +124,8 @@ impl Emitter {
     /// `:only` no other instantiation happens in that scope.
     pub fn log_restore_instantiations(&mut self, key: &str, only: bool) {
         if !self.is_none() {
-            let mut items = vec![
-                Node::Atom("restore-instantiations".to_string()),
-                Node::Atom(key.to_string()),
-            ];
+            let mut items =
+                vec![Node::Atom("restore-instantiations".to_string()), Node::Atom(key.to_string())];
             if only {
                 items.push(Node::Atom(":only".to_string()));
             }
