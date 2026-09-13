@@ -1,12 +1,12 @@
 # Basis fork build: publish the per-commit Verus release the MCP server and the
 # benchmark harness download.
 #
-# build.yml already produces verus-arm64-macos.zip and verus-x86-linux.zip as
-# workflow artifacts. Artifacts expire and need an authenticated API call to
-# fetch, so a consumer cannot pin "the Verus built from commit X" the way it
-# pins cvc5 and z3. This publishes the same zips to a per-commit GitHub release
-# with sha256 sidecars, matching the basis-build workflows on
-# BasisResearch/cvc5 and BasisResearch/z3.
+# build.yml already produces verus-arm64-macos.zip, verus-x86-linux.zip and
+# verus-arm64-linux.zip as workflow artifacts. Artifacts expire and need an
+# authenticated API call to fetch, so a consumer cannot pin "the Verus built
+# from commit X" the way it pins cvc5 and z3. This publishes the same zips to a
+# per-commit GitHub release with sha256 sidecars, matching the basis-build
+# workflows on BasisResearch/cvc5 and BasisResearch/z3.
 #
 # The asset is a zip of the whole target-verus/release tree, not a bare binary,
 # because Verus needs its vstd.vir and libraries alongside the executable. That
@@ -49,7 +49,7 @@ jobs:
       - name: checksum
         shell: bash
         run: |
-          for name in verus-arm64-macos verus-x86-linux; do
+          for name in verus-arm64-macos verus-x86-linux verus-arm64-linux; do
             test -f "$name/$name.zip" || { echo "missing $name/$name.zip"; exit 1; }
             ( cd "$name" && shasum -a 256 "$name.zip" > "$name.zip.sha256" )
             cat "$name/$name.zip.sha256"
@@ -81,4 +81,6 @@ jobs:
             verus-arm64-macos/verus-arm64-macos.zip.sha256 \
             verus-x86-linux/verus-x86-linux.zip \
             verus-x86-linux/verus-x86-linux.zip.sha256 \
+            verus-arm64-linux/verus-arm64-linux.zip \
+            verus-arm64-linux/verus-arm64-linux.zip.sha256 \
             SHA256SUMS
