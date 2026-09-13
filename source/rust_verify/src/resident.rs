@@ -904,9 +904,14 @@ impl Server {
                             )
                         })
                     });
-                    // Every path here came from a solver answer, so the save
-                    // has a result to read from.
-                    if let Some(key) = &replay_key {
+                    // Only a proof is worth keeping. A failed check's instances
+                    // are no certificate, and saving them would replace one
+                    // that still closes the query once the failing edit is
+                    // undone. Every path here came from a solver answer, so
+                    // the save has a result to read from.
+                    if let Some(key) =
+                        replay_key.as_ref().filter(|_| matches!(result, QueryResult::Valid))
+                    {
                         air.save_instantiations(key);
                         if let Some(dir) = &cert_dir {
                             write_certificate(air, dir, key);

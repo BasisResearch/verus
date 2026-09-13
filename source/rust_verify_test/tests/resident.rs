@@ -318,12 +318,12 @@ fn resident_rechecks_preserve_query_scopes_and_solver_process() {
     eprintln!("one verifier process, one cvc5 launch, {checks} checks, balanced scopes");
 }
 
-/// With instantiation replay, every resident check saves its instantiations,
-/// and a recheck of a query with saved ones first tries them alone
-/// (`:only`), falling back to the ordinary check unless that proves the
-/// query. Replayed instances are instances of asserted quantifiers, so no
-/// verdict may change, including the failing query's. The reply says which
-/// checks tried a certificate and whether it closed the query.
+/// With instantiation replay, every resident check that proves its query
+/// saves its instantiations, and a recheck of a query with saved ones first
+/// tries them alone (`:only`), falling back to the ordinary check unless that
+/// proves the query. A failed check saves nothing, so the failing query's
+/// rechecks search as usual. The reply says which checks tried a certificate
+/// and whether it closed the query.
 #[test]
 fn resident_instantiation_replay_keeps_verdicts() {
     let mut worker = Worker::start_with_env(SOURCE, &[], &[("VERUS_RESIDENT_INST_REPLAY", "1")]);
@@ -336,7 +336,7 @@ fn resident_instantiation_replay_keeps_verdicts() {
     let checks = [
         ("::failing", "invalid", None),
         ("::passing", "valid", None),
-        ("::failing", "invalid", Some(false)),
+        ("::failing", "invalid", None),
         ("::passing", "valid", Some(true)),
         ("::passing", "valid", Some(true)),
     ];
@@ -365,24 +365,29 @@ fn resident_instantiation_replay_keeps_verdicts() {
             restores += log.matches(":only)").count();
         }
     }
-    // One save per check; a certificate attempt for the three rechecks of a
-    // query that had already been checked in this session.
-    assert_eq!((saves, restores), (checks.len(), 3));
+    // One save per valid check; a certificate attempt for the two rechecks of
+    // the passing query.
+    assert_eq!((saves, restores), (3, 2));
 }
 
 /// A certificate exported by one session is imported by the next, a fresh
-/// compilation and solver, before its first check of the same query: the
-/// passing query keeps its verdict, and the failing query's certificate does
-/// not turn its failure into a pass.
+/// compilation and solver, before its first check of the same query. Only
+/// the passing query exports one. After an edit that breaks the passing
+/// proof, the same query imports that certificate, which must not turn the
+/// failure into a pass, and the failed check must not replace it.
 #[test]
 fn resident_instantiation_certificates_survive_a_new_session() {
     let certificates = tempfile::tempdir().unwrap();
     let dir = certificates.path().to_str().unwrap().to_owned();
     let envs = [("VERUS_RESIDENT_INST_REPLAY", "1"), ("VERUS_RESIDENT_INST_DIR", dir.as_str())];
+    // The same function, kind and description as `passing`, so the same
+    // certificate key, but its assertion is false.
+    let broken = SOURCE.replace("assert(recursive(0) == 0)", "assert(recursive(0) == 1)");
+    assert_ne!(broken, SOURCE);
     // (query, verdict, certificate closed it), the last `None` when no
     // certificate was tried.
-    let run = |checks: &[(&str, &str, Option<bool>)]| {
-        let mut worker = Worker::start_with_env(SOURCE, &[], &envs);
+    let run = |source: &str, checks: &[(&str, &str, Option<bool>)]| {
+        let mut worker = Worker::start_with_env(source, &[], &envs);
         let ready = worker.receive();
         assert_eq!(ready["event"], "ready");
         let session = ready["session"].clone();
@@ -412,19 +417,22 @@ fn resident_instantiation_certificates_survive_a_new_session() {
         }
         imports
     };
-    assert_eq!(run(&[("::passing", "valid", None), ("::failing", "invalid", None)]), 0);
-    let exported: Vec<_> = fs::read_dir(certificates.path())
-        .unwrap()
-        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
-        .collect();
-    assert_eq!(exported.len(), 2, "{exported:?}");
-    assert!(exported.iter().all(|name| name.starts_with('c') && name.ends_with(".smt2")));
-    // A new session: the solver has saved nothing, so each first check
-    // imports the file the previous session exported.
+    assert_eq!(run(SOURCE, &[("::passing", "valid", None), ("::failing", "invalid", None)]), 0);
+    let exported: Vec<_> =
+        fs::read_dir(certificates.path()).unwrap().map(|entry| entry.unwrap().path()).collect();
+    assert_eq!(exported.len(), 1, "{exported:?}");
+    let name = exported[0].file_name().unwrap().to_str().unwrap();
+    assert!(name.starts_with('c') && name.ends_with(".smt2"), "{name}");
+    let certificate = fs::read_to_string(&exported[0]).unwrap();
+    // A new session: the solver has saved nothing, so the passing query's
+    // first check imports the file the previous session exported.
     assert_eq!(
-        run(&[("::passing", "valid", Some(true)), ("::failing", "invalid", Some(false))]),
-        2
+        run(SOURCE, &[("::passing", "valid", Some(true)), ("::failing", "invalid", None)]),
+        1
     );
+    // The broken edit imports it too, and still fails.
+    assert_eq!(run(&broken, &[("::passing", "invalid", Some(false))]), 1);
+    assert_eq!(fs::read_to_string(&exported[0]).unwrap(), certificate);
 }
 
 /// Each spawned context must survive initial verification and be reused even
