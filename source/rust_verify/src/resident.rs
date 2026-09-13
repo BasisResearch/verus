@@ -24,11 +24,13 @@ use crate::buckets::BucketId;
 use crate::commands::{QueryOp, Style};
 use air::ast::{CommandX, Commands, Query};
 use air::context::{Context, QueryContext, ValidityResult};
+use air::instantiations::ImportInstantiations;
 use air::messages::{ArcDynMessage, Diagnostics, MessageLevel};
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::io::{self, BufRead, Read, Write};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use vir::ast_util::fun_as_friendly_rust_name;
 use vir::def::{CommandContext, CommandsWithContext};
@@ -219,20 +221,22 @@ fn certificate_key(function: &str, kind: QueryKind, description: &str, repeat: u
 }
 
 /// Export what `key` saved to `<dir>/<key>.smt2`, where a later session's
-/// solver can import it. Written beside and renamed into place, so a reader
-/// never sees half a file; a failure only costs a later session its
-/// certificate.
+/// solver can import it. Only a certificate that names an instance is written.
+/// It goes to a file no other writer uses, then is renamed into place, so a
+/// reader never sees half a file, nor two sessions' writes interleaved. A
+/// failure only costs a later session its certificate.
 fn write_certificate(air: &mut Context, dir: &std::path::Path, key: &str) {
-    let lines = air.export_instantiations(key);
-    if lines.iter().any(|line| line.starts_with("(error")) {
+    static WRITES: AtomicUsize = AtomicUsize::new(0);
+    let Some(certificate) = air.export_instantiations(key) else {
         return;
-    }
-    let text: Vec<&str> =
-        lines.iter().map(String::as_str).filter(|line| !line.starts_with(';')).collect();
+    };
     let path = dir.join(format!("{key}.smt2"));
-    let partial = dir.join(format!("{key}.smt2.partial"));
-    if std::fs::write(&partial, text.join("\n")).is_ok() {
-        let _ = std::fs::rename(&partial, &path);
+    let write = WRITES.fetch_add(1, Ordering::Relaxed);
+    let partial = dir.join(format!("{key}.smt2.{}-{write}.partial", std::process::id()));
+    if std::fs::write(&partial, certificate.to_text()).is_err()
+        || std::fs::rename(&partial, &path).is_err()
+    {
+        let _ = std::fs::remove_file(&partial);
     }
 }
 
@@ -722,8 +726,12 @@ impl Server {
                         if air.has_saved_instantiations(key) {
                             return Some((key.clone(), None));
                         }
+                        // A file that is not exactly a certificate for this
+                        // key is never sent: it could assert anything.
                         let path = cert_dir.as_ref()?.join(format!("{key}.smt2"));
-                        std::fs::read_to_string(path).ok().map(|text| (key.clone(), Some(text)))
+                        let text = std::fs::read_to_string(path).ok()?;
+                        let import = ImportInstantiations::parse(&text, key)?;
+                        Some((key.clone(), Some(import)))
                     });
                     if let Some((key, import)) = certificate {
                         let source = match import {

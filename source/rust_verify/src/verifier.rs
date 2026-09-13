@@ -1250,7 +1250,8 @@ impl Verifier {
     }
 
     /// Experimental: resident rechecks first try the instantiations the
-    /// previous check of the same query made (see resident.rs). Not under
+    /// previous check of the same query made (see resident.rs). Its solvers
+    /// run with proofs and twice the rlimit, as under provenance. Not under
     /// provenance, which describes the ordinary search.
     fn instantiation_replay(&self) -> bool {
         self.args.resident

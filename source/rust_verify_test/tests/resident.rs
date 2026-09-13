@@ -2,12 +2,13 @@
 #![cfg(unix)]
 
 use serde_json::{Value, json};
+use std::collections::BTreeSet;
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::net::Shutdown;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
@@ -356,18 +357,93 @@ fn resident_instantiation_replay_keeps_verdicts() {
     }
     assert_eq!(worker.send(json!({"command": "close", "session": session}))["event"], "closed");
     worker.finish(false);
-    let (mut saves, mut restores) = (0, 0);
-    for entry in fs::read_dir(worker.dir.path().join("logs")).unwrap() {
-        let path = entry.unwrap().path();
-        if path.extension().is_some_and(|ext| ext == "smt2") {
-            let log = fs::read_to_string(path).unwrap();
-            saves += log.matches("(save-instantiations c").count();
-            restores += log.matches(":only)").count();
-        }
-    }
+    let logs = smt_logs(worker.dir.path());
+    let saves: usize = logs.iter().map(|log| log.matches("(save-instantiations c").count()).sum();
+    let restores: usize = logs.iter().map(|log| log.matches(":only)").count()).sum();
     // One save per valid check; a certificate attempt for the two rechecks of
     // the passing query.
     assert_eq!((saves, restores), (3, 2));
+    // Replay's solvers run with full proofs, so they get twice the budget a
+    // plain session's solvers do.
+    let mut plain = Worker::start(SOURCE, &[]);
+    let ready = plain.receive();
+    assert_eq!(ready["instantiation_replay"], false);
+    let session = ready["session"].clone();
+    let query = query_id(&ready, "::passing");
+    let result =
+        plain.send(json!({"command": "check", "session": session, "bucket": 0, "query": query}));
+    assert_eq!(result["result"], "valid", "{result}");
+    assert_eq!(plain.send(json!({"command": "close", "session": session}))["event"], "closed");
+    plain.finish(false);
+    let plain_budgets = resource_budgets(&smt_logs(plain.dir.path()));
+    assert!(!plain_budgets.is_empty());
+    let doubled: BTreeSet<u64> = plain_budgets.iter().map(|budget| budget * 2).collect();
+    assert_eq!(resource_budgets(&logs), doubled);
+}
+
+/// The contents of a worker's SMT logs.
+fn smt_logs(worker_dir: &Path) -> Vec<String> {
+    fs::read_dir(worker_dir.join("logs"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "smt2"))
+        .map(|path| fs::read_to_string(path).unwrap())
+        .collect()
+}
+
+/// The nonzero per-check resource budgets the logged solvers were given.
+fn resource_budgets(logs: &[String]) -> BTreeSet<u64> {
+    logs.iter()
+        .flat_map(|log| log.lines())
+        .filter_map(|line| {
+            line.trim()
+                .strip_prefix("(set-option :reproducible-resource-limit ")?
+                .strip_suffix(')')?
+                .parse()
+                .ok()
+        })
+        .filter(|budget| *budget != 0)
+        .collect()
+}
+
+/// Check each `(query, verdict, closed)` in a new session over `source`, where
+/// `closed` is `None` when no certificate may be tried, and otherwise whether
+/// an imported one closed the query. Returns how many certificates the
+/// session's solvers were sent.
+fn check_session(
+    source: &str,
+    envs: &[(&str, &str)],
+    checks: &[(&str, &str, Option<bool>)],
+) -> usize {
+    let mut worker = Worker::start_with_env(source, &[], envs);
+    let ready = worker.receive();
+    assert_eq!(ready["event"], "ready");
+    let session = ready["session"].clone();
+    for (name, expected, closed) in checks {
+        let query = query_id(&ready, name);
+        let result = worker
+            .send(json!({"command": "check", "session": session, "bucket": 0, "query": query}));
+        assert_eq!(result["event"], "checked", "{result}");
+        assert_eq!(result["result"], *expected, "{result}");
+        match closed {
+            None => assert!(result["certificate"].is_null(), "{}", result),
+            Some(closed) => {
+                assert_eq!(result["certificate"]["source"], "imported", "{result}");
+                assert_eq!(result["certificate"]["closed"], *closed, "{result}");
+            }
+        }
+    }
+    assert_eq!(worker.send(json!({"command": "close", "session": session}))["event"], "closed");
+    worker.finish(false);
+    smt_logs(worker.dir.path())
+        .iter()
+        .map(|log| log.matches("(import-instantiations c").count())
+        .sum()
+}
+
+/// The files in a certificate directory.
+fn certificate_files(dir: &Path) -> Vec<PathBuf> {
+    fs::read_dir(dir).unwrap().map(|entry| entry.unwrap().path()).collect()
 }
 
 /// A certificate exported by one session is imported by the next, a fresh
@@ -384,55 +460,53 @@ fn resident_instantiation_certificates_survive_a_new_session() {
     // certificate key, but its assertion is false.
     let broken = SOURCE.replace("assert(recursive(0) == 0)", "assert(recursive(0) == 1)");
     assert_ne!(broken, SOURCE);
-    // (query, verdict, certificate closed it), the last `None` when no
-    // certificate was tried.
-    let run = |source: &str, checks: &[(&str, &str, Option<bool>)]| {
-        let mut worker = Worker::start_with_env(source, &[], &envs);
-        let ready = worker.receive();
-        assert_eq!(ready["event"], "ready");
-        let session = ready["session"].clone();
-        for (name, expected, closed) in checks {
-            let query = query_id(&ready, name);
-            let result = worker
-                .send(json!({"command": "check", "session": session, "bucket": 0, "query": query}));
-            assert_eq!(result["event"], "checked", "{result}");
-            assert_eq!(result["result"], *expected, "{result}");
-            match closed {
-                None => assert!(result["certificate"].is_null(), "{}", result),
-                Some(closed) => {
-                    assert_eq!(result["certificate"]["source"], "imported", "{result}");
-                    assert_eq!(result["certificate"]["closed"], *closed, "{result}");
-                }
-            }
-        }
-        assert_eq!(worker.send(json!({"command": "close", "session": session}))["event"], "closed");
-        worker.finish(false);
-        let mut imports = 0;
-        for entry in fs::read_dir(worker.dir.path().join("logs")).unwrap() {
-            let path = entry.unwrap().path();
-            if path.extension().is_some_and(|ext| ext == "smt2") {
-                imports +=
-                    fs::read_to_string(path).unwrap().matches("(import-instantiations c").count();
-            }
-        }
-        imports
-    };
-    assert_eq!(run(SOURCE, &[("::passing", "valid", None), ("::failing", "invalid", None)]), 0);
-    let exported: Vec<_> =
-        fs::read_dir(certificates.path()).unwrap().map(|entry| entry.unwrap().path()).collect();
+    let first = [("::passing", "valid", None), ("::failing", "invalid", None)];
+    assert_eq!(check_session(SOURCE, &envs, &first), 0);
+    let exported = certificate_files(certificates.path());
     assert_eq!(exported.len(), 1, "{exported:?}");
     let name = exported[0].file_name().unwrap().to_str().unwrap();
     assert!(name.starts_with('c') && name.ends_with(".smt2"), "{name}");
     let certificate = fs::read_to_string(&exported[0]).unwrap();
     // A new session: the solver has saved nothing, so the passing query's
     // first check imports the file the previous session exported.
-    assert_eq!(
-        run(SOURCE, &[("::passing", "valid", Some(true)), ("::failing", "invalid", None)]),
-        1
-    );
+    let second = [("::passing", "valid", Some(true)), ("::failing", "invalid", None)];
+    assert_eq!(check_session(SOURCE, &envs, &second), 1);
     // The broken edit imports it too, and still fails.
-    assert_eq!(run(&broken, &[("::passing", "invalid", Some(false))]), 1);
+    assert_eq!(check_session(&broken, &envs, &[("::passing", "invalid", Some(false))]), 1);
     assert_eq!(fs::read_to_string(&exported[0]).unwrap(), certificate);
+}
+
+/// A file in the certificate directory reaches a solver only if it is exactly
+/// a certificate for its query's key. Anything else is ignored: the check
+/// searches as usual and the session survives. A planted `(assert false)`
+/// must not prove the broken assertion, and a truncated file must not stop
+/// the solver. A passing check then replaces the file with a certificate the
+/// next session imports.
+#[test]
+fn resident_instantiation_certificates_ignore_foreign_files() {
+    let certificates = tempfile::tempdir().unwrap();
+    let dir = certificates.path().to_str().unwrap().to_owned();
+    let envs = [("VERUS_RESIDENT_INST_REPLAY", "1"), ("VERUS_RESIDENT_INST_DIR", dir.as_str())];
+    let broken = SOURCE.replace("assert(recursive(0) == 0)", "assert(recursive(0) == 1)");
+    assert_eq!(check_session(SOURCE, &envs, &[("::passing", "valid", None)]), 0);
+    let exported = certificate_files(certificates.path());
+    assert_eq!(exported.len(), 1, "{exported:?}");
+    let path = &exported[0];
+    let key = path.file_stem().unwrap().to_str().unwrap().to_owned();
+    let planted = [
+        "(assert false)".to_owned(),
+        format!("(import-instantiations {key} \"(a)\")\n(assert false)"),
+        format!("(import-instantiations {key} \"(abc"),
+        "xyz".to_owned(),
+    ];
+    for text in &planted {
+        fs::write(path, text).unwrap();
+        assert_eq!(check_session(&broken, &envs, &[("::passing", "invalid", None)]), 0, "{text}");
+        assert_eq!(&fs::read_to_string(path).unwrap(), text);
+    }
+    assert_eq!(check_session(SOURCE, &envs, &[("::passing", "valid", None)]), 0);
+    assert_eq!(check_session(SOURCE, &envs, &[("::passing", "valid", Some(true))]), 1);
+    assert_eq!(certificate_files(certificates.path()), exported);
 }
 
 /// Each spawned context must survive initial verification and be reused even

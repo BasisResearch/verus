@@ -3,6 +3,7 @@ use crate::ast::{
 };
 use crate::closure::ClosureTerm;
 use crate::emitter::Emitter;
+use crate::instantiations::ImportInstantiations;
 use crate::messages::{ArcDynMessage, Diagnostics};
 use crate::model::Model;
 use crate::node;
@@ -166,9 +167,9 @@ pub struct Context {
     pub(crate) restore_instantiations: Option<(String, bool)>,
     /// The keys this solver has saved instantiations under.
     pub(crate) saved_instantiations: HashSet<String>,
-    /// An `import-instantiations` command to send before the next query's
-    /// first `check-sat`, once its declarations are in scope (cvc5 only).
-    pub(crate) import_instantiations: Option<String>,
+    /// A certificate to import before the next query's first `check-sat`,
+    /// once its declarations are in scope (cvc5 only).
+    pub(crate) import_instantiations: Option<ImportInstantiations>,
     variable_versions: VariableVersions,
 }
 
@@ -394,22 +395,23 @@ impl Context {
         self.saved_instantiations.contains(key)
     }
 
-    /// Send `command`, an `import-instantiations` command another solver
-    /// exported, in the next query's scope just before its first `check-sat`,
-    /// where the query's declarations are in scope (cvc5 only). cvc5 skips an
-    /// entry naming a symbol it has not declared.
-    pub fn set_import_instantiations(&mut self, command: Option<String>) {
-        assert!(command.is_none() || matches!(self.solver, SmtSolver::Cvc5));
-        self.import_instantiations = command;
+    /// Import `certificate`, which another solver exported, in the next query's
+    /// scope just before its first `check-sat`, where the query's declarations
+    /// are in scope (cvc5 only). cvc5 skips an entry naming a symbol it has not
+    /// declared.
+    pub fn set_import_instantiations(&mut self, certificate: Option<ImportInstantiations>) {
+        assert!(certificate.is_none() || matches!(self.solver, SmtSolver::Cvc5));
+        self.import_instantiations = certificate;
     }
 
-    /// Ask the solver for what `key` saved, as an `import-instantiations`
-    /// command, and return its reply lines (cvc5 only). Flushes: call it
-    /// after `save_instantiations` and before `finish_query`.
-    pub fn export_instantiations(&mut self, key: &str) -> Vec<String> {
+    /// Ask the solver for what `key` saved, as a certificate another solver
+    /// can import (cvc5 only). `None` when the reply is an error, or names no
+    /// instance. Flushes: call it after `save_instantiations` and before
+    /// `finish_query`.
+    pub fn export_instantiations(&mut self, key: &str) -> Option<ImportInstantiations> {
         assert!(matches!(self.solver, SmtSolver::Cvc5));
         self.smt_log.log_export_instantiations(key);
-        self.flush_commands()
+        ImportInstantiations::parse(&self.flush_commands().join("\n"), key)
     }
 
     /// Save the current query's instantiations under `key` before

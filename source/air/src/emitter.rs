@@ -1,5 +1,6 @@
 use crate::ast::{Decl, Expr, Ident, Query};
 use crate::context::SmtSolver;
+use crate::instantiations::ImportInstantiations;
 use crate::printer::{NodeWriter, Printer, macro_push_node};
 use crate::{node, nodes};
 use sise::TreeNode as Node;
@@ -141,15 +142,11 @@ impl Emitter {
         }
     }
 
-    /// Text already in SMT-LIB syntax, sent as is: an imported certificate.
-    pub fn log_raw(&mut self, text: &str) {
-        if let Some(w) = &mut self.pipe_buffer {
-            writeln!(w, "{}", text).unwrap();
-            w.flush().unwrap();
-        }
-        if let Some(w) = &mut self.log {
-            writeln!(w, "{}{}", self.current_indent, text).unwrap();
-            w.flush().unwrap();
+    /// `(import-instantiations k ...)`: a certificate another solver exported,
+    /// already validated by `ImportInstantiations::parse`.
+    pub fn log_import_instantiations(&mut self, certificate: &ImportInstantiations) {
+        if !self.is_none() {
+            self.log_node(&certificate.to_node());
         }
     }
 

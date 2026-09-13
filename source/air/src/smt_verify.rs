@@ -266,16 +266,21 @@ pub(crate) fn smt_check_assertion<'ctx>(
             // `reproducible-resource-limit` (alias of `rlimit-per`) is one of the few
             // cvc5 options that may be set after initialisation; 0 means no limit.
             // Provenance mode spends more of the budget on proof bookkeeping during
-            // search (measured on toydb), so it gets twice as much.
-            let budget =
-                if context.provenance { context.rlimit.saturating_mul(2) } else { context.rlimit };
+            // search (measured on toydb), so it gets twice as much. Instantiation
+            // replay runs with full proofs (`--produce-proofs`), which slowed a
+            // first search about 1.6x on toydb, so it gets the same.
+            let budget = if context.provenance || context.instantiation_replay {
+                context.rlimit.saturating_mul(2)
+            } else {
+                context.rlimit
+            };
             context.smt_log.log_set_option("reproducible-resource-limit", &budget.to_string());
         }
     }
 
     // Only the query's first check imports: later rounds share its scope.
-    if let Some(command) = context.import_instantiations.take() {
-        context.smt_log.log_raw(&command);
+    if let Some(certificate) = context.import_instantiations.take() {
+        context.smt_log.log_import_instantiations(&certificate);
     }
     context.smt_log.log_word("check-sat");
     if context.provenance {
