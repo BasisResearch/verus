@@ -150,7 +150,7 @@ fn run_example_for_file(file_path: &str) {
     };
 
     if !success {
-        eprintln!("- example {} - mode: {:?} - failed -", &path, mode);
+        eprintln!("- example {} - mode: {:?} - failed -", path, mode);
         if warnings.len() > 0 {
             for w in warnings {
                 eprintln!("- warning - {}", w.rendered);

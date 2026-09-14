@@ -5,7 +5,7 @@ use common::*;
 fn line_count_file(filename: &str) -> String {
     assert!(filename.ends_with(".rs"));
     let file_path = test_cases_path().join(filename);
-    run_line_count(&file_path).expect(&format!("line_count failed on {:?}", file_path))
+    run_line_count(&file_path).unwrap_or_else(|_| panic!("line_count failed on {:?}", file_path))
 }
 
 #[test]

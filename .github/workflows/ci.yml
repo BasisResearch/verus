@@ -63,13 +63,15 @@ jobs:
           toolchain: 1.97.1
           components: clippy
 
+      # --all-targets so that tests are linted too: a lint in a test file
+      # otherwise reaches main and only shows up in a local run
       - name: clippy check codebase
         working-directory: ./source
-        run: cargo clippy -- -D warnings
+        run: cargo clippy --all-targets -- -D warnings
 
       - name: clippy check vargo
         working-directory: ./tools/vargo
-        run: cargo clippy -- -D warnings
+        run: cargo clippy --all-targets -- -D warnings
 
   # smoke test toolchain manifest creation
   create-manifest-smoke-test:
