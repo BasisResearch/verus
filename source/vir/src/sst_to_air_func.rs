@@ -68,6 +68,9 @@ pub(crate) fn func_bind_trig(
     let trigger: Trigger = Arc::new(trig_exprs.clone());
     let triggers: Triggers = Arc::new(vec![trigger]);
     let qid = new_internal_qid(ctx, name, role);
+    if let Some(qid) = &qid {
+        crate::sst_to_air::record_qid_type_binders(ctx, qid, &binders);
+    }
     Arc::new(BindX::Quant(Quant::Forall, Arc::new(binders), triggers, qid))
 }
 

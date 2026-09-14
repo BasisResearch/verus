@@ -606,6 +606,7 @@ pub(crate) fn parse_matching_loops_lines(lines: &Vec<String>) -> crate::context:
                             ":depth-per-rung" => l.depth_per_rung = dec(&v).unwrap_or(0.0),
                             ":depth-per-round" => l.depth_per_round = dec(&v).unwrap_or(0.0),
                             ":fanout-per-round" => l.fanout_per_round = dec(&v).unwrap_or(0.0),
+                            ":fanout-per-step" => l.fanout_per_step = dec(&v).unwrap_or(0.0),
                             ":via" => {
                                 l.via = match &v {
                                     Node::List(qs) => qs.iter().map(|q| symbol(q)).collect(),
@@ -613,7 +614,7 @@ pub(crate) fn parse_matching_loops_lines(lines: &Vec<String>) -> crate::context:
                                 }
                             }
                             ":trigger" => l.trigger = terms(&v),
-                            ":context" => l.context = terms(&v).into_iter().next(),
+                            ":context" => l.context = terms(&v),
                             ":shape" => l.shape = terms(&v),
                             ":step" => l.step = terms(&v),
                             ":ladder" => {

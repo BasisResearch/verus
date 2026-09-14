@@ -971,6 +971,7 @@ pub(crate) fn new_user_qid(ctx: &Ctx, exp: &Exp) -> Qid {
                 user: Some(BndInfoUser { span: exp.span.clone(), trigs: trigs.clone() }),
                 role: None,
                 tag: None,
+                type_binders: Vec::new(),
             };
             ctx.global.qid_map.borrow_mut().insert(qid.clone(), bnd_info);
         }
@@ -3117,18 +3118,38 @@ fn byte_string_indices_to_air(ctx: &Ctx, lit: Arc<Vec<u8>>) -> Expr {
 }
 
 /// Record, for every `:qid` inside `expr` that `qid_map` knows, that the
-/// quantifier was sent inside the top-level assertion tagged `tag`.
+/// quantifier was sent inside the top-level assertion tagged `tag`, and its
+/// type binders (see `record_qid_type_binders`).
 pub(crate) fn record_qid_owner(ctx: &Ctx, expr: &Expr, tag: &air::def::ProvenanceTag) {
-    let mut qids: Vec<air::ast::Ident> = Vec::new();
-    air::ast_util::quantifier_ids(expr, &mut qids);
-    if qids.is_empty() {
-        return;
-    }
-    let mut qid_map = ctx.global.qid_map.borrow_mut();
-    for qid in qids {
-        if let Some(info) = qid_map.get_mut(&*qid) {
+    let mut quantifiers = Vec::new();
+    air::ast_util::quantifier_binders(expr, &mut quantifiers);
+    for (qid, binders) in quantifiers {
+        if let Some(info) = ctx.global.qid_map.borrow_mut().get_mut(&*qid) {
             info.tag = Some(tag.clone());
         }
+        record_qid_type_binders(ctx, &qid, &binders);
+    }
+}
+
+/// Record which binders of the quantifier `qid` bind type parameters: those
+/// of sort `Dcr` or `Type`, a decoration and a type id per type parameter.
+/// A solver's instantiation vector for `qid` binds them too.
+pub(crate) fn record_qid_type_binders(
+    ctx: &Ctx,
+    qid: &str,
+    binders: &[air::ast::Binder<air::ast::Typ>],
+) {
+    let is_type_binder = |typ: &air::ast::Typ| {
+        matches!(&**typ, air::ast::TypX::Named(sort)
+            if sort.as_str() == crate::def::DECORATION || sort.as_str() == crate::def::TYPE)
+    };
+    if let Some(info) = ctx.global.qid_map.borrow_mut().get_mut(qid) {
+        info.type_binders = binders
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| is_type_binder(&b.a))
+            .map(|(k, _)| k)
+            .collect();
     }
 }
 

@@ -262,11 +262,22 @@ pub fn render_term(names: &SourceNames, term: &str) -> String {
 
 /// One instantiation vector (`(t1 t2)`) as a comma-separated source list.
 pub fn render_vector(names: &SourceNames, vector: &str) -> String {
+    render_vector_except(names, vector, &[])
+}
+
+/// One instantiation vector without its entries at `skip`: the positions of
+/// the quantifier's type binders (a decoration and a type id per type
+/// parameter), as the encoder recorded them where it emitted the quantifier.
+pub fn render_vector_except(names: &SourceNames, vector: &str, skip: &[usize]) -> String {
     let mut parser = sise::Parser::new(vector);
     match sise::parse_tree(&mut parser) {
-        Ok(Node::List(items)) => {
-            items.iter().map(|i| render_node(names, i)).collect::<Vec<_>>().join(", ")
-        }
+        Ok(Node::List(items)) => items
+            .iter()
+            .enumerate()
+            .filter(|(k, _)| !skip.contains(k))
+            .map(|(_, i)| render_node(names, i))
+            .collect::<Vec<_>>()
+            .join(", "),
         Ok(node) => render_node(names, &node),
         Err(_) => vector.to_string(),
     }
@@ -477,6 +488,15 @@ mod tests {
         // an application too short to hold the recorded type arguments is
         // left as it was emitted
         assert_eq!(render_term(&names, &format!("({head} $)")), format!("{seq_index}($)"));
+    }
+
+    /// A generic quantifier's instantiation vector binds its type binders
+    /// too; the positions the encoder recorded for them are left out.
+    #[test]
+    fn type_binders_are_left_out_of_vectors() {
+        let names = SourceNames::new();
+        assert_eq!(render_vector_except(&names, "($ INT s (I 1))", &[0, 1]), "s, 1");
+        assert_eq!(render_vector(&names, "($ INT s (I 1))"), "$, INT, s, 1");
     }
 
     #[test]

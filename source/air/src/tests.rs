@@ -2369,7 +2369,7 @@ fn matching_loops_reply_parses() {
     assert_eq!((l.chain, l.self_fed, l.ladder_length), (10, 9, 10));
     assert_eq!(l.depth_per_round, 1.0);
     assert_eq!(l.trigger, vec!["(f x)"]);
-    assert_eq!(l.context.as_deref(), Some("(g _0)"));
+    assert_eq!(l.context, vec!["(g _0)"]);
     assert_eq!(l.shape, vec!["(f _0)"]);
     assert_eq!(l.step, vec!["(f (g _0))"]);
     assert_eq!(l.ladder.len(), 4);
@@ -2397,6 +2397,20 @@ fn matching_loops_reply_parses() {
     assert_eq!((l.qid.as_str(), l.via.clone()), ("|odd name|", vec!["|odd name|".to_string()]));
     assert_eq!(l.trigger, vec!["(str.++ s \"a|b\")"]);
     assert_eq!(l.shape, vec!["(f (g _0))"]);
+    // `:fanout-per-step` beside `:fanout-per-round`, and one context per
+    // class of growing subterm (BasisResearch/cvc5#3 since ea27199)
+    let info = crate::smt_verify::parse_matching_loops_lines(&vec![
+        "(:matching-loops (:rounds 10 :instantiations 31 :dropped 0 :max-inst-rounds true :loops ("
+            .to_string(),
+        "(loop :qid |user_f_branches_1| :confidence high :growth exponential-fanout \
+         :edges confirmed :stable true :fanout-per-round 1.41 :fanout-per-step 2.00 \
+         :context ((r _0) (l _0)) :ladder-length 5))))"
+            .to_string(),
+    ]);
+    assert!(info.unparsed.is_empty(), "{:?}", info.unparsed);
+    let l = &info.loops[0];
+    assert_eq!((l.fanout_per_round, l.fanout_per_step), (1.41, 2.0));
+    assert_eq!(l.context, vec!["(r _0)", "(l _0)"]);
 }
 
 /// The extra lines provenance mode adds to a check-sat batch: instantiation

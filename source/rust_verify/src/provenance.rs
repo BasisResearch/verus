@@ -106,7 +106,7 @@ pub struct QueryMatchingLoops {
 #[derive(serde::Serialize, Clone, Debug)]
 pub struct MatchingLoopSmt {
     pub trigger: Vec<String>,
-    pub context: Option<String>,
+    pub context: Vec<String>,
     pub shape: Vec<String>,
     pub step: Vec<String>,
     pub ladder: Vec<Vec<String>>,
@@ -136,8 +136,9 @@ pub struct ResolvedMatchingLoop {
     /// shape or without confirmed self-feeding edges
     pub confidence: String,
     /// linear-depth (+d solver term depth/round), exponential-fanout (xf
-    /// instantiations/round), or bounded. The depth is the solver's, so it
-    /// counts the boxes `term_ladder` leaves out.
+    /// instantiations/step, a step being one of the quantifier's own
+    /// rounds), or bounded. The depth is the solver's, so it counts the boxes
+    /// `term_ladder` leaves out.
     pub growth_rate: String,
     /// the quantifier's first trigger, in source spelling
     pub trigger: String,
@@ -145,9 +146,10 @@ pub struct ResolvedMatchingLoop {
     /// where they differ: `f(_0)  →  f(g(_0))`
     pub term_shape: String,
     /// what each rung wraps around the previous rung's growing subterm,
-    /// generalised over the chain, `_0` marking that subterm: `cons(_1, _0)`
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub growth_context: Option<String>,
+    /// generalised over the chain, `_0` marking that subterm: `cons(_1, _0)`;
+    /// one per class when the loop climbs several subterms (`r(_0)`, `l(_0)`)
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub growth_context: Vec<String>,
     /// the trigger as instantiated by the first rungs of the chain and by its
     /// last, in source spelling; `…` stands for the rungs cvc5 left out
     pub term_ladder: Vec<String>,
@@ -168,6 +170,9 @@ pub struct ResolvedMatchingLoop {
     pub depth_per_rung: f64,
     pub depth_per_round: f64,
     pub fanout_per_round: f64,
+    /// growth per step of the quantifier's own rounds, which a loop that
+    /// fires every other round shows and `fanout_per_round` averages away
+    pub fanout_per_step: f64,
     /// instantiations per round, the last rounds of the check
     pub per_round: Vec<u64>,
     /// the other quantifiers a step passed through, where they are written
@@ -221,6 +226,9 @@ struct Quantifier {
     span: Option<String>,
     tag: Option<air::def::ProvenanceTag>,
     role: Option<&'static str>,
+    /// positions of the binders that bind type parameters, which an
+    /// instantiation's `terms` leave out
+    type_binders: Vec<usize>,
 }
 
 const PRELUDE_QID_PREFIX: &str = "prelude_";
@@ -307,6 +315,7 @@ impl Symbols {
                         span: info.user.as_ref().map(|user| user.span.as_string.clone()),
                         tag: info.tag.clone(),
                         role: info.role.as_ref().map(role_name),
+                        type_binders: info.type_binders.clone(),
                     },
                 )
             })
@@ -437,6 +446,8 @@ impl Symbols {
             .map(|(qid, vectors)| {
                 let QuantifierSite { fun: fun_name, span, inside, site, role } =
                     self.describe_quantifier(fun, qid);
+                let type_binders =
+                    self.quantifiers.get(qid).map_or(&[][..], |q| q.type_binders.as_slice());
                 ResolvedInstantiation {
                     qid: qid.clone(),
                     fun: fun_name,
@@ -447,7 +458,9 @@ impl Symbols {
                     count: vectors.len(),
                     terms: vectors
                         .iter()
-                        .map(|v| vir::air_names::render_vector(&source_names, v))
+                        .map(|v| {
+                            vir::air_names::render_vector_except(&source_names, v, type_binders)
+                        })
                         .collect(),
                     vectors: vectors.clone(),
                 }
@@ -491,8 +504,8 @@ impl Symbols {
                         format!("linear-depth (+{:.2} solver term depth/round)", l.depth_per_round)
                     }
                     "exponential-fanout" => format!(
-                        "exponential-fanout (x{:.2} instantiations/round)",
-                        l.fanout_per_round
+                        "exponential-fanout (x{:.2} instantiations/step)",
+                        l.fanout_per_step
                     ),
                     other => other.to_string(),
                 };
@@ -521,8 +534,9 @@ impl Symbols {
                     term_shape: format!("{}  →  {}", render(&l.shape), render(&l.step)),
                     growth_context: l
                         .context
-                        .as_ref()
-                        .map(|c| vir::air_names::render_term(&names, c)),
+                        .iter()
+                        .map(|c| vir::air_names::render_term(&names, c))
+                        .collect(),
                     term_ladder,
                     ladder_length: l.ladder_length,
                     stable_shape: l.stable,
@@ -535,6 +549,7 @@ impl Symbols {
                     depth_per_rung: l.depth_per_rung,
                     depth_per_round: l.depth_per_round,
                     fanout_per_round: l.fanout_per_round,
+                    fanout_per_step: l.fanout_per_step,
                     per_round: l.per_round.clone(),
                     via,
                     followers: Vec::new(),

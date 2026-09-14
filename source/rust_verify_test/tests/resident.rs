@@ -635,9 +635,9 @@ verus! {
     let checked = worker.send(json!({"command":"check", "session":ready["session"], "bucket":0, "query":query_id(&ready, "incomplete")}));
     assert_eq!(checked["result"], "invalid", "{checked}");
     assert_eq!(checked["matching_loops"]["loops"], json!([]), "{checked}");
-    // two written loops: each prelude axiom follows the loops whose terms it
-    // shares, so subtraction rides b's loop and not a's. Addition rides a's,
-    // and may ride b's too: `a(0) + b(0)` puts b's terms under an addition.
+    // two written loops, each reported on its own. cvc5 leaves out most
+    // formulas that only ride a loop; any it still lists follow a loop whose
+    // terms they share, so subtraction never follows a's loop
     let checked = worker.send(json!({"command":"check", "session":ready["session"], "bucket":0, "query":query_id(&ready, "twin")}));
     let found = checked["matching_loops"]["loops"].as_array().unwrap();
     let on = |f: &str| {
@@ -649,12 +649,9 @@ verus! {
     let follows = |l: &serde_json::Value, qid: &str| {
         l["followers"].as_array().is_some_and(|fs| fs.iter().any(|f| f == qid))
     };
-    assert!(
-        follows(on("b(i)"), "prelude_sub") && !follows(on("a(i)"), "prelude_sub"),
-        "{}",
-        checked
-    );
-    assert!(follows(on("a(i)"), "prelude_add"), "{}", checked);
+    assert_eq!(found.len(), 2, "{}", checked);
+    on("b(i)");
+    assert!(!follows(on("a(i)"), "prelude_sub"), "{}", checked);
     // the axiom Verus generates for `Seq::index` rides the written loop
     let checked = worker.send(json!({"command":"check", "session":ready["session"], "bucket":0, "query":query_id(&ready, "indexed")}));
     let found = checked["matching_loops"]["loops"].as_array().unwrap();

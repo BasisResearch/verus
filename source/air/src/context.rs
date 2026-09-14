@@ -105,14 +105,18 @@ pub struct MatchingLoop {
     pub depth_per_rung: f64,
     pub depth_per_round: f64,
     pub fanout_per_round: f64,
+    /// growth per step of the quantifier's own rounds: a loop that fires
+    /// every other round doubles per step while `fanout_per_round` reads 1.41
+    pub fanout_per_step: f64,
     /// qids of the other quantifiers a step passed through
     pub via: Vec<String>,
     /// the first trigger, one term per trigger term
     pub trigger: Vec<String>,
     /// what each rung wraps around the previous one's growing subterm,
-    /// generalised over the chain, `_0` marking that subterm; empty when the
-    /// rungs do not grow into each other
-    pub context: Option<String>,
+    /// generalised over the chain, `_0` marking that subterm; one per class
+    /// when the loop climbs several subterms (`(r _0)`, `(l _0)`), and empty
+    /// when the rungs do not grow into each other
+    pub context: Vec<String>,
     /// the generalisation of every rung, and of every rung after the first
     pub shape: Vec<String>,
     pub step: Vec<String>,

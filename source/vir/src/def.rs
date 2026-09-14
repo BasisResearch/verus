@@ -1102,8 +1102,13 @@ pub fn new_internal_qid(
     let qid = format!("{}{}_definition", air::profiler::INTERNAL_QUANT_PREFIX, name);
 
     if let Some(fun) = ctx.fun.as_ref() {
-        let bnd_info =
-            crate::sst::BndInfo { fun: fun.current_fun.clone(), user: None, role, tag: None };
+        let bnd_info = crate::sst::BndInfo {
+            fun: fun.current_fun.clone(),
+            user: None,
+            role,
+            tag: None,
+            type_binders: Vec::new(),
+        };
         ctx.global.qid_map.borrow_mut().insert(qid.clone(), bnd_info);
     }
 
