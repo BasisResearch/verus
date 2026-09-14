@@ -108,6 +108,21 @@ pub(crate) struct Symbols {
 }
 
 impl Symbols {
+    /// The function a generated `:qid` belongs to and, for a quantifier the
+    /// user wrote, its source span.
+    pub(crate) fn quantifier_site(&self, qid: &str) -> Option<(&str, Option<&str>)> {
+        self.quantifiers.get(qid).map(|q| (q.fun.as_str(), q.span.as_deref()))
+    }
+
+    /// Every `:qid` of a function whose path starts with `prefix`.
+    pub(crate) fn quantifiers_of(&self, prefix: &str) -> std::collections::HashSet<String> {
+        self.quantifiers
+            .iter()
+            .filter(|(_, q)| q.fun.starts_with(prefix))
+            .map(|(qid, _)| qid.clone())
+            .collect()
+    }
+
     pub(crate) fn capture(
         global: &vir::context::GlobalCtx,
         source_names: vir::air_names::SourceNames,

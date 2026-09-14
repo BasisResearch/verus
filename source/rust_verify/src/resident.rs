@@ -24,10 +24,13 @@ use crate::buckets::BucketId;
 use crate::commands::{QueryOp, Style};
 use air::ast::{CommandX, Commands, Query};
 use air::context::{Context, QueryContext, ValidityResult};
+use air::inst_graph::{GraphFilter, GraphOp, GraphReply, GraphSummary, Site};
 use air::instantiations::ImportInstantiations;
 use air::messages::{ArcDynMessage, Diagnostics, MessageLevel};
+use air::profiler::InstantiationGraph;
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, BufRead, Read, Write};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -103,9 +106,53 @@ pub(crate) struct QueryJournal {
 #[derive(Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]
 enum Request {
-    List { session: Option<String> },
-    Check { session: String, bucket: BucketIndex, query: QueryId },
-    Close { session: String },
+    List {
+        session: Option<String>,
+    },
+    Check {
+        session: String,
+        bucket: BucketIndex,
+        query: QueryId,
+    },
+    Close {
+        session: String,
+    },
+    /// Query the instantiation graph the last check of this query recorded.
+    /// `path` needs `to_inst`, and starts from `from_qid` or else a root.
+    InstGraph {
+        session: String,
+        bucket: BucketIndex,
+        query: QueryId,
+        op: GraphOpName,
+        #[serde(default)]
+        filter: GraphFilterRequest,
+        from_qid: Option<String>,
+        to_inst: Option<u64>,
+        /// How many items the answer lists at most: 1 to 1000, default 20.
+        limit: Option<usize>,
+    },
+}
+
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum GraphOpName {
+    Cycles,
+    TopCost,
+    Subgraph,
+    Path,
+    Growth,
+}
+
+/// Which instantiations an `inst_graph` request looks at. Every given field
+/// restricts them further.
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GraphFilterRequest {
+    /// Only instantiations of this `:qid`.
+    quantifier: Option<String>,
+    /// Only quantifiers of functions whose path starts with this.
+    source_fn: Option<String>,
+    min_depth: Option<u64>,
 }
 
 #[derive(Clone, Serialize)]
@@ -272,6 +319,10 @@ fn write_certificate(air: &mut Context, dir: &std::path::Path, key: &str) {
 pub(crate) struct Server {
     buckets: Vec<RetainedBucket>,
     info: SessionInfo,
+    /// (bucket, query) -> the instantiation graph of its last check, when
+    /// the solvers record them. Queries read these; they never reach the
+    /// solver, so they cannot change its state.
+    graphs: HashMap<(usize, usize), InstantiationGraph>,
 }
 
 /// What a session reports about the invocation behind it, and the settings a
@@ -291,6 +342,9 @@ pub(crate) struct SessionInfo {
     /// Whether ordinary cvc5 solvers were launched for instantiation replay
     /// (`VERUS_RESIDENT_INST_REPLAY`), so rechecks try certificates first.
     pub(crate) instantiation_replay: bool,
+    /// Whether cvc5 solvers were launched recording instantiation graphs
+    /// (`VERUS_RESIDENT_INST_GRAPH`), so each check keeps its graph.
+    pub(crate) inst_graph: bool,
 }
 
 #[derive(Serialize)]
@@ -305,6 +359,7 @@ enum Response<'a> {
         spinoff_all: bool,
         smt_options: &'a [(String, String)],
         instantiation_replay: bool,
+        inst_graph: bool,
         input_files: &'a [String],
         buckets: &'a [BucketDescription],
     },
@@ -324,6 +379,17 @@ enum Response<'a> {
         provenance: Option<&'a crate::provenance::ResolvedQueryProvenance>,
         /// Present when this check tried a certificate before searching.
         certificate: Option<CertificateAttempt>,
+        /// The size of the instantiation graph this check kept, in a
+        /// session that records them.
+        inst_graph: Option<GraphSummary>,
+        /// Why a session that records graphs kept none for this check.
+        inst_graph_error: Option<String>,
+    },
+    InstGraph {
+        session: &'a str,
+        bucket: BucketIndex,
+        query: QueryId,
+        result: &'a GraphReply,
     },
     Error {
         message: &'a str,
@@ -573,7 +639,7 @@ impl Server {
         // Compilation can finish in any order. Protocol ordinals follow the
         // verifier's bucket identity, not worker completion order.
         buckets.sort_by(|left, right| left.id.cmp(&right.id));
-        Self { buckets, info }
+        Self { buckets, info, graphs: HashMap::new() }
     }
 
     pub(crate) fn serve(
@@ -642,6 +708,7 @@ impl Server {
                 spinoff_all: self.info.spinoff_all,
                 smt_options: &self.info.smt_options,
                 instantiation_replay: self.info.instantiation_replay,
+                inst_graph: self.info.inst_graph,
                 input_files: &self.info.input_files,
                 buckets: &buckets,
             },
@@ -682,6 +749,7 @@ impl Server {
                 Request::List { session: Some(requested) }
                 | Request::Check { session: requested, .. }
                 | Request::Close { session: requested }
+                | Request::InstGraph { session: requested, .. }
                     if requested != session =>
                 {
                     send(
@@ -806,6 +874,26 @@ impl Server {
                     // The response describes round zero. Later error searches
                     // replace AIR's provenance, even when their verdict differs.
                     let first_provenance = air.take_provenance();
+                    // The graph of the check that decided the verdict: the
+                    // certificate attempt's when it closed the query, else
+                    // the search's. Later error rounds search again, which
+                    // replaces the solver's record, so it is read now. A
+                    // solver without quantifiers (bit-vector) has none.
+                    let graph = air
+                        .inst_graph()
+                        .then(|| InstantiationGraph::from_live(&air.instantiation_graph()));
+                    let (graph_summary, graph_error) = match graph {
+                        Some(Ok(graph)) => {
+                            let summary = graph.summary();
+                            self.graphs.insert((bucket_id.0, id.0), graph);
+                            (Some(summary), None)
+                        }
+                        Some(Err(error)) => {
+                            self.graphs.remove(&(bucket_id.0, id.0));
+                            (None, Some(error))
+                        }
+                        None => (None, None),
+                    };
                     // Ask for further errors exactly as far as the original
                     // invocation did, so rechecking a function with several
                     // failing assertions reports the same ones rather than
@@ -966,8 +1054,92 @@ impl Server {
                             restore_ms,
                             provenance: provenance.as_ref(),
                             certificate: attempted,
+                            inst_graph: graph_summary,
+                            inst_graph_error: graph_error,
                         },
                     )?;
+                }
+                Request::InstGraph {
+                    bucket: bucket_id,
+                    query: id,
+                    op,
+                    filter,
+                    from_qid,
+                    to_inst,
+                    limit,
+                    ..
+                } => {
+                    let Some(bucket) = self.buckets.get(bucket_id.0) else {
+                        send(&mut output, &Response::Error { message: "unknown bucket" })?;
+                        continue;
+                    };
+                    if bucket.queries.get(id.0).is_none() {
+                        send(&mut output, &Response::Error { message: "unknown query" })?;
+                        continue;
+                    }
+                    let Some(graph) = self.graphs.get(&(bucket_id.0, id.0)) else {
+                        send(
+                            &mut output,
+                            &Response::Error {
+                                message: "no instantiation graph for this query; check it first in a session that records them",
+                            },
+                        )?;
+                        continue;
+                    };
+                    let op = match (op, to_inst) {
+                        (GraphOpName::Cycles, _) => GraphOp::Cycles,
+                        (GraphOpName::TopCost, _) => GraphOp::TopCost,
+                        (GraphOpName::Subgraph, _) => GraphOp::Subgraph,
+                        (GraphOpName::Growth, _) => GraphOp::Growth,
+                        (GraphOpName::Path, Some(to_inst)) => GraphOp::Path { from_qid, to_inst },
+                        (GraphOpName::Path, None) => {
+                            send(
+                                &mut output,
+                                &Response::Error { message: "path requires to_inst" },
+                            )?;
+                            continue;
+                        }
+                    };
+                    let mut quantifiers = filter.quantifier.map(|qid| HashSet::from([qid]));
+                    if let Some(prefix) = &filter.source_fn {
+                        let Some(symbols) = &bucket.symbols else {
+                            send(
+                                &mut output,
+                                &Response::Error {
+                                    message: "source_fn needs the bucket's symbols",
+                                },
+                            )?;
+                            continue;
+                        };
+                        let owned = symbols.quantifiers_of(prefix);
+                        quantifiers = Some(match quantifiers {
+                            Some(named) => named.intersection(&owned).cloned().collect(),
+                            None => owned,
+                        });
+                    }
+                    let filter = GraphFilter { quantifiers, min_depth: filter.min_depth };
+                    match graph.query(&op, &filter, limit.unwrap_or(20).clamp(1, 1000)) {
+                        Ok(mut reply) => {
+                            if let Some(symbols) = &bucket.symbols {
+                                reply.answer.annotate(|qid| {
+                                    symbols.quantifier_site(qid).map(|(function, span)| Site {
+                                        function: function.to_owned(),
+                                        span: span.map(str::to_owned),
+                                    })
+                                });
+                            }
+                            send(
+                                &mut output,
+                                &Response::InstGraph {
+                                    session,
+                                    bucket: bucket_id,
+                                    query: id,
+                                    result: &reply,
+                                },
+                            )?;
+                        }
+                        Err(message) => send(&mut output, &Response::Error { message: &message })?,
+                    }
                 }
             }
         }

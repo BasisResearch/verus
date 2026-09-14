@@ -28,10 +28,35 @@ pub struct Profiler {
     instantiation_graph: InstantiationGraph,
 }
 
+/// An instantiation in an `InstantiationGraph`.
+pub type NodeId = (u64, usize);
+
+/// What the solver recorded about an instantiation besides its quantifier.
+/// A z3 trace yields only the depth, computed from its edges; cvc5's live
+/// graph (`InstantiationGraph::from_live`) yields all of it.
+#[derive(Clone, Debug, Default)]
+pub struct InstInfo {
+    /// The strategy that made it (a cvc5 inference id), when known.
+    pub strategy: Option<String>,
+    /// The solver's instantiation round, from 1; 0 when unknown.
+    pub round: u64,
+    /// 0 without parents, otherwise one more than the deepest parent.
+    pub depth: u64,
+    /// The depth of its deepest instantiating term, when known.
+    pub term_depth: Option<u64>,
+}
+
+/// Edges run from the instantiation that introduced a term to those that
+/// matched it. `names` holds each instantiation's quantifier name (its
+/// `:qid`). Queries are in `crate::inst_graph`.
+#[derive(Debug)]
 pub struct InstantiationGraph {
-    pub edges: HashMap<(u64, usize), HashSet<(u64, usize)>>,
-    pub names: HashMap<(u64, usize), String>,
-    pub nodes: HashSet<(u64, usize)>,
+    pub edges: HashMap<NodeId, HashSet<NodeId>>,
+    pub names: HashMap<NodeId, String>,
+    pub nodes: HashSet<NodeId>,
+    pub info: HashMap<NodeId, InstInfo>,
+    /// Instantiations the solver made but did not record.
+    pub dropped: u64,
 }
 
 #[derive(Debug)]
@@ -111,7 +136,10 @@ impl Profiler {
             }
         }
 
-        Ok(InstantiationGraph { edges, names, nodes })
+        let mut graph =
+            InstantiationGraph { edges, names, nodes, info: HashMap::new(), dropped: 0 };
+        graph.compute_depths();
+        Ok(graph)
     }
 
     fn compute_quantifier_costs(

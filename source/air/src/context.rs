@@ -161,6 +161,9 @@ pub struct Context {
     /// Whether this solver may save and restore instantiations across
     /// rechecks of a query (cvc5 only, fixed at launch).
     pub(crate) instantiation_replay: bool,
+    /// Whether this solver records its instantiation graph (cvc5 only,
+    /// fixed at launch).
+    pub(crate) inst_graph: bool,
     /// The key under which the next query's scope restores saved
     /// instantiations, and whether they are the only ones allowed (cvc5
     /// only).
@@ -242,6 +245,7 @@ impl Context {
             provenance: false,
             last_provenance: None,
             instantiation_replay: false,
+            inst_graph: false,
             restore_instantiations: None,
             saved_instantiations: HashSet::new(),
             import_instantiations: None,
@@ -267,6 +271,7 @@ impl Context {
                 transcript_log,
                 self.provenance,
                 self.instantiation_replay,
+                self.inst_graph,
             ));
         }
         self.smt_process.as_mut().unwrap()
@@ -377,6 +382,27 @@ impl Context {
 
     pub fn instantiation_replay(&self) -> bool {
         self.instantiation_replay
+    }
+
+    /// Record the instantiation graph (cvc5 only; must precede the first
+    /// query). The solver is launched with `--inst-graph`.
+    pub fn set_inst_graph(&mut self, enabled: bool) {
+        assert!(matches!(self.state, ContextState::NotStarted));
+        assert!(!enabled || matches!(self.solver, SmtSolver::Cvc5));
+        self.inst_graph = enabled;
+    }
+
+    pub fn inst_graph(&self) -> bool {
+        self.inst_graph
+    }
+
+    /// Ask the solver for the instantiation graph of its last `check-sat` and
+    /// return its reply lines (cvc5 with `set_inst_graph` only). Read-only:
+    /// call it after a query's answer and before anything that checks again.
+    pub fn instantiation_graph(&mut self) -> Vec<String> {
+        assert!(self.inst_graph);
+        self.smt_log.log_get_instantiation_graph();
+        self.flush_commands()
     }
 
     /// Restore the instantiations saved under `key` in the next query's scope

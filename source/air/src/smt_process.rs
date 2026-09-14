@@ -111,6 +111,7 @@ impl SmtProcess {
         transcript_log: Option<Box<dyn std::io::Write + Send>>,
         provenance: bool,
         instantiation_replay: bool,
+        inst_graph: bool,
     ) -> Self {
         let solver_info = SolverInfo::new(solver);
         let mut args: Vec<&str> = match solver {
@@ -139,6 +140,12 @@ impl SmtProcess {
             // refutation used. The full set is no certificate: replayed
             // alone it answered slower than an ordinary recheck.
             args.push("--produce-proofs");
+        }
+        if inst_graph {
+            assert!(matches!(solver, SmtSolver::Cvc5));
+            // Record which instantiation introduced the terms each one
+            // matched, for `(get-instantiation-graph)`.
+            args.push("--inst-graph");
         }
         let mut child = match std::process::Command::new(solver_info.executable())
             .args(args)

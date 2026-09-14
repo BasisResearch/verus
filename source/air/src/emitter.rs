@@ -134,6 +134,15 @@ impl Emitter {
         }
     }
 
+    /// `(get-instantiation-graph)`: cvc5 replies with the instantiations of
+    /// the last `check-sat` and which earlier ones they matched terms of.
+    pub fn log_get_instantiation_graph(&mut self) {
+        if !self.is_none() {
+            let command = Node::Atom("get-instantiation-graph".to_string());
+            self.log_node(&Node::List(vec![command]));
+        }
+    }
+
     /// `(export-instantiations k)`: cvc5 replies with an
     /// `import-instantiations` command carrying what `k` saved.
     pub fn log_export_instantiations(&mut self, key: &str) {

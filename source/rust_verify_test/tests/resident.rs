@@ -381,6 +381,139 @@ fn resident_instantiation_replay_keeps_verdicts() {
     assert_eq!(resource_budgets(&logs), doubled);
 }
 
+/// Two quantifiers that feed each other: each instance of one introduces the
+/// trigger of the other, so e-matching never stops (a matching loop).
+const LOOP_SOURCE: &str = r#"
+use vstd::prelude::*;
+verus! {
+    uninterp spec fn enc(x: int) -> int;
+    uninterp spec fn dec(x: int) -> int;
+
+    proof fn roundtrip(a: int)
+        requires
+            forall|x: int| #[trigger] enc(x) > dec(enc(x)),
+            forall|y: int| #[trigger] dec(y) > enc(dec(y)),
+    {
+        assert(enc(a) == 0);
+    }
+
+    proof fn passing() { assert(1 + 1 == 2); }
+}
+"#;
+
+/// With `VERUS_RESIDENT_INST_GRAPH`, each check keeps its query's cvc5
+/// instantiation graph, and `inst_graph` requests answer from it with source
+/// spans. The loop's two quantifiers form the only cycle.
+///
+/// Needs a cvc5 with `--inst-graph` (BasisResearch/cvc5 `inst-graph/query`);
+/// run with `--ignored` and `VERUS_CVC5_PATH` pointing at it until the pinned
+/// release has it.
+#[test]
+#[ignore]
+fn resident_inst_graph_finds_the_matching_loop() {
+    let mut worker = Worker::start_with_env(
+        LOOP_SOURCE,
+        &["--rlimit", "1", "-V", "no-solver-version-check"],
+        &[("VERUS_RESIDENT_INST_GRAPH", "1")],
+    );
+    let ready = worker.receive();
+    assert_eq!(ready["event"], "ready", "{ready}");
+    assert_eq!(ready["inst_graph"], true);
+    let session = ready["session"].clone();
+    let looping = query_id(&ready, "::roundtrip");
+    let passing = query_id(&ready, "::passing");
+    let graph = |worker: &mut Worker<ChildStdin>, query: &Value, op: Value| {
+        let mut request =
+            json!({"command": "inst_graph", "session": session, "bucket": 0, "query": query});
+        request.as_object_mut().unwrap().extend(op.as_object().unwrap().clone());
+        worker.send(request)
+    };
+    // No graph before the query is checked.
+    let early = graph(&mut worker, &passing, json!({"op": "cycles"}));
+    assert_eq!(early["event"], "error", "{early}");
+
+    let checked =
+        worker.send(json!({"command": "check", "session": session, "bucket": 0, "query": looping}));
+    assert_eq!(checked["event"], "checked", "{checked}");
+    assert_ne!(checked["result"], "valid", "{checked}");
+    let summary = &checked["inst_graph"];
+    assert!(summary["instantiations"].as_u64().unwrap() > 10, "{checked}");
+    assert!(summary["edges"].as_u64().unwrap() > 5, "{checked}");
+    assert!(summary["max_depth"].as_u64().unwrap() > 2, "{checked}");
+
+    let cycles = graph(&mut worker, &looping, json!({"op": "cycles"}));
+    assert_eq!(cycles["event"], "inst_graph", "{cycles}");
+    let result = &cycles["result"];
+    assert_eq!(result["op"], "cycles");
+    let found = result["cycles"].as_array().unwrap();
+    assert_eq!(found.len(), 1, "{result}");
+    assert_eq!(found[0]["length"], 2, "{result}");
+    assert!(found[0]["repetitions"].as_u64().unwrap() > 5, "{result}");
+    for node in found[0]["nodes"].as_array().unwrap() {
+        assert!(node["function"].as_str().unwrap().ends_with("::roundtrip"), "{node}");
+        assert!(node["source_span"].as_str().unwrap().contains("fixture.rs"), "{node}");
+    }
+    // Each unrolling is one deeper than the last.
+    let depths: Vec<u64> = found[0]["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| n["depth"].as_u64().unwrap())
+        .collect();
+    assert!(depths.windows(2).all(|pair| pair[1] == pair[0] + 1), "{depths:?}");
+
+    // The loop's quantifiers are the costliest, and a filter on another
+    // function leaves nothing to report.
+    let cost = graph(&mut worker, &looping, json!({"op": "top_cost", "limit": 2}));
+    let ranked = cost["result"]["quantifiers"].as_array().unwrap();
+    let loop_qids: BTreeSet<&str> =
+        found[0]["quantifiers"].as_array().unwrap().iter().map(|q| q.as_str().unwrap()).collect();
+    let top: BTreeSet<&str> = ranked.iter().map(|q| q["qid"].as_str().unwrap()).collect();
+    assert_eq!(top, loop_qids, "{cost}");
+    let elsewhere = graph(
+        &mut worker,
+        &looping,
+        json!({"op": "cycles", "filter": {"source_fn": "no_such_crate::"}}),
+    );
+    assert!(elsewhere["result"]["cycles"].as_array().unwrap().is_empty(), "{elsewhere}");
+
+    // The deepest instantiation descends from a root through the loop.
+    let deepest = found[0]["nodes"].as_array().unwrap().last().unwrap()["inst"].clone();
+    let path =
+        graph(&mut worker, &looping, json!({"op": "path", "to_inst": deepest, "limit": 1000}));
+    let chain = path["result"]["nodes"].as_array().unwrap();
+    assert_eq!(chain.last().unwrap()["inst"], deepest, "{path}");
+    assert_eq!(chain[0]["depth"], 0, "{path}");
+    let growth = graph(&mut worker, &looping, json!({"op": "growth"}));
+    assert_eq!(growth["result"]["step"], "round", "{growth}");
+    assert!(!growth["result"]["per_round"].as_array().unwrap().is_empty(), "{growth}");
+    let pathless = graph(&mut worker, &looping, json!({"op": "path"}));
+    assert_eq!(pathless["event"], "error", "{pathless}");
+
+    // A healthy query records its own, smaller graph.
+    let healthy =
+        worker.send(json!({"command": "check", "session": session, "bucket": 0, "query": passing}));
+    assert_eq!(healthy["result"], "valid", "{healthy}");
+    assert!(healthy["inst_graph"].is_object(), "{healthy}");
+    assert_eq!(worker.send(json!({"command": "close", "session": session}))["event"], "closed");
+    worker.finish(false);
+
+    // Without the variable, no graph is recorded or served.
+    let mut plain = Worker::start(LOOP_SOURCE, &["--rlimit", "1", "-V", "no-solver-version-check"]);
+    let ready = plain.receive();
+    assert_eq!(ready["inst_graph"], false);
+    let session = ready["session"].clone();
+    let checked =
+        plain.send(json!({"command": "check", "session": session, "bucket": 0, "query": passing}));
+    assert!(checked["inst_graph"].is_null(), "{checked}");
+    let refused = plain.send(
+        json!({"command": "inst_graph", "session": session, "bucket": 0, "query": passing, "op": "cycles"}),
+    );
+    assert_eq!(refused["event"], "error", "{refused}");
+    assert_eq!(plain.send(json!({"command": "close", "session": session}))["event"], "closed");
+    plain.finish(false);
+}
+
 /// The contents of a worker's SMT logs.
 fn smt_logs(worker_dir: &Path) -> Vec<String> {
     fs::read_dir(worker_dir.join("logs"))
