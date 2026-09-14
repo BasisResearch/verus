@@ -435,10 +435,6 @@ pub fn parse_args_with_imports(
     const EXTENDED_PROVENANCE: &str = "provenance";
     const EXTENDED_NL_FRONTIER: &str = "nl-frontier";
     const EXTENDED_KEYS: &[(&str, &str)] = &[
-        (
-            EXTENDED_NL_FRONTIER,
-            "Record, per query, the nonlinear terms cvc5 could not reconcile with its linear model, with their values, asserted bounds and where they entered the problem (read-only: the search is the ordinary one)",
-        ),
         (EXTENDED_IGNORE_UNEXPECTED_SMT, "Ignore unexpected SMT output"),
         (EXTENDED_DEBUG, "Enable debugging of proof failures"),
         (
@@ -458,6 +454,10 @@ pub fn parse_args_with_imports(
         (
             EXTENDED_PROVENANCE,
             "Provenance mode: run cvc5 with preprocessing proofs and twice the rlimit, and record which hypotheses, axioms and quantifiers each query used (diagnostic; verdicts may differ from a plain run)",
+        ),
+        (
+            EXTENDED_NL_FRONTIER,
+            "Record, per query, the nonlinear terms cvc5 could not reconcile with its linear model, with their values, asserted bounds and where they entered the problem (read-only: the search is the ordinary one)",
         ),
         (EXTENDED_ALLOW_INLINE_AIR, "Allow the POTENTIALLY UNSOUND use of inline_air_stmt"),
         (

@@ -2387,10 +2387,10 @@ fn parse_nl_frontier_reply() {
     let f = crate::smt_verify::parse_nl_frontier(
         "(:nl-frontier (:result unknown :reason resourceout :enabled true :checks 40 \
          :rounds 38 :punts 0 :last lemma :atoms (\
-         (:atom (* x y) :kind product :current true :rounds 12 :value 5 :from-args (- 6) \
+         (:atom (* x y) :kind product :current true :rounds 12 :value 5 :from-args -6 \
          :lower (:value 0 :strict false :fixed true) \
          :args ((:term x :value 2 :lower (:value 0 :strict false :fixed true)) \
-         (:term |y%1| :value (- 3) :upper (:value 10 :strict true :fixed false))) \
+         (:term |y%1| :value -1/3 :upper (:value 10 :strict true :fixed false))) \
          :hosts ((:in input :term (Mul x |y%1|) :tags (query hyp_2)) \
          (:in instance :term (Mul x |y%1|) :qid prelude_mul :count 3)))) \
          :omitted 0 :truncated false))",
@@ -2406,7 +2406,8 @@ fn parse_nl_frontier_reply() {
         (a.atom.as_str(), a.kind.as_str(), a.current, a.rounds),
         ("(* x y)", "product", true, 12)
     );
-    assert_eq!((a.value.as_str(), a.from_args.as_str()), ("5", "(- 6)"));
+    assert_eq!((a.value.as_str(), a.from_args.as_str()), ("5", "-6"));
+    assert_eq!(a.args[1].value, "-1/3");
     assert!(a.lower.as_ref().is_some_and(|b| b.value == "0" && !b.strict && b.fixed));
     assert!(a.upper.is_none());
     // quoted symbols lose their bars
@@ -2428,4 +2429,18 @@ fn parse_nl_frontier_reply() {
     assert_eq!(crate::smt_verify::parse_nl_frontier(bad).unparsed.as_deref(), Some(bad));
     let bad = "(:nl-frontier unsupported)";
     assert_eq!(crate::smt_verify::parse_nl_frontier(bad).unparsed.as_deref(), Some(bad));
+    // a key without a value is malformed, at any depth
+    let bad = "(:nl-frontier (:result sat :checks))";
+    assert_eq!(crate::smt_verify::parse_nl_frontier(bad).unparsed.as_deref(), Some(bad));
+    let bad = "(:nl-frontier (:result sat :atoms ((:atom (* x y) :kind))))";
+    assert_eq!(crate::smt_verify::parse_nl_frontier(bad).unparsed.as_deref(), Some(bad));
+    // a quoted symbol that is not one word keeps its bars
+    let f = crate::smt_verify::parse_nl_frontier(
+        "(:nl-frontier (:result sat :atoms ((:atom (* x |a b|) :args ((:term |a b| :value 3)) \
+         :hosts ((:in input :term (Mul x |a b|) :tags (query)))))))",
+    );
+    assert!(f.unparsed.is_none(), "{:?}", f.unparsed);
+    assert_eq!(f.atoms[0].atom, "(* x |a b|)");
+    assert_eq!(f.atoms[0].args[0].term, "|a b|");
+    assert_eq!(f.atoms[0].hosts[0].term, "(Mul x |a b|)");
 }

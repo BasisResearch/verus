@@ -358,6 +358,8 @@ pub struct Verifier {
 
     // proof debugging purposes
     expand_flag: bool,
+    /// whether the queries being checked are the recheck with recommends
+    recommends_flag: bool,
 
     error_format: Option<ErrorOutputType>,
 }
@@ -571,6 +573,7 @@ impl Verifier {
             buckets: HashMap::new(),
 
             expand_flag: false,
+            recommends_flag: false,
             error_format: None,
         }
     }
@@ -625,6 +628,7 @@ impl Verifier {
             buckets: self.buckets.clone(),
 
             expand_flag: self.expand_flag,
+            recommends_flag: self.recommends_flag,
             error_format: self.error_format,
         }
     }
@@ -932,12 +936,20 @@ impl Verifier {
                 ValidityResult::UnexpectedOutput(s) => format!("unexpected output: {}", s),
             };
             if let Some(frontier) = air_context.take_nl_frontier() {
+                let pass = if self.expand_flag {
+                    "expand_errors"
+                } else if self.recommends_flag {
+                    "recommends"
+                } else {
+                    "check"
+                };
                 self.func_nl_frontier.entry(context.fun.clone()).or_default().push(
                     QueryNlFrontier {
                         desc: context.desc.clone(),
                         span: context.span.as_string.clone(),
                         round: nl_frontier_round,
                         result: result_str(),
+                        pass,
                         frontier,
                     },
                 );
@@ -1249,11 +1261,7 @@ impl Verifier {
     }
 
     /// Resolve batch replies with the same owned metadata used by resident checks.
-    fn resolve_provenance(&mut self, global_ctx: &vir::context::GlobalCtx) {
-        let symbols = crate::provenance::Symbols::capture(
-            global_ctx,
-            global_ctx.air_source_names.borrow().clone(),
-        );
+    fn resolve_provenance(&mut self, symbols: &crate::provenance::Symbols) {
         for (fun, queries) in std::mem::take(&mut self.func_provenance) {
             let resolved = queries.into_iter().map(|query| symbols.resolve(&fun, query));
             self.func_details.entry(fun.clone()).or_default().provenance.extend(resolved);
@@ -1261,14 +1269,7 @@ impl Verifier {
     }
 
     /// Join each query's nonlinear frontier to source, per function.
-    fn resolve_nl_frontier(&mut self, global_ctx: &vir::context::GlobalCtx) {
-        if self.func_nl_frontier.is_empty() {
-            return;
-        }
-        let symbols = crate::provenance::Symbols::capture(
-            global_ctx,
-            global_ctx.air_source_names.borrow().clone(),
-        );
+    fn resolve_nl_frontier(&mut self, symbols: &crate::provenance::Symbols) {
         for (fun, queries) in std::mem::take(&mut self.func_nl_frontier) {
             let resolved =
                 queries.into_iter().map(|query| symbols.resolve_nl_frontier(&fun, query));
@@ -1688,6 +1689,7 @@ impl Verifier {
                         let function = &op.get_function();
                         let is_recommend = query_op.is_recommend();
                         self.expand_flag = query_op.is_expanded();
+                        self.recommends_flag = is_recommend;
 
                         let mut spinoff_context_counter = 1;
 
@@ -2766,9 +2768,18 @@ impl Verifier {
                 writeln!(file, "{:#?}", triggers).expect("error writing to trigger log file");
             }
         }
+        // One capture of the symbol tables serves every join of cvc5's
+        // replies back to source
+        let symbols = (self.args.provenance || self.args.nl_frontier).then(|| {
+            crate::provenance::Symbols::capture(
+                &global_ctx,
+                global_ctx.air_source_names.borrow().clone(),
+            )
+            .with_function_spans(&krate.functions)
+        });
         // Join the provenance cvc5 reported back to source, per function
         if self.args.provenance {
-            self.resolve_provenance(&global_ctx);
+            self.resolve_provenance(symbols.as_ref().expect("captured under provenance"));
             if self.args.log_all {
                 let mut file = self.create_log_file(None, crate::config::PROVENANCE_FILE_SUFFIX)?;
                 let mut by_fun: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
@@ -2795,7 +2806,7 @@ impl Verifier {
         }
         // Join the nonlinear frontiers cvc5 reported back to source
         if self.args.nl_frontier {
-            self.resolve_nl_frontier(&global_ctx);
+            self.resolve_nl_frontier(symbols.as_ref().expect("captured under nl-frontier"));
         }
         // Log the provenance joins: qid -> (function, owning tag, span), hyp -> (kind, span)
         if self.args.log_all {

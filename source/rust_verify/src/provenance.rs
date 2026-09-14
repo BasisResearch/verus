@@ -98,6 +98,10 @@ pub struct QueryNlFrontier {
     pub round: usize,
     /// "valid", "invalid", "canceled", or the solver's unexpected output
     pub result: String,
+    /// "check" for the ordinary check, "recommends" for the recheck Verus
+    /// runs with recommends after a failure, "expand_errors" under
+    /// `--expand-errors`
+    pub pass: &'static str,
     pub frontier: air::context::NlFrontier,
 }
 
@@ -143,6 +147,8 @@ pub struct ResolvedNlHost {
     pub qid: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fun: Option<String>,
+    /// the quantifier's span in source; for a spec function's definition,
+    /// which no quantifier in source spells, the function's span
     #[serde(skip_serializing_if = "Option::is_none")]
     pub span: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -176,10 +182,11 @@ pub struct ResolvedNlAtom {
     pub args: Vec<ResolvedNlTerm>,
     pub hosts: Vec<ResolvedNlHost>,
     /// The best source location of a host: a hypothesis, the goal of this
-    /// query (its span), a quantifier written in source, or an axiom. The
-    /// span is of the enclosing clause, function or quantifier, not of the
-    /// arithmetic expression itself. None when no host has a location (the
-    /// solver's own lemmas can introduce products).
+    /// query (its span), a quantifier written in source or the spec function
+    /// whose definition produced it, or an axiom. The span is of the
+    /// enclosing clause, function or quantifier, not of the arithmetic
+    /// expression itself. None when no host has a location (the solver's own
+    /// lemmas can introduce products).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub span: Option<String>,
     /// what `span` is: the host tag's kind (requires, goal, axiom, ...) or
@@ -195,6 +202,8 @@ pub struct ResolvedQueryNlFrontier {
     pub span: String,
     pub round: usize,
     pub result: String,
+    /// check, recommends (the recheck after a failure) or expand_errors
+    pub pass: &'static str,
     /// cvc5's own answer to the check: unsat, sat, unknown, or none
     pub solver_result: String,
     /// cvc5's unknown explanation (incomplete, resourceout, ...) or none
@@ -251,6 +260,9 @@ pub(crate) struct Symbols {
     quantifiers: HashMap<String, Quantifier>,
     axiom_owners: HashMap<String, String>,
     source_names: vir::air_names::SourceNames,
+    /// Friendly function name -> the function's span, when recorded (see
+    /// `with_function_spans`).
+    function_spans: HashMap<String, String>,
 }
 
 impl Symbols {
@@ -302,7 +314,19 @@ impl Symbols {
             quantifiers,
             axiom_owners: global.axiom_owners.borrow().clone(),
             source_names,
+            function_spans: HashMap::new(),
         }
+    }
+
+    /// Record each function's span, so that a spec function's definition
+    /// axiom, which no quantifier in source spells, can be located at the
+    /// function it defines.
+    pub(crate) fn with_function_spans(mut self, functions: &[vir::ast::Function]) -> Self {
+        self.function_spans = functions
+            .iter()
+            .map(|f| (fun_as_friendly_rust_name(&f.x.name), f.span.as_string.clone()))
+            .collect();
+        self
     }
 
     /// Join one tag from a reply about one of `fun`'s queries back to source.
@@ -484,6 +508,13 @@ impl Symbols {
                                 Some(j) => (j.fun, j.span, j.site, j.role),
                                 None => (None, None, None, None),
                             };
+                            // a definition axiom has no quantifier in source:
+                            // locate it at the spec function it defines
+                            let span = span.or_else(|| {
+                                role.filter(|r| r.starts_with("definition"))
+                                    .and(qfun.as_ref())
+                                    .and_then(|f| self.function_spans.get(f).cloned())
+                            });
                             ResolvedNlHost {
                                 place: "instance",
                                 term,
@@ -531,6 +562,7 @@ impl Symbols {
             span: q.span,
             round: q.round,
             result: q.result,
+            pass: q.pass,
             solver_result: f.result,
             reason: f.reason,
             enabled: f.enabled,
@@ -548,7 +580,7 @@ impl Symbols {
 
 /// The best location among an atom's hosts: a hypothesis clause, then the
 /// goal of the query (whose span is the query's), then a quantifier written
-/// in source, then an axiom with a span.
+/// in source or a spec function's definition, then an axiom with a span.
 fn best_location(hosts: &[ResolvedNlHost], query_span: &str) -> (Option<String>, Option<String>) {
     let input_tags = || hosts.iter().filter(|h| h.place == "input").flat_map(|h| h.tags.iter());
     if let Some(t) = input_tags().find(|t| {
@@ -571,7 +603,9 @@ fn best_location(hosts: &[ResolvedNlHost], query_span: &str) -> (Option<String>,
     (None, None)
 }
 
-/// An SMT-LIB numeral as text: `(- 5)` is `-5`, `(/ 1 2)` is `1/2`.
+/// A number from a solver reply as text. cvc5 prints a rational as `-5` or
+/// `1/2`, which passes through; the SMT-LIB spellings `(- 5)` and `(/ 1 2)`
+/// read the same.
 fn smt_number(s: &str) -> String {
     let t = s.trim();
     if let Some(inner) = t.strip_prefix("(- ").and_then(|r| r.strip_suffix(')')) {
@@ -626,6 +660,8 @@ mod tests {
     #[test]
     fn smt_numbers_read_as_numbers() {
         assert_eq!(smt_number("5"), "5");
+        assert_eq!(smt_number("-5"), "-5");
+        assert_eq!(smt_number("1/2"), "1/2");
         assert_eq!(smt_number("(- 5)"), "-5");
         assert_eq!(smt_number("(/ 1 2)"), "1/2");
         assert_eq!(smt_number("(- (/ 1 2))"), "-1/2");
@@ -676,5 +712,60 @@ mod tests {
         let mut prelude = host("instance", vec![], Some("x"));
         prelude.fun = Some("prelude".to_string());
         assert_eq!(best_location(&[prelude], q), (None, None));
+    }
+
+    #[test]
+    fn a_definition_host_is_located_at_its_spec_function() {
+        let qid = "internal_crate__area_definition";
+        let def_span = "src/a.rs:3:1: 3:40 (#0)";
+        let symbols = Symbols {
+            hypotheses: HashMap::new(),
+            quantifiers: HashMap::from([(
+                qid.to_string(),
+                Quantifier {
+                    fun: "crate::area".to_string(),
+                    span: None,
+                    tag: None,
+                    role: Some("definition"),
+                },
+            )]),
+            axiom_owners: HashMap::new(),
+            source_names: HashMap::new(),
+            function_spans: HashMap::from([("crate::area".to_string(), def_span.to_string())]),
+        };
+        let atom = air::context::NlAtom {
+            atom: "(* h w)".to_string(),
+            kind: "product".to_string(),
+            hosts: vec![air::context::NlHost {
+                input: false,
+                term: "(Mul w h)".to_string(),
+                qid: Some(qid.to_string()),
+                count: 1,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let query = QueryNlFrontier {
+            desc: "function body check".to_string(),
+            span: "src/a.rs:5:1: 5:30 (#0)".to_string(),
+            round: 0,
+            result: "invalid".to_string(),
+            pass: "recommends",
+            frontier: air::context::NlFrontier { atoms: vec![atom], ..Default::default() },
+        };
+        let fun = std::sync::Arc::new(vir::ast::FunX {
+            path: std::sync::Arc::new(vir::ast::PathX {
+                krate: vir::ast::CrateId::Internal,
+                segments: std::sync::Arc::new(vec![std::sync::Arc::new("big".to_string())]),
+            }),
+        });
+        let r = symbols.resolve_nl_frontier(&fun, query);
+        assert_eq!(r.pass, "recommends");
+        let a = &r.atoms[0];
+        assert_eq!(a.hosts[0].span.as_deref(), Some(def_span));
+        assert_eq!(
+            (a.span.as_deref(), a.span_basis.as_deref()),
+            (Some(def_span), Some("definition"))
+        );
     }
 }

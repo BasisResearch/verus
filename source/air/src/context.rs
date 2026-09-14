@@ -107,7 +107,8 @@ pub struct NlAtom {
     /// In how many rounds it was wrong.
     pub rounds: u64,
     /// Its value in the linear model, and the value its arguments give it
-    /// (they differ: that is why it is on the frontier).
+    /// (they differ: that is why it is on the frontier). Each is a rational
+    /// as cvc5 prints it (`-5`, `1/2`), or `none`.
     pub value: String,
     pub from_args: String,
     /// The bounds asserted on the atom itself.
@@ -131,7 +132,7 @@ pub struct NlTerm {
 /// A constant bound read off an asserted literal.
 #[derive(Debug, Clone, Default)]
 pub struct NlBound {
-    /// An SMT-LIB constant, e.g. `5` or `(- 5)`.
+    /// A rational as cvc5 prints it, e.g. `5`, `-5` or `1/2`.
     pub value: String,
     pub strict: bool,
     /// Whether the literal is implied by the assertions (fixed at SAT level

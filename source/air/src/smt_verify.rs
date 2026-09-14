@@ -479,8 +479,9 @@ pub(crate) fn smt_check_assertion<'ctx>(
 /// [:lower BOUND] [:upper BOUND] :args ((:term T :value V [:lower BOUND]
 /// [:upper BOUND]) ...) :hosts (HOST ...))`, each BOUND `(:value C :strict B
 /// :fixed B)`, and each HOST `(:in input :term T :tags (T ...))` or `(:in
-/// instance :term T :qid Q :count N)`. Unknown keys are skipped; a reply that
-/// does not parse is kept whole in `unparsed`.
+/// instance :term T :qid Q :count N)`. Values are as cvc5 prints them
+/// (`-5`, `1/2`). Unknown keys are skipped; a reply that does not parse (a
+/// malformed value, a key without one) is kept whole in `unparsed`.
 pub(crate) fn parse_nl_frontier(line: &str) -> crate::context::NlFrontier {
     use sise::TreeNode;
     let mut out = crate::context::NlFrontier::default();
@@ -530,6 +531,7 @@ pub(crate) fn parse_nl_frontier(line: &str) -> crate::context::NlFrontier {
                     }
                 }
             }
+            [_] => bad = true,
             _ => {}
         }
     }
@@ -540,12 +542,17 @@ pub(crate) fn parse_nl_frontier(line: &str) -> crate::context::NlFrontier {
 }
 
 /// A reply subterm as text: lists re-joined, quoted symbols unquoted (see
-/// `bar_symbols_as_strings`).
+/// `bar_symbols_as_strings`), unless whitespace or parentheses in one mean
+/// only its bars keep it one symbol.
 fn sexp_text(node: &sise::TreeNode) -> String {
     match node {
-        sise::TreeNode::Atom(a) => {
-            a.strip_prefix('"').and_then(|t| t.strip_suffix('"')).unwrap_or(a).to_owned()
-        }
+        sise::TreeNode::Atom(a) => match a.strip_prefix('"').and_then(|t| t.strip_suffix('"')) {
+            Some(t) if t.contains(|c: char| c.is_whitespace() || c == '(' || c == ')') => {
+                format!("|{t}|")
+            }
+            Some(t) => t.to_owned(),
+            None => a.to_owned(),
+        },
         sise::TreeNode::List(items) => {
             format!("({})", items.iter().map(sexp_text).collect::<Vec<_>>().join(" "))
         }
@@ -565,6 +572,7 @@ fn parse_nl_bound(node: &sise::TreeNode) -> Option<crate::context::NlBound> {
             [sise::TreeNode::Atom(k), sise::TreeNode::Atom(v)] if k == ":fixed" => {
                 b.fixed = v == "true"
             }
+            [_] => return None,
             _ => {}
         }
     }
@@ -581,6 +589,7 @@ fn parse_nl_term(node: &sise::TreeNode) -> Option<crate::context::NlTerm> {
             [sise::TreeNode::Atom(k), v] if k == ":value" => t.value = sexp_text(v),
             [sise::TreeNode::Atom(k), v] if k == ":lower" => t.lower = Some(parse_nl_bound(v)?),
             [sise::TreeNode::Atom(k), v] if k == ":upper" => t.upper = Some(parse_nl_bound(v)?),
+            [_] => return None,
             _ => {}
         }
     }
@@ -629,12 +638,14 @@ fn parse_nl_atom(node: &sise::TreeNode) -> Option<crate::context::NlAtom> {
                             [TreeNode::Atom(k), TreeNode::Atom(v)] if k == ":count" => {
                                 h.count = difficulty_count(v)?
                             }
+                            [_] => return None,
                             _ => {}
                         }
                     }
                     a.hosts.push(h);
                 }
             }
+            [_] => return None,
             _ => {}
         }
     }
