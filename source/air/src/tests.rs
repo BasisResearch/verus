@@ -2398,7 +2398,7 @@ fn replayed_scope_reuses_generated_names() {
     let commands = Parser::new(message_interface.clone()).nodes_to_commands(&nodes).unwrap();
     let CommandX::Global(decl) = &*commands[0] else { panic!("expected a declaration") };
     let mut air_context = crate::context::Context::new(message_interface, SmtSolver::Z3);
-    let mut scope = |air_context: &mut crate::context::Context| {
+    let scope = |air_context: &mut crate::context::Context| {
         air_context.push();
         air_context.global(decl).unwrap();
         air_context.pop();
