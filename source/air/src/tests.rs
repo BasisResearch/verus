@@ -24,6 +24,8 @@ fn run_nodes_as_test(should_typecheck: bool, should_be_valid: bool, nodes: &[sis
                     &command,
                     Default::default(),
                 );
+                // A query that fails to type-check opens no query to finish.
+                let opened_query = !matches!(result, ValidityResult::TypeError(_));
                 match (&**command, should_typecheck, should_be_valid, result) {
                     (_, false, _, ValidityResult::TypeError(_)) => {}
                     (_, true, _, ValidityResult::TypeError(s)) => {
@@ -36,7 +38,7 @@ fn run_nodes_as_test(should_typecheck: bool, should_be_valid: bool, nodes: &[sis
                     }
                     _ => {}
                 }
-                if matches!(**command, CommandX::CheckValid(..)) {
+                if opened_query && matches!(**command, CommandX::CheckValid(..)) {
                     air_context.finish_query();
                 }
             }
@@ -2406,4 +2408,32 @@ fn replayed_scope_reuses_generated_names() {
     let second = scope(&mut air_context);
     assert!(first.contains("%%lambda%%0"), "{}", first);
     assert!(second.contains("%%lambda%%0") && !second.contains("%%lambda%%1"), "{}", second);
+}
+
+#[test]
+fn type_error_in_query_closes_its_name_scope() {
+    // A query that fails to type-check must close the name scope it opened.
+    // Otherwise the next pop closes that scope instead of the caller's, and a
+    // lambda declared in the caller's scope stays cached after the solver
+    // drops its declaration, so declaring it again emits nothing.
+    let message_interface = std::sync::Arc::new(crate::messages::AirMessageInterface {});
+    let mut nodes = Vec::new();
+    macro_push_node(
+        &mut nodes,
+        node!((axiom (= 10 (apply Int (lambda ((x Int) (y Int)) (+ x y 5)) 2 3)))),
+    );
+    macro_push_node(&mut nodes, node!((check-valid (assert (forall ((x Int)) (+ x true))))));
+    let commands = Parser::new(message_interface.clone()).nodes_to_commands(&nodes).unwrap();
+    let CommandX::Global(decl) = &*commands[0] else { panic!("expected a declaration") };
+    let mut air_context = crate::context::Context::new(message_interface.clone(), SmtSolver::Z3);
+    air_context.push();
+    air_context.global(decl).unwrap();
+    let result =
+        air_context.command(&*message_interface, &Reporter {}, &commands[1], Default::default());
+    assert!(matches!(result, ValidityResult::TypeError(_)), "{:?}", result);
+    air_context.pop();
+    let _ = air_context.smt_log.take_pipe_data();
+    air_context.global(decl).unwrap();
+    let again = String::from_utf8(air_context.smt_log.take_pipe_data()).unwrap();
+    assert!(again.contains("(declare-fun %%lambda%%0"), "{}", again);
 }

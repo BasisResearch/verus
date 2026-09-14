@@ -949,6 +949,18 @@ pub(crate) fn add_decl<'ctx>(
 pub(crate) fn check_query(context: &mut Context, query: &Query) -> Result<Query, TypeError> {
     let num_scopes = context.typing.decls.num_scopes();
     context.push_name_scope();
+    let query = check_query_in_name_scope(context, query);
+    // A type error can return from inside a binder's scope. Close any such
+    // scope so that the pop below closes the name scope opened above.
+    while context.typing.decls.num_scopes() > num_scopes + 1 {
+        context.typing.decls.pop_scope();
+    }
+    context.pop_name_scope();
+    assert_eq!(context.typing.decls.num_scopes(), num_scopes);
+    query
+}
+
+fn check_query_in_name_scope(context: &mut Context, query: &Query) -> Result<Query, TypeError> {
     let mut locals: Vec<Decl> = Vec::new();
     for decl in query.local.iter() {
         let (mut gen_decls, decl) = check_decl(context, decl)?;
@@ -965,9 +977,5 @@ pub(crate) fn check_query(context: &mut Context, query: &Query) -> Result<Query,
     let (mut gen_decls, assertion) = crate::closure::simplify_stmt(context, &query.assertion);
     assert_eq!(context.apply_map.num_scopes(), context.typing.decls.num_scopes());
     locals.append(&mut gen_decls);
-    let query = Arc::new(QueryX { local: Arc::new(locals), assertion });
-
-    context.pop_name_scope();
-    assert_eq!(context.typing.decls.num_scopes(), num_scopes);
-    Ok(query)
+    Ok(Arc::new(QueryX { local: Arc::new(locals), assertion }))
 }

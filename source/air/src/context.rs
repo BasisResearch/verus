@@ -114,7 +114,8 @@ impl Default for SmtSolver {
 }
 
 /// The counters that name AIR's generated symbols (axiom labels, arrays,
-/// lambdas, chooses and applies), as they stood when a name scope opened.
+/// lambdas, chooses and applies) and anonymous axiom tags, as they stood when
+/// a name scope opened.
 #[derive(Clone, Copy)]
 struct NameCounters {
     axiom_infos: u64,
@@ -122,6 +123,7 @@ struct NameCounters {
     lambda: u64,
     choose: u64,
     apply: u64,
+    anon_axiom: u64,
 }
 
 pub struct Context {
@@ -569,6 +571,7 @@ impl Context {
             lambda: self.lambda_count,
             choose: self.choose_count,
             apply: self.apply_count,
+            anon_axiom: self.anon_axiom_count,
         });
         self.axiom_infos.push_scope(false);
         self.array_map.push_scope(false);
@@ -581,13 +584,14 @@ impl Context {
     pub(crate) fn pop_name_scope(&mut self) {
         // The popped scope's names left the solver with it, and the maps below
         // forget them, so its numbers are free for the next scope to reuse.
-        if let Some(counters) = self.name_counters.pop() {
-            self.axiom_infos_count = counters.axiom_infos;
-            self.array_count = counters.array;
-            self.lambda_count = counters.lambda;
-            self.choose_count = counters.choose;
-            self.apply_count = counters.apply;
-        }
+        let counters =
+            self.name_counters.pop().expect("pop_name_scope without a matching push_name_scope");
+        self.axiom_infos_count = counters.axiom_infos;
+        self.array_count = counters.array;
+        self.lambda_count = counters.lambda;
+        self.choose_count = counters.choose;
+        self.apply_count = counters.apply;
+        self.anon_axiom_count = counters.anon_axiom;
         self.axiom_infos.pop_scope();
         self.array_map.pop_scope();
         self.lambda_map.pop_scope();
