@@ -275,8 +275,14 @@ impl InstantiationGraph {
                     if number::<usize>(index, line)? != quantifiers.len() {
                         return Err(malformed(line));
                     }
-                    let name = name.strip_prefix('|').and_then(|n| n.strip_suffix('|'));
-                    quantifiers.push(name.unwrap_or(rest.split_once(' ').unwrap().1).to_owned());
+                    let name =
+                        name.strip_prefix('|').and_then(|n| n.strip_suffix('|')).unwrap_or(name);
+                    // cvc5 prints every formula without a qid as `_`. Named by
+                    // index, distinct formulas stay distinct quantifier nodes.
+                    quantifiers.push(match name {
+                        "_" => format!("_unnamed_{index}"),
+                        _ => name.to_owned(),
+                    });
                 }
                 "node" => {
                     // <index> <quantifier> <strategy> <round> <depth> <term depth> (<parents>)
@@ -863,6 +869,17 @@ mod tests {
         let forward =
             lines("(instantiation-graph\n(quantifier 0 q)\n(node 0 0 X 1 0 0 (1))\n(dropped 0)\n)");
         assert!(InstantiationGraph::from_live(&forward).is_err());
+    }
+
+    #[test]
+    fn unnamed_quantifiers_stay_apart() {
+        // One unnamed formula's instance feeds another's. Merged under `_`,
+        // they would form a self-loop and report a cycle that is not there.
+        let text = "(instantiation-graph\n(quantifier 0 _)\n(quantifier 1 _)\n(node 0 0 X 1 0 0 ())\n(node 1 1 X 2 1 1 (0))\n(dropped 0)\n)";
+        let graph = InstantiationGraph::from_live(&lines(text)).unwrap();
+        assert_eq!(graph.names[&(0, 0)], "_unnamed_0");
+        assert_eq!(graph.names[&(1, 0)], "_unnamed_1");
+        assert!(graph.cycles(&GraphFilter::default(), 10).is_empty());
     }
 
     #[test]
