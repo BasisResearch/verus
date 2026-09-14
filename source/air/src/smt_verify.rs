@@ -195,6 +195,10 @@ pub(crate) fn smt_check_assertion<'ctx>(
     only_check_earlier: bool,
     report_long_running: Option<&mut ReportLongRunning>,
 ) -> ValidityResult {
+    // a check that returns before reading the reply must not leave the
+    // previous check's pressure or difficulty behind for its caller to take
+    context.last_inst_pressure = None;
+    context.last_difficulty = None;
     let disabled_expr = if only_check_earlier {
         // disable all labels that come after the first known error
         let mut disabled: Vec<Expr> = Vec::new();
@@ -291,6 +295,10 @@ pub(crate) fn smt_check_assertion<'ctx>(
         // anything else can disturb the difficulty map or the unsat core
         context.smt_log.log_get_info("difficulty-gradient");
     }
+    if context.inst_pressure {
+        // in the same batch, right after the answer it describes
+        context.smt_log.log_get_info("inst-pressure");
+    }
     if context.provenance {
         // in the same batch: the tag lists arrive after the result and the
         // instantiation dump, before the sentinel
@@ -327,7 +335,10 @@ pub(crate) fn smt_check_assertion<'ctx>(
     let mut unsat = None;
     let mut provenance_lines: Vec<String> = Vec::new();
     let mut difficulty = None;
+    let mut inst_pressure = None;
     for line in smt_output {
+        // Both keys come in the order they were asked, difficulty first, so
+        // a cvc5 without either answers `unsupported` to each in turn.
         if context.difficulty && line.starts_with("(:difficulty-gradient ") {
             difficulty = Some(parse_difficulty_gradient(&line));
         } else if context.difficulty && difficulty.is_none() && line == "unsupported" {
@@ -336,6 +347,12 @@ pub(crate) fn smt_check_assertion<'ctx>(
                 unparsed: Some(line),
                 ..Default::default()
             });
+        } else if context.inst_pressure && line.starts_with("(:inst-pressure ") {
+            inst_pressure = Some(parse_inst_pressure(&line));
+        } else if context.inst_pressure && inst_pressure.is_none() && line == "unsupported" {
+            // a cvc5 without the key; say so rather than fail the query
+            inst_pressure =
+                Some(crate::context::InstPressure { unparsed: Some(line), ..Default::default() });
         } else if line == "unsat" {
             assert!(unsat == None);
             unsat = Some(SmtOutput::Unsat);
@@ -373,6 +390,7 @@ pub(crate) fn smt_check_assertion<'ctx>(
         context.last_provenance = Some(parse_provenance_lines(&provenance_lines));
     }
     context.last_difficulty = difficulty;
+    context.last_inst_pressure = inst_pressure;
 
     let unsat = unsat.expect("expected sat/unsat/unknown from SMT solver");
 
@@ -487,10 +505,8 @@ pub(crate) fn smt_check_assertion<'ctx>(
 pub(crate) fn parse_difficulty_gradient(line: &str) -> crate::context::DifficultyGradient {
     use sise::TreeNode;
     let mut out = crate::context::DifficultyGradient::default();
-    let text = bar_symbols_as_strings(line);
-    let mut parser = sise::Parser::new(&text);
-    let fields = match sise::parse_tree(&mut parser) {
-        Ok(TreeNode::List(items)) => match &items[..] {
+    let fields = match read_smt_sexp(line) {
+        Some(TreeNode::List(items)) => match &items[..] {
             [TreeNode::Atom(key), TreeNode::List(fields)] if key == ":difficulty-gradient" => {
                 fields.clone()
             }
@@ -569,9 +585,6 @@ fn parse_difficulty_row(row: &sise::TreeNode) -> Option<crate::context::Difficul
             [TreeNode::Atom(k), TreeNode::List(tags)] if k == ":tags" => {
                 for tag in tags {
                     let TreeNode::Atom(tag) = tag else { return None };
-                    // a quoted symbol arrives as a sise string (see bar_symbols_as_strings)
-                    let tag =
-                        tag.strip_prefix('"').and_then(|t| t.strip_suffix('"')).unwrap_or(tag);
                     r.tags.push(tag.to_owned());
                 }
             }
@@ -587,32 +600,138 @@ fn parse_difficulty_row(row: &sise::TreeNode) -> Option<crate::context::Difficul
     Some(r)
 }
 
-/// cvc5 quotes a symbol that needs it as `|...|`, which sise cannot read, so
-/// spell each one as a sise string. A symbol that cannot be a sise string
-/// (it holds `"` or `\`) is left alone, and the reply stays unparsed.
-fn bar_symbols_as_strings(line: &str) -> String {
-    let mut out = String::with_capacity(line.len());
-    let mut rest = line;
-    while let Some(start) = rest.find('|') {
-        out.push_str(&rest[..start]);
-        let tail = &rest[start + 1..];
-        match tail.find('|') {
-            Some(end)
-                if tail[..end].chars().all(|c| matches!(c, ' '..='~') && c != '"' && c != '\\') =>
-            {
-                out.push('"');
-                out.push_str(&tail[..end]);
-                out.push('"');
-                rest = &tail[end + 1..];
+/// Parse cvc5's `(:inst-pressure (:rounds R :refutation B :quantifiers (ROW
+/// ...)))`, where each ROW is `(qid :key value ...)`. Unknown keys are
+/// skipped; a reply that does not parse is kept whole in `unparsed`.
+pub(crate) fn parse_inst_pressure(line: &str) -> crate::context::InstPressure {
+    use sise::TreeNode;
+    let mut out = crate::context::InstPressure::default();
+    let fields = match read_smt_sexp(line) {
+        Some(TreeNode::List(items)) => match &items[..] {
+            [TreeNode::Atom(key), TreeNode::List(fields)] if key == ":inst-pressure" => {
+                fields.clone()
             }
-            _ => {
-                out.push_str(&rest[start..]);
-                rest = "";
+            _ => Vec::new(),
+        },
+        _ => Vec::new(),
+    };
+    if fields.is_empty() {
+        out.unparsed = Some(line.to_owned());
+        return out;
+    }
+    for pair in fields.chunks(2) {
+        match pair {
+            [TreeNode::Atom(k), TreeNode::Atom(v)] if k == ":rounds" => {
+                out.rounds = v.parse().unwrap_or(0);
+            }
+            [TreeNode::Atom(k), TreeNode::Atom(v)] if k == ":refutation" => {
+                out.refutation = v == "true";
+            }
+            [TreeNode::Atom(k), TreeNode::List(rows)] if k == ":quantifiers" => {
+                for row in rows {
+                    match parse_quant_pressure(row) {
+                        Some(q) => out.quantifiers.push(q),
+                        None => out.unparsed = Some(line.to_owned()),
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Read one SMT-LIB s-expression as a sise tree. sise cannot read cvc5's
+/// symbols: a quoted one is `|...|`, and a simple one may hold characters
+/// sise's atoms lack (`^`). A quoted symbol becomes an atom without its
+/// bars; a string literal keeps its quotes. `None` when the text is not
+/// exactly one balanced expression.
+fn read_smt_sexp(text: &str) -> Option<sise::TreeNode> {
+    use sise::TreeNode;
+    let mut stack: Vec<Vec<TreeNode>> = vec![Vec::new()];
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '(' => stack.push(Vec::new()),
+            ')' => {
+                let list = stack.pop()?;
+                stack.last_mut()?.push(TreeNode::List(list));
+            }
+            '|' => {
+                let mut symbol = String::new();
+                loop {
+                    match chars.next()? {
+                        '|' => break,
+                        c => symbol.push(c),
+                    }
+                }
+                stack.last_mut()?.push(TreeNode::Atom(symbol));
+            }
+            '"' => {
+                // `""` inside a string is an escaped quote
+                let mut literal = String::from('"');
+                loop {
+                    let c = chars.next()?;
+                    literal.push(c);
+                    if c == '"' {
+                        if chars.peek() == Some(&'"') {
+                            literal.push(chars.next()?);
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                stack.last_mut()?.push(TreeNode::Atom(literal));
+            }
+            c if c.is_whitespace() => {}
+            c => {
+                let mut atom = String::from(c);
+                while let Some(&c) = chars.peek() {
+                    if c.is_whitespace() || matches!(c, '(' | ')' | '|' | '"') {
+                        break;
+                    }
+                    atom.push(c);
+                    chars.next();
+                }
+                stack.last_mut()?.push(TreeNode::Atom(atom));
             }
         }
     }
-    out.push_str(rest);
-    out
+    let mut top = stack.pop()?;
+    if !stack.is_empty() || top.len() != 1 {
+        return None;
+    }
+    top.pop()
+}
+
+/// One `(qid :key value ...)` row of `(get-info :inst-pressure)`.
+fn parse_quant_pressure(row: &sise::TreeNode) -> Option<crate::context::QuantPressure> {
+    use sise::TreeNode;
+    let TreeNode::List(items) = row else { return None };
+    let (TreeNode::Atom(qid), rest) = items.split_first()? else { return None };
+    let mut q =
+        crate::context::QuantPressure { qid: qid.to_owned(), named: true, ..Default::default() };
+    for pair in rest.chunks(2) {
+        let [TreeNode::Atom(k), TreeNode::Atom(v)] = pair else { return None };
+        if k == ":named" {
+            q.named = v != "false";
+            continue;
+        }
+        let n: u64 = v.parse().ok()?;
+        match k.as_str() {
+            ":instantiations" => q.instantiations = n,
+            ":duplicate-eq" => q.duplicate_eq = n,
+            ":duplicate-ent" => q.duplicate_ent = n,
+            ":duplicate-lemma" => q.duplicate_lemma = n,
+            ":conflict" => q.conflict = n,
+            ":propagate" => q.propagate = n,
+            ":first-round" => q.first_round = Some(n),
+            ":last-round" => q.last_round = Some(n),
+            ":refutation" => q.refutation = Some(n),
+            _ => {}
+        }
+    }
+    Some(q)
 }
 
 /// Parse what provenance mode adds to a `check-sat` batch's output: the
@@ -830,6 +949,11 @@ pub(crate) fn smt_check_query<'ctx>(
     // add query-local declarations
     for decl in query.local.iter() {
         if let Err(err) = crate::typecheck::add_decl(context, decl, false) {
+            // A type error opens no query to finish, so close the scope opened above.
+            if !context.single_check_query {
+                context.pop_name_scope();
+                context.smt_log.log_pop();
+            }
             return ValidityResult::TypeError(err);
         }
         smt_add_decl(context, decl);

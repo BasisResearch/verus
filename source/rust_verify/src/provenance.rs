@@ -94,6 +94,9 @@ pub struct ResolvedQueryProvenance {
 pub struct QueryDifficulty {
     pub desc: String,
     pub span: String,
+    /// `body`, `recommends`, `expanded`, ...: a recommends rerun or an
+    /// expanded recheck shares the body check's `desc` and `span`
+    pub kind: &'static str,
     /// 0 for the first check of the query, then one per multi-error round
     pub round: usize,
     /// "valid", "invalid", "canceled", or the solver's unexpected output
@@ -122,6 +125,10 @@ pub struct ResolvedDifficultyRow {
 pub struct ResolvedQueryDifficulty {
     pub desc: String,
     pub span: String,
+    pub kind: &'static str,
+    /// 0 for the first check, then one per multi-error round. The rounds of
+    /// a query share its solver scope, and cvc5 keeps difficulty until that
+    /// scope is popped, so a round's counts include the rounds before it.
     pub round: usize,
     pub result: String,
     /// cvc5's own answer to the check: unsat, sat, unknown, or none
@@ -130,15 +137,93 @@ pub struct ResolvedQueryDifficulty {
     pub difficulty: bool,
     /// whether each row carries `in_core`
     pub core: bool,
-    /// one per tagged input assertion in scope, largest difficulty first
+    /// Largest difficulty first: every hypothesis and the goal, and each
+    /// axiom that did some work or is in the core.
     pub rows: Vec<ResolvedDifficultyRow>,
-    /// the untagged input assertions (the AIR prelude), summed
+    /// The axioms in scope that did no work (difficulty 0) and are not in
+    /// the core, counted rather than listed: most of what is in scope.
+    pub idle_axioms: u64,
+    /// the untagged input assertions (each multi-error round's assertion
+    /// disabling the errors already found), summed
     pub untagged_asserted: u64,
     pub untagged_difficulty: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub untagged_in_core: Option<u64>,
     /// difficulty cvc5 could not carry back to a current input assertion
     pub unmatched_difficulty: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unparsed: Option<String>,
+}
+
+/// One `check-sat` under `-V inst-pressure`, as cvc5 reported it: rows by
+/// `:qid`, not yet joined to source.
+#[derive(Clone, Debug)]
+pub struct QueryInstPressure {
+    pub desc: String,
+    pub span: String,
+    /// `body`, `recommends`, `expanded`, ...: a recommends rerun or an
+    /// expanded recheck shares the body check's `desc` and `span`
+    pub kind: &'static str,
+    /// 0 for the first check of the query, then one per multi-error round
+    pub round: usize,
+    /// "valid", "invalid", "canceled", or the solver's unexpected output
+    pub result: String,
+    pub pressure: air::context::InstPressure,
+}
+
+/// One quantifier's instantiation pressure in one query, joined to source.
+/// Every count is the solver's own; nothing here is derived.
+#[derive(serde::Serialize, Clone, Debug)]
+pub struct ResolvedQuantPressure {
+    pub qid: String,
+    /// false for a quantifier without a `:qid`: `qid` is then synthetic
+    pub named: bool,
+    /// prelude, or the function the quantifier was written in
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fun: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub span: Option<String>,
+    /// Where the quantifier is written, in prose (as in provenance).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub site: Option<String>,
+    /// Why the quantifier exists, as the encoder that emitted it said.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub role: Option<&'static str>,
+    pub instantiations: u64,
+    /// attempts rejected because the term vector was used before
+    pub duplicate_eq: u64,
+    /// attempts rejected because the instance was already entailed
+    pub duplicate_ent: u64,
+    /// attempts rejected because the same lemma was already sent
+    pub duplicate_lemma: u64,
+    /// instances made by conflict-based instantiation because they
+    /// conflicted with, or propagated in, the current assignment
+    pub conflict: u64,
+    pub propagate: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_round: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_round: Option<u64>,
+    /// instances the refutation used; only after `unsat` with proofs on
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refutation: Option<u64>,
+}
+
+/// A query's instantiation pressure with every quantifier joined to source
+/// (`-V inst-pressure`).
+#[derive(serde::Serialize, Clone, Debug)]
+pub struct ResolvedQueryInstPressure {
+    pub desc: String,
+    pub span: String,
+    pub kind: &'static str,
+    pub round: usize,
+    pub result: String,
+    /// instantiation rounds that sent lemmas
+    pub rounds: u64,
+    /// whether each row carries `refutation`
+    pub refutation: bool,
+    /// most instantiated first
+    pub quantifiers: Vec<ResolvedQuantPressure>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub unparsed: Option<String>,
 }
@@ -362,35 +447,95 @@ impl Symbols {
     }
 
     /// Join each tagged assertion of a query's difficulty gradient to source.
+    /// cvc5 reports every tagged assertion in scope, which is mostly axioms
+    /// that play no part; those are counted in `idle_axioms`, not listed.
     pub(crate) fn resolve_difficulty(
         &self,
         fun: &Fun,
         q: QueryDifficulty,
     ) -> ResolvedQueryDifficulty {
         let g = q.gradient;
-        let rows = g
-            .rows
-            .into_iter()
-            .map(|row| ResolvedDifficultyRow {
-                tags: row.tags.iter().map(|t| self.tag_of(fun, t)).collect(),
-                difficulty: row.difficulty,
-                in_core: row.in_core,
-            })
-            .collect();
+        let mut rows = Vec::new();
+        let mut idle_axioms = 0u64;
+        for row in g.rows {
+            let tags: Vec<ResolvedTag> = row.tags.iter().map(|t| self.tag_of(fun, t)).collect();
+            let axiom = tags
+                .iter()
+                .all(|t| matches!(t.kind.as_str(), "axiom" | "prelude" | "anonymous_axiom"));
+            if axiom && row.difficulty == 0 && row.in_core != Some(true) {
+                idle_axioms += 1;
+            } else {
+                rows.push(ResolvedDifficultyRow {
+                    tags,
+                    difficulty: row.difficulty,
+                    in_core: row.in_core,
+                });
+            }
+        }
         ResolvedQueryDifficulty {
             desc: q.desc,
             span: q.span,
+            kind: q.kind,
             round: q.round,
             result: q.result,
             solver_result: g.result,
             difficulty: g.difficulty,
             core: g.core,
             rows,
+            idle_axioms,
             untagged_asserted: g.untagged_asserted,
             untagged_difficulty: g.untagged_difficulty,
             untagged_in_core: g.untagged_in_core,
             unmatched_difficulty: g.unmatched_difficulty,
             unparsed: g.unparsed,
+        }
+    }
+
+    /// Join each quantifier of a query's instantiation pressure to source.
+    pub(crate) fn resolve_inst_pressure(
+        &self,
+        fun: &Fun,
+        q: QueryInstPressure,
+    ) -> ResolvedQueryInstPressure {
+        let quantifiers = q
+            .pressure
+            .quantifiers
+            .into_iter()
+            .map(|p| {
+                let join = if p.named {
+                    self.quantifier(fun, &p.qid)
+                } else {
+                    QuantifierJoin { fun: None, span: None, inside: None, site: None, role: None }
+                };
+                ResolvedQuantPressure {
+                    qid: p.qid,
+                    named: p.named,
+                    fun: join.fun,
+                    span: join.span,
+                    site: join.site,
+                    role: join.role,
+                    instantiations: p.instantiations,
+                    duplicate_eq: p.duplicate_eq,
+                    duplicate_ent: p.duplicate_ent,
+                    duplicate_lemma: p.duplicate_lemma,
+                    conflict: p.conflict,
+                    propagate: p.propagate,
+                    first_round: p.first_round,
+                    last_round: p.last_round,
+                    refutation: p.refutation,
+                }
+            })
+            .collect();
+        ResolvedQueryInstPressure {
+            desc: q.desc,
+            span: q.span,
+            kind: q.kind,
+            round: q.round,
+            result: q.result,
+            rounds: q.pressure.rounds,
+            refutation: q.pressure.refutation,
+            quantifiers,
+            unparsed: q.pressure.unparsed,
         }
     }
 }

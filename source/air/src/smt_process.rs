@@ -141,7 +141,12 @@ impl SmtProcess {
         }
         if difficulty {
             assert!(matches!(solver, SmtSolver::Cvc5));
-            args.extend_from_slice(DIFFICULTY_ARGS);
+            // provenance mode may already have passed `--proof-mode=pp-only`
+            for arg in DIFFICULTY_ARGS {
+                if !args.contains(arg) {
+                    args.push(arg);
+                }
+            }
         }
         if instantiation_replay {
             assert!(matches!(solver, SmtSolver::Cvc5));

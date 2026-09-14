@@ -67,6 +67,10 @@ pub type VariableVersions = HashMap<String, (String, u32)>;
 /// cvc5 attributed to it and, after `unsat`, whether the unsat core holds it.
 /// Tags are the symbols from the wire; the join back to source happens in
 /// Verus.
+///
+/// cvc5 keeps difficulty until the query's scope is popped, and the rounds
+/// of a multi-error query share that scope, so a later round's counts
+/// include the work of the rounds before it.
 #[derive(Debug, Clone, Default)]
 pub struct DifficultyGradient {
     /// `unsat`, `sat` or `unknown` as cvc5 answered; `none` before a check.
@@ -77,13 +81,32 @@ pub struct DifficultyGradient {
     pub core: bool,
     /// One per distinct tagged input assertion, largest difficulty first.
     pub rows: Vec<DifficultyRow>,
-    /// Input assertions without a tag (the AIR prelude), summed.
+    /// Input assertions without a tag, summed. Every assertion Verus emits
+    /// is tagged, the AIR prelude's included; what is left is the assertion
+    /// each multi-error round adds to disable the errors already reported.
     pub untagged_asserted: u64,
     pub untagged_difficulty: u64,
     /// How many of them the unsat core holds, when `core`.
     pub untagged_in_core: Option<u64>,
     /// Difficulty cvc5 could not carry back to a current input assertion.
     pub unmatched_difficulty: u64,
+    /// The reply, when it did not parse.
+    pub unparsed: Option<String>,
+}
+
+/// What cvc5's `(get-info :inst-pressure)` reported for one `check-sat`
+/// (`-V inst-pressure`): per quantifier, by `:qid`, how often it was
+/// instantiated and how often an attempt was rejected as a duplicate. The
+/// join back to source happens in Verus.
+#[derive(Debug, Clone, Default)]
+pub struct InstPressure {
+    /// Instantiation rounds that sent lemmas.
+    pub rounds: u64,
+    /// Whether each row says how many of its instances the refutation used.
+    /// Only after `unsat` with proofs on, so not in an ordinary run.
+    pub refutation: bool,
+    /// Most instantiated first.
+    pub quantifiers: Vec<QuantPressure>,
     /// The reply, when it did not parse.
     pub unparsed: Option<String>,
 }
@@ -99,6 +122,32 @@ pub struct DifficultyRow {
     pub difficulty: u64,
     /// Whether the unsat core holds it; `None` unless the reply has a core.
     pub in_core: Option<bool>,
+}
+
+/// One quantifier's row of `(get-info :inst-pressure)`. Counts are the
+/// solver's own, disaggregated: every attempt that reached the duplicate
+/// checks is counted once, as added or as one kind of duplicate.
+#[derive(Debug, Clone, Default)]
+pub struct QuantPressure {
+    /// The `:qid`, or a synthetic `quant_<n>` when `named` is false.
+    pub qid: String,
+    pub named: bool,
+    pub instantiations: u64,
+    /// Rejected: the same term vector was used before.
+    pub duplicate_eq: u64,
+    /// Rejected: the instance was already entailed.
+    pub duplicate_ent: u64,
+    /// Rejected: the same lemma was already sent.
+    pub duplicate_lemma: u64,
+    /// Instances made because they conflicted with, or propagated in, the
+    /// current assignment (conflict-based instantiation).
+    pub conflict: u64,
+    pub propagate: u64,
+    /// The rounds of the first and last instantiation; none without one.
+    pub first_round: Option<u64>,
+    pub last_round: Option<u64>,
+    /// Instances the refutation used, when `InstPressure::refutation`.
+    pub refutation: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -152,6 +201,19 @@ impl Default for SmtSolver {
     }
 }
 
+/// The counters that name AIR's generated symbols (axiom labels, arrays,
+/// lambdas, chooses and applies) and anonymous axiom tags, as they stood when
+/// a name scope opened.
+#[derive(Clone, Copy)]
+struct NameCounters {
+    axiom_infos: u64,
+    array: u64,
+    lambda: u64,
+    choose: u64,
+    apply: u64,
+    anon_axiom: u64,
+}
+
 pub struct Context {
     pub(crate) message_interface: Arc<dyn crate::messages::MessageInterface>,
     smt_process: Option<SmtProcess>,
@@ -165,6 +227,11 @@ pub struct Context {
     pub(crate) choose_count: u64,
     pub(crate) apply_map: ScopeMap<(Typs, Typ), Ident>,
     pub(crate) apply_count: u64,
+    /// One entry per open name scope. Popping a scope restores its counters,
+    /// so replaying a popped scope reproduces the names it generated: a
+    /// resident session rebuilds query prefixes that way, and instantiation
+    /// certificates refer to formulas by those names.
+    name_counters: Vec<NameCounters>,
     pub(crate) typing: Typing,
     pub(crate) debug: bool,
     pub(crate) ignore_unexpected_smt: bool,
@@ -206,6 +273,12 @@ pub struct Context {
     /// The difficulty gradient of the last `check-sat`, until the caller
     /// takes it.
     pub(crate) last_difficulty: Option<DifficultyGradient>,
+    /// Ask cvc5 for `(get-info :inst-pressure)` after every `check-sat`
+    /// (`-V inst-pressure`). Read-only: the search is unchanged.
+    pub(crate) inst_pressure: bool,
+    /// The instantiation pressure of the last `check-sat`, until the caller
+    /// takes it.
+    pub(crate) last_inst_pressure: Option<InstPressure>,
     /// Whether this solver may save and restore instantiations across
     /// rechecks of a query (cvc5 only, fixed at launch).
     pub(crate) instantiation_replay: bool,
@@ -239,6 +312,7 @@ impl Context {
             choose_count: 0,
             apply_map: ScopeMap::new(),
             apply_count: 0,
+            name_counters: Vec::new(),
             typing: Typing {
                 message_interface: message_interface.clone(),
                 decls: crate::scope_map::ScopeMap::new(),
@@ -291,6 +365,8 @@ impl Context {
             last_provenance: None,
             difficulty: false,
             last_difficulty: None,
+            inst_pressure: false,
+            last_inst_pressure: None,
             instantiation_replay: false,
             restore_instantiations: None,
             saved_instantiations: HashSet::new(),
@@ -405,6 +481,19 @@ impl Context {
             info.variable_versions = self.variable_versions.clone();
             info
         })
+    }
+
+    /// The instantiation pressure cvc5 reported for the most recent
+    /// `check-sat`, if it was asked; each call returns it once.
+    pub fn take_inst_pressure(&mut self) -> Option<InstPressure> {
+        self.last_inst_pressure.take()
+    }
+
+    /// Ask for `(get-info :inst-pressure)` after every `check-sat` (cvc5 only).
+    /// It only reads counters, so the solver and its budget are unchanged.
+    pub fn set_inst_pressure(&mut self, enabled: bool) {
+        assert!(!enabled || matches!(self.solver, SmtSolver::Cvc5));
+        self.inst_pressure = enabled;
     }
 
     /// Turn provenance mode on (cvc5 only; must precede the first query).
@@ -613,6 +702,14 @@ impl Context {
     }
 
     pub(crate) fn push_name_scope(&mut self) {
+        self.name_counters.push(NameCounters {
+            axiom_infos: self.axiom_infos_count,
+            array: self.array_count,
+            lambda: self.lambda_count,
+            choose: self.choose_count,
+            apply: self.apply_count,
+            anon_axiom: self.anon_axiom_count,
+        });
         self.axiom_infos.push_scope(false);
         self.array_map.push_scope(false);
         self.lambda_map.push_scope(false);
@@ -622,6 +719,16 @@ impl Context {
     }
 
     pub(crate) fn pop_name_scope(&mut self) {
+        // The popped scope's names left the solver with it, and the maps below
+        // forget them, so its numbers are free for the next scope to reuse.
+        let counters =
+            self.name_counters.pop().expect("pop_name_scope without a matching push_name_scope");
+        self.axiom_infos_count = counters.axiom_infos;
+        self.array_count = counters.array;
+        self.lambda_count = counters.lambda;
+        self.choose_count = counters.choose;
+        self.apply_count = counters.apply;
+        self.anon_axiom_count = counters.anon_axiom;
         self.axiom_infos.pop_scope();
         self.array_map.pop_scope();
         self.lambda_map.pop_scope();

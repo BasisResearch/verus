@@ -42,6 +42,9 @@ pub const HYPS_FILE_SUFFIX: &str = ".hyps";
 /// `--log-all` under `-V provenance`: per function, what cvc5 reported for
 /// each query (tags, instantiations), as JSON.
 pub const PROVENANCE_FILE_SUFFIX: &str = ".provenance.json";
+/// `--log-all` under `-V inst-pressure`: per function, each query's
+/// instantiation pressure joined to source, as JSON.
+pub const INST_PRESSURE_FILE_SUFFIX: &str = ".inst_pressure.json";
 pub const IMPL_NAMES_SUFFIX: &str = ".impl_names";
 pub const CALL_GRAPH_FILE_SUFFIX_FULL_INITIAL: &str = "-call-graph-full-initial.dot";
 pub const CALL_GRAPH_FILE_SUFFIX_FULL_SIMPLIFIED: &str = "-call-graph-full-simplified.dot";
@@ -129,6 +132,8 @@ pub struct ArgsX {
     pub provenance: bool,
     /// Record cvc5's per-assertion difficulty and unsat-core membership.
     pub difficulty: bool,
+    /// Record cvc5's per-quantifier instantiation pressure for every query.
+    pub inst_pressure: bool,
     pub reach: Option<String>,
     /// Serve retained AIR queries over stdin/stdout after compilation.
     pub resident: bool,
@@ -182,6 +187,7 @@ impl ArgsX {
             no_assert_ids: Default::default(),
             provenance: Default::default(),
             difficulty: Default::default(),
+            inst_pressure: Default::default(),
             reach: Default::default(),
             resident: false,
         }
@@ -433,8 +439,13 @@ pub fn parse_args_with_imports(
     const EXTENDED_NO_BV_SIMPLIFY: &str = "no-bv-simplify";
     const EXTENDED_NO_ASSERT_IDS: &str = "no-assert-ids";
     const EXTENDED_PROVENANCE: &str = "provenance";
+    const EXTENDED_INST_PRESSURE: &str = "inst-pressure";
     const EXTENDED_DIFFICULTY: &str = "difficulty";
     const EXTENDED_KEYS: &[(&str, &str)] = &[
+        (
+            EXTENDED_INST_PRESSURE,
+            "Record each query's instantiation pressure from cvc5: per quantifier, instantiations, duplicates, rounds (read-only; the search is unchanged)",
+        ),
         (
             EXTENDED_DIFFICULTY,
             "Record, per query, cvc5's difficulty for each hypothesis and axiom and whether the unsat core holds it (diagnostic: cvc5 runs with preprocessing proofs, solving under assumptions and twice the budget)",
@@ -893,12 +904,19 @@ pub fn parse_args_with_imports(
         no_assert_ids: extended.contains_key(EXTENDED_NO_ASSERT_IDS),
         provenance: extended.contains_key(EXTENDED_PROVENANCE),
         difficulty: extended.contains_key(EXTENDED_DIFFICULTY),
+        inst_pressure: extended.contains_key(EXTENDED_INST_PRESSURE),
         resident: matches.opt_present(OPT_RESIDENT),
     };
 
     if args.provenance && !matches!(args.solver, SmtSolver::Cvc5) {
         error(
             "-V provenance requires cvc5 (it is unavailable for vstd and internal test mode)"
+                .to_string(),
+        );
+    }
+    if args.inst_pressure && !matches!(args.solver, SmtSolver::Cvc5) {
+        error(
+            "-V inst-pressure requires cvc5 (it is unavailable for vstd and internal test mode)"
                 .to_string(),
         );
     }

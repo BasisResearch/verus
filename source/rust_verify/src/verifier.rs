@@ -334,6 +334,9 @@ pub struct Verifier {
     /// Under `-V difficulty`: what cvc5 reported for each query of each
     /// function, raw (tag symbols), in check order
     func_difficulty: HashMap<Fun, Vec<QueryDifficulty>>,
+    /// Under `-V inst-pressure`: what cvc5 reported for each query of each
+    /// function, by qid, in check order
+    func_inst_pressure: HashMap<Fun, Vec<QueryInstPressure>>,
     /// Errors to report after verification has run
     deferred_errors: Vec<VirErr>,
 
@@ -363,8 +366,9 @@ pub struct Verifier {
 }
 
 pub use crate::provenance::{
-    QueryDifficulty, QueryProvenance, ResolvedDifficultyRow, ResolvedInstantiation,
-    ResolvedQueryDifficulty, ResolvedQueryProvenance, ResolvedTag,
+    QueryDifficulty, QueryInstPressure, QueryProvenance, ResolvedDifficultyRow,
+    ResolvedInstantiation, ResolvedQuantPressure, ResolvedQueryDifficulty,
+    ResolvedQueryInstPressure, ResolvedQueryProvenance, ResolvedTag,
 };
 
 #[derive(serde::Serialize)]
@@ -377,6 +381,9 @@ pub struct FuncDetails {
     /// filled under `-V difficulty`
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub difficulty: Vec<ResolvedQueryDifficulty>,
+    /// filled under `-V inst-pressure`
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub inst_pressure: Vec<ResolvedQueryInstPressure>,
 }
 
 impl Default for FuncDetails {
@@ -386,6 +393,7 @@ impl Default for FuncDetails {
             failed_proof_notes: Default::default(),
             provenance: Default::default(),
             difficulty: Default::default(),
+            inst_pressure: Default::default(),
         }
     }
 }
@@ -396,6 +404,7 @@ impl FuncDetails {
         self.failed_proof_notes.extend(other.failed_proof_notes);
         self.provenance.extend(other.provenance);
         self.difficulty.extend(other.difficulty);
+        self.inst_pressure.extend(other.inst_pressure);
     }
 
     pub fn to_json(&self) -> serde_json::Value {
@@ -552,6 +561,7 @@ impl Verifier {
             func_details: HashMap::new(),
             func_provenance: HashMap::new(),
             func_difficulty: HashMap::new(),
+            func_inst_pressure: HashMap::new(),
             deferred_errors: Vec::new(),
 
             dep_tracker: if via_cargo_args.is_some() { Some(dep_tracker) } else { None },
@@ -606,6 +616,7 @@ impl Verifier {
             func_details: HashMap::new(),
             func_provenance: HashMap::new(),
             func_difficulty: HashMap::new(),
+            func_inst_pressure: HashMap::new(),
             deferred_errors: Vec::new(),
 
             via_cargo_args: self.via_cargo_args.clone(),
@@ -645,6 +656,9 @@ impl Verifier {
         }
         for (fun, queries) in other.func_difficulty {
             self.func_difficulty.entry(fun).or_default().extend(queries);
+        }
+        for (fun, queries) in other.func_inst_pressure {
+            self.func_inst_pressure.entry(fun).or_default().extend(queries);
         }
         self.deferred_errors.extend(other.deferred_errors);
     }
@@ -833,6 +847,7 @@ impl Verifier {
         command: &Command,
         context: &CommandContext,
         prover_choice: vir::def::ProverChoice,
+        query_op: QueryOp,
         default_prover_failed_assert_ids: &mut Vec<AssertId>,
     ) -> RunCommandQueriesResult {
         let is_singular = prover_choice == vir::def::ProverChoice::Singular;
@@ -921,8 +936,8 @@ impl Verifier {
         let mut invalidity = false;
         let mut timed_out = false;
         let mut used_axioms = None;
-        let mut provenance_round = 0usize;
-        let mut difficulty_round = 0usize;
+        // 0 for the query's first check, then one per multi-error round
+        let mut round = 0usize;
         loop {
             let result_str = || match &result {
                 ValidityResult::Valid(_) => "valid".to_string(),
@@ -936,19 +951,31 @@ impl Verifier {
                     QueryDifficulty {
                         desc: context.desc.clone(),
                         span: context.span.as_string.clone(),
-                        round: difficulty_round,
+                        kind: query_op.kind(),
+                        round,
                         result: result_str(),
                         gradient,
                     },
                 );
-                difficulty_round += 1;
+            }
+            if let Some(pressure) = air_context.take_inst_pressure() {
+                self.func_inst_pressure.entry(context.fun.clone()).or_default().push(
+                    QueryInstPressure {
+                        desc: context.desc.clone(),
+                        span: context.span.as_string.clone(),
+                        kind: query_op.kind(),
+                        round,
+                        result: result_str(),
+                        pressure,
+                    },
+                );
             }
             if let Some(info) = air_context.take_provenance() {
                 self.func_provenance.entry(context.fun.clone()).or_default().push(
                     QueryProvenance {
                         desc: context.desc.clone(),
                         span: context.span.as_string.clone(),
-                        round: provenance_round,
+                        round,
                         result: result_str(),
                         sources: info.sources,
                         instantiations: info.instantiations,
@@ -956,8 +983,8 @@ impl Verifier {
                         unparsed: info.unparsed,
                     },
                 );
-                provenance_round += 1;
             }
+            round += 1;
             match result {
                 ValidityResult::Valid(usage_info) => {
                     if (is_check_valid && is_first_check && level == Some(MessageLevel::Error))
@@ -1185,6 +1212,7 @@ impl Verifier {
         bucket_id: &BucketId,
         comment: &str,
         desc_prefix: Option<&str>,
+        query_op: QueryOp,
         default_prover_failed_assert_ids: &mut Vec<AssertId>,
         includes_function: bool,
     ) -> RunCommandQueriesResult {
@@ -1225,6 +1253,7 @@ impl Verifier {
                     &command,
                     &context,
                     *prover_choice,
+                    query_op,
                     default_prover_failed_assert_ids,
                 );
         }
@@ -1249,11 +1278,7 @@ impl Verifier {
     }
 
     /// Resolve batch replies with the same owned metadata used by resident checks.
-    fn resolve_provenance(&mut self, global_ctx: &vir::context::GlobalCtx) {
-        let symbols = crate::provenance::Symbols::capture(
-            global_ctx,
-            global_ctx.air_source_names.borrow().clone(),
-        );
+    fn resolve_provenance(&mut self, symbols: &crate::provenance::Symbols) {
         for (fun, queries) in std::mem::take(&mut self.func_provenance) {
             let resolved = queries.into_iter().map(|query| symbols.resolve(&fun, query));
             self.func_details.entry(fun.clone()).or_default().provenance.extend(resolved);
@@ -1261,17 +1286,19 @@ impl Verifier {
     }
 
     /// Join each query's difficulty gradient to source, per function.
-    fn resolve_difficulty(&mut self, global_ctx: &vir::context::GlobalCtx) {
-        if self.func_difficulty.is_empty() {
-            return;
-        }
-        let symbols = crate::provenance::Symbols::capture(
-            global_ctx,
-            global_ctx.air_source_names.borrow().clone(),
-        );
+    fn resolve_difficulty(&mut self, symbols: &crate::provenance::Symbols) {
         for (fun, queries) in std::mem::take(&mut self.func_difficulty) {
             let resolved = queries.into_iter().map(|query| symbols.resolve_difficulty(&fun, query));
             self.func_details.entry(fun.clone()).or_default().difficulty.extend(resolved);
+        }
+    }
+
+    /// Join each query's instantiation pressure to source, per function.
+    fn resolve_inst_pressure(&mut self, symbols: &crate::provenance::Symbols) {
+        for (fun, queries) in std::mem::take(&mut self.func_inst_pressure) {
+            let resolved =
+                queries.into_iter().map(|query| symbols.resolve_inst_pressure(&fun, query));
+            self.func_details.entry(fun.clone()).or_default().inst_pressure.extend(resolved);
         }
     }
 
@@ -1324,6 +1351,9 @@ impl Verifier {
         }
         if self.args.difficulty {
             air_context.set_difficulty(true);
+        }
+        if self.args.inst_pressure {
+            air_context.set_inst_pressure(true);
         }
         if self.instantiation_replay() {
             air_context.set_instantiation_replay(true);
@@ -1835,6 +1865,7 @@ impl Verifier {
                                 bucket_id,
                                 &op.to_air_comment(),
                                 None,
+                                *query_op,
                                 &mut default_prover_failed_assert_ids,
                                 includes_function,
                             );
@@ -2765,36 +2796,59 @@ impl Verifier {
                 writeln!(file, "{:#?}", triggers).expect("error writing to trigger log file");
             }
         }
-        // Join the provenance cvc5 reported back to source, per function
-        if self.args.provenance {
-            self.resolve_provenance(&global_ctx);
-            if self.args.log_all {
-                let mut file = self.create_log_file(None, crate::config::PROVENANCE_FILE_SUFFIX)?;
+        // Join what cvc5 reported (instantiation pressure, difficulty,
+        // provenance) back to source, per function. The joins read the same
+        // symbols.
+        if self.args.inst_pressure || self.args.difficulty || self.args.provenance {
+            let symbols = crate::provenance::Symbols::capture(
+                &global_ctx,
+                global_ctx.air_source_names.borrow().clone(),
+            );
+            if self.args.inst_pressure {
+                self.resolve_inst_pressure(&symbols);
+            }
+            if self.args.difficulty {
+                self.resolve_difficulty(&symbols);
+            }
+            if self.args.provenance {
+                self.resolve_provenance(&symbols);
+            }
+        }
+        // `--log-all`: per function, what each of them reported, as JSON
+        if self.args.log_all {
+            type Select = fn(&FuncDetails) -> Option<serde_json::Value>;
+            let logs: [(bool, &str, Select); 2] = [
+                (self.args.inst_pressure, crate::config::INST_PRESSURE_FILE_SUFFIX, |d| {
+                    (!d.inst_pressure.is_empty()).then(|| {
+                        serde_json::to_value(&d.inst_pressure).expect("inst-pressure json")
+                    })
+                }),
+                (self.args.provenance, crate::config::PROVENANCE_FILE_SUFFIX, |d| {
+                    (!d.provenance.is_empty())
+                        .then(|| serde_json::to_value(&d.provenance).expect("provenance json"))
+                }),
+            ];
+            for (enabled, suffix, select) in logs {
+                if !enabled {
+                    continue;
+                }
+                let mut file = self.create_log_file(None, suffix)?;
                 let mut by_fun: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
                 let mut funs: Vec<&Fun> = self.func_details.keys().collect();
                 funs.sort();
                 for fun in funs {
-                    let details = &self.func_details[fun];
-                    if details.provenance.is_empty() {
-                        continue;
+                    if let Some(value) = select(&self.func_details[fun]) {
+                        by_fun.insert(fun_as_friendly_rust_name(fun), value);
                     }
-                    by_fun.insert(
-                        fun_as_friendly_rust_name(fun),
-                        serde_json::to_value(&details.provenance).expect("provenance json"),
-                    );
                 }
                 writeln!(
                     file,
                     "{}",
                     serde_json::to_string_pretty(&serde_json::Value::Object(by_fun))
-                        .expect("provenance json")
+                        .expect("func details json")
                 )
-                .expect("error writing to provenance log file");
+                .expect("error writing to log file");
             }
-        }
-        // Join the difficulty gradients cvc5 reported back to source
-        if self.args.difficulty {
-            self.resolve_difficulty(&global_ctx);
         }
         // Log the provenance joins: qid -> (function, owning tag, span), hyp -> (kind, span)
         if self.args.log_all {

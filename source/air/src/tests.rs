@@ -24,6 +24,8 @@ fn run_nodes_as_test(should_typecheck: bool, should_be_valid: bool, nodes: &[sis
                     &command,
                     Default::default(),
                 );
+                // A query that fails to type-check opens no query to finish.
+                let opened_query = !matches!(result, ValidityResult::TypeError(_));
                 match (&**command, should_typecheck, should_be_valid, result) {
                     (_, false, _, ValidityResult::TypeError(_)) => {}
                     (_, true, _, ValidityResult::TypeError(s)) => {
@@ -36,7 +38,7 @@ fn run_nodes_as_test(should_typecheck: bool, should_be_valid: bool, nodes: &[sis
                     }
                     _ => {}
                 }
-                if matches!(**command, CommandX::CheckValid(..)) {
+                if opened_query && matches!(**command, CommandX::CheckValid(..)) {
                     air_context.finish_query();
                 }
             }
@@ -2400,6 +2402,15 @@ fn parse_difficulty_gradient_reply() {
     assert_eq!(g.rows[2].in_core, Some(false));
     assert_eq!((g.untagged_asserted, g.untagged_in_core, g.unmatched_difficulty), (1, Some(0), 0));
 
+    // a quoted symbol may hold spaces and quotes
+    let g = crate::smt_verify::parse_difficulty_gradient(
+        "(:difficulty-gradient (:result sat :difficulty true :core false :rows (\
+         (:tags (|a \"b\" c|) :difficulty 2)) :untagged (:asserted 0 :difficulty 0) \
+         :unmatched-difficulty 0))",
+    );
+    assert!(g.unparsed.is_none(), "{:?}", g.unparsed);
+    assert_eq!(g.rows[0].tags, vec!["a \"b\" c".to_string()]);
+
     // no core outside unsat; a count beyond u64 saturates
     let g = crate::smt_verify::parse_difficulty_gradient(
         "(:difficulty-gradient (:result unknown :difficulty true :core false :rows (\
@@ -2415,4 +2426,163 @@ fn parse_difficulty_gradient_reply() {
     assert_eq!(g.unparsed.as_deref(), Some("(:difficulty-gradient unsupported)"));
     let bad = "(:difficulty-gradient (:result sat :rows ((:tags (a) :difficulty many))))";
     assert_eq!(crate::smt_verify::parse_difficulty_gradient(bad).unparsed.as_deref(), Some(bad));
+}
+
+#[test]
+fn replayed_scope_reuses_generated_names() {
+    // A resident session rebuilds a popped query prefix by replaying its
+    // declarations. The replay must name AIR's generated symbols as the first
+    // pass did, because instantiation certificates refer to formulas that
+    // mention them.
+    let message_interface = std::sync::Arc::new(crate::messages::AirMessageInterface {});
+    let mut nodes = Vec::new();
+    macro_push_node(
+        &mut nodes,
+        node!((axiom (= 10 (apply Int (lambda ((x Int) (y Int)) (+ x y 5)) 2 3)))),
+    );
+    let commands = Parser::new(message_interface.clone()).nodes_to_commands(&nodes).unwrap();
+    let CommandX::Global(decl) = &*commands[0] else { panic!("expected a declaration") };
+    let mut air_context = crate::context::Context::new(message_interface, SmtSolver::Z3);
+    let scope = |air_context: &mut crate::context::Context| {
+        air_context.push();
+        air_context.global(decl).unwrap();
+        air_context.pop();
+        String::from_utf8(air_context.smt_log.take_pipe_data()).unwrap()
+    };
+    let first = scope(&mut air_context);
+    let second = scope(&mut air_context);
+    assert!(first.contains("%%lambda%%0"), "{}", first);
+    assert!(second.contains("%%lambda%%0") && !second.contains("%%lambda%%1"), "{}", second);
+}
+
+#[test]
+fn type_error_in_query_closes_its_name_scope() {
+    // A query that fails to type-check must close the name scope it opened.
+    // Otherwise the next pop closes that scope instead of the caller's, and a
+    // lambda declared in the caller's scope stays cached after the solver
+    // drops its declaration, so declaring it again emits nothing.
+    let message_interface = std::sync::Arc::new(crate::messages::AirMessageInterface {});
+    let mut nodes = Vec::new();
+    macro_push_node(
+        &mut nodes,
+        node!((axiom (= 10 (apply Int (lambda ((x Int) (y Int)) (+ x y 5)) 2 3)))),
+    );
+    macro_push_node(&mut nodes, node!((check-valid (assert (forall ((x Int)) (+ x true))))));
+    let commands = Parser::new(message_interface.clone()).nodes_to_commands(&nodes).unwrap();
+    let CommandX::Global(decl) = &*commands[0] else { panic!("expected a declaration") };
+    let mut air_context = crate::context::Context::new(message_interface.clone(), SmtSolver::Z3);
+    air_context.push();
+    air_context.global(decl).unwrap();
+    let result =
+        air_context.command(&*message_interface, &Reporter {}, &commands[1], Default::default());
+    assert!(matches!(result, ValidityResult::TypeError(_)), "{:?}", result);
+    air_context.pop();
+    let _ = air_context.smt_log.take_pipe_data();
+    air_context.global(decl).unwrap();
+    let again = String::from_utf8(air_context.smt_log.take_pipe_data()).unwrap();
+    assert!(again.contains("(declare-fun %%lambda%%0"), "{}", again);
+}
+
+#[test]
+fn type_error_in_declaration_closes_its_binder_scope() {
+    // A declaration whose type error is inside a binder must close the
+    // binder's typing scope. Otherwise the next pop leaves the typing scopes
+    // one deeper than the name maps, which lowering the next lambda asserts
+    // against.
+    let message_interface = std::sync::Arc::new(crate::messages::AirMessageInterface {});
+    let mut nodes = Vec::new();
+    macro_push_node(&mut nodes, node!((axiom (forall ((x Int)) (+ x true)))));
+    macro_push_node(
+        &mut nodes,
+        node!((axiom (= 10 (apply Int (lambda ((x Int) (y Int)) (+ x y 5)) 2 3)))),
+    );
+    let commands = Parser::new(message_interface.clone()).nodes_to_commands(&nodes).unwrap();
+    let CommandX::Global(ill_typed) = &*commands[0] else { panic!("expected a declaration") };
+    let CommandX::Global(lambda) = &*commands[1] else { panic!("expected a declaration") };
+    let mut air_context = crate::context::Context::new(message_interface, SmtSolver::Z3);
+    air_context.push();
+    assert!(air_context.global(ill_typed).is_err());
+    air_context.pop();
+    air_context.global(lambda).unwrap();
+}
+
+#[test]
+fn parse_inst_pressure_reply() {
+    let info = crate::smt_verify::parse_inst_pressure(
+        "(:inst-pressure (:rounds 3 :refutation true :quantifiers (\
+         (user_f_1 :instantiations 5 :duplicate-eq 2 :duplicate-ent 1 :duplicate-lemma 0 \
+         :conflict 1 :propagate 0 :first-round 0 :last-round 2 :refutation 1) \
+         (|user%g| :instantiations 0 :duplicate-eq 4 :duplicate-ent 0 :duplicate-lemma 0 \
+         :conflict 0 :propagate 0 :refutation 0) \
+         (quant_0 :named false :instantiations 1 :duplicate-eq 0 :duplicate-ent 0 \
+         :duplicate-lemma 0 :conflict 0 :propagate 1 :first-round 1 :last-round 1 \
+         :refutation 0))))",
+    );
+    assert!(info.unparsed.is_none(), "{:?}", info.unparsed);
+    assert_eq!((info.rounds, info.refutation, info.quantifiers.len()), (3, true, 3));
+    let f = &info.quantifiers[0];
+    assert_eq!(f.qid, "user_f_1");
+    assert!(f.named);
+    assert_eq!(
+        (f.instantiations, f.duplicate_eq, f.duplicate_ent, f.duplicate_lemma),
+        (5, 2, 1, 0)
+    );
+    assert_eq!(
+        (f.conflict, f.first_round, f.last_round, f.refutation),
+        (1, Some(0), Some(2), Some(1))
+    );
+    // only duplicates: no rounds; quoted symbols lose their bars
+    let q = &info.quantifiers[1];
+    assert_eq!((q.qid.as_str(), q.first_round, q.duplicate_eq), ("user%g", None, 4));
+    let u = &info.quantifiers[2];
+    assert_eq!((u.qid.as_str(), u.named, u.propagate), ("quant_0", false, 1));
+
+    // no quantifier instantiated; no refutation counts outside proof mode
+    let info = crate::smt_verify::parse_inst_pressure(
+        "(:inst-pressure (:rounds 0 :refutation false :quantifiers ()))",
+    );
+    assert!(info.unparsed.is_none() && info.quantifiers.is_empty() && !info.refutation);
+    // a solver without the key, or anything unforeseen, is kept whole
+    let info = crate::smt_verify::parse_inst_pressure("(:inst-pressure unsupported)");
+    assert_eq!(info.unparsed.as_deref(), Some("(:inst-pressure unsupported)"));
+}
+
+#[test]
+fn parse_inst_pressure_symbols() {
+    let row = |qid: &str| {
+        format!(
+            "(:inst-pressure (:rounds 1 :refutation false :quantifiers (({} :instantiations 1 \
+             :duplicate-eq 0 :duplicate-ent 0 :duplicate-lemma 0 :conflict 0 :propagate 0 \
+             :first-round 0 :last-round 0))))",
+            qid
+        )
+    };
+    let qids = |line: &str| {
+        let info = crate::smt_verify::parse_inst_pressure(line);
+        assert!(info.unparsed.is_none(), "{:?}", info.unparsed);
+        info.quantifiers.into_iter().map(|q| q.qid).collect::<Vec<_>>()
+    };
+    // a simple symbol may hold characters sise's atoms lack
+    assert_eq!(qids(&row("a^b")), vec!["a^b"]);
+    // a quoted one may hold anything but a bar, spaces and quotes included
+    assert_eq!(qids(&row("|a b|")), vec!["a b"]);
+    assert_eq!(qids(&row("|say \"hi\"|")), vec!["say \"hi\""]);
+    assert_eq!(qids(&row("||")), vec![""]);
+
+    // unbalanced, trailing, or cut short: kept whole
+    for line in [
+        "(:inst-pressure (:rounds 1 :refutation false :quantifiers ((a :instantiations 1)))",
+        "(:inst-pressure (:rounds 1)) x",
+        "(:inst-pressure (:rounds 1 :refutation false :quantifiers ((|a :instantiations 1))))",
+    ] {
+        let info = crate::smt_verify::parse_inst_pressure(line);
+        assert_eq!(info.unparsed.as_deref(), Some(line));
+    }
+    // a malformed row is reported, the others kept
+    let info = crate::smt_verify::parse_inst_pressure(
+        "(:inst-pressure (:rounds 2 :refutation false :quantifiers ((ok :instantiations 1) \
+         (bad :instantiations x))))",
+    );
+    assert!(info.unparsed.is_some());
+    assert_eq!(info.quantifiers.len(), 1);
 }
