@@ -229,6 +229,8 @@ pub struct EgraphReply {
     pub used_omitted: u64,
     /// terms left out because they print larger than cvc5's size limit
     pub too_large: u64,
+    /// equalities cvc5 left out because its rewriter closes them on its own
+    pub trivial: u64,
     /// The solver's refusal, as after `unsat`, where there is no e-graph to
     /// read, or a reply this parser did not recognise.
     pub error: Option<String>,

@@ -137,6 +137,11 @@ enum Request {
         /// List equalities with a side a quantifier was instantiated with.
         #[serde(default)]
         include_used: bool,
+        /// List the encoding's own equalities: a function against its
+        /// recursive variant or fuel constant, and sides that do not render
+        /// as source.
+        #[serde(default)]
+        include_encoding: bool,
         /// The id of an equality from this query's reading to assert in a
         /// second check.
         #[serde(default)]
@@ -592,8 +597,15 @@ struct EgraphSummary {
     /// value inside it), neither renders as source, or an equality listed
     /// before reads the same (the same one between differently boxed terms).
     hidden: usize,
+    /// Equalities not listed because they relate the encoding's own terms: a
+    /// function against its recursive variant or fuel constant, or a side
+    /// that does not render as source (see `include_encoding`).
+    encoding_omitted: usize,
     /// Terms cvc5 left out because they print larger than its size limit.
     too_large: u64,
+    /// Equalities cvc5 left out because its rewriter closes them on its own,
+    /// such as `x == 0 + x`.
+    trivial_omitted: u64,
 }
 
 #[derive(Clone, Serialize)]
@@ -770,15 +782,34 @@ impl<'a> QueryNames<'a> {
                 || vir::air_names::renders_as_source(&self.plain, rhs))
     }
 
-    /// The reading's equalities worth showing, in its order, and how many
-    /// were hidden.
-    fn resolve(&self, reply: &EgraphReply) -> (Vec<ResolvedEquality>, usize) {
+    /// The reading's equalities worth showing, in its order, how many were
+    /// hidden, and how many were the encoding's own.
+    fn resolve(
+        &self,
+        reply: &EgraphReply,
+        include_encoding: bool,
+    ) -> (Vec<ResolvedEquality>, usize, usize) {
         let mut hidden = 0;
+        let mut encoding = 0;
         let mut resolved: Vec<ResolvedEquality> = Vec::new();
         let mut seen: HashMap<(String, String), usize> = HashMap::new();
         for equality in &reply.equalities {
             if !self.shows(&equality.lhs, &equality.rhs) {
                 hidden += 1;
+                continue;
+            }
+            // A class of Verus terms mostly holds the encoding's own
+            // equalities: a function against its recursive variant or fuel
+            // constant, and terms with no source spelling at all. Neither
+            // says anything the source can act on, so they are left out
+            // unless the caller asks for them.
+            if !include_encoding
+                && (self.verus_assert(equality).is_none()
+                    || [&equality.lhs, &equality.rhs]
+                        .iter()
+                        .any(|term| vir::air_names::names_fuel_or_recursion(term)))
+            {
+                encoding += 1;
                 continue;
             }
             let (lhs, rhs) = (self.show(&equality.lhs), self.show(&equality.rhs));
@@ -815,7 +846,7 @@ impl<'a> QueryNames<'a> {
                 smt_rhs: equality.rhs.clone(),
             });
         }
-        (resolved, hidden)
+        (resolved, hidden, encoding)
     }
 }
 
@@ -943,6 +974,7 @@ fn serve_egraph(
     id: QueryId,
     limit: Option<u32>,
     include_used: bool,
+    include_encoding: bool,
     inject: Option<&str>,
     set_rlimit: &impl Fn(&mut Context, f32),
 ) -> io::Result<Result<EgraphOutcome, &'static str>> {
@@ -959,7 +991,7 @@ fn serve_egraph(
     let (before, reading) = egraph_check(air, query, None, set_rlimit)?;
     let empty = SourceNames::new();
     let names = QueryNames::new(bucket.symbols.as_ref(), &reading.variable_versions, &empty);
-    let (listed, hidden) = names.resolve(&reading);
+    let (listed, hidden, encoding_omitted) = names.resolve(&reading, include_encoding);
     let injection = match inject {
         None => None,
         Some(wanted) => {
@@ -988,7 +1020,9 @@ fn serve_egraph(
         listed: shown.len(),
         used_omitted: used.len(),
         hidden,
+        encoding_omitted,
         too_large: reading.too_large,
+        trivial_omitted: reading.trivial,
     };
     let equalities = shown.into_iter().take(limit).collect();
     Ok(Ok(EgraphOutcome { before, summary, equalities, injection }))
@@ -1223,6 +1257,7 @@ impl Server {
                     query: id,
                     limit,
                     include_used,
+                    include_encoding,
                     inject,
                     ..
                 } => {
@@ -1239,6 +1274,7 @@ impl Server {
                         id,
                         limit,
                         include_used,
+                        include_encoding,
                         inject.as_deref(),
                         &set_rlimit,
                     ) {
@@ -1811,11 +1847,39 @@ mod tests {
                 equalities: pairs.iter().map(|e| (*e).clone()).collect(),
                 ..EgraphReply::default()
             };
-            let (listed, hidden) = names.resolve(&reply);
-            assert_eq!((listed.len(), hidden), (1, 1));
+            let (listed, hidden, encoding) = names.resolve(&reply, false);
+            assert_eq!((listed.len(), hidden, encoding), (1, 1, 0));
             assert!(listed[0].used_by_proof);
             assert_eq!(listed[0].used_by, vec!["user_q"]);
         }
+    }
+
+    /// A class of Verus terms mostly holds equalities of the encoding, not of
+    /// the source: they are counted, and returned only when asked for.
+    #[test]
+    fn the_encodings_own_equalities_are_left_out_unless_asked() {
+        let (plain, shown, versions) = versioned_names();
+        let names = QueryNames {
+            symbols: None,
+            shown: Cow::Borrowed(&shown),
+            plain: Cow::Borrowed(&plain),
+            versions: &versions,
+        };
+        let reply = EgraphReply {
+            equalities: vec![
+                // A temporary, which renders as no source.
+                equality("x", "tmp%9", "entailed", &[]),
+                // A function against its own fuelled recursive variant.
+                equality("x", "(rec%f.? x (succ fuel_nat%f))", "entailed", &[]),
+                equality("x", "y", "entailed", &[]),
+            ],
+            ..EgraphReply::default()
+        };
+        let (listed, _, encoding) = names.resolve(&reply, false);
+        assert_eq!((listed.len(), encoding), (1, 2));
+        assert_eq!((listed[0].lhs.as_str(), listed[0].rhs.as_str()), ("x", "y"));
+        let (all, _, encoding) = names.resolve(&reply, true);
+        assert_eq!((all.len(), encoding), (3, 0));
     }
 
     #[test]

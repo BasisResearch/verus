@@ -287,6 +287,31 @@ fn render_builtin(names: &SourceNames, head: &str, args: &[Node]) -> Option<Stri
     }
 }
 
+/// Whether `term` names the fuel and recursion encoding: a function's
+/// recursive variant (`rec%f`, which renders as `f (recursive variant)`) or a
+/// fuel constant (`fuel_nat%f`). Such an equality relates a function to its
+/// own encoding rather than two things the source says.
+pub fn names_fuel_or_recursion(term: &str) -> bool {
+    fn names(node: &Node) -> bool {
+        match node {
+            Node::Atom(atom) => {
+                atom.contains(crate::def::PREFIX_RECURSIVE)
+                    || atom.contains(crate::def::PREFIX_FUEL_NAT)
+            }
+            Node::List(items) => items.iter().any(names),
+        }
+    }
+    let mut parser = sise::Parser::new(term);
+    match sise::parse_tree(&mut parser) {
+        Ok(node) => names(&node),
+        // An unparsable term is judged by its text.
+        Err(_) => {
+            term.contains(crate::def::PREFIX_RECURSIVE)
+                || term.contains(crate::def::PREFIX_FUEL_NAT)
+        }
+    }
+}
+
 /// Whether `render_term` writes every symbol of `term` as the source spells
 /// it: each is a recorded name, a box, a numeral, `true` or `false`, an
 /// SMT-LIB operator, or a `let` binder. Otherwise the rendering keeps some
@@ -427,6 +452,17 @@ mod tests {
     /// pipeline, from `sst_util::binary_op_str`.
     /// A solver reports terms it rewrote in SMT-LIB's own operators, which no
     /// encoder records, so they have a spelling of their own.
+    /// The fuel and recursion encoding, which renders but says nothing the
+    /// source says.
+    #[test]
+    fn fuel_and_recursion_terms_are_named_as_such() {
+        assert!(names_fuel_or_recursion("(krate!m.rec%f.? x (succ fuel_nat%krate!m.f.))"));
+        assert!(names_fuel_or_recursion("fuel_nat%krate!m.f."));
+        assert!(!names_fuel_or_recursion("(krate!m.f.? (I x))"));
+        // Judged by its text when it does not parse.
+        assert!(names_fuel_or_recursion("(rec%f"));
+    }
+
     #[test]
     fn solver_operators_read_as_source() {
         let mut names = SourceNames::new();
