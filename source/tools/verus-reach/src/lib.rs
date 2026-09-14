@@ -234,21 +234,16 @@ pub struct Graph {
     /// Used by ghost code: reached from a running function through a
     /// contract or proof, then through anything
     pub used: HashSet<String>,
-    /// The reachable and used functions, plus whatever mentions them or is
-    /// mentioned by them, transitively, through edges between functions in
-    /// either direction. Edges to types and to other crates' items are not
-    /// walked: everything constructs an `Option` or holds an `Expression`,
-    /// and walking those backwards would join the whole crate. The rest of
-    /// this set is where explicit roots hide: theorems about reachable
-    /// functions that nothing calls.
+    /// The reached functions (reachable, or used ghost functions) plus the
+    /// functions that mention one directly, through an edge of any kind:
+    /// one hop against the edges' direction. Only edges between functions
+    /// of the analyzed crates count; a hop onto a type or a foreign item
+    /// (everything constructs an `Option`) would gather the whole crate.
+    /// Reachable is a subset. The rest is where explicit roots hide:
+    /// theorems about reachable functions that nothing calls.
     pub connected: HashSet<String>,
     /// Ids some function refers to
     referred: HashSet<String>,
-    /// Ghost functions whose contract is stated in the vocabulary of the
-    /// reachable code: it mentions a reachable verified exec function, a
-    /// spec the contract of one is stated in, or a spec those are defined
-    /// by. Sharing a helper lemma or a utility spec does not count.
-    states_reached: HashSet<String>,
 }
 
 impl Graph {
@@ -312,67 +307,28 @@ impl Graph {
             }
         }
 
-        // From everything reached, ignore direction and context, but only
-        // between functions of the analyzed crates
-        let mut adjacent: HashMap<&str, Vec<&str>> = HashMap::new();
+        // One hop against the edges, between functions only
+        let covered = |id: &String| {
+            nodes
+                .get(id)
+                .map_or(false, |n| reachable.contains(id) || (n.is_ghost() && used.contains(id)))
+        };
         let mut referred = HashSet::new();
+        let mut connected: HashSet<String> =
+            nodes.keys().filter(|id| covered(id)).cloned().collect();
         for edge in reports.iter().flat_map(|r| r.edges.iter()) {
             if nodes.contains_key(&edge.from) {
                 referred.insert(edge.to.clone());
-                if nodes.contains_key(&edge.to) {
-                    adjacent.entry(&edge.from).or_default().push(&edge.to);
-                    adjacent.entry(&edge.to).or_default().push(&edge.from);
+                if covered(&edge.to) {
+                    connected.insert(edge.from.clone());
                 }
             }
         }
-        let covered: Vec<&String> = nodes
-            .values()
-            .filter(|n| reachable.contains(&n.id) || (n.is_ghost() && used.contains(&n.id)))
-            .map(|n| &n.id)
-            .collect();
-        let mut connected: HashSet<String> = covered.iter().map(|id| (*id).clone()).collect();
-        let mut queue: VecDeque<&str> = covered.iter().map(|id| id.as_str()).collect();
-        while let Some(id) = queue.pop_front() {
-            for next in adjacent.get(id).map_or(&[][..], |v| v) {
-                if connected.insert(next.to_string()) {
-                    queue.push_back(next);
-                }
-            }
-        }
-
-        // The vocabulary the reachable code's contracts are stated in
-        let mut vocabulary: HashSet<String> = nodes
-            .values()
-            .filter(|n| n.is_verified_exec() && reachable.contains(&n.id))
-            .map(|n| n.id.clone())
-            .collect();
-        let mut queue: VecDeque<String> = vocabulary.iter().cloned().collect();
-        while let Some(id) = queue.pop_front() {
-            let from_exec = nodes.get(&id).map_or(false, |n| !n.is_ghost());
-            for edge in out.get(id.as_str()).map_or(&[][..], |v| v) {
-                let spec = nodes.get(&edge.to).map_or(false, |n| n.mode == "spec");
-                if spec && (!from_exec || edge.kind == EdgeKind::Contract) {
-                    if vocabulary.insert(edge.to.clone()) {
-                        queue.push_back(edge.to.clone());
-                    }
-                }
-            }
-        }
-        let states_reached: HashSet<String> = nodes
-            .values()
-            .filter(|n| n.is_ghost())
-            .filter(|n| {
-                out.get(n.id.as_str()).map_or(false, |edges| {
-                    edges.iter().any(|e| e.kind == EdgeKind::Contract && vocabulary.contains(&e.to))
-                })
-            })
-            .map(|n| n.id.clone())
-            .collect();
-        Ok(Graph { nodes, roots: root_ids, reachable, used, connected, referred, states_reached })
+        Ok(Graph { nodes, roots: root_ids, reachable, used, connected, referred })
     }
 
-    /// Verified functions connected to reached code but not reachable: what
-    /// the roots miss, one step of direction away.
+    /// Verified functions that mention reached code but are not reachable:
+    /// what the roots miss, one step against the edges.
     pub fn connected_unreachable(&self) -> Vec<&Node> {
         self.nodes
             .values()
@@ -381,19 +337,12 @@ impl Graph {
     }
 
     /// Candidates for `#[verifier::reach_root]`: ghost functions that
-    /// nothing refers to, so they are top-level statements, whose contract
-    /// is stated about reachable code (see `states_reached`). Being merely
-    /// connected is not enough: a theorem about a dead printer shares helper
-    /// lemmas and utility specs with the parser without saying anything
-    /// about it.
+    /// mention reached code and that nothing refers to, so they are
+    /// top-level statements.
     pub fn suggested_roots(&self) -> Vec<&Node> {
         self.connected_unreachable()
             .into_iter()
-            .filter(|n| {
-                n.is_ghost()
-                    && !self.referred.contains(&n.id)
-                    && self.states_reached.contains(&n.id)
-            })
+            .filter(|n| n.is_ghost() && !self.referred.contains(&n.id))
             .collect()
     }
 
@@ -615,9 +564,10 @@ mod tests {
     }
 
     #[test]
-    fn connected_holds_the_reachable_and_the_theorems_about_it() {
+    fn connected_is_the_reached_code_and_what_mentions_it_directly() {
         // A theorem about `wired`, and a lemma the theorem uses; neither is
-        // called. A spec about the unreachable twin is connected to nothing.
+        // called. The lemma is two hops away, and a spec about the
+        // unreachable twin touches nothing reached.
         let mut reports = lib_and_bin();
         reports[0].nodes.push(proof("lib::theorem"));
         reports[0].nodes.push(proof("lib::lemma_for_theorem"));
@@ -628,15 +578,12 @@ mod tests {
             assert!(graph.connected.contains(&n.id), "{} reachable but not connected", n.id);
         }
         assert!(graph.connected.contains("lib::theorem"));
-        assert!(graph.connected.contains("lib::lemma_for_theorem"));
+        assert!(!graph.connected.contains("lib::lemma_for_theorem"));
         assert!(!graph.connected.contains("lib::verified::spec_inc"));
         fn names(v: Vec<&Node>) -> Vec<&str> {
             v.iter().map(|n| n.id.as_str()).collect()
         }
-        assert_eq!(
-            names(graph.connected_unreachable()),
-            vec!["lib::lemma_for_theorem", "lib::theorem"]
-        );
+        assert_eq!(names(graph.connected_unreachable()), vec!["lib::theorem"]);
         assert_eq!(names(graph.suggested_roots()), vec!["lib::theorem"]);
     }
 
