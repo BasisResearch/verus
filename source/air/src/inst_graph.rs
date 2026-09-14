@@ -223,6 +223,10 @@ pub struct GraphSummary {
     pub rounds: u64,
     pub max_depth: u64,
     pub dropped: u64,
+    /// Which check-sat the graph is of, for a caller that ran more than one:
+    /// a resident recheck reports `certificate` or `search`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub check: Option<&'static str>,
 }
 
 fn malformed(line: &str) -> String {
@@ -338,6 +342,7 @@ impl InstantiationGraph {
             rounds: self.info.values().map(|info| info.round).max().unwrap_or(0),
             max_depth: self.info.values().map(|info| info.depth).max().unwrap_or(0),
             dropped: self.dropped,
+            check: None,
         }
     }
 
@@ -648,9 +653,11 @@ impl InstantiationGraph {
         let length = chain.len();
         let truncated = length > limit;
         if truncated {
-            // Keep both ends: where the chain starts and what it reaches.
-            let head = limit.div_ceil(2);
-            chain.drain(head..length - (limit - head));
+            // Keep both ends: where the chain starts and what it reaches. A
+            // single node can only be one end, and the target is the one asked
+            // about.
+            let tail = (limit / 2).max(1);
+            chain.drain(limit - tail..length - tail);
         }
         Ok(PathAnswer {
             nodes: Some(chain.into_iter().map(|node| self.node(node)).collect()),
@@ -721,7 +728,8 @@ pub fn fit(counts: &[u64]) -> Fit {
     let n = counts.len();
     let xs: Vec<f64> = (1..=n).map(|x| x as f64).collect();
     let ys: Vec<f64> = counts.iter().map(|&c| c as f64).collect();
-    let slope = least_squares(&xs, &ys).map_or(0.0, |(slope, _)| slope);
+    let round = |x: f64| (x * 1000.0).round() / 1000.0;
+    let slope = round(least_squares(&xs, &ys).map_or(0.0, |(slope, _)| slope));
     if n < 3 {
         return Fit { label: "insufficient_data", slope, ratio: None, ratio_r2: None };
     }
@@ -743,8 +751,7 @@ pub fn fit(counts: &[u64]) -> Fit {
     } else {
         "bounded"
     };
-    let round = |x: f64| (x * 1000.0).round() / 1000.0;
-    Fit { label, slope: round(slope), ratio: ratio.map(round), ratio_r2: ratio_r2.map(round) }
+    Fit { label, slope, ratio: ratio.map(round), ratio_r2: ratio_r2.map(round) }
 }
 
 /// Slope and R² of the least-squares line through the points, if there are
@@ -928,6 +935,13 @@ mod tests {
         assert!(root.truncated);
         let insts: Vec<u64> = root.nodes.unwrap().iter().map(|n| n.inst).collect();
         assert_eq!(insts, [0, 1, 4]);
+        // Too short for both ends, a path keeps the target it was asked about.
+        let ends = |limit| -> Vec<u64> {
+            graph.path(None, 4, limit).unwrap().nodes.unwrap().iter().map(|n| n.inst).collect()
+        };
+        assert_eq!(ends(1), [4]);
+        assert_eq!(ends(2), [0, 4]);
+        assert_eq!(ends(4), [0, 1, 3, 4]);
         assert!(graph.path(Some("absent"), 4, 10).unwrap().nodes.is_none());
         assert!(graph.path(None, 99, 10).is_err());
     }

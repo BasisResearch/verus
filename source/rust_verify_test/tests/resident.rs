@@ -437,9 +437,10 @@ fn resident_inst_graph_finds_the_matching_loop() {
     assert_eq!(checked["event"], "checked", "{checked}");
     assert_ne!(checked["result"], "valid", "{checked}");
     let summary = &checked["inst_graph"];
-    assert!(summary["instantiations"].as_u64().unwrap() > 10, "{checked}");
-    assert!(summary["edges"].as_u64().unwrap() > 5, "{checked}");
-    assert!(summary["max_depth"].as_u64().unwrap() > 2, "{checked}");
+    assert_eq!(summary["check"], "search", "{checked}");
+    assert!(summary["instantiations"].as_u64().unwrap() > 10, "{}", checked);
+    assert!(summary["edges"].as_u64().unwrap() > 5, "{}", checked);
+    assert!(summary["max_depth"].as_u64().unwrap() > 2, "{}", checked);
 
     let cycles = graph(&mut worker, &looping, json!({"op": "cycles"}));
     assert_eq!(cycles["event"], "inst_graph", "{cycles}");
@@ -448,10 +449,10 @@ fn resident_inst_graph_finds_the_matching_loop() {
     let found = result["cycles"].as_array().unwrap();
     assert_eq!(found.len(), 1, "{result}");
     assert_eq!(found[0]["length"], 2, "{result}");
-    assert!(found[0]["repetitions"].as_u64().unwrap() > 5, "{result}");
+    assert!(found[0]["repetitions"].as_u64().unwrap() > 5, "{}", result);
     for node in found[0]["nodes"].as_array().unwrap() {
-        assert!(node["function"].as_str().unwrap().ends_with("::roundtrip"), "{node}");
-        assert!(node["source_span"].as_str().unwrap().contains("fixture.rs"), "{node}");
+        assert!(node["function"].as_str().unwrap().ends_with("::roundtrip"), "{}", node);
+        assert!(node["source_span"].as_str().unwrap().contains("fixture.rs"), "{}", node);
     }
     // Each unrolling is one deeper than the last.
     let depths: Vec<u64> = found[0]["nodes"]
@@ -460,7 +461,7 @@ fn resident_inst_graph_finds_the_matching_loop() {
         .iter()
         .map(|n| n["depth"].as_u64().unwrap())
         .collect();
-    assert!(depths.windows(2).all(|pair| pair[1] == pair[0] + 1), "{depths:?}");
+    assert!(depths.windows(2).all(|pair| pair[1] == pair[0] + 1), "{:?}", depths);
 
     // The loop's quantifiers are the costliest, and a filter on another
     // function leaves nothing to report.
@@ -470,12 +471,25 @@ fn resident_inst_graph_finds_the_matching_loop() {
         found[0]["quantifiers"].as_array().unwrap().iter().map(|q| q.as_str().unwrap()).collect();
     let top: BTreeSet<&str> = ranked.iter().map(|q| q["qid"].as_str().unwrap()).collect();
     assert_eq!(top, loop_qids, "{cost}");
-    let elsewhere = graph(
-        &mut worker,
-        &looping,
-        json!({"op": "cycles", "filter": {"source_fn": "no_such_crate::"}}),
-    );
-    assert!(elsewhere["result"]["cycles"].as_array().unwrap().is_empty(), "{elsewhere}");
+    // `source_fn` matches whole path segments: the loop's function and its
+    // crate find the loop, a partial segment or another crate does not.
+    let function = found[0]["nodes"][0]["function"].as_str().unwrap().to_owned();
+    let krate = function.strip_suffix("::roundtrip").unwrap().to_owned();
+    let partial = function.strip_suffix("trip").unwrap().to_owned();
+    for (source_fn, cycles) in
+        [(function.as_str(), 1), (krate.as_str(), 1), (partial.as_str(), 0), ("no_such_crate::", 0)]
+    {
+        let filtered = graph(
+            &mut worker,
+            &looping,
+            json!({"op": "cycles", "filter": {"source_fn": source_fn}}),
+        );
+        assert_eq!(
+            filtered["result"]["cycles"].as_array().unwrap().len(),
+            cycles,
+            "{source_fn}: {filtered}"
+        );
+    }
 
     // The deepest instantiation descends from a root through the loop.
     let deepest = found[0]["nodes"].as_array().unwrap().last().unwrap()["inst"].clone();
@@ -486,7 +500,7 @@ fn resident_inst_graph_finds_the_matching_loop() {
     assert_eq!(chain[0]["depth"], 0, "{path}");
     let growth = graph(&mut worker, &looping, json!({"op": "growth"}));
     assert_eq!(growth["result"]["step"], "round", "{growth}");
-    assert!(!growth["result"]["per_round"].as_array().unwrap().is_empty(), "{growth}");
+    assert!(!growth["result"]["per_round"].as_array().unwrap().is_empty(), "{}", growth);
     let pathless = graph(&mut worker, &looping, json!({"op": "path"}));
     assert_eq!(pathless["event"], "error", "{pathless}");
 
@@ -494,7 +508,7 @@ fn resident_inst_graph_finds_the_matching_loop() {
     let healthy =
         worker.send(json!({"command": "check", "session": session, "bucket": 0, "query": passing}));
     assert_eq!(healthy["result"], "valid", "{healthy}");
-    assert!(healthy["inst_graph"].is_object(), "{healthy}");
+    assert!(healthy["inst_graph"].is_object(), "{}", healthy);
     assert_eq!(worker.send(json!({"command": "close", "session": session}))["event"], "closed");
     worker.finish(false);
 
@@ -505,7 +519,7 @@ fn resident_inst_graph_finds_the_matching_loop() {
     let session = ready["session"].clone();
     let checked =
         plain.send(json!({"command": "check", "session": session, "bucket": 0, "query": passing}));
-    assert!(checked["inst_graph"].is_null(), "{checked}");
+    assert!(checked["inst_graph"].is_null(), "{}", checked);
     let refused = plain.send(
         json!({"command": "inst_graph", "session": session, "bucket": 0, "query": passing, "op": "cycles"}),
     );

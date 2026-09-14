@@ -114,11 +114,18 @@ impl Symbols {
         self.quantifiers.get(qid).map(|q| (q.fun.as_str(), q.span.as_deref()))
     }
 
-    /// Every `:qid` of a function whose path starts with `prefix`.
-    pub(crate) fn quantifiers_of(&self, prefix: &str) -> std::collections::HashSet<String> {
+    /// Every `:qid` of a function at `path` or inside it, matching whole
+    /// segments: `a::f` takes `a::f` and `a::f::g` but not `a::foo`. Only
+    /// quantifiers `qid_map` records an owner for are found; axioms made
+    /// outside any function, such as a spec function's definition, are not.
+    pub(crate) fn quantifiers_of(&self, path: &str) -> std::collections::HashSet<String> {
+        let path = path.strip_suffix("::").unwrap_or(path);
+        let within = |fun: &str| {
+            fun.strip_prefix(path).is_some_and(|rest| rest.is_empty() || rest.starts_with("::"))
+        };
         self.quantifiers
             .iter()
-            .filter(|(_, q)| q.fun.starts_with(prefix))
+            .filter(|(_, q)| within(&q.fun))
             .map(|(qid, _)| qid.clone())
             .collect()
     }

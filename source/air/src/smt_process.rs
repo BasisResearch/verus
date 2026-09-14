@@ -144,8 +144,11 @@ impl SmtProcess {
         if inst_graph {
             assert!(matches!(solver, SmtSolver::Cvc5));
             // Record which instantiation introduced the terms each one
-            // matched, for `(get-instantiation-graph)`.
+            // matched, for `(get-instantiation-graph)`. A resident session
+            // keeps one graph per query, so each is capped well below cvc5's
+            // default of a million; the rest are counted as dropped.
             args.push("--inst-graph");
+            args.push("--inst-graph-max=100000");
         }
         let mut child = match std::process::Command::new(solver_info.executable())
             .args(args)

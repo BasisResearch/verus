@@ -878,13 +878,17 @@ impl Server {
                     // certificate attempt's when it closed the query, else
                     // the search's. Later error rounds search again, which
                     // replaces the solver's record, so it is read now. A
-                    // solver without quantifiers (bit-vector) has none.
+                    // query with nothing to instantiate (bit-vector,
+                    // nonlinear) gets an empty graph; an error comes only
+                    // when cvc5 cannot answer.
                     let graph = air
                         .inst_graph()
                         .then(|| InstantiationGraph::from_live(&air.instantiation_graph()));
                     let (graph_summary, graph_error) = match graph {
                         Some(Ok(graph)) => {
-                            let summary = graph.summary();
+                            let mut summary = graph.summary();
+                            let certified = attempted.as_ref().is_some_and(|a| a.closed);
+                            summary.check = Some(if certified { "certificate" } else { "search" });
                             self.graphs.insert((bucket_id.0, id.0), graph);
                             (Some(summary), None)
                         }
