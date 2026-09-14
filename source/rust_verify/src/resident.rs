@@ -782,6 +782,7 @@ impl Server {
                         air.set_restore_instantiations(None, false);
                         air.set_import_instantiations(None);
                         drop(air.take_provenance());
+                        drop(air.take_unknown_reason());
                         match attempt {
                             ValidityResult::Valid(usage) => {
                                 certified = Some(ValidityResult::Valid(usage))

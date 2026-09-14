@@ -374,7 +374,7 @@ pub struct FuncDetails {
     /// filled under `-V provenance`
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub provenance: Vec<ResolvedQueryProvenance>,
-    /// one entry per query whose first check answered `unknown`
+    /// one entry per error-level query whose first check answered `unknown`
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub unknown_reasons: Vec<ResolvedUnknownReason>,
 }
@@ -923,9 +923,11 @@ impl Verifier {
         let mut used_axioms = None;
         let mut provenance_round = 0usize;
         loop {
-            // Like the resident reply, this describes the first round only.
+            // Like the resident reply, this describes the first round only, and
+            // like the error count, only queries reported as errors: not
+            // recommends checks, expanded errors, or profile reruns.
             if let Some(reason) = air_context.take_unknown_reason() {
-                if is_first_check {
+                if is_first_check && level == Some(MessageLevel::Error) {
                     self.func_unknown_reasons.entry(context.fun.clone()).or_default().push((
                         context.desc.clone(),
                         context.span.as_string.clone(),

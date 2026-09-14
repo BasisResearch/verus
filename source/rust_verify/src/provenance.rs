@@ -117,6 +117,18 @@ pub struct ResolvedCulprit {
     pub role: Option<&'static str>,
 }
 
+impl ResolvedCulprit {
+    /// Sort key: quantifiers with a source span, then the rest Verus emitted,
+    /// then the prelude's.
+    fn rank(&self) -> u8 {
+        match (&self.span, self.fun.as_deref()) {
+            (Some(_), _) => 0,
+            (None, Some("prelude")) => 2,
+            (None, _) => 1,
+        }
+    }
+}
+
 /// Why a query's first check answered `unknown`, with the solver's candidate
 /// culprit quantifiers joined back to source.
 #[derive(serde::Serialize, Clone, Debug)]
@@ -130,7 +142,8 @@ pub struct ResolvedUnknownReason {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub incomplete_id: Option<String>,
     /// the asserted quantifiers no solver strategy claimed to have fully
-    /// processed, in the order the solver found them
+    /// processed: those with a source span first and the prelude's last, each
+    /// group in the order the solver found them
     pub culprits: Vec<ResolvedCulprit>,
 }
 
@@ -167,7 +180,7 @@ impl Quantifiers {
         span: &str,
         reason: air::context::UnknownReason,
     ) -> ResolvedUnknownReason {
-        let culprits = reason
+        let mut culprits: Vec<ResolvedCulprit> = reason
             .culprit_qids
             .into_iter()
             .map(|qid| match self.0.get(&qid) {
@@ -185,6 +198,10 @@ impl Quantifiers {
                 },
             })
             .collect();
+        // Under plain E-matching every asserted quantifier is a culprit, and
+        // the prelude alone contributes about 80. The ones with a source span
+        // are the ones a user can act on, so they lead; the sort is stable.
+        culprits.sort_by_key(ResolvedCulprit::rank);
         ResolvedUnknownReason {
             desc: desc.to_owned(),
             span: span.to_owned(),
@@ -404,4 +421,49 @@ fn quantifier_site(inside: &Option<ResolvedTag>, span: &Option<String>) -> Optio
         (_, Some(o), None) => format!("a quantifier in `{o}`"),
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unknown_culprits_put_source_spans_first_and_the_prelude_last() {
+        let quantifier = |span: Option<&str>| Quantifier {
+            fun: "lib::f".to_owned(),
+            span: span.map(str::to_owned),
+            tag: None,
+            role: None,
+        };
+        let table = Quantifiers(HashMap::from([
+            ("user_lib__f_0".to_owned(), quantifier(Some("lib.rs:3:9: 3:40 (#0)"))),
+            ("internal_lib__f_definition".to_owned(), quantifier(None)),
+        ]));
+        let reason = air::context::UnknownReason {
+            reason: "incomplete".to_owned(),
+            incomplete_id: Some("QUANTIFIERS".to_owned()),
+            culprit_qids: [
+                "prelude_box_unbox_int",
+                "internal_lib__f_definition",
+                "unmapped",
+                "prelude_fuel_defaults",
+                "user_lib__f_0",
+            ]
+            .map(str::to_owned)
+            .to_vec(),
+        };
+        let resolved = table.resolve_unknown("desc", "span", reason);
+        let qids: Vec<&str> = resolved.culprits.iter().map(|c| c.qid.as_str()).collect();
+        assert_eq!(
+            qids,
+            [
+                "user_lib__f_0",
+                "internal_lib__f_definition",
+                "unmapped",
+                "prelude_box_unbox_int",
+                "prelude_fuel_defaults",
+            ]
+        );
+        assert_eq!(resolved.culprits[4].role, Some("fuel_defaults"));
+    }
 }

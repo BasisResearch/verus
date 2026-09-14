@@ -665,6 +665,9 @@ impl Context {
         query_context: QueryContext<'_, '_>,
     ) -> ValidityResult {
         self.ensure_started();
+        // Cleared here as well as in `smt_check_assertion`: a query can fail
+        // before it reaches the solver, and must not report an earlier reason.
+        self.last_unknown_reason = None;
 
         self.air_initial_log.log_query(query);
         let query = match crate::typecheck::check_query(self, query) {

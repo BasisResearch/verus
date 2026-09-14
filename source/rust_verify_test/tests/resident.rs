@@ -726,12 +726,20 @@ fn resident_checks_say_why_the_solver_answered_unknown() {
         assert!(reason["desc"].is_string() && reason["span"].is_string(), "{failing}");
         // A cvc5 older than the incomplete-id key answers `unsupported`, which
         // leaves the id out and the culprits empty.
+        let culprits = reason["culprits"].as_array().unwrap();
         if let Some(id) = reason.get("incomplete_id").and_then(|id| id.as_str()) {
             assert!(id.starts_with("QUANTIFIERS"), "{failing}");
+            // At least the prelude's quantifiers are asserted in every query.
+            assert!(!culprits.is_empty(), "{failing}");
         }
-        for culprit in reason["culprits"].as_array().unwrap() {
-            assert!(culprit["qid"].is_string(), "{failing}");
-        }
+        // Source-spanned culprits lead and the prelude's come last.
+        let rank = |culprit: &Value| match (culprit.get("span"), culprit["fun"].as_str()) {
+            (Some(_), _) => 0,
+            (None, Some("prelude")) => 2,
+            (None, _) => 1,
+        };
+        assert!(culprits.iter().all(|culprit| culprit["qid"].is_string()), "{failing}");
+        assert!(culprits.windows(2).all(|pair| rank(&pair[0]) <= rank(&pair[1])), "{failing}");
         let passing = worker.send(
             json!({"command":"check", "session":session, "bucket":0, "query":query_id(&ready, "::passing")}),
         );
