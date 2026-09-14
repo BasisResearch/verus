@@ -1277,6 +1277,7 @@ mod tests {
                 input_files: Vec::new(),
                 smt_options: Vec::new(),
                 instantiation_replay: false,
+                inst_graph: false,
             },
         );
         let input = format!("{}\n{{\"command\":\"list\"}}\n", " ".repeat(65537));
