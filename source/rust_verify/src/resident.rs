@@ -1098,6 +1098,60 @@ mod tests {
         }
     }
 
+    /// A query's certificate names formulas of its prefix, and those mention
+    /// AIR's generated helpers, so replaying a popped prefix must name them as
+    /// building it did.
+    #[test]
+    fn replayed_prefix_reproduces_generated_names() {
+        #[derive(Clone, Default)]
+        struct Log(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Log {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        // The generated helpers `bytes` declares, in order.
+        fn helpers(bytes: &[u8]) -> Vec<String> {
+            String::from_utf8(bytes.to_vec())
+                .unwrap()
+                .lines()
+                .map(|line| line.trim_start())
+                .filter(|line| {
+                    line.starts_with("(declare-fun %%") || line.starts_with("(declare-const %%")
+                })
+                .map(|line| line.split_whitespace().nth(1).unwrap().to_string())
+                .collect()
+        }
+        let log = Log::default();
+        let mut air = Context::new(Arc::new(VirMessageInterface {}), SmtSolver::Z3);
+        air.set_smt_log(Box::new(log.clone()));
+        let first = commands("(axiom (= 10 (apply Int (lambda ((x Int) (y Int)) (+ x y 5)) 2 3)))");
+        let second = commands(
+            "(declare-fun g (Int) Bool)
+             (axiom (g 4))
+             (axiom (= 20 (apply Int (array 10 20 30) 1)))
+             (axiom (g (choose ((x Int)) (! (g x) :pattern ((g x))) x)))",
+        );
+        let mut journal = QueryJournal::new();
+        apply(&mut journal, &mut air, &first);
+        // Stands in for record_query, which pins the prefix ending here.
+        journal.recorded_in_scope = true;
+        apply(&mut journal, &mut air, &second);
+        let built = helpers(&log.0.lock().unwrap());
+        for helper in ["%%lambda%%", "%%apply%%", "%%array%%", "%%choose%%"] {
+            assert!(built.iter().any(|name| name.starts_with(helper)), "{built:?}");
+        }
+        let mark = log.0.lock().unwrap().len();
+        journal.restore_prefix(&mut air, 0).unwrap();
+        journal.restore_prefix(&mut air, 2).unwrap();
+        let replayed = helpers(&log.0.lock().unwrap()[mark..]);
+        assert_eq!(built, replayed);
+    }
+
     #[test]
     fn oversized_request_closes_without_parsing_its_suffix() {
         let mut session = Server::new(
