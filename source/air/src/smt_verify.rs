@@ -406,6 +406,15 @@ pub(crate) fn smt_check_assertion<'ctx>(
                 }
             }
 
+            if context.matching_loops {
+                // After the check, so it cannot perturb the check's budget.
+                // Read before the next check-sat, whose presolve clears it.
+                context.smt_log.log_get_info("matching-loops");
+                let smt_data = context.smt_log.take_pipe_data();
+                let lines = context.get_smt_process().send_commands(smt_data);
+                context.last_matching_loops = Some(parse_matching_loops_lines(&lines));
+            }
+
             match reason.expect("expected :reason-unknown") {
                 SmtReasonUnknown::Canceled | SmtReasonUnknown::Unknown => {
                     context.state = ContextState::Canceled;
@@ -515,6 +524,147 @@ pub(crate) fn parse_provenance_lines(lines: &Vec<String>) -> crate::context::Pro
         }
     }
     info
+}
+
+/// Parse cvc5's `(get-info :matching-loops)` reply:
+/// `(:matching-loops (:rounds n :instantiations n :dropped n
+/// :max-inst-rounds b :loops ((loop :qid q :key value ...) ...)))`.
+/// Keys it does not know, and replies of another shape, are kept verbatim
+/// in `unparsed` rather than failed on.
+pub(crate) fn parse_matching_loops_lines(lines: &Vec<String>) -> crate::context::MatchingLoopsInfo {
+    use crate::context::{MatchingLoop, MatchingLoopsInfo};
+    use sise::TreeNode as Node;
+    let mut info = MatchingLoopsInfo::default();
+    let text = unquote_symbols(&lines.join("\n"));
+    let mut parser = sise::Parser::new(text.as_str());
+    let body = match sise::parse_tree(&mut parser) {
+        Ok(Node::List(reply)) => match reply.as_slice() {
+            [Node::Atom(key), Node::List(body)] if key == ":matching-loops" => body.clone(),
+            _ => {
+                info.unparsed = lines.clone();
+                return info;
+            }
+        },
+        _ => {
+            info.unparsed = lines.clone();
+            return info;
+        }
+    };
+    let text_of = |n: &Node| crate::printer::node_to_string(n);
+    let symbol = |n: &Node| text_of(n);
+    let num = |n: &Node| text_of(n).parse::<u64>().ok();
+    let dec = |n: &Node| text_of(n).parse::<f64>().ok();
+    let flag = |n: &Node| text_of(n) == "true";
+    let terms = |n: &Node| match n {
+        Node::List(items) => items.iter().map(|t| text_of(t)).collect(),
+        _ => vec![],
+    };
+    // `:key value` pairs
+    let pairs = |items: &[Node]| -> Vec<(String, Node)> {
+        items
+            .chunks(2)
+            .filter_map(|kv| match kv {
+                [Node::Atom(k), v] if k.starts_with(':') => Some((k.clone(), v.clone())),
+                _ => None,
+            })
+            .collect()
+    };
+    let unknown = |k: &str, v: &Node, unparsed: &mut Vec<String>| {
+        unparsed.push(format!("{k} {}", text_of(v)));
+    };
+    for (key, value) in pairs(&body) {
+        match (key.as_str(), &value) {
+            (":rounds", v) => info.rounds = num(v).unwrap_or(0),
+            (":instantiations", v) => info.instantiations = num(v).unwrap_or(0),
+            (":dropped", v) => info.dropped = num(v).unwrap_or(0),
+            (":max-inst-rounds", v) => info.max_inst_rounds = flag(v),
+            (":loops", Node::List(loops)) => {
+                for form in loops {
+                    let items = match form {
+                        Node::List(items) if matches!(items.first(), Some(Node::Atom(h)) if h == "loop") => {
+                            &items[1..]
+                        }
+                        _ => {
+                            info.unparsed.push(text_of(form));
+                            continue;
+                        }
+                    };
+                    let mut l = MatchingLoop::default();
+                    for (k, v) in pairs(items) {
+                        match k.as_str() {
+                            ":qid" => l.qid = symbol(&v),
+                            ":confidence" => l.confidence = text_of(&v),
+                            ":growth" => l.growth = text_of(&v),
+                            ":edges" => l.edges_confirmed = text_of(&v) == "confirmed",
+                            ":stable" => l.stable = flag(&v),
+                            ":instantiations" => l.instantiations = num(&v).unwrap_or(0),
+                            ":rounds" => l.rounds = num(&v).unwrap_or(0),
+                            ":first-round" => l.first_round = num(&v).unwrap_or(0),
+                            ":last-round" => l.last_round = num(&v).unwrap_or(0),
+                            ":chain" => l.chain = num(&v).unwrap_or(0),
+                            ":self-fed" => l.self_fed = num(&v).unwrap_or(0),
+                            ":depth-per-rung" => l.depth_per_rung = dec(&v).unwrap_or(0.0),
+                            ":depth-per-round" => l.depth_per_round = dec(&v).unwrap_or(0.0),
+                            ":fanout-per-round" => l.fanout_per_round = dec(&v).unwrap_or(0.0),
+                            ":via" => {
+                                l.via = match &v {
+                                    Node::List(qs) => qs.iter().map(|q| symbol(q)).collect(),
+                                    _ => vec![],
+                                }
+                            }
+                            ":trigger" => l.trigger = terms(&v),
+                            ":context" => l.context = terms(&v).into_iter().next(),
+                            ":shape" => l.shape = terms(&v),
+                            ":step" => l.step = terms(&v),
+                            ":ladder" => {
+                                l.ladder = match &v {
+                                    Node::List(rungs) => rungs.iter().map(|r| terms(r)).collect(),
+                                    _ => vec![],
+                                }
+                            }
+                            ":ladder-length" => l.ladder_length = num(&v).unwrap_or(0),
+                            ":per-round" => {
+                                l.per_round = match &v {
+                                    Node::List(ns) => ns.iter().filter_map(|n| num(n)).collect(),
+                                    _ => vec![],
+                                }
+                            }
+                            _ => unknown(&k, &v, &mut info.unparsed),
+                        }
+                    }
+                    info.loops.push(l);
+                }
+            }
+            (k, v) => unknown(k, v, &mut info.unparsed),
+        }
+    }
+    info
+}
+
+/// cvc5 prints a symbol between bars when SMT-LIB needs it quoted, which
+/// sise cannot read. Drop the bars around any quoted symbol sise can read
+/// bare; leave the rest, so the reply fails to parse and is kept verbatim.
+fn unquote_symbols(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find('|') {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 1..];
+        match after.find('|') {
+            Some(end)
+                if !after[..end].is_empty() && after[..end].chars().all(sise::is_atom_chr) =>
+            {
+                out.push_str(&after[..end]);
+                rest = &after[end + 1..];
+            }
+            _ => {
+                out.push('|');
+                rest = after;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 pub(crate) fn smt_get_rlimit_count(context: &mut Context) -> Result<u64, ValidityResult> {

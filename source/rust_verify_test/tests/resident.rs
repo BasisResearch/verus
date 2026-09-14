@@ -556,6 +556,72 @@ fn resident_spinoff_all_reuses_original_solvers() {
     }
 }
 
+/// A session under `-V matching-loops=N` reports, with a check that came back
+/// unknown, the quantifier that fed its own trigger, in source spelling; an
+/// unknown without a loop reports none.
+///
+/// Needs a cvc5 with `--matching-loops` (BasisResearch cvc5 branch
+/// `kg/matching-loop-scope`), which the pinned release lacks; run it with
+/// `VERUS_CVC5_PATH` pointing there and `--ignored`.
+#[test]
+#[ignore = "needs a cvc5 with --matching-loops"]
+fn resident_matching_loops_name_the_self_feeding_quantifier() {
+    let source = r#"
+use vstd::prelude::*;
+verus! {
+    pub uninterp spec fn a(i: int) -> int;
+    pub uninterp spec fn h(x: int) -> int;
+
+    proof fn loops()
+        requires forall|i: int| #[trigger] a(i) < a(i + 1),
+        ensures a(0) > 100,
+    {
+    }
+
+    proof fn incomplete(x: int)
+        requires forall|y: int| #[trigger] h(y) > 0,
+        ensures h(x) > 1,
+    {
+    }
+}
+"#;
+    let mut worker =
+        Worker::start(source, &["-V", "matching-loops=20", "-V", "no-solver-version-check"]);
+    let ready = worker.receive();
+    assert_eq!(ready["matching_loops"], true, "{ready}");
+    let checked = worker.send(json!({"command":"check", "session":ready["session"], "bucket":0, "query":query_id(&ready, "loops")}));
+    assert_eq!(checked["result"], "invalid", "{checked}");
+    let report = &checked["matching_loops"];
+    assert_eq!(report["max_inst_rounds"], true, "{checked}");
+    let found = report["loops"].as_array().unwrap();
+    let culprit = found
+        .iter()
+        .find(|l| l["trigger"].as_str().is_some_and(|t| t.contains("a(i)")))
+        .unwrap_or_else(|| panic!("no loop on a: {checked}"));
+    assert_eq!(culprit["confidence"], "high", "{culprit}");
+    assert_eq!(culprit["edges"], "confirmed", "{culprit}");
+    assert!(culprit["fun"].as_str().unwrap().ends_with("::loops"), "{culprit}");
+    assert!(culprit["span"].as_str().unwrap().contains("fixture.rs"), "{culprit}");
+    assert!(culprit["growth_rate"].as_str().unwrap().starts_with("linear-depth"), "{culprit}");
+    let ladder = culprit["term_ladder"].as_array().unwrap();
+    assert!(ladder.len() >= 3, "{culprit}");
+    assert!(ladder[1].as_str().unwrap().contains("(0 + 1)"), "{culprit}");
+    assert!(ladder[2].as_str().unwrap().contains("((0 + 1) + 1)"), "{culprit}");
+    // the prelude axioms the loop drags along are not loops of their own
+    assert!(
+        found.iter().all(|l| l["fun"].as_str().is_some_and(|f| f.ends_with("::loops"))),
+        "{checked}"
+    );
+    let checked = worker.send(json!({"command":"check", "session":ready["session"], "bucket":0, "query":query_id(&ready, "incomplete")}));
+    assert_eq!(checked["result"], "invalid", "{checked}");
+    assert_eq!(checked["matching_loops"]["loops"], json!([]), "{checked}");
+    assert_eq!(
+        worker.send(json!({"command":"close", "session":ready["session"]}))["event"],
+        "closed"
+    );
+    worker.finish(false);
+}
+
 /// Identical local hypothesis and quantifier ordinals in different buckets
 /// must resolve through that bucket's source maps after the compiler exits.
 #[test]

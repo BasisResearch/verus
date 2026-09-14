@@ -331,6 +331,9 @@ pub struct Verifier {
     /// Under `-V provenance`: what cvc5 reported for each query of each
     /// function, raw (tag symbols and qids), in check order
     pub func_provenance: HashMap<Fun, Vec<QueryProvenance>>,
+    /// Under `-V matching-loops`: what cvc5 reported after each unknown check
+    /// of each function, not yet joined to source.
+    pub func_matching_loops: HashMap<Fun, Vec<QueryMatchingLoops>>,
     /// Errors to report after verification has run
     deferred_errors: Vec<VirErr>,
 
@@ -360,7 +363,8 @@ pub struct Verifier {
 }
 
 pub use crate::provenance::{
-    QueryProvenance, ResolvedInstantiation, ResolvedQueryProvenance, ResolvedTag,
+    QueryMatchingLoops, QueryProvenance, ResolvedInstantiation, ResolvedMatchingLoop,
+    ResolvedQueryMatchingLoops, ResolvedQueryProvenance, ResolvedTag,
 };
 
 #[derive(serde::Serialize)]
@@ -370,6 +374,9 @@ pub struct FuncDetails {
     /// filled under `-V provenance`
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub provenance: Vec<ResolvedQueryProvenance>,
+    /// filled under `-V matching-loops`, one entry per unknown check
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub matching_loops: Vec<ResolvedQueryMatchingLoops>,
 }
 
 impl Default for FuncDetails {
@@ -378,6 +385,7 @@ impl Default for FuncDetails {
             obligation_proof_notes: Default::default(),
             failed_proof_notes: Default::default(),
             provenance: Default::default(),
+            matching_loops: Default::default(),
         }
     }
 }
@@ -387,6 +395,7 @@ impl FuncDetails {
         self.obligation_proof_notes.extend(other.obligation_proof_notes);
         self.failed_proof_notes.extend(other.failed_proof_notes);
         self.provenance.extend(other.provenance);
+        self.matching_loops.extend(other.matching_loops);
     }
 
     pub fn to_json(&self) -> serde_json::Value {
@@ -411,6 +420,17 @@ fn report_chosen_triggers(
             m.primary_span(s)
         });
         diagnostics.report(&msg);
+    }
+}
+
+/// A check's verdict as the provenance and matching-loop records spell it.
+fn validity_result_str(result: &ValidityResult) -> String {
+    match result {
+        ValidityResult::Valid(_) => "valid".to_string(),
+        ValidityResult::Invalid(..) => "invalid".to_string(),
+        ValidityResult::Canceled => "canceled".to_string(),
+        ValidityResult::TypeError(e) => format!("type error: {}", e),
+        ValidityResult::UnexpectedOutput(s) => format!("unexpected output: {}", s),
     }
 }
 
@@ -542,6 +562,7 @@ impl Verifier {
 
             func_details: HashMap::new(),
             func_provenance: HashMap::new(),
+            func_matching_loops: HashMap::new(),
             deferred_errors: Vec::new(),
 
             dep_tracker: if via_cargo_args.is_some() { Some(dep_tracker) } else { None },
@@ -595,6 +616,7 @@ impl Verifier {
 
             func_details: HashMap::new(),
             func_provenance: HashMap::new(),
+            func_matching_loops: HashMap::new(),
             deferred_errors: Vec::new(),
 
             via_cargo_args: self.via_cargo_args.clone(),
@@ -632,6 +654,9 @@ impl Verifier {
         for (fun, queries) in other.func_provenance {
             self.func_provenance.entry(fun).or_default().extend(queries);
         }
+        for (fun, queries) in other.func_matching_loops {
+            self.func_matching_loops.entry(fun).or_default().extend(queries);
+        }
         self.deferred_errors.extend(other.deferred_errors);
     }
 
@@ -656,6 +681,7 @@ impl Verifier {
             buckets,
             crate::resident::SessionInfo {
                 provenance: self.args.provenance,
+                matching_loops: self.args.matching_loops,
                 spinoff_all: self.args.spinoff_all,
                 multiple_errors: self.args.multiple_errors,
                 smt_options: self.args.smt_options.clone(),
@@ -908,15 +934,22 @@ impl Verifier {
         let mut timed_out = false;
         let mut used_axioms = None;
         let mut provenance_round = 0usize;
+        let mut check_round = 0usize;
         loop {
+            if let Some(info) = air_context.take_matching_loops() {
+                self.func_matching_loops.entry(context.fun.clone()).or_default().push(
+                    QueryMatchingLoops {
+                        desc: context.desc.clone(),
+                        span: context.span.as_string.clone(),
+                        round: check_round,
+                        result: validity_result_str(&result),
+                        info,
+                    },
+                );
+            }
+            check_round += 1;
             if let Some(info) = air_context.take_provenance() {
-                let result_str = match &result {
-                    ValidityResult::Valid(_) => "valid".to_string(),
-                    ValidityResult::Invalid(..) => "invalid".to_string(),
-                    ValidityResult::Canceled => "canceled".to_string(),
-                    ValidityResult::TypeError(e) => format!("type error: {}", e),
-                    ValidityResult::UnexpectedOutput(s) => format!("unexpected output: {}", s),
-                };
+                let result_str = validity_result_str(&result);
                 self.func_provenance.entry(context.fun.clone()).or_default().push(
                     QueryProvenance {
                         desc: context.desc.clone(),
@@ -1233,6 +1266,19 @@ impl Verifier {
         }
     }
 
+    /// Resolve batch matching-loop replies the same way as provenance.
+    fn resolve_matching_loops(&mut self, global_ctx: &vir::context::GlobalCtx) {
+        let symbols = crate::provenance::Symbols::capture(
+            global_ctx,
+            global_ctx.air_source_names.borrow().clone(),
+        );
+        for (fun, queries) in std::mem::take(&mut self.func_matching_loops) {
+            let resolved =
+                queries.into_iter().map(|query| symbols.resolve_matching_loops(&fun, query));
+            self.func_details.entry(fun.clone()).or_default().matching_loops.extend(resolved);
+        }
+    }
+
     fn set_rlimit(solver: SmtSolver, air_context: &mut air::context::Context, rlimit: f32) {
         let per_second = match solver {
             SmtSolver::Z3 => RLIMIT_PER_SECOND,
@@ -1279,6 +1325,9 @@ impl Verifier {
         }
         if self.args.provenance {
             air_context.set_provenance(true);
+        }
+        if self.args.matching_loops {
+            air_context.set_matching_loops(true, self.args.matching_loop_rounds);
         }
         if self.instantiation_replay() {
             air_context.set_instantiation_replay(true);
@@ -2067,7 +2116,7 @@ impl Verifier {
                 air_context,
                 journal,
                 resident_spinoffs,
-                self.args.provenance.then(|| {
+                (self.args.provenance || self.args.matching_loops).then(|| {
                     crate::provenance::Symbols::capture(&ctx.global, ctx.name_ctxt.source_names())
                 }),
             ));
@@ -2719,6 +2768,10 @@ impl Verifier {
             for triggers in chosen_triggers {
                 writeln!(file, "{:#?}", triggers).expect("error writing to trigger log file");
             }
+        }
+        // Join the matching loops cvc5 reported back to source, per function
+        if self.args.matching_loops {
+            self.resolve_matching_loops(&global_ctx);
         }
         // Join the provenance cvc5 reported back to source, per function
         if self.args.provenance {

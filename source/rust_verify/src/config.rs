@@ -127,6 +127,10 @@ pub struct ArgsX {
     pub no_bv_simplify: bool,
     pub no_assert_ids: bool,
     pub provenance: bool,
+    /// `-V matching-loops[=rounds]`: ask cvc5 for self-feeding quantifiers
+    /// after every unknown, bounding instantiation rounds when given.
+    pub matching_loops: bool,
+    pub matching_loop_rounds: Option<u32>,
     pub reach: Option<String>,
     /// Serve retained AIR queries over stdin/stdout after compilation.
     pub resident: bool,
@@ -179,6 +183,8 @@ impl ArgsX {
             no_bv_simplify: Default::default(),
             no_assert_ids: Default::default(),
             provenance: Default::default(),
+            matching_loops: Default::default(),
+            matching_loop_rounds: Default::default(),
             reach: Default::default(),
             resident: false,
         }
@@ -430,6 +436,7 @@ pub fn parse_args_with_imports(
     const EXTENDED_NO_BV_SIMPLIFY: &str = "no-bv-simplify";
     const EXTENDED_NO_ASSERT_IDS: &str = "no-assert-ids";
     const EXTENDED_PROVENANCE: &str = "provenance";
+    const EXTENDED_MATCHING_LOOPS: &str = "matching-loops";
     const EXTENDED_KEYS: &[(&str, &str)] = &[
         (EXTENDED_IGNORE_UNEXPECTED_SMT, "Ignore unexpected SMT output"),
         (EXTENDED_DEBUG, "Enable debugging of proof failures"),
@@ -450,6 +457,10 @@ pub fn parse_args_with_imports(
         (
             EXTENDED_PROVENANCE,
             "Provenance mode: run cvc5 with preprocessing proofs and twice the rlimit, and record which hypotheses, axioms and quantifiers each query used (diagnostic; verdicts may differ from a plain run)",
+        ),
+        (
+            EXTENDED_MATCHING_LOOPS,
+            "Matching-loop mode: after every unknown, ask cvc5 which quantifiers fed their own triggers, and on what growing terms (diagnostic). -V matching-loops=N also stops quantifier instantiation after N rounds, which can turn a resource-limit failure into an incomplete one",
         ),
         (EXTENDED_ALLOW_INLINE_AIR, "Allow the POTENTIALLY UNSOUND use of inline_air_stmt"),
         (
@@ -884,12 +895,27 @@ pub fn parse_args_with_imports(
         no_bv_simplify: extended.contains_key(EXTENDED_NO_BV_SIMPLIFY),
         no_assert_ids: extended.contains_key(EXTENDED_NO_ASSERT_IDS),
         provenance: extended.contains_key(EXTENDED_PROVENANCE),
+        matching_loops: extended.contains_key(EXTENDED_MATCHING_LOOPS),
+        matching_loop_rounds: match extended.get(EXTENDED_MATCHING_LOOPS) {
+            Some(Some(rounds)) => Some(rounds.parse::<u32>().unwrap_or_else(|_| {
+                error(format!(
+                    "expected a number of instantiation rounds after -V {EXTENDED_MATCHING_LOOPS}=, found {rounds}"
+                ))
+            })),
+            _ => None,
+        },
         resident: matches.opt_present(OPT_RESIDENT),
     };
 
     if args.provenance && !matches!(args.solver, SmtSolver::Cvc5) {
         error(
             "-V provenance requires cvc5 (it is unavailable for vstd and internal test mode)"
+                .to_string(),
+        );
+    }
+    if args.matching_loops && !matches!(args.solver, SmtSolver::Cvc5) {
+        error(
+            "-V matching-loops requires cvc5 (it is unavailable for vstd and internal test mode)"
                 .to_string(),
         );
     }

@@ -88,6 +88,124 @@ pub struct ResolvedQueryProvenance {
     pub unparsed: Vec<String>,
 }
 
+/// One unknown `check-sat` under `-V matching-loops`, as cvc5 reported it.
+/// Symbols and SMT terms, not yet joined to source.
+#[derive(Clone, Debug)]
+pub struct QueryMatchingLoops {
+    pub desc: String,
+    pub span: String,
+    /// 0 for the first check of the query, then one per multi-error round
+    pub round: usize,
+    /// "invalid" or "canceled": the verdict the unknown turned into
+    pub result: String,
+    pub info: air::context::MatchingLoopsInfo,
+}
+
+/// A loop's terms as the solver sees them. Kept for debugging this
+/// pipeline; not for display.
+#[derive(serde::Serialize, Clone, Debug)]
+pub struct MatchingLoopSmt {
+    pub trigger: Vec<String>,
+    pub context: Option<String>,
+    pub shape: Vec<String>,
+    pub step: Vec<String>,
+    pub ladder: Vec<Vec<String>>,
+    pub via: Vec<String>,
+}
+
+/// One self-feeding quantifier, joined back to source (`-V matching-loops`).
+/// The ladder, rounds and counts are the solver's own record; the verdict
+/// that they form a loop is a judgement, graded by `confidence`.
+#[derive(serde::Serialize, Clone, Debug)]
+pub struct ResolvedMatchingLoop {
+    pub qid: String,
+    /// prelude, or the function the quantifier was written in
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fun: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub span: Option<String>,
+    /// Where the quantifier is written, in prose
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub site: Option<String>,
+    /// Why the quantifier exists, as the encoder that emitted it said
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub role: Option<&'static str>,
+    /// high: a stable shape of rising depth, fed by its own instantiations,
+    /// still climbing when the round limit stopped the check; medium: the
+    /// same without the round limit; low: rising depth with an unstable
+    /// shape or without confirmed self-feeding edges
+    pub confidence: String,
+    /// linear-depth (+d nesting/round), exponential-fanout (xf
+    /// instantiations/round), or bounded
+    pub growth_rate: String,
+    /// the quantifier's first trigger, in source spelling
+    pub trigger: String,
+    /// every rung generalised, then every rung after the first, with `_n`
+    /// where they differ: `f(_0)  →  f(g(_0))`
+    pub term_shape: String,
+    /// what each rung wraps around the previous rung's growing subterm,
+    /// generalised over the chain, `_0` marking that subterm: `cons(_1, _0)`
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub growth_context: Option<String>,
+    /// the trigger as instantiated by the first rungs of the chain and by its
+    /// last, in source spelling
+    pub term_ladder: Vec<String>,
+    /// how many rungs the chain has
+    pub ladder_length: u64,
+    /// whether each rung grows out of the previous one by one context
+    pub stable_shape: bool,
+    /// confirmed: each rung matched a term the previous rung introduced;
+    /// unconfirmed: the ladder is the deepest instantiation of each round
+    pub edges: String,
+    /// rounds in which the quantifier was instantiated, and the chain's span
+    pub rounds: u64,
+    pub first_round: u64,
+    pub last_round: u64,
+    pub instantiations: u64,
+    /// instantiations that matched a term another of its own introduced
+    pub self_fed: u64,
+    pub depth_per_rung: f64,
+    pub depth_per_round: f64,
+    pub fanout_per_round: f64,
+    /// instantiations per round, the last rounds of the check
+    pub per_round: Vec<u64>,
+    /// the other quantifiers a step passed through, where they are written
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub via: Vec<String>,
+    /// quantifiers no Verus function wrote (the prelude's box, has_type and
+    /// arithmetic axioms) that climbed in the same check only because a
+    /// written quantifier fed them; listed on the most confident written
+    /// loop instead of as loops of their own
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub followers: Vec<String>,
+    pub smt: MatchingLoopSmt,
+}
+
+/// An unknown query's matching loops, joined to source (`-V matching-loops`).
+#[derive(serde::Serialize, Clone, Debug)]
+pub struct ResolvedQueryMatchingLoops {
+    pub desc: String,
+    pub span: String,
+    pub round: usize,
+    pub result: String,
+    /// the last instantiation round of the check
+    pub rounds: u64,
+    pub instantiations: u64,
+    /// instantiations cvc5 stopped recording (past `--matching-loops-max`)
+    #[serde(skip_serializing_if = "is_zero")]
+    pub dropped: u64,
+    /// whether the instantiation round limit stopped the check
+    pub max_inst_rounds: bool,
+    /// most confident first
+    pub loops: Vec<ResolvedMatchingLoop>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub unparsed: Vec<String>,
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
+}
+
 struct Hypothesis {
     kind: String,
     span: String,
@@ -97,6 +215,25 @@ struct Quantifier {
     span: Option<String>,
     tag: Option<air::def::ProvenanceTag>,
     role: Option<&'static str>,
+}
+
+const PRELUDE_QID_PREFIX: &str = "prelude_";
+/// The prelude writes this one by hand, so it has no `qid_map` entry.
+const FUEL_DEFAULTS_QID: &str = "prelude_fuel_defaults";
+
+/// Where a quantifier is written, joined back to source.
+struct QuantifierSite {
+    fun: Option<String>,
+    span: Option<String>,
+    inside: Option<ResolvedTag>,
+    site: Option<String>,
+    role: Option<&'static str>,
+}
+
+/// A span as `file:line:col`, without its directory or byte range.
+fn span_short(s: &Option<String>) -> Option<String> {
+    s.as_ref()
+        .map(|s| s.rsplit('/').next().unwrap_or(s).split(" (#").next().unwrap_or(s).to_string())
 }
 
 /// No compiler context, source map, or VIR expression is retained here.
@@ -159,60 +296,56 @@ impl Symbols {
         }
     }
 
-    pub(crate) fn resolve(&self, fun: &Fun, q: QueryProvenance) -> ResolvedQueryProvenance {
-        const PRELUDE_QID_PREFIX: &str = "prelude_";
-        /// The prelude writes this one by hand, so it has no `qid_map` entry.
-        const FUEL_DEFAULTS_QID: &str = "prelude_fuel_defaults";
+    /// One tag from a solver reply, joined back to source.
+    fn tag_of(&self, fun: &Fun, symbol: &str) -> ResolvedTag {
         let hyp_map = &self.hypotheses;
         let qid_map = &self.quantifiers;
         let axiom_owners = &self.axiom_owners;
-        let air_source_names = &self.source_names;
-        let tag_of = |fun: &Fun, symbol: &str| -> ResolvedTag {
-            let mut r = ResolvedTag {
-                tag: symbol.to_string(),
-                kind: String::new(),
-                owner: None,
-                span: None,
-            };
-            match air::def::ProvenanceTag::from_symbol(symbol) {
-                Some(air::def::ProvenanceTag::Hyp(air::def::HypId(k))) => {
-                    match hyp_map.get(fun).and_then(|hs| hs.get(k as usize)) {
-                        Some(info) => {
-                            r.kind = info.kind.clone();
-                            r.owner = Some(fun_as_friendly_rust_name(fun));
-                            r.span = Some(info.span.clone());
-                        }
-                        None => r.kind = "hypothesis (unknown id)".to_string(),
+        let mut r =
+            ResolvedTag { tag: symbol.to_string(), kind: String::new(), owner: None, span: None };
+        match air::def::ProvenanceTag::from_symbol(symbol) {
+            Some(air::def::ProvenanceTag::Hyp(air::def::HypId(k))) => {
+                match hyp_map.get(fun).and_then(|hs| hs.get(k as usize)) {
+                    Some(info) => {
+                        r.kind = info.kind.clone();
+                        r.owner = Some(fun_as_friendly_rust_name(fun));
+                        r.span = Some(info.span.clone());
                     }
+                    None => r.kind = "hypothesis (unknown id)".to_string(),
                 }
-                Some(air::def::ProvenanceTag::Query) => r.kind = "query".to_string(),
-                Some(air::def::ProvenanceTag::Assert(_)) => r.kind = "goal".to_string(),
-                Some(air::def::ProvenanceTag::Axiom(ident)) => {
-                    let ident: &str = &ident;
-                    if let Some(owner) = axiom_owners.get(symbol) {
-                        r.kind = "axiom".to_string();
-                        r.owner = Some(owner.clone());
-                    } else if let Some(info) = qid_map.get(ident) {
-                        r.kind = "axiom".to_string();
-                        r.owner = Some(info.fun.clone());
-                        r.span = info.span.clone();
-                    } else if ident.starts_with(PRELUDE_QID_PREFIX) {
-                        r.kind = "prelude".to_string();
-                    } else if ident.starts_with("anon_") {
-                        r.kind = "anonymous_axiom".to_string();
-                    } else {
-                        r.kind = "axiom".to_string();
-                    }
-                }
-                None => r.kind = "untagged".to_string(),
             }
-            r
-        };
-        let is_hyp_kind =
-            |k: &str| matches!(k, "requires" | "type_invariant" | "fuel" | "trait_bound");
-        // SSA versions are query-local. Preserve assignment identity in the display.
-        let mut source_names = std::borrow::Cow::Borrowed(air_source_names);
-        for (symbol, (base, version)) in &q.variable_versions {
+            Some(air::def::ProvenanceTag::Query) => r.kind = "query".to_string(),
+            Some(air::def::ProvenanceTag::Assert(_)) => r.kind = "goal".to_string(),
+            Some(air::def::ProvenanceTag::Axiom(ident)) => {
+                let ident: &str = &ident;
+                if let Some(owner) = axiom_owners.get(symbol) {
+                    r.kind = "axiom".to_string();
+                    r.owner = Some(owner.clone());
+                } else if let Some(info) = qid_map.get(ident) {
+                    r.kind = "axiom".to_string();
+                    r.owner = Some(info.fun.clone());
+                    r.span = info.span.clone();
+                } else if ident.starts_with(PRELUDE_QID_PREFIX) {
+                    r.kind = "prelude".to_string();
+                } else if ident.starts_with("anon_") {
+                    r.kind = "anonymous_axiom".to_string();
+                } else {
+                    r.kind = "axiom".to_string();
+                }
+            }
+            None => r.kind = "untagged".to_string(),
+        }
+        r
+    }
+
+    /// The source names for one query's terms: SSA versions are query-local,
+    /// so each versioned symbol shows its assignment version.
+    fn query_source_names(
+        &self,
+        versions: &air::context::VariableVersions,
+    ) -> std::borrow::Cow<'_, vir::air_names::SourceNames> {
+        let mut source_names = std::borrow::Cow::Borrowed(&self.source_names);
+        for (symbol, (base, version)) in versions {
             if let Some(name) = vir::air_names::source_symbol(&source_names, base) {
                 source_names.to_mut().insert(
                     symbol.clone(),
@@ -220,6 +353,43 @@ impl Symbols {
                 );
             }
         }
+        source_names
+    }
+
+    /// Where the quantifier `qid` is written and why it exists, as far as the
+    /// encoders recorded it.
+    fn describe_quantifier(&self, fun: &Fun, qid: &str) -> QuantifierSite {
+        match self.quantifiers.get(qid) {
+            Some(info) => {
+                let inside = info.tag.as_ref().map(|t| self.tag_of(fun, &t.to_symbol()));
+                let site = quantifier_site(&inside, &span_short(&info.span));
+                QuantifierSite {
+                    fun: Some(info.fun.clone()),
+                    span: info.span.clone(),
+                    inside,
+                    site,
+                    role: info.role,
+                }
+            }
+            None => {
+                let inside = None;
+                QuantifierSite {
+                    fun: qid.starts_with(PRELUDE_QID_PREFIX).then(|| "prelude".to_string()),
+                    span: None,
+                    site: quantifier_site(&inside, &None),
+                    inside,
+                    role: (qid == FUEL_DEFAULTS_QID).then_some("fuel_defaults"),
+                }
+            }
+        }
+    }
+
+    pub(crate) fn resolve(&self, fun: &Fun, q: QueryProvenance) -> ResolvedQueryProvenance {
+        let tag_of = |fun: &Fun, symbol: &str| self.tag_of(fun, symbol);
+        let is_hyp_kind =
+            |k: &str| matches!(k, "requires" | "type_invariant" | "fuel" | "trait_bound");
+        // SSA versions are query-local. Preserve assignment identity in the display.
+        let source_names = self.query_source_names(&q.variable_versions);
         let mut hypotheses: Vec<ResolvedTag> = Vec::new();
         let mut sources: Vec<Vec<ResolvedTag>> = Vec::new();
         let mut axioms_in_scope = 0usize;
@@ -242,32 +412,8 @@ impl Symbols {
             .instantiations
             .iter()
             .map(|(qid, vectors)| {
-                let span_short = |s: &Option<String>| -> Option<String> {
-                    s.as_ref().map(|s| {
-                        s.rsplit('/')
-                            .next()
-                            .unwrap_or(s)
-                            .split(" (#")
-                            .next()
-                            .unwrap_or(s)
-                            .to_string()
-                    })
-                };
-                let (fun_name, span, inside, role) = match qid_map.get(qid) {
-                    Some(info) => (
-                        Some(info.fun.clone()),
-                        info.span.clone(),
-                        info.tag.as_ref().map(|t| tag_of(fun, &t.to_symbol())),
-                        info.role,
-                    ),
-                    None => (
-                        qid.starts_with(PRELUDE_QID_PREFIX).then(|| "prelude".to_string()),
-                        None,
-                        None,
-                        (qid.as_str() == FUEL_DEFAULTS_QID).then_some("fuel_defaults"),
-                    ),
-                };
-                let site = quantifier_site(&inside, &span_short(&span));
+                let QuantifierSite { fun: fun_name, span, inside, site, role } =
+                    self.describe_quantifier(fun, qid);
                 ResolvedInstantiation {
                     qid: qid.clone(),
                     fun: fun_name,
@@ -294,6 +440,108 @@ impl Symbols {
             axioms_in_scope,
             instantiations,
             unparsed: q.unparsed,
+        }
+    }
+
+    pub(crate) fn resolve_matching_loops(
+        &self,
+        fun: &Fun,
+        q: QueryMatchingLoops,
+    ) -> ResolvedQueryMatchingLoops {
+        let names = self.query_source_names(&q.info.variable_versions);
+        let render = |terms: &[String]| -> String {
+            terms
+                .iter()
+                .map(|t| vir::air_names::render_term(&names, t))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let loops = q
+            .info
+            .loops
+            .into_iter()
+            .map(|l| {
+                let QuantifierSite { fun: fun_name, span, inside: _, site, role } =
+                    self.describe_quantifier(fun, &l.qid);
+                let growth_rate = match l.growth.as_str() {
+                    "linear-depth" => {
+                        format!("linear-depth (+{:.2} nesting/round)", l.depth_per_round)
+                    }
+                    "exponential-fanout" => format!(
+                        "exponential-fanout (x{:.2} instantiations/round)",
+                        l.fanout_per_round
+                    ),
+                    other => other.to_string(),
+                };
+                let via = l
+                    .via
+                    .iter()
+                    .map(|qid| {
+                        self.describe_quantifier(fun, qid).site.unwrap_or_else(|| qid.clone())
+                    })
+                    .collect();
+                ResolvedMatchingLoop {
+                    qid: l.qid.clone(),
+                    fun: fun_name,
+                    span,
+                    site,
+                    role,
+                    confidence: l.confidence.clone(),
+                    growth_rate,
+                    trigger: render(&l.trigger),
+                    term_shape: format!("{}  →  {}", render(&l.shape), render(&l.step)),
+                    growth_context: l
+                        .context
+                        .as_ref()
+                        .map(|c| vir::air_names::render_term(&names, c)),
+                    term_ladder: l.ladder.iter().map(|rung| render(rung)).collect(),
+                    ladder_length: l.ladder_length,
+                    stable_shape: l.stable,
+                    edges: if l.edges_confirmed { "confirmed" } else { "unconfirmed" }.to_string(),
+                    rounds: l.rounds,
+                    first_round: l.first_round,
+                    last_round: l.last_round,
+                    instantiations: l.instantiations,
+                    self_fed: l.self_fed,
+                    depth_per_rung: l.depth_per_rung,
+                    depth_per_round: l.depth_per_round,
+                    fanout_per_round: l.fanout_per_round,
+                    per_round: l.per_round.clone(),
+                    via,
+                    followers: Vec::new(),
+                    smt: MatchingLoopSmt {
+                        trigger: l.trigger,
+                        context: l.context,
+                        shape: l.shape,
+                        step: l.step,
+                        ladder: l.ladder,
+                        via: l.via,
+                    },
+                }
+            })
+            .collect::<Vec<ResolvedMatchingLoop>>();
+        // The prelude's axioms cannot loop by themselves: they climb when a
+        // quantifier some function wrote feeds them new terms. When a check
+        // has such a written loop, the unwritten ones ride it.
+        let written = |l: &ResolvedMatchingLoop| l.fun.as_deref().is_some_and(|f| f != "prelude");
+        let (mut loops, riders): (Vec<_>, Vec<_>) = loops.into_iter().partition(written);
+        match loops.first_mut() {
+            Some(driver) => {
+                driver.followers = riders.into_iter().map(|l| l.site.unwrap_or(l.qid)).collect()
+            }
+            None => loops = riders,
+        }
+        ResolvedQueryMatchingLoops {
+            desc: q.desc,
+            span: q.span,
+            round: q.round,
+            result: q.result,
+            rounds: q.info.rounds,
+            instantiations: q.info.instantiations,
+            dropped: q.info.dropped,
+            max_inst_rounds: q.info.max_inst_rounds,
+            loops,
+            unparsed: q.info.unparsed,
         }
     }
 }

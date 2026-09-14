@@ -111,8 +111,11 @@ impl SmtProcess {
         transcript_log: Option<Box<dyn std::io::Write + Send>>,
         provenance: bool,
         instantiation_replay: bool,
+        matching_loops: bool,
+        inst_max_rounds: Option<u32>,
     ) -> Self {
         let solver_info = SolverInfo::new(solver);
+        let inst_max_rounds_arg = inst_max_rounds.map(|n| format!("--inst-max-rounds={n}"));
         let mut args: Vec<&str> = match solver {
             SmtSolver::Z3 => vec!["-smt2", "-in"],
             // No `--rlimit` here: cvc5's `--rlimit` is a *cumulative* budget for the
@@ -139,6 +142,15 @@ impl SmtProcess {
             // refutation used. The full set is no certificate: replayed
             // alone it answered slower than an ordinary recheck.
             args.push("--produce-proofs");
+        }
+        if matching_loops {
+            assert!(matches!(solver, SmtSolver::Cvc5));
+            // Records each instantiation's round, terms and parents for
+            // `(get-info :matching-loops)`; spends no resource units.
+            args.push("--matching-loops");
+            if let Some(arg) = &inst_max_rounds_arg {
+                args.push(arg.as_str());
+            }
         }
         let mut child = match std::process::Command::new(solver_info.executable())
             .args(args)
