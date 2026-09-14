@@ -1285,11 +1285,30 @@ impl Verifier {
         }
     }
 
-    /// Join each query's difficulty gradient to source, per function.
-    fn resolve_difficulty(&mut self, symbols: &crate::provenance::Symbols) {
+    /// Join each query's difficulty gradient to source, per function. A cvc5
+    /// without the key answers `unsupported`; say so once, because those
+    /// records carry no rows although their checks still ran under difficulty
+    /// mode's options and budget.
+    fn resolve_difficulty(
+        &mut self,
+        symbols: &crate::provenance::Symbols,
+        reporter: &impl air::messages::Diagnostics,
+    ) {
+        let mut unsupported = 0usize;
         for (fun, queries) in std::mem::take(&mut self.func_difficulty) {
-            let resolved = queries.into_iter().map(|query| symbols.resolve_difficulty(&fun, query));
+            let resolved: Vec<ResolvedQueryDifficulty> =
+                queries.into_iter().map(|query| symbols.resolve_difficulty(&fun, query)).collect();
+            unsupported +=
+                resolved.iter().filter(|r| r.unparsed.as_deref() == Some("unsupported")).count();
             self.func_details.entry(fun.clone()).or_default().difficulty.extend(resolved);
+        }
+        if unsupported > 0 {
+            reporter.report(
+                &warning_bare(format!(
+                    "-V difficulty: this cvc5 answered `unsupported` to (get-info :difficulty-gradient) for {unsupported} check(s), so those records carry no rows; the checks still ran with difficulty mode's cvc5 options and twice the usual budget"
+                ))
+                .to_any(),
+            );
         }
     }
 
@@ -2808,7 +2827,7 @@ impl Verifier {
                 self.resolve_inst_pressure(&symbols);
             }
             if self.args.difficulty {
-                self.resolve_difficulty(&symbols);
+                self.resolve_difficulty(&symbols, &reporter);
             }
             if self.args.provenance {
                 self.resolve_provenance(&symbols);
@@ -2817,11 +2836,15 @@ impl Verifier {
         // `--log-all`: per function, what each of them reported, as JSON
         if self.args.log_all {
             type Select = fn(&FuncDetails) -> Option<serde_json::Value>;
-            let logs: [(bool, &str, Select); 2] = [
+            let logs: [(bool, &str, Select); 3] = [
                 (self.args.inst_pressure, crate::config::INST_PRESSURE_FILE_SUFFIX, |d| {
                     (!d.inst_pressure.is_empty()).then(|| {
                         serde_json::to_value(&d.inst_pressure).expect("inst-pressure json")
                     })
+                }),
+                (self.args.difficulty, crate::config::DIFFICULTY_FILE_SUFFIX, |d| {
+                    (!d.difficulty.is_empty())
+                        .then(|| serde_json::to_value(&d.difficulty).expect("difficulty json"))
                 }),
                 (self.args.provenance, crate::config::PROVENANCE_FILE_SUFFIX, |d| {
                     (!d.provenance.is_empty())

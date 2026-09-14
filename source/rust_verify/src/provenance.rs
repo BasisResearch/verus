@@ -119,8 +119,26 @@ pub struct ResolvedDifficultyRow {
     pub in_core: Option<bool>,
 }
 
+/// Whether a difficulty row is an axiom that did nothing: it was in scope,
+/// no lemma used a literal it made relevant, and the unsat core does not
+/// hold it (or the check reported no core). Most of a query's rows are
+/// these, so `resolve_difficulty` counts them instead of listing them. A row
+/// cvc5 sent without tags is listed rather than counted, so that nothing
+/// disappears into the count.
+fn is_idle_axiom(tags: &[ResolvedTag], difficulty: u64, in_core: Option<bool>) -> bool {
+    difficulty == 0
+        && in_core != Some(true)
+        && !tags.is_empty()
+        && tags.iter().all(|t| matches!(t.kind.as_str(), "axiom" | "prelude" | "anonymous_axiom"))
+}
+
 /// A query's difficulty gradient with every tag joined to source
 /// (`-V difficulty`).
+///
+/// Several records of one function can share `desc`, `span`, `kind` and
+/// `round`: a bit-vector or nonlinear subquery, a loop body check, and each
+/// recheck of an expanded error under `--expand-errors`. `result` and the
+/// rows tell those apart.
 #[derive(serde::Serialize, Clone, Debug)]
 pub struct ResolvedQueryDifficulty {
     pub desc: String,
@@ -131,7 +149,8 @@ pub struct ResolvedQueryDifficulty {
     /// scope is popped, so a round's counts include the rounds before it.
     pub round: usize,
     pub result: String,
-    /// cvc5's own answer to the check: unsat, sat, unknown, or none
+    /// cvc5's own answer to the check: unsat, sat, unknown, or none. Empty
+    /// when `unparsed` is set, since cvc5 then never answered the key.
     pub solver_result: String,
     /// whether cvc5 tracked difficulty
     pub difficulty: bool,
@@ -459,10 +478,7 @@ impl Symbols {
         let mut idle_axioms = 0u64;
         for row in g.rows {
             let tags: Vec<ResolvedTag> = row.tags.iter().map(|t| self.tag_of(fun, t)).collect();
-            let axiom = tags
-                .iter()
-                .all(|t| matches!(t.kind.as_str(), "axiom" | "prelude" | "anonymous_axiom"));
-            if axiom && row.difficulty == 0 && row.in_core != Some(true) {
+            if is_idle_axiom(&tags, row.difficulty, row.in_core) {
                 idle_axioms += 1;
             } else {
                 rows.push(ResolvedDifficultyRow {
@@ -568,4 +584,32 @@ fn quantifier_site(inside: &Option<ResolvedTag>, span: &Option<String>) -> Optio
         (_, Some(o), None) => format!("a quantifier in `{o}`"),
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ResolvedTag, is_idle_axiom};
+
+    fn tag(kind: &str) -> ResolvedTag {
+        ResolvedTag { tag: "t".to_string(), kind: kind.to_string(), owner: None, span: None }
+    }
+
+    #[test]
+    fn idle_axioms_are_the_ones_that_did_no_work() {
+        // an axiom in scope that no lemma used and no core holds
+        assert!(is_idle_axiom(&[tag("axiom")], 0, Some(false)));
+        assert!(is_idle_axiom(&[tag("prelude")], 0, None));
+        assert!(is_idle_axiom(&[tag("anonymous_axiom"), tag("axiom")], 0, None));
+        // an axiom that did work, or that the core holds, is listed
+        assert!(!is_idle_axiom(&[tag("axiom")], 1, Some(false)));
+        assert!(!is_idle_axiom(&[tag("axiom")], 0, Some(true)));
+        // hypotheses and the goal are listed whatever they did
+        assert!(!is_idle_axiom(&[tag("requires")], 0, Some(false)));
+        assert!(!is_idle_axiom(&[tag("fuel")], 0, None));
+        assert!(!is_idle_axiom(&[tag("query")], 0, Some(false)));
+        // a merged row counts as idle only if every tag of it does
+        assert!(!is_idle_axiom(&[tag("axiom"), tag("requires")], 0, None));
+        // a row without tags is listed rather than lost in the count
+        assert!(!is_idle_axiom(&[], 0, None));
+    }
 }

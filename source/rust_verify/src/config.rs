@@ -45,6 +45,9 @@ pub const PROVENANCE_FILE_SUFFIX: &str = ".provenance.json";
 /// `--log-all` under `-V inst-pressure`: per function, each query's
 /// instantiation pressure joined to source, as JSON.
 pub const INST_PRESSURE_FILE_SUFFIX: &str = ".inst_pressure.json";
+/// `--log-all` under `-V difficulty`: per function, each query's difficulty
+/// gradient joined to source, as JSON.
+pub const DIFFICULTY_FILE_SUFFIX: &str = ".difficulty.json";
 pub const IMPL_NAMES_SUFFIX: &str = ".impl_names";
 pub const CALL_GRAPH_FILE_SUFFIX_FULL_INITIAL: &str = "-call-graph-full-initial.dot";
 pub const CALL_GRAPH_FILE_SUFFIX_FULL_SIMPLIFIED: &str = "-call-graph-full-simplified.dot";
