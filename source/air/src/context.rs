@@ -1021,7 +1021,7 @@ impl Context {
         self.typing.decls.pop_scope();
     }
 
-    fn ensure_started(&mut self) {
+    pub(crate) fn ensure_started(&mut self) {
         match self.state {
             ContextState::NotStarted => {
                 let profile_logfile_name = self.profile_logfile_name.clone();
