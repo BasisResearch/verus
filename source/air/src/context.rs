@@ -156,6 +156,19 @@ impl Default for SmtSolver {
     }
 }
 
+/// The counters that name AIR's generated symbols (axiom labels, arrays,
+/// lambdas, chooses and applies) and anonymous axiom tags, as they stood when
+/// a name scope opened.
+#[derive(Clone, Copy)]
+struct NameCounters {
+    axiom_infos: u64,
+    array: u64,
+    lambda: u64,
+    choose: u64,
+    apply: u64,
+    anon_axiom: u64,
+}
+
 pub struct Context {
     pub(crate) message_interface: Arc<dyn crate::messages::MessageInterface>,
     smt_process: Option<SmtProcess>,
@@ -169,6 +182,11 @@ pub struct Context {
     pub(crate) choose_count: u64,
     pub(crate) apply_map: ScopeMap<(Typs, Typ), Ident>,
     pub(crate) apply_count: u64,
+    /// One entry per open name scope. Popping a scope restores its counters,
+    /// so replaying a popped scope reproduces the names it generated: a
+    /// resident session rebuilds query prefixes that way, and instantiation
+    /// certificates refer to formulas by those names.
+    name_counters: Vec<NameCounters>,
     pub(crate) typing: Typing,
     pub(crate) debug: bool,
     pub(crate) ignore_unexpected_smt: bool,
@@ -240,6 +258,7 @@ impl Context {
             choose_count: 0,
             apply_map: ScopeMap::new(),
             apply_count: 0,
+            name_counters: Vec::new(),
             typing: Typing {
                 message_interface: message_interface.clone(),
                 decls: crate::scope_map::ScopeMap::new(),
@@ -610,6 +629,14 @@ impl Context {
     }
 
     pub(crate) fn push_name_scope(&mut self) {
+        self.name_counters.push(NameCounters {
+            axiom_infos: self.axiom_infos_count,
+            array: self.array_count,
+            lambda: self.lambda_count,
+            choose: self.choose_count,
+            apply: self.apply_count,
+            anon_axiom: self.anon_axiom_count,
+        });
         self.axiom_infos.push_scope(false);
         self.array_map.push_scope(false);
         self.lambda_map.push_scope(false);
@@ -619,6 +646,16 @@ impl Context {
     }
 
     pub(crate) fn pop_name_scope(&mut self) {
+        // The popped scope's names left the solver with it, and the maps below
+        // forget them, so its numbers are free for the next scope to reuse.
+        let counters =
+            self.name_counters.pop().expect("pop_name_scope without a matching push_name_scope");
+        self.axiom_infos_count = counters.axiom_infos;
+        self.array_count = counters.array;
+        self.lambda_count = counters.lambda;
+        self.choose_count = counters.choose;
+        self.apply_count = counters.apply;
+        self.anon_axiom_count = counters.anon_axiom;
         self.axiom_infos.pop_scope();
         self.array_map.pop_scope();
         self.lambda_map.pop_scope();

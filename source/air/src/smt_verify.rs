@@ -825,6 +825,11 @@ pub(crate) fn smt_check_query<'ctx>(
     // add query-local declarations
     for decl in query.local.iter() {
         if let Err(err) = crate::typecheck::add_decl(context, decl, false) {
+            // A type error opens no query to finish, so close the scope opened above.
+            if !context.single_check_query {
+                context.pop_name_scope();
+                context.smt_log.log_pop();
+            }
             return ValidityResult::TypeError(err);
         }
         smt_add_decl(context, decl);
