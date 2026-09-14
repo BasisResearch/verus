@@ -239,6 +239,8 @@ pub struct GraphSummary {
     pub quantifiers: usize,
     pub rounds: u64,
     pub max_depth: u64,
+    /// Attributed edges (cvc5's `(eq ...)` lists), not counted in `edges`.
+    pub eq_edges: usize,
     pub dropped: u64,
     /// Which check-sat the graph is of, for a caller that ran more than one:
     /// a resident recheck reports `certificate` or `search`.
@@ -263,6 +265,7 @@ impl InstantiationGraph {
             names: HashMap::new(),
             nodes: HashSet::new(),
             info: HashMap::new(),
+            eq_edges: HashMap::new(),
             dropped: 0,
         };
         // Names and strategies are shared by every instantiation that has
@@ -310,8 +313,13 @@ impl InstantiationGraph {
                 }
                 "node" => {
                     // <index> <quantifier> <strategy> <round> <depth> <term depth> (<parents>)
+                    // and, when cvc5 attributed any, (eq <parents>)
                     let (fields, parents) = rest.split_once(" (").ok_or_else(|| malformed(line))?;
                     let parents = parents.strip_suffix(')').ok_or_else(|| malformed(line))?;
+                    let (parents, attributed) = match parents.split_once(") (eq") {
+                        Some((parents, attributed)) => (parents, attributed),
+                        None => (parents, ""),
+                    };
                     let fields: Vec<&str> = fields.split(' ').collect();
                     let [index, quantifier, strategy, round, depth, term_depth] = fields[..] else {
                         return Err(malformed(line));
@@ -348,6 +356,13 @@ impl InstantiationGraph {
                         }
                         graph.edges.entry((parent, 0)).or_default().insert(id);
                     }
+                    for parent in attributed.split(' ').filter(|parent| !parent.is_empty()) {
+                        let parent: u64 = number(parent, line)?;
+                        if parent >= index {
+                            return Err(malformed(line));
+                        }
+                        graph.eq_edges.entry((parent, 0)).or_default().insert(id);
+                    }
                 }
                 "dropped" => graph.dropped = number(rest, line)?,
                 _ => return Err(malformed(line)),
@@ -366,6 +381,7 @@ impl InstantiationGraph {
             quantifiers: self.names.values().collect::<HashSet<_>>().len(),
             rounds: self.info.values().map(|info| info.round).max().unwrap_or(0),
             max_depth: self.info.values().map(|info| info.depth).max().unwrap_or(0),
+            eq_edges: self.eq_edges.values().map(HashSet::len).sum(),
             dropped: self.dropped,
             check: None,
         }
@@ -960,6 +976,23 @@ mod tests {
         let forward =
             lines("(instantiation-graph\n(quantifier 0 q)\n(node 0 0 X 1 0 0 (1))\n(dropped 0)\n)");
         assert!(InstantiationGraph::from_live(&forward).is_err());
+    }
+
+    #[test]
+    fn attributed_parents_are_kept_apart() {
+        // Node 2's exact parent is 1; 0 is only attributed. Queries see the
+        // exact edge alone.
+        let text = "(instantiation-graph\n(quantifier 0 q)\n(node 0 0 X 1 0 0 ())\n(node 1 0 X 2 1 1 (0))\n(node 2 0 X 3 2 2 (1) (eq 0))\n(node 3 0 X 4 0 0 () (eq 1 2))\n(dropped 0)\n)";
+        let graph = InstantiationGraph::from_live(&lines(text)).unwrap();
+        assert_eq!(graph.edges[&(0, 0)], HashSet::from([(1, 0)]));
+        assert_eq!(graph.eq_edges[&(0, 0)], HashSet::from([(2, 0)]));
+        assert_eq!(graph.eq_edges[&(1, 0)], HashSet::from([(3, 0)]));
+        let summary = graph.summary();
+        assert_eq!((summary.edges, summary.eq_edges), (2, 3));
+        let bad = lines(
+            "(instantiation-graph\n(quantifier 0 q)\n(node 0 0 X 1 0 0 () (eq 0))\n(dropped 0)\n)",
+        );
+        assert!(InstantiationGraph::from_live(&bad).is_err());
     }
 
     #[test]

@@ -59,6 +59,10 @@ pub struct InstantiationGraph {
     pub names: HashMap<NodeId, Arc<str>>,
     pub nodes: HashSet<NodeId>,
     pub info: HashMap<NodeId, InstInfo>,
+    /// Edges cvc5 attributes rather than observes (its `(eq ...)` list):
+    /// through a nested matched term, a binding or a representative. Kept
+    /// apart from `edges`; queries read `edges` only.
+    pub eq_edges: HashMap<NodeId, HashSet<NodeId>>,
     /// Instantiations the solver made but did not record.
     pub dropped: u64,
 }
@@ -140,8 +144,14 @@ impl Profiler {
             }
         }
 
-        let mut graph =
-            InstantiationGraph { edges, names, nodes, info: HashMap::new(), dropped: 0 };
+        let mut graph = InstantiationGraph {
+            edges,
+            names,
+            nodes,
+            info: HashMap::new(),
+            eq_edges: HashMap::new(),
+            dropped: 0,
+        };
         graph.compute_depths();
         Ok(graph)
     }
