@@ -559,6 +559,11 @@ fn a_spec_root_uses_but_does_not_run() {
             len(x) + len(x)
         }
 
+        proof fn lemma_len(x: u64)
+            ensures spec_len(x) == x,
+        {
+        }
+
         fn main() {
         }
     };
@@ -568,6 +573,11 @@ fn a_spec_root_uses_but_does_not_run() {
         edge_kinds(&report, "test_crate::twice_len", "test_crate::len"),
         vec![EdgeKind::Proof],
         "a ghost body's references are ghost"
+    );
+    // A proof function's own contract keeps its label
+    assert_eq!(
+        edge_kinds(&report, "test_crate::lemma_len", "test_crate::spec_len"),
+        vec![EdgeKind::Contract]
     );
     let roots = Roots { add: vec!["test_crate::twice_len".into()], ..Roots::default() };
     let graph = Graph::new(std::slice::from_ref(&report), &roots).unwrap();

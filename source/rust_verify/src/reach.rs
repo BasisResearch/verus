@@ -41,11 +41,14 @@ impl<'a, 'tcx> Visitor<'tcx> for Callees<'a, 'tcx> {
     }
 
     fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {
-        // Ghost code nested in compiled code changes the context; ghost
-        // code nested in ghost code keeps the outer one
+        // Ghost code nested in compiled code changes the context; a
+        // contract clause is a contract even inside a ghost body; other
+        // ghost code nested in ghost code keeps the outer context
         let outer = self.kind;
-        if let (EdgeKind::Call, Some(kind)) = (outer, self.ghost_kind(expr)) {
-            self.kind = kind;
+        match (outer, self.ghost_kind(expr)) {
+            (EdgeKind::Call, Some(kind)) => self.kind = kind,
+            (EdgeKind::Proof, Some(EdgeKind::Contract)) => self.kind = EdgeKind::Contract,
+            _ => {}
         }
         if let ExprKind::Path(qpath) = &expr.kind {
             if let Res::Def(_, def_id) = self.typeck.qpath_res(qpath, expr.hir_id) {
