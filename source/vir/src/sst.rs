@@ -52,6 +52,11 @@ pub struct BndInfo {
     /// The tagged top-level assertion this quantifier was sent inside, once
     /// known (axiom or hypothesis); `None` for quantifiers in the query body.
     pub tag: Option<air::def::ProvenanceTag>,
+    /// Positions of the binders that bind type parameters (sort `Dcr` or
+    /// `Type`), recorded from the binders as built (`func_bind_trig`) or as
+    /// tagged (`record_qid_owner`). A solver's instantiation vector binds
+    /// these too; the source does not.
+    pub type_binders: Vec<usize>,
 }
 
 /// What a hypothesis axiom of a function's query is; recorded per `HypId`

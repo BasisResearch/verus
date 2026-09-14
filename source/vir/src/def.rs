@@ -489,6 +489,25 @@ impl NameCtxt {
         );
     }
 
+    /// A function application's head `symbol`, and how many of its leading
+    /// arguments are type arguments (`typ_to_ids` of each, decoration and
+    /// type id), so a source rendering can drop them: `s[i]` is emitted as
+    /// `(vstd!seq.Seq.index.? $ INT s i)`. Called at every call site; a head's
+    /// type arguments never change, so only the first call records it.
+    pub(crate) fn record_source_function(&self, symbol: &str, fun: &Fun, type_args: usize) {
+        let mut imp = self.imp.borrow_mut();
+        if let Some(crate::air_names::SourceName::Function { .. }) = imp.source_names.get(symbol) {
+            return;
+        }
+        imp.source_names.insert(
+            symbol.to_string(),
+            crate::air_names::SourceName::Function {
+                name: source_name_of_path(&fun.path),
+                type_args,
+            },
+        );
+    }
+
     /// Lower a source variable and record its spelling at the encoding boundary.
     pub(crate) fn var_ident(&self, ident: &VarIdent) -> Ident {
         use crate::ast::VarIdentDisambiguate as D;
@@ -1088,8 +1107,13 @@ pub fn new_internal_qid(
     let qid = format!("{}{}_definition", air::profiler::INTERNAL_QUANT_PREFIX, name);
 
     if let Some(fun) = ctx.fun.as_ref() {
-        let bnd_info =
-            crate::sst::BndInfo { fun: fun.current_fun.clone(), user: None, role, tag: None };
+        let bnd_info = crate::sst::BndInfo {
+            fun: fun.current_fun.clone(),
+            user: None,
+            role,
+            tag: None,
+            type_binders: Vec::new(),
+        };
         ctx.global.qid_map.borrow_mut().insert(qid.clone(), bnd_info);
     }
 

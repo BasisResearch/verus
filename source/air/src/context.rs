@@ -62,6 +62,180 @@ pub struct ProvenanceInfo {
 
 pub type VariableVersions = HashMap<String, (String, u32)>;
 
+/// Why a `check-sat` answered `unknown`, as the solver reported it. The join
+/// of the culprit `:qid`s back to source happens in Verus.
+#[derive(Debug, Clone, Default)]
+pub struct UnknownReason {
+    /// The `(get-info :reason-unknown)` answer, unquoted: `incomplete`,
+    /// `resourceout`, `timeout`, ...
+    pub reason: String,
+    /// cvc5's own classification of an incomplete answer, the `IncompleteId`
+    /// behind `(get-info :incomplete-id)`: `QUANTIFIERS`, `ARITH_NL`,
+    /// `QUANTIFIERS_MAX_INST_ROUNDS`, ... `None` when the answer was not
+    /// incomplete or the solver cannot say.
+    pub incomplete_id: Option<String>,
+    /// The `:qid`s of `(get-info :incomplete-culprits)`: the asserted
+    /// quantifiers no strategy claimed to have fully processed. Candidates,
+    /// not a verdict: when the solver gave up for a global reason (the
+    /// instantiation round limit, a module's own check) there are none.
+    pub culprit_qids: Vec<String>,
+}
+
+/// What cvc5's `(get-info :nl-frontier)` reported for one `check-sat`
+/// (`-V nl-frontier`): the nonlinear terms whose value in the linear model
+/// the nonlinear extension could not reconcile with their arguments' values,
+/// and where each entered the problem. Terms and tags are the solver's
+/// spelling; the join back to source happens in Verus.
+#[derive(Debug, Clone, Default)]
+pub struct NlFrontier {
+    /// SSA symbol -> original AIR variable and assignment version, recorded by lowering.
+    pub variable_versions: VariableVersions,
+    /// `unsat`, `sat` or `unknown` as cvc5 answered; `none` before a check.
+    pub result: String,
+    /// The unknown explanation in lower case (`incomplete`, `resourceout`,
+    /// ...), `none` unless `unknown`.
+    pub reason: String,
+    /// Whether cvc5's nonlinear extension was on.
+    pub enabled: bool,
+    /// Model-based refinement runs, runs with an assertion false in the
+    /// candidate model, and runs that gave up (no lemma, model unverified).
+    pub checks: u64,
+    pub rounds: u64,
+    pub punts: u64,
+    /// How the most recent run ended: `none`, `sat`, `lemma` or `punt`.
+    pub last: String,
+    /// Most recent round's atoms first, then by rounds wrong.
+    pub atoms: Vec<NlAtom>,
+    /// Atoms left out of `atoms`.
+    pub omitted: u64,
+    /// Whether the search for hosts in instantiations stopped early.
+    pub truncated: bool,
+    /// The reply, when it did not parse.
+    pub unparsed: Option<String>,
+}
+
+/// What cvc5 reported for `(get-info :matching-loops)` after a `check-sat`
+/// answered unknown (`-V matching-loops`): the quantifiers whose
+/// instantiations fed themselves, symbols and SMT terms not yet joined to
+/// source. The fields mirror the reply (see cvc5's
+/// `theory/quantifiers/matching_loops.h`).
+#[derive(Debug, Clone, Default)]
+pub struct MatchingLoopsInfo {
+    /// SSA symbol -> original AIR variable and assignment version, recorded by lowering.
+    pub variable_versions: VariableVersions,
+    /// The last instantiation round of the check
+    pub rounds: u64,
+    /// Instantiations recorded, and those past cvc5's recording cap
+    pub instantiations: u64,
+    pub dropped: u64,
+    /// Whether the instantiation round limit stopped the check
+    pub max_inst_rounds: bool,
+    pub loops: Vec<MatchingLoop>,
+    /// Reply parts the parser did not recognise, kept rather than failed on.
+    pub unparsed: Vec<String>,
+}
+
+/// One self-feeding quantifier, as cvc5 reported it. Terms are SMT text.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct MatchingLoop {
+    pub qid: String,
+    /// high (the round limit cut the loop off while it climbed), medium, low
+    pub confidence: String,
+    /// linear-depth, exponential-fanout, or bounded
+    pub growth: String,
+    /// whether the chain follows instantiations that matched a term the
+    /// previous rung introduced, rather than the deepest one of each round
+    pub edges_confirmed: bool,
+    /// whether consecutive rungs generalise to one shape
+    pub stable: bool,
+    pub instantiations: u64,
+    pub rounds: u64,
+    pub first_round: u64,
+    pub last_round: u64,
+    pub chain: u64,
+    pub self_fed: u64,
+    pub depth_per_rung: f64,
+    pub depth_per_round: f64,
+    pub fanout_per_round: f64,
+    /// growth per step of the quantifier's own rounds: a loop that fires
+    /// every other round doubles per step while `fanout_per_round` reads 1.41
+    pub fanout_per_step: f64,
+    /// qids of the other quantifiers a step passed through
+    pub via: Vec<String>,
+    /// the trigger whose matches formed the rungs, one term per trigger term
+    pub trigger: Vec<String>,
+    /// what each rung wraps around the previous one's growing subterm,
+    /// generalised over the chain, `_0` marking that subterm; one per class
+    /// when the loop climbs several subterms (`(r _0)`, `(l _0)`), and empty
+    /// when the rungs do not grow into each other
+    pub context: Vec<String>,
+    /// the generalisation of every rung, and of every rung after the first
+    pub shape: Vec<String>,
+    pub step: Vec<String>,
+    /// the first rungs and the last, each the trigger instantiated
+    pub ladder: Vec<Vec<String>>,
+    pub ladder_length: u64,
+    /// instantiations of the quantifier per round, the last rounds
+    pub per_round: Vec<u64>,
+}
+
+/// What a query's first `check-sat` also asks cvc5 for: the equalities its
+/// e-graph holds between the query's own terms (`get-egraph-equalities`).
+#[derive(Debug, Clone, Copy)]
+pub struct EgraphRequest {
+    /// The most equalities cvc5 replies with.
+    pub limit: u32,
+    /// Whether to include equalities with a side some quantifier was
+    /// instantiated with.
+    pub include_used: bool,
+}
+
+/// One equality from `(get-egraph-equalities)`, its terms as cvc5 printed
+/// them. The same solver can parse them back in the same query's scope.
+#[derive(Debug, Clone)]
+pub struct EgraphEquality {
+    pub lhs: String,
+    pub rhs: String,
+    /// `entailed` (every literal of the explanation holds at decision level 0
+    /// in the query's scope), `decision`, or `unknown`
+    pub level: String,
+    /// whether some quantifier was instantiated with either side
+    pub used: bool,
+    /// the `:qid`s of those quantifiers
+    pub used_by: Vec<String>,
+    /// how many of the two sides are subterms of the query, 0 to 2
+    pub focus: u32,
+    /// the literals the equality follows from, except those cvc5 left out
+    pub because: Vec<String>,
+    /// how many literals of the explanation cvc5 left out, as naming a
+    /// skolem or printing larger than its size limit; when not 0, `because`
+    /// alone does not imply the equality
+    pub because_hidden: u64,
+}
+
+/// cvc5's reply to `(get-egraph-equalities)` after a query's first
+/// `check-sat`, with what it counted.
+#[derive(Debug, Clone, Default)]
+pub struct EgraphReply {
+    pub equalities: Vec<EgraphEquality>,
+    /// classes listed
+    pub classes: u64,
+    /// equalities before the limit
+    pub candidates: u64,
+    /// focus terms sent, and how many of them the e-graph holds
+    pub focus: u64,
+    pub focus_found: u64,
+    /// equalities left out because a quantifier was instantiated with a side
+    pub used_omitted: u64,
+    /// terms left out because they print larger than cvc5's size limit
+    pub too_large: u64,
+    /// The solver's refusal, as after `unsat`, where there is no e-graph to
+    /// read, or a reply this parser did not recognise.
+    pub error: Option<String>,
+    /// SSA symbol -> original AIR variable and assignment version, recorded by lowering.
+    pub variable_versions: VariableVersions,
+}
+
 /// What cvc5's `(get-info :difficulty-gradient)` reported for one
 /// `check-sat` (`-V difficulty`): per tagged input assertion, the lemma work
 /// cvc5 attributed to it and, after `unsat`, whether the unsat core holds it.
@@ -109,6 +283,65 @@ pub struct InstPressure {
     pub quantifiers: Vec<QuantPressure>,
     /// The reply, when it did not parse.
     pub unparsed: Option<String>,
+}
+
+/// One nonlinear term of `(get-info :nl-frontier)`.
+#[derive(Debug, Clone, Default)]
+pub struct NlAtom {
+    /// The term as the input spelled it, e.g. `(* x y)`.
+    pub atom: String,
+    /// product, power, division, iand, pow2 or transcendental
+    pub kind: String,
+    /// Whether it was wrong in the most recent refinement round.
+    pub current: bool,
+    /// In how many rounds it was wrong.
+    pub rounds: u64,
+    /// Its value in the linear model, and the value its arguments give it
+    /// (they differ: that is why it is on the frontier). Each is a rational
+    /// as cvc5 prints it (`-5`, `1/2`), or `none`.
+    pub value: String,
+    pub from_args: String,
+    /// The bounds asserted on the atom itself.
+    pub lower: Option<NlBound>,
+    pub upper: Option<NlBound>,
+    /// Its distinct arguments with their values and asserted bounds.
+    pub args: Vec<NlTerm>,
+    /// Where it entered the problem.
+    pub hosts: Vec<NlHost>,
+}
+
+/// A term with its model value and asserted bounds.
+#[derive(Debug, Clone, Default)]
+pub struct NlTerm {
+    pub term: String,
+    pub value: String,
+    pub lower: Option<NlBound>,
+    pub upper: Option<NlBound>,
+}
+
+/// A constant bound read off an asserted literal.
+#[derive(Debug, Clone, Default)]
+pub struct NlBound {
+    /// A rational as cvc5 prints it, e.g. `5`, `-5` or `1/2`.
+    pub value: String,
+    pub strict: bool,
+    /// Whether the literal is implied by the assertions (fixed at SAT level
+    /// 0), rather than holding only in the branch the solver explored.
+    pub fixed: bool,
+}
+
+/// A term that applies one function to exactly an atom's factors: in a
+/// tagged input assertion, or in the instantiations of one quantifier.
+#[derive(Debug, Clone, Default)]
+pub struct NlHost {
+    /// `true` for an input assertion, `false` for an instantiation.
+    pub input: bool,
+    pub term: String,
+    /// Input hosts: the tags of the assertions holding the term.
+    pub tags: Vec<String>,
+    /// Instantiation hosts: the quantifier's `:qid`, and how many vectors.
+    pub qid: Option<String>,
+    pub count: u64,
 }
 
 /// One tagged input assertion of `(get-info :difficulty-gradient)`.
@@ -273,6 +506,24 @@ pub struct Context {
     /// The difficulty gradient of the last `check-sat`, until the caller
     /// takes it.
     pub(crate) last_difficulty: Option<DifficultyGradient>,
+    /// Why the last `check-sat` answered `unknown`, until the caller takes it.
+    pub(crate) last_unknown_reason: Option<UnknownReason>,
+    /// Nonlinear frontier mode (`-V nl-frontier`): cvc5 is asked for
+    /// `(get-info :nl-frontier)` after every `check-sat`. cvc5 records the
+    /// frontier during every check anyway, so the search is the ordinary one.
+    pub(crate) nl_frontier: bool,
+    /// The nonlinear frontier of the last `check-sat`, until the caller takes it.
+    pub(crate) last_nl_frontier: Option<NlFrontier>,
+    /// Matching-loop mode (`-V matching-loops`): cvc5 records each
+    /// instantiation's round, terms and parents, and is asked for the loops
+    /// among them after every unknown. Recording spends no resource units,
+    /// so the verdict is a plain run's unless `inst_max_rounds` is set.
+    pub(crate) matching_loops: bool,
+    /// cvc5's `--inst-max-rounds`, only under matching-loop mode. A loop is
+    /// high confidence only when this limit stopped the check.
+    pub(crate) inst_max_rounds: Option<u32>,
+    /// The matching loops of the last unknown `check-sat`, until taken.
+    pub(crate) last_matching_loops: Option<MatchingLoopsInfo>,
     /// Ask cvc5 for `(get-info :inst-pressure)` after every `check-sat`
     /// (`-V inst-pressure`). Read-only: the search is unchanged.
     pub(crate) inst_pressure: bool,
@@ -292,6 +543,16 @@ pub struct Context {
     /// once its declarations are in scope (cvc5 only).
     pub(crate) import_instantiations: Option<ImportInstantiations>,
     variable_versions: VariableVersions,
+    /// Ask each query's first `check-sat` for the equalities cvc5's e-graph
+    /// holds between the query's terms (cvc5 only).
+    pub(crate) egraph_request: Option<EgraphRequest>,
+    /// The query's terms that focus the request, from lowering to the check.
+    pub(crate) egraph_focus: Option<Vec<sise::TreeNode>>,
+    /// The reply to the last request, until the caller takes it.
+    pub(crate) last_egraph: Option<EgraphReply>,
+    /// An equality to assert in the next query's scope just before its first
+    /// `check-sat` (cvc5 only).
+    pub(crate) inject_equality: Option<(sise::TreeNode, sise::TreeNode)>,
 }
 
 impl Context {
@@ -365,6 +626,12 @@ impl Context {
             last_provenance: None,
             difficulty: false,
             last_difficulty: None,
+            last_unknown_reason: None,
+            nl_frontier: false,
+            last_nl_frontier: None,
+            matching_loops: false,
+            inst_max_rounds: None,
+            last_matching_loops: None,
             inst_pressure: false,
             last_inst_pressure: None,
             instantiation_replay: false,
@@ -372,6 +639,10 @@ impl Context {
             saved_instantiations: HashSet::new(),
             import_instantiations: None,
             variable_versions: HashMap::new(),
+            egraph_request: None,
+            egraph_focus: None,
+            last_egraph: None,
+            inject_equality: None,
             solver,
         };
         context.axiom_infos.push_scope(false);
@@ -394,6 +665,8 @@ impl Context {
                 self.provenance,
                 self.difficulty,
                 self.instantiation_replay,
+                self.matching_loops,
+                self.inst_max_rounds,
             ));
         }
         self.smt_process.as_mut().unwrap()
@@ -483,6 +756,28 @@ impl Context {
         })
     }
 
+    /// Why the most recent `check-sat` answered `unknown`, if it did; each call
+    /// returns it once. Rounds that did not answer `unknown` leave none.
+    pub fn take_unknown_reason(&mut self) -> Option<UnknownReason> {
+        self.last_unknown_reason.take()
+    }
+
+    /// The nonlinear frontier cvc5 reported for the most recent `check-sat`,
+    /// if it was asked; each call returns it once.
+    pub fn take_nl_frontier(&mut self) -> Option<NlFrontier> {
+        self.last_nl_frontier.take().map(|mut frontier| {
+            frontier.variable_versions = self.variable_versions.clone();
+            frontier
+        })
+    }
+
+    /// Ask cvc5 for `(get-info :nl-frontier)` after every `check-sat` (cvc5
+    /// only). Nothing about the solver's launch or budget changes.
+    pub fn set_nl_frontier(&mut self, enabled: bool) {
+        assert!(!enabled || matches!(self.solver, SmtSolver::Cvc5));
+        self.nl_frontier = enabled;
+    }
+
     /// The instantiation pressure cvc5 reported for the most recent
     /// `check-sat`, if it was asked; each call returns it once.
     pub fn take_inst_pressure(&mut self) -> Option<InstPressure> {
@@ -503,6 +798,26 @@ impl Context {
         assert!(matches!(self.state, ContextState::NotStarted));
         assert!(!enabled || matches!(self.solver, SmtSolver::Cvc5));
         self.provenance = enabled;
+    }
+
+    /// The matching loops cvc5 reported after the most recent unknown
+    /// `check-sat`, if any; each call returns them once.
+    pub fn take_matching_loops(&mut self) -> Option<MatchingLoopsInfo> {
+        self.last_matching_loops.take().map(|mut info| {
+            info.variable_versions = self.variable_versions.clone();
+            info
+        })
+    }
+
+    /// Turn matching-loop mode on (cvc5 only; must precede the first query).
+    /// The solver is launched with `--matching-loops`, and with
+    /// `--inst-max-rounds` when `inst_max_rounds` is given; each unknown is
+    /// followed by `(get-info :matching-loops)`.
+    pub fn set_matching_loops(&mut self, enabled: bool, inst_max_rounds: Option<u32>) {
+        assert!(matches!(self.state, ContextState::NotStarted));
+        assert!(!enabled || matches!(self.solver, SmtSolver::Cvc5));
+        self.matching_loops = enabled;
+        self.inst_max_rounds = if enabled { inst_max_rounds } else { None };
     }
 
     /// The difficulty gradient cvc5 reported for the most recent
@@ -577,6 +892,48 @@ impl Context {
         assert!(matches!(self.solver, SmtSolver::Cvc5));
         self.smt_log.log_save_instantiations(key);
         self.saved_instantiations.insert(key.to_owned());
+    }
+
+    /// Ask each following query's first `check-sat` for the equalities
+    /// cvc5's e-graph then holds, in the classes of the query's own terms,
+    /// until set to `None` (cvc5 only). Take each reply with `take_egraph`
+    /// after `check_valid`. Assignment versions are recorded for the reply,
+    /// as in provenance mode. The request is read in the same batch as the
+    /// check, so nothing sent after `check-sat` has changed the solver's state.
+    /// `None` also drops focus terms or an injected equality that a check
+    /// which never reached `check-sat` left behind.
+    pub fn set_egraph_request(&mut self, request: Option<EgraphRequest>) {
+        assert!(request.is_none() || matches!(self.solver, SmtSolver::Cvc5));
+        self.egraph_request = request;
+        if request.is_none() {
+            self.egraph_focus = None;
+            self.inject_equality = None;
+        }
+    }
+
+    /// The reply to the e-graph request of the most recent query, if one was
+    /// asked for; each call returns it once.
+    pub fn take_egraph(&mut self) -> Option<EgraphReply> {
+        self.last_egraph.take().map(|mut reply| {
+            reply.variable_versions = self.variable_versions.clone();
+            reply
+        })
+    }
+
+    /// Assert `lhs = rhs` in the next query's scope, after its own assertion
+    /// and just before its first `check-sat` (cvc5 only). `finish_query` pops
+    /// it with the scope. The terms must come from an `EgraphReply` of the
+    /// same solver for the same query, which names only symbols that scope
+    /// declares: cvc5 exits on a term it cannot parse. Err if either is not a
+    /// single s-expression.
+    pub fn set_inject_equality(&mut self, lhs: &str, rhs: &str) -> Result<(), String> {
+        assert!(matches!(self.solver, SmtSolver::Cvc5));
+        let parse = |term: &str| {
+            sise::parse_tree(&mut sise::Parser::new(term))
+                .map_err(|_| format!("not a single SMT term: {term}"))
+        };
+        self.inject_equality = Some((parse(lhs)?, parse(rhs)?));
+        Ok(())
     }
 
     pub fn set_profile_with_logfile_name(&mut self, file_name: String) {
@@ -757,6 +1114,15 @@ impl Context {
                         crate::smt_process::PROVENANCE_ARGS.join(" ")
                     ));
                 }
+                if self.matching_loops {
+                    let rounds = match self.inst_max_rounds {
+                        Some(n) => format!(" --inst-max-rounds={n}"),
+                        None => String::new(),
+                    };
+                    self.comment(&format!(
+                        "matching-loop mode: cvc5 args --matching-loops{rounds}"
+                    ));
+                }
                 if self.difficulty {
                     self.comment(&format!(
                         "difficulty mode: cvc5 args {}",
@@ -817,14 +1183,19 @@ impl Context {
         query_context: QueryContext<'_, '_>,
     ) -> ValidityResult {
         self.ensure_started();
+        // Cleared here as well as in `smt_check_assertion`: a query can fail
+        // before it reaches the solver, and must not report an earlier reason.
+        self.last_unknown_reason = None;
 
         self.air_initial_log.log_query(query);
         let query = match crate::typecheck::check_query(self, query) {
             Ok(query) => query,
             Err(err) => return ValidityResult::TypeError(err),
         };
-        let (query, snapshots, local_vars, variable_versions) =
-            crate::var_to_const::lower_query(&query, self.provenance);
+        let (query, snapshots, local_vars, variable_versions) = crate::var_to_const::lower_query(
+            &query,
+            self.provenance || self.egraph_request.is_some(),
+        );
         self.variable_versions = variable_versions;
         self.air_middle_log.log_query(&query);
         let query = crate::block_to_assert::lower_query(message_interface, &query);
