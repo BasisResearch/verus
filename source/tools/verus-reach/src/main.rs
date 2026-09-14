@@ -44,13 +44,13 @@ struct Args {
     #[arg(long)]
     no_implicit_roots: bool,
     /// Exit with an error if fewer than this percentage of verified
-    /// functions (exec, spec, and proof) are used
+    /// functions (exec, spec, and proof) are reachable
     #[arg(long)]
     fail_under: Option<u64>,
     /// Write an LCOV trace file to stdout instead of the summary
     #[arg(long, conflicts_with = "html")]
     lcov: bool,
-    /// List the verified functions that mention reached code directly (one
+    /// List the verified functions that mention reachable code directly (one
     /// hop against the edges, any kind, between functions only) but are not
     /// reachable, instead of the summary. Ghost functions among them that
     /// nothing refers to are flagged as candidates for
@@ -122,7 +122,7 @@ fn summary(reports: &[Report], graph: &Graph) -> String {
     let reached: Vec<&Node> = fns.iter().copied().filter(|n| graph.is_used(n)).collect();
     writeln!(
         out,
-        "\nverified functions: {:>6}   used: {:>6}  ({})",
+        "\nverified functions: {:>6}   reachable: {:>6}  ({})",
         fns.len(),
         reached.len(),
         show(pct(reached.len(), fns.len()))
@@ -131,14 +131,14 @@ fn summary(reports: &[Report], graph: &Graph) -> String {
     for mode in ["exec", "spec", "proof"] {
         let total = fns.iter().filter(|n| n.mode == mode).count();
         let hit = reached.iter().filter(|n| n.mode == mode).count();
-        writeln!(out, "  {mode:<17} {total:>6}   used: {hit:>6}  ({})", show(pct(hit, total)))
+        writeln!(out, "  {mode:<17} {total:>6}   reachable: {hit:>6}  ({})", show(pct(hit, total)))
             .unwrap();
     }
     let trusted = fns.iter().filter(|n| n.is_trusted()).count();
     let trusted_hit = reached.iter().filter(|n| n.is_trusted()).count();
     writeln!(
         out,
-        "  of which trusted  {trusted:>6}   used: {trusted_hit:>6}  ({})",
+        "  of which trusted  {trusted:>6}   reachable: {trusted_hit:>6}  ({})",
         show(pct(trusted_hit, trusted))
     )
     .unwrap();
@@ -147,7 +147,7 @@ fn summary(reports: &[Report], graph: &Graph) -> String {
     let reached_loc: usize = reached.iter().map(|n| loc(n)).sum();
     writeln!(
         out,
-        "verified LoC:       {:>6}   used: {:>6}  ({})",
+        "verified LoC:       {:>6}   reachable: {:>6}  ({})",
         total_loc,
         reached_loc,
         show(pct(reached_loc, total_loc))
@@ -156,7 +156,7 @@ fn summary(reports: &[Report], graph: &Graph) -> String {
     writeln!(out, "(LoC counts every line of the function, including proof blocks)").unwrap();
     writeln!(
         out,
-        "(a function is used when it runs, or when the contracts and proofs of used code mention it)"
+        "(a function is reachable when it runs, or when the contracts and proofs of reachable code mention it)"
     )
     .unwrap();
 
@@ -185,7 +185,7 @@ fn summary(reports: &[Report], graph: &Graph) -> String {
 
     let unreachable: Vec<&Node> = fns.iter().copied().filter(|n| !graph.is_used(n)).collect();
     if !unreachable.is_empty() {
-        writeln!(out, "\nunused verified functions:").unwrap();
+        writeln!(out, "\nunreachable verified functions:").unwrap();
     }
     for f in unreachable {
         writeln!(out, "  {}:{}   {:<5} {}", f.span.file, f.span.start_line, f.mode, f.name())
@@ -199,14 +199,17 @@ fn connected(graph: &Graph) -> String {
     let (reached, total) = graph.coverage();
     let connected =
         graph.nodes.values().filter(|n| n.is_verified() && graph.connected.contains(&n.id)).count();
-    writeln!(out, "verified functions: {total}   used: {reached}   mention used code: {connected}")
-        .unwrap();
+    writeln!(
+        out,
+        "verified functions: {total}   reachable: {reached}   mention reachable code: {connected}"
+    )
+    .unwrap();
     let mut rest = graph.connected_unreachable();
     rest.sort_by_key(|n| (&n.span.file, n.span.start_line));
     let suggested: HashSet<&str> = graph.suggested_roots().iter().map(|n| n.id.as_str()).collect();
     writeln!(
         out,
-        "\nmention used code but are unused ({}; * = candidate root, referred to by nothing):",
+        "\nmention reachable code but are unreachable ({}; * = candidate root, referred to by nothing):",
         rest.len()
     )
     .unwrap();
@@ -246,7 +249,7 @@ fn below_threshold(graph: &Graph, threshold: u64) -> Option<String> {
     };
     (pct < threshold).then(|| {
         format!(
-            "{reached} of {total} verified functions used ({pct}%), below --fail-under {threshold}"
+            "{reached} of {total} verified functions reachable ({pct}%), below --fail-under {threshold}"
         )
     })
 }
@@ -309,11 +312,11 @@ mod tests {
     fn summary_counts_exec_spec_and_proof_functions() {
         let (reports, graph) = graph();
         let text = summary(&reports, &graph);
-        assert!(text.contains("verified functions:      6   used:      4  (66%)"), "{text}");
-        assert!(text.contains("  exec                   3   used:      2  (66%)"), "{text}");
-        assert!(text.contains("  spec                   2   used:      1  (50%)"), "{text}");
-        assert!(text.contains("  proof                  1   used:      1  (100%)"), "{text}");
-        assert!(text.contains("verified LoC:           18   used:     12  (66%)"), "{text}");
+        assert!(text.contains("verified functions:      6   reachable:      4  (66%)"), "{text}");
+        assert!(text.contains("  exec                   3   reachable:      2  (66%)"), "{text}");
+        assert!(text.contains("  spec                   2   reachable:      1  (50%)"), "{text}");
+        assert!(text.contains("  proof                  1   reachable:      1  (100%)"), "{text}");
+        assert!(text.contains("verified LoC:           18   reachable:     12  (66%)"), "{text}");
         assert!(
             text.contains(
                 "  lib               4/4    fns      12/12     LoC     2/2    exec     2/2    ghost"
@@ -329,12 +332,12 @@ mod tests {
     }
 
     #[test]
-    fn summary_lists_unused_verified_functions_with_their_mode() {
+    fn summary_lists_unreachable_verified_functions_with_their_mode() {
         let (reports, graph) = graph();
         let text = summary(&reports, &graph);
         assert!(
             text.contains(
-                "unused verified functions:\n  x.rs:1   exec  inc\n  x.rs:1   spec  spec_inc\n"
+                "unreachable verified functions:\n  x.rs:1   exec  inc\n  x.rs:1   spec  spec_inc\n"
             ),
             "{text}"
         );
@@ -365,7 +368,7 @@ mod tests {
         let (_, graph) = graph();
         assert_eq!(below_threshold(&graph, 66), None);
         let msg = below_threshold(&graph, 67).unwrap();
-        assert!(msg.contains("4 of 6 verified functions used (66%)"), "{msg}");
+        assert!(msg.contains("4 of 6 verified functions reachable (66%)"), "{msg}");
     }
 
     #[test]
@@ -381,6 +384,6 @@ mod tests {
         let graph = Graph::new(&reports, &Roots::default()).unwrap();
         assert!(below_threshold(&graph, 1).unwrap().contains("no verified functions"));
         let text = summary(&reports, &graph);
-        assert!(text.contains("verified functions:      0   used:      0  (n/a)"), "{text}");
+        assert!(text.contains("verified functions:      0   reachable:      0  (n/a)"), "{text}");
     }
 }

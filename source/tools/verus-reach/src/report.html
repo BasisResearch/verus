@@ -137,8 +137,8 @@ table.cov tbody tr:hover td { background: color-mix(in srgb, var(--accent) 6%, t
   function pct(a, b) { return b ? Math.floor(100 * a / b) : null; }
   function band(p) { return p === null ? "" : p >= HI ? "hi" : p >= MED ? "med" : "lo"; }
   function bandInv(p) { return p === null ? "" : p <= 100 - HI ? "hi" : p <= 100 - MED ? "med" : "lo"; }
-  function state(f) { return f.verified ? (f.used ? "vr" : "vd") : (f.used ? "ur" : "uu"); }
-  var STATE_LABEL = { vr: "verified, used", vd: "verified, unused", ur: "used, unverified", uu: "unused, unverified" };
+  function state(f) { return f.verified ? (f.reachable ? "vr" : "vd") : (f.reachable ? "ur" : "uu"); }
+  var STATE_LABEL = { vr: "verified, reachable", vd: "verified, unreachable", ur: "reachable, unverified", uu: "unreachable, unverified" };
   var STATE_ORDER = { vd: 0, ur: 1, vr: 2, uu: 3 };
 
   // What the counts range over: every function, or exec functions only.
@@ -153,12 +153,12 @@ table.cov tbody tr:hover td { background: color-mix(in srgb, var(--accent) 6%, t
     var fns = all.filter(inScope);
     var s = { verified: 0, vreach: 0, reach: 0, fns: fns.length, exec: [0, 0], spec: [0, 0], proof: [0, 0] };
     fns.forEach(function (f) {
-      if (f.used) s.reach++;
+      if (f.reachable) s.reach++;
       if (f.verified) {
         s.verified++;
-        if (f.used) s.vreach++;
+        if (f.reachable) s.vreach++;
         var m = s[f.mode];
-        if (m) { m[1]++; if (f.used) m[0]++; }
+        if (m) { m[1]++; if (f.reachable) m[0]++; }
       }
     });
     s.dead = pct(s.verified - s.vreach, s.verified);
@@ -186,9 +186,9 @@ table.cov tbody tr:hover td { background: color-mix(in srgb, var(--accent) 6%, t
 
   var COLS = [
     { key: "name", label: "Name" },
-    { key: "dead", label: "Unused verified / verified", title: "verified functions nothing uses, over all verified functions", metric: true,
+    { key: "dead", label: "Unreachable verified / verified", title: "verified functions nothing reaches, over all verified functions", metric: true,
       cell: function (s) { return barCell(s.dead, bandInv(s.dead), s.verified - s.vreach, s.verified); } },
-    { key: "share", label: "Used verified / used", title: "used functions that are verified, over all used functions", metric: true,
+    { key: "share", label: "Reachable verified / reachable", title: "reachable functions that are verified, over all reachable functions", metric: true,
       cell: function (s) { return barCell(s.share, band(s.share), s.vreach, s.reach); } },
     { key: "fns", label: "Functions", num: true, cell: function (s) { return s.fns; } }
   ];
@@ -249,13 +249,13 @@ table.cov tbody tr:hover td { background: color-mix(in srgb, var(--accent) 6%, t
     h += '<div class="scope"><span class="label">Counting</span><span class="seg">' +
       '<button type="button" id="scope-all" data-scope="all" aria-pressed="' + (scope === "all") + '">exec + ghost</button>' +
       '<button type="button" id="scope-exec" data-scope="exec" aria-pressed="' + (scope === "exec") + '">exec only</button></span>' +
-      '<span class="muted">' + (scope === "all" ? "spec and proof functions count as verified code" : "spec and proof functions are left out of every count; what is used is unchanged") + '</span></div>';
+      '<span class="muted">' + (scope === "all" ? "spec and proof functions count as verified code" : "spec and proof functions are left out of every count; reachability is unchanged") + '</span></div>';
     h += '<div class="tiles">' +
-      tile("Unused verified / verified", TOTAL.dead, bandInv(TOTAL.dead), (TOTAL.verified - TOTAL.vreach) + " of " + TOTAL.verified + " verified functions nothing uses · " + modes) +
-      tile("Used verified / used", TOTAL.share, band(TOTAL.share), TOTAL.vreach + " of " + TOTAL.reach + " used functions are verified") +
+      tile("Unreachable verified / verified", TOTAL.dead, bandInv(TOTAL.dead), (TOTAL.verified - TOTAL.vreach) + " of " + TOTAL.verified + " verified functions nothing reaches · " + modes) +
+      tile("Reachable verified / reachable", TOTAL.share, band(TOTAL.share), TOTAL.vreach + " of " + TOTAL.reach + " reachable functions are verified") +
       '</div>';
-    h += '<div class="legend"><span class="vr">verified and used</span><span class="vd">verified but nothing uses it</span>' +
-      '<span class="ur">used but unverified</span><span class="uu">neither</span>' +
+    h += '<div class="legend"><span class="vr">verified and reachable</span><span class="vd">verified but nothing reaches it</span>' +
+      '<span class="ur">reachable but unverified</span><span class="uu">neither</span>' +
       '<span class="muted">trusted: an external_body proof or an uninterpreted spec, counted as verified</span>' +
       '<span class="muted">bars: green ≥ ' + HI + '%, amber ≥ ' + MED + '%, red below (genhtml limits)</span></div>';
     return h;
@@ -301,7 +301,7 @@ table.cov tbody tr:hover td { background: color-mix(in srgb, var(--accent) 6%, t
     var lines = f.source.split("\n");
     if (lines.length && lines[lines.length - 1] === "") lines.pop();
     var mark = new Array(lines.length + 1);
-    var painted = f.functions.slice().sort(function (a, b) { return (b.verified - a.verified) || (b.used - a.used); });
+    var painted = f.functions.slice().sort(function (a, b) { return (b.verified - a.verified) || (b.reachable - a.reachable); });
     painted.forEach(function (fn) {
       for (var l = fn.start; l <= fn.end && l <= lines.length; l++) if (!mark[l]) mark[l] = fn;
     });

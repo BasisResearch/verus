@@ -21,7 +21,7 @@ fn function(n: &Node, graph: &Graph) -> Value {
         "end": n.span.end_line,
         "verified": n.is_verified(),
         "trusted": n.is_trusted(),
-        "used": graph.is_used(n),
+        "reachable": graph.is_used(n),
     })
 }
 
@@ -185,8 +185,8 @@ mod tests {
         assert_eq!(x["file"]["source"], "fn a() {}\n");
         let fns = x["file"]["functions"].as_array().unwrap();
         let by_name = |name: &str| fns.iter().find(|f| f["name"] == name).unwrap();
-        assert_eq!(by_name("wired")["used"], true);
-        assert_eq!(by_name("spec_inc")["used"], false);
+        assert_eq!(by_name("wired")["reachable"], true);
+        assert_eq!(by_name("spec_inc")["reachable"], false);
         // 6 verified, 4 reachable; main and inc reachable but unverified
         let all = &x["totals"]["all"];
         assert_eq!(all["verified"], 6);
