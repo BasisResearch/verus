@@ -6,6 +6,7 @@ use smt_scope::items::QuantIdx;
 use smt_scope::parsers::LogParser;
 use smt_scope::parsers::z3::Z3Parser;
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 pub const PROVER_LOG_FILE: &str = "verus-prover-trace.log";
 
@@ -28,10 +29,42 @@ pub struct Profiler {
     instantiation_graph: InstantiationGraph,
 }
 
+/// An instantiation in an `InstantiationGraph`.
+pub type NodeId = (u64, usize);
+
+/// What the solver recorded about an instantiation besides its quantifier.
+/// A z3 trace yields only the depth, computed from its edges; cvc5's live
+/// graph (`InstantiationGraph::from_live`) yields all of it.
+#[derive(Clone, Debug, Default)]
+pub struct InstInfo {
+    /// The strategy that made it (a cvc5 inference id), when known. Shared
+    /// among the instantiations it made, like `names`.
+    pub strategy: Option<Arc<str>>,
+    /// The solver's instantiation round, from 1; 0 when unknown.
+    pub round: u64,
+    /// 0 without parents, otherwise one more than the deepest parent.
+    pub depth: u64,
+    /// The depth of its deepest instantiating term, when known.
+    pub term_depth: Option<u64>,
+}
+
+/// Edges run from the instantiation that introduced a term to those that
+/// matched it. `names` holds each instantiation's quantifier name (its
+/// `:qid`), one allocation per quantifier shared by all its instantiations, so
+/// a large graph costs little more than its structure. Queries are in
+/// `crate::inst_graph`.
+#[derive(Debug)]
 pub struct InstantiationGraph {
-    pub edges: HashMap<(u64, usize), HashSet<(u64, usize)>>,
-    pub names: HashMap<(u64, usize), String>,
-    pub nodes: HashSet<(u64, usize)>,
+    pub edges: HashMap<NodeId, HashSet<NodeId>>,
+    pub names: HashMap<NodeId, Arc<str>>,
+    pub nodes: HashSet<NodeId>,
+    pub info: HashMap<NodeId, InstInfo>,
+    /// Edges cvc5 attributes rather than observes (its `(eq ...)` list):
+    /// through a nested matched term, a binding or a representative. Kept
+    /// apart from `edges`; queries read `edges` only.
+    pub eq_edges: HashMap<NodeId, HashSet<NodeId>>,
+    /// Instantiations the solver made but did not record.
+    pub dropped: u64,
 }
 
 #[derive(Debug)]
@@ -54,7 +87,7 @@ impl Profiler {
     ) -> Result<InstantiationGraph, ProfilerError> {
         // Convert smt-scope's graph structure to our InstantiationGraph format
         let mut edges: HashMap<(u64, usize), HashSet<(u64, usize)>> = HashMap::new();
-        let mut names: HashMap<(u64, usize), String> = HashMap::new();
+        let mut names: HashMap<(u64, usize), Arc<str>> = HashMap::new();
         let mut nodes: HashSet<(u64, usize)> = HashSet::new();
 
         for (inst_idx, inst) in parser.instantiations().iter_enumerated() {
@@ -87,7 +120,7 @@ impl Profiler {
                     _ => format!("unknown_inst_{}", usize::from(inst_idx)),
                 }
             };
-            names.insert(inst_id, name);
+            names.insert(inst_id, name.into());
 
             // Get dependencies from the instantiation graph
             use petgraph::visit::EdgeRef;
@@ -107,11 +140,20 @@ impl Profiler {
             if !names.contains_key(node_id) {
                 // This shouldn't happen if we iterated through all instantiations,
                 // but add a fallback just in case
-                names.insert(*node_id, format!("unknown_node_{}", node_id.0));
+                names.insert(*node_id, format!("unknown_node_{}", node_id.0).into());
             }
         }
 
-        Ok(InstantiationGraph { edges, names, nodes })
+        let mut graph = InstantiationGraph {
+            edges,
+            names,
+            nodes,
+            info: HashMap::new(),
+            eq_edges: HashMap::new(),
+            dropped: 0,
+        };
+        graph.compute_depths();
+        Ok(graph)
     }
 
     fn compute_quantifier_costs(

@@ -49,6 +49,7 @@ pub fn assoc_type_decls_to_air(ctx: &Ctx, traits: &Vec<Trait>) -> Commands {
 pub fn assoc_type_impls_to_air(ctx: &Ctx, assocs: &Vec<AssocTypeImpl>) -> Commands {
     let mut commands: Vec<Command> = Vec::new();
     for assoc in assocs {
+        let start = commands.len();
         let AssocTypeImplX {
             name,
             impl_path,
@@ -112,6 +113,8 @@ pub fn assoc_type_impls_to_air(ctx: &Ctx, assocs: &Vec<AssocTypeImpl>) -> Comman
         } else {
             push_command(false, 0);
         }
+        let owner = path_as_friendly_rust_name(impl_path);
+        crate::sst_to_air::record_internal_qid_owners(ctx, &commands[start..], &owner);
     }
     Arc::new(commands)
 }

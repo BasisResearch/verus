@@ -1074,7 +1074,14 @@ pub fn trait_bound_axioms(ctx: &Ctx, traits: &Vec<Trait>) -> Commands {
             let forall = mk_bind_expr(&bind, &imply);
             let axiom =
                 Arc::new(DeclX::Axiom(air::ast::Axiom { named: None, tag: None, expr: forall }));
-            commands.push(Arc::new(CommandX::Global(axiom)));
+            let command = Arc::new(CommandX::Global(axiom));
+            let owner = path_as_friendly_rust_name(&tr.x.name);
+            crate::sst_to_air::record_internal_qid_owners(
+                ctx,
+                std::slice::from_ref(&command),
+                &owner,
+            );
+            commands.push(command);
         }
     }
     Arc::new(commands)
@@ -1366,7 +1373,10 @@ pub fn trait_impl_to_air(ctx: &Ctx, imp: &TraitImpl) -> Commands {
     let imply = mk_implies(&air::ast_util::mk_and(&req_bounds), &tr_bound);
     let forall = mk_bind_expr(&bind, &imply);
     let axiom = mk_unnamed_axiom(forall);
-    Arc::new(vec![Arc::new(CommandX::Global(axiom))])
+    let commands = vec![Arc::new(CommandX::Global(axiom))];
+    let owner = path_as_friendly_rust_name(&imp.x.impl_path);
+    crate::sst_to_air::record_internal_qid_owners(ctx, &commands, &owner);
+    Arc::new(commands)
 }
 
 pub fn check_no_dupe_impls(krate: &Krate) -> Result<(), VirErr> {

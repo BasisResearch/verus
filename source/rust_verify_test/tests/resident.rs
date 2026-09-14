@@ -724,6 +724,220 @@ fn resident_instantiation_replay_keeps_verdicts() {
     assert_eq!(resource_budgets(&logs), doubled);
 }
 
+/// Two quantifiers that feed each other: each instance of one introduces the
+/// trigger of the other, so e-matching never stops (a matching loop).
+const LOOP_SOURCE: &str = r#"
+use vstd::prelude::*;
+verus! {
+    uninterp spec fn enc(x: int) -> int;
+    uninterp spec fn dec(x: int) -> int;
+
+    proof fn roundtrip(a: int)
+        requires
+            forall|x: int| #[trigger] enc(x) > dec(enc(x)),
+            forall|y: int| #[trigger] dec(y) > enc(dec(y)),
+    {
+        assert(enc(a) == 0);
+    }
+
+    proof fn passing() { assert(1 + 1 == 2); }
+}
+"#;
+
+/// With `VERUS_RESIDENT_INST_GRAPH`, each check keeps its query's cvc5
+/// instantiation graph, and `inst_graph` requests answer from it with source
+/// spans. The loop's two quantifiers form the only cycle.
+#[test]
+fn resident_inst_graph_finds_the_matching_loop() {
+    let mut worker = Worker::start_with_env(
+        LOOP_SOURCE,
+        &["--rlimit", "1"],
+        &[("VERUS_RESIDENT_INST_GRAPH", "1")],
+    );
+    let ready = worker.receive();
+    assert_eq!(ready["event"], "ready", "{ready}");
+    assert_eq!(ready["inst_graph"], true);
+    let session = ready["session"].clone();
+    let looping = query_id(&ready, "::roundtrip");
+    let passing = query_id(&ready, "::passing");
+    let graph = |worker: &mut Worker<ChildStdin>, query: &Value, op: Value| {
+        let mut request =
+            json!({"command": "inst_graph", "session": session, "bucket": 0, "query": query});
+        request.as_object_mut().unwrap().extend(op.as_object().unwrap().clone());
+        worker.send(request)
+    };
+    // No graph before the query is checked.
+    let early = graph(&mut worker, &passing, json!({"op": "cycles"}));
+    assert_eq!(early["event"], "error", "{early}");
+
+    let checked =
+        worker.send(json!({"command": "check", "session": session, "bucket": 0, "query": looping}));
+    assert_eq!(checked["event"], "checked", "{checked}");
+    assert_ne!(checked["result"], "valid", "{checked}");
+    let summary = &checked["inst_graph"];
+    assert_eq!(summary["check"], "search", "{checked}");
+    assert!(summary["instantiations"].as_u64().unwrap() > 10, "{}", checked);
+    assert!(summary["edges"].as_u64().unwrap() > 5, "{}", checked);
+    assert!(summary["max_depth"].as_u64().unwrap() > 2, "{}", checked);
+
+    let cycles = graph(&mut worker, &looping, json!({"op": "cycles"}));
+    assert_eq!(cycles["event"], "inst_graph", "{cycles}");
+    let result = &cycles["result"];
+    assert_eq!(result["op"], "cycles");
+    let found = result["cycles"].as_array().unwrap();
+    assert_eq!(found.len(), 1, "{result}");
+    assert_eq!(found[0]["length"], 2, "{result}");
+    assert!(found[0]["repetitions"].as_u64().unwrap() > 5, "{}", result);
+    for node in found[0]["nodes"].as_array().unwrap() {
+        assert!(node["function"].as_str().unwrap().ends_with("::roundtrip"), "{}", node);
+        assert!(node["source_span"].as_str().unwrap().contains("fixture.rs"), "{}", node);
+    }
+    // Each unrolling is one deeper than the last.
+    let depths: Vec<u64> = found[0]["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| n["depth"].as_u64().unwrap())
+        .collect();
+    assert!(depths.windows(2).all(|pair| pair[1] == pair[0] + 1), "{:?}", depths);
+
+    // The loop's quantifiers are the costliest, and a filter on another
+    // function leaves nothing to report.
+    let cost = graph(&mut worker, &looping, json!({"op": "top_cost", "limit": 2}));
+    let ranked = cost["result"]["quantifiers"].as_array().unwrap();
+    let loop_qids: BTreeSet<&str> =
+        found[0]["quantifiers"].as_array().unwrap().iter().map(|q| q.as_str().unwrap()).collect();
+    let top: BTreeSet<&str> = ranked.iter().map(|q| q["qid"].as_str().unwrap()).collect();
+    assert_eq!(top, loop_qids, "{cost}");
+    // `source_fn` matches whole path segments: the loop's function and its
+    // crate find the loop, a partial segment or another crate does not.
+    let function = found[0]["nodes"][0]["function"].as_str().unwrap().to_owned();
+    let krate = function.strip_suffix("::roundtrip").unwrap().to_owned();
+    let partial = function.strip_suffix("trip").unwrap().to_owned();
+    for (source_fn, cycles) in
+        [(function.as_str(), 1), (krate.as_str(), 1), (partial.as_str(), 0), ("no_such_crate::", 0)]
+    {
+        let filtered = graph(
+            &mut worker,
+            &looping,
+            json!({"op": "cycles", "filter": {"source_fn": source_fn}}),
+        );
+        assert_eq!(
+            filtered["result"]["cycles"].as_array().unwrap().len(),
+            cycles,
+            "{source_fn}: {filtered}"
+        );
+    }
+    // Naming one member of the loop finds the whole loop.
+    let member = found[0]["quantifiers"][0].as_str().unwrap();
+    let named =
+        graph(&mut worker, &looping, json!({"op": "cycles", "filter": {"quantifier": member}}));
+    assert_eq!(named["result"]["cycles"][0]["length"], 2, "{}", named);
+
+    // The deepest instantiation descends from a root through the loop.
+    let deepest = found[0]["nodes"].as_array().unwrap().last().unwrap()["inst"].clone();
+    let path =
+        graph(&mut worker, &looping, json!({"op": "path", "to_inst": deepest, "limit": 1000}));
+    let chain = path["result"]["nodes"].as_array().unwrap();
+    assert_eq!(chain.last().unwrap()["inst"], deepest, "{path}");
+    assert_eq!(chain[0]["depth"], 0, "{path}");
+    let growth = graph(&mut worker, &looping, json!({"op": "growth"}));
+    assert_eq!(growth["result"]["step"], "round", "{growth}");
+    assert!(!growth["result"]["per_round"].as_array().unwrap().is_empty(), "{}", growth);
+    let pathless = graph(&mut worker, &looping, json!({"op": "path"}));
+    assert_eq!(pathless["event"], "error", "{pathless}");
+
+    // A healthy query records its own, smaller graph.
+    let healthy =
+        worker.send(json!({"command": "check", "session": session, "bucket": 0, "query": passing}));
+    assert_eq!(healthy["result"], "valid", "{healthy}");
+    assert!(healthy["inst_graph"].is_object(), "{}", healthy);
+    assert_eq!(worker.send(json!({"command": "close", "session": session}))["event"], "closed");
+    worker.finish(false);
+
+    // Without the variable, no graph is recorded or served.
+    let mut plain = Worker::start(LOOP_SOURCE, &["--rlimit", "1"]);
+    let ready = plain.receive();
+    assert_eq!(ready["inst_graph"], false);
+    let session = ready["session"].clone();
+    let checked =
+        plain.send(json!({"command": "check", "session": session, "bucket": 0, "query": passing}));
+    assert!(checked["inst_graph"].is_null(), "{}", checked);
+    let refused = plain.send(
+        json!({"command": "inst_graph", "session": session, "bucket": 0, "query": passing, "op": "cycles"}),
+    );
+    assert_eq!(refused["event"], "error", "{refused}");
+    assert_eq!(plain.send(json!({"command": "close", "session": session}))["event"], "closed");
+    plain.finish(false);
+}
+
+/// Every quantifier in a graph but the prelude's has an owner: a function's
+/// definition and pre/post axioms their function, a datatype's box and type
+/// axioms the datatype, so `source_fn` finds those too.
+#[test]
+fn resident_inst_graph_names_internal_axiom_owners() {
+    let source = r#"
+use vstd::prelude::*;
+verus! {
+    proof fn pushed(s: Seq<int>)
+        requires s.len() > 3,
+        ensures
+            s.push(1).len() == s.len() + 1,
+            s.subrange(0, 2).len() == 2,
+            s.push(7)[s.len() as int] == 7,
+    {
+    }
+}
+"#;
+    let mut worker = Worker::start_with_env(source, &[], &[("VERUS_RESIDENT_INST_GRAPH", "1")]);
+    let ready = worker.receive();
+    assert_eq!(ready["event"], "ready", "{}", ready);
+    let succeeded = ready["invocation_succeeded"].as_bool().unwrap();
+    let session = ready["session"].clone();
+    let query = query_id(&ready, "::pushed");
+    let checked =
+        worker.send(json!({"command": "check", "session": session, "bucket": 0, "query": query}));
+    assert_eq!(checked["result"], "valid", "{}", checked);
+    // Each node as (qid, owner).
+    let mut subgraph = |filter: Value| -> Vec<(String, Option<String>)> {
+        let reply = worker.send(json!({"command": "inst_graph", "session": session, "bucket": 0,
+            "query": query, "op": "subgraph", "limit": 1000, "filter": filter}));
+        reply["result"]["nodes"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{}", reply))
+            .iter()
+            .map(|n| {
+                (n["qid"].as_str().unwrap().to_owned(), n["function"].as_str().map(str::to_owned))
+            })
+            .collect()
+    };
+
+    let all = subgraph(json!({}));
+    for (qid, owner) in &all {
+        assert_eq!(owner.is_none(), qid.starts_with("prelude_"), "{} {:?}", qid, owner);
+    }
+    let owner_of = |qid: &str| all.iter().find(|(q, _)| q == qid).and_then(|(_, o)| o.clone());
+    let len = "internal_vstd!seq.Seq.len.?_pre_post_definition";
+    assert_eq!(owner_of(len).as_deref(), Some("vstd::seq::Seq::len"), "{:?}", all);
+    let (boxed, boxed_owner) = all
+        .iter()
+        .find(|(q, _)| {
+            q.starts_with("internal_vstd__seq__Seq<") && q.ends_with("_axiom_definition")
+        })
+        .unwrap_or_else(|| panic!("no datatype axiom in {:?}", all));
+    assert!(boxed_owner.as_deref().unwrap().starts_with("vstd::seq::Seq<"), "{:?}", boxed_owner);
+
+    // The datatype's path takes its axioms, its instantiations' and its
+    // methods', and nothing else.
+    let seq = subgraph(json!({"source_fn": "vstd::seq::Seq"}));
+    assert!(seq.iter().any(|(q, _)| q == boxed) && seq.iter().any(|(q, _)| q == len), "{:?}", seq);
+    for (qid, owner) in &seq {
+        assert!(owner.as_deref().unwrap().starts_with("vstd::seq::Seq"), "{} {:?}", qid, owner);
+    }
+    assert_eq!(worker.send(json!({"command": "close", "session": session}))["event"], "closed");
+    worker.finish(succeeded);
+}
+
 /// The contents of a worker's SMT logs.
 fn smt_logs(worker_dir: &Path) -> Vec<String> {
     fs::read_dir(worker_dir.join("logs"))
@@ -1225,6 +1439,43 @@ fn resident_rejects_bad_requests_and_accepts_eof() {
     assert_eq!(checked["result"], "valid");
     // Restoration is reported apart from the check it precedes.
     assert!(checked["restore_ms"].is_number(), "{}", checked);
+    worker.finish(true);
+}
+
+/// `ready` names the requests the worker serves, so a client can tell a
+/// request this build does not have from one it rejected: both answer with the
+/// same error otherwise.
+#[test]
+fn resident_ready_lists_the_requests_it_serves() {
+    let mut worker = Worker::start("use vstd::prelude::*; verus! { proof fn passing() {} }", &[]);
+    let ready = worker.receive();
+    let commands: Vec<String> = ready["commands"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{}", ready))
+        .iter()
+        .map(|command| command.as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(commands, ["list", "check", "bisect", "egraph", "close", "inst_graph"], "{ready}");
+    // Each listed request parses: a stale session is refused as a session,
+    // not as an unknown request, so the list cannot drift from `Request`.
+    for command in &commands {
+        let request = match command.as_str() {
+            "list" | "close" => json!({"command": command, "session": "stale"}),
+            "check" | "egraph" => {
+                json!({"command": command, "session": "stale", "bucket": 0, "query": 0})
+            }
+            "bisect" => {
+                json!({"command": command, "session": "stale", "bucket": 0, "query": 0, "mode": "flip"})
+            }
+            "inst_graph" => {
+                json!({"command": command, "session": "stale", "bucket": 0, "query": 0, "op": "cycles"})
+            }
+            _ => panic!("no request for {}", command),
+        };
+        let reply = worker.send(request);
+        assert_eq!(reply["event"], "error", "{command}: {reply}");
+        assert_ne!(reply["message"], "invalid resident request", "{command}: {reply}");
+    }
     worker.finish(true);
 }
 

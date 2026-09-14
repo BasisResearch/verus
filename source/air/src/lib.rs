@@ -4,6 +4,7 @@ pub mod bisect;
 pub mod context;
 pub mod emitter;
 pub mod focus;
+pub mod inst_graph;
 pub mod instantiations;
 pub mod messages;
 pub mod model;

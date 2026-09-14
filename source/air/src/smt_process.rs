@@ -120,6 +120,7 @@ impl SmtProcess {
         provenance: bool,
         difficulty: bool,
         instantiation_replay: bool,
+        inst_graph: bool,
         matching_loops: bool,
         inst_max_rounds: Option<u32>,
     ) -> Self {
@@ -160,6 +161,15 @@ impl SmtProcess {
             // refutation used. The full set is no certificate: replayed
             // alone it answered slower than an ordinary recheck.
             args.push("--produce-proofs");
+        }
+        if inst_graph {
+            assert!(matches!(solver, SmtSolver::Cvc5));
+            // Record which instantiation introduced the terms each one
+            // matched, for `(get-instantiation-graph)`. A resident session
+            // keeps one graph per query, so each is capped well below cvc5's
+            // default of a million; the rest are counted as dropped.
+            args.push("--inst-graph");
+            args.push("--inst-graph-max=100000");
         }
         if matching_loops {
             assert!(matches!(solver, SmtSolver::Cvc5));

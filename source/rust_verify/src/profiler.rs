@@ -17,9 +17,10 @@ pub fn write_instantiation_graph(
     qid_map: &HashMap<String, vir::sst::BndInfo>,
     profile_file_name: std::path::PathBuf,
 ) {
-    let air::profiler::InstantiationGraph { edges, nodes, names } = instantiation_graph;
+    // The internals format keeps the graph's shape and names only.
+    let air::profiler::InstantiationGraph { edges, nodes, names, .. } = instantiation_graph;
     use internals_interface::*;
-    let name_strs: HashSet<String> = names.values().cloned().collect();
+    let name_strs: HashSet<String> = names.values().map(|name| name.to_string()).collect();
     let quantifiers: HashMap<String, Quantifier> = name_strs
         .iter()
         .map(|n| {
@@ -51,7 +52,7 @@ pub fn write_instantiation_graph(
             (
                 n.clone(),
                 std::rc::Rc::new(InstantiationX {
-                    quantifier: quantifiers[&names[n]].clone(),
+                    quantifier: quantifiers[&*names[n]].clone(),
                     id: *n,
                 }),
             )

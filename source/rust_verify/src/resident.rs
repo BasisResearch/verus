@@ -40,12 +40,14 @@ use air::ast::{CommandX, Commands, Query};
 use air::context::{
     Context, EgraphReply, EgraphRequest, QueryContext, SmtSolver, ValidityResult, VariableVersions,
 };
+use air::inst_graph::{GraphFilter, GraphOp, GraphReply, GraphSummary, Site};
 use air::instantiations::ImportInstantiations;
 use air::messages::{ArcDynMessage, Diagnostics, MessageLevel};
+use air::profiler::InstantiationGraph;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::cell::RefCell;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::{self, BufRead, Read, Write};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -133,6 +135,14 @@ pub(crate) struct QueryJournal {
     recorded_in_scope: bool,
 }
 
+/// The requests this worker serves, as `ready` reports them. A client reads
+/// the list rather than guessing from `protocol`: requests reach releases in
+/// their own order, and a worker that does not know a request answers exactly
+/// as it does a malformed one. Every `Request` variant belongs here, in the
+/// protocol's snake case, which `resident_ready_lists_the_requests_it_serves`
+/// checks by sending each one.
+const COMMANDS: &[&str] = &["list", "check", "bisect", "egraph", "close", "inst_graph"];
+
 #[derive(Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]
 enum Request {
@@ -179,6 +189,43 @@ enum Request {
     Close {
         session: String,
     },
+    /// Query the instantiation graph the last check of this query recorded.
+    /// `path` needs `to_inst`, and starts from `from_qid` or else a root.
+    InstGraph {
+        session: String,
+        bucket: BucketIndex,
+        query: QueryId,
+        op: GraphOpName,
+        #[serde(default)]
+        filter: GraphFilterRequest,
+        from_qid: Option<String>,
+        to_inst: Option<u64>,
+        /// How many items the answer lists at most: 1 to 1000, default 20.
+        limit: Option<usize>,
+    },
+}
+
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum GraphOpName {
+    Cycles,
+    TopCost,
+    Subgraph,
+    Path,
+    Growth,
+}
+
+/// Which instantiations an `inst_graph` request looks at. Every given field
+/// restricts them further.
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GraphFilterRequest {
+    /// Only instantiations of this `:qid`.
+    quantifier: Option<String>,
+    /// Only quantifiers owned at this path or inside it, by whole segments:
+    /// a function's, or for internal axioms a datatype's, trait's or impl's.
+    source_fn: Option<String>,
+    min_depth: Option<u64>,
 }
 
 #[derive(Clone, Copy, Deserialize, Serialize)]
@@ -335,6 +382,68 @@ fn certificate_key(function: &str, kind: QueryKind, description: &str, repeat: u
 /// The most a certificate file may hold for it to be read.
 const MAX_CERTIFICATE_BYTES: u64 = 64 << 20;
 
+/// The largest `inst_graph` reply sent. A larger answer is refused with an
+/// error instead: a caller that caps replies (the MCP client, at 16 MiB)
+/// would otherwise take it for a dead worker and end the session.
+const MAX_GRAPH_REPLY_BYTES: usize = 8 << 20;
+
+/// The most instantiations a session's kept graphs hold together: about ten
+/// graphs at the solver's per-check cap (`--inst-graph-max=100000`). A graph at
+/// the cap takes about 34 MB, so without a budget a session that checks many
+/// looping queries would grow without bound.
+const MAX_KEPT_INSTANTIATIONS: usize = 1_000_000;
+
+/// Each query's instantiation graph from its last check, keyed by (bucket,
+/// query). Past `budget` instantiations in all, the graphs least recently
+/// checked or queried are dropped, never the one just kept.
+struct KeptGraphs {
+    graphs: HashMap<(usize, usize), (InstantiationGraph, u64)>,
+    budget: usize,
+    total: usize,
+    clock: u64,
+}
+
+impl KeptGraphs {
+    fn new(budget: usize) -> Self {
+        Self { graphs: HashMap::new(), budget, total: 0, clock: 0 }
+    }
+
+    fn tick(&mut self) -> u64 {
+        self.clock += 1;
+        self.clock
+    }
+
+    fn insert(&mut self, key: (usize, usize), graph: InstantiationGraph) {
+        self.remove(&key);
+        self.total += graph.nodes.len();
+        let used = self.tick();
+        self.graphs.insert(key, (graph, used));
+        while self.total > self.budget {
+            let oldest = self
+                .graphs
+                .iter()
+                .filter(|(other, _)| **other != key)
+                .min_by_key(|(_, (_, used))| *used)
+                .map(|(other, _)| *other);
+            let Some(oldest) = oldest else { break };
+            self.remove(&oldest);
+        }
+    }
+
+    fn remove(&mut self, key: &(usize, usize)) {
+        if let Some((graph, _)) = self.graphs.remove(key) {
+            self.total -= graph.nodes.len();
+        }
+    }
+
+    fn get(&mut self, key: &(usize, usize)) -> Option<&InstantiationGraph> {
+        let used = self.tick();
+        let (graph, last) = self.graphs.get_mut(key)?;
+        *last = used;
+        Some(graph)
+    }
+}
+
 /// The text of the certificate at `path`, if it is a regular file of at most
 /// `MAX_CERTIFICATE_BYTES`. The directory is shared, so anything may sit at
 /// that name. On unix the file is opened without blocking, so a FIFO there
@@ -384,6 +493,11 @@ fn write_certificate(air: &mut Context, dir: &std::path::Path, key: &str) {
 pub(crate) struct Server {
     buckets: Vec<RetainedBucket>,
     info: SessionInfo,
+    /// (bucket, query) -> the instantiation graph of its last check, when
+    /// the solvers record them, within `MAX_KEPT_INSTANTIATIONS`. Queries
+    /// read these; they never reach the solver, so they cannot change its
+    /// state.
+    graphs: KeptGraphs,
 }
 
 /// What a session reports about the invocation behind it, and the settings a
@@ -409,6 +523,9 @@ pub(crate) struct SessionInfo {
     /// Whether ordinary cvc5 solvers were launched for instantiation replay
     /// (`VERUS_RESIDENT_INST_REPLAY`), so rechecks try certificates first.
     pub(crate) instantiation_replay: bool,
+    /// Whether cvc5 solvers were launched recording instantiation graphs
+    /// (`VERUS_RESIDENT_INST_GRAPH`), so each check keeps its graph.
+    pub(crate) inst_graph: bool,
 }
 
 #[derive(Serialize)]
@@ -416,6 +533,8 @@ pub(crate) struct SessionInfo {
 enum Response<'a> {
     Ready {
         protocol: u32,
+        /// The requests this worker serves; see `COMMANDS`.
+        commands: &'a [&'a str],
         session: &'a str,
         process_id: u32,
         invocation_succeeded: bool,
@@ -425,6 +544,7 @@ enum Response<'a> {
         spinoff_all: bool,
         smt_options: &'a [(String, String)],
         instantiation_replay: bool,
+        inst_graph: bool,
         input_files: &'a [String],
         buckets: &'a [BucketDescription],
     },
@@ -451,6 +571,17 @@ enum Response<'a> {
         difficulty: Option<&'a crate::provenance::ResolvedQueryDifficulty>,
         /// Present when this check tried a certificate before searching.
         certificate: Option<CertificateAttempt>,
+        /// The size of the instantiation graph this check kept, in a
+        /// session that records them.
+        inst_graph: Option<GraphSummary>,
+        /// Why a session that records graphs kept none for this check.
+        inst_graph_error: Option<String>,
+    },
+    InstGraph {
+        session: &'a str,
+        bucket: BucketIndex,
+        query: QueryId,
+        result: &'a GraphReply,
     },
     Bisected {
         session: &'a str,
@@ -1400,7 +1531,7 @@ impl Server {
         // Compilation can finish in any order. Protocol ordinals follow the
         // verifier's bucket identity, not worker completion order.
         buckets.sort_by(|left, right| left.id.cmp(&right.id));
-        Self { buckets, info }
+        Self { buckets, info, graphs: KeptGraphs::new(MAX_KEPT_INSTANTIATIONS) }
     }
 
     pub(crate) fn serve(
@@ -1462,6 +1593,7 @@ impl Server {
             &mut output,
             &Response::Ready {
                 protocol: 2,
+                commands: COMMANDS,
                 session,
                 process_id: std::process::id(),
                 invocation_succeeded,
@@ -1471,6 +1603,7 @@ impl Server {
                 spinoff_all: self.info.spinoff_all,
                 smt_options: &self.info.smt_options,
                 instantiation_replay: self.info.instantiation_replay,
+                inst_graph: self.info.inst_graph,
                 input_files: &self.info.input_files,
                 buckets: &buckets,
             },
@@ -1513,6 +1646,7 @@ impl Server {
                 | Request::Bisect { session: requested, .. }
                 | Request::Egraph { session: requested, .. }
                 | Request::Close { session: requested }
+                | Request::InstGraph { session: requested, .. }
                     if requested != session =>
                 {
                     send(
@@ -1745,6 +1879,30 @@ impl Server {
                     // The response describes round zero. Later error searches
                     // replace AIR's provenance, even when their verdict differs.
                     let first_provenance = air.take_provenance();
+                    // The graph of the check that decided the verdict: the
+                    // certificate attempt's when it closed the query, else
+                    // the search's. Later error rounds search again, which
+                    // replaces the solver's record, so it is read now. A
+                    // query with nothing to instantiate (bit-vector,
+                    // nonlinear) gets an empty graph; an error comes only
+                    // when cvc5 cannot answer.
+                    let graph = air
+                        .inst_graph()
+                        .then(|| InstantiationGraph::from_live(&air.instantiation_graph()));
+                    let (graph_summary, graph_error) = match graph {
+                        Some(Ok(graph)) => {
+                            let mut summary = graph.summary();
+                            let certified = attempted.as_ref().is_some_and(|a| a.closed);
+                            summary.check = Some(if certified { "certificate" } else { "search" });
+                            self.graphs.insert((bucket_id.0, id.0), graph);
+                            (Some(summary), None)
+                        }
+                        Some(Err(error)) => {
+                            self.graphs.remove(&(bucket_id.0, id.0));
+                            (None, Some(error))
+                        }
+                        None => (None, None),
+                    };
                     let first_unknown_reason = air.take_unknown_reason();
                     let first_matching_loops = air.take_matching_loops();
                     let first_difficulty = air.take_difficulty();
@@ -1968,8 +2126,99 @@ impl Server {
                             matching_loops: matching_loops.as_ref(),
                             difficulty: difficulty.as_ref(),
                             certificate: attempted,
+                            inst_graph: graph_summary,
+                            inst_graph_error: graph_error,
                         },
                     )?;
+                }
+                Request::InstGraph {
+                    bucket: bucket_id,
+                    query: id,
+                    op,
+                    filter,
+                    from_qid,
+                    to_inst,
+                    limit,
+                    ..
+                } => {
+                    let Some(bucket) = self.buckets.get(bucket_id.0) else {
+                        send(&mut output, &Response::Error { message: "unknown bucket" })?;
+                        continue;
+                    };
+                    if bucket.queries.get(id.0).is_none() {
+                        send(&mut output, &Response::Error { message: "unknown query" })?;
+                        continue;
+                    }
+                    let Some(graph) = self.graphs.get(&(bucket_id.0, id.0)) else {
+                        let message = format!(
+                            "no instantiation graph for this query; check it in a session that records them. Past {MAX_KEPT_INSTANTIATIONS} instantiations in all, a session drops its least recently used graphs"
+                        );
+                        send(&mut output, &Response::Error { message: &message })?;
+                        continue;
+                    };
+                    let op = match (op, to_inst) {
+                        (GraphOpName::Cycles, _) => GraphOp::Cycles,
+                        (GraphOpName::TopCost, _) => GraphOp::TopCost,
+                        (GraphOpName::Subgraph, _) => GraphOp::Subgraph,
+                        (GraphOpName::Growth, _) => GraphOp::Growth,
+                        (GraphOpName::Path, Some(to_inst)) => GraphOp::Path { from_qid, to_inst },
+                        (GraphOpName::Path, None) => {
+                            send(
+                                &mut output,
+                                &Response::Error { message: "path requires to_inst" },
+                            )?;
+                            continue;
+                        }
+                    };
+                    let mut quantifiers = filter.quantifier.map(|qid| HashSet::from([qid]));
+                    if let Some(prefix) = &filter.source_fn {
+                        let Some(symbols) = &bucket.symbols else {
+                            send(
+                                &mut output,
+                                &Response::Error {
+                                    message: "source_fn needs the bucket's symbols",
+                                },
+                            )?;
+                            continue;
+                        };
+                        let owned = symbols.quantifiers_of(prefix);
+                        quantifiers = Some(match quantifiers {
+                            Some(named) => named.intersection(&owned).cloned().collect(),
+                            None => owned,
+                        });
+                    }
+                    let filter = GraphFilter { quantifiers, min_depth: filter.min_depth };
+                    match graph.query(&op, &filter, limit.unwrap_or(20).clamp(1, 1000)) {
+                        Ok(mut reply) => {
+                            if let Some(symbols) = &bucket.symbols {
+                                reply.answer.annotate(|qid| {
+                                    symbols.quantifier_site(qid).map(|(function, span)| Site {
+                                        function: function.to_owned(),
+                                        span: span.map(str::to_owned),
+                                    })
+                                });
+                            }
+                            let response = Response::InstGraph {
+                                session,
+                                bucket: bucket_id,
+                                query: id,
+                                result: &reply,
+                            };
+                            let text =
+                                serde_json::to_string(&response).map_err(io::Error::other)?;
+                            if text.len() > MAX_GRAPH_REPLY_BYTES {
+                                let message = format!(
+                                    "the {}-byte answer is over the {MAX_GRAPH_REPLY_BYTES}-byte limit; lower limit or narrow the filter",
+                                    text.len()
+                                );
+                                send(&mut output, &Response::Error { message: &message })?;
+                            } else {
+                                writeln!(output, "{text}")?;
+                                output.flush()?;
+                            }
+                        }
+                        Err(message) => send(&mut output, &Response::Error { message: &message })?,
+                    }
                 }
             }
         }
@@ -2005,6 +2254,44 @@ mod tests {
         air::parser::Parser::new(Arc::new(VirMessageInterface {}))
             .nodes_to_commands(&nodes)
             .unwrap()
+    }
+
+    /// `COMMANDS` names every request, so a client that reads `ready` and
+    /// skips what it does not list never skips one this worker serves. serde
+    /// names the variants it knows when it meets one it does not, which keeps
+    /// this honest without writing the list out a second time.
+    #[test]
+    fn commands_names_every_request() {
+        let refused = serde_json::from_str::<Request>(r#"{"command": "no_such_request"}"#);
+        let Err(error) = refused else { panic!("an unknown command is refused") };
+        let error = error.to_string();
+        // unknown variant `no_such_request`, expected one of `list`, `check`, ...
+        let names: BTreeSet<&str> = error.split('`').skip(3).step_by(2).collect();
+        assert!(names.contains("list"), "unexpected serde message: {error}");
+        assert_eq!(names, COMMANDS.iter().copied().collect::<BTreeSet<_>>(), "{error}");
+    }
+
+    #[test]
+    fn kept_graphs_drop_the_least_recently_used_past_the_budget() {
+        let graph = |n: usize| {
+            let mut lines = vec!["(instantiation-graph".to_owned(), "(quantifier 0 q)".to_owned()];
+            lines.extend((0..n).map(|i| format!("(node {i} 0 X 1 0 0 ())")));
+            lines.extend(["(dropped 0)".to_owned(), ")".to_owned()]);
+            InstantiationGraph::from_live(&lines).unwrap()
+        };
+        let mut kept = KeptGraphs::new(10);
+        kept.insert((0, 0), graph(4));
+        kept.insert((0, 1), graph(4));
+        // Reading (0, 0) leaves (0, 1) the least recently used.
+        assert!(kept.get(&(0, 0)).is_some());
+        kept.insert((0, 2), graph(4));
+        assert!(kept.get(&(0, 1)).is_none());
+        assert!(kept.get(&(0, 0)).is_some() && kept.get(&(0, 2)).is_some());
+        assert_eq!(kept.total, 8);
+        // A recheck replaces its query's graph, and the graph just kept stays
+        // even when it alone is over the budget.
+        kept.insert((0, 2), graph(12));
+        assert_eq!((kept.graphs.len(), kept.total), (1, 12));
     }
 
     #[test]
@@ -2319,6 +2606,7 @@ mod tests {
                 input_files: Vec::new(),
                 smt_options: Vec::new(),
                 instantiation_replay: false,
+                inst_graph: false,
             },
         );
         let input = format!("{}\n{{\"command\":\"list\"}}\n", " ".repeat(65537));

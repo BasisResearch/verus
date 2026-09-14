@@ -731,6 +731,7 @@ impl Verifier {
                 multiple_errors: self.args.multiple_errors,
                 smt_options: self.args.smt_options.clone(),
                 instantiation_replay: self.instantiation_replay(),
+                inst_graph: self.inst_graph(),
                 input_files: std::mem::take(&mut self.resident_inputs),
             },
         )
@@ -1469,6 +1470,15 @@ impl Verifier {
             && std::env::var_os("VERUS_RESIDENT_INST_REPLAY").is_some()
     }
 
+    /// Resident checks record each query's instantiation graph for later
+    /// queries (`inst_graph` requests, see resident.rs). Read-only: the
+    /// solver only keeps a record of what it instantiated.
+    fn inst_graph(&self) -> bool {
+        self.args.resident
+            && matches!(self.args.solver, air::context::SmtSolver::Cvc5)
+            && std::env::var_os("VERUS_RESIDENT_INST_GRAPH").is_some()
+    }
+
     fn new_air_context_with_prelude<'m>(
         &mut self,
         ctx: &vir::context::Ctx,
@@ -1503,6 +1513,9 @@ impl Verifier {
         }
         if self.instantiation_replay() {
             air_context.set_instantiation_replay(true);
+        }
+        if self.inst_graph() {
+            air_context.set_inst_graph(true);
         }
         air_context.set_ignore_unexpected_smt(self.args.ignore_unexpected_smt);
         air_context.set_debug(self.args.debugger);

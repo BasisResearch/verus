@@ -3153,6 +3153,27 @@ pub(crate) fn record_qid_type_binders(
     }
 }
 
+/// Record `owner` (a friendly path) for every `:qid` in the axioms among
+/// `commands` that `qid_map` does not know: the internal quantifiers made for
+/// a datatype, trait, impl or type outside any function.
+pub(crate) fn record_internal_qid_owners(ctx: &Ctx, commands: &[air::ast::Command], owner: &str) {
+    let mut qids: Vec<air::ast::Ident> = Vec::new();
+    for command in commands {
+        if let CommandX::Global(decl) = &**command {
+            if let DeclX::Axiom(axiom) = &**decl {
+                air::ast_util::quantifier_ids(&axiom.expr, &mut qids);
+            }
+        }
+    }
+    let qid_map = ctx.global.qid_map.borrow();
+    let mut owners = ctx.global.internal_qid_owners.borrow_mut();
+    for qid in qids {
+        if !qid_map.contains_key(&*qid) {
+            owners.entry(qid.to_string()).or_insert_with(|| owner.to_owned());
+        }
+    }
+}
+
 /// A hypothesis axiom of the current function's query, tagged `hyp_k` with
 /// `k` the next free index for the function, and its source recorded in
 /// `GlobalCtx::hyp_map`. Falls back to an untagged axiom outside a function.

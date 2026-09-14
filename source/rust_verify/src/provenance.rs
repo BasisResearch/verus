@@ -711,6 +711,8 @@ pub(crate) struct Symbols {
     hypotheses: HashMap<Fun, Vec<Hypothesis>>,
     quantifiers: HashMap<String, Quantifier>,
     axiom_owners: HashMap<String, String>,
+    /// Owners of the internal quantifiers `quantifiers` has no function for.
+    internal_qid_owners: HashMap<String, String>,
     source_names: vir::air_names::SourceNames,
     /// Friendly function name -> the function's span, when recorded (see
     /// `with_function_spans`).
@@ -721,6 +723,35 @@ pub(crate) struct Symbols {
 }
 
 impl Symbols {
+    /// What a generated `:qid` belongs to: its function or, for an internal
+    /// quantifier made outside any function, the datatype, trait or impl it
+    /// was made for. For a quantifier the user wrote, also its source span.
+    pub(crate) fn quantifier_site(&self, qid: &str) -> Option<(&str, Option<&str>)> {
+        match self.quantifiers.get(qid) {
+            Some(q) => Some((q.fun.as_str(), q.span.as_deref())),
+            None => self.internal_qid_owners.get(qid).map(|owner| (owner.as_str(), None)),
+        }
+    }
+
+    /// Every `:qid` owned at `path` or inside it, matching whole segments:
+    /// `a::S` takes `a::S`, `a::S::f` and `a::S<int.>` but not `a::Seq`. The
+    /// prelude's quantifiers belong to nothing and are never found.
+    pub(crate) fn quantifiers_of(&self, path: &str) -> std::collections::HashSet<String> {
+        let path = path.strip_suffix("::").unwrap_or(path);
+        let within = |owner: &str| {
+            owner.strip_prefix(path).is_some_and(|rest| {
+                rest.is_empty() || rest.starts_with("::") || rest.starts_with('<')
+            })
+        };
+        let functions = self.quantifiers.iter().map(|(qid, q)| (qid, q.fun.as_str()));
+        let internal = self.internal_qid_owners.iter().map(|(qid, owner)| (qid, owner.as_str()));
+        functions
+            .chain(internal)
+            .filter(|(_, owner)| within(owner))
+            .map(|(qid, _)| qid.clone())
+            .collect()
+    }
+
     pub(crate) fn capture(
         global: &vir::context::GlobalCtx,
         source_names: vir::air_names::SourceNames,
@@ -753,6 +784,7 @@ impl Symbols {
             hypotheses,
             quantifiers,
             axiom_owners: global.axiom_owners.borrow().clone(),
+            internal_qid_owners: global.internal_qid_owners.borrow().clone(),
             source_names,
             function_spans: HashMap::new(),
             crate_name: vir::def::krate_to_string_ignore_stable_id(&global.crate_name),
@@ -1514,6 +1546,7 @@ mod tests {
                 },
             )]),
             axiom_owners: HashMap::new(),
+            internal_qid_owners: HashMap::new(),
             source_names: HashMap::new(),
             function_spans: HashMap::from([("crate::area".to_string(), def_span.to_string())]),
             crate_name: "crate".to_string(),

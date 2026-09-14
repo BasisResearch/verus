@@ -29,17 +29,18 @@ asset_x86_linux = "z3-x86-linux"
 sha256_x86_linux = "99f5433928fa62adc3a19207d97b14111d62964e26b10b37d286f9e641e0dfbf"
 
 [cvc5]
-# Fork `main` at 3a6d3d6ec9: carries `:assert-id` provenance tags through
+# Fork `main` at c893833109: carries `:assert-id` provenance tags through
 # preprocessing, answers `(get-assertion-sources)`, saves, restores, exports
 # and imports quantifier instantiations (resident certificates), lists what
-# the e-graph holds after a check (`(get-egraph-equalities)`), and reports
+# the e-graph holds after a check (`(get-egraph-equalities)`), reports
 # matching loops, per-quantifier instantiation pressure, per-assertion
 # difficulty and why a check gave up (`:incomplete-id`, its culprit
-# quantifiers) through `(get-info ...)`.
-version = "1.3.5.dev+main@3a6d3d6"
+# quantifiers) through `(get-info ...)`, and records the instantiation graph
+# of a check (`--inst-graph`, `(get-instantiation-graph)`).
+version = "1.3.5.dev+main@c893833"
 repo = "BasisResearch/cvc5"
-tag = "basis-3a6d3d6ec9"
+tag = "basis-c893833109"
 asset_arm64_macos = "cvc5-arm64-macos"
-sha256_arm64_macos = "792e76eb6b20190d785b044c966bc139250dc77fd07647e3af17bc003e473cdb"
+sha256_arm64_macos = "6027eea05b6f37df924c705428b30866bd79c5c0c069e7c51457d2080a51dc45"
 asset_x86_linux = "cvc5-x86-linux"
-sha256_x86_linux = "354661c19ad689078442a39077dbf647e25cc1e5a5b17f969830017ea54cda1c"
+sha256_x86_linux = "b78c86f05b573fb82f51ae0f6b2edc21cfa087cf302d5f689cc00d2c2d6f00b3"
