@@ -234,15 +234,15 @@ pub struct Graph {
     /// Used by ghost code: reached from a running function through a
     /// contract or proof, then through anything
     pub used: HashSet<String>,
-    /// The reached functions (reachable, or used ghost functions) plus the
-    /// functions that mention one directly, through an edge of any kind:
+    /// The used functions plus the functions that mention one directly,
+    /// through an edge of any kind:
     /// one hop against the edges' direction. Only edges between functions
     /// of the analyzed crates count; a hop onto a type or a foreign item
     /// (everything constructs an `Option`) would gather the whole crate.
     /// Reachable is a subset. The rest is where explicit roots hide:
     /// theorems about reachable functions that nothing calls.
     pub connected: HashSet<String>,
-    /// Ids some function refers to
+    /// Ids some other function refers to
     referred: HashSet<String>,
 }
 
@@ -308,17 +308,18 @@ impl Graph {
         }
 
         // One hop against the edges, between functions only
-        let covered = |id: &String| {
-            nodes
-                .get(id)
-                .map_or(false, |n| reachable.contains(id) || (n.is_ghost() && used.contains(id)))
-        };
+        let covered =
+            |id: &String| nodes.contains_key(id) && (reachable.contains(id) || used.contains(id));
         let mut referred = HashSet::new();
         let mut connected: HashSet<String> =
             nodes.keys().filter(|id| covered(id)).cloned().collect();
         for edge in reports.iter().flat_map(|r| r.edges.iter()) {
             if nodes.contains_key(&edge.from) {
-                referred.insert(edge.to.clone());
+                // A function mentioning itself (its own result in its
+                // contract, recursion) has no referrer
+                if edge.from != edge.to {
+                    referred.insert(edge.to.clone());
+                }
                 if covered(&edge.to) {
                     connected.insert(edge.from.clone());
                 }
@@ -327,29 +328,37 @@ impl Graph {
         Ok(Graph { nodes, roots: root_ids, reachable, used, connected, referred })
     }
 
-    /// Verified functions that mention reached code but are not reachable:
-    /// what the roots miss, one step against the edges.
+    /// Verified functions that mention used code but are not used: what the
+    /// roots miss, one step against the edges.
     pub fn connected_unreachable(&self) -> Vec<&Node> {
         self.nodes
             .values()
-            .filter(|n| n.is_verified() && self.connected.contains(&n.id) && !self.is_reachable(n))
+            .filter(|n| n.is_verified() && self.connected.contains(&n.id) && !self.is_used(n))
             .collect()
     }
 
-    /// Candidates for `#[verifier::reach_root]`: ghost functions that
-    /// mention reached code and that nothing refers to, so they are
-    /// top-level statements.
+    /// Candidates for `#[verifier::reach_root]`: functions that mention used
+    /// code and that nothing refers to, so they are top-level statements: a
+    /// theorem, or an exec round-trip check that calls the real code.
     pub fn suggested_roots(&self) -> Vec<&Node> {
         self.connected_unreachable()
             .into_iter()
-            .filter(|n| n.is_ghost() && !self.referred.contains(&n.id))
+            .filter(|n| !self.referred.contains(&n.id))
             .collect()
     }
 
     /// An exec function is reachable when it runs; a ghost function, when
-    /// running code uses it.
+    /// running code uses it. Kept apart from [`Graph::is_used`] for
+    /// comparison with dynamic coverage, which sees only what runs.
     pub fn is_reachable(&self, node: &Node) -> bool {
         self.reachable.contains(&node.id) || (node.is_ghost() && self.used.contains(&node.id))
+    }
+
+    /// The verification effort contributes to real behavior: the function
+    /// runs, or the contracts and proofs of code that runs or is used
+    /// mention it. What the outputs show, exec and ghost alike.
+    pub fn is_used(&self, node: &Node) -> bool {
+        self.reachable.contains(&node.id) || self.used.contains(&node.id)
     }
 
     /// The roots, by display name
@@ -357,12 +366,12 @@ impl Graph {
         self.roots.iter().map(|id| self.nodes[id].def_path.as_str()).collect()
     }
 
-    /// Verified functions, exec and ghost: (reachable, total)
+    /// Verified functions, exec and ghost: (used, total)
     pub fn coverage(&self) -> (usize, usize) {
         self.count(Node::is_verified)
     }
 
-    /// Verified exec functions: (reachable, total)
+    /// Verified exec functions: (used, total)
     pub fn exec_coverage(&self) -> (usize, usize) {
         self.count(Node::is_verified_exec)
     }
@@ -375,7 +384,7 @@ impl Graph {
     fn count(&self, select: fn(&Node) -> bool) -> (usize, usize) {
         let fns = self.nodes.values().filter(|n| select(n));
         let total = fns.clone().count();
-        (fns.filter(|n| self.is_reachable(n)).count(), total)
+        (fns.filter(|n| self.is_used(n)).count(), total)
     }
 }
 

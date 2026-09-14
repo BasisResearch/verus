@@ -21,7 +21,7 @@ fn function(n: &Node, graph: &Graph) -> Value {
         "end": n.span.end_line,
         "verified": n.is_verified(),
         "trusted": n.is_trusted(),
-        "reachable": graph.is_reachable(n),
+        "used": graph.is_used(n),
     })
 }
 
@@ -124,11 +124,11 @@ fn total(files: &BTreeMap<&str, Vec<&Node>>, graph: &Graph, scope: fn(&Node) -> 
     let all: Vec<&Node> = files.values().flatten().copied().filter(|n| scope(n)).collect();
     let fns = all.len();
     let verified = all.iter().filter(|n| n.is_verified()).count();
-    let reach = all.iter().filter(|n| graph.is_reachable(n)).count();
-    let vreach = all.iter().filter(|n| n.is_verified() && graph.is_reachable(n)).count();
+    let reach = all.iter().filter(|n| graph.is_used(n)).count();
+    let vreach = all.iter().filter(|n| n.is_verified() && graph.is_used(n)).count();
     let mode = |m: &str| {
         let of = all.iter().filter(|n| n.is_verified() && n.mode == m);
-        json!([of.clone().filter(|n| graph.is_reachable(n)).count(), of.count()])
+        json!([of.clone().filter(|n| graph.is_used(n)).count(), of.count()])
     };
     let pct = |a: usize, b: usize| (b > 0).then(|| (100 * a / b) as u64);
     json!({
@@ -185,8 +185,8 @@ mod tests {
         assert_eq!(x["file"]["source"], "fn a() {}\n");
         let fns = x["file"]["functions"].as_array().unwrap();
         let by_name = |name: &str| fns.iter().find(|f| f["name"] == name).unwrap();
-        assert_eq!(by_name("wired")["reachable"], true);
-        assert_eq!(by_name("spec_inc")["reachable"], false);
+        assert_eq!(by_name("wired")["used"], true);
+        assert_eq!(by_name("spec_inc")["used"], false);
         // 6 verified, 4 reachable; main and inc reachable but unverified
         let all = &x["totals"]["all"];
         assert_eq!(all["verified"], 6);
