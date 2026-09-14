@@ -270,6 +270,11 @@ fn certificate_key(function: &str, kind: QueryKind, description: &str, repeat: u
 /// The most a certificate file may hold for it to be read.
 const MAX_CERTIFICATE_BYTES: u64 = 64 << 20;
 
+/// The largest `inst_graph` reply sent. A larger answer is refused with an
+/// error instead: a caller that caps replies (the MCP client, at 16 MiB)
+/// would otherwise take it for a dead worker and end the session.
+const MAX_GRAPH_REPLY_BYTES: usize = 8 << 20;
+
 /// The text of the certificate at `path`, if it is a regular file of at most
 /// `MAX_CERTIFICATE_BYTES`. The directory is shared, so anything may sit at
 /// that name. On unix the file is opened without blocking, so a FIFO there
@@ -1132,15 +1137,24 @@ impl Server {
                                     })
                                 });
                             }
-                            send(
-                                &mut output,
-                                &Response::InstGraph {
-                                    session,
-                                    bucket: bucket_id,
-                                    query: id,
-                                    result: &reply,
-                                },
-                            )?;
+                            let response = Response::InstGraph {
+                                session,
+                                bucket: bucket_id,
+                                query: id,
+                                result: &reply,
+                            };
+                            let text =
+                                serde_json::to_string(&response).map_err(io::Error::other)?;
+                            if text.len() > MAX_GRAPH_REPLY_BYTES {
+                                let message = format!(
+                                    "the {}-byte answer is over the {MAX_GRAPH_REPLY_BYTES}-byte limit; lower limit or narrow the filter",
+                                    text.len()
+                                );
+                                send(&mut output, &Response::Error { message: &message })?;
+                            } else {
+                                writeln!(output, "{text}")?;
+                                output.flush()?;
+                            }
                         }
                         Err(message) => send(&mut output, &Response::Error { message: &message })?,
                     }

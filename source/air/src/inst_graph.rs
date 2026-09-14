@@ -14,10 +14,16 @@ use serde::Serialize;
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet, VecDeque};
 
+/// Most entries in a `growth` series. A longer one is summed into buckets, so
+/// the answer stays small however many rounds the solver ran.
+pub const GROWTH_STEPS: usize = 100;
+
 /// Which instantiations a query looks at.
 #[derive(Clone, Debug, Default)]
 pub struct GraphFilter {
     /// Only instantiations of these quantifiers, by name; all when `None`.
+    /// `cycles` instead keeps the loops that pass through one of them, so a
+    /// loop is found by naming any of its members.
     pub quantifiers: Option<HashSet<String>>,
     /// Only instantiations at least this deep.
     pub min_depth: Option<u64>,
@@ -29,7 +35,7 @@ pub enum GraphOp {
     Cycles,
     TopCost,
     Subgraph,
-    /// The shortest chain of parents leading to `to_inst` from an
+    /// The shortest chain of parents leading to `to_inst` from an earlier
     /// instantiation of `from_qid`, or from a root when `from_qid` is `None`.
     Path {
         from_qid: Option<String>,
@@ -70,7 +76,8 @@ pub struct Cycle {
     pub instantiations: u64,
     /// The longest chain of their instantiations, each a parent of the next.
     pub longest_chain: usize,
-    /// That chain from its root side, at most `limit` nodes, and its edges.
+    /// That chain from its root side, and its edges. All cycles together list
+    /// at most `limit` nodes, the first cycles' first.
     pub nodes: Vec<GraphNode>,
     pub edges: Vec<(u64, u64)>,
 }
@@ -107,9 +114,9 @@ pub struct Subgraph {
 
 #[derive(Debug, Serialize)]
 pub struct PathAnswer {
-    /// Ancestor first. `None` when no instantiation of `from_qid` leads to
+    /// Ancestor first; empty when no instantiation of `from_qid` leads to
     /// the target.
-    pub nodes: Option<Vec<GraphNode>>,
+    pub nodes: Vec<GraphNode>,
     /// Instantiations on the whole chain.
     pub length: usize,
     /// Whether the middle of a chain longer than `limit` was left out.
@@ -141,6 +148,7 @@ pub struct QuantifierGrowth {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_span: Option<String>,
     pub count: u64,
+    /// Over the same steps, and buckets, as the answer's chosen series.
     pub per_step: Vec<u64>,
     pub fit: Fit,
 }
@@ -149,10 +157,15 @@ pub struct QuantifierGrowth {
 pub struct Growth {
     /// `round` when the solver recorded instantiation rounds, else `depth`.
     pub step: &'static str,
-    /// Instantiations per round, from round 1; empty without rounds.
+    /// Instantiations per round, from round 1; empty without rounds. A series
+    /// lists at most `GROWTH_STEPS` entries: past that, each entry sums
+    /// `round_width` consecutive rounds.
     pub per_round: Vec<u64>,
-    /// Instantiations per depth, from depth 0.
+    pub round_width: usize,
+    /// Instantiations per depth, from depth 0, summed `depth_width` depths to
+    /// an entry.
     pub per_depth: Vec<u64>,
+    pub depth_width: usize,
     /// The fit over the chosen steps.
     pub fit: Fit,
     /// The `limit` most instantiated quantifiers over the same steps.
@@ -205,7 +218,7 @@ impl GraphAnswer {
                 .iter_mut()
                 .for_each(|q| fill(&q.qid, &mut q.function, &mut q.source_span)),
             GraphAnswer::Subgraph(s) => s.nodes.iter_mut().for_each(node),
-            GraphAnswer::Path(p) => p.nodes.iter_mut().flatten().for_each(node),
+            GraphAnswer::Path(p) => p.nodes.iter_mut().for_each(node),
             GraphAnswer::Growth(g) => g
                 .quantifiers
                 .iter_mut()
@@ -395,7 +408,11 @@ impl InstantiationGraph {
 
     fn keep(&self, filter: &GraphFilter, id: NodeId) -> bool {
         filter.quantifiers.as_ref().is_none_or(|qs| qs.contains(self.name(id)))
-            && filter.min_depth.is_none_or(|min| self.info(id).depth >= min)
+            && self.deep_enough(filter, id)
+    }
+
+    fn deep_enough(&self, filter: &GraphFilter, id: NodeId) -> bool {
+        filter.min_depth.is_none_or(|min| self.info(id).depth >= min)
     }
 
     fn children(&self, id: NodeId) -> impl Iterator<Item = NodeId> + '_ {
@@ -461,14 +478,15 @@ impl InstantiationGraph {
     pub fn cycles(&self, filter: &GraphFilter, limit: usize) -> Vec<Cycle> {
         // Quantifier-level edges, weighted by how many instantiation edges
         // they stand for. The instantiation graph itself is acyclic: a parent
-        // always precedes its child.
+        // always precedes its child. Only depth narrows the edges: a loop
+        // needs all its members, so `quantifiers` selects loops afterwards.
         let mut weights: BTreeMap<(&str, &str), u64> = BTreeMap::new();
         let mut adjacent: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
         for (&parent, children) in &self.edges {
-            if !self.keep(filter, parent) {
+            if !self.deep_enough(filter, parent) {
                 continue;
             }
-            for &child in children.iter().filter(|&&child| self.keep(filter, child)) {
+            for &child in children.iter().filter(|&&child| self.deep_enough(filter, child)) {
                 let (from, to) = (self.name(parent), self.name(child));
                 *weights.entry((from, to)).or_default() += 1;
                 adjacent.entry(from).or_default().insert(to);
@@ -483,12 +501,20 @@ impl InstantiationGraph {
             if members.len() == 1 && !weights.contains_key(&(component[0], component[0])) {
                 continue;
             }
+            if filter
+                .quantifiers
+                .as_ref()
+                .is_some_and(|qs| !members.iter().any(|m| qs.contains(*m)))
+            {
+                continue;
+            }
             let repetitions = weights
                 .iter()
                 .filter(|((from, to), _)| members.contains(from) && members.contains(to))
                 .map(|(_, count)| count)
                 .sum();
-            let member = |id: NodeId| self.keep(filter, id) && members.contains(self.name(id));
+            let member =
+                |id: NodeId| self.deep_enough(filter, id) && members.contains(self.name(id));
             // Longest chain among the members, by dynamic programming in
             // topological order.
             let mut best: HashMap<NodeId, (usize, Option<NodeId>)> = HashMap::new();
@@ -515,19 +541,18 @@ impl InstantiationGraph {
                 cursor = best[&node].1;
             }
             chain.reverse();
-            let longest_chain = chain.len();
-            chain.truncate(limit);
-            cycles.push(Cycle {
+            let cycle = Cycle {
                 quantifiers: members.iter().map(|q| q.to_string()).collect(),
                 length: members.len(),
                 repetitions,
                 instantiations,
-                longest_chain,
-                edges: chain.windows(2).map(|pair| (pair[0].0, pair[1].0)).collect(),
-                nodes: chain.into_iter().map(|node| self.node(node)).collect(),
-            });
+                longest_chain: chain.len(),
+                nodes: Vec::new(),
+                edges: Vec::new(),
+            };
+            cycles.push((cycle, chain));
         }
-        cycles.sort_by(|a, b| {
+        cycles.sort_by(|(a, _), (b, _)| {
             (Reverse(a.repetitions), Reverse(a.longest_chain), &a.quantifiers).cmp(&(
                 Reverse(b.repetitions),
                 Reverse(b.longest_chain),
@@ -535,7 +560,18 @@ impl InstantiationGraph {
             ))
         });
         cycles.truncate(limit);
+        // The chains share one budget of `limit` nodes, in rank order.
+        let mut budget = limit;
         cycles
+            .into_iter()
+            .map(|(mut cycle, mut chain)| {
+                chain.truncate(budget);
+                budget -= chain.len();
+                cycle.edges = chain.windows(2).map(|pair| (pair[0].0, pair[1].0)).collect();
+                cycle.nodes = chain.into_iter().map(|node| self.node(node)).collect();
+                cycle
+            })
+            .collect()
     }
 
     pub fn top_cost(&self, filter: &GraphFilter, limit: usize) -> Vec<QuantifierCost> {
@@ -621,9 +657,16 @@ impl InstantiationGraph {
         if !self.nodes.contains(&target) {
             return Err(format!("no instantiation {to_inst} in the graph"));
         }
+        if let Some(qid) = from_qid {
+            if !self.names.values().any(|name| name == qid) {
+                return Err(format!("no instantiation of {qid} in the graph"));
+            }
+        }
         let parents = self.parents();
+        // With `from_qid`, the chain starts at an earlier instantiation of it,
+        // never at the target itself.
         let is_start = |node: NodeId| match from_qid {
-            Some(qid) => self.name(node) == qid,
+            Some(qid) => node != target && self.name(node) == qid,
             None => parents.get(&node).is_none_or(Vec::is_empty),
         };
         // Breadth first over parents finds the shortest chain.
@@ -644,7 +687,7 @@ impl InstantiationGraph {
             }
         }
         let Some(start) = start else {
-            return Ok(PathAnswer { nodes: None, length: 0, truncated: false });
+            return Ok(PathAnswer { nodes: Vec::new(), length: 0, truncated: false });
         };
         let mut chain = vec![start];
         while let Some(&node) = next.get(chain.last().unwrap()) {
@@ -660,7 +703,7 @@ impl InstantiationGraph {
             chain.drain(limit - tail..length - tail);
         }
         Ok(PathAnswer {
-            nodes: Some(chain.into_iter().map(|node| self.node(node)).collect()),
+            nodes: chain.into_iter().map(|node| self.node(node)).collect(),
             length,
             truncated,
         })
@@ -671,32 +714,40 @@ impl InstantiationGraph {
             self.nodes.iter().copied().filter(|&node| self.keep(filter, node)).collect();
         let rounds = kept.iter().map(|&node| self.info(node).round).max().unwrap_or(0);
         let depths = kept.iter().map(|&node| self.info(node).depth).max();
+        // Counts per step, summed into at most `GROWTH_STEPS` entries of
+        // `width` steps each.
         let series = |nodes: &mut dyn Iterator<Item = NodeId>, by_round: bool| {
             let steps =
                 if by_round { rounds as usize } else { depths.map_or(0, |d| d as usize + 1) };
-            let mut counts = vec![0u64; steps];
+            let width = steps.div_ceil(GROWTH_STEPS).max(1);
+            let mut counts = vec![0u64; steps.div_ceil(width)];
             for node in nodes {
                 let info = self.info(node);
                 let step = if by_round { info.round as usize } else { info.depth as usize + 1 };
                 // Rounds count from 1; a round of 0 means the builder could not say.
                 if step >= 1 && step <= steps {
-                    counts[step - 1] += 1;
+                    counts[(step - 1) / width] += 1;
                 }
             }
-            counts
+            (counts, width)
         };
         let by_round = rounds > 0;
-        let per_round = if by_round { series(&mut kept.iter().copied(), true) } else { vec![] };
-        let per_depth = series(&mut kept.iter().copied(), false);
+        let (per_round, round_width) =
+            if by_round { series(&mut kept.iter().copied(), true) } else { (vec![], 1) };
+        let (per_depth, depth_width) = series(&mut kept.iter().copied(), false);
         let overall = fit(if by_round { &per_round } else { &per_depth });
         let mut by_qid: BTreeMap<&str, Vec<NodeId>> = BTreeMap::new();
         for &node in &kept {
             by_qid.entry(self.name(node)).or_default().push(node);
         }
-        let mut quantifiers: Vec<QuantifierGrowth> = by_qid
+        // Only the `limit` most instantiated get a series.
+        let mut by_qid: Vec<(&str, Vec<NodeId>)> = by_qid.into_iter().collect();
+        by_qid.sort_by(|(a, x), (b, y)| y.len().cmp(&x.len()).then(a.cmp(b)));
+        by_qid.truncate(limit);
+        let quantifiers: Vec<QuantifierGrowth> = by_qid
             .into_iter()
             .map(|(qid, nodes)| {
-                let per_step = series(&mut nodes.iter().copied(), by_round);
+                let (per_step, _) = series(&mut nodes.iter().copied(), by_round);
                 QuantifierGrowth {
                     qid: qid.to_owned(),
                     function: None,
@@ -707,12 +758,12 @@ impl InstantiationGraph {
                 }
             })
             .collect();
-        quantifiers.sort_by(|a, b| b.count.cmp(&a.count).then(a.qid.cmp(&b.qid)));
-        quantifiers.truncate(limit);
         Growth {
             step: if by_round { "round" } else { "depth" },
             per_round,
+            round_width,
             per_depth,
+            depth_width,
             fit: overall,
             quantifiers,
         }
@@ -898,12 +949,17 @@ mod tests {
         assert_eq!((cycle.length, cycle.repetitions, cycle.longest_chain), (2, 3, 4));
         assert_eq!(cycle.instantiations, 5);
         assert_eq!(cycle.edges, [(1, 2), (2, 3), (3, 4)]);
-        // Filtering one side away breaks the loop.
-        let filter = GraphFilter {
-            quantifiers: Some(HashSet::from(["user_decode_42".to_owned()])),
+        // Naming either member finds the loop; naming neither does not.
+        let only = |qid: &str| GraphFilter {
+            quantifiers: Some(HashSet::from([qid.to_owned()])),
             min_depth: None,
         };
-        assert!(graph().cycles(&filter, 10).is_empty());
+        assert_eq!(graph().cycles(&only("user_decode_42"), 10)[0].repetitions, 3);
+        assert_eq!(graph().cycles(&only("user_encode_41"), 10).len(), 1);
+        assert!(graph().cycles(&only("internal root"), 10).is_empty());
+        // All cycles together list at most `limit` nodes.
+        let short = graph().cycles(&GraphFilter::default(), 2);
+        assert_eq!((short[0].nodes.len(), short[0].longest_chain), (2, 4));
         // So does looking only below the second unrolling.
         let deep = GraphFilter { quantifiers: None, min_depth: Some(4) };
         assert!(graph().cycles(&deep, 10).is_empty());
@@ -928,21 +984,28 @@ mod tests {
     fn path_finds_the_shortest_chain_and_keeps_both_ends() {
         let graph = graph();
         let path = graph.path(Some("user_decode_42"), 4, 10).unwrap();
-        let insts: Vec<u64> = path.nodes.unwrap().iter().map(|n| n.inst).collect();
+        let insts: Vec<u64> = path.nodes.iter().map(|n| n.inst).collect();
         assert_eq!(insts, [3, 4]);
         let root = graph.path(None, 4, 3).unwrap();
         assert_eq!(root.length, 5);
         assert!(root.truncated);
-        let insts: Vec<u64> = root.nodes.unwrap().iter().map(|n| n.inst).collect();
+        let insts: Vec<u64> = root.nodes.iter().map(|n| n.inst).collect();
         assert_eq!(insts, [0, 1, 4]);
         // Too short for both ends, a path keeps the target it was asked about.
         let ends = |limit| -> Vec<u64> {
-            graph.path(None, 4, limit).unwrap().nodes.unwrap().iter().map(|n| n.inst).collect()
+            graph.path(None, 4, limit).unwrap().nodes.iter().map(|n| n.inst).collect()
         };
         assert_eq!(ends(1), [4]);
         assert_eq!(ends(2), [0, 4]);
         assert_eq!(ends(4), [0, 1, 3, 4]);
-        assert!(graph.path(Some("absent"), 4, 10).unwrap().nodes.is_none());
+        // From an earlier instantiation of the target's own quantifier.
+        let own = graph.path(Some("user_decode_42"), 3, 10).unwrap();
+        let insts: Vec<u64> = own.nodes.iter().map(|n| n.inst).collect();
+        assert_eq!(insts, [1, 2, 3]);
+        // A quantifier with no instantiation on the way leads nowhere; one
+        // with no instantiation at all is an error, like an unknown target.
+        assert!(graph.path(Some("user_encode_41"), 1, 10).unwrap().nodes.is_empty());
+        assert!(graph.path(Some("absent"), 4, 10).is_err());
         assert!(graph.path(None, 99, 10).is_err());
     }
 
@@ -962,6 +1025,24 @@ mod tests {
         assert_eq!(growth.step, "round");
         assert_eq!(growth.per_round, [2, 1, 1, 2]);
         assert_eq!(growth.per_depth, [1, 2, 1, 1, 1]);
+        assert_eq!((growth.round_width, growth.depth_width), (1, 1));
+    }
+
+    #[test]
+    fn growth_buckets_long_series() {
+        // 250 rounds of one instantiation each: at most 100 entries, so three
+        // rounds to an entry.
+        let mut text = String::from("(instantiation-graph\n(quantifier 0 q)\n");
+        for i in 0..250 {
+            let parents = if i == 0 { String::new() } else { (i - 1).to_string() };
+            text += &format!("(node {i} 0 X {} {i} 0 ({parents}))\n", i + 1);
+        }
+        text += "(dropped 0)\n)";
+        let graph = InstantiationGraph::from_live(&lines(&text)).unwrap();
+        let growth = graph.growth(&GraphFilter::default(), 10);
+        assert_eq!((growth.round_width, growth.per_round.len()), (3, 84));
+        assert_eq!(growth.per_round.iter().sum::<u64>(), 250);
+        assert_eq!((growth.depth_width, growth.quantifiers[0].per_step.len()), (3, 84));
     }
 
     #[test]

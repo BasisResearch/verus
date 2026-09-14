@@ -490,6 +490,11 @@ fn resident_inst_graph_finds_the_matching_loop() {
             "{source_fn}: {filtered}"
         );
     }
+    // Naming one member of the loop finds the whole loop.
+    let member = found[0]["quantifiers"][0].as_str().unwrap();
+    let named =
+        graph(&mut worker, &looping, json!({"op": "cycles", "filter": {"quantifier": member}}));
+    assert_eq!(named["result"]["cycles"][0]["length"], 2, "{}", named);
 
     // The deepest instantiation descends from a root through the loop.
     let deepest = found[0]["nodes"].as_array().unwrap().last().unwrap()["inst"].clone();
