@@ -282,12 +282,29 @@ pub(crate) fn smt_check_assertion<'ctx>(
     if let Some(certificate) = context.import_instantiations.take() {
         context.smt_log.log_import_instantiations(&certificate);
     }
+    // Likewise an injected equality, which goes with the scope's pop.
+    if let Some((lhs, rhs)) = context.inject_equality.take() {
+        context.smt_log.log_node(&sise::TreeNode::List(vec![
+            sise::TreeNode::Atom("assert".to_string()),
+            sise::TreeNode::List(vec![sise::TreeNode::Atom("=".to_string()), lhs, rhs]),
+        ]));
+    }
     context.smt_log.log_word("check-sat");
     if context.provenance {
         // in the same batch: the tag lists arrive after the result and the
         // instantiation dump, before the sentinel
         context.smt_log.log_get_assertion_sources();
     }
+    // The e-graph is read in the same batch too, after the tag lists and
+    // before `get-info` or `get-model` can run. Only a query's first check
+    // has focus terms, so later error rounds do not ask again.
+    let egraph_asked = match (context.egraph_focus.take(), context.egraph_request) {
+        (Some(focus), Some(request)) => {
+            context.smt_log.log_get_egraph_equalities(&focus, request.limit, request.include_used);
+            true
+        }
+        _ => false,
+    };
 
     // Run SMT solver
     let smt_run_start_time = std::time::Instant::now();
@@ -318,7 +335,18 @@ pub(crate) fn smt_check_assertion<'ctx>(
     // Process SMT results
     let mut unsat = None;
     let mut provenance_lines: Vec<String> = Vec::new();
+    let mut egraph_lines: Vec<String> = Vec::new();
     for line in smt_output {
+        // The e-graph reply, or the solver's refusal of the request, is the
+        // batch's last: every line from its first on belongs to it.
+        if !egraph_lines.is_empty()
+            || (egraph_asked
+                && unsat.is_some()
+                && (line.starts_with("(egraph-equalities") || line.starts_with("(error")))
+        {
+            egraph_lines.push(line);
+            continue;
+        }
         if line == "unsat" {
             assert!(unsat == None);
             unsat = Some(SmtOutput::Unsat);
@@ -354,6 +382,9 @@ pub(crate) fn smt_check_assertion<'ctx>(
 
     if context.provenance {
         context.last_provenance = Some(parse_provenance_lines(&provenance_lines));
+    }
+    if egraph_asked {
+        context.last_egraph = Some(parse_egraph_lines(&egraph_lines));
     }
 
     let unsat = unsat.expect("expected sat/unsat/unknown from SMT solver");
@@ -515,6 +546,260 @@ pub(crate) fn parse_provenance_lines(lines: &Vec<String>) -> crate::context::Pro
         }
     }
     info
+}
+
+/// Parse cvc5's reply to `(get-egraph-equalities)`: `(egraph-equalities
+/// (summary :classes n ...) (equality <lhs> <rhs> :level l :used b :focus n
+/// :because (<lit> ...))*)`, or the `(error "...")` it gives instead.
+pub(crate) fn parse_egraph_lines(lines: &[String]) -> crate::context::EgraphReply {
+    use sise::TreeNode as Node;
+    /// The `:key value` pairs the summary and each equality spell fields as.
+    fn fields<'a>(items: &'a [Node]) -> impl Iterator<Item = (&'a str, &'a Node)> + 'a {
+        items.chunks(2).filter_map(|pair| match pair {
+            [Node::Atom(key), value] if key.starts_with(':') => Some((key.as_str(), value)),
+            _ => None,
+        })
+    }
+    fn number(node: &Node) -> u64 {
+        match node {
+            Node::Atom(a) => a.parse().unwrap_or(0),
+            Node::List(_) => 0,
+        }
+    }
+    let mut reply = crate::context::EgraphReply::default();
+    let text = format!("({})", lines.join("\n"));
+    let mut parser = sise::Parser::new(text.as_str());
+    let forms = match sise::parse_tree(&mut parser) {
+        Ok(Node::List(forms)) => forms,
+        _ => Vec::new(),
+    };
+    let mut recognised = false;
+    for form in forms.iter() {
+        let Node::List(items) = form else { continue };
+        match items.first() {
+            Some(Node::Atom(head)) if head == "egraph-equalities" => {
+                recognised = true;
+                for item in &items[1..] {
+                    let Node::List(parts) = item else { continue };
+                    match parts.first() {
+                        Some(Node::Atom(head)) if head == "summary" => {
+                            for (key, value) in fields(&parts[1..]) {
+                                match key {
+                                    ":classes" => reply.classes = number(value),
+                                    ":candidates" => reply.candidates = number(value),
+                                    ":focus" => reply.focus = number(value),
+                                    ":focus-found" => reply.focus_found = number(value),
+                                    ":used-omitted" => reply.used_omitted = number(value),
+                                    _ => {}
+                                }
+                            }
+                        }
+                        Some(Node::Atom(head)) if head == "equality" && parts.len() >= 3 => {
+                            let mut equality = crate::context::EgraphEquality {
+                                lhs: crate::printer::node_to_string(&parts[1]),
+                                rhs: crate::printer::node_to_string(&parts[2]),
+                                level: "unknown".to_string(),
+                                used: false,
+                                used_by: Vec::new(),
+                                focus: 0,
+                                because: Vec::new(),
+                            };
+                            for (key, value) in fields(&parts[3..]) {
+                                match (key, value) {
+                                    (":level", Node::Atom(level)) => equality.level = level.clone(),
+                                    (":used", Node::Atom(used)) => equality.used = used == "true",
+                                    (":used-by", Node::List(qids)) => {
+                                        equality.used_by = qids
+                                            .iter()
+                                            .map(crate::printer::node_to_string)
+                                            .collect()
+                                    }
+                                    (":focus", value) => equality.focus = number(value) as u32,
+                                    (":because", Node::List(lits)) => {
+                                        equality.because = lits
+                                            .iter()
+                                            .map(crate::printer::node_to_string)
+                                            .collect()
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            reply.equalities.push(equality);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Some(Node::Atom(head)) if head == "error" && !recognised => {
+                reply.error = Some(match items.get(1) {
+                    Some(Node::Atom(message)) => message.trim_matches('"').to_string(),
+                    _ => crate::printer::node_to_string(form),
+                });
+            }
+            _ => {}
+        }
+    }
+    if recognised {
+        reply.error = None;
+    } else if reply.error.is_none() {
+        reply.error = Some(format!("unrecognised e-graph reply: {}", lines.join(" ")));
+    }
+    reply
+}
+
+/// At most this many focus terms go with one e-graph request, in at most
+/// this many printed bytes; the smallest are kept.
+const EGRAPH_FOCUS_TERMS: usize = 4000;
+const EGRAPH_FOCUS_BYTES: usize = 1 << 20;
+/// A term of more nodes than this is not a focus term. Printing each focus
+/// term apart would otherwise cost the square of the query's depth.
+const EGRAPH_FOCUS_TERM_NODES: usize = 64;
+
+/// The query's own terms, which focus `(get-egraph-equalities)` on the
+/// classes the query is about: variables and non-Boolean applications that
+/// cvc5 can parse at the query's scope, so none that mentions a bound
+/// variable, a closure, or an assertion label. Boolean connectives and
+/// relations are left out; cvc5 does not list Boolean classes.
+fn egraph_focus_terms(expr: &Expr, printer: &crate::printer::Printer) -> Vec<sise::TreeNode> {
+    /// Collect `expr`'s focus terms into `out`. Returns its size in nodes if
+    /// it names no bound variable and can be printed at the query's scope.
+    fn walk(expr: &Expr, bound: &mut Vec<Ident>, out: &mut Vec<Expr>) -> Option<usize> {
+        // Every child is walked, whether or not an earlier one was closed.
+        fn all(sizes: Vec<Option<usize>>) -> Option<usize> {
+            sizes.into_iter().sum::<Option<usize>>().map(|size| size + 1)
+        }
+        let (size, boolean) = match &**expr {
+            ExprX::Const(_) => return Some(1),
+            ExprX::Var(x) => {
+                if bound.contains(x) {
+                    return None;
+                }
+                let label = x.starts_with(PREFIX_LABEL) || x.starts_with(GLOBAL_PREFIX_LABEL);
+                (Some(1), label)
+            }
+            ExprX::Old(..) => return None,
+            ExprX::Apply(_, args) => {
+                (all(args.iter().map(|arg| walk(arg, bound, out)).collect()), false)
+            }
+            ExprX::ApplyFun(_, fun, args) => {
+                walk(fun, bound, out);
+                for arg in args.iter() {
+                    walk(arg, bound, out);
+                }
+                return None;
+            }
+            ExprX::Array(args) => {
+                for arg in args.iter() {
+                    walk(arg, bound, out);
+                }
+                return None;
+            }
+            ExprX::Unary(op, arg) => (
+                all(vec![walk(arg, bound, out)]),
+                matches!(
+                    op,
+                    UnaryOp::Not
+                        | UnaryOp::FloatIsNormal
+                        | UnaryOp::FloatIsSubnormal
+                        | UnaryOp::FloatIsZero
+                        | UnaryOp::FloatIsInfinite
+                        | UnaryOp::FloatIsNaN
+                        | UnaryOp::FloatIsNegative
+                        | UnaryOp::FloatIsPositive
+                ),
+            ),
+            ExprX::Binary(op, lhs, rhs) => (
+                all(vec![walk(lhs, bound, out), walk(rhs, bound, out)]),
+                matches!(
+                    op,
+                    BinaryOp::Implies
+                        | BinaryOp::Eq
+                        | BinaryOp::Le
+                        | BinaryOp::Ge
+                        | BinaryOp::Lt
+                        | BinaryOp::Gt
+                        | BinaryOp::Relation(..)
+                        | BinaryOp::BitULt
+                        | BinaryOp::BitUGt
+                        | BinaryOp::BitULe
+                        | BinaryOp::BitUGe
+                        | BinaryOp::BitSLt
+                        | BinaryOp::BitSGt
+                        | BinaryOp::BitSLe
+                        | BinaryOp::BitSGe
+                        | BinaryOp::FloatEq
+                        | BinaryOp::FloatLt
+                        | BinaryOp::FloatGt
+                        | BinaryOp::FloatLe
+                        | BinaryOp::FloatGe
+                ),
+            ),
+            ExprX::Multi(op, args) => (
+                all(args.iter().map(|arg| walk(arg, bound, out)).collect()),
+                matches!(op, MultiOp::And | MultiOp::Or | MultiOp::Xor | MultiOp::Distinct),
+            ),
+            ExprX::IfElse(cond, lhs, rhs) => (
+                all(vec![walk(cond, bound, out), walk(lhs, bound, out), walk(rhs, bound, out)]),
+                false,
+            ),
+            ExprX::Bind(bind, body) => {
+                let depth = bound.len();
+                match &**bind {
+                    BindX::Let(binders) => {
+                        // a let's definitions are outside its own bindings
+                        for binder in binders.iter() {
+                            walk(&binder.a, bound, out);
+                        }
+                        bound.extend(binders.iter().map(|binder| binder.name.clone()));
+                        walk(body, bound, out);
+                    }
+                    BindX::Quant(_, binders, _, _) | BindX::Lambda(binders, _, _) => {
+                        bound.extend(binders.iter().map(|binder| binder.name.clone()));
+                        walk(body, bound, out);
+                    }
+                    BindX::Choose(binders, _, _, cond) => {
+                        bound.extend(binders.iter().map(|binder| binder.name.clone()));
+                        walk(cond, bound, out);
+                        walk(body, bound, out);
+                    }
+                }
+                bound.truncate(depth);
+                return None;
+            }
+            ExprX::LabeledAxiom(_, _, inner) | ExprX::LabeledAssertion(_, _, _, inner) => {
+                walk(inner, bound, out);
+                return None;
+            }
+        };
+        if let Some(nodes) = size {
+            if !boolean && nodes <= EGRAPH_FOCUS_TERM_NODES {
+                out.push(expr.clone());
+            }
+        }
+        size
+    }
+    let mut terms: Vec<Expr> = Vec::new();
+    walk(expr, &mut Vec::new(), &mut terms);
+    let mut seen = std::collections::HashSet::new();
+    let mut printed: Vec<(String, sise::TreeNode)> = Vec::new();
+    for term in terms {
+        let node = printer.expr_to_node(&term);
+        let text = crate::printer::node_to_string(&node);
+        if seen.insert(text.clone()) {
+            printed.push((text, node));
+        }
+    }
+    printed.sort_by(|a, b| a.0.len().cmp(&b.0.len()).then_with(|| a.0.cmp(&b.0)));
+    let mut bytes = 0;
+    printed
+        .into_iter()
+        .take(EGRAPH_FOCUS_TERMS)
+        .take_while(|(text, _)| {
+            bytes += text.len() + 1;
+            bytes <= EGRAPH_FOCUS_BYTES
+        })
+        .map(|(_, node)| node)
+        .collect()
 }
 
 pub(crate) fn smt_get_rlimit_count(context: &mut Context) -> Result<u64, ValidityResult> {
@@ -688,6 +973,16 @@ pub(crate) fn smt_check_query<'ctx>(
     };
     let assertion = elim_zero_args_expr(assertion);
 
+    // An e-graph request is focused on the classes of this query's own terms.
+    if context.egraph_request.is_some() {
+        let printer = crate::printer::Printer::new(
+            context.message_interface.clone(),
+            true,
+            context.solver.clone(),
+        );
+        context.egraph_focus = Some(egraph_focus_terms(&assertion, &printer));
+    }
+
     // add labels to assertions for error reporting
     let mut infos: Vec<AssertionInfo> = Vec::new();
     let mut axiom_infos: Vec<AxiomInfo> = Vec::new();
@@ -731,4 +1026,85 @@ pub(crate) fn smt_check_query<'ctx>(
     }
 
     result
+}
+
+#[cfg(test)]
+mod egraph_tests {
+    use super::*;
+
+    fn lines(text: &[&str]) -> Vec<String> {
+        text.iter().map(|line| line.to_string()).collect()
+    }
+
+    #[test]
+    fn egraph_reply_parses_summary_equalities_and_refusals() {
+        let reply = parse_egraph_lines(&lines(&[
+            "(egraph-equalities",
+            "(summary :classes 2 :candidates 3 :focus 4 :focus-found 3 :used-omitted 1)",
+            "(equality (f b) c :level entailed :used false :used-by () :focus 2 :because ((= a b) (= (f a) c)))",
+            "(equality d b :level decision :used true :used-by (prelude_box user_f_1) :focus 1 :because ())",
+            ")",
+        ]));
+        assert!(reply.error.is_none(), "{:?}", reply.error);
+        assert_eq!(
+            (reply.classes, reply.candidates, reply.focus, reply.focus_found, reply.used_omitted),
+            (2, 3, 4, 3, 1)
+        );
+        assert_eq!(reply.equalities.len(), 2);
+        let first = &reply.equalities[0];
+        assert_eq!(
+            (first.lhs.as_str(), first.rhs.as_str(), first.level.as_str(), first.used, first.focus),
+            ("(f b)", "c", "entailed", false, 2)
+        );
+        assert_eq!(first.because, vec!["(= a b)", "(= (f a) c)"]);
+        assert!(reply.equalities[1].used && reply.equalities[1].because.is_empty());
+        assert!(first.used_by.is_empty());
+        assert_eq!(reply.equalities[1].used_by, vec!["prelude_box", "user_f_1"]);
+
+        let refused = parse_egraph_lines(&lines(&[
+            "(error \"cannot get e-graph equalities unless after a SAT or UNKNOWN response.\")",
+        ]));
+        assert!(refused.equalities.is_empty());
+        assert!(refused.error.unwrap().contains("cannot get e-graph equalities"));
+        assert!(parse_egraph_lines(&Vec::new()).error.is_some());
+    }
+
+    #[test]
+    fn egraph_focus_skips_bound_variables_labels_and_connectives() {
+        let var = |x: &str| Arc::new(ExprX::Var(Arc::new(x.to_string())));
+        let apply = |f: &str, args: Vec<Expr>| {
+            Arc::new(ExprX::Apply(Arc::new(f.to_string()), Arc::new(args)))
+        };
+        let eq = |a: Expr, b: Expr| Arc::new(ExprX::Binary(BinaryOp::Eq, a, b));
+        let one = Arc::new(ExprX::Const(crate::ast::Constant::Nat(Arc::new("1".to_string()))));
+        let binder = Arc::new(crate::ast::BinderX {
+            name: Arc::new("i".to_string()),
+            a: Arc::new(TypX::Int),
+        });
+        let forall = Arc::new(ExprX::Bind(
+            Arc::new(BindX::Quant(Quant::Forall, Arc::new(vec![binder]), Arc::new(vec![]), None)),
+            eq(apply("g", vec![var("i")]), var("z")),
+        ));
+        let label = format!("{}0", PREFIX_LABEL);
+        let goal = Arc::new(ExprX::Binary(
+            BinaryOp::Implies,
+            var(&label),
+            Arc::new(ExprX::Binary(
+                BinaryOp::Lt,
+                Arc::new(ExprX::Multi(MultiOp::Add, Arc::new(vec![var("x"), one]))),
+                var("w"),
+            )),
+        ));
+        let query = mk_and(&vec![eq(apply("f", vec![var("x")]), var("y")), forall, goal]);
+        let printer = crate::printer::Printer::new(
+            Arc::new(crate::messages::AirMessageInterface {}),
+            true,
+            SmtSolver::Cvc5,
+        );
+        let focus: Vec<String> = egraph_focus_terms(&query, &printer)
+            .iter()
+            .map(crate::printer::node_to_string)
+            .collect();
+        assert_eq!(focus, vec!["w", "x", "y", "z", "(f x)", "(+ x 1)"]);
+    }
 }

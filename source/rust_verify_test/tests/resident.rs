@@ -319,6 +319,113 @@ fn resident_rechecks_preserve_query_scopes_and_solver_process() {
     eprintln!("one verifier process, one cvc5 launch, {checks} checks, balanced scopes");
 }
 
+const EGRAPH_SOURCE: &str = r#"
+use vstd::prelude::*;
+verus! {
+    spec fn f(x: int) -> int;
+    spec fn g(x: int) -> int;
+
+    proof fn egraph_target(a: int, b: int)
+        requires f(a) == g(b), g(b) > 0,
+    {
+        assert(f(a) > 1);
+    }
+
+    proof fn egraph_passing(a: int, b: int)
+        requires a == b,
+    {
+        assert(b == a);
+    }
+}
+"#;
+
+/// An `egraph` request lists the equalities a failing query's e-graph holds
+/// between the query's own terms, in source spelling. `f(a) == g(b)` survives
+/// preprocessing, which solves an equality with a variable side, such as
+/// `a == b`, by substitution instead. An injection checks the
+/// query again with one of them asserted, in a scope popped right after, so a
+/// later check of the retained query is unchanged. The equality to inject is
+/// named by the id the reading gave it; an unknown id is refused, and the
+/// session keeps serving.
+///
+/// Needs a cvc5 with `get-egraph-equalities`. Until the pinned release has it,
+/// run with `--ignored` and `VERUS_CVC5_PATH` pointing at such a build.
+#[test]
+#[ignore]
+fn resident_egraph_lists_and_injects_equalities() {
+    let mut worker = Worker::start(EGRAPH_SOURCE, &["-V", "no-solver-version-check"]);
+    let ready = worker.receive();
+    assert_eq!(ready["event"], "ready", "{ready}");
+    let session = ready["session"].clone();
+    let target = query_id(&ready, "::egraph_target");
+    let listed =
+        worker.send(json!({"command": "egraph", "session": session, "bucket": 0, "query": target}));
+    assert_eq!(listed["event"], "egraph", "{listed}");
+    assert_eq!(listed["before"]["result"], "invalid", "{listed}");
+    assert!(listed["summary"]["focus_found"].as_u64().unwrap() > 0, "{listed}");
+    let pair = listed["equalities"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|equality| {
+            let sides = [equality["lhs"].as_str().unwrap(), equality["rhs"].as_str().unwrap()];
+            sides.iter().any(|side| side.ends_with("f(a)"))
+                && sides.iter().any(|side| side.ends_with("g(b)"))
+        })
+        .unwrap_or_else(|| panic!("no f(a) == g(b): {listed}"))
+        .clone();
+    assert_eq!(pair["level"], "entailed", "{pair}");
+    assert_eq!(pair["used_by_proof"], false, "{pair}");
+    assert!(pair["verus_assert"].as_str().unwrap().starts_with("assert("), "{pair}");
+    assert!(!pair["holds_because"].as_array().unwrap().is_empty(), "{pair}");
+    // Differently boxed terms of the same equality read alike; it is listed once.
+    let mut rendered: Vec<(String, String)> = listed["equalities"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|equality| {
+            let lhs = equality["lhs"].as_str().unwrap().to_string();
+            let rhs = equality["rhs"].as_str().unwrap().to_string();
+            if lhs <= rhs { (lhs, rhs) } else { (rhs, lhs) }
+        })
+        .collect();
+    let listed_count = rendered.len();
+    rendered.sort();
+    rendered.dedup();
+    assert_eq!(rendered.len(), listed_count, "{listed}");
+
+    // A requires the query already entails changes nothing when injected.
+    let injected = worker.send(json!({"command": "egraph", "session": session, "bucket": 0,
+        "query": target, "inject": pair["id"]}));
+    assert_eq!(injected["injection"]["equality"]["id"], pair["id"], "{injected}");
+    assert_eq!(injected["injection"]["after"]["result"], "invalid", "{injected}");
+    assert_eq!(injected["injection"]["closed"], false, "{injected}");
+    assert!(injected["injection"]["frontier_delta"].is_object(), "{injected}");
+
+    let refused = worker.send(json!({"command": "egraph", "session": session, "bucket": 0,
+        "query": target, "inject": "eq#000000000000"}));
+    assert_eq!(refused["event"], "error", "{refused}");
+    let checked =
+        worker.send(json!({"command": "check", "session": session, "bucket": 0, "query": target}));
+    assert_eq!(checked["result"], "invalid", "{checked}");
+
+    // A valid query leaves no e-graph to read.
+    let passing = query_id(&ready, "::egraph_passing");
+    let valid = worker
+        .send(json!({"command": "egraph", "session": session, "bucket": 0, "query": passing}));
+    assert_eq!(valid["before"]["result"], "valid", "{valid}");
+    assert!(valid["before"]["egraph_error"].is_string(), "{valid}");
+    assert!(valid["equalities"].as_array().unwrap().is_empty(), "{valid}");
+
+    assert_eq!(worker.send(json!({"command": "close", "session": session}))["event"], "closed");
+    worker.finish(false);
+    let launches = fs::read_to_string(worker.dir.path().join("launches")).unwrap();
+    assert_eq!(launches.lines().count(), 1, "{launches}");
+    for log in smt_logs(worker.dir.path()) {
+        assert_eq!(log.matches("(push").count(), log.matches("(pop").count());
+    }
+}
+
 /// With instantiation replay, every resident check that proves its query
 /// saves its instantiations, and a recheck of a query with saved ones first
 /// tries them alone (`:only`), falling back to the ordinary check unless that
