@@ -566,6 +566,16 @@ pub(crate) fn parse_egraph_lines(lines: &[String]) -> crate::context::EgraphRepl
             Node::List(_) => 0,
         }
     }
+    /// A term on one line, as SMT-LIB spells it. The terms go back to the
+    /// solver and are hashed into equality ids, so they carry no layout.
+    fn one_line(node: &Node) -> String {
+        match node {
+            Node::Atom(a) => a.clone(),
+            Node::List(items) => {
+                format!("({})", items.iter().map(one_line).collect::<Vec<_>>().join(" "))
+            }
+        }
+    }
     let mut reply = crate::context::EgraphReply::default();
     let text = format!("({})", lines.join("\n"));
     let mut parser = sise::Parser::new(text.as_str());
@@ -596,8 +606,8 @@ pub(crate) fn parse_egraph_lines(lines: &[String]) -> crate::context::EgraphRepl
                         }
                         Some(Node::Atom(head)) if head == "equality" && parts.len() >= 3 => {
                             let mut equality = crate::context::EgraphEquality {
-                                lhs: crate::printer::node_to_string(&parts[1]),
-                                rhs: crate::printer::node_to_string(&parts[2]),
+                                lhs: one_line(&parts[1]),
+                                rhs: one_line(&parts[2]),
                                 level: "unknown".to_string(),
                                 used: false,
                                 used_by: Vec::new(),
@@ -609,17 +619,11 @@ pub(crate) fn parse_egraph_lines(lines: &[String]) -> crate::context::EgraphRepl
                                     (":level", Node::Atom(level)) => equality.level = level.clone(),
                                     (":used", Node::Atom(used)) => equality.used = used == "true",
                                     (":used-by", Node::List(qids)) => {
-                                        equality.used_by = qids
-                                            .iter()
-                                            .map(crate::printer::node_to_string)
-                                            .collect()
+                                        equality.used_by = qids.iter().map(one_line).collect()
                                     }
                                     (":focus", value) => equality.focus = number(value) as u32,
                                     (":because", Node::List(lits)) => {
-                                        equality.because = lits
-                                            .iter()
-                                            .map(crate::printer::node_to_string)
-                                            .collect()
+                                        equality.because = lits.iter().map(one_line).collect()
                                     }
                                     _ => {}
                                 }

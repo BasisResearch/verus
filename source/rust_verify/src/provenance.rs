@@ -105,6 +105,9 @@ pub(crate) struct Symbols {
     quantifiers: HashMap<String, Quantifier>,
     axiom_owners: HashMap<String, String>,
     source_names: vir::air_names::SourceNames,
+    /// The crate being verified, whose items the source names spell under
+    /// its own name, and source pasted into it must spell under `crate::`.
+    crate_name: String,
 }
 
 impl Symbols {
@@ -156,6 +159,7 @@ impl Symbols {
             quantifiers,
             axiom_owners: global.axiom_owners.borrow().clone(),
             source_names,
+            crate_name: vir::def::krate_to_string_ignore_stable_id(&global.crate_name),
         }
     }
 
@@ -173,6 +177,34 @@ impl Symbols {
             if let Some(name) = vir::air_names::source_symbol(&names, base) {
                 let name = if annotate { format!("{name} (version {version})") } else { name };
                 names.to_mut().insert(symbol.clone(), vir::air_names::SourceName::Symbol(name));
+            }
+        }
+        names
+    }
+
+    /// The source names for pasting one query's solver terms into the crate
+    /// they came from: SSA symbols as their variable alone, and the crate's
+    /// own items as `crate::` paths, since a crate cannot name itself.
+    pub(crate) fn paste_names<'a>(
+        &'a self,
+        versions: &air::context::VariableVersions,
+    ) -> std::borrow::Cow<'a, vir::air_names::SourceNames> {
+        use vir::air_names::SourceName;
+        let mut names = self.query_names(versions, false);
+        let own = format!("{}::", self.crate_name);
+        let renamed: Vec<(String, String)> = names
+            .iter()
+            .filter_map(|(symbol, name)| match name {
+                SourceName::Symbol(name) => {
+                    name.strip_prefix(&own).map(|rest| (symbol.clone(), format!("crate::{rest}")))
+                }
+                _ => None,
+            })
+            .collect();
+        if !renamed.is_empty() {
+            let names = names.to_mut();
+            for (symbol, name) in renamed {
+                names.insert(symbol, SourceName::Symbol(name));
             }
         }
         names

@@ -336,8 +336,33 @@ verus! {
     {
         assert(b == a);
     }
+
+    fn egraph_versions(v: &mut Vec<u64>, x: u64)
+        requires old(v).len() > 0, x < 100,
+    {
+        let y = x + 1;
+        v.set(0, y);
+        let mut z = y;
+        z = z + 1;
+        assert(v[0] == z);
+    }
 }
 "#;
+
+/// The variables `text` names with an assignment version, as `(name, version)`.
+fn versions_named(text: &str) -> Vec<(String, String)> {
+    const MARK: &str = " (version ";
+    let mut found = Vec::new();
+    let mut rest = text;
+    while let Some(at) = rest.find(MARK) {
+        let name = rest[..at].rsplit(|c: char| !(c.is_alphanumeric() || c == '_')).next();
+        let tail = &rest[at + MARK.len()..];
+        let version: String = tail.chars().take_while(|c| c.is_ascii_digit()).collect();
+        found.push((name.unwrap_or_default().to_string(), version));
+        rest = tail;
+    }
+    found
+}
 
 /// An `egraph` request lists the equalities a failing query's e-graph holds
 /// between the query's own terms, in source spelling. `f(a) == g(b)` survives
@@ -362,7 +387,7 @@ fn resident_egraph_lists_and_injects_equalities() {
         worker.send(json!({"command": "egraph", "session": session, "bucket": 0, "query": target}));
     assert_eq!(listed["event"], "egraph", "{listed}");
     assert_eq!(listed["before"]["result"], "invalid", "{listed}");
-    assert!(listed["summary"]["focus_found"].as_u64().unwrap() > 0, "{listed}");
+    assert!(listed["summary"]["focus_found"].as_u64().unwrap() > 0, "{}", listed);
     let pair = listed["equalities"]
         .as_array()
         .unwrap()
@@ -372,12 +397,38 @@ fn resident_egraph_lists_and_injects_equalities() {
             sides.iter().any(|side| side.ends_with("f(a)"))
                 && sides.iter().any(|side| side.ends_with("g(b)"))
         })
-        .unwrap_or_else(|| panic!("no f(a) == g(b): {listed}"))
+        .unwrap_or_else(|| panic!("no f(a) == g(b): {}", listed))
         .clone();
     assert_eq!(pair["level"], "entailed", "{pair}");
     assert_eq!(pair["used_by_proof"], false, "{pair}");
-    assert!(pair["verus_assert"].as_str().unwrap().starts_with("assert("), "{pair}");
-    assert!(!pair["holds_because"].as_array().unwrap().is_empty(), "{pair}");
+    assert!(!pair["holds_because"].as_array().unwrap().is_empty(), "{}", pair);
+    // Only an entailed equality is offered as an assert: `a == b` holds in
+    // the model the search ended on, and is listed without one.
+    let equalities = listed["equalities"].as_array().unwrap();
+    assert!(equalities.iter().any(|e| e["level"] == "decision"), "{}", listed);
+    for equality in equalities {
+        assert!(
+            equality["level"] == "entailed" || equality["verus_assert"].is_null(),
+            "{}",
+            equality
+        );
+    }
+    // The offered assert is source for the crate it came from, and it holds
+    // there: pasted in place of the failing assert, the function verifies.
+    let pasted = pair["verus_assert"].as_str().unwrap();
+    assert!(pasted.contains("crate::f(a)") && pasted.contains("crate::g(b)"), "{}", pair);
+    let mut paste_worker = Worker::start(
+        &EGRAPH_SOURCE.replace("assert(f(a) > 1);", pasted),
+        &["-V", "no-solver-version-check"],
+    );
+    let paste_ready = paste_worker.receive();
+    assert_eq!(paste_ready["event"], "ready", "{paste_ready}");
+    let pasted_check = paste_worker.send(json!({"command": "check",
+        "session": paste_ready["session"], "bucket": 0,
+        "query": query_id(&paste_ready, "::egraph_target")}));
+    assert_eq!(pasted_check["result"], "valid", "{pasted_check}");
+    paste_worker.send(json!({"command": "close", "session": paste_ready["session"]}));
+    paste_worker.finish(false);
     // Differently boxed terms of the same equality read alike; it is listed once.
     let mut rendered: Vec<(String, String)> = listed["equalities"]
         .as_array()
@@ -400,7 +451,7 @@ fn resident_egraph_lists_and_injects_equalities() {
     assert_eq!(injected["injection"]["equality"]["id"], pair["id"], "{injected}");
     assert_eq!(injected["injection"]["after"]["result"], "invalid", "{injected}");
     assert_eq!(injected["injection"]["closed"], false, "{injected}");
-    assert!(injected["injection"]["frontier_delta"].is_object(), "{injected}");
+    assert!(injected["injection"]["frontier_delta"].is_object(), "{}", injected);
 
     let refused = worker.send(json!({"command": "egraph", "session": session, "bucket": 0,
         "query": target, "inject": "eq#000000000000"}));
@@ -414,8 +465,27 @@ fn resident_egraph_lists_and_injects_equalities() {
     let valid = worker
         .send(json!({"command": "egraph", "session": session, "bucket": 0, "query": passing}));
     assert_eq!(valid["before"]["result"], "valid", "{valid}");
-    assert!(valid["before"]["egraph_error"].is_string(), "{valid}");
-    assert!(valid["equalities"].as_array().unwrap().is_empty(), "{valid}");
+    assert!(valid["before"]["egraph_error"].is_string(), "{}", valid);
+    assert!(valid["equalities"].as_array().unwrap().is_empty(), "{}", valid);
+
+    // `z == (z + 1)` would name two assignments of `z` alike. The reading
+    // holds such an equality between versions of `z`, and offers no assert
+    // for it or any other that names one variable at two versions.
+    let versions = query_id(&ready, "::egraph_versions");
+    let versioned = worker
+        .send(json!({"command": "egraph", "session": session, "bucket": 0, "query": versions}));
+    assert_eq!(versioned["event"], "egraph", "{versioned}");
+    let mut mixed = 0;
+    for equality in versioned["equalities"].as_array().unwrap() {
+        let text = format!("{} {}", equality["lhs"], equality["rhs"]);
+        let named = versions_named(&text);
+        let two = named.iter().any(|(x, v)| named.iter().any(|(y, w)| x == y && v != w));
+        if two {
+            mixed += 1;
+            assert!(equality["verus_assert"].is_null(), "{}", equality);
+        }
+    }
+    assert!(mixed > 0, "{}", versioned);
 
     assert_eq!(worker.send(json!({"command": "close", "session": session}))["event"], "closed");
     worker.finish(false);

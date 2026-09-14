@@ -367,7 +367,7 @@ enum Response<'a> {
         bucket: BucketIndex,
         query: QueryId,
         #[serde(flatten)]
-        outcome: EgraphOutcome,
+        outcome: Box<EgraphOutcome>,
     },
     Error {
         message: &'a str,
@@ -604,8 +604,10 @@ struct ResolvedEquality {
     focus: u32,
     /// The literals the equality follows from, in source spelling.
     holds_because: Vec<String>,
-    /// `assert(lhs == rhs);` to add to the source, when both sides render as
-    /// source. Variables are named without versions: place it where they hold
+    /// `assert(lhs == rhs);` to add to the source, when the equality is
+    /// entailed, both sides render as source, and no variable appears at two
+    /// assignment versions. Variables are named without versions and the
+    /// crate's own items under `crate::`: place it where the variables hold
     /// the versions `lhs` and `rhs` show.
     #[serde(skip_serializing_if = "Option::is_none")]
     verus_assert: Option<String>,
@@ -658,26 +660,62 @@ struct QueryNames<'a> {
     symbols: Option<&'a crate::provenance::Symbols>,
     /// SSA symbols as their variable with its assignment version, to show.
     shown: Cow<'a, SourceNames>,
-    /// SSA symbols as their variable alone, for source to paste.
+    /// Source to paste: SSA symbols as their variable alone, and the crate's
+    /// own items under `crate::`.
     plain: Cow<'a, SourceNames>,
+    /// Each SSA symbol's variable and version. Two versions of one variable
+    /// read alike in `plain`, so an assert naming both cannot be pasted.
+    versions: &'a VariableVersions,
 }
 
 impl<'a> QueryNames<'a> {
     fn new(
         symbols: Option<&'a crate::provenance::Symbols>,
-        versions: &VariableVersions,
+        versions: &'a VariableVersions,
         empty: &'a SourceNames,
     ) -> Self {
         match symbols {
             Some(symbols) => Self {
                 symbols: Some(symbols),
                 shown: symbols.query_names(versions, true),
-                plain: symbols.query_names(versions, false),
+                plain: symbols.paste_names(versions),
+                versions,
             },
-            None => {
-                Self { symbols: None, shown: Cow::Borrowed(empty), plain: Cow::Borrowed(empty) }
+            None => Self {
+                symbols: None,
+                shown: Cow::Borrowed(empty),
+                plain: Cow::Borrowed(empty),
+                versions,
+            },
+        }
+    }
+
+    /// `assert(lhs == rhs);` to add to the source, when that assert says what
+    /// the equality says: it is entailed, both sides render as source, and no
+    /// variable appears in it at two assignment versions.
+    fn verus_assert(&self, equality: &air::context::EgraphEquality) -> Option<String> {
+        if equality.level != "entailed" {
+            return None;
+        }
+        let terms = [equality.lhs.as_str(), equality.rhs.as_str()];
+        if !terms.iter().all(|term| vir::air_names::renders_as_source(&self.plain, term)) {
+            return None;
+        }
+        // SSA symbols are plain SMT-LIB symbols, never quoted, so splitting
+        // on parentheses and spaces finds every one.
+        let mut version_of: HashMap<&str, u32> = HashMap::new();
+        for atom in terms.iter().flat_map(|term| term.split(['(', ')', ' ', '\n'])) {
+            if let Some((base, version)) = self.versions.get(atom) {
+                if *version_of.entry(base.as_str()).or_insert(*version) != *version {
+                    return None;
+                }
             }
         }
+        Some(format!(
+            "assert({} == {});",
+            vir::air_names::render_term(&self.plain, &equality.lhs),
+            vir::air_names::render_term(&self.plain, &equality.rhs)
+        ))
     }
 
     /// Where the quantifiers a proof relies on among `qids` are written.
@@ -710,26 +748,32 @@ impl<'a> QueryNames<'a> {
     /// were hidden.
     fn resolve(&self, reply: &EgraphReply) -> (Vec<ResolvedEquality>, usize) {
         let mut hidden = 0;
-        let mut resolved = Vec::new();
-        let mut seen = std::collections::HashSet::new();
+        let mut resolved: Vec<ResolvedEquality> = Vec::new();
+        let mut seen: HashMap<(String, String), usize> = HashMap::new();
         for equality in &reply.equalities {
             if !self.shows(&equality.lhs, &equality.rhs) {
                 hidden += 1;
                 continue;
             }
-            // The same equality between differently boxed terms reads the
-            // same; show it once, under the first reading's terms.
             let (lhs, rhs) = (self.show(&equality.lhs), self.show(&equality.rhs));
             let key =
                 if lhs <= rhs { (lhs.clone(), rhs.clone()) } else { (rhs.clone(), lhs.clone()) };
-            if !seen.insert(key) {
+            let used_by = self.proof_uses(&equality.used_by);
+            // The same equality between differently boxed terms reads the
+            // same; show it once, under the first reading's terms. A proof
+            // uses it when it uses either spelling, whichever came first.
+            if let Some(&index) = seen.get(&key) {
+                let kept = &mut resolved[index];
+                let merged: BTreeSet<String> = kept.used_by.drain(..).chain(used_by).collect();
+                kept.used_by = merged.into_iter().collect();
+                kept.used_by_proof = !kept.used_by.is_empty();
+                if kept.verus_assert.is_none() {
+                    kept.verus_assert = self.verus_assert(equality);
+                }
                 hidden += 1;
                 continue;
             }
-            let pasteable = [&equality.lhs, &equality.rhs]
-                .iter()
-                .all(|term| vir::air_names::renders_as_source(&self.plain, term));
-            let used_by = self.proof_uses(&equality.used_by);
+            seen.insert(key, resolved.len());
             resolved.push(ResolvedEquality {
                 id: equality_id(&equality.lhs, &equality.rhs),
                 lhs,
@@ -739,13 +783,7 @@ impl<'a> QueryNames<'a> {
                 used_by,
                 focus: equality.focus,
                 holds_because: equality.because.iter().map(|lit| self.show(lit)).collect(),
-                verus_assert: pasteable.then(|| {
-                    format!(
-                        "assert({} == {});",
-                        vir::air_names::render_term(&self.plain, &equality.lhs),
-                        vir::air_names::render_term(&self.plain, &equality.rhs)
-                    )
-                }),
+                verus_assert: self.verus_assert(equality),
                 smt_lhs: equality.lhs.clone(),
                 smt_rhs: equality.rhs.clone(),
             });
@@ -1177,7 +1215,12 @@ impl Server {
                     ) {
                         Ok(Ok(outcome)) => send(
                             &mut output,
-                            &Response::Egraph { session, bucket: bucket_id, query: id, outcome },
+                            &Response::Egraph {
+                                session,
+                                bucket: bucket_id,
+                                query: id,
+                                outcome: Box::new(outcome),
+                            },
                         )?,
                         Ok(Err(message)) => send(&mut output, &Response::Error { message })?,
                         Err(error) => return fatal(&mut output, error),
@@ -1603,10 +1646,12 @@ mod tests {
             .iter()
             .map(|x| (x.to_string(), vir::air_names::SourceName::Symbol(x.to_string())))
             .collect();
+        let versions = VariableVersions::new();
         let names = QueryNames {
             symbols: None,
             shown: Cow::Borrowed(&recorded),
             plain: Cow::Borrowed(&recorded),
+            versions: &versions,
         };
         // Three classes, {a, b}, {c, d} and {e, f}; the second reading loses the last.
         let before = reading(&[("a", "b"), ("c", "d"), ("e", "f")]);
@@ -1623,6 +1668,86 @@ mod tests {
             (same.new_equality_count, same.lost_equality_count, same.classes_merged),
             (0, 0, 0)
         );
+    }
+
+    fn equality(
+        lhs: &str,
+        rhs: &str,
+        level: &str,
+        used_by: &[&str],
+    ) -> air::context::EgraphEquality {
+        air::context::EgraphEquality {
+            lhs: lhs.to_string(),
+            rhs: rhs.to_string(),
+            level: level.to_string(),
+            used: !used_by.is_empty(),
+            used_by: used_by.iter().map(|qid| qid.to_string()).collect(),
+            focus: 1,
+            because: Vec::new(),
+        }
+    }
+
+    /// Names as `Symbols::query_names` and `paste_names` give them, for a
+    /// query where `z@0` and `z@1` are two assignments of `z`.
+    fn versioned_names() -> (SourceNames, SourceNames, VariableVersions) {
+        let symbol = |name: &str| vir::air_names::SourceName::Symbol(name.to_string());
+        let mut plain: SourceNames =
+            ["x", "y"].iter().map(|x| (x.to_string(), symbol(x))).collect();
+        let mut shown = plain.clone();
+        let mut versions = VariableVersions::new();
+        for version in [0, 1] {
+            let ssa = format!("z@{version}");
+            plain.insert(ssa.clone(), symbol("z"));
+            shown.insert(ssa.clone(), symbol(&format!("z (version {version})")));
+            versions.insert(ssa, ("z".to_string(), version));
+        }
+        (plain, shown, versions)
+    }
+
+    #[test]
+    fn pasted_asserts_need_entailment_and_one_version_per_variable() {
+        let (plain, shown, versions) = versioned_names();
+        let names = QueryNames {
+            symbols: None,
+            shown: Cow::Borrowed(&shown),
+            plain: Cow::Borrowed(&plain),
+            versions: &versions,
+        };
+        assert_eq!(
+            names.verus_assert(&equality("z@1", "(+ x 1)", "entailed", &[])).as_deref(),
+            Some("assert(z == (x + 1));")
+        );
+        // `z == (z + 1)` would paste one name for two assignments.
+        assert_eq!(names.verus_assert(&equality("z@1", "(+ z@0 1)", "entailed", &[])), None);
+        // Holds only in the model the search ended on.
+        assert_eq!(names.verus_assert(&equality("z@1", "x", "decision", &[])), None);
+        // `tmp` renders as no source.
+        assert_eq!(names.verus_assert(&equality("z@1", "tmp", "entailed", &[])), None);
+    }
+
+    #[test]
+    fn differently_spelled_duplicates_merge_whichever_comes_first() {
+        let (plain, shown, versions) = versioned_names();
+        let names = QueryNames {
+            symbols: None,
+            shown: Cow::Borrowed(&shown),
+            plain: Cow::Borrowed(&plain),
+            versions: &versions,
+        };
+        // The same equality in two spellings, as between a boxed and an
+        // unboxed term; only the second has a quantifier instantiated with it.
+        let unused = equality("x", "y", "entailed", &[]);
+        let used = equality("y", "x", "entailed", &["user_q"]);
+        for pairs in [[&unused, &used], [&used, &unused]] {
+            let reply = EgraphReply {
+                equalities: pairs.iter().map(|e| (*e).clone()).collect(),
+                ..EgraphReply::default()
+            };
+            let (listed, hidden) = names.resolve(&reply);
+            assert_eq!((listed.len(), hidden), (1, 1));
+            assert!(listed[0].used_by_proof);
+            assert_eq!(listed[0].used_by, vec!["user_q"]);
+        }
     }
 
     #[test]
