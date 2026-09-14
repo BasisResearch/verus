@@ -21,6 +21,7 @@ use std::sync::Arc;
 pub fn opaque_types_to_air(ctx: &Ctx, opaque_types: &Vec<OpaqueType>) -> Commands {
     let mut commands: Vec<Command> = Vec::new();
     for opaque_type in opaque_types {
+        let start = commands.len();
         // The arguments needed to instantiate the OpaqueType
         let mut args_typ = Vec::new();
         for _ in opaque_type.x.typ_params.iter() {
@@ -124,6 +125,8 @@ pub fn opaque_types_to_air(ctx: &Ctx, opaque_types: &Vec<OpaqueType>) -> Command
             let axiom = mk_unnamed_axiom(and);
             commands.push(Arc::new(CommandX::Global(axiom)));
         }
+        let owner = path_as_friendly_rust_name(&opaque_type.x.name);
+        crate::sst_to_air::record_internal_qid_owners(ctx, &commands[start..], &owner);
     }
 
     Arc::new(commands)

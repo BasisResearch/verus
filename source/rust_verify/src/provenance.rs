@@ -104,28 +104,37 @@ pub(crate) struct Symbols {
     hypotheses: HashMap<Fun, Vec<Hypothesis>>,
     quantifiers: HashMap<String, Quantifier>,
     axiom_owners: HashMap<String, String>,
+    /// Owners of the internal quantifiers `quantifiers` has no function for.
+    internal_qid_owners: HashMap<String, String>,
     source_names: vir::air_names::SourceNames,
 }
 
 impl Symbols {
-    /// The function a generated `:qid` belongs to and, for a quantifier the
-    /// user wrote, its source span.
+    /// What a generated `:qid` belongs to: its function or, for an internal
+    /// quantifier made outside any function, the datatype, trait or impl it
+    /// was made for. For a quantifier the user wrote, also its source span.
     pub(crate) fn quantifier_site(&self, qid: &str) -> Option<(&str, Option<&str>)> {
-        self.quantifiers.get(qid).map(|q| (q.fun.as_str(), q.span.as_deref()))
+        match self.quantifiers.get(qid) {
+            Some(q) => Some((q.fun.as_str(), q.span.as_deref())),
+            None => self.internal_qid_owners.get(qid).map(|owner| (owner.as_str(), None)),
+        }
     }
 
-    /// Every `:qid` of a function at `path` or inside it, matching whole
-    /// segments: `a::f` takes `a::f` and `a::f::g` but not `a::foo`. Only
-    /// quantifiers `qid_map` records an owner for are found; axioms made
-    /// outside any function, such as a spec function's definition, are not.
+    /// Every `:qid` owned at `path` or inside it, matching whole segments:
+    /// `a::S` takes `a::S`, `a::S::f` and `a::S<int.>` but not `a::Seq`. The
+    /// prelude's quantifiers belong to nothing and are never found.
     pub(crate) fn quantifiers_of(&self, path: &str) -> std::collections::HashSet<String> {
         let path = path.strip_suffix("::").unwrap_or(path);
-        let within = |fun: &str| {
-            fun.strip_prefix(path).is_some_and(|rest| rest.is_empty() || rest.starts_with("::"))
+        let within = |owner: &str| {
+            owner.strip_prefix(path).is_some_and(|rest| {
+                rest.is_empty() || rest.starts_with("::") || rest.starts_with('<')
+            })
         };
-        self.quantifiers
-            .iter()
-            .filter(|(_, q)| within(&q.fun))
+        let functions = self.quantifiers.iter().map(|(qid, q)| (qid, q.fun.as_str()));
+        let internal = self.internal_qid_owners.iter().map(|(qid, owner)| (qid, owner.as_str()));
+        functions
+            .chain(internal)
+            .filter(|(_, owner)| within(owner))
             .map(|(qid, _)| qid.clone())
             .collect()
     }
@@ -177,6 +186,7 @@ impl Symbols {
             hypotheses,
             quantifiers,
             axiom_owners: global.axiom_owners.borrow().clone(),
+            internal_qid_owners: global.internal_qid_owners.borrow().clone(),
             source_names,
         }
     }

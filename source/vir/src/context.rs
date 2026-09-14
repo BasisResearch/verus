@@ -78,6 +78,11 @@ pub struct GlobalCtx {
     /// datatype's resolve axiom. Axioms tagged from a `:qid` join through
     /// `qid_map` instead.
     pub axiom_owners: RefCell<HashMap<String, String>>,
+    /// `:qid` -> owner (friendly path) for the internal quantifiers vir makes
+    /// outside any function, which `qid_map` has no function for: a datatype's
+    /// box and type axioms, a trait's or impl's bound axioms, an associated
+    /// type's or opaque type's axioms.
+    pub internal_qid_owners: RefCell<HashMap<String, String>>,
     /// AIR symbol -> source name, recorded by the encoders as they encode
     /// (see `crate::air_names`), collected here from each module's NameCtxt.
     pub air_source_names: RefCell<crate::air_names::SourceNames>,
@@ -727,6 +732,7 @@ impl GlobalCtx {
         let qid_map = RefCell::new(HashMap::new());
         let hyp_map = RefCell::new(HashMap::new());
         let axiom_owners = RefCell::new(HashMap::new());
+        let internal_qid_owners = RefCell::new(HashMap::new());
         let air_source_names = RefCell::new(HashMap::new());
 
         let datatype_graph = crate::recursive_types::build_datatype_graph(krate, &mut span_infos);
@@ -747,6 +753,7 @@ impl GlobalCtx {
             qid_map,
             hyp_map,
             axiom_owners,
+            internal_qid_owners,
             air_source_names,
             rlimit,
             interpreter_log,
@@ -767,6 +774,7 @@ impl GlobalCtx {
         let qid_map = RefCell::new(HashMap::new());
         let hyp_map = RefCell::new(HashMap::new());
         let axiom_owners = RefCell::new(HashMap::new());
+        let internal_qid_owners = RefCell::new(HashMap::new());
         let air_source_names = RefCell::new(HashMap::new());
 
         GlobalCtx {
@@ -785,6 +793,7 @@ impl GlobalCtx {
             qid_map,
             hyp_map,
             axiom_owners,
+            internal_qid_owners,
             air_source_names,
             rlimit: self.rlimit,
             interpreter_log,
@@ -803,6 +812,7 @@ impl GlobalCtx {
         self.qid_map.borrow_mut().extend(other.qid_map.into_inner());
         self.hyp_map.borrow_mut().extend(other.hyp_map.into_inner());
         self.axiom_owners.borrow_mut().extend(other.axiom_owners.into_inner());
+        self.internal_qid_owners.borrow_mut().extend(other.internal_qid_owners.into_inner());
         crate::air_names::merge_source_names(
             &mut self.air_source_names.borrow_mut(),
             other.air_source_names.into_inner(),

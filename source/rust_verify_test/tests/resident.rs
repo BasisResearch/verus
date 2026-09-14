@@ -528,6 +528,80 @@ fn resident_inst_graph_finds_the_matching_loop() {
     plain.finish(false);
 }
 
+/// Every quantifier in a graph but the prelude's has an owner: a function's
+/// definition and pre/post axioms their function, a datatype's box and type
+/// axioms the datatype, so `source_fn` finds those too.
+///
+/// Needs a cvc5 with `--inst-graph`, like the test above.
+#[test]
+#[ignore]
+fn resident_inst_graph_names_internal_axiom_owners() {
+    let source = r#"
+use vstd::prelude::*;
+verus! {
+    proof fn pushed(s: Seq<int>)
+        requires s.len() > 3,
+        ensures
+            s.push(1).len() == s.len() + 1,
+            s.subrange(0, 2).len() == 2,
+            s.push(7)[s.len() as int] == 7,
+    {
+    }
+}
+"#;
+    let mut worker = Worker::start_with_env(
+        source,
+        &["-V", "no-solver-version-check"],
+        &[("VERUS_RESIDENT_INST_GRAPH", "1")],
+    );
+    let ready = worker.receive();
+    assert_eq!(ready["event"], "ready", "{}", ready);
+    let succeeded = ready["invocation_succeeded"].as_bool().unwrap();
+    let session = ready["session"].clone();
+    let query = query_id(&ready, "::pushed");
+    let checked =
+        worker.send(json!({"command": "check", "session": session, "bucket": 0, "query": query}));
+    assert_eq!(checked["result"], "valid", "{}", checked);
+    // Each node as (qid, owner).
+    let mut subgraph = |filter: Value| -> Vec<(String, Option<String>)> {
+        let reply = worker.send(json!({"command": "inst_graph", "session": session, "bucket": 0,
+            "query": query, "op": "subgraph", "limit": 1000, "filter": filter}));
+        reply["result"]["nodes"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{}", reply))
+            .iter()
+            .map(|n| {
+                (n["qid"].as_str().unwrap().to_owned(), n["function"].as_str().map(str::to_owned))
+            })
+            .collect()
+    };
+
+    let all = subgraph(json!({}));
+    for (qid, owner) in &all {
+        assert_eq!(owner.is_none(), qid.starts_with("prelude_"), "{} {:?}", qid, owner);
+    }
+    let owner_of = |qid: &str| all.iter().find(|(q, _)| q == qid).and_then(|(_, o)| o.clone());
+    let len = "internal_vstd!seq.Seq.len.?_pre_post_definition";
+    assert_eq!(owner_of(len).as_deref(), Some("vstd::seq::Seq::len"), "{:?}", all);
+    let (boxed, boxed_owner) = all
+        .iter()
+        .find(|(q, _)| {
+            q.starts_with("internal_vstd__seq__Seq<") && q.ends_with("_axiom_definition")
+        })
+        .unwrap_or_else(|| panic!("no datatype axiom in {:?}", all));
+    assert!(boxed_owner.as_deref().unwrap().starts_with("vstd::seq::Seq<"), "{:?}", boxed_owner);
+
+    // The datatype's path takes its axioms, its instantiations' and its
+    // methods', and nothing else.
+    let seq = subgraph(json!({"source_fn": "vstd::seq::Seq"}));
+    assert!(seq.iter().any(|(q, _)| q == boxed) && seq.iter().any(|(q, _)| q == len), "{:?}", seq);
+    for (qid, owner) in &seq {
+        assert!(owner.as_deref().unwrap().starts_with("vstd::seq::Seq"), "{} {:?}", qid, owner);
+    }
+    assert_eq!(worker.send(json!({"command": "close", "session": session}))["event"], "closed");
+    worker.finish(succeeded);
+}
+
 /// The contents of a worker's SMT logs.
 fn smt_logs(worker_dir: &Path) -> Vec<String> {
     fs::read_dir(worker_dir.join("logs"))

@@ -140,6 +140,10 @@ fn datatype_or_fun_to_air_commands(
     add_ext_equal: bool,
 ) {
     use crate::def::QID_EXT_EQUAL;
+    // The quantifiers made here belong to the datatype; they are recorded at
+    // the end, from what was pushed onto each list after these lengths.
+    let starts =
+        [field_commands.len(), token_commands.len(), box_commands.len(), axiom_commands.len()];
     let x = air_unique_var("x");
     let x_var = ident_var(&x.lower());
     let apolytyp = str_typ(crate::def::POLY);
@@ -690,6 +694,12 @@ fn datatype_or_fun_to_air_commands(
             pre.push(mk_bind_expr(&bind, &imply));
             axiom_commands.push(eq_command(&path_as_friendly_rust_name(dpath), &pre));
         }
+    }
+
+    let owner = path_as_friendly_rust_name(dpath);
+    let lists = [&*field_commands, &*token_commands, &*box_commands, &*axiom_commands];
+    for (commands, start) in lists.into_iter().zip(starts) {
+        crate::sst_to_air::record_internal_qid_owners(ctx, &commands[start..], &owner);
     }
 }
 
