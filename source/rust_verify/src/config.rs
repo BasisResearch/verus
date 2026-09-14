@@ -127,6 +127,8 @@ pub struct ArgsX {
     pub no_bv_simplify: bool,
     pub no_assert_ids: bool,
     pub provenance: bool,
+    /// Record cvc5's per-assertion difficulty and unsat-core membership.
+    pub difficulty: bool,
     pub reach: Option<String>,
     /// Serve retained AIR queries over stdin/stdout after compilation.
     pub resident: bool,
@@ -179,6 +181,7 @@ impl ArgsX {
             no_bv_simplify: Default::default(),
             no_assert_ids: Default::default(),
             provenance: Default::default(),
+            difficulty: Default::default(),
             reach: Default::default(),
             resident: false,
         }
@@ -430,7 +433,12 @@ pub fn parse_args_with_imports(
     const EXTENDED_NO_BV_SIMPLIFY: &str = "no-bv-simplify";
     const EXTENDED_NO_ASSERT_IDS: &str = "no-assert-ids";
     const EXTENDED_PROVENANCE: &str = "provenance";
+    const EXTENDED_DIFFICULTY: &str = "difficulty";
     const EXTENDED_KEYS: &[(&str, &str)] = &[
+        (
+            EXTENDED_DIFFICULTY,
+            "Record, per query, cvc5's difficulty for each hypothesis and axiom and whether the unsat core holds it (diagnostic: cvc5 runs with preprocessing proofs, solving under assumptions and twice the budget)",
+        ),
         (EXTENDED_IGNORE_UNEXPECTED_SMT, "Ignore unexpected SMT output"),
         (EXTENDED_DEBUG, "Enable debugging of proof failures"),
         (
@@ -884,6 +892,7 @@ pub fn parse_args_with_imports(
         no_bv_simplify: extended.contains_key(EXTENDED_NO_BV_SIMPLIFY),
         no_assert_ids: extended.contains_key(EXTENDED_NO_ASSERT_IDS),
         provenance: extended.contains_key(EXTENDED_PROVENANCE),
+        difficulty: extended.contains_key(EXTENDED_DIFFICULTY),
         resident: matches.opt_present(OPT_RESIDENT),
     };
 
@@ -895,6 +904,19 @@ pub fn parse_args_with_imports(
     }
     if args.provenance && args.no_assert_ids {
         error("-V provenance and -V no-assert-ids exclude each other".to_string());
+    }
+    if args.difficulty && !matches!(args.solver, SmtSolver::Cvc5) {
+        error(
+            "-V difficulty requires cvc5 (it is unavailable for vstd and internal test mode)"
+                .to_string(),
+        );
+    }
+    if args.difficulty && args.no_assert_ids {
+        // the rows are keyed by the ids; without them every row is untagged
+        error("-V difficulty and -V no-assert-ids exclude each other".to_string());
+    }
+    if args.difficulty && args.resident {
+        error("-V difficulty is not available in resident mode".to_string());
     }
 
     if args.resident

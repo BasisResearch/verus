@@ -268,8 +268,11 @@ pub(crate) fn smt_check_assertion<'ctx>(
             // Provenance mode spends more of the budget on proof bookkeeping during
             // search (measured on toydb), so it gets twice as much. Instantiation
             // replay runs with full proofs (`--produce-proofs`), which slowed a
-            // first search about 1.6x on toydb, so it gets the same.
-            let budget = if context.provenance || context.instantiation_replay {
+            // first search about 1.6x on toydb, so it gets the same. Difficulty
+            // mode pays for the same preprocessing proofs plus solving under
+            // assumptions, so it gets the same too.
+            let budget = if context.provenance || context.instantiation_replay || context.difficulty
+            {
                 context.rlimit.saturating_mul(2)
             } else {
                 context.rlimit
@@ -283,6 +286,11 @@ pub(crate) fn smt_check_assertion<'ctx>(
         context.smt_log.log_import_instantiations(&certificate);
     }
     context.smt_log.log_word("check-sat");
+    if context.difficulty {
+        // in the same batch, right after the answer it describes and before
+        // anything else can disturb the difficulty map or the unsat core
+        context.smt_log.log_get_info("difficulty-gradient");
+    }
     if context.provenance {
         // in the same batch: the tag lists arrive after the result and the
         // instantiation dump, before the sentinel
@@ -318,8 +326,17 @@ pub(crate) fn smt_check_assertion<'ctx>(
     // Process SMT results
     let mut unsat = None;
     let mut provenance_lines: Vec<String> = Vec::new();
+    let mut difficulty = None;
     for line in smt_output {
-        if line == "unsat" {
+        if context.difficulty && line.starts_with("(:difficulty-gradient ") {
+            difficulty = Some(parse_difficulty_gradient(&line));
+        } else if context.difficulty && difficulty.is_none() && line == "unsupported" {
+            // a cvc5 without the key; say so rather than fail the query
+            difficulty = Some(crate::context::DifficultyGradient {
+                unparsed: Some(line),
+                ..Default::default()
+            });
+        } else if line == "unsat" {
             assert!(unsat == None);
             unsat = Some(SmtOutput::Unsat);
         } else if line == "sat" {
@@ -355,6 +372,7 @@ pub(crate) fn smt_check_assertion<'ctx>(
     if context.provenance {
         context.last_provenance = Some(parse_provenance_lines(&provenance_lines));
     }
+    context.last_difficulty = difficulty;
 
     let unsat = unsat.expect("expected sat/unsat/unknown from SMT solver");
 
@@ -459,6 +477,142 @@ pub(crate) fn smt_check_assertion<'ctx>(
             }
         }
     }
+}
+
+/// Parse cvc5's `(:difficulty-gradient (:result R :difficulty B :core B
+/// :rows (ROW ...) :untagged (:asserted N :difficulty N [:in-core N])
+/// :unmatched-difficulty N))`, where each ROW is `(:tags (T ...) :difficulty
+/// N [:in-core B])`. Unknown keys are skipped; a reply that does not parse
+/// is kept whole in `unparsed`.
+pub(crate) fn parse_difficulty_gradient(line: &str) -> crate::context::DifficultyGradient {
+    use sise::TreeNode;
+    let mut out = crate::context::DifficultyGradient::default();
+    let text = bar_symbols_as_strings(line);
+    let mut parser = sise::Parser::new(&text);
+    let fields = match sise::parse_tree(&mut parser) {
+        Ok(TreeNode::List(items)) => match &items[..] {
+            [TreeNode::Atom(key), TreeNode::List(fields)] if key == ":difficulty-gradient" => {
+                fields.clone()
+            }
+            _ => Vec::new(),
+        },
+        _ => Vec::new(),
+    };
+    if fields.is_empty() {
+        out.unparsed = Some(line.to_owned());
+        return out;
+    }
+    let mut bad = false;
+    for pair in fields.chunks(2) {
+        match pair {
+            [TreeNode::Atom(k), TreeNode::Atom(v)] if k == ":result" => out.result = v.clone(),
+            [TreeNode::Atom(k), TreeNode::Atom(v)] if k == ":difficulty" => {
+                out.difficulty = v == "true";
+            }
+            [TreeNode::Atom(k), TreeNode::Atom(v)] if k == ":core" => out.core = v == "true",
+            [TreeNode::Atom(k), TreeNode::Atom(v)] if k == ":unmatched-difficulty" => {
+                match difficulty_count(v) {
+                    Some(n) => out.unmatched_difficulty = n,
+                    None => bad = true,
+                }
+            }
+            [TreeNode::Atom(k), TreeNode::List(rows)] if k == ":rows" => {
+                for row in rows {
+                    match parse_difficulty_row(row) {
+                        Some(r) => out.rows.push(r),
+                        None => bad = true,
+                    }
+                }
+            }
+            [TreeNode::Atom(k), TreeNode::List(untagged)] if k == ":untagged" => {
+                for pair in untagged.chunks(2) {
+                    let [TreeNode::Atom(k), TreeNode::Atom(v)] = pair else {
+                        bad = true;
+                        continue;
+                    };
+                    let Some(n) = difficulty_count(v) else {
+                        bad = true;
+                        continue;
+                    };
+                    match k.as_str() {
+                        ":asserted" => out.untagged_asserted = n,
+                        ":difficulty" => out.untagged_difficulty = n,
+                        ":in-core" => out.untagged_in_core = Some(n),
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    if bad {
+        out.unparsed = Some(line.to_owned());
+    }
+    out
+}
+
+/// A count from a difficulty reply. cvc5 prints arbitrary-precision
+/// integers, so one too large for u64 saturates rather than fails.
+fn difficulty_count(v: &str) -> Option<u64> {
+    (!v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| v.parse::<u64>().unwrap_or(u64::MAX))
+}
+
+/// One `(:tags (T ...) :difficulty N [:in-core B])` row of
+/// `(get-info :difficulty-gradient)`.
+fn parse_difficulty_row(row: &sise::TreeNode) -> Option<crate::context::DifficultyRow> {
+    use sise::TreeNode;
+    let TreeNode::List(items) = row else { return None };
+    let mut r = crate::context::DifficultyRow::default();
+    for pair in items.chunks(2) {
+        match pair {
+            [TreeNode::Atom(k), TreeNode::List(tags)] if k == ":tags" => {
+                for tag in tags {
+                    let TreeNode::Atom(tag) = tag else { return None };
+                    // a quoted symbol arrives as a sise string (see bar_symbols_as_strings)
+                    let tag =
+                        tag.strip_prefix('"').and_then(|t| t.strip_suffix('"')).unwrap_or(tag);
+                    r.tags.push(tag.to_owned());
+                }
+            }
+            [TreeNode::Atom(k), TreeNode::Atom(v)] if k == ":difficulty" => {
+                r.difficulty = difficulty_count(v)?;
+            }
+            [TreeNode::Atom(k), TreeNode::Atom(v)] if k == ":in-core" => {
+                r.in_core = Some(v == "true");
+            }
+            _ => {}
+        }
+    }
+    Some(r)
+}
+
+/// cvc5 quotes a symbol that needs it as `|...|`, which sise cannot read, so
+/// spell each one as a sise string. A symbol that cannot be a sise string
+/// (it holds `"` or `\`) is left alone, and the reply stays unparsed.
+fn bar_symbols_as_strings(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut rest = line;
+    while let Some(start) = rest.find('|') {
+        out.push_str(&rest[..start]);
+        let tail = &rest[start + 1..];
+        match tail.find('|') {
+            Some(end)
+                if tail[..end].chars().all(|c| matches!(c, ' '..='~') && c != '"' && c != '\\') =>
+            {
+                out.push('"');
+                out.push_str(&tail[..end]);
+                out.push('"');
+                rest = &tail[end + 1..];
+            }
+            _ => {
+                out.push_str(&rest[start..]);
+                rest = "";
+            }
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Parse what provenance mode adds to a `check-sat` batch's output: the

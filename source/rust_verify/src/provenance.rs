@@ -88,6 +88,80 @@ pub struct ResolvedQueryProvenance {
     pub unparsed: Vec<String>,
 }
 
+/// One `check-sat` under `-V difficulty`, as cvc5 reported it: rows by tag
+/// symbol, not yet joined to source.
+#[derive(Clone, Debug)]
+pub struct QueryDifficulty {
+    pub desc: String,
+    pub span: String,
+    /// 0 for the first check of the query, then one per multi-error round
+    pub round: usize,
+    /// "valid", "invalid", "canceled", or the solver's unexpected output
+    pub result: String,
+    pub gradient: air::context::DifficultyGradient,
+}
+
+/// One tagged input assertion of a query, joined to source. The numbers are
+/// cvc5's own; nothing here is derived.
+#[derive(serde::Serialize, Clone, Debug)]
+pub struct ResolvedDifficultyRow {
+    /// The assertion's tags, each joined to source; several when identical
+    /// assertions were merged.
+    pub tags: Vec<ResolvedTag>,
+    /// How many lemmas used a literal this assertion made relevant (cvc5's
+    /// difficulty measure): a heuristic for the solver work through it.
+    pub difficulty: u64,
+    /// Whether the unsat core holds it; present only after `unsat`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub in_core: Option<bool>,
+}
+
+/// A query's difficulty gradient with every tag joined to source
+/// (`-V difficulty`).
+#[derive(serde::Serialize, Clone, Debug)]
+pub struct ResolvedQueryDifficulty {
+    pub desc: String,
+    pub span: String,
+    pub round: usize,
+    pub result: String,
+    /// cvc5's own answer to the check: unsat, sat, unknown, or none
+    pub solver_result: String,
+    /// whether cvc5 tracked difficulty
+    pub difficulty: bool,
+    /// whether each row carries `in_core`
+    pub core: bool,
+    /// one per tagged input assertion in scope, largest difficulty first
+    pub rows: Vec<ResolvedDifficultyRow>,
+    /// the untagged input assertions (the AIR prelude), summed
+    pub untagged_asserted: u64,
+    pub untagged_difficulty: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub untagged_in_core: Option<u64>,
+    /// difficulty cvc5 could not carry back to a current input assertion
+    pub unmatched_difficulty: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unparsed: Option<String>,
+}
+
+const PRELUDE_QID_PREFIX: &str = "prelude_";
+/// The prelude writes this one by hand, so it has no `qid_map` entry.
+const FUEL_DEFAULTS_QID: &str = "prelude_fuel_defaults";
+
+/// Where an instantiated quantifier came from, joined back to source.
+struct QuantifierJoin {
+    fun: Option<String>,
+    span: Option<String>,
+    inside: Option<ResolvedTag>,
+    site: Option<String>,
+    role: Option<&'static str>,
+}
+
+/// A span without its directory or trailing id, for prose.
+fn span_short(s: &Option<String>) -> Option<String> {
+    s.as_ref()
+        .map(|s| s.rsplit('/').next().unwrap_or(s).split(" (#").next().unwrap_or(s).to_string())
+}
+
 struct Hypothesis {
     kind: String,
     span: String,
@@ -159,55 +233,69 @@ impl Symbols {
         }
     }
 
-    pub(crate) fn resolve(&self, fun: &Fun, q: QueryProvenance) -> ResolvedQueryProvenance {
-        const PRELUDE_QID_PREFIX: &str = "prelude_";
-        /// The prelude writes this one by hand, so it has no `qid_map` entry.
-        const FUEL_DEFAULTS_QID: &str = "prelude_fuel_defaults";
-        let hyp_map = &self.hypotheses;
-        let qid_map = &self.quantifiers;
-        let axiom_owners = &self.axiom_owners;
-        let air_source_names = &self.source_names;
-        let tag_of = |fun: &Fun, symbol: &str| -> ResolvedTag {
-            let mut r = ResolvedTag {
-                tag: symbol.to_string(),
-                kind: String::new(),
-                owner: None,
-                span: None,
-            };
-            match air::def::ProvenanceTag::from_symbol(symbol) {
-                Some(air::def::ProvenanceTag::Hyp(air::def::HypId(k))) => {
-                    match hyp_map.get(fun).and_then(|hs| hs.get(k as usize)) {
-                        Some(info) => {
-                            r.kind = info.kind.clone();
-                            r.owner = Some(fun_as_friendly_rust_name(fun));
-                            r.span = Some(info.span.clone());
-                        }
-                        None => r.kind = "hypothesis (unknown id)".to_string(),
+    /// Join one tag from a reply about one of `fun`'s queries back to source.
+    fn tag_of(&self, fun: &Fun, symbol: &str) -> ResolvedTag {
+        let mut r =
+            ResolvedTag { tag: symbol.to_string(), kind: String::new(), owner: None, span: None };
+        match air::def::ProvenanceTag::from_symbol(symbol) {
+            Some(air::def::ProvenanceTag::Hyp(air::def::HypId(k))) => {
+                match self.hypotheses.get(fun).and_then(|hs| hs.get(k as usize)) {
+                    Some(info) => {
+                        r.kind = info.kind.clone();
+                        r.owner = Some(fun_as_friendly_rust_name(fun));
+                        r.span = Some(info.span.clone());
                     }
+                    None => r.kind = "hypothesis (unknown id)".to_string(),
                 }
-                Some(air::def::ProvenanceTag::Query) => r.kind = "query".to_string(),
-                Some(air::def::ProvenanceTag::Assert(_)) => r.kind = "goal".to_string(),
-                Some(air::def::ProvenanceTag::Axiom(ident)) => {
-                    let ident: &str = &ident;
-                    if let Some(owner) = axiom_owners.get(symbol) {
-                        r.kind = "axiom".to_string();
-                        r.owner = Some(owner.clone());
-                    } else if let Some(info) = qid_map.get(ident) {
-                        r.kind = "axiom".to_string();
-                        r.owner = Some(info.fun.clone());
-                        r.span = info.span.clone();
-                    } else if ident.starts_with(PRELUDE_QID_PREFIX) {
-                        r.kind = "prelude".to_string();
-                    } else if ident.starts_with("anon_") {
-                        r.kind = "anonymous_axiom".to_string();
-                    } else {
-                        r.kind = "axiom".to_string();
-                    }
-                }
-                None => r.kind = "untagged".to_string(),
             }
-            r
+            Some(air::def::ProvenanceTag::Query) => r.kind = "query".to_string(),
+            Some(air::def::ProvenanceTag::Assert(_)) => r.kind = "goal".to_string(),
+            Some(air::def::ProvenanceTag::Axiom(ident)) => {
+                let ident: &str = &ident;
+                if let Some(owner) = self.axiom_owners.get(symbol) {
+                    r.kind = "axiom".to_string();
+                    r.owner = Some(owner.clone());
+                } else if let Some(info) = self.quantifiers.get(ident) {
+                    r.kind = "axiom".to_string();
+                    r.owner = Some(info.fun.clone());
+                    r.span = info.span.clone();
+                } else if ident.starts_with(PRELUDE_QID_PREFIX) {
+                    r.kind = "prelude".to_string();
+                } else if ident.starts_with("anon_") {
+                    r.kind = "anonymous_axiom".to_string();
+                } else {
+                    r.kind = "axiom".to_string();
+                }
+            }
+            None => r.kind = "untagged".to_string(),
+        }
+        r
+    }
+
+    /// Join a quantifier that one of `fun`'s queries instantiated back to
+    /// source by its `:qid`.
+    fn quantifier(&self, fun: &Fun, qid: &str) -> QuantifierJoin {
+        let (fun_name, span, inside, role) = match self.quantifiers.get(qid) {
+            Some(info) => (
+                Some(info.fun.clone()),
+                info.span.clone(),
+                info.tag.as_ref().map(|t| self.tag_of(fun, &t.to_symbol())),
+                info.role,
+            ),
+            None => (
+                qid.starts_with(PRELUDE_QID_PREFIX).then(|| "prelude".to_string()),
+                None,
+                None,
+                (qid == FUEL_DEFAULTS_QID).then_some("fuel_defaults"),
+            ),
         };
+        let site = quantifier_site(&inside, &span_short(&span));
+        QuantifierJoin { fun: fun_name, span, inside, site, role }
+    }
+
+    pub(crate) fn resolve(&self, fun: &Fun, q: QueryProvenance) -> ResolvedQueryProvenance {
+        let air_source_names = &self.source_names;
+        let tag_of = |fun: &Fun, symbol: &str| self.tag_of(fun, symbol);
         let is_hyp_kind =
             |k: &str| matches!(k, "requires" | "type_invariant" | "fuel" | "trait_bound");
         // SSA versions are query-local. Preserve assignment identity in the display.
@@ -242,32 +330,8 @@ impl Symbols {
             .instantiations
             .iter()
             .map(|(qid, vectors)| {
-                let span_short = |s: &Option<String>| -> Option<String> {
-                    s.as_ref().map(|s| {
-                        s.rsplit('/')
-                            .next()
-                            .unwrap_or(s)
-                            .split(" (#")
-                            .next()
-                            .unwrap_or(s)
-                            .to_string()
-                    })
-                };
-                let (fun_name, span, inside, role) = match qid_map.get(qid) {
-                    Some(info) => (
-                        Some(info.fun.clone()),
-                        info.span.clone(),
-                        info.tag.as_ref().map(|t| tag_of(fun, &t.to_symbol())),
-                        info.role,
-                    ),
-                    None => (
-                        qid.starts_with(PRELUDE_QID_PREFIX).then(|| "prelude".to_string()),
-                        None,
-                        None,
-                        (qid.as_str() == FUEL_DEFAULTS_QID).then_some("fuel_defaults"),
-                    ),
-                };
-                let site = quantifier_site(&inside, &span_short(&span));
+                let QuantifierJoin { fun: fun_name, span, inside, site, role } =
+                    self.quantifier(fun, qid);
                 ResolvedInstantiation {
                     qid: qid.clone(),
                     fun: fun_name,
@@ -294,6 +358,39 @@ impl Symbols {
             axioms_in_scope,
             instantiations,
             unparsed: q.unparsed,
+        }
+    }
+
+    /// Join each tagged assertion of a query's difficulty gradient to source.
+    pub(crate) fn resolve_difficulty(
+        &self,
+        fun: &Fun,
+        q: QueryDifficulty,
+    ) -> ResolvedQueryDifficulty {
+        let g = q.gradient;
+        let rows = g
+            .rows
+            .into_iter()
+            .map(|row| ResolvedDifficultyRow {
+                tags: row.tags.iter().map(|t| self.tag_of(fun, t)).collect(),
+                difficulty: row.difficulty,
+                in_core: row.in_core,
+            })
+            .collect();
+        ResolvedQueryDifficulty {
+            desc: q.desc,
+            span: q.span,
+            round: q.round,
+            result: q.result,
+            solver_result: g.result,
+            difficulty: g.difficulty,
+            core: g.core,
+            rows,
+            untagged_asserted: g.untagged_asserted,
+            untagged_difficulty: g.untagged_difficulty,
+            untagged_in_core: g.untagged_in_core,
+            unmatched_difficulty: g.unmatched_difficulty,
+            unparsed: g.unparsed,
         }
     }
 }

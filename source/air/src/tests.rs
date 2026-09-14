@@ -2380,3 +2380,39 @@ fn provenance_reply_parses() {
     let info = crate::smt_verify::parse_provenance_lines(&vec!["(surprise 1 2)".to_string()]);
     assert_eq!(info.unparsed, vec!["(surprise 1 2)".to_string()]);
 }
+
+#[test]
+fn parse_difficulty_gradient_reply() {
+    // cvc5's reply to the regression get-info-difficulty-gradient.smt2
+    let g = crate::smt_verify::parse_difficulty_gradient(
+        "(:difficulty-gradient (:result unsat :difficulty true :core true :rows (\
+         (:tags (ax_f) :difficulty 1 :in-core true) \
+         (:tags (query_0) :difficulty 1 :in-core true) \
+         (:tags (hyp_a |hyp%b|) :difficulty 0 :in-core false)) \
+         :untagged (:asserted 1 :difficulty 0 :in-core 0) :unmatched-difficulty 0))",
+    );
+    assert!(g.unparsed.is_none(), "{:?}", g.unparsed);
+    assert_eq!((g.result.as_str(), g.difficulty, g.core, g.rows.len()), ("unsat", true, true, 3));
+    assert_eq!(g.rows[0].tags, vec!["ax_f".to_string()]);
+    assert_eq!((g.rows[0].difficulty, g.rows[0].in_core), (1, Some(true)));
+    // merged assertions carry several tags; quoted symbols lose their bars
+    assert_eq!(g.rows[2].tags, vec!["hyp_a".to_string(), "hyp%b".to_string()]);
+    assert_eq!(g.rows[2].in_core, Some(false));
+    assert_eq!((g.untagged_asserted, g.untagged_in_core, g.unmatched_difficulty), (1, Some(0), 0));
+
+    // no core outside unsat; a count beyond u64 saturates
+    let g = crate::smt_verify::parse_difficulty_gradient(
+        "(:difficulty-gradient (:result unknown :difficulty true :core false :rows (\
+         (:tags (ax_f) :difficulty 123456789012345678901234567890)) \
+         :untagged (:asserted 2 :difficulty 7) :unmatched-difficulty 3))",
+    );
+    assert!(g.unparsed.is_none() && !g.core);
+    assert_eq!((g.rows[0].difficulty, g.rows[0].in_core), (u64::MAX, None));
+    assert_eq!((g.untagged_difficulty, g.untagged_in_core, g.unmatched_difficulty), (7, None, 3));
+
+    // a solver without the key, or anything unforeseen, is kept whole
+    let g = crate::smt_verify::parse_difficulty_gradient("(:difficulty-gradient unsupported)");
+    assert_eq!(g.unparsed.as_deref(), Some("(:difficulty-gradient unsupported)"));
+    let bad = "(:difficulty-gradient (:result sat :rows ((:tags (a) :difficulty many))))";
+    assert_eq!(crate::smt_verify::parse_difficulty_gradient(bad).unparsed.as_deref(), Some(bad));
+}
