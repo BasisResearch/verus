@@ -13,6 +13,9 @@ pub struct QueryProvenance {
     pub variable_versions: air::context::VariableVersions,
     pub desc: String,
     pub span: String,
+    /// Under `--expand-errors`, the obligation the recheck was focused on, as
+    /// the symbol its goal tag carries (`aid_3_1_2`).
+    pub focus: Option<String>,
     /// 0 for the first check of the query, then one per multi-error round
     pub round: usize,
     /// "valid", "invalid", "canceled", or the solver's unexpected output
@@ -73,6 +76,10 @@ pub struct ResolvedInstantiation {
 pub struct ResolvedQueryProvenance {
     pub desc: String,
     pub span: String,
+    /// Under `--expand-errors`, the obligation this recheck was focused on,
+    /// as the symbol its goal tag carries (`aid_3_1_2`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub focus: Option<String>,
     pub round: usize,
     pub result: String,
     /// hypotheses (requires, type invariants, fuel, trait bounds) that fed
@@ -97,6 +104,9 @@ pub struct QueryNlFrontier {
     /// `body`, `recommends`, `expanded`, ...: a recommends rerun or an
     /// expanded recheck shares the body check's `desc` and `span`
     pub kind: &'static str,
+    /// Under `--expand-errors`, the obligation the recheck was focused on, as
+    /// the symbol its goal tag carries (`aid_3_1_2`).
+    pub focus: Option<String>,
     /// 0 for the first check of the query, then one per multi-error round
     pub round: usize,
     /// "valid", "invalid", "canceled", or the solver's unexpected output
@@ -200,6 +210,10 @@ pub struct ResolvedQueryNlFrontier {
     pub desc: String,
     pub span: String,
     pub kind: &'static str,
+    /// Under `--expand-errors`, the obligation this recheck was focused on,
+    /// as the symbol its goal tag carries (`aid_3_1_2`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub focus: Option<String>,
     pub round: usize,
     pub result: String,
     /// cvc5's own answer to the check: unsat, sat, unknown, or none
@@ -324,6 +338,9 @@ pub struct QueryInstPressure {
     /// `body`, `recommends`, `expanded`, ...: a recommends rerun or an
     /// expanded recheck shares the body check's `desc` and `span`
     pub kind: &'static str,
+    /// Under `--expand-errors`, the obligation the recheck was focused on, as
+    /// the symbol its goal tag carries (`aid_3_1_2`).
+    pub focus: Option<String>,
     /// 0 for the first check of the query, then one per multi-error round
     pub round: usize,
     /// "valid", "invalid", "canceled", or the solver's unexpected output
@@ -376,6 +393,10 @@ pub struct ResolvedQueryInstPressure {
     pub desc: String,
     pub span: String,
     pub kind: &'static str,
+    /// Under `--expand-errors`, the obligation this recheck was focused on,
+    /// as the symbol its goal tag carries (`aid_3_1_2`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub focus: Option<String>,
     pub round: usize,
     pub result: String,
     /// instantiation rounds that sent lemmas
@@ -394,6 +415,9 @@ pub struct ResolvedQueryInstPressure {
 pub struct QueryMatchingLoops {
     pub desc: String,
     pub span: String,
+    /// Under `--expand-errors`, the obligation the recheck was focused on, as
+    /// the symbol its goal tag carries (`aid_3_1_2`).
+    pub focus: Option<String>,
     /// 0 for the first check of the query, then one per multi-error round
     pub round: usize,
     /// "invalid" or "canceled": the verdict the unknown turned into
@@ -493,6 +517,10 @@ pub struct ResolvedMatchingLoop {
 pub struct ResolvedQueryMatchingLoops {
     pub desc: String,
     pub span: String,
+    /// Under `--expand-errors`, the obligation this recheck was focused on,
+    /// as the symbol its goal tag carries (`aid_3_1_2`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub focus: Option<String>,
     pub round: usize,
     pub result: String,
     /// the last instantiation round of the check
@@ -838,6 +866,9 @@ impl Symbols {
                 let ident: &str = &ident;
                 if let Some(owner) = self.axiom_owners.get(symbol) {
                     r.kind = "axiom".to_string();
+                    // a broadcast axiom is known by the function that states
+                    // it, so the span is that function's (`with_function_spans`)
+                    r.span = self.function_spans.get(owner).cloned();
                     r.owner = Some(owner.clone());
                 } else if let Some(info) = self.quantifiers.get(ident) {
                     r.kind = "axiom".to_string();
@@ -928,6 +959,7 @@ impl Symbols {
         ResolvedQueryProvenance {
             desc: q.desc,
             span: q.span,
+            focus: q.focus,
             round: q.round,
             result: q.result,
             hypotheses,
@@ -1020,6 +1052,7 @@ impl Symbols {
             desc: q.desc,
             span: q.span,
             kind: q.kind,
+            focus: q.focus,
             round: q.round,
             result: q.result,
             rounds: q.pressure.rounds,
@@ -1159,6 +1192,7 @@ impl Symbols {
         ResolvedQueryMatchingLoops {
             desc: q.desc,
             span: q.span,
+            focus: q.focus,
             round: q.round,
             result: q.result,
             rounds: q.info.rounds,
@@ -1267,6 +1301,7 @@ impl Symbols {
         ResolvedQueryNlFrontier {
             desc: q.desc,
             span: q.span,
+            focus: q.focus,
             round: q.round,
             result: q.result,
             kind: q.kind,
@@ -1498,6 +1533,7 @@ mod tests {
         let query = QueryNlFrontier {
             desc: "function body check".to_string(),
             span: "src/a.rs:5:1: 5:30 (#0)".to_string(),
+            focus: None,
             round: 0,
             result: "invalid".to_string(),
             kind: "recommends",

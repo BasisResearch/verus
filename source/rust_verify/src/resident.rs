@@ -1844,6 +1844,8 @@ impl Server {
                                 crate::provenance::QueryProvenance {
                                     desc: query.context.desc.clone(),
                                     span: query.context.span.as_string.clone(),
+                                    // resident rechecks never expand an error
+                                    focus: None,
                                     round: 0,
                                     result: match result {
                                         QueryResult::Valid => "valid",
@@ -1873,6 +1875,8 @@ impl Server {
                                 crate::provenance::QueryMatchingLoops {
                                     desc: query.context.desc.clone(),
                                     span: query.context.span.as_string.clone(),
+                                    // resident rechecks never expand an error
+                                    focus: None,
                                     round: 0,
                                     result: match result {
                                         QueryResult::Valid => "valid",

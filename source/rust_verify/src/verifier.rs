@@ -1007,6 +1007,7 @@ impl Verifier {
                         desc: context.desc.clone(),
                         span: context.span.as_string.clone(),
                         kind: query_op.kind(),
+                        focus: focus_assert_id.map(air::def::assert_id_to_symbol),
                         round,
                         result: result_str(),
                         frontier,
@@ -1018,6 +1019,7 @@ impl Verifier {
                     QueryMatchingLoops {
                         desc: context.desc.clone(),
                         span: context.span.as_string.clone(),
+                        focus: focus_assert_id.map(air::def::assert_id_to_symbol),
                         round,
                         result: result_str(),
                         info,
@@ -1043,6 +1045,7 @@ impl Verifier {
                         desc: context.desc.clone(),
                         span: context.span.as_string.clone(),
                         kind: query_op.kind(),
+                        focus: focus_assert_id.map(air::def::assert_id_to_symbol),
                         round,
                         result: result_str(),
                         pressure,
@@ -1054,6 +1057,7 @@ impl Verifier {
                     QueryProvenance {
                         desc: context.desc.clone(),
                         span: context.span.as_string.clone(),
+                        focus: focus_assert_id.map(air::def::assert_id_to_symbol),
                         round,
                         result: result_str(),
                         sources: info.sources,
