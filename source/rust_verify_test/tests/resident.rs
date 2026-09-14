@@ -1470,7 +1470,7 @@ fn resident_ready_lists_the_requests_it_serves() {
             "inst_graph" => {
                 json!({"command": command, "session": "stale", "bucket": 0, "query": 0, "op": "cycles"})
             }
-            _ => panic!("no request for {command}"),
+            _ => panic!("no request for {}", command),
         };
         let reply = worker.send(request);
         assert_eq!(reply["event"], "error", "{command}: {reply}");

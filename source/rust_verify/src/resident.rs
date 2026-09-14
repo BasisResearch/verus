@@ -2256,6 +2256,21 @@ mod tests {
             .unwrap()
     }
 
+    /// `COMMANDS` names every request, so a client that reads `ready` and
+    /// skips what it does not list never skips one this worker serves. serde
+    /// names the variants it knows when it meets one it does not, which keeps
+    /// this honest without writing the list out a second time.
+    #[test]
+    fn commands_names_every_request() {
+        let refused = serde_json::from_str::<Request>(r#"{"command": "no_such_request"}"#);
+        let Err(error) = refused else { panic!("an unknown command is refused") };
+        let error = error.to_string();
+        // unknown variant `no_such_request`, expected one of `list`, `check`, ...
+        let names: BTreeSet<&str> = error.split('`').skip(3).step_by(2).collect();
+        assert!(names.contains("list"), "unexpected serde message: {error}");
+        assert_eq!(names, COMMANDS.iter().copied().collect::<BTreeSet<_>>(), "{error}");
+    }
+
     #[test]
     fn kept_graphs_drop_the_least_recently_used_past_the_budget() {
         let graph = |n: usize| {
