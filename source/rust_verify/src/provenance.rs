@@ -475,6 +475,116 @@ struct Quantifier {
     type_binders: Vec<usize>,
 }
 
+/// One candidate culprit of an `unknown` answer, joined back to source.
+#[derive(serde::Serialize, Clone, Debug)]
+pub struct ResolvedCulprit {
+    pub qid: String,
+    /// prelude, or the function the quantifier was written in
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fun: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub span: Option<String>,
+    /// Why the quantifier exists, as the encoder that emitted it said.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub role: Option<&'static str>,
+}
+
+impl ResolvedCulprit {
+    /// Sort key: quantifiers with a source span, then the rest Verus emitted,
+    /// then the prelude's.
+    fn rank(&self) -> u8 {
+        match (&self.span, self.fun.as_deref()) {
+            (Some(_), _) => 0,
+            (None, Some("prelude")) => 2,
+            (None, _) => 1,
+        }
+    }
+}
+
+/// Why a query's first check answered `unknown`, with the solver's candidate
+/// culprit quantifiers joined back to source.
+#[derive(serde::Serialize, Clone, Debug)]
+pub struct ResolvedUnknownReason {
+    pub desc: String,
+    pub span: String,
+    /// the solver's `:reason-unknown`: incomplete, resourceout, timeout, ...
+    pub reason: String,
+    /// cvc5's `IncompleteId` for an incomplete answer: QUANTIFIERS, ARITH_NL,
+    /// QUANTIFIERS_MAX_INST_ROUNDS, ...
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub incomplete_id: Option<String>,
+    /// the asserted quantifiers no solver strategy claimed to have fully
+    /// processed: those with a source span first and the prelude's last, each
+    /// group in the order the solver found them
+    pub culprits: Vec<ResolvedCulprit>,
+}
+
+/// The quantifier table alone. It is enough to join an `unknown` answer's
+/// culprits to source, and cheap enough to capture in every run, unlike the
+/// rest of `Symbols`.
+pub(crate) struct Quantifiers(HashMap<String, Quantifier>);
+
+impl Quantifiers {
+    pub(crate) fn capture(global: &vir::context::GlobalCtx) -> Self {
+        Self(
+            global
+                .qid_map
+                .borrow()
+                .iter()
+                .map(|(qid, info)| {
+                    (
+                        qid.clone(),
+                        Quantifier {
+                            fun: fun_as_friendly_rust_name(&info.fun),
+                            span: info.user.as_ref().map(|user| user.span.as_string.clone()),
+                            tag: info.tag.clone(),
+                            role: info.role.as_ref().map(role_name),
+                            type_binders: info.type_binders.clone(),
+                        },
+                    )
+                })
+                .collect(),
+        )
+    }
+
+    pub(crate) fn resolve_unknown(
+        &self,
+        desc: &str,
+        span: &str,
+        reason: air::context::UnknownReason,
+    ) -> ResolvedUnknownReason {
+        let mut culprits: Vec<ResolvedCulprit> = reason
+            .culprit_qids
+            .into_iter()
+            .map(|qid| match self.0.get(&qid) {
+                Some(info) => ResolvedCulprit {
+                    fun: Some(info.fun.clone()),
+                    span: info.span.clone(),
+                    role: info.role,
+                    qid,
+                },
+                None => ResolvedCulprit {
+                    fun: qid.starts_with(PRELUDE_QID_PREFIX).then(|| "prelude".to_string()),
+                    span: None,
+                    role: (qid == FUEL_DEFAULTS_QID).then_some("fuel_defaults"),
+                    qid,
+                },
+            })
+            .collect();
+        // Under plain E-matching every asserted quantifier is a culprit, and
+        // the prelude alone contributes about 80. The ones with a source span
+        // are the ones a user can act on, so they lead; the sort is stable.
+        culprits.sort_by_key(ResolvedCulprit::rank);
+        ResolvedUnknownReason {
+            desc: desc.to_owned(),
+            span: span.to_owned(),
+            reason: reason.reason,
+            incomplete_id: reason.incomplete_id,
+            culprits,
+        }
+    }
+}
+
 /// No compiler context, source map, or VIR expression is retained here.
 pub(crate) struct Symbols {
     hypotheses: HashMap<Fun, Vec<Hypothesis>>,
@@ -517,23 +627,7 @@ impl Symbols {
                 )
             })
             .collect();
-        let quantifiers = global
-            .qid_map
-            .borrow()
-            .iter()
-            .map(|(qid, info)| {
-                (
-                    qid.clone(),
-                    Quantifier {
-                        fun: fun_as_friendly_rust_name(&info.fun),
-                        span: info.user.as_ref().map(|user| user.span.as_string.clone()),
-                        tag: info.tag.clone(),
-                        role: info.role.as_ref().map(role_name),
-                        type_binders: info.type_binders.clone(),
-                    },
-                )
-            })
-            .collect();
+        let Quantifiers(quantifiers) = Quantifiers::capture(global);
         Self {
             hypotheses,
             quantifiers,
@@ -1125,6 +1219,47 @@ fn quantifier_site(inside: &Option<ResolvedTag>, span: &Option<String>) -> Optio
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unknown_culprits_put_source_spans_first_and_the_prelude_last() {
+        let quantifier = |span: Option<&str>| Quantifier {
+            fun: "lib::f".to_owned(),
+            span: span.map(str::to_owned),
+            tag: None,
+            role: None,
+            type_binders: Vec::new(),
+        };
+        let table = Quantifiers(HashMap::from([
+            ("user_lib__f_0".to_owned(), quantifier(Some("lib.rs:3:9: 3:40 (#0)"))),
+            ("internal_lib__f_definition".to_owned(), quantifier(None)),
+        ]));
+        let reason = air::context::UnknownReason {
+            reason: "incomplete".to_owned(),
+            incomplete_id: Some("QUANTIFIERS".to_owned()),
+            culprit_qids: [
+                "prelude_box_unbox_int",
+                "internal_lib__f_definition",
+                "unmapped",
+                "prelude_fuel_defaults",
+                "user_lib__f_0",
+            ]
+            .map(str::to_owned)
+            .to_vec(),
+        };
+        let resolved = table.resolve_unknown("desc", "span", reason);
+        let qids: Vec<&str> = resolved.culprits.iter().map(|c| c.qid.as_str()).collect();
+        assert_eq!(
+            qids,
+            [
+                "user_lib__f_0",
+                "internal_lib__f_definition",
+                "unmapped",
+                "prelude_box_unbox_int",
+                "prelude_fuel_defaults",
+            ]
+        );
+        assert_eq!(resolved.culprits[4].role, Some("fuel_defaults"));
+    }
 
     #[test]
     fn smt_numbers_read_as_numbers() {

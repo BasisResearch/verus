@@ -177,6 +177,8 @@ pub(crate) struct RetainedBucket {
     cert_keys: Vec<String>,
     state: Mutex<Vec<SolverState>>,
     symbols: Option<crate::provenance::Symbols>,
+    /// Joins an `unknown` answer's culprits to source; kept in every mode.
+    quantifiers: crate::provenance::Quantifiers,
 }
 
 pub(crate) struct SolverState {
@@ -197,6 +199,7 @@ impl RetainedBucket {
         journal: QueryJournal,
         mut spinoffs: Vec<SolverState>,
         symbols: Option<crate::provenance::Symbols>,
+        quantifiers: crate::provenance::Quantifiers,
     ) -> Self {
         let mut states = Vec::new();
         // Spinoff queries already own their declaration context. The unused
@@ -238,7 +241,7 @@ impl RetainedBucket {
                 addresses.push((solver, local));
             }
         }
-        Self { id, queries, addresses, cert_keys, state: Mutex::new(states), symbols }
+        Self { id, queries, addresses, cert_keys, state: Mutex::new(states), symbols, quantifiers }
     }
 }
 
@@ -365,6 +368,9 @@ enum Response<'a> {
         elapsed_ms: u128,
         restore_ms: u128,
         provenance: Option<&'a crate::provenance::ResolvedQueryProvenance>,
+        /// Present when the first round answered `unknown`: the solver's reason
+        /// and candidate culprit quantifiers.
+        unknown_reason: Option<&'a crate::provenance::ResolvedUnknownReason>,
         /// Present when round zero came back unknown under `-V matching-loops`.
         matching_loops: Option<&'a crate::provenance::ResolvedQueryMatchingLoops>,
         /// Present when this check tried a certificate before searching.
@@ -1326,6 +1332,7 @@ impl Server {
                         air.set_restore_instantiations(None, false);
                         air.set_import_instantiations(None);
                         drop(air.take_provenance());
+                        drop(air.take_unknown_reason());
                         drop(air.take_matching_loops());
                         drop(air.take_inst_pressure());
                         match attempt {
@@ -1358,6 +1365,7 @@ impl Server {
                     // The response describes round zero. Later error searches
                     // replace AIR's provenance, even when their verdict differs.
                     let first_provenance = air.take_provenance();
+                    let first_unknown_reason = air.take_unknown_reason();
                     let first_matching_loops = air.take_matching_loops();
                     // Sessions do not report instantiation pressure yet.
                     drop(air.take_inst_pressure());
@@ -1496,6 +1504,13 @@ impl Server {
                             )
                         })
                     });
+                    let unknown_reason = first_unknown_reason.map(|reason| {
+                        bucket.quantifiers.resolve_unknown(
+                            &query.context.desc,
+                            &query.context.span.as_string,
+                            reason,
+                        )
+                    });
                     let matching_loops = first_matching_loops.and_then(|info| {
                         bucket.symbols.as_ref().map(|symbols| {
                             symbols.resolve_matching_loops(
@@ -1541,6 +1556,7 @@ impl Server {
                             elapsed_ms: start.elapsed().as_millis(),
                             restore_ms,
                             provenance: provenance.as_ref(),
+                            unknown_reason: unknown_reason.as_ref(),
                             matching_loops: matching_loops.as_ref(),
                             certificate: attempted,
                         },

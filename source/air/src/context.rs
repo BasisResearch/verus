@@ -62,6 +62,25 @@ pub struct ProvenanceInfo {
 
 pub type VariableVersions = HashMap<String, (String, u32)>;
 
+/// Why a `check-sat` answered `unknown`, as the solver reported it. The join
+/// of the culprit `:qid`s back to source happens in Verus.
+#[derive(Debug, Clone, Default)]
+pub struct UnknownReason {
+    /// The `(get-info :reason-unknown)` answer, unquoted: `incomplete`,
+    /// `resourceout`, `timeout`, ...
+    pub reason: String,
+    /// cvc5's own classification of an incomplete answer, the `IncompleteId`
+    /// behind `(get-info :incomplete-id)`: `QUANTIFIERS`, `ARITH_NL`,
+    /// `QUANTIFIERS_MAX_INST_ROUNDS`, ... `None` when the answer was not
+    /// incomplete or the solver cannot say.
+    pub incomplete_id: Option<String>,
+    /// The `:qid`s of `(get-info :incomplete-culprits)`: the asserted
+    /// quantifiers no strategy claimed to have fully processed. Candidates,
+    /// not a verdict: when the solver gave up for a global reason (the
+    /// instantiation round limit, a module's own check) there are none.
+    pub culprit_qids: Vec<String>,
+}
+
 /// What cvc5's `(get-info :nl-frontier)` reported for one `check-sat`
 /// (`-V nl-frontier`): the nonlinear terms whose value in the linear model
 /// the nonlinear extension could not reconcile with their arguments' values,
@@ -433,6 +452,8 @@ pub struct Context {
     pub(crate) provenance: bool,
     /// The provenance of the last `check-sat`, until the caller takes it.
     pub(crate) last_provenance: Option<ProvenanceInfo>,
+    /// Why the last `check-sat` answered `unknown`, until the caller takes it.
+    pub(crate) last_unknown_reason: Option<UnknownReason>,
     /// Nonlinear frontier mode (`-V nl-frontier`): cvc5 is asked for
     /// `(get-info :nl-frontier)` after every `check-sat`. cvc5 records the
     /// frontier during every check anyway, so the search is the ordinary one.
@@ -549,6 +570,7 @@ impl Context {
             anon_axiom_count: 0,
             provenance: false,
             last_provenance: None,
+            last_unknown_reason: None,
             nl_frontier: false,
             last_nl_frontier: None,
             matching_loops: false,
@@ -675,6 +697,12 @@ impl Context {
             info.variable_versions = self.variable_versions.clone();
             info
         })
+    }
+
+    /// Why the most recent `check-sat` answered `unknown`, if it did; each call
+    /// returns it once. Rounds that did not answer `unknown` leave none.
+    pub fn take_unknown_reason(&mut self) -> Option<UnknownReason> {
+        self.last_unknown_reason.take()
     }
 
     /// The nonlinear frontier cvc5 reported for the most recent `check-sat`,
@@ -1076,6 +1104,9 @@ impl Context {
         query_context: QueryContext<'_, '_>,
     ) -> ValidityResult {
         self.ensure_started();
+        // Cleared here as well as in `smt_check_assertion`: a query can fail
+        // before it reaches the solver, and must not report an earlier reason.
+        self.last_unknown_reason = None;
 
         self.air_initial_log.log_query(query);
         let query = match crate::typecheck::check_query(self, query) {

@@ -331,6 +331,9 @@ pub struct Verifier {
     /// Under `-V provenance`: what cvc5 reported for each query of each
     /// function, raw (tag symbols and qids), in check order
     pub func_provenance: HashMap<Fun, Vec<QueryProvenance>>,
+    /// Why each query whose first check answered `unknown` did so, as the
+    /// solver said (description, span, reason), until joined to source
+    func_unknown_reasons: HashMap<Fun, Vec<(String, String, air::context::UnknownReason)>>,
     /// Under `-V nl-frontier`: what cvc5 reported for each query of each
     /// function, raw (solver terms, tag symbols and qids), in check order
     func_nl_frontier: HashMap<Fun, Vec<QueryNlFrontier>>,
@@ -369,9 +372,10 @@ pub struct Verifier {
 }
 
 pub use crate::provenance::{
-    QueryInstPressure, QueryMatchingLoops, QueryNlFrontier, QueryProvenance, ResolvedInstantiation,
-    ResolvedMatchingLoop, ResolvedQuantPressure, ResolvedQueryInstPressure,
+    QueryInstPressure, QueryMatchingLoops, QueryNlFrontier, QueryProvenance, ResolvedCulprit,
+    ResolvedInstantiation, ResolvedMatchingLoop, ResolvedQuantPressure, ResolvedQueryInstPressure,
     ResolvedQueryMatchingLoops, ResolvedQueryNlFrontier, ResolvedQueryProvenance, ResolvedTag,
+    ResolvedUnknownReason,
 };
 
 #[derive(serde::Serialize)]
@@ -381,6 +385,9 @@ pub struct FuncDetails {
     /// filled under `-V provenance`
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub provenance: Vec<ResolvedQueryProvenance>,
+    /// one entry per error-level query whose first check answered `unknown`
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub unknown_reasons: Vec<ResolvedUnknownReason>,
     /// filled under `-V nl-frontier`
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub nl_frontier: Vec<ResolvedQueryNlFrontier>,
@@ -398,6 +405,7 @@ impl Default for FuncDetails {
             obligation_proof_notes: Default::default(),
             failed_proof_notes: Default::default(),
             provenance: Default::default(),
+            unknown_reasons: Default::default(),
             nl_frontier: Default::default(),
             matching_loops: Default::default(),
             inst_pressure: Default::default(),
@@ -410,6 +418,7 @@ impl FuncDetails {
         self.obligation_proof_notes.extend(other.obligation_proof_notes);
         self.failed_proof_notes.extend(other.failed_proof_notes);
         self.provenance.extend(other.provenance);
+        self.unknown_reasons.extend(other.unknown_reasons);
         self.nl_frontier.extend(other.nl_frontier);
         self.matching_loops.extend(other.matching_loops);
         self.inst_pressure.extend(other.inst_pressure);
@@ -568,6 +577,7 @@ impl Verifier {
 
             func_details: HashMap::new(),
             func_provenance: HashMap::new(),
+            func_unknown_reasons: HashMap::new(),
             func_nl_frontier: HashMap::new(),
             func_matching_loops: HashMap::new(),
             func_inst_pressure: HashMap::new(),
@@ -624,6 +634,7 @@ impl Verifier {
 
             func_details: HashMap::new(),
             func_provenance: HashMap::new(),
+            func_unknown_reasons: HashMap::new(),
             func_nl_frontier: HashMap::new(),
             func_matching_loops: HashMap::new(),
             func_inst_pressure: HashMap::new(),
@@ -663,6 +674,9 @@ impl Verifier {
         self.func_details.absorb_with(other.func_details, |lhs, rhs| lhs.absorb(rhs));
         for (fun, queries) in other.func_provenance {
             self.func_provenance.entry(fun).or_default().extend(queries);
+        }
+        for (fun, reasons) in other.func_unknown_reasons {
+            self.func_unknown_reasons.entry(fun).or_default().extend(reasons);
         }
         for (fun, queries) in other.func_nl_frontier {
             self.func_nl_frontier.entry(fun).or_default().extend(queries);
@@ -953,6 +967,18 @@ impl Verifier {
         // 0 for the query's first check, then one per multi-error round
         let mut round = 0usize;
         loop {
+            // Like the resident reply, this describes the first round only, and
+            // like the error count, only queries reported as errors: not
+            // recommends checks, expanded errors, or profile reruns.
+            if let Some(reason) = air_context.take_unknown_reason() {
+                if is_first_check && level == Some(MessageLevel::Error) {
+                    self.func_unknown_reasons.entry(context.fun.clone()).or_default().push((
+                        context.desc.clone(),
+                        context.span.as_string.clone(),
+                        reason,
+                    ));
+                }
+            }
             let result_str = || match &result {
                 ValidityResult::Valid(_) => "valid".to_string(),
                 ValidityResult::Invalid(..) => "invalid".to_string(),
@@ -1307,6 +1333,20 @@ impl Verifier {
         for (fun, queries) in std::mem::take(&mut self.func_provenance) {
             let resolved = queries.into_iter().map(|query| symbols.resolve(&fun, query));
             self.func_details.entry(fun.clone()).or_default().provenance.extend(resolved);
+        }
+    }
+
+    /// Join the culprit quantifiers of each `unknown` answer back to source.
+    fn resolve_unknown_reasons(&mut self, global_ctx: &vir::context::GlobalCtx) {
+        if self.func_unknown_reasons.is_empty() {
+            return;
+        }
+        let quantifiers = crate::provenance::Quantifiers::capture(global_ctx);
+        for (fun, reasons) in std::mem::take(&mut self.func_unknown_reasons) {
+            let resolved = reasons
+                .into_iter()
+                .map(|(desc, span, reason)| quantifiers.resolve_unknown(&desc, &span, reason));
+            self.func_details.entry(fun).or_default().unknown_reasons.extend(resolved);
         }
     }
 
@@ -2187,6 +2227,7 @@ impl Verifier {
                     &ctx.global,
                     ctx.name_ctxt.source_names(),
                 )),
+                crate::provenance::Quantifiers::capture(&ctx.global),
             ));
         }
 
@@ -2837,6 +2878,8 @@ impl Verifier {
                 writeln!(file, "{:#?}", triggers).expect("error writing to trigger log file");
             }
         }
+        // Join why queries answered unknown back to source, in every mode
+        self.resolve_unknown_reasons(&global_ctx);
         // Join what cvc5 reported (matching loops, instantiation pressure,
         // provenance, nonlinear frontiers) back to source, per function. The
         // joins read the same symbols.

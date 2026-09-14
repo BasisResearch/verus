@@ -2454,6 +2454,21 @@ fn provenance_reply_parses() {
     assert_eq!(info.unparsed, vec!["(surprise 1 2)".to_string()]);
 }
 
+/// cvc5's `(get-info :incomplete-culprits)` reply: plain symbols, and symbols
+/// it had to quote.
+#[test]
+fn incomplete_culprits_reply_parses() {
+    let parse = crate::smt_verify::parse_incomplete_culprits;
+    assert_eq!(
+        parse("(:incomplete-culprits (user_lib__f_4 |also never matched| prelude_box_unbox))"),
+        vec!["user_lib__f_4", "also never matched", "prelude_box_unbox"]
+    );
+    assert!(parse("(:incomplete-culprits ())").is_empty());
+    // an unterminated quote ends the list rather than inventing a name
+    assert_eq!(parse("(:incomplete-culprits (a |b))"), vec!["a"]);
+    assert!(parse("unsupported").is_empty());
+}
+
 #[test]
 fn parse_nl_frontier_reply() {
     // the shape cvc5's (get-info :nl-frontier) prints after a budget runs out
