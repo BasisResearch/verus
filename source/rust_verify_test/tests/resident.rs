@@ -583,6 +583,22 @@ verus! {
         ensures h(x) > 1,
     {
     }
+
+    pub uninterp spec fn b(i: int) -> int;
+
+    proof fn twin()
+        requires
+            forall|i: int| #[trigger] a(i) < a(i + 1),
+            forall|i: int| #[trigger] b(i) < b(i - 1),
+        ensures a(0) + b(0) > 100,
+    {
+    }
+
+    proof fn indexed(s: Seq<int>)
+        requires forall|i: int| 0 <= i < s.len() - 1 ==> #[trigger] s[i] < s[i + 1],
+        ensures s.len() > 5 ==> s[0] + 100 < s[5],
+    {
+    }
 }
 "#;
     let mut worker =
@@ -597,24 +613,53 @@ verus! {
     let culprit = found
         .iter()
         .find(|l| l["trigger"].as_str().is_some_and(|t| t.contains("a(i)")))
-        .unwrap_or_else(|| panic!("no loop on a: {checked}"));
-    assert_eq!(culprit["confidence"], "high", "{culprit}");
-    assert_eq!(culprit["edges"], "confirmed", "{culprit}");
-    assert!(culprit["fun"].as_str().unwrap().ends_with("::loops"), "{culprit}");
-    assert!(culprit["span"].as_str().unwrap().contains("fixture.rs"), "{culprit}");
-    assert!(culprit["growth_rate"].as_str().unwrap().starts_with("linear-depth"), "{culprit}");
+        .unwrap_or_else(|| panic!("no loop on a: {}", checked));
+    assert_eq!(culprit["confidence"], "high", "{}", culprit);
+    assert_eq!(culprit["edges"], "confirmed", "{}", culprit);
+    assert!(culprit["fun"].as_str().unwrap().ends_with("::loops"), "{}", culprit);
+    assert!(culprit["span"].as_str().unwrap().contains("fixture.rs"), "{}", culprit);
+    assert!(culprit["growth_rate"].as_str().unwrap().starts_with("linear-depth"), "{}", culprit);
     let ladder = culprit["term_ladder"].as_array().unwrap();
-    assert!(ladder.len() >= 3, "{culprit}");
-    assert!(ladder[1].as_str().unwrap().contains("(0 + 1)"), "{culprit}");
-    assert!(ladder[2].as_str().unwrap().contains("((0 + 1) + 1)"), "{culprit}");
+    assert!(ladder.len() >= 3, "{}", culprit);
+    assert!(ladder[1].as_str().unwrap().contains("(0 + 1)"), "{}", culprit);
+    assert!(ladder[2].as_str().unwrap().contains("((0 + 1) + 1)"), "{}", culprit);
+    // cvc5 sends the first rungs and the last of the 20-round chain
+    assert!(ladder.iter().any(|rung| rung == "…"), "{}", culprit);
+    assert!(culprit["growth_rate"].as_str().unwrap().contains("solver term depth"), "{}", culprit);
     // the prelude axioms the loop drags along are not loops of their own
     assert!(
         found.iter().all(|l| l["fun"].as_str().is_some_and(|f| f.ends_with("::loops"))),
-        "{checked}"
+        "{}",
+        checked
     );
     let checked = worker.send(json!({"command":"check", "session":ready["session"], "bucket":0, "query":query_id(&ready, "incomplete")}));
     assert_eq!(checked["result"], "invalid", "{checked}");
     assert_eq!(checked["matching_loops"]["loops"], json!([]), "{checked}");
+    // two written loops: each prelude axiom follows the loops whose terms it
+    // shares, so subtraction rides b's loop and not a's. Addition rides a's,
+    // and may ride b's too: `a(0) + b(0)` puts b's terms under an addition.
+    let checked = worker.send(json!({"command":"check", "session":ready["session"], "bucket":0, "query":query_id(&ready, "twin")}));
+    let found = checked["matching_loops"]["loops"].as_array().unwrap();
+    let on = |f: &str| {
+        found
+            .iter()
+            .find(|l| l["trigger"].as_str().is_some_and(|t| t.contains(f)))
+            .unwrap_or_else(|| panic!("no loop on {}: {}", f, checked))
+    };
+    let follows = |l: &serde_json::Value, qid: &str| {
+        l["followers"].as_array().is_some_and(|fs| fs.iter().any(|f| f == qid))
+    };
+    assert!(
+        follows(on("b(i)"), "prelude_sub") && !follows(on("a(i)"), "prelude_sub"),
+        "{}",
+        checked
+    );
+    assert!(follows(on("a(i)"), "prelude_add"), "{}", checked);
+    // the axiom Verus generates for `Seq::index` rides the written loop
+    let checked = worker.send(json!({"command":"check", "session":ready["session"], "bucket":0, "query":query_id(&ready, "indexed")}));
+    let found = checked["matching_loops"]["loops"].as_array().unwrap();
+    assert!(!found.is_empty(), "{}", checked);
+    assert!(found.iter().all(|l| l["qid"].as_str().unwrap().starts_with("user_")), "{}", checked);
     assert_eq!(
         worker.send(json!({"command":"close", "session":ready["session"]}))["event"],
         "closed"

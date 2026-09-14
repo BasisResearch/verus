@@ -2383,6 +2383,20 @@ fn matching_loops_reply_parses() {
     assert!(info.loops.is_empty() && info.unparsed.is_empty());
     let info = crate::smt_verify::parse_matching_loops_lines(&vec!["(error \"no\")".to_string()]);
     assert_eq!(info.unparsed, vec!["(error \"no\")".to_string()]);
+    // a quoted symbol sise cannot read bare, a bar inside a string literal,
+    // and a term broken across lines: the reply still parses, terms one line
+    let info = crate::smt_verify::parse_matching_loops_lines(&vec![
+        "(:matching-loops (:rounds 3 :instantiations 3 :dropped 0 :max-inst-rounds false :loops ("
+            .to_string(),
+        "(loop :qid |odd name| :confidence low :growth bounded :edges unconfirmed :stable false \
+         :via (|odd name|) :trigger ((str.++ s \"a|b\")) :shape ((f\n   (g _0))) :ladder-length 0))))"
+            .to_string(),
+    ]);
+    assert!(info.unparsed.is_empty(), "{:?}", info.unparsed);
+    let l = &info.loops[0];
+    assert_eq!((l.qid.as_str(), l.via.clone()), ("|odd name|", vec!["|odd name|".to_string()]));
+    assert_eq!(l.trigger, vec!["(str.++ s \"a|b\")"]);
+    assert_eq!(l.shape, vec!["(f (g _0))"]);
 }
 
 /// The extra lines provenance mode adds to a check-sat batch: instantiation

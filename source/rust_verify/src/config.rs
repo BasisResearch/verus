@@ -897,11 +897,13 @@ pub fn parse_args_with_imports(
         provenance: extended.contains_key(EXTENDED_PROVENANCE),
         matching_loops: extended.contains_key(EXTENDED_MATCHING_LOOPS),
         matching_loop_rounds: match extended.get(EXTENDED_MATCHING_LOOPS) {
-            Some(Some(rounds)) => Some(rounds.parse::<u32>().unwrap_or_else(|_| {
-                error(format!(
-                    "expected a number of instantiation rounds after -V {EXTENDED_MATCHING_LOOPS}=, found {rounds}"
-                ))
-            })),
+            // zero rounds would instantiate nothing and fail every quantified check
+            Some(Some(rounds)) => Some(match rounds.parse::<u32>() {
+                Ok(n) if n > 0 => n,
+                _ => error(format!(
+                    "expected a positive number of instantiation rounds after -V {EXTENDED_MATCHING_LOOPS}=, found {rounds}"
+                )),
+            }),
             _ => None,
         },
         resident: matches.opt_present(OPT_RESIDENT),

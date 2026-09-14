@@ -1,5 +1,5 @@
 //! Owned source metadata used by both batch verification and resident rechecks.
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use vir::ast::Fun;
 use vir::ast_util::fun_as_friendly_rust_name;
 
@@ -135,8 +135,9 @@ pub struct ResolvedMatchingLoop {
     /// same without the round limit; low: rising depth with an unstable
     /// shape or without confirmed self-feeding edges
     pub confidence: String,
-    /// linear-depth (+d nesting/round), exponential-fanout (xf
-    /// instantiations/round), or bounded
+    /// linear-depth (+d solver term depth/round), exponential-fanout (xf
+    /// instantiations/round), or bounded. The depth is the solver's, so it
+    /// counts the boxes `term_ladder` leaves out.
     pub growth_rate: String,
     /// the quantifier's first trigger, in source spelling
     pub trigger: String,
@@ -148,7 +149,7 @@ pub struct ResolvedMatchingLoop {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub growth_context: Option<String>,
     /// the trigger as instantiated by the first rungs of the chain and by its
-    /// last, in source spelling
+    /// last, in source spelling; `…` stands for the rungs cvc5 left out
     pub term_ladder: Vec<String>,
     /// how many rungs the chain has
     pub ladder_length: u64,
@@ -172,10 +173,11 @@ pub struct ResolvedMatchingLoop {
     /// the other quantifiers a step passed through, where they are written
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub via: Vec<String>,
-    /// quantifiers no Verus function wrote (the prelude's box, has_type and
-    /// arithmetic axioms) that climbed in the same check only because a
-    /// written quantifier fed them; listed on the most confident written
-    /// loop instead of as loops of their own
+    /// quantifiers the user did not write (the prelude's box, has_type and
+    /// arithmetic axioms, and the axioms Verus generates for definitions)
+    /// that climbed in the same check on this loop's terms: a rung cvc5
+    /// reported for them shares a term that this loop grows and no other
+    /// written loop does. A quantifier can follow several loops.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub followers: Vec<String>,
     pub smt: MatchingLoopSmt,
@@ -198,6 +200,10 @@ pub struct ResolvedQueryMatchingLoops {
     pub max_inst_rounds: bool,
     /// most confident first
     pub loops: Vec<ResolvedMatchingLoop>,
+    /// quantifiers the user did not write that climbed alongside the written
+    /// loops but share a term with none of them in particular
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub followers: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub unparsed: Vec<String>,
 }
@@ -228,6 +234,23 @@ struct QuantifierSite {
     inside: Option<ResolvedTag>,
     site: Option<String>,
     role: Option<&'static str>,
+}
+
+/// Every parenthesised subterm of an SMT term printed on one line, as text,
+/// so that equal subterms of different terms compare equal.
+fn subterms(term: &str, out: &mut HashSet<String>) {
+    let mut starts = Vec::new();
+    for (i, c) in term.char_indices() {
+        match c {
+            '(' => starts.push(i),
+            ')' => {
+                if let Some(start) = starts.pop() {
+                    out.insert(term[start..=i].to_string());
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 /// A span as `file:line:col`, without its directory or byte range.
@@ -465,7 +488,7 @@ impl Symbols {
                     self.describe_quantifier(fun, &l.qid);
                 let growth_rate = match l.growth.as_str() {
                     "linear-depth" => {
-                        format!("linear-depth (+{:.2} nesting/round)", l.depth_per_round)
+                        format!("linear-depth (+{:.2} solver term depth/round)", l.depth_per_round)
                     }
                     "exponential-fanout" => format!(
                         "exponential-fanout (x{:.2} instantiations/round)",
@@ -480,6 +503,12 @@ impl Symbols {
                         self.describe_quantifier(fun, qid).site.unwrap_or_else(|| qid.clone())
                     })
                     .collect();
+                let mut term_ladder: Vec<String> =
+                    l.ladder.iter().map(|rung| render(rung)).collect();
+                // cvc5 sends the first rungs and the last: mark the gap
+                if term_ladder.len() >= 2 && l.ladder_length > term_ladder.len() as u64 {
+                    term_ladder.insert(term_ladder.len() - 1, "…".to_string());
+                }
                 ResolvedMatchingLoop {
                     qid: l.qid.clone(),
                     fun: fun_name,
@@ -494,7 +523,7 @@ impl Symbols {
                         .context
                         .as_ref()
                         .map(|c| vir::air_names::render_term(&names, c)),
-                    term_ladder: l.ladder.iter().map(|rung| render(rung)).collect(),
+                    term_ladder,
                     ladder_length: l.ladder_length,
                     stable_shape: l.stable,
                     edges: if l.edges_confirmed { "confirmed" } else { "unconfirmed" }.to_string(),
@@ -520,16 +549,47 @@ impl Symbols {
                 }
             })
             .collect::<Vec<ResolvedMatchingLoop>>();
-        // The prelude's axioms cannot loop by themselves: they climb when a
-        // quantifier some function wrote feeds them new terms. When a check
-        // has such a written loop, the unwritten ones ride it.
-        let written = |l: &ResolvedMatchingLoop| l.fun.as_deref().is_some_and(|f| f != "prelude");
+        // Only a quantifier the user wrote can drive a loop. The prelude's
+        // axioms, and the ones Verus generates for definitions, climb when a
+        // written quantifier feeds them new terms. When a check has a written
+        // loop, each of the others follows the written loops whose own terms
+        // it shares; terms every written loop has (`(I 0)`) pick out none.
+        let written =
+            |l: &ResolvedMatchingLoop| l.qid.starts_with(air::profiler::USER_QUANT_PREFIX);
         let (mut loops, riders): (Vec<_>, Vec<_>) = loops.into_iter().partition(written);
-        match loops.first_mut() {
-            Some(driver) => {
-                driver.followers = riders.into_iter().map(|l| l.site.unwrap_or(l.qid)).collect()
+        let mut followers = Vec::new();
+        if loops.is_empty() {
+            loops = riders;
+        } else {
+            let terms_of = |l: &ResolvedMatchingLoop| {
+                let mut terms = HashSet::new();
+                for t in l.smt.ladder.iter().flatten().chain(&l.smt.step) {
+                    subterms(t, &mut terms);
+                }
+                terms
+            };
+            let grown: Vec<HashSet<String>> = loops.iter().map(terms_of).collect();
+            let own: Vec<HashSet<String>> = (0..grown.len())
+                .map(|i| {
+                    let others =
+                        |t: &String| (0..grown.len()).any(|j| j != i && grown[j].contains(t));
+                    grown[i].iter().filter(|t| !others(t)).cloned().collect()
+                })
+                .collect();
+            for rider in riders {
+                let terms = terms_of(&rider);
+                let label = rider.site.unwrap_or(rider.qid);
+                let mut fed = false;
+                for (driver, own) in loops.iter_mut().zip(&own) {
+                    if !own.is_disjoint(&terms) {
+                        driver.followers.push(label.clone());
+                        fed = true;
+                    }
+                }
+                if !fed {
+                    followers.push(label);
+                }
             }
-            None => loops = riders,
         }
         ResolvedQueryMatchingLoops {
             desc: q.desc,
@@ -541,6 +601,7 @@ impl Symbols {
             dropped: q.info.dropped,
             max_inst_rounds: q.info.max_inst_rounds,
             loops,
+            followers,
             unparsed: q.info.unparsed,
         }
     }

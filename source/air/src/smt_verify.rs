@@ -550,7 +550,7 @@ pub(crate) fn parse_matching_loops_lines(lines: &Vec<String>) -> crate::context:
             return info;
         }
     };
-    let text_of = |n: &Node| crate::printer::node_to_string(n);
+    let text_of = |n: &Node| node_to_line(n);
     let symbol = |n: &Node| text_of(n);
     let num = |n: &Node| text_of(n).parse::<u64>().ok();
     let dec = |n: &Node| text_of(n).parse::<f64>().ok();
@@ -641,27 +641,56 @@ pub(crate) fn parse_matching_loops_lines(lines: &Vec<String>) -> crate::context:
     info
 }
 
+/// One node on one line. The pretty printer breaks long terms across lines,
+/// and the resolver compares terms by their text. A quoted symbol that
+/// `unquote_symbols` had to carry as a sise string gets its bars back.
+fn node_to_line(n: &sise::TreeNode) -> String {
+    match n {
+        sise::TreeNode::Atom(a) => {
+            match a.strip_prefix("\"|").and_then(|a| a.strip_suffix("|\"")) {
+                Some(quoted) => format!("|{}|", quoted.replace("\\\"", "\"")),
+                None => a.clone(),
+            }
+        }
+        sise::TreeNode::List(items) => {
+            format!("({})", items.iter().map(node_to_line).collect::<Vec<_>>().join(" "))
+        }
+    }
+}
+
 /// cvc5 prints a symbol between bars when SMT-LIB needs it quoted, which
-/// sise cannot read. Drop the bars around any quoted symbol sise can read
-/// bare; leave the rest, so the reply fails to parse and is kept verbatim.
+/// sise cannot read. A quoted symbol sise can read bare loses its bars; any
+/// other becomes the sise string `"|...|"` (characters sise strings cannot
+/// hold become `?`), so one odd symbol does not cost the whole reply. String
+/// literals are copied as they are, so a bar inside one is left alone.
 fn unquote_symbols(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
-    while let Some(start) = rest.find('|') {
+    while let Some(start) = rest.find(&['|', '"'][..]) {
         out.push_str(&rest[..start]);
+        let open = &rest[start..start + 1];
         let after = &rest[start + 1..];
-        match after.find('|') {
-            Some(end)
-                if !after[..end].is_empty() && after[..end].chars().all(sise::is_atom_chr) =>
-            {
-                out.push_str(&after[..end]);
-                rest = &after[end + 1..];
+        let Some(end) = after.find(open) else {
+            out.push_str(&rest[start..]);
+            return out;
+        };
+        let inner = &after[..end];
+        if open == "\"" {
+            out.push_str(&rest[start..start + end + 2]);
+        } else if !inner.is_empty() && inner.chars().all(sise::is_atom_chr) {
+            out.push_str(inner);
+        } else {
+            out.push_str("\"|");
+            for c in inner.chars() {
+                match c {
+                    '"' => out.push_str("\\\""),
+                    c if sise::is_atom_string_chr(c) => out.push(c),
+                    _ => out.push('?'),
+                }
             }
-            _ => {
-                out.push('|');
-                rest = after;
-            }
+            out.push_str("|\"");
         }
+        rest = &after[end + 1..];
     }
     out.push_str(rest);
     out
