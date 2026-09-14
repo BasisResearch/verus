@@ -2437,3 +2437,26 @@ fn type_error_in_query_closes_its_name_scope() {
     let again = String::from_utf8(air_context.smt_log.take_pipe_data()).unwrap();
     assert!(again.contains("(declare-fun %%lambda%%0"), "{}", again);
 }
+
+#[test]
+fn type_error_in_declaration_closes_its_binder_scope() {
+    // A declaration whose type error is inside a binder must close the
+    // binder's typing scope. Otherwise the next pop leaves the typing scopes
+    // one deeper than the name maps, which lowering the next lambda asserts
+    // against.
+    let message_interface = std::sync::Arc::new(crate::messages::AirMessageInterface {});
+    let mut nodes = Vec::new();
+    macro_push_node(&mut nodes, node!((axiom (forall ((x Int)) (+ x true)))));
+    macro_push_node(
+        &mut nodes,
+        node!((axiom (= 10 (apply Int (lambda ((x Int) (y Int)) (+ x y 5)) 2 3)))),
+    );
+    let commands = Parser::new(message_interface.clone()).nodes_to_commands(&nodes).unwrap();
+    let CommandX::Global(ill_typed) = &*commands[0] else { panic!("expected a declaration") };
+    let CommandX::Global(lambda) = &*commands[1] else { panic!("expected a declaration") };
+    let mut air_context = crate::context::Context::new(message_interface, SmtSolver::Z3);
+    air_context.push();
+    assert!(air_context.global(ill_typed).is_err());
+    air_context.pop();
+    air_context.global(lambda).unwrap();
+}
