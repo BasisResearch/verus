@@ -88,6 +88,94 @@ pub struct ResolvedQueryProvenance {
     pub unparsed: Vec<String>,
 }
 
+/// One `check-sat` under `-V inst-pressure`, as cvc5 reported it: rows by
+/// `:qid`, not yet joined to source.
+#[derive(Clone, Debug)]
+pub struct QueryInstPressure {
+    pub desc: String,
+    pub span: String,
+    /// 0 for the first check of the query, then one per multi-error round
+    pub round: usize,
+    /// "valid", "invalid", "canceled", or the solver's unexpected output
+    pub result: String,
+    pub pressure: air::context::InstPressure,
+}
+
+/// One quantifier's instantiation pressure in one query, joined to source.
+/// Every count is the solver's own; nothing here is derived.
+#[derive(serde::Serialize, Clone, Debug)]
+pub struct ResolvedQuantPressure {
+    pub qid: String,
+    /// false for a quantifier without a `:qid`: `qid` is then synthetic
+    pub named: bool,
+    /// prelude, or the function the quantifier was written in
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fun: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub span: Option<String>,
+    /// Where the quantifier is written, in prose (as in provenance).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub site: Option<String>,
+    /// Why the quantifier exists, as the encoder that emitted it said.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub role: Option<&'static str>,
+    pub instantiations: u64,
+    /// attempts rejected because the term vector was used before
+    pub duplicate_eq: u64,
+    /// attempts rejected because the instance was already entailed
+    pub duplicate_ent: u64,
+    /// attempts rejected because the same lemma was already sent
+    pub duplicate_lemma: u64,
+    /// instances made by conflict-based instantiation because they
+    /// conflicted with, or propagated in, the current assignment
+    pub conflict: u64,
+    pub propagate: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_round: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_round: Option<u64>,
+    /// instances the refutation used; only after `unsat` with proofs on
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refutation: Option<u64>,
+}
+
+/// A query's instantiation pressure with every quantifier joined to source
+/// (`-V inst-pressure`).
+#[derive(serde::Serialize, Clone, Debug)]
+pub struct ResolvedQueryInstPressure {
+    pub desc: String,
+    pub span: String,
+    pub round: usize,
+    pub result: String,
+    /// instantiation rounds that sent lemmas
+    pub rounds: u64,
+    /// whether each row carries `refutation`
+    pub refutation: bool,
+    /// most instantiated first
+    pub quantifiers: Vec<ResolvedQuantPressure>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unparsed: Option<String>,
+}
+
+const PRELUDE_QID_PREFIX: &str = "prelude_";
+/// The prelude writes this one by hand, so it has no `qid_map` entry.
+const FUEL_DEFAULTS_QID: &str = "prelude_fuel_defaults";
+
+/// Where an instantiated quantifier came from, joined back to source.
+struct QuantifierJoin {
+    fun: Option<String>,
+    span: Option<String>,
+    inside: Option<ResolvedTag>,
+    site: Option<String>,
+    role: Option<&'static str>,
+}
+
+/// A span without its directory or trailing id, for prose.
+fn span_short(s: &Option<String>) -> Option<String> {
+    s.as_ref()
+        .map(|s| s.rsplit('/').next().unwrap_or(s).split(" (#").next().unwrap_or(s).to_string())
+}
+
 struct Hypothesis {
     kind: String,
     span: String,
@@ -159,55 +247,69 @@ impl Symbols {
         }
     }
 
-    pub(crate) fn resolve(&self, fun: &Fun, q: QueryProvenance) -> ResolvedQueryProvenance {
-        const PRELUDE_QID_PREFIX: &str = "prelude_";
-        /// The prelude writes this one by hand, so it has no `qid_map` entry.
-        const FUEL_DEFAULTS_QID: &str = "prelude_fuel_defaults";
-        let hyp_map = &self.hypotheses;
-        let qid_map = &self.quantifiers;
-        let axiom_owners = &self.axiom_owners;
-        let air_source_names = &self.source_names;
-        let tag_of = |fun: &Fun, symbol: &str| -> ResolvedTag {
-            let mut r = ResolvedTag {
-                tag: symbol.to_string(),
-                kind: String::new(),
-                owner: None,
-                span: None,
-            };
-            match air::def::ProvenanceTag::from_symbol(symbol) {
-                Some(air::def::ProvenanceTag::Hyp(air::def::HypId(k))) => {
-                    match hyp_map.get(fun).and_then(|hs| hs.get(k as usize)) {
-                        Some(info) => {
-                            r.kind = info.kind.clone();
-                            r.owner = Some(fun_as_friendly_rust_name(fun));
-                            r.span = Some(info.span.clone());
-                        }
-                        None => r.kind = "hypothesis (unknown id)".to_string(),
+    /// Join one tag from a reply about one of `fun`'s queries back to source.
+    fn tag_of(&self, fun: &Fun, symbol: &str) -> ResolvedTag {
+        let mut r =
+            ResolvedTag { tag: symbol.to_string(), kind: String::new(), owner: None, span: None };
+        match air::def::ProvenanceTag::from_symbol(symbol) {
+            Some(air::def::ProvenanceTag::Hyp(air::def::HypId(k))) => {
+                match self.hypotheses.get(fun).and_then(|hs| hs.get(k as usize)) {
+                    Some(info) => {
+                        r.kind = info.kind.clone();
+                        r.owner = Some(fun_as_friendly_rust_name(fun));
+                        r.span = Some(info.span.clone());
                     }
+                    None => r.kind = "hypothesis (unknown id)".to_string(),
                 }
-                Some(air::def::ProvenanceTag::Query) => r.kind = "query".to_string(),
-                Some(air::def::ProvenanceTag::Assert(_)) => r.kind = "goal".to_string(),
-                Some(air::def::ProvenanceTag::Axiom(ident)) => {
-                    let ident: &str = &ident;
-                    if let Some(owner) = axiom_owners.get(symbol) {
-                        r.kind = "axiom".to_string();
-                        r.owner = Some(owner.clone());
-                    } else if let Some(info) = qid_map.get(ident) {
-                        r.kind = "axiom".to_string();
-                        r.owner = Some(info.fun.clone());
-                        r.span = info.span.clone();
-                    } else if ident.starts_with(PRELUDE_QID_PREFIX) {
-                        r.kind = "prelude".to_string();
-                    } else if ident.starts_with("anon_") {
-                        r.kind = "anonymous_axiom".to_string();
-                    } else {
-                        r.kind = "axiom".to_string();
-                    }
-                }
-                None => r.kind = "untagged".to_string(),
             }
-            r
+            Some(air::def::ProvenanceTag::Query) => r.kind = "query".to_string(),
+            Some(air::def::ProvenanceTag::Assert(_)) => r.kind = "goal".to_string(),
+            Some(air::def::ProvenanceTag::Axiom(ident)) => {
+                let ident: &str = &ident;
+                if let Some(owner) = self.axiom_owners.get(symbol) {
+                    r.kind = "axiom".to_string();
+                    r.owner = Some(owner.clone());
+                } else if let Some(info) = self.quantifiers.get(ident) {
+                    r.kind = "axiom".to_string();
+                    r.owner = Some(info.fun.clone());
+                    r.span = info.span.clone();
+                } else if ident.starts_with(PRELUDE_QID_PREFIX) {
+                    r.kind = "prelude".to_string();
+                } else if ident.starts_with("anon_") {
+                    r.kind = "anonymous_axiom".to_string();
+                } else {
+                    r.kind = "axiom".to_string();
+                }
+            }
+            None => r.kind = "untagged".to_string(),
+        }
+        r
+    }
+
+    /// Join a quantifier that one of `fun`'s queries instantiated back to
+    /// source by its `:qid`.
+    fn quantifier(&self, fun: &Fun, qid: &str) -> QuantifierJoin {
+        let (fun_name, span, inside, role) = match self.quantifiers.get(qid) {
+            Some(info) => (
+                Some(info.fun.clone()),
+                info.span.clone(),
+                info.tag.as_ref().map(|t| self.tag_of(fun, &t.to_symbol())),
+                info.role,
+            ),
+            None => (
+                qid.starts_with(PRELUDE_QID_PREFIX).then(|| "prelude".to_string()),
+                None,
+                None,
+                (qid == FUEL_DEFAULTS_QID).then_some("fuel_defaults"),
+            ),
         };
+        let site = quantifier_site(&inside, &span_short(&span));
+        QuantifierJoin { fun: fun_name, span, inside, site, role }
+    }
+
+    pub(crate) fn resolve(&self, fun: &Fun, q: QueryProvenance) -> ResolvedQueryProvenance {
+        let air_source_names = &self.source_names;
+        let tag_of = |fun: &Fun, symbol: &str| self.tag_of(fun, symbol);
         let is_hyp_kind =
             |k: &str| matches!(k, "requires" | "type_invariant" | "fuel" | "trait_bound");
         // SSA versions are query-local. Preserve assignment identity in the display.
@@ -242,32 +344,8 @@ impl Symbols {
             .instantiations
             .iter()
             .map(|(qid, vectors)| {
-                let span_short = |s: &Option<String>| -> Option<String> {
-                    s.as_ref().map(|s| {
-                        s.rsplit('/')
-                            .next()
-                            .unwrap_or(s)
-                            .split(" (#")
-                            .next()
-                            .unwrap_or(s)
-                            .to_string()
-                    })
-                };
-                let (fun_name, span, inside, role) = match qid_map.get(qid) {
-                    Some(info) => (
-                        Some(info.fun.clone()),
-                        info.span.clone(),
-                        info.tag.as_ref().map(|t| tag_of(fun, &t.to_symbol())),
-                        info.role,
-                    ),
-                    None => (
-                        qid.starts_with(PRELUDE_QID_PREFIX).then(|| "prelude".to_string()),
-                        None,
-                        None,
-                        (qid.as_str() == FUEL_DEFAULTS_QID).then_some("fuel_defaults"),
-                    ),
-                };
-                let site = quantifier_site(&inside, &span_short(&span));
+                let QuantifierJoin { fun: fun_name, span, inside, site, role } =
+                    self.quantifier(fun, qid);
                 ResolvedInstantiation {
                     qid: qid.clone(),
                     fun: fun_name,
@@ -294,6 +372,53 @@ impl Symbols {
             axioms_in_scope,
             instantiations,
             unparsed: q.unparsed,
+        }
+    }
+
+    /// Join each quantifier of a query's instantiation pressure to source.
+    pub(crate) fn resolve_inst_pressure(
+        &self,
+        fun: &Fun,
+        q: QueryInstPressure,
+    ) -> ResolvedQueryInstPressure {
+        let quantifiers = q
+            .pressure
+            .quantifiers
+            .into_iter()
+            .map(|p| {
+                let join = if p.named {
+                    self.quantifier(fun, &p.qid)
+                } else {
+                    QuantifierJoin { fun: None, span: None, inside: None, site: None, role: None }
+                };
+                ResolvedQuantPressure {
+                    qid: p.qid,
+                    named: p.named,
+                    fun: join.fun,
+                    span: join.span,
+                    site: join.site,
+                    role: join.role,
+                    instantiations: p.instantiations,
+                    duplicate_eq: p.duplicate_eq,
+                    duplicate_ent: p.duplicate_ent,
+                    duplicate_lemma: p.duplicate_lemma,
+                    conflict: p.conflict,
+                    propagate: p.propagate,
+                    first_round: p.first_round,
+                    last_round: p.last_round,
+                    refutation: p.refutation,
+                }
+            })
+            .collect();
+        ResolvedQueryInstPressure {
+            desc: q.desc,
+            span: q.span,
+            round: q.round,
+            result: q.result,
+            rounds: q.pressure.rounds,
+            refutation: q.pressure.refutation,
+            quantifiers,
+            unparsed: q.pressure.unparsed,
         }
     }
 }

@@ -2380,3 +2380,44 @@ fn provenance_reply_parses() {
     let info = crate::smt_verify::parse_provenance_lines(&vec!["(surprise 1 2)".to_string()]);
     assert_eq!(info.unparsed, vec!["(surprise 1 2)".to_string()]);
 }
+
+#[test]
+fn parse_inst_pressure_reply() {
+    let info = crate::smt_verify::parse_inst_pressure(
+        "(:inst-pressure (:rounds 3 :refutation true :quantifiers (\
+         (user_f_1 :instantiations 5 :duplicate-eq 2 :duplicate-ent 1 :duplicate-lemma 0 \
+         :conflict 1 :propagate 0 :first-round 0 :last-round 2 :refutation 1) \
+         (|user%g| :instantiations 0 :duplicate-eq 4 :duplicate-ent 0 :duplicate-lemma 0 \
+         :conflict 0 :propagate 0 :refutation 0) \
+         (quant_0 :named false :instantiations 1 :duplicate-eq 0 :duplicate-ent 0 \
+         :duplicate-lemma 0 :conflict 0 :propagate 1 :first-round 1 :last-round 1 \
+         :refutation 0))))",
+    );
+    assert!(info.unparsed.is_none(), "{:?}", info.unparsed);
+    assert_eq!((info.rounds, info.refutation, info.quantifiers.len()), (3, true, 3));
+    let f = &info.quantifiers[0];
+    assert_eq!(f.qid, "user_f_1");
+    assert!(f.named);
+    assert_eq!(
+        (f.instantiations, f.duplicate_eq, f.duplicate_ent, f.duplicate_lemma),
+        (5, 2, 1, 0)
+    );
+    assert_eq!(
+        (f.conflict, f.first_round, f.last_round, f.refutation),
+        (1, Some(0), Some(2), Some(1))
+    );
+    // only duplicates: no rounds; quoted symbols lose their bars
+    let q = &info.quantifiers[1];
+    assert_eq!((q.qid.as_str(), q.first_round, q.duplicate_eq), ("user%g", None, 4));
+    let u = &info.quantifiers[2];
+    assert_eq!((u.qid.as_str(), u.named, u.propagate), ("quant_0", false, 1));
+
+    // no quantifier instantiated; no refutation counts outside proof mode
+    let info = crate::smt_verify::parse_inst_pressure(
+        "(:inst-pressure (:rounds 0 :refutation false :quantifiers ()))",
+    );
+    assert!(info.unparsed.is_none() && info.quantifiers.is_empty() && !info.refutation);
+    // a solver without the key, or anything unforeseen, is kept whole
+    let info = crate::smt_verify::parse_inst_pressure("(:inst-pressure unsupported)");
+    assert_eq!(info.unparsed.as_deref(), Some("(:inst-pressure unsupported)"));
+}

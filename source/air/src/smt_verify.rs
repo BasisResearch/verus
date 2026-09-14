@@ -283,6 +283,10 @@ pub(crate) fn smt_check_assertion<'ctx>(
         context.smt_log.log_import_instantiations(&certificate);
     }
     context.smt_log.log_word("check-sat");
+    if context.inst_pressure {
+        // in the same batch, right after the answer it describes
+        context.smt_log.log_get_info("inst-pressure");
+    }
     if context.provenance {
         // in the same batch: the tag lists arrive after the result and the
         // instantiation dump, before the sentinel
@@ -318,8 +322,15 @@ pub(crate) fn smt_check_assertion<'ctx>(
     // Process SMT results
     let mut unsat = None;
     let mut provenance_lines: Vec<String> = Vec::new();
+    let mut inst_pressure = None;
     for line in smt_output {
-        if line == "unsat" {
+        if context.inst_pressure && line.starts_with("(:inst-pressure ") {
+            inst_pressure = Some(parse_inst_pressure(&line));
+        } else if context.inst_pressure && inst_pressure.is_none() && line == "unsupported" {
+            // a cvc5 without the key; say so rather than fail the query
+            inst_pressure =
+                Some(crate::context::InstPressure { unparsed: Some(line), ..Default::default() });
+        } else if line == "unsat" {
             assert!(unsat == None);
             unsat = Some(SmtOutput::Unsat);
         } else if line == "sat" {
@@ -355,6 +366,7 @@ pub(crate) fn smt_check_assertion<'ctx>(
     if context.provenance {
         context.last_provenance = Some(parse_provenance_lines(&provenance_lines));
     }
+    context.last_inst_pressure = inst_pressure;
 
     let unsat = unsat.expect("expected sat/unsat/unknown from SMT solver");
 
@@ -459,6 +471,109 @@ pub(crate) fn smt_check_assertion<'ctx>(
             }
         }
     }
+}
+
+/// Parse cvc5's `(:inst-pressure (:rounds R :refutation B :quantifiers (ROW
+/// ...)))`, where each ROW is `(qid :key value ...)`. Unknown keys are
+/// skipped; a reply that does not parse is kept whole in `unparsed`.
+pub(crate) fn parse_inst_pressure(line: &str) -> crate::context::InstPressure {
+    use sise::TreeNode;
+    let mut out = crate::context::InstPressure::default();
+    let text = bar_symbols_as_strings(line);
+    let mut parser = sise::Parser::new(&text);
+    let fields = match sise::parse_tree(&mut parser) {
+        Ok(TreeNode::List(items)) => match &items[..] {
+            [TreeNode::Atom(key), TreeNode::List(fields)] if key == ":inst-pressure" => {
+                fields.clone()
+            }
+            _ => Vec::new(),
+        },
+        _ => Vec::new(),
+    };
+    if fields.is_empty() {
+        out.unparsed = Some(line.to_owned());
+        return out;
+    }
+    for pair in fields.chunks(2) {
+        match pair {
+            [TreeNode::Atom(k), TreeNode::Atom(v)] if k == ":rounds" => {
+                out.rounds = v.parse().unwrap_or(0);
+            }
+            [TreeNode::Atom(k), TreeNode::Atom(v)] if k == ":refutation" => {
+                out.refutation = v == "true";
+            }
+            [TreeNode::Atom(k), TreeNode::List(rows)] if k == ":quantifiers" => {
+                for row in rows {
+                    match parse_quant_pressure(row) {
+                        Some(q) => out.quantifiers.push(q),
+                        None => out.unparsed = Some(line.to_owned()),
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// cvc5 quotes a symbol that needs it as `|...|`, which sise cannot read, so
+/// spell each one as a sise string. A symbol that cannot be a sise string
+/// (it holds `"` or `\`) is left alone, and the reply stays unparsed.
+fn bar_symbols_as_strings(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut rest = line;
+    while let Some(start) = rest.find('|') {
+        out.push_str(&rest[..start]);
+        let tail = &rest[start + 1..];
+        match tail.find('|') {
+            Some(end)
+                if tail[..end].chars().all(|c| matches!(c, ' '..='~') && c != '"' && c != '\\') =>
+            {
+                out.push('"');
+                out.push_str(&tail[..end]);
+                out.push('"');
+                rest = &tail[end + 1..];
+            }
+            _ => {
+                out.push_str(&rest[start..]);
+                rest = "";
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// One `(qid :key value ...)` row of `(get-info :inst-pressure)`.
+fn parse_quant_pressure(row: &sise::TreeNode) -> Option<crate::context::QuantPressure> {
+    use sise::TreeNode;
+    let TreeNode::List(items) = row else { return None };
+    let (TreeNode::Atom(qid), rest) = items.split_first()? else { return None };
+    // a quoted symbol arrives as a sise string (see bar_symbols_as_strings)
+    let qid = qid.strip_prefix('"').and_then(|q| q.strip_suffix('"')).unwrap_or(qid);
+    let mut q =
+        crate::context::QuantPressure { qid: qid.to_owned(), named: true, ..Default::default() };
+    for pair in rest.chunks(2) {
+        let [TreeNode::Atom(k), TreeNode::Atom(v)] = pair else { return None };
+        if k == ":named" {
+            q.named = v != "false";
+            continue;
+        }
+        let n: u64 = v.parse().ok()?;
+        match k.as_str() {
+            ":instantiations" => q.instantiations = n,
+            ":duplicate-eq" => q.duplicate_eq = n,
+            ":duplicate-ent" => q.duplicate_ent = n,
+            ":duplicate-lemma" => q.duplicate_lemma = n,
+            ":conflict" => q.conflict = n,
+            ":propagate" => q.propagate = n,
+            ":first-round" => q.first_round = Some(n),
+            ":last-round" => q.last_round = Some(n),
+            ":refutation" => q.refutation = Some(n),
+            _ => {}
+        }
+    }
+    Some(q)
 }
 
 /// Parse what provenance mode adds to a `check-sat` batch's output: the
