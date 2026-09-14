@@ -17,6 +17,9 @@
 //! ID. Diagnostics can include further rounds requested by `--multiple-errors`.
 //! Under `-V matching-loops`, `ready.matching_loops` is true and a check whose
 //! round zero came back unknown carries its source-resolved `matching_loops`.
+//! Under `-V difficulty`, `ready.difficulty` is true and every check carries its
+//! source-resolved `difficulty`: round zero's gradient, since that is the round
+//! the response describes.
 //!
 //! `ready.smt_options` echoes the ordered name/value pairs already applied at
 //! solver startup. Rechecks preserve those settings in the original contexts;
@@ -85,6 +88,20 @@ enum QueryKind {
 }
 
 impl QueryKind {
+    /// What the diagnostic records call this kind of check. The batch run
+    /// reads the same name off the `QueryOp` (`QueryOp::kind`), and
+    /// `kind_names_match_the_batch_run` holds the two together.
+    fn name(self) -> &'static str {
+        match self {
+            Self::Termination => "termination",
+            Self::Body => "body",
+            Self::RecommendsFollowup => "recommends",
+            Self::Recommends => "recommends_checked",
+            Self::Expanded => "expanded",
+            Self::ApiSafety => "api_safety",
+        }
+    }
+
     fn from_op(op: &QueryOp) -> Self {
         match op {
             QueryOp::SpecTermination => Self::Termination,
@@ -378,6 +395,9 @@ pub(crate) struct SessionInfo {
     /// Whether the retained solvers record instantiations for
     /// `(get-info :matching-loops)` (`-V matching-loops`).
     pub(crate) matching_loops: bool,
+    /// Whether the retained solvers track per-assertion difficulty and unsat
+    /// cores for `(get-info :difficulty-gradient)` (`-V difficulty`).
+    pub(crate) difficulty: bool,
     pub(crate) spinoff_all: bool,
     /// How many errors one query may report, as `--multiple-errors` set it. A
     /// recheck looks for as many as the original invocation did.
@@ -401,6 +421,7 @@ enum Response<'a> {
         invocation_succeeded: bool,
         provenance: bool,
         matching_loops: bool,
+        difficulty: bool,
         spinoff_all: bool,
         smt_options: &'a [(String, String)],
         instantiation_replay: bool,
@@ -426,6 +447,8 @@ enum Response<'a> {
         unknown_reason: Option<&'a crate::provenance::ResolvedUnknownReason>,
         /// Present when round zero came back unknown under `-V matching-loops`.
         matching_loops: Option<&'a crate::provenance::ResolvedQueryMatchingLoops>,
+        /// Round zero's difficulty gradient, under `-V difficulty`.
+        difficulty: Option<&'a crate::provenance::ResolvedQueryDifficulty>,
         /// Present when this check tried a certificate before searching.
         certificate: Option<CertificateAttempt>,
     },
@@ -1444,6 +1467,7 @@ impl Server {
                 invocation_succeeded,
                 provenance: self.info.provenance,
                 matching_loops: self.info.matching_loops,
+                difficulty: self.info.difficulty,
                 spinoff_all: self.info.spinoff_all,
                 smt_options: &self.info.smt_options,
                 instantiation_replay: self.info.instantiation_replay,
@@ -1689,6 +1713,7 @@ impl Server {
                         drop(air.take_provenance());
                         drop(air.take_unknown_reason());
                         drop(air.take_matching_loops());
+                        drop(air.take_difficulty());
                         drop(air.take_inst_pressure());
                         match attempt {
                             ValidityResult::Valid(usage) => {
@@ -1722,6 +1747,7 @@ impl Server {
                     let first_provenance = air.take_provenance();
                     let first_unknown_reason = air.take_unknown_reason();
                     let first_matching_loops = air.take_matching_loops();
+                    let first_difficulty = air.take_difficulty();
                     // Sessions do not report instantiation pressure yet.
                     drop(air.take_inst_pressure());
                     // Ask for further errors exactly as far as the original
@@ -1807,6 +1833,7 @@ impl Server {
                                 );
                                 drop(air.take_provenance());
                                 drop(air.take_matching_loops());
+                                drop(air.take_difficulty());
                                 drop(air.take_inst_pressure());
                             }
                             ValidityResult::TypeError(error) => {
@@ -1844,6 +1871,8 @@ impl Server {
                                 crate::provenance::QueryProvenance {
                                     desc: query.context.desc.clone(),
                                     span: query.context.span.as_string.clone(),
+                                    // resident rechecks never expand an error
+                                    focus: None,
                                     round: 0,
                                     result: match result {
                                         QueryResult::Valid => "valid",
@@ -1873,6 +1902,8 @@ impl Server {
                                 crate::provenance::QueryMatchingLoops {
                                     desc: query.context.desc.clone(),
                                     span: query.context.span.as_string.clone(),
+                                    // resident rechecks never expand an error
+                                    focus: None,
                                     round: 0,
                                     result: match result {
                                         QueryResult::Valid => "valid",
@@ -1881,6 +1912,28 @@ impl Server {
                                     }
                                     .to_owned(),
                                     info,
+                                },
+                            )
+                        })
+                    });
+                    let difficulty = first_difficulty.and_then(|gradient| {
+                        bucket.symbols.as_ref().map(|symbols| {
+                            symbols.resolve_difficulty(
+                                &query.context.fun,
+                                crate::provenance::QueryDifficulty {
+                                    desc: query.context.desc.clone(),
+                                    span: query.context.span.as_string.clone(),
+                                    kind: query.kind.name(),
+                                    // resident rechecks never expand an error
+                                    focus: None,
+                                    round: 0,
+                                    result: match result {
+                                        QueryResult::Valid => "valid",
+                                        QueryResult::Invalid => "invalid",
+                                        QueryResult::ResourceLimit => "canceled",
+                                    }
+                                    .to_owned(),
+                                    gradient,
                                 },
                             )
                         })
@@ -1913,6 +1966,7 @@ impl Server {
                             provenance: provenance.as_ref(),
                             unknown_reason: unknown_reason.as_ref(),
                             matching_loops: matching_loops.as_ref(),
+                            difficulty: difficulty.as_ref(),
                             certificate: attempted,
                         },
                     )?;
@@ -1925,6 +1979,22 @@ impl Server {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn kind_names_match_the_batch_run() {
+        // A session's records name a check exactly as the batch run does, so
+        // a caller reading both cannot see two names for one kind of query.
+        for op in [
+            QueryOp::SpecTermination,
+            QueryOp::Body(Style::Normal),
+            QueryOp::Body(Style::RecommendsFollowupFromError),
+            QueryOp::Body(Style::RecommendsChecked),
+            QueryOp::Body(Style::Expanded),
+            QueryOp::Body(Style::CheckApiSafety),
+        ] {
+            assert_eq!(QueryKind::from_op(&op).name(), op.kind());
+        }
+    }
     use air::context::SmtSolver;
     use std::sync::Arc;
 
@@ -2243,6 +2313,7 @@ mod tests {
             SessionInfo {
                 provenance: false,
                 matching_loops: false,
+                difficulty: false,
                 spinoff_all: false,
                 multiple_errors: 2,
                 input_files: Vec::new(),

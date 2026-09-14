@@ -331,6 +331,9 @@ pub struct Verifier {
     /// Under `-V provenance`: what cvc5 reported for each query of each
     /// function, raw (tag symbols and qids), in check order
     pub func_provenance: HashMap<Fun, Vec<QueryProvenance>>,
+    /// Under `-V difficulty`: what cvc5 reported for each query of each
+    /// function, raw (tag symbols), in check order
+    func_difficulty: HashMap<Fun, Vec<QueryDifficulty>>,
     /// Why each query whose first check answered `unknown` did so, as the
     /// solver said (description, span, reason), until joined to source
     func_unknown_reasons: HashMap<Fun, Vec<(String, String, air::context::UnknownReason)>>,
@@ -372,8 +375,9 @@ pub struct Verifier {
 }
 
 pub use crate::provenance::{
-    QueryInstPressure, QueryMatchingLoops, QueryNlFrontier, QueryProvenance, ResolvedCulprit,
-    ResolvedInstantiation, ResolvedMatchingLoop, ResolvedQuantPressure, ResolvedQueryInstPressure,
+    QueryDifficulty, QueryInstPressure, QueryMatchingLoops, QueryNlFrontier, QueryProvenance,
+    ResolvedCulprit, ResolvedDifficultyRow, ResolvedInstantiation, ResolvedMatchingLoop,
+    ResolvedQuantPressure, ResolvedQueryDifficulty, ResolvedQueryInstPressure,
     ResolvedQueryMatchingLoops, ResolvedQueryNlFrontier, ResolvedQueryProvenance, ResolvedTag,
     ResolvedUnknownReason,
 };
@@ -385,6 +389,9 @@ pub struct FuncDetails {
     /// filled under `-V provenance`
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub provenance: Vec<ResolvedQueryProvenance>,
+    /// filled under `-V difficulty`
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub difficulty: Vec<ResolvedQueryDifficulty>,
     /// one entry per error-level query whose first check answered `unknown`
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub unknown_reasons: Vec<ResolvedUnknownReason>,
@@ -405,6 +412,7 @@ impl Default for FuncDetails {
             obligation_proof_notes: Default::default(),
             failed_proof_notes: Default::default(),
             provenance: Default::default(),
+            difficulty: Default::default(),
             unknown_reasons: Default::default(),
             nl_frontier: Default::default(),
             matching_loops: Default::default(),
@@ -418,6 +426,7 @@ impl FuncDetails {
         self.obligation_proof_notes.extend(other.obligation_proof_notes);
         self.failed_proof_notes.extend(other.failed_proof_notes);
         self.provenance.extend(other.provenance);
+        self.difficulty.extend(other.difficulty);
         self.unknown_reasons.extend(other.unknown_reasons);
         self.nl_frontier.extend(other.nl_frontier);
         self.matching_loops.extend(other.matching_loops);
@@ -577,6 +586,7 @@ impl Verifier {
 
             func_details: HashMap::new(),
             func_provenance: HashMap::new(),
+            func_difficulty: HashMap::new(),
             func_unknown_reasons: HashMap::new(),
             func_nl_frontier: HashMap::new(),
             func_matching_loops: HashMap::new(),
@@ -634,6 +644,7 @@ impl Verifier {
 
             func_details: HashMap::new(),
             func_provenance: HashMap::new(),
+            func_difficulty: HashMap::new(),
             func_unknown_reasons: HashMap::new(),
             func_nl_frontier: HashMap::new(),
             func_matching_loops: HashMap::new(),
@@ -684,6 +695,9 @@ impl Verifier {
         for (fun, queries) in other.func_matching_loops {
             self.func_matching_loops.entry(fun).or_default().extend(queries);
         }
+        for (fun, queries) in other.func_difficulty {
+            self.func_difficulty.entry(fun).or_default().extend(queries);
+        }
         for (fun, queries) in other.func_inst_pressure {
             self.func_inst_pressure.entry(fun).or_default().extend(queries);
         }
@@ -712,6 +726,7 @@ impl Verifier {
             crate::resident::SessionInfo {
                 provenance: self.args.provenance,
                 matching_loops: self.args.matching_loops,
+                difficulty: self.args.difficulty,
                 spinoff_all: self.args.spinoff_all,
                 multiple_errors: self.args.multiple_errors,
                 smt_options: self.args.smt_options.clone(),
@@ -876,6 +891,7 @@ impl Verifier {
         context: &CommandContext,
         prover_choice: vir::def::ProverChoice,
         query_op: QueryOp,
+        focus_assert_id: Option<&AssertId>,
         default_prover_failed_assert_ids: &mut Vec<AssertId>,
     ) -> RunCommandQueriesResult {
         let is_singular = prover_choice == vir::def::ProverChoice::Singular;
@@ -992,6 +1008,7 @@ impl Verifier {
                         desc: context.desc.clone(),
                         span: context.span.as_string.clone(),
                         kind: query_op.kind(),
+                        focus: focus_assert_id.map(air::def::assert_id_to_symbol),
                         round,
                         result: result_str(),
                         frontier,
@@ -1003,9 +1020,23 @@ impl Verifier {
                     QueryMatchingLoops {
                         desc: context.desc.clone(),
                         span: context.span.as_string.clone(),
+                        focus: focus_assert_id.map(air::def::assert_id_to_symbol),
                         round,
                         result: result_str(),
                         info,
+                    },
+                );
+            }
+            if let Some(gradient) = air_context.take_difficulty() {
+                self.func_difficulty.entry(context.fun.clone()).or_default().push(
+                    QueryDifficulty {
+                        desc: context.desc.clone(),
+                        span: context.span.as_string.clone(),
+                        kind: query_op.kind(),
+                        focus: focus_assert_id.map(air::def::assert_id_to_symbol),
+                        round,
+                        result: result_str(),
+                        gradient,
                     },
                 );
             }
@@ -1015,6 +1046,7 @@ impl Verifier {
                         desc: context.desc.clone(),
                         span: context.span.as_string.clone(),
                         kind: query_op.kind(),
+                        focus: focus_assert_id.map(air::def::assert_id_to_symbol),
                         round,
                         result: result_str(),
                         pressure,
@@ -1026,6 +1058,7 @@ impl Verifier {
                     QueryProvenance {
                         desc: context.desc.clone(),
                         span: context.span.as_string.clone(),
+                        focus: focus_assert_id.map(air::def::assert_id_to_symbol),
                         round,
                         result: result_str(),
                         sources: info.sources,
@@ -1264,6 +1297,7 @@ impl Verifier {
         comment: &str,
         desc_prefix: Option<&str>,
         query_op: QueryOp,
+        focus_assert_id: Option<&AssertId>,
         default_prover_failed_assert_ids: &mut Vec<AssertId>,
         includes_function: bool,
     ) -> RunCommandQueriesResult {
@@ -1305,6 +1339,7 @@ impl Verifier {
                     &context,
                     *prover_choice,
                     query_op,
+                    focus_assert_id,
                     default_prover_failed_assert_ids,
                 );
         }
@@ -1368,6 +1403,33 @@ impl Verifier {
         }
     }
 
+    /// Join each query's difficulty gradient to source, per function. A cvc5
+    /// without the key answers `unsupported`; say so once, because those
+    /// records carry no rows although their checks still ran under difficulty
+    /// mode's options and budget.
+    fn resolve_difficulty(
+        &mut self,
+        symbols: &crate::provenance::Symbols,
+        reporter: &impl air::messages::Diagnostics,
+    ) {
+        let mut unsupported = 0usize;
+        for (fun, queries) in std::mem::take(&mut self.func_difficulty) {
+            let resolved: Vec<ResolvedQueryDifficulty> =
+                queries.into_iter().map(|query| symbols.resolve_difficulty(&fun, query)).collect();
+            unsupported +=
+                resolved.iter().filter(|r| r.unparsed.as_deref() == Some("unsupported")).count();
+            self.func_details.entry(fun.clone()).or_default().difficulty.extend(resolved);
+        }
+        if unsupported > 0 {
+            reporter.report(
+                &warning_bare(format!(
+                    "-V difficulty: this cvc5 answered `unsupported` to (get-info :difficulty-gradient) for {unsupported} check(s), so those records carry no rows; the checks still ran with difficulty mode's cvc5 options and twice the usual budget"
+                ))
+                .to_any(),
+            );
+        }
+    }
+
     /// Join each query's instantiation pressure to source, per function.
     fn resolve_inst_pressure(&mut self, symbols: &crate::provenance::Symbols) {
         for (fun, queries) in std::mem::take(&mut self.func_inst_pressure) {
@@ -1399,7 +1461,10 @@ impl Verifier {
     /// provenance, which describes the ordinary search.
     fn instantiation_replay(&self) -> bool {
         self.args.resident
+            // Both of these launch cvc5 with `--proof-mode=pp-only`, and
+            // replay wants the full proofs `--produce-proofs` asks for.
             && !self.args.provenance
+            && !self.args.difficulty
             && matches!(self.args.solver, air::context::SmtSolver::Cvc5)
             && std::env::var_os("VERUS_RESIDENT_INST_REPLAY").is_some()
     }
@@ -1429,6 +1494,9 @@ impl Verifier {
         }
         if self.args.matching_loops {
             air_context.set_matching_loops(true, self.args.matching_loop_rounds);
+        }
+        if self.args.difficulty {
+            air_context.set_difficulty(true);
         }
         if self.args.inst_pressure {
             air_context.set_inst_pressure(true);
@@ -1790,6 +1858,7 @@ impl Verifier {
                         snap_map,
                         profile_rerun,
                         func_check_sst,
+                        focus_assert_id,
                     } => {
                         let level = query_op.message_level();
                         let function = &op.get_function();
@@ -1944,6 +2013,7 @@ impl Verifier {
                                 &op.to_air_comment(),
                                 None,
                                 *query_op,
+                                focus_assert_id.as_ref(),
                                 &mut default_prover_failed_assert_ids,
                                 includes_function,
                             );
@@ -2881,10 +2951,11 @@ impl Verifier {
         // Join why queries answered unknown back to source, in every mode
         self.resolve_unknown_reasons(&global_ctx);
         // Join what cvc5 reported (matching loops, instantiation pressure,
-        // provenance, nonlinear frontiers) back to source, per function. The
-        // joins read the same symbols.
+        // difficulty, provenance, nonlinear frontiers) back to source, per
+        // function. The joins read the same symbols.
         if self.args.matching_loops
             || self.args.inst_pressure
+            || self.args.difficulty
             || self.args.provenance
             || self.args.nl_frontier
         {
@@ -2899,6 +2970,9 @@ impl Verifier {
             if self.args.inst_pressure {
                 self.resolve_inst_pressure(&symbols);
             }
+            if self.args.difficulty {
+                self.resolve_difficulty(&symbols, &reporter);
+            }
             if self.args.provenance {
                 self.resolve_provenance(&symbols);
             }
@@ -2909,11 +2983,15 @@ impl Verifier {
         // `--log-all`: per function, what each of them reported, as JSON
         if self.args.log_all {
             type Select = fn(&FuncDetails) -> Option<serde_json::Value>;
-            let logs: [(bool, &str, Select); 2] = [
+            let logs: [(bool, &str, Select); 3] = [
                 (self.args.inst_pressure, crate::config::INST_PRESSURE_FILE_SUFFIX, |d| {
                     (!d.inst_pressure.is_empty()).then(|| {
                         serde_json::to_value(&d.inst_pressure).expect("inst-pressure json")
                     })
+                }),
+                (self.args.difficulty, crate::config::DIFFICULTY_FILE_SUFFIX, |d| {
+                    (!d.difficulty.is_empty())
+                        .then(|| serde_json::to_value(&d.difficulty).expect("difficulty json"))
                 }),
                 (self.args.provenance, crate::config::PROVENANCE_FILE_SUFFIX, |d| {
                     (!d.provenance.is_empty())

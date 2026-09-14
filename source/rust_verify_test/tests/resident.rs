@@ -808,7 +808,7 @@ fn resident_instantiation_certificates_survive_a_new_session() {
     let exported = certificate_files(certificates.path());
     assert_eq!(exported.len(), 1, "{exported:?}");
     let name = exported[0].file_name().unwrap().to_str().unwrap();
-    assert!(name.starts_with('c') && name.ends_with(".smt2"), "{name}");
+    assert!(name.starts_with('c') && name.ends_with(".smt2"), "{}", name);
     let certificate = fs::read_to_string(&exported[0]).unwrap();
     // A new session: the solver has saved nothing, so the passing query's
     // first check imports the file the previous session exported.
@@ -1168,17 +1168,17 @@ fn resident_checks_say_why_the_solver_answered_unknown() {
         let failing = worker.send(
             json!({"command":"check", "session":session, "bucket":0, "query":query_id(&ready, "::failing")}),
         );
-        assert_eq!(failing["result"], "invalid", "{failing}");
+        assert_eq!(failing["result"], "invalid", "{}", failing);
         let reason = &failing["unknown_reason"];
-        assert_eq!(reason["reason"], "incomplete", "{failing}");
-        assert!(reason["desc"].is_string() && reason["span"].is_string(), "{failing}");
+        assert_eq!(reason["reason"], "incomplete", "{}", failing);
+        assert!(reason["desc"].is_string() && reason["span"].is_string(), "{}", failing);
         // A cvc5 older than the incomplete-id key answers `unsupported`, which
         // leaves the id out and the culprits empty.
         let culprits = reason["culprits"].as_array().unwrap();
         if let Some(id) = reason.get("incomplete_id").and_then(|id| id.as_str()) {
-            assert!(id.starts_with("QUANTIFIERS"), "{failing}");
+            assert!(id.starts_with("QUANTIFIERS"), "{}", failing);
             // At least the prelude's quantifiers are asserted in every query.
-            assert!(!culprits.is_empty(), "{failing}");
+            assert!(!culprits.is_empty(), "{}", failing);
         }
         // Source-spanned culprits lead and the prelude's come last.
         let rank = |culprit: &Value| match (culprit.get("span"), culprit["fun"].as_str()) {
@@ -1186,13 +1186,13 @@ fn resident_checks_say_why_the_solver_answered_unknown() {
             (None, Some("prelude")) => 2,
             (None, _) => 1,
         };
-        assert!(culprits.iter().all(|culprit| culprit["qid"].is_string()), "{failing}");
-        assert!(culprits.windows(2).all(|pair| rank(&pair[0]) <= rank(&pair[1])), "{failing}");
+        assert!(culprits.iter().all(|culprit| culprit["qid"].is_string()), "{}", failing);
+        assert!(culprits.windows(2).all(|pair| rank(&pair[0]) <= rank(&pair[1])), "{}", failing);
         let passing = worker.send(
             json!({"command":"check", "session":session, "bucket":0, "query":query_id(&ready, "::passing")}),
         );
-        assert_eq!(passing["result"], "valid", "{passing}");
-        assert!(passing["unknown_reason"].is_null(), "{passing}");
+        assert_eq!(passing["result"], "valid", "{}", passing);
+        assert!(passing["unknown_reason"].is_null(), "{}", passing);
     }
     assert_eq!(worker.send(json!({"command":"close", "session":session}))["event"], "closed");
     worker.finish(false);
@@ -1789,4 +1789,97 @@ fn resident_retains_function_buckets_alongside_module_buckets() {
     }
     worker.finish(true);
     assert_eq!(fs::read_to_string(worker.dir.path().join("launches")).unwrap().lines().count(), 2);
+}
+
+/// A session under `-V difficulty` reports, for every check it runs, what
+/// cvc5 attributed to each tagged assertion of that query, joined to source:
+/// the goal and the hypotheses are listed, the axioms that did no work are
+/// counted rather than listed, and a recheck names no focused obligation,
+/// since a session never expands an error.
+///
+/// Needs the pinned cvc5 to answer `(get-info :difficulty-gradient)`
+/// (BasisResearch/cvc5#5).
+#[test]
+fn resident_difficulty_reports_the_gradient_of_a_check() {
+    let source = r#"
+use vstd::prelude::*;
+verus! {
+    pub uninterp spec fn enc(k: int) -> int;
+    pub uninterp spec fn dec(v: int) -> int;
+
+    #[verifier::external_body]
+    pub broadcast proof fn roundtrip(k: int)
+        ensures #[trigger] dec(enc(k)) == k,
+    {
+    }
+
+    proof fn decode_ok(k: int, v: int, bound: int)
+        requires
+            v == enc(k),
+            bound < 100,
+        ensures
+            dec(v) == k,
+    {
+        broadcast use roundtrip;
+    }
+}
+"#;
+    let mut worker = Worker::start(source, &["-V", "difficulty"]);
+    let ready = worker.receive();
+    assert_eq!(ready["difficulty"], true, "{}", ready);
+    let checked = worker.send(json!({"command":"check", "session":ready["session"], "bucket":0, "query":query_id(&ready, "decode_ok")}));
+    assert_eq!(checked["result"], "valid", "{}", checked);
+    let report = &checked["difficulty"];
+    assert_eq!(report["kind"], "body", "{}", checked);
+    assert_eq!(report["round"], 0, "{}", checked);
+    assert_eq!(report["result"], "valid", "{}", checked);
+    assert_eq!(report["solver_result"], "unsat", "{}", checked);
+    assert_eq!(report["difficulty"], true, "{}", checked);
+    assert_eq!(report["core"], true, "{}", checked);
+    assert!(report["unparsed"].is_null(), "the pinned cvc5 answers the key: {}", checked);
+    assert!(report["focus"].is_null(), "a session expands no error: {}", checked);
+    let kinds = |row: &serde_json::Value| {
+        row["tags"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tag| tag["kind"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>()
+    };
+    let rows = report["rows"].as_array().unwrap();
+    let goal = rows
+        .iter()
+        .find(|row| kinds(row).iter().any(|kind| kind == "query"))
+        .unwrap_or_else(|| panic!("no goal row: {}", checked));
+    // the goal is in every refutation's core
+    assert_eq!(goal["in_core"], true, "{}", goal);
+    // both requires clauses are listed, whatever work they did
+    let requires = rows.iter().filter(|row| kinds(row).iter().any(|k| k == "requires")).count();
+    assert_eq!(requires, 2, "{}", checked);
+    // the axioms that did nothing are counted: most of what is in scope
+    assert!(report["idle_axioms"].as_u64().unwrap() > 0, "{}", checked);
+    assert_eq!(
+        worker.send(json!({"command":"close", "session":ready["session"]}))["event"],
+        "closed"
+    );
+    // every query of the fixture verifies, so the invocation succeeded
+    worker.finish(true);
+}
+
+/// Without `-V difficulty` a session says the mode is off and its checks
+/// carry no gradient, so a caller cannot mistake an absent reply for an empty
+/// one.
+#[test]
+fn resident_without_difficulty_reports_none() {
+    let mut worker = Worker::start(SOURCE, &[]);
+    let ready = worker.receive();
+    assert_eq!(ready["difficulty"], false, "{}", ready);
+    let checked = worker.send(json!({"command":"check", "session":ready["session"], "bucket":0, "query":query_id(&ready, "passing")}));
+    assert_eq!(checked["result"], "valid", "{}", checked);
+    assert!(checked["difficulty"].is_null(), "{}", checked);
+    assert_eq!(
+        worker.send(json!({"command":"close", "session":ready["session"]}))["event"],
+        "closed"
+    );
+    worker.finish(false);
 }

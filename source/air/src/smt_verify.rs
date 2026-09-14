@@ -186,9 +186,10 @@ impl SmtSolver {
 /// mode spends more of the budget on proof bookkeeping during search
 /// (measured on toydb), so it gets twice as much. Instantiation replay runs
 /// with full proofs (`--produce-proofs`), which slowed a first search about
-/// 1.6x on toydb, so it gets the same.
+/// 1.6x on toydb, so it gets the same, and difficulty mode pays for the same
+/// preprocessing proofs plus solving under assumptions, so it does too.
 pub(crate) fn cvc5_query_budget(context: &Context) -> u32 {
-    if context.provenance || context.instantiation_replay {
+    if context.provenance || context.instantiation_replay || context.difficulty {
         context.rlimit.saturating_mul(2)
     } else {
         context.rlimit
@@ -210,8 +211,9 @@ pub(crate) fn smt_check_assertion<'ctx>(
 ) -> ValidityResult {
     context.last_unknown_reason = None;
     // a check that returns before reading the reply must not leave the
-    // previous check's pressure behind for its caller to take
+    // previous check's pressure or difficulty behind for its caller to take
     context.last_inst_pressure = None;
+    context.last_difficulty = None;
     let disabled_expr = if only_check_earlier {
         // disable all labels that come after the first known error
         let mut disabled: Vec<Expr> = Vec::new();
@@ -299,6 +301,11 @@ pub(crate) fn smt_check_assertion<'ctx>(
         ]));
     }
     context.smt_log.log_word("check-sat");
+    if context.difficulty {
+        // in the same batch, right after the answer it describes and before
+        // anything else can disturb the difficulty map or the unsat core
+        context.smt_log.log_get_info("difficulty-gradient");
+    }
     if context.nl_frontier {
         // in the same batch, right after the answer it describes
         context.smt_log.log_get_info("nl-frontier");
@@ -352,6 +359,7 @@ pub(crate) fn smt_check_assertion<'ctx>(
     // Process SMT results
     let mut unsat = None;
     let mut provenance_lines: Vec<String> = Vec::new();
+    let mut difficulty = None;
     let mut nl_frontier = None;
     let mut egraph_lines: Vec<String> = Vec::new();
     let mut inst_pressure = None;
@@ -366,7 +374,18 @@ pub(crate) fn smt_check_assertion<'ctx>(
             egraph_lines.push(line);
             continue;
         }
-        if context.nl_frontier && line.starts_with("(:nl-frontier ") {
+        // The keys come in the order they were asked, difficulty first, then
+        // nl-frontier and inst-pressure, so a cvc5 without them answers
+        // `unsupported` to each in turn and these branches take them in order.
+        if context.difficulty && line.starts_with("(:difficulty-gradient ") {
+            difficulty = Some(parse_difficulty_gradient(&line));
+        } else if context.difficulty && difficulty.is_none() && line == "unsupported" {
+            // a cvc5 without the key; say so rather than fail the query
+            difficulty = Some(crate::context::DifficultyGradient {
+                unparsed: Some(line),
+                ..Default::default()
+            });
+        } else if context.nl_frontier && line.starts_with("(:nl-frontier ") {
             nl_frontier = Some(parse_nl_frontier(&line));
         } else if context.nl_frontier && nl_frontier.is_none() && line == "unsupported" {
             // a cvc5 without the key; say so rather than fail the query
@@ -415,6 +434,7 @@ pub(crate) fn smt_check_assertion<'ctx>(
         context.last_provenance = Some(parse_provenance_lines(&provenance_lines));
     }
     context.last_nl_frontier = nl_frontier;
+    context.last_difficulty = difficulty;
     context.last_inst_pressure = inst_pressure;
     if egraph_asked {
         context.last_egraph = Some(parse_egraph_lines(&egraph_lines));
@@ -774,6 +794,102 @@ fn bar_symbols_as_strings(line: &str) -> String {
     }
     out.push_str(rest);
     out
+}
+
+/// Parse cvc5's `(:difficulty-gradient (:result R :difficulty B :core B
+/// :rows (ROW ...) :untagged (:asserted N :difficulty N [:in-core N])
+/// :unmatched-difficulty N))`, where each ROW is `(:tags (T ...) :difficulty
+/// N [:in-core B])`. Unknown keys are skipped; a reply that does not parse
+/// is kept whole in `unparsed`.
+pub(crate) fn parse_difficulty_gradient(line: &str) -> crate::context::DifficultyGradient {
+    use sise::TreeNode;
+    let mut out = crate::context::DifficultyGradient::default();
+    let fields = match read_smt_sexp(line) {
+        Some(TreeNode::List(items)) => match &items[..] {
+            [TreeNode::Atom(key), TreeNode::List(fields)] if key == ":difficulty-gradient" => {
+                fields.clone()
+            }
+            _ => Vec::new(),
+        },
+        _ => Vec::new(),
+    };
+    if fields.is_empty() {
+        out.unparsed = Some(line.to_owned());
+        return out;
+    }
+    let mut bad = false;
+    for pair in fields.chunks(2) {
+        match pair {
+            [TreeNode::Atom(k), TreeNode::Atom(v)] if k == ":result" => out.result = v.clone(),
+            [TreeNode::Atom(k), TreeNode::Atom(v)] if k == ":difficulty" => {
+                out.difficulty = v == "true";
+            }
+            [TreeNode::Atom(k), TreeNode::Atom(v)] if k == ":core" => out.core = v == "true",
+            [TreeNode::Atom(k), TreeNode::Atom(v)] if k == ":unmatched-difficulty" => {
+                match difficulty_count(v) {
+                    Some(n) => out.unmatched_difficulty = n,
+                    None => bad = true,
+                }
+            }
+            [TreeNode::Atom(k), TreeNode::List(rows)] if k == ":rows" => {
+                for row in rows {
+                    match parse_difficulty_row(row) {
+                        Some(r) => out.rows.push(r),
+                        None => bad = true,
+                    }
+                }
+            }
+            [TreeNode::Atom(k), TreeNode::List(untagged)] if k == ":untagged" => {
+                for pair in untagged.chunks(2) {
+                    let [TreeNode::Atom(k), TreeNode::Atom(v)] = pair else {
+                        bad = true;
+                        continue;
+                    };
+                    let Some(n) = difficulty_count(v) else {
+                        bad = true;
+                        continue;
+                    };
+                    match k.as_str() {
+                        ":asserted" => out.untagged_asserted = n,
+                        ":difficulty" => out.untagged_difficulty = n,
+                        ":in-core" => out.untagged_in_core = Some(n),
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    if bad {
+        out.unparsed = Some(line.to_owned());
+    }
+    out
+}
+
+/// One `(:tags (T ...) :difficulty N [:in-core B])` row of
+/// `(get-info :difficulty-gradient)`.
+fn parse_difficulty_row(row: &sise::TreeNode) -> Option<crate::context::DifficultyRow> {
+    use sise::TreeNode;
+    let TreeNode::List(items) = row else { return None };
+    let mut r = crate::context::DifficultyRow::default();
+    for pair in items.chunks(2) {
+        match pair {
+            [TreeNode::Atom(k), TreeNode::List(tags)] if k == ":tags" => {
+                for tag in tags {
+                    let TreeNode::Atom(tag) = tag else { return None };
+                    r.tags.push(tag.to_owned());
+                }
+            }
+            [TreeNode::Atom(k), TreeNode::Atom(v)] if k == ":difficulty" => {
+                r.difficulty = difficulty_count(v)?;
+            }
+            [TreeNode::Atom(k), TreeNode::Atom(v)] if k == ":in-core" => {
+                r.in_core = Some(v == "true");
+            }
+            _ => {}
+        }
+    }
+    Some(r)
 }
 
 /// Parse cvc5's `(:inst-pressure (:rounds R :refutation B :quantifiers (ROW

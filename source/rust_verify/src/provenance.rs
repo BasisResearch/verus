@@ -13,6 +13,9 @@ pub struct QueryProvenance {
     pub variable_versions: air::context::VariableVersions,
     pub desc: String,
     pub span: String,
+    /// Under `--expand-errors`, the obligation the recheck was focused on, as
+    /// the symbol its goal tag carries (`aid_3_1_2`).
+    pub focus: Option<String>,
     /// 0 for the first check of the query, then one per multi-error round
     pub round: usize,
     /// "valid", "invalid", "canceled", or the solver's unexpected output
@@ -73,6 +76,10 @@ pub struct ResolvedInstantiation {
 pub struct ResolvedQueryProvenance {
     pub desc: String,
     pub span: String,
+    /// Under `--expand-errors`, the obligation this recheck was focused on,
+    /// as the symbol its goal tag carries (`aid_3_1_2`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub focus: Option<String>,
     pub round: usize,
     pub result: String,
     /// hypotheses (requires, type invariants, fuel, trait bounds) that fed
@@ -97,6 +104,9 @@ pub struct QueryNlFrontier {
     /// `body`, `recommends`, `expanded`, ...: a recommends rerun or an
     /// expanded recheck shares the body check's `desc` and `span`
     pub kind: &'static str,
+    /// Under `--expand-errors`, the obligation the recheck was focused on, as
+    /// the symbol its goal tag carries (`aid_3_1_2`).
+    pub focus: Option<String>,
     /// 0 for the first check of the query, then one per multi-error round
     pub round: usize,
     /// "valid", "invalid", "canceled", or the solver's unexpected output
@@ -200,6 +210,10 @@ pub struct ResolvedQueryNlFrontier {
     pub desc: String,
     pub span: String,
     pub kind: &'static str,
+    /// Under `--expand-errors`, the obligation this recheck was focused on,
+    /// as the symbol its goal tag carries (`aid_3_1_2`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub focus: Option<String>,
     pub round: usize,
     pub result: String,
     /// cvc5's own answer to the check: unsat, sat, unknown, or none
@@ -222,6 +236,99 @@ pub struct ResolvedQueryNlFrontier {
     pub unparsed: Option<String>,
 }
 
+/// One `check-sat` under `-V difficulty`, as cvc5 reported it: rows by tag
+/// symbol, not yet joined to source.
+#[derive(Clone, Debug)]
+pub struct QueryDifficulty {
+    pub desc: String,
+    pub span: String,
+    /// `body`, `recommends`, `expanded`, ...: a recommends rerun or an
+    /// expanded recheck shares the body check's `desc` and `span`
+    pub kind: &'static str,
+    /// Under `--expand-errors`, the obligation the recheck was focused on, as
+    /// the symbol its goal tag carries (`aid_3_1_2`).
+    pub focus: Option<String>,
+    /// 0 for the first check of the query, then one per multi-error round
+    pub round: usize,
+    /// "valid", "invalid", "canceled", or the solver's unexpected output
+    pub result: String,
+    pub gradient: air::context::DifficultyGradient,
+}
+
+/// One tagged input assertion of a query, joined to source. The numbers are
+/// cvc5's own; nothing here is derived.
+#[derive(serde::Serialize, Clone, Debug)]
+pub struct ResolvedDifficultyRow {
+    /// The assertion's tags, each joined to source; several when identical
+    /// assertions were merged.
+    pub tags: Vec<ResolvedTag>,
+    /// How many lemmas used a literal this assertion made relevant (cvc5's
+    /// difficulty measure): a heuristic for the solver work through it.
+    pub difficulty: u64,
+    /// Whether the unsat core holds it; present only after `unsat`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub in_core: Option<bool>,
+}
+
+/// Whether a difficulty row is an axiom that did nothing: it was in scope,
+/// no lemma used a literal it made relevant, and the unsat core does not
+/// hold it (or the check reported no core). Most of a query's rows are
+/// these, so `resolve_difficulty` counts them instead of listing them. A row
+/// cvc5 sent without tags is listed rather than counted, so that nothing
+/// disappears into the count.
+fn is_idle_axiom(tags: &[ResolvedTag], difficulty: u64, in_core: Option<bool>) -> bool {
+    difficulty == 0
+        && in_core != Some(true)
+        && !tags.is_empty()
+        && tags.iter().all(|t| matches!(t.kind.as_str(), "axiom" | "prelude" | "anonymous_axiom"))
+}
+
+/// A query's difficulty gradient with every tag joined to source
+/// (`-V difficulty`).
+///
+/// Several records of one function can share `desc`, `span`, `kind` and
+/// `round`: a bit-vector or nonlinear subquery and a loop body check each
+/// come from the function's own check. Expanded rechecks carry `focus` to
+/// say which obligation they are about.
+#[derive(serde::Serialize, Clone, Debug)]
+pub struct ResolvedQueryDifficulty {
+    pub desc: String,
+    pub span: String,
+    pub kind: &'static str,
+    /// Under `--expand-errors`, the obligation this recheck was focused on,
+    /// as the symbol its goal tag carries (`aid_3_1_2`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub focus: Option<String>,
+    /// 0 for the first check, then one per multi-error round. The rounds of
+    /// a query share its solver scope, and cvc5 keeps difficulty until that
+    /// scope is popped, so a round's counts include the rounds before it.
+    pub round: usize,
+    pub result: String,
+    /// cvc5's own answer to the check: unsat, sat, unknown, or none. Empty
+    /// when `unparsed` is set, since cvc5 then never answered the key.
+    pub solver_result: String,
+    /// whether cvc5 tracked difficulty
+    pub difficulty: bool,
+    /// whether each row carries `in_core`
+    pub core: bool,
+    /// Largest difficulty first: every hypothesis and the goal, and each
+    /// axiom that did some work or is in the core.
+    pub rows: Vec<ResolvedDifficultyRow>,
+    /// The axioms in scope that did no work (difficulty 0) and are not in
+    /// the core, counted rather than listed: most of what is in scope.
+    pub idle_axioms: u64,
+    /// the untagged input assertions (each multi-error round's assertion
+    /// disabling the errors already found), summed
+    pub untagged_asserted: u64,
+    pub untagged_difficulty: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub untagged_in_core: Option<u64>,
+    /// difficulty cvc5 could not carry back to a current input assertion
+    pub unmatched_difficulty: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unparsed: Option<String>,
+}
+
 /// One `check-sat` under `-V inst-pressure`, as cvc5 reported it: rows by
 /// `:qid`, not yet joined to source.
 #[derive(Clone, Debug)]
@@ -231,6 +338,9 @@ pub struct QueryInstPressure {
     /// `body`, `recommends`, `expanded`, ...: a recommends rerun or an
     /// expanded recheck shares the body check's `desc` and `span`
     pub kind: &'static str,
+    /// Under `--expand-errors`, the obligation the recheck was focused on, as
+    /// the symbol its goal tag carries (`aid_3_1_2`).
+    pub focus: Option<String>,
     /// 0 for the first check of the query, then one per multi-error round
     pub round: usize,
     /// "valid", "invalid", "canceled", or the solver's unexpected output
@@ -283,6 +393,10 @@ pub struct ResolvedQueryInstPressure {
     pub desc: String,
     pub span: String,
     pub kind: &'static str,
+    /// Under `--expand-errors`, the obligation this recheck was focused on,
+    /// as the symbol its goal tag carries (`aid_3_1_2`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub focus: Option<String>,
     pub round: usize,
     pub result: String,
     /// instantiation rounds that sent lemmas
@@ -301,6 +415,9 @@ pub struct ResolvedQueryInstPressure {
 pub struct QueryMatchingLoops {
     pub desc: String,
     pub span: String,
+    /// Under `--expand-errors`, the obligation the recheck was focused on, as
+    /// the symbol its goal tag carries (`aid_3_1_2`).
+    pub focus: Option<String>,
     /// 0 for the first check of the query, then one per multi-error round
     pub round: usize,
     /// "invalid" or "canceled": the verdict the unknown turned into
@@ -400,6 +517,10 @@ pub struct ResolvedMatchingLoop {
 pub struct ResolvedQueryMatchingLoops {
     pub desc: String,
     pub span: String,
+    /// Under `--expand-errors`, the obligation this recheck was focused on,
+    /// as the symbol its goal tag carries (`aid_3_1_2`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub focus: Option<String>,
     pub round: usize,
     pub result: String,
     /// the last instantiation round of the check
@@ -745,6 +866,9 @@ impl Symbols {
                 let ident: &str = &ident;
                 if let Some(owner) = self.axiom_owners.get(symbol) {
                     r.kind = "axiom".to_string();
+                    // a broadcast axiom is known by the function that states
+                    // it, so the span is that function's (`with_function_spans`)
+                    r.span = self.function_spans.get(owner).cloned();
                     r.owner = Some(owner.clone());
                 } else if let Some(info) = self.quantifiers.get(ident) {
                     r.kind = "axiom".to_string();
@@ -835,6 +959,7 @@ impl Symbols {
         ResolvedQueryProvenance {
             desc: q.desc,
             span: q.span,
+            focus: q.focus,
             round: q.round,
             result: q.result,
             hypotheses,
@@ -842,6 +967,49 @@ impl Symbols {
             axioms_in_scope,
             instantiations,
             unparsed: q.unparsed,
+        }
+    }
+
+    /// Join each tagged assertion of a query's difficulty gradient to source.
+    /// cvc5 reports every tagged assertion in scope, which is mostly axioms
+    /// that play no part; those are counted in `idle_axioms`, not listed.
+    pub(crate) fn resolve_difficulty(
+        &self,
+        fun: &Fun,
+        q: QueryDifficulty,
+    ) -> ResolvedQueryDifficulty {
+        let g = q.gradient;
+        let mut rows = Vec::new();
+        let mut idle_axioms = 0u64;
+        for row in g.rows {
+            let tags: Vec<ResolvedTag> = row.tags.iter().map(|t| self.tag_of(fun, t)).collect();
+            if is_idle_axiom(&tags, row.difficulty, row.in_core) {
+                idle_axioms += 1;
+            } else {
+                rows.push(ResolvedDifficultyRow {
+                    tags,
+                    difficulty: row.difficulty,
+                    in_core: row.in_core,
+                });
+            }
+        }
+        ResolvedQueryDifficulty {
+            desc: q.desc,
+            span: q.span,
+            kind: q.kind,
+            focus: q.focus,
+            round: q.round,
+            result: q.result,
+            solver_result: g.result,
+            difficulty: g.difficulty,
+            core: g.core,
+            rows,
+            idle_axioms,
+            untagged_asserted: g.untagged_asserted,
+            untagged_difficulty: g.untagged_difficulty,
+            untagged_in_core: g.untagged_in_core,
+            unmatched_difficulty: g.unmatched_difficulty,
+            unparsed: g.unparsed,
         }
     }
 
@@ -884,6 +1052,7 @@ impl Symbols {
             desc: q.desc,
             span: q.span,
             kind: q.kind,
+            focus: q.focus,
             round: q.round,
             result: q.result,
             rounds: q.pressure.rounds,
@@ -1023,6 +1192,7 @@ impl Symbols {
         ResolvedQueryMatchingLoops {
             desc: q.desc,
             span: q.span,
+            focus: q.focus,
             round: q.round,
             result: q.result,
             rounds: q.info.rounds,
@@ -1131,6 +1301,7 @@ impl Symbols {
         ResolvedQueryNlFrontier {
             desc: q.desc,
             span: q.span,
+            focus: q.focus,
             round: q.round,
             result: q.result,
             kind: q.kind,
@@ -1362,6 +1533,7 @@ mod tests {
         let query = QueryNlFrontier {
             desc: "function body check".to_string(),
             span: "src/a.rs:5:1: 5:30 (#0)".to_string(),
+            focus: None,
             round: 0,
             result: "invalid".to_string(),
             kind: "recommends",
@@ -1381,5 +1553,24 @@ mod tests {
             (a.span.as_deref(), a.span_basis.as_deref()),
             (Some(def_span), Some("definition"))
         );
+    }
+
+    #[test]
+    fn idle_axioms_are_the_ones_that_did_no_work() {
+        // an axiom in scope that no lemma used and no core holds
+        assert!(is_idle_axiom(&[tag("axiom", None)], 0, Some(false)));
+        assert!(is_idle_axiom(&[tag("prelude", None)], 0, None));
+        assert!(is_idle_axiom(&[tag("anonymous_axiom", None), tag("axiom", None)], 0, None));
+        // an axiom that did work, or that the core holds, is listed
+        assert!(!is_idle_axiom(&[tag("axiom", None)], 1, Some(false)));
+        assert!(!is_idle_axiom(&[tag("axiom", None)], 0, Some(true)));
+        // hypotheses and the goal are listed whatever they did
+        assert!(!is_idle_axiom(&[tag("requires", None)], 0, Some(false)));
+        assert!(!is_idle_axiom(&[tag("fuel", None)], 0, None));
+        assert!(!is_idle_axiom(&[tag("query", None)], 0, Some(false)));
+        // a merged row counts as idle only if every tag of it does
+        assert!(!is_idle_axiom(&[tag("axiom", None), tag("requires", None)], 0, None));
+        // a row without tags is listed rather than lost in the count
+        assert!(!is_idle_axiom(&[], 0, None));
     }
 }

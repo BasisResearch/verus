@@ -236,6 +236,38 @@ pub struct EgraphReply {
     pub variable_versions: VariableVersions,
 }
 
+/// What cvc5's `(get-info :difficulty-gradient)` reported for one
+/// `check-sat` (`-V difficulty`): per tagged input assertion, the lemma work
+/// cvc5 attributed to it and, after `unsat`, whether the unsat core holds it.
+/// Tags are the symbols from the wire; the join back to source happens in
+/// Verus.
+///
+/// cvc5 keeps difficulty until the query's scope is popped, and the rounds
+/// of a multi-error query share that scope, so a later round's counts
+/// include the work of the rounds before it.
+#[derive(Debug, Clone, Default)]
+pub struct DifficultyGradient {
+    /// `unsat`, `sat` or `unknown` as cvc5 answered; `none` before a check.
+    pub result: String,
+    /// Whether cvc5 tracked difficulty (`--produce-difficulty`).
+    pub difficulty: bool,
+    /// Whether each row says if the unsat core holds it: after `unsat` only.
+    pub core: bool,
+    /// One per distinct tagged input assertion, largest difficulty first.
+    pub rows: Vec<DifficultyRow>,
+    /// Input assertions without a tag, summed. Every assertion Verus emits
+    /// is tagged, the AIR prelude's included; what is left is the assertion
+    /// each multi-error round adds to disable the errors already reported.
+    pub untagged_asserted: u64,
+    pub untagged_difficulty: u64,
+    /// How many of them the unsat core holds, when `core`.
+    pub untagged_in_core: Option<u64>,
+    /// Difficulty cvc5 could not carry back to a current input assertion.
+    pub unmatched_difficulty: u64,
+    /// The reply, when it did not parse.
+    pub unparsed: Option<String>,
+}
+
 /// What cvc5's `(get-info :inst-pressure)` reported for one `check-sat`
 /// (`-V inst-pressure`): per quantifier, by `:qid`, how often it was
 /// instantiated and how often an attempt was rejected as a duplicate. The
@@ -310,6 +342,19 @@ pub struct NlHost {
     /// Instantiation hosts: the quantifier's `:qid`, and how many vectors.
     pub qid: Option<String>,
     pub count: u64,
+}
+
+/// One tagged input assertion of `(get-info :difficulty-gradient)`.
+#[derive(Debug, Clone, Default)]
+pub struct DifficultyRow {
+    /// Several when hash-consing merged identical assertions.
+    pub tags: Vec<String>,
+    /// How many lemmas used a literal that this assertion made relevant
+    /// (cvc5's `lemma-literal-all` difficulty): a heuristic measure of the
+    /// solver work that flowed through it.
+    pub difficulty: u64,
+    /// Whether the unsat core holds it; `None` unless the reply has a core.
+    pub in_core: Option<bool>,
 }
 
 /// One quantifier's row of `(get-info :inst-pressure)`. Counts are the
@@ -452,6 +497,15 @@ pub struct Context {
     pub(crate) provenance: bool,
     /// The provenance of the last `check-sat`, until the caller takes it.
     pub(crate) last_provenance: Option<ProvenanceInfo>,
+    /// Difficulty mode (`-V difficulty`): cvc5 tracks per-assertion
+    /// difficulty and unsat cores, which needs preprocessing proofs and
+    /// solving under assumptions, gets twice the per-query budget, and is
+    /// asked for `(get-info :difficulty-gradient)` after every `check-sat`.
+    /// It perturbs the search, so plain runs stay the verdict of record.
+    pub(crate) difficulty: bool,
+    /// The difficulty gradient of the last `check-sat`, until the caller
+    /// takes it.
+    pub(crate) last_difficulty: Option<DifficultyGradient>,
     /// Why the last `check-sat` answered `unknown`, until the caller takes it.
     pub(crate) last_unknown_reason: Option<UnknownReason>,
     /// Nonlinear frontier mode (`-V nl-frontier`): cvc5 is asked for
@@ -570,6 +624,8 @@ impl Context {
             anon_axiom_count: 0,
             provenance: false,
             last_provenance: None,
+            difficulty: false,
+            last_difficulty: None,
             last_unknown_reason: None,
             nl_frontier: false,
             last_nl_frontier: None,
@@ -607,6 +663,7 @@ impl Context {
                 &self.solver,
                 transcript_log,
                 self.provenance,
+                self.difficulty,
                 self.instantiation_replay,
                 self.matching_loops,
                 self.inst_max_rounds,
@@ -761,6 +818,22 @@ impl Context {
         assert!(!enabled || matches!(self.solver, SmtSolver::Cvc5));
         self.matching_loops = enabled;
         self.inst_max_rounds = if enabled { inst_max_rounds } else { None };
+    }
+
+    /// The difficulty gradient cvc5 reported for the most recent
+    /// `check-sat`, if it was asked; each call returns it once.
+    pub fn take_difficulty(&mut self) -> Option<DifficultyGradient> {
+        self.last_difficulty.take()
+    }
+
+    /// Turn difficulty mode on (cvc5 only; must precede the first query).
+    /// Under it the solver is launched with `DIFFICULTY_ARGS`, each query
+    /// runs with twice the budget, and `(get-info :difficulty-gradient)`
+    /// follows every `check-sat`.
+    pub fn set_difficulty(&mut self, enabled: bool) {
+        assert!(matches!(self.state, ContextState::NotStarted));
+        assert!(!enabled || matches!(self.solver, SmtSolver::Cvc5));
+        self.difficulty = enabled;
     }
 
     /// Allow saving and restoring instantiations (cvc5 only; must precede the
@@ -1048,6 +1121,12 @@ impl Context {
                     };
                     self.comment(&format!(
                         "matching-loop mode: cvc5 args --matching-loops{rounds}"
+                    ));
+                }
+                if self.difficulty {
+                    self.comment(&format!(
+                        "difficulty mode: cvc5 args {}",
+                        crate::smt_process::DIFFICULTY_ARGS.join(" ")
                     ));
                 }
                 self.comment("AIR prelude");

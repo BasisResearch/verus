@@ -2300,7 +2300,7 @@ fn assert_id_roundtrip() {
     let node = sise::parse_tree(&mut sise_parser).expect("sise");
     let message_interface = std::sync::Arc::new(crate::messages::AirMessageInterface {});
     let parser = Parser::new(message_interface.clone());
-    let commands = parser.nodes_to_commands(&[node.clone()]).expect("parses");
+    let commands = parser.nodes_to_commands(std::slice::from_ref(&node)).expect("parses");
     assert_eq!(commands.len(), 1);
     let query = match &*commands[0] {
         CommandX::CheckValid(query) => query.clone(),
@@ -2531,6 +2531,51 @@ fn parse_nl_frontier_reply() {
     assert_eq!(f.atoms[0].atom, "(* x |a b|)");
     assert_eq!(f.atoms[0].args[0].term, "|a b|");
     assert_eq!(f.atoms[0].hosts[0].term, "(Mul x |a b|)");
+}
+
+#[test]
+fn parse_difficulty_gradient_reply() {
+    // cvc5's reply to the regression get-info-difficulty-gradient.smt2
+    let g = crate::smt_verify::parse_difficulty_gradient(
+        "(:difficulty-gradient (:result unsat :difficulty true :core true :rows (\
+         (:tags (ax_f) :difficulty 1 :in-core true) \
+         (:tags (query_0) :difficulty 1 :in-core true) \
+         (:tags (hyp_a |hyp%b|) :difficulty 0 :in-core false)) \
+         :untagged (:asserted 1 :difficulty 0 :in-core 0) :unmatched-difficulty 0))",
+    );
+    assert!(g.unparsed.is_none(), "{:?}", g.unparsed);
+    assert_eq!((g.result.as_str(), g.difficulty, g.core, g.rows.len()), ("unsat", true, true, 3));
+    assert_eq!(g.rows[0].tags, vec!["ax_f".to_string()]);
+    assert_eq!((g.rows[0].difficulty, g.rows[0].in_core), (1, Some(true)));
+    // merged assertions carry several tags; quoted symbols lose their bars
+    assert_eq!(g.rows[2].tags, vec!["hyp_a".to_string(), "hyp%b".to_string()]);
+    assert_eq!(g.rows[2].in_core, Some(false));
+    assert_eq!((g.untagged_asserted, g.untagged_in_core, g.unmatched_difficulty), (1, Some(0), 0));
+
+    // a quoted symbol may hold spaces and quotes
+    let g = crate::smt_verify::parse_difficulty_gradient(
+        "(:difficulty-gradient (:result sat :difficulty true :core false :rows (\
+         (:tags (|a \"b\" c|) :difficulty 2)) :untagged (:asserted 0 :difficulty 0) \
+         :unmatched-difficulty 0))",
+    );
+    assert!(g.unparsed.is_none(), "{:?}", g.unparsed);
+    assert_eq!(g.rows[0].tags, vec!["a \"b\" c".to_string()]);
+
+    // no core outside unsat; a count beyond u64 saturates
+    let g = crate::smt_verify::parse_difficulty_gradient(
+        "(:difficulty-gradient (:result unknown :difficulty true :core false :rows (\
+         (:tags (ax_f) :difficulty 123456789012345678901234567890)) \
+         :untagged (:asserted 2 :difficulty 7) :unmatched-difficulty 3))",
+    );
+    assert!(g.unparsed.is_none() && !g.core);
+    assert_eq!((g.rows[0].difficulty, g.rows[0].in_core), (u64::MAX, None));
+    assert_eq!((g.untagged_difficulty, g.untagged_in_core, g.unmatched_difficulty), (7, None, 3));
+
+    // a solver without the key, or anything unforeseen, is kept whole
+    let g = crate::smt_verify::parse_difficulty_gradient("(:difficulty-gradient unsupported)");
+    assert_eq!(g.unparsed.as_deref(), Some("(:difficulty-gradient unsupported)"));
+    let bad = "(:difficulty-gradient (:result sat :rows ((:tags (a) :difficulty many))))";
+    assert_eq!(crate::smt_verify::parse_difficulty_gradient(bad).unparsed.as_deref(), Some(bad));
 }
 
 #[test]
