@@ -62,6 +62,97 @@ pub struct ProvenanceInfo {
 
 pub type VariableVersions = HashMap<String, (String, u32)>;
 
+/// What cvc5's `(get-info :nl-frontier)` reported for one `check-sat`
+/// (`-V nl-frontier`): the nonlinear terms whose value in the linear model
+/// the nonlinear extension could not reconcile with their arguments' values,
+/// and where each entered the problem. Terms and tags are the solver's
+/// spelling; the join back to source happens in Verus.
+#[derive(Debug, Clone, Default)]
+pub struct NlFrontier {
+    /// SSA symbol -> original AIR variable and assignment version, recorded by lowering.
+    pub variable_versions: VariableVersions,
+    /// `unsat`, `sat` or `unknown` as cvc5 answered; `none` before a check.
+    pub result: String,
+    /// The unknown explanation in lower case (`incomplete`, `resourceout`,
+    /// ...), `none` unless `unknown`.
+    pub reason: String,
+    /// Whether cvc5's nonlinear extension was on.
+    pub enabled: bool,
+    /// Model-based refinement runs, runs with an assertion false in the
+    /// candidate model, and runs that gave up (no lemma, model unverified).
+    pub checks: u64,
+    pub rounds: u64,
+    pub punts: u64,
+    /// How the most recent run ended: `none`, `sat`, `lemma` or `punt`.
+    pub last: String,
+    /// Most recent round's atoms first, then by rounds wrong.
+    pub atoms: Vec<NlAtom>,
+    /// Atoms left out of `atoms`.
+    pub omitted: u64,
+    /// Whether the search for hosts in instantiations stopped early.
+    pub truncated: bool,
+    /// The reply, when it did not parse.
+    pub unparsed: Option<String>,
+}
+
+/// One nonlinear term of `(get-info :nl-frontier)`.
+#[derive(Debug, Clone, Default)]
+pub struct NlAtom {
+    /// The term as the input spelled it, e.g. `(* x y)`.
+    pub atom: String,
+    /// product, power, division, iand, pow2 or transcendental
+    pub kind: String,
+    /// Whether it was wrong in the most recent refinement round.
+    pub current: bool,
+    /// In how many rounds it was wrong.
+    pub rounds: u64,
+    /// Its value in the linear model, and the value its arguments give it
+    /// (they differ: that is why it is on the frontier).
+    pub value: String,
+    pub from_args: String,
+    /// The bounds asserted on the atom itself.
+    pub lower: Option<NlBound>,
+    pub upper: Option<NlBound>,
+    /// Its distinct arguments with their values and asserted bounds.
+    pub args: Vec<NlTerm>,
+    /// Where it entered the problem.
+    pub hosts: Vec<NlHost>,
+}
+
+/// A term with its model value and asserted bounds.
+#[derive(Debug, Clone, Default)]
+pub struct NlTerm {
+    pub term: String,
+    pub value: String,
+    pub lower: Option<NlBound>,
+    pub upper: Option<NlBound>,
+}
+
+/// A constant bound read off an asserted literal.
+#[derive(Debug, Clone, Default)]
+pub struct NlBound {
+    /// An SMT-LIB constant, e.g. `5` or `(- 5)`.
+    pub value: String,
+    pub strict: bool,
+    /// Whether the literal is implied by the assertions (fixed at SAT level
+    /// 0), rather than holding only in the branch the solver explored.
+    pub fixed: bool,
+}
+
+/// A term that applies one function to exactly an atom's factors: in a
+/// tagged input assertion, or in the instantiations of one quantifier.
+#[derive(Debug, Clone, Default)]
+pub struct NlHost {
+    /// `true` for an input assertion, `false` for an instantiation.
+    pub input: bool,
+    pub term: String,
+    /// Input hosts: the tags of the assertions holding the term.
+    pub tags: Vec<String>,
+    /// Instantiation hosts: the quantifier's `:qid`, and how many vectors.
+    pub qid: Option<String>,
+    pub count: u64,
+}
+
 #[derive(Debug)]
 pub enum ValidityResult {
     Valid(UsageInfo),
@@ -158,6 +249,12 @@ pub struct Context {
     pub(crate) provenance: bool,
     /// The provenance of the last `check-sat`, until the caller takes it.
     pub(crate) last_provenance: Option<ProvenanceInfo>,
+    /// Nonlinear frontier mode (`-V nl-frontier`): cvc5 is asked for
+    /// `(get-info :nl-frontier)` after every `check-sat`. cvc5 records the
+    /// frontier during every check anyway, so the search is the ordinary one.
+    pub(crate) nl_frontier: bool,
+    /// The nonlinear frontier of the last `check-sat`, until the caller takes it.
+    pub(crate) last_nl_frontier: Option<NlFrontier>,
     /// Whether this solver may save and restore instantiations across
     /// rechecks of a query (cvc5 only, fixed at launch).
     pub(crate) instantiation_replay: bool,
@@ -241,6 +338,8 @@ impl Context {
             anon_axiom_count: 0,
             provenance: false,
             last_provenance: None,
+            nl_frontier: false,
+            last_nl_frontier: None,
             instantiation_replay: false,
             restore_instantiations: None,
             saved_instantiations: HashSet::new(),
@@ -354,6 +453,22 @@ impl Context {
             info.variable_versions = self.variable_versions.clone();
             info
         })
+    }
+
+    /// The nonlinear frontier cvc5 reported for the most recent `check-sat`,
+    /// if it was asked; each call returns it once.
+    pub fn take_nl_frontier(&mut self) -> Option<NlFrontier> {
+        self.last_nl_frontier.take().map(|mut frontier| {
+            frontier.variable_versions = self.variable_versions.clone();
+            frontier
+        })
+    }
+
+    /// Ask cvc5 for `(get-info :nl-frontier)` after every `check-sat` (cvc5
+    /// only). Nothing about the solver's launch or budget changes.
+    pub fn set_nl_frontier(&mut self, enabled: bool) {
+        assert!(!enabled || matches!(self.solver, SmtSolver::Cvc5));
+        self.nl_frontier = enabled;
     }
 
     /// Turn provenance mode on (cvc5 only; must precede the first query).

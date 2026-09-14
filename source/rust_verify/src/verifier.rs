@@ -331,6 +331,9 @@ pub struct Verifier {
     /// Under `-V provenance`: what cvc5 reported for each query of each
     /// function, raw (tag symbols and qids), in check order
     pub func_provenance: HashMap<Fun, Vec<QueryProvenance>>,
+    /// Under `-V nl-frontier`: what cvc5 reported for each query of each
+    /// function, raw (solver terms, tag symbols and qids), in check order
+    func_nl_frontier: HashMap<Fun, Vec<QueryNlFrontier>>,
     /// Errors to report after verification has run
     deferred_errors: Vec<VirErr>,
 
@@ -360,7 +363,8 @@ pub struct Verifier {
 }
 
 pub use crate::provenance::{
-    QueryProvenance, ResolvedInstantiation, ResolvedQueryProvenance, ResolvedTag,
+    QueryNlFrontier, QueryProvenance, ResolvedInstantiation, ResolvedQueryNlFrontier,
+    ResolvedQueryProvenance, ResolvedTag,
 };
 
 #[derive(serde::Serialize)]
@@ -370,6 +374,9 @@ pub struct FuncDetails {
     /// filled under `-V provenance`
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub provenance: Vec<ResolvedQueryProvenance>,
+    /// filled under `-V nl-frontier`
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub nl_frontier: Vec<ResolvedQueryNlFrontier>,
 }
 
 impl Default for FuncDetails {
@@ -378,6 +385,7 @@ impl Default for FuncDetails {
             obligation_proof_notes: Default::default(),
             failed_proof_notes: Default::default(),
             provenance: Default::default(),
+            nl_frontier: Default::default(),
         }
     }
 }
@@ -387,6 +395,7 @@ impl FuncDetails {
         self.obligation_proof_notes.extend(other.obligation_proof_notes);
         self.failed_proof_notes.extend(other.failed_proof_notes);
         self.provenance.extend(other.provenance);
+        self.nl_frontier.extend(other.nl_frontier);
     }
 
     pub fn to_json(&self) -> serde_json::Value {
@@ -542,6 +551,7 @@ impl Verifier {
 
             func_details: HashMap::new(),
             func_provenance: HashMap::new(),
+            func_nl_frontier: HashMap::new(),
             deferred_errors: Vec::new(),
 
             dep_tracker: if via_cargo_args.is_some() { Some(dep_tracker) } else { None },
@@ -595,6 +605,7 @@ impl Verifier {
 
             func_details: HashMap::new(),
             func_provenance: HashMap::new(),
+            func_nl_frontier: HashMap::new(),
             deferred_errors: Vec::new(),
 
             via_cargo_args: self.via_cargo_args.clone(),
@@ -631,6 +642,9 @@ impl Verifier {
         self.func_details.absorb_with(other.func_details, |lhs, rhs| lhs.absorb(rhs));
         for (fun, queries) in other.func_provenance {
             self.func_provenance.entry(fun).or_default().extend(queries);
+        }
+        for (fun, queries) in other.func_nl_frontier {
+            self.func_nl_frontier.entry(fun).or_default().extend(queries);
         }
         self.deferred_errors.extend(other.deferred_errors);
     }
@@ -908,21 +922,34 @@ impl Verifier {
         let mut timed_out = false;
         let mut used_axioms = None;
         let mut provenance_round = 0usize;
+        let mut nl_frontier_round = 0usize;
         loop {
+            let result_str = || match &result {
+                ValidityResult::Valid(_) => "valid".to_string(),
+                ValidityResult::Invalid(..) => "invalid".to_string(),
+                ValidityResult::Canceled => "canceled".to_string(),
+                ValidityResult::TypeError(e) => format!("type error: {}", e),
+                ValidityResult::UnexpectedOutput(s) => format!("unexpected output: {}", s),
+            };
+            if let Some(frontier) = air_context.take_nl_frontier() {
+                self.func_nl_frontier.entry(context.fun.clone()).or_default().push(
+                    QueryNlFrontier {
+                        desc: context.desc.clone(),
+                        span: context.span.as_string.clone(),
+                        round: nl_frontier_round,
+                        result: result_str(),
+                        frontier,
+                    },
+                );
+                nl_frontier_round += 1;
+            }
             if let Some(info) = air_context.take_provenance() {
-                let result_str = match &result {
-                    ValidityResult::Valid(_) => "valid".to_string(),
-                    ValidityResult::Invalid(..) => "invalid".to_string(),
-                    ValidityResult::Canceled => "canceled".to_string(),
-                    ValidityResult::TypeError(e) => format!("type error: {}", e),
-                    ValidityResult::UnexpectedOutput(s) => format!("unexpected output: {}", s),
-                };
                 self.func_provenance.entry(context.fun.clone()).or_default().push(
                     QueryProvenance {
                         desc: context.desc.clone(),
                         span: context.span.as_string.clone(),
                         round: provenance_round,
-                        result: result_str,
+                        result: result_str(),
                         sources: info.sources,
                         instantiations: info.instantiations,
                         variable_versions: info.variable_versions,
@@ -1233,6 +1260,22 @@ impl Verifier {
         }
     }
 
+    /// Join each query's nonlinear frontier to source, per function.
+    fn resolve_nl_frontier(&mut self, global_ctx: &vir::context::GlobalCtx) {
+        if self.func_nl_frontier.is_empty() {
+            return;
+        }
+        let symbols = crate::provenance::Symbols::capture(
+            global_ctx,
+            global_ctx.air_source_names.borrow().clone(),
+        );
+        for (fun, queries) in std::mem::take(&mut self.func_nl_frontier) {
+            let resolved =
+                queries.into_iter().map(|query| symbols.resolve_nl_frontier(&fun, query));
+            self.func_details.entry(fun.clone()).or_default().nl_frontier.extend(resolved);
+        }
+    }
+
     fn set_rlimit(solver: SmtSolver, air_context: &mut air::context::Context, rlimit: f32) {
         let per_second = match solver {
             SmtSolver::Z3 => RLIMIT_PER_SECOND,
@@ -1279,6 +1322,9 @@ impl Verifier {
         }
         if self.args.provenance {
             air_context.set_provenance(true);
+        }
+        if self.args.nl_frontier {
+            air_context.set_nl_frontier(true);
         }
         if self.instantiation_replay() {
             air_context.set_instantiation_replay(true);
@@ -2746,6 +2792,10 @@ impl Verifier {
                 )
                 .expect("error writing to provenance log file");
             }
+        }
+        // Join the nonlinear frontiers cvc5 reported back to source
+        if self.args.nl_frontier {
+            self.resolve_nl_frontier(&global_ctx);
         }
         // Log the provenance joins: qid -> (function, owning tag, span), hyp -> (kind, span)
         if self.args.log_all {

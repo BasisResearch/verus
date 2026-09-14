@@ -127,6 +127,8 @@ pub struct ArgsX {
     pub no_bv_simplify: bool,
     pub no_assert_ids: bool,
     pub provenance: bool,
+    /// Record cvc5's nonlinear frontier after every query.
+    pub nl_frontier: bool,
     pub reach: Option<String>,
     /// Serve retained AIR queries over stdin/stdout after compilation.
     pub resident: bool,
@@ -179,6 +181,7 @@ impl ArgsX {
             no_bv_simplify: Default::default(),
             no_assert_ids: Default::default(),
             provenance: Default::default(),
+            nl_frontier: Default::default(),
             reach: Default::default(),
             resident: false,
         }
@@ -430,7 +433,12 @@ pub fn parse_args_with_imports(
     const EXTENDED_NO_BV_SIMPLIFY: &str = "no-bv-simplify";
     const EXTENDED_NO_ASSERT_IDS: &str = "no-assert-ids";
     const EXTENDED_PROVENANCE: &str = "provenance";
+    const EXTENDED_NL_FRONTIER: &str = "nl-frontier";
     const EXTENDED_KEYS: &[(&str, &str)] = &[
+        (
+            EXTENDED_NL_FRONTIER,
+            "Record, per query, the nonlinear terms cvc5 could not reconcile with its linear model, with their values, asserted bounds and where they entered the problem (read-only: the search is the ordinary one)",
+        ),
         (EXTENDED_IGNORE_UNEXPECTED_SMT, "Ignore unexpected SMT output"),
         (EXTENDED_DEBUG, "Enable debugging of proof failures"),
         (
@@ -884,8 +892,19 @@ pub fn parse_args_with_imports(
         no_bv_simplify: extended.contains_key(EXTENDED_NO_BV_SIMPLIFY),
         no_assert_ids: extended.contains_key(EXTENDED_NO_ASSERT_IDS),
         provenance: extended.contains_key(EXTENDED_PROVENANCE),
+        nl_frontier: extended.contains_key(EXTENDED_NL_FRONTIER),
         resident: matches.opt_present(OPT_RESIDENT),
     };
+
+    if args.nl_frontier && !matches!(args.solver, SmtSolver::Cvc5) {
+        error(
+            "-V nl-frontier requires cvc5 (it is unavailable for vstd and internal test mode)"
+                .to_string(),
+        );
+    }
+    if args.nl_frontier && args.resident {
+        error("-V nl-frontier is not available in resident mode".to_string());
+    }
 
     if args.provenance && !matches!(args.solver, SmtSolver::Cvc5) {
         error(

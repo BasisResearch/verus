@@ -245,6 +245,43 @@ pub fn render_term(names: &SourceNames, term: &str) -> String {
     }
 }
 
+/// A term the solver built with its own arithmetic (`*`, `+`, `-`, `div`,
+/// `mod`, `/`), such as a nonlinear monomial, in source spelling: the
+/// arithmetic infix, `div` and `mod` as the `/` and `%` Verus writes for
+/// integers, everything else rendered as `render_term` does.
+pub fn render_smt_arith(names: &SourceNames, term: &str) -> String {
+    fn go(names: &SourceNames, node: &Node, nested: bool) -> String {
+        if let Node::List(items) = node {
+            if let [Node::Atom(head), args @ ..] = &items[..] {
+                let op = match head.as_str() {
+                    "*" => Some(" * "),
+                    "+" => Some(" + "),
+                    "-" => Some(" - "),
+                    "div" | "/" => Some(" / "),
+                    "mod" => Some(" % "),
+                    _ => None,
+                };
+                if let Some(op) = op {
+                    if args.len() >= 2 {
+                        let s = args.iter().map(|a| go(names, a, true)).collect::<Vec<_>>();
+                        let s = s.join(op);
+                        return if nested { format!("({s})") } else { s };
+                    }
+                    if head == "-" && args.len() == 1 {
+                        return format!("-{}", go(names, &args[0], true));
+                    }
+                }
+            }
+        }
+        render_node(names, node)
+    }
+    let mut parser = sise::Parser::new(term);
+    match sise::parse_tree(&mut parser) {
+        Ok(node) => go(names, &node, false),
+        Err(_) => term.to_string(),
+    }
+}
+
 /// One instantiation vector (`(t1 t2)`) as a comma-separated source list.
 pub fn render_vector(names: &SourceNames, vector: &str) -> String {
     let mut parser = sise::Parser::new(vector);
@@ -419,6 +456,25 @@ mod tests {
         ] {
             assert_eq!(render_term(&names, term), expected);
         }
+    }
+
+    /// A nonlinear monomial comes back in the solver's own arithmetic (`*`,
+    /// `div`, `mod`), n-ary, around encoded operands.
+    #[test]
+    fn solver_arithmetic_reads_as_source() {
+        let ctx = NameCtxt::new();
+        let x = ctx.var_ident(&VarIdent(Arc::new("x".into()), VarIdentDisambiguate::VirParam));
+        let names = ctx.source_names();
+        assert_eq!(render_smt_arith(&names, &format!("(* {x} {x} y)")), "x * x * y");
+        assert_eq!(
+            render_smt_arith(&names, &format!("(* (div n {x}) (- y 1))")),
+            "(n / x) * (y - 1)"
+        );
+        assert_eq!(render_smt_arith(&names, "(mod a b)"), "a % b");
+        assert_eq!(render_smt_arith(&names, "(- a)"), "-a");
+        assert_eq!(render_smt_arith(&names, &format!("(* (%I (I {x})) y)")), "x * y");
+        // a term that does not parse comes back as it was
+        assert_eq!(render_smt_arith(&names, "(* a"), "(* a");
     }
 
     /// `let` is SMT-LIB wire syntax, so it is rendered from its shape rather
