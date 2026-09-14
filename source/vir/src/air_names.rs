@@ -236,6 +236,15 @@ fn render_node(names: &SourceNames, node: &Node) -> String {
                     _ => {}
                 }
             }
+            // SMT-LIB's own operators, which no encoder records because the
+            // solver writes them, as in a term cvc5 rewrote and reported.
+            if let Some(Node::Atom(head)) = items.first() {
+                if !names.contains_key(head) {
+                    if let Some(text) = render_builtin(names, head, &items[1..]) {
+                        return text;
+                    }
+                }
+            }
             let parts: Vec<String> = items.iter().map(|i| render_node(names, i)).collect();
             match parts.split_first() {
                 // an application prints as the source would write it
@@ -247,6 +256,60 @@ fn render_node(names: &SourceNames, node: &Node) -> String {
             }
         }
     }
+}
+
+/// SMT-LIB operators a solver writes in the terms it reports.
+const SMT_BUILTIN_HEADS: &[&str] = &[
+    "=", "distinct", "not", "and", "or", "=>", "ite", "+", "-", "*", "div", "mod", "<", "<=", ">",
+    ">=",
+];
+
+/// An application of an SMT-LIB operator in source spelling: `(= a b)` reads
+/// `(a == b)` and `(ite c a b)` reads `(if c { a } else { b })`. `None` for
+/// anything else, or an operator applied to an unexpected number of arguments.
+fn render_builtin(names: &SourceNames, head: &str, args: &[Node]) -> Option<String> {
+    let args: Vec<String> = args.iter().map(|arg| render_node(names, arg)).collect();
+    let infix = |op: &str| format!("({})", args.join(&format!(" {op} ")));
+    match (head, args.len()) {
+        ("not", 1) => Some(format!("!{}", args[0])),
+        ("-", 1) => Some(format!("-{}", args[0])),
+        ("ite", 3) => Some(format!("(if {} {{ {} }} else {{ {} }})", args[0], args[1], args[2])),
+        ("=", 2) => Some(infix("==")),
+        ("distinct", 2) => Some(infix("!=")),
+        ("=>", 2) => Some(infix("==>")),
+        ("div", 2) => Some(infix("/")),
+        ("mod", 2) => Some(infix("%")),
+        ("<" | "<=" | ">" | ">=", 2) => Some(infix(head)),
+        ("+" | "-" | "*", n) if n >= 2 => Some(infix(head)),
+        ("and", n) if n >= 2 => Some(infix("&&")),
+        ("or", n) if n >= 2 => Some(infix("||")),
+        _ => None,
+    }
+}
+
+/// Whether `render_term` writes every symbol of `term` as the source spells
+/// it: each is a recorded name, a box, a numeral, `true` or `false`, an
+/// SMT-LIB operator, or a `let` binder. Otherwise the rendering keeps some
+/// symbol as the solver spells it, and is no source to paste.
+pub fn renders_as_source(names: &SourceNames, term: &str) -> bool {
+    fn reads(names: &SourceNames, node: &Node) -> bool {
+        match node {
+            Node::Atom(atom) => {
+                atom == "true"
+                    || atom == "false"
+                    || (!atom.is_empty() && atom.chars().all(|c| c.is_ascii_digit() || c == '.'))
+                    || SMT_BUILTIN_HEADS.contains(&atom.as_str())
+                    || atom == "let"
+                    || atom.starts_with("_let_")
+                    || is_box_head(atom)
+                    || names.contains_key(atom)
+                    || source_symbol(names, atom).is_some()
+            }
+            Node::List(items) => items.iter().all(|item| reads(names, item)),
+        }
+    }
+    let mut parser = sise::Parser::new(term);
+    matches!(sise::parse_tree(&mut parser), Ok(node) if reads(names, &node))
 }
 
 /// One SMT term, rendered in source spelling: boxes dropped, mangled
@@ -294,6 +357,24 @@ mod tests {
     /// encoder recorded it as one when it emitted it; there is no table here
     /// restating that. `sst_to_air::record_op` does the recording in the
     /// pipeline, from `sst_util::binary_op_str`.
+    /// A solver reports terms it rewrote in SMT-LIB's own operators, which no
+    /// encoder records, so they have a spelling of their own.
+    #[test]
+    fn solver_operators_read_as_source() {
+        let mut names = SourceNames::new();
+        for x in ["x", "y"] {
+            names.insert(x.to_string(), SourceName::Symbol(x.to_string()));
+        }
+        assert_eq!(render_term(&names, "(= (+ x 1) (* 2 y))"), "((x + 1) == (2 * y))");
+        assert_eq!(render_term(&names, "(ite (< x 0) (- x) x)"), "(if (x < 0) { -x } else { x })");
+        assert_eq!(render_term(&names, "(not (= x (- 5)))"), "!(x == -5)");
+        assert_eq!(render_term(&names, "(mod (div x 2) 8)"), "((x / 2) % 8)");
+        assert!(renders_as_source(&names, "(+ x (mod y 8))"));
+        assert!(renders_as_source(&names, "(let ((_let_1 (+ x 1))) (* _let_1 _let_1))"));
+        assert!(!renders_as_source(&names, "(+ x tmp%1)"));
+        assert!(!renders_as_source(&names, "(unrecorded x)"));
+    }
+
     #[test]
     fn arithmetic_preserves_grouping_through_boxes() {
         let mut names = SourceNames::new();
@@ -363,7 +444,7 @@ mod tests {
             // Do not discard range arguments or guess a target for unrecorded forms.
             ("(uClip 32 value)", "uClip(32, value)"),
             ("(uClip value)", "uClip(value)"),
-            ("(uClip (+ 8 8) value)", "uClip(+(8, 8), value)"),
+            ("(uClip (+ 8 8) value)", "uClip((8 + 8), value)"),
         ] {
             assert_eq!(render_term(&ctx.source_names(), term), expected);
         }
