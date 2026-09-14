@@ -234,11 +234,13 @@ pub struct Graph {
     /// Used by ghost code: reached from a running function through a
     /// contract or proof, then through anything
     pub used: HashSet<String>,
-    /// Connected to a root through edges in either direction: the
-    /// reachable functions, plus whatever mentions them or is mentioned by
-    /// them, transitively. Reachable is a subset. The rest of it is where
-    /// explicit roots hide: theorems about reachable functions that nothing
-    /// calls.
+    /// The reachable and used functions, plus whatever mentions them or is
+    /// mentioned by them, transitively, through edges between functions in
+    /// either direction. Edges to types and to other crates' items are not
+    /// walked: everything constructs an `Option` or holds an `Expression`,
+    /// and walking those backwards would join the whole crate. The rest of
+    /// this set is where explicit roots hide: theorems about reachable
+    /// functions that nothing calls.
     pub connected: HashSet<String>,
     /// Ids some function refers to
     referred: HashSet<String>,
@@ -305,18 +307,26 @@ impl Graph {
             }
         }
 
-        // The same search ignoring direction and context
+        // From everything reached, ignore direction and context, but only
+        // between functions of the analyzed crates
         let mut adjacent: HashMap<&str, Vec<&str>> = HashMap::new();
         let mut referred = HashSet::new();
         for edge in reports.iter().flat_map(|r| r.edges.iter()) {
-            adjacent.entry(&edge.from).or_default().push(&edge.to);
-            adjacent.entry(&edge.to).or_default().push(&edge.from);
             if nodes.contains_key(&edge.from) {
                 referred.insert(edge.to.clone());
+                if nodes.contains_key(&edge.to) {
+                    adjacent.entry(&edge.from).or_default().push(&edge.to);
+                    adjacent.entry(&edge.to).or_default().push(&edge.from);
+                }
             }
         }
-        let mut connected: HashSet<String> = root_ids.iter().cloned().collect();
-        let mut queue: VecDeque<&str> = root_ids.iter().map(String::as_str).collect();
+        let covered: Vec<&String> = nodes
+            .values()
+            .filter(|n| reachable.contains(&n.id) || (n.is_ghost() && used.contains(&n.id)))
+            .map(|n| &n.id)
+            .collect();
+        let mut connected: HashSet<String> = covered.iter().map(|id| (*id).clone()).collect();
+        let mut queue: VecDeque<&str> = covered.iter().map(|id| id.as_str()).collect();
         while let Some(id) = queue.pop_front() {
             for next in adjacent.get(id).map_or(&[][..], |v| v) {
                 if connected.insert(next.to_string()) {
@@ -327,8 +337,8 @@ impl Graph {
         Ok(Graph { nodes, roots: root_ids, reachable, used, connected, referred })
     }
 
-    /// Verified functions connected to a root but not reachable: what the
-    /// roots miss, one step of direction away.
+    /// Verified functions connected to reached code but not reachable: what
+    /// the roots miss, one step of direction away.
     pub fn connected_unreachable(&self) -> Vec<&Node> {
         self.nodes
             .values()
@@ -337,8 +347,8 @@ impl Graph {
     }
 
     /// Candidates for `#[verifier::reach_root]`: ghost functions connected
-    /// to a root that nothing refers to, so they are top-level statements,
-    /// and that mention something reachable.
+    /// to reached code that nothing refers to, so they are top-level
+    /// statements about it.
     pub fn suggested_roots(&self) -> Vec<&Node> {
         self.connected_unreachable()
             .into_iter()

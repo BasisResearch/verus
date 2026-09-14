@@ -1,8 +1,8 @@
 //! Renders the reports written by `verus --reach DIR`.
 //!
 //!   verus-reach DIR...            text summary
-//!   verus-reach --connected DIR... verified functions connected to a root
-//!                                 but not reachable, with the top-level
+//!   verus-reach --connected DIR... verified functions connected to reached
+//!                                 code but not reachable, with the top-level
 //!                                 ones flagged as candidates for
 //!                                 #[verifier::reach_root]
 //!   verus-reach --lcov DIR...     LCOV, for grcov, genhtml, Codecov, IDE gutters
@@ -50,11 +50,11 @@ struct Args {
     /// Write an LCOV trace file to stdout instead of the summary
     #[arg(long, conflicts_with = "html")]
     lcov: bool,
-    /// List the verified functions connected to a root through edges in
-    /// either direction but not reachable, instead of the summary. Ghost
-    /// functions among them that nothing refers to are flagged as
-    /// candidates for `#[verifier::reach_root]`: theorems about reachable
-    /// code that nothing calls
+    /// List the verified functions connected to reached code through
+    /// function-to-function edges in either direction but not reachable,
+    /// instead of the summary. Ghost functions among them that nothing
+    /// refers to are flagged as candidates for `#[verifier::reach_root]`:
+    /// theorems about reachable code that nothing calls
     #[arg(long, conflicts_with_all = ["html", "lcov"])]
     connected: bool,
     /// Write an HTML report into this directory (index.html and a page per
@@ -200,7 +200,7 @@ fn connected(graph: &Graph) -> String {
         graph.nodes.values().filter(|n| n.is_verified() && graph.connected.contains(&n.id)).count();
     writeln!(
         out,
-        "verified functions: {total}   reachable: {reached}   connected to a root: {connected}"
+        "verified functions: {total}   reachable: {reached}   connected to reached code: {connected}"
     )
     .unwrap();
     let mut rest = graph.connected_unreachable();
