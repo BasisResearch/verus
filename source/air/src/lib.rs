@@ -1,5 +1,6 @@
 pub mod ast;
 pub mod ast_util;
+pub mod bisect;
 pub mod context;
 pub mod emitter;
 pub mod focus;

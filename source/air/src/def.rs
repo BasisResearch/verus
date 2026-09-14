@@ -12,6 +12,13 @@ pub const CHOOSE: &str = "%%choose%%";
 pub const HOLE: &str = "%%hole%%";
 pub const APPLY: &str = "%%apply%%";
 pub const TEMP: &str = "%%x%%";
+/// A bisect probe's guard for one hypothesis: the hypothesis is asserted as
+/// `(=> guard h)`, and each probe assumes the guard or its negation.
+pub const BISECT_GUARD: &str = "%%bisect_guard%%";
+/// A bisect probe's switch for the fact an assertion leaves behind: the fact
+/// is assumed as `(or switch fact)`, and each probe assumes the switch false
+/// unless it removes the fact.
+pub const BISECT_DROP: &str = "%%bisect_drop%%";
 pub const SKOLEM_ID_PREFIX: &str = "skolem";
 pub const ARRAY_QID: &str = "__AIR_ARRAY_QID__";
 

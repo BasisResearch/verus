@@ -731,6 +731,14 @@ impl Symbols {
         }
     }
 
+    /// The source of `hyp_k` of `fun`: the kind of hypothesis (`requires`,
+    /// `type_invariant`, `fuel`, `trait_bound`) and its span. A bisect names
+    /// the hypotheses it removes by this.
+    pub(crate) fn hypothesis(&self, fun: &Fun, k: u64) -> Option<(&str, &str)> {
+        let hypothesis = self.hypotheses.get(fun)?.get(usize::try_from(k).ok()?)?;
+        Some((&hypothesis.kind, &hypothesis.span))
+    }
+
     /// The source names for one query's solver terms: each SSA symbol in
     /// `versions` is named as its variable, followed by its assignment version
     /// when `annotate`. SSA versions are query-local, so a display keeps
