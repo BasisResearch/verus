@@ -244,6 +244,11 @@ pub struct Graph {
     pub connected: HashSet<String>,
     /// Ids some function refers to
     referred: HashSet<String>,
+    /// Ghost functions whose contract is stated in the vocabulary of the
+    /// reachable code: it mentions a reachable verified exec function, a
+    /// spec the contract of one is stated in, or a spec those are defined
+    /// by. Sharing a helper lemma or a utility spec does not count.
+    states_reached: HashSet<String>,
 }
 
 impl Graph {
@@ -334,7 +339,36 @@ impl Graph {
                 }
             }
         }
-        Ok(Graph { nodes, roots: root_ids, reachable, used, connected, referred })
+
+        // The vocabulary the reachable code's contracts are stated in
+        let mut vocabulary: HashSet<String> = nodes
+            .values()
+            .filter(|n| n.is_verified_exec() && reachable.contains(&n.id))
+            .map(|n| n.id.clone())
+            .collect();
+        let mut queue: VecDeque<String> = vocabulary.iter().cloned().collect();
+        while let Some(id) = queue.pop_front() {
+            let from_exec = nodes.get(&id).map_or(false, |n| !n.is_ghost());
+            for edge in out.get(id.as_str()).map_or(&[][..], |v| v) {
+                let spec = nodes.get(&edge.to).map_or(false, |n| n.mode == "spec");
+                if spec && (!from_exec || edge.kind == EdgeKind::Contract) {
+                    if vocabulary.insert(edge.to.clone()) {
+                        queue.push_back(edge.to.clone());
+                    }
+                }
+            }
+        }
+        let states_reached: HashSet<String> = nodes
+            .values()
+            .filter(|n| n.is_ghost())
+            .filter(|n| {
+                out.get(n.id.as_str()).map_or(false, |edges| {
+                    edges.iter().any(|e| e.kind == EdgeKind::Contract && vocabulary.contains(&e.to))
+                })
+            })
+            .map(|n| n.id.clone())
+            .collect();
+        Ok(Graph { nodes, roots: root_ids, reachable, used, connected, referred, states_reached })
     }
 
     /// Verified functions connected to reached code but not reachable: what
@@ -346,13 +380,20 @@ impl Graph {
             .collect()
     }
 
-    /// Candidates for `#[verifier::reach_root]`: ghost functions connected
-    /// to reached code that nothing refers to, so they are top-level
-    /// statements about it.
+    /// Candidates for `#[verifier::reach_root]`: ghost functions that
+    /// nothing refers to, so they are top-level statements, whose contract
+    /// is stated about reachable code (see `states_reached`). Being merely
+    /// connected is not enough: a theorem about a dead printer shares helper
+    /// lemmas and utility specs with the parser without saying anything
+    /// about it.
     pub fn suggested_roots(&self) -> Vec<&Node> {
         self.connected_unreachable()
             .into_iter()
-            .filter(|n| n.is_ghost() && !self.referred.contains(&n.id))
+            .filter(|n| {
+                n.is_ghost()
+                    && !self.referred.contains(&n.id)
+                    && self.states_reached.contains(&n.id)
+            })
             .collect()
     }
 

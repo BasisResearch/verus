@@ -53,8 +53,9 @@ struct Args {
     /// List the verified functions connected to reached code through
     /// function-to-function edges in either direction but not reachable,
     /// instead of the summary. Ghost functions among them that nothing
-    /// refers to are flagged as candidates for `#[verifier::reach_root]`:
-    /// theorems about reachable code that nothing calls
+    /// refers to and whose contract is stated about reachable code are
+    /// flagged as candidates for `#[verifier::reach_root]`: theorems about
+    /// reachable code that nothing calls
     #[arg(long, conflicts_with_all = ["html", "lcov"])]
     connected: bool,
     /// Write an HTML report into this directory (index.html and a page per
@@ -208,7 +209,7 @@ fn connected(graph: &Graph) -> String {
     let suggested: HashSet<&str> = graph.suggested_roots().iter().map(|n| n.id.as_str()).collect();
     writeln!(
         out,
-        "\nconnected but unreachable ({}; * = candidate root, referred to by nothing):",
+        "\nconnected but unreachable ({}; * = candidate root: referred to by nothing, contract stated about reachable code):",
         rest.len()
     )
     .unwrap();
