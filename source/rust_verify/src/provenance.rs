@@ -88,9 +88,48 @@ pub struct ResolvedQueryProvenance {
     pub unparsed: Vec<String>,
 }
 
-struct Hypothesis {
-    kind: String,
-    span: String,
+pub(crate) struct Hypothesis {
+    /// requires, type_invariant, fuel or trait_bound
+    pub(crate) kind: String,
+    pub(crate) span: String,
+}
+
+/// Every function's hypotheses: `hyp_k` of a function is its entry `k`.
+pub(crate) struct Hypotheses(HashMap<Fun, Vec<Hypothesis>>);
+
+impl Hypotheses {
+    pub(crate) fn capture(global: &vir::context::GlobalCtx) -> Self {
+        Self(
+            global
+                .hyp_map
+                .borrow()
+                .iter()
+                .map(|(fun, hypotheses)| {
+                    (
+                        fun.clone(),
+                        hypotheses
+                            .iter()
+                            .map(|info| Hypothesis {
+                                kind: match info.kind {
+                                    vir::sst::HypKind::Requires => "requires",
+                                    vir::sst::HypKind::TypeInvariant => "type_invariant",
+                                    vir::sst::HypKind::Fuel => "fuel",
+                                    vir::sst::HypKind::TraitBound => "trait_bound",
+                                }
+                                .to_owned(),
+                                span: info.span.as_string.clone(),
+                            })
+                            .collect(),
+                    )
+                })
+                .collect(),
+        )
+    }
+
+    /// `hyp_k` of `fun`.
+    pub(crate) fn get(&self, fun: &Fun, k: u64) -> Option<&Hypothesis> {
+        self.0.get(fun).and_then(|hypotheses| hypotheses.get(usize::try_from(k).ok()?))
+    }
 }
 struct Quantifier {
     fun: String,
@@ -101,7 +140,7 @@ struct Quantifier {
 
 /// No compiler context, source map, or VIR expression is retained here.
 pub(crate) struct Symbols {
-    hypotheses: HashMap<Fun, Vec<Hypothesis>>,
+    hypotheses: Hypotheses,
     quantifiers: HashMap<String, Quantifier>,
     axiom_owners: HashMap<String, String>,
     source_names: vir::air_names::SourceNames,
@@ -112,29 +151,7 @@ impl Symbols {
         global: &vir::context::GlobalCtx,
         source_names: vir::air_names::SourceNames,
     ) -> Self {
-        let hypotheses = global
-            .hyp_map
-            .borrow()
-            .iter()
-            .map(|(fun, hypotheses)| {
-                (
-                    fun.clone(),
-                    hypotheses
-                        .iter()
-                        .map(|info| Hypothesis {
-                            kind: match info.kind {
-                                vir::sst::HypKind::Requires => "requires",
-                                vir::sst::HypKind::TypeInvariant => "type_invariant",
-                                vir::sst::HypKind::Fuel => "fuel",
-                                vir::sst::HypKind::TraitBound => "trait_bound",
-                            }
-                            .to_owned(),
-                            span: info.span.as_string.clone(),
-                        })
-                        .collect(),
-                )
-            })
-            .collect();
+        let hypotheses = Hypotheses::capture(global);
         let quantifiers = global
             .qid_map
             .borrow()
@@ -176,7 +193,7 @@ impl Symbols {
             };
             match air::def::ProvenanceTag::from_symbol(symbol) {
                 Some(air::def::ProvenanceTag::Hyp(air::def::HypId(k))) => {
-                    match hyp_map.get(fun).and_then(|hs| hs.get(k as usize)) {
+                    match hyp_map.get(fun, k) {
                         Some(info) => {
                             r.kind = info.kind.clone();
                             r.owner = Some(fun_as_friendly_rust_name(fun));

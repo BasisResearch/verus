@@ -213,6 +213,18 @@ impl Emitter {
         }
     }
 
+    /// `(check-sat-assuming (l ...))`, each literal a boolean constant or its
+    /// negation.
+    pub fn log_check_sat_assuming(&mut self, literals: &[Expr]) {
+        if !self.is_none() {
+            let literals = literals.iter().map(|l| self.printer.expr_to_node(l)).collect();
+            self.log_node(&Node::List(vec![
+                Node::Atom("check-sat-assuming".to_string()),
+                Node::List(literals),
+            ]));
+        }
+    }
+
     pub fn log_word(&mut self, s: &str) {
         if !self.is_none() {
             self.log_node(&Node::List(vec![Node::Atom(s.to_string())]));

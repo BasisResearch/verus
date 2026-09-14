@@ -2070,6 +2070,7 @@ impl Verifier {
                 self.args.provenance.then(|| {
                     crate::provenance::Symbols::capture(&ctx.global, ctx.name_ctxt.source_names())
                 }),
+                crate::provenance::Hypotheses::capture(&ctx.global),
             ));
         }
 

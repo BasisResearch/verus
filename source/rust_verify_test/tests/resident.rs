@@ -319,6 +319,162 @@ fn resident_rechecks_preserve_query_scopes_and_solver_process() {
     eprintln!("one verifier process, one cvc5 launch, {checks} checks, balanced scopes");
 }
 
+const BISECT_SOURCE: &str = r#"
+use vstd::prelude::*;
+verus! {
+    uninterp spec fn f(i: int) -> int;
+    uninterp spec fn g(i: int) -> int;
+    uninterp spec fn a(i: int) -> int;
+
+    // a(0) in the goal seeds the trigger, and each instance adds a(i + 1)
+    proof fn looping()
+        requires
+            forall|i: int| #[trigger] a(i) < a(i + 1),
+        ensures
+            a(0) > 100,
+    {
+    }
+
+    proof fn needs_one(x: int, y: int)
+        requires
+            y > 100,
+            x > 3,
+    {
+        assert(x > 2);
+    }
+
+    proof fn fails_one(x: int)
+        requires
+            x > 3,
+    {
+        assert(x > 2);
+        assert(x > 5);
+        assert(x > 1);
+    }
+
+    proof fn unprovable(x: int)
+        requires
+            x > 0,
+            forall|i: int| #[trigger] f(i) < f(i + 1),
+    {
+        assert(g(x) == 0);
+    }
+}
+"#;
+
+/// `fixture.rs:<line>:`, the start of a span on the first line holding `needle`.
+fn span_of(needle: &str) -> String {
+    let line = BISECT_SOURCE.lines().position(|l| l.contains(needle)).unwrap() + 1;
+    format!("fixture.rs:{line}:")
+}
+
+/// Bisect finds the failing goal, the one `requires` a proof needs, and the
+/// quantifier behind a matching loop, and leaves the retained solver as it
+/// was: ordinary rechecks answer as before and every probe scope is popped.
+#[test]
+fn resident_bisect_localises_and_leaves_the_session_unchanged() {
+    let mut worker = Worker::start(BISECT_SOURCE, &["--rlimit", "2"]);
+    let ready = worker.receive();
+    let session = ready["session"].clone();
+    let request = |name: &str, extra: Value| {
+        let mut request = json!({
+            "command": "bisect", "session": session, "bucket": 0, "query": query_id(&ready, name),
+        });
+        request.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        request
+    };
+    let only = |reply: &Value| -> Value {
+        let set = reply["minimal_statement_ids"].as_array().unwrap();
+        assert_eq!(set.len(), 1, "{reply}");
+        set[0].clone()
+    };
+
+    // Assuming the one failing assertion makes the rest provable.
+    let reply = worker.send(request("::fails_one", json!({"mode": "flip"})));
+    assert_eq!(reply["event"], "bisected", "{reply}");
+    assert_eq!(reply["status"], "found");
+    assert_eq!(reply["target"], "valid");
+    // cvc5 answers a failing goal `unknown (incomplete)` rather than `sat`
+    // whenever quantified axioms are in scope; Verus reports both as invalid.
+    assert_ne!(reply["verdict_before"]["result"], "valid", "{reply}");
+    assert_eq!(reply["verdict_after_removal"]["result"], "valid");
+    assert_eq!(reply["minimal"], true);
+    let goal = only(&reply);
+    assert_eq!(goal["kind"], "goal");
+    assert!(goal["assert_id"].is_array(), "{goal}");
+    assert!(goal["span"].as_str().unwrap().contains(&span_of("assert(x > 5)")), "{goal}");
+    assert!(reply["checks_used"].as_u64().unwrap() <= reply["budget_checks"].as_u64().unwrap());
+
+    // The proof of `needs_one` cannot lose `x > 3`, and needs nothing else.
+    for mode in ["flip", "core"] {
+        let reply = worker.send(request("::needs_one", json!({"mode": mode})));
+        assert_eq!(reply["status"], "found", "{reply}");
+        assert_eq!(reply["verdict_before"]["result"], "valid");
+        assert_eq!(reply["minimal"], true);
+        let requires = only(&reply);
+        assert_eq!(requires["kind"], "hypothesis");
+        assert_eq!(requires["description"], "requires");
+        assert!(requires["span"].as_str().unwrap().contains(&span_of("x > 3,")), "{requires}");
+        let valid_after = reply["verdict_after_removal"]["result"] == "valid";
+        assert_eq!(valid_after, mode == "core", "{reply}");
+    }
+
+    // Only the goal decides `unprovable`: its hypotheses, removed, change
+    // nothing, so a search restricted to them finds no set.
+    let reply = worker.send(request("::unprovable", json!({"mode": "flip", "target": "changed"})));
+    assert_eq!(reply["status"], "found", "{reply}");
+    assert_ne!(reply["verdict_before"]["result"], "valid");
+    let goal = only(&reply);
+    assert_eq!(goal["kind"], "goal");
+    assert!(goal["span"].as_str().unwrap().contains(&span_of("assert(g(x) == 0)")), "{goal}");
+    let reply = worker.send(request(
+        "::unprovable",
+        json!({"mode": "flip", "target": "changed", "kinds": ["hypothesis"]}),
+    ));
+    assert_eq!(reply["status"], "unreachable", "{reply}");
+    assert_eq!(reply["minimal_statement_ids"], json!([]));
+
+    // A matching loop runs the solver out of budget; the one hypothesis whose
+    // removal stops that is the self-triggering quantifier.
+    let reply = worker.send(request(
+        "::looping",
+        json!({"mode": "flip", "target": "changed", "kinds": ["hypothesis"]}),
+    ));
+    assert_eq!(reply["status"], "found", "{reply}");
+    assert_eq!(reply["verdict_before"]["reason"], "resourceout");
+    assert_ne!(reply["verdict_after_removal"]["reason"], "resourceout");
+    let quantifier = only(&reply);
+    assert_eq!(quantifier["kind"], "hypothesis");
+    assert_eq!(quantifier["description"], "requires");
+    assert!(quantifier["span"].as_str().unwrap().contains(&span_of("a(i) < a(i + 1)")));
+
+    // Bad requests are refused without ending the session.
+    let refused = worker.send(request("::needs_one", json!({"mode": "core", "target": "valid"})));
+    assert_eq!(refused["event"], "error", "{refused}");
+    let refused = worker.send(request("::needs_one", json!({"mode": "flip", "budget_checks": 0})));
+    assert_eq!(refused["event"], "error", "{refused}");
+
+    // A short budget still returns a verified set, marked not minimal.
+    let reply = worker.send(request("::fails_one", json!({"mode": "flip", "budget_checks": 2})));
+    assert_eq!(reply["checks_used"], 2, "{reply}");
+    assert_eq!(reply["minimal"], false);
+
+    for (name, expected) in [("::fails_one", "invalid"), ("::needs_one", "valid")] {
+        let query = query_id(&ready, name);
+        let result = worker
+            .send(json!({"command": "check", "session": session, "bucket": 0, "query": query}));
+        assert_eq!(result["result"], expected, "{result}");
+    }
+    assert_eq!(worker.send(json!({"command": "close", "session": session}))["event"], "closed");
+    worker.finish(false);
+    let mut probes = 0;
+    for log in smt_logs(worker.dir.path()) {
+        assert_eq!(log.matches("(push").count(), log.matches("(pop").count());
+        probes += log.matches("(check-sat-assuming").count();
+    }
+    assert!(probes >= 10, "{probes}");
+}
+
 /// With instantiation replay, every resident check that proves its query
 /// saves its instantiations, and a recheck of a query with saved ones first
 /// tries them alone (`:only`), falling back to the ordinary check unless that

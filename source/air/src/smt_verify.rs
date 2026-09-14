@@ -10,7 +10,7 @@ pub use crate::model::{Model, ModelDef};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-fn label_asserts<'ctx>(
+pub(crate) fn label_asserts<'ctx>(
     context: &mut Context,
     infos: &mut Vec<AssertionInfo>,
     axiom_infos: &mut Vec<AxiomInfo>,
@@ -94,7 +94,7 @@ fn label_asserts<'ctx>(
 
 /// In SMT-LIB, functions applied to zero arguments are considered constants.
 /// REVIEW: maybe AIR should follow this design for consistency.
-fn elim_zero_args_expr(expr: &Expr) -> Expr {
+pub(crate) fn elim_zero_args_expr(expr: &Expr) -> Expr {
     crate::visitor::map_expr_visitor(expr, &mut |expr| match &**expr {
         ExprX::Apply(x, es) if es.len() == 0 => Arc::new(ExprX::Var(x.clone())),
         _ => expr.clone(),
@@ -182,6 +182,19 @@ impl SmtSolver {
     }
 }
 
+/// The per-check cvc5 resource budget for this context's queries. Provenance
+/// mode spends more of the budget on proof bookkeeping during search
+/// (measured on toydb), so it gets twice as much. Instantiation replay runs
+/// with full proofs (`--produce-proofs`), which slowed a first search about
+/// 1.6x on toydb, so it gets the same.
+pub(crate) fn cvc5_query_budget(context: &Context) -> u32 {
+    if context.provenance || context.instantiation_replay {
+        context.rlimit.saturating_mul(2)
+    } else {
+        context.rlimit
+    }
+}
+
 pub type ReportLongRunning<'a> =
     (std::time::Duration, Box<dyn FnMut(std::time::Duration, bool) -> () + 'a>);
 
@@ -265,15 +278,7 @@ pub(crate) fn smt_check_assertion<'ctx>(
         SmtSolver::Cvc5 => {
             // `reproducible-resource-limit` (alias of `rlimit-per`) is one of the few
             // cvc5 options that may be set after initialisation; 0 means no limit.
-            // Provenance mode spends more of the budget on proof bookkeeping during
-            // search (measured on toydb), so it gets twice as much. Instantiation
-            // replay runs with full proofs (`--produce-proofs`), which slowed a
-            // first search about 1.6x on toydb, so it gets the same.
-            let budget = if context.provenance || context.instantiation_replay {
-                context.rlimit.saturating_mul(2)
-            } else {
-                context.rlimit
-            };
+            let budget = cvc5_query_budget(context);
             context.smt_log.log_set_option("reproducible-resource-limit", &budget.to_string());
         }
     }

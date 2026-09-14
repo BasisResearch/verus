@@ -103,10 +103,71 @@ pub(crate) struct QueryJournal {
 #[derive(Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]
 enum Request {
-    List { session: Option<String> },
-    Check { session: String, bucket: BucketIndex, query: QueryId },
-    Close { session: String },
+    List {
+        session: Option<String>,
+    },
+    Check {
+        session: String,
+        bucket: BucketIndex,
+        query: QueryId,
+    },
+    /// Probe the query with parts of it switched off (see `air::bisect`).
+    Bisect {
+        session: String,
+        bucket: BucketIndex,
+        query: QueryId,
+        mode: BisectMode,
+        /// Flip mode only. Default: `not_valid` for a valid query, else `valid`.
+        target: Option<BisectTarget>,
+        /// At most this many probes, 1..=`MAX_BISECT_CHECKS`.
+        budget_checks: Option<usize>,
+        /// Which kinds of unit may be removed (flip) or kept (core). Default:
+        /// every kind for a `valid` or `changed` flip, hypotheses and facts
+        /// otherwise, since removing a goal cannot break a proof.
+        kinds: Option<Vec<BisectKind>>,
+        /// Only units whose `AssertId` starts with this prefix.
+        under: Option<Vec<u64>>,
+    },
+    Close {
+        session: String,
+    },
 }
+
+#[derive(Clone, Copy, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum BisectMode {
+    Flip,
+    Core,
+}
+
+#[derive(Clone, Copy, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum BisectTarget {
+    Valid,
+    NotValid,
+    Changed,
+}
+
+#[derive(Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum BisectKind {
+    Hypothesis,
+    Goal,
+    Fact,
+}
+
+impl BisectKind {
+    fn of(kind: air::bisect::UnitKind) -> Self {
+        match kind {
+            air::bisect::UnitKind::Hypothesis => Self::Hypothesis,
+            air::bisect::UnitKind::Goal => Self::Goal,
+            air::bisect::UnitKind::Fact => Self::Fact,
+        }
+    }
+}
+
+const DEFAULT_BISECT_CHECKS: usize = 24;
+const MAX_BISECT_CHECKS: usize = 256;
 
 #[derive(Clone, Serialize)]
 struct QueryDescription {
@@ -138,6 +199,8 @@ pub(crate) struct RetainedBucket {
     cert_keys: Vec<String>,
     state: Mutex<Vec<SolverState>>,
     symbols: Option<crate::provenance::Symbols>,
+    /// Names the hypotheses a bisect removes; kept in every mode.
+    hypotheses: crate::provenance::Hypotheses,
 }
 
 pub(crate) struct SolverState {
@@ -158,6 +221,7 @@ impl RetainedBucket {
         journal: QueryJournal,
         mut spinoffs: Vec<SolverState>,
         symbols: Option<crate::provenance::Symbols>,
+        hypotheses: crate::provenance::Hypotheses,
     ) -> Self {
         let mut states = Vec::new();
         // Spinoff queries already own their declaration context. The unused
@@ -199,7 +263,7 @@ impl RetainedBucket {
                 addresses.push((solver, local));
             }
         }
-        Self { id, queries, addresses, cert_keys, state: Mutex::new(states), symbols }
+        Self { id, queries, addresses, cert_keys, state: Mutex::new(states), symbols, hypotheses }
     }
 }
 
@@ -325,6 +389,13 @@ enum Response<'a> {
         /// Present when this check tried a certificate before searching.
         certificate: Option<CertificateAttempt>,
     },
+    Bisected {
+        session: &'a str,
+        bucket: BucketIndex,
+        query: QueryId,
+        #[serde(flatten)]
+        report: BisectReport,
+    },
     Error {
         message: &'a str,
     },
@@ -358,6 +429,223 @@ enum QueryResult {
     Valid,
     Invalid,
     ResourceLimit,
+}
+
+/// A solver answer to one bisect probe.
+#[derive(Serialize)]
+struct ProbeVerdict {
+    /// `valid` (unsat), `invalid` (sat) or `unknown`
+    result: &'static str,
+    /// the solver's reason for `unknown`, such as `resourceout` or `incomplete`
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+}
+
+impl From<&air::bisect::Answer> for ProbeVerdict {
+    fn from(answer: &air::bisect::Answer) -> Self {
+        Self { result: answer.result(), reason: answer.reason().map(str::to_owned) }
+    }
+}
+
+/// One switchable part of a query, joined back to source.
+#[derive(Serialize)]
+struct BisectUnit {
+    /// Position among the query's units; probes name units by it.
+    index: usize,
+    kind: BisectKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    assert_id: Option<Vec<u64>>,
+    /// A hypothesis's kind (`requires`, `type_invariant`, `fuel`,
+    /// `trait_bound`); a goal's or fact's error message, such as
+    /// `assertion failed` or `precondition not satisfied`.
+    description: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    span: Option<String>,
+    /// The message's labels, such as the callee `requires` a precondition
+    /// goal is about.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    labels: Vec<SourceLabel>,
+}
+
+#[derive(Serialize)]
+struct BisectProbe {
+    /// How many units the probe switched off.
+    removed: usize,
+    verdict: ProbeVerdict,
+}
+
+/// The reply to a bisect request. Every verdict after `verdict_before`
+/// describes a weaker query than the original, never the original itself.
+#[derive(Serialize)]
+struct BisectReport {
+    mode: BisectMode,
+    /// The flip target searched for, after defaulting.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target: Option<BisectTarget>,
+    /// `found`, `already_at_target`, `unreachable`, `not_valid`,
+    /// `no_candidates` or `budget_exhausted`.
+    status: &'static str,
+    /// The probe with nothing removed. It can differ from an ordinary check
+    /// near the resource limit: hypotheses are guarded, so the solver cannot
+    /// substitute them away.
+    verdict_before: Option<ProbeVerdict>,
+    /// Flip: the units whose removal reaches the target. Core: the units that
+    /// have to stay for the query to remain valid when every other candidate
+    /// is removed.
+    minimal_statement_ids: Vec<BisectUnit>,
+    /// The probe of that configuration.
+    verdict_after_removal: Option<ProbeVerdict>,
+    /// Whether restoring (flip) or removing (core) any one member was probed
+    /// and loses the result. False when the budget ran out first.
+    minimal: bool,
+    /// The set was found by trying units one at a time, because removing
+    /// every candidate did not reach the target.
+    non_monotone: bool,
+    checks_used: usize,
+    budget_checks: usize,
+    /// Units the search could remove (flip) or keep (core).
+    candidates: usize,
+    units: usize,
+    /// Every `AssertId` in the query has one component, so splitting by id
+    /// prefix is splitting a flat list.
+    flat_ids: bool,
+    probes: Vec<BisectProbe>,
+    elapsed_ms: u128,
+    restore_ms: u128,
+}
+
+struct BisectRequest {
+    mode: BisectMode,
+    target: Option<BisectTarget>,
+    budget: usize,
+    kinds: Option<Vec<BisectKind>>,
+    under: Option<Vec<u64>>,
+}
+
+/// Run one bisect over `query` in `air`, which must be at the query's prefix
+/// with its budget set. The probes' scope is popped before this returns.
+fn bisect(
+    air: &mut Context,
+    query: &RetainedQuery,
+    hypotheses: &crate::provenance::Hypotheses,
+    request: BisectRequest,
+) -> io::Result<BisectReport> {
+    use air::bisect::{Answer, Mode, Status, Target, UnitKind};
+    let mut prober =
+        air.bisect_query(&query.query).map_err(|error| io::Error::other(error.to_string()))?;
+    let count = prober.units().len();
+    let before = prober.probe(&vec![false; count]).map_err(io::Error::other)?;
+    let target = match request.mode {
+        BisectMode::Core => None,
+        BisectMode::Flip => Some(request.target.unwrap_or(if before == Answer::Valid {
+            BisectTarget::NotValid
+        } else {
+            BisectTarget::Valid
+        })),
+    };
+    let mode = match target {
+        None => Mode::Core,
+        Some(BisectTarget::Valid) => Mode::Flip(Target::Valid),
+        Some(BisectTarget::NotValid) => Mode::Flip(Target::NotValid),
+        Some(BisectTarget::Changed) => Mode::Flip(Target::Changed),
+    };
+    let kinds = request.kinds.unwrap_or_else(|| match mode {
+        Mode::Flip(Target::Valid | Target::Changed) => {
+            vec![BisectKind::Hypothesis, BisectKind::Goal, BisectKind::Fact]
+        }
+        Mode::Flip(Target::NotValid) | Mode::Core => {
+            vec![BisectKind::Hypothesis, BisectKind::Fact]
+        }
+    });
+    let units = prober.units().to_vec();
+    let under = request.under.map(|prefix| air::bisect::units_under_prefix(&units, &prefix));
+    let candidates: Vec<usize> = (0..count)
+        .filter(|&i| kinds.contains(&BisectKind::of(units[i].kind)))
+        .filter(|i| under.as_ref().is_none_or(|under| under.contains(i)))
+        .collect();
+    let outcome = air::bisect::search(
+        mode,
+        count,
+        &candidates,
+        request.budget,
+        Some(before),
+        &mut |disabled| prober.probe(disabled),
+    )
+    .map_err(io::Error::other)?;
+    drop(prober);
+
+    let fun = &query.context.fun;
+    let describe = |index: usize| {
+        let unit = &units[index];
+        let (description, span, labels) = match unit.kind {
+            UnitKind::Hypothesis => {
+                let found = match &unit.tag {
+                    Some(air::def::ProvenanceTag::Hyp(air::def::HypId(k))) => {
+                        hypotheses.get(fun, *k)
+                    }
+                    _ => None,
+                };
+                match found {
+                    Some(h) => (h.kind.clone(), Some(h.span.clone()), Vec::new()),
+                    None => ("hypothesis".to_owned(), None, Vec::new()),
+                }
+            }
+            UnitKind::Goal | UnitKind::Fact => {
+                match unit.error.as_ref().and_then(|e| e.downcast_ref::<MessageX>()) {
+                    Some(message) => (
+                        message.note.clone(),
+                        message.spans.first().map(|s| s.as_string.clone()),
+                        message
+                            .labels
+                            .iter()
+                            .map(|label| SourceLabel {
+                                message: label.note.clone(),
+                                span: label.span.as_string.clone(),
+                            })
+                            .collect(),
+                    ),
+                    None => (String::new(), None, Vec::new()),
+                }
+            }
+        };
+        BisectUnit {
+            index,
+            kind: BisectKind::of(unit.kind),
+            assert_id: unit.assert_id.as_ref().map(|id| (**id).clone()),
+            description,
+            span,
+            labels,
+        }
+    };
+    Ok(BisectReport {
+        mode: request.mode,
+        target,
+        status: match outcome.status {
+            Status::Found => "found",
+            Status::AlreadyAtTarget => "already_at_target",
+            Status::Unreachable => "unreachable",
+            Status::NotValid => "not_valid",
+            Status::NoCandidates => "no_candidates",
+            Status::BudgetExhausted => "budget_exhausted",
+        },
+        verdict_before: outcome.before.as_ref().map(ProbeVerdict::from),
+        minimal_statement_ids: outcome.set.iter().map(|&i| describe(i)).collect(),
+        verdict_after_removal: outcome.after.as_ref().map(ProbeVerdict::from),
+        minimal: outcome.minimal,
+        non_monotone: outcome.non_monotone,
+        checks_used: outcome.probes.len(),
+        budget_checks: request.budget,
+        candidates: candidates.len(),
+        units: count,
+        flat_ids: units.iter().all(|u| u.assert_id.as_ref().is_none_or(|id| id.len() <= 1)),
+        probes: outcome
+            .probes
+            .iter()
+            .map(|p| BisectProbe { removed: p.disabled.len(), verdict: (&p.answer).into() })
+            .collect(),
+        elapsed_ms: 0,
+        restore_ms: 0,
+    })
 }
 
 /// `air::messages::MessageLevel` serialises its Rust variant names, and the
@@ -681,6 +969,7 @@ impl Server {
             match request {
                 Request::List { session: Some(requested) }
                 | Request::Check { session: requested, .. }
+                | Request::Bisect { session: requested, .. }
                 | Request::Close { session: requested }
                     if requested != session =>
                 {
@@ -698,6 +987,73 @@ impl Server {
                     }
                     send(&mut output, &Response::Closed { session })?;
                     return Ok(());
+                }
+                Request::Bisect {
+                    bucket: bucket_id,
+                    query: id,
+                    mode,
+                    target,
+                    budget_checks,
+                    kinds,
+                    under,
+                    ..
+                } => {
+                    let Some(bucket) = self.buckets.get(bucket_id.0) else {
+                        send(&mut output, &Response::Error { message: "unknown bucket" })?;
+                        continue;
+                    };
+                    if bucket.queries.get(id.0).is_none() {
+                        send(&mut output, &Response::Error { message: "unknown query" })?;
+                        continue;
+                    }
+                    let budget = budget_checks.unwrap_or(DEFAULT_BISECT_CHECKS);
+                    if budget == 0 || budget > MAX_BISECT_CHECKS {
+                        send(
+                            &mut output,
+                            &Response::Error { message: "budget_checks must be between 1 and 256" },
+                        )?;
+                        continue;
+                    }
+                    if matches!(mode, BisectMode::Core) && target.is_some() {
+                        send(
+                            &mut output,
+                            &Response::Error { message: "target applies to flip mode only" },
+                        )?;
+                        continue;
+                    }
+                    let mut state = match bucket.state.lock() {
+                        Ok(state) => state,
+                        Err(_) => {
+                            return fatal(
+                                &mut output,
+                                io::Error::other("resident bucket poisoned"),
+                            );
+                        }
+                    };
+                    let (solver, local) = bucket.addresses[id.0];
+                    let SolverState { air, journal } = &mut state[solver];
+                    let prefix = journal.queries[local].prefix;
+                    let restore_start = Instant::now();
+                    if let Err(error) = journal.restore_prefix(air, prefix) {
+                        return fatal(&mut output, error);
+                    }
+                    let restore_ms = restore_start.elapsed().as_millis();
+                    let query = &journal.queries[local];
+                    set_rlimit(air, query.rlimit);
+                    let request = BisectRequest { mode, target, budget, kinds, under };
+                    let start = Instant::now();
+                    let report = match bisect(air, query, &bucket.hypotheses, request) {
+                        Ok(mut report) => {
+                            report.elapsed_ms = start.elapsed().as_millis();
+                            report.restore_ms = restore_ms;
+                            report
+                        }
+                        Err(error) => return fatal(&mut output, error),
+                    };
+                    send(
+                        &mut output,
+                        &Response::Bisected { session, bucket: bucket_id, query: id, report },
+                    )?;
                 }
                 Request::Check { bucket: bucket_id, query: id, .. } => {
                     let Some(bucket) = self.buckets.get(bucket_id.0) else {
