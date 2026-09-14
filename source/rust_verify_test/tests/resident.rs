@@ -401,8 +401,20 @@ fn resident_bisect_localises_and_leaves_the_session_unchanged() {
     assert_eq!(reply["minimal"], true);
     let goal = only(&reply);
     assert_eq!(goal["kind"], "goal");
-    assert!(goal["assert_id"].is_array(), "{goal}");
-    assert!(goal["span"].as_str().unwrap().contains(&span_of("assert(x > 5)")), "{goal}");
+    assert!(goal["assert_id"].is_array(), "{}", goal);
+    assert!(goal["span"].as_str().unwrap().contains(&span_of("assert(x > 5)")), "{}", goal);
+    // Each probe names the units it switched off.
+    for probe in reply["probes"].as_array().unwrap() {
+        let units = probe["removed_units"].as_array().unwrap();
+        assert_eq!(units.len() as u64, probe["removed"].as_u64().unwrap(), "{probe}");
+    }
+    let removed: Vec<Value> = reply["probes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|probe| probe["removed_units"].clone())
+        .collect();
+    assert!(removed.contains(&json!([goal["index"]])), "{}", reply);
     assert!(reply["checks_used"].as_u64().unwrap() <= reply["budget_checks"].as_u64().unwrap());
 
     // The proof of `needs_one` cannot lose `x > 3`, and needs nothing else.
@@ -414,7 +426,7 @@ fn resident_bisect_localises_and_leaves_the_session_unchanged() {
         let requires = only(&reply);
         assert_eq!(requires["kind"], "hypothesis");
         assert_eq!(requires["description"], "requires");
-        assert!(requires["span"].as_str().unwrap().contains(&span_of("x > 3,")), "{requires}");
+        assert!(requires["span"].as_str().unwrap().contains(&span_of("x > 3,")), "{}", requires);
         let valid_after = reply["verdict_after_removal"]["result"] == "valid";
         assert_eq!(valid_after, mode == "core", "{reply}");
     }
@@ -426,13 +438,18 @@ fn resident_bisect_localises_and_leaves_the_session_unchanged() {
     assert_ne!(reply["verdict_before"]["result"], "valid");
     let goal = only(&reply);
     assert_eq!(goal["kind"], "goal");
-    assert!(goal["span"].as_str().unwrap().contains(&span_of("assert(g(x) == 0)")), "{goal}");
+    assert!(goal["span"].as_str().unwrap().contains(&span_of("assert(g(x) == 0)")), "{}", goal);
     let reply = worker.send(request(
         "::unprovable",
         json!({"mode": "flip", "target": "changed", "kinds": ["hypothesis"]}),
     ));
     assert_eq!(reply["status"], "unreachable", "{reply}");
     assert_eq!(reply["minimal_statement_ids"], json!([]));
+    // No set, so no verdict for one; what removing everything answered is
+    // reported apart.
+    assert!(reply["verdict_after_removal"].is_null(), "{}", reply);
+    assert_ne!(reply["verdict_all_removed"]["result"], "valid", "{reply}");
+    assert!(reply["verdict_all_removed"]["result"].is_string(), "{}", reply);
 
     // A matching loop runs the solver out of budget; the one hypothesis whose
     // removal stops that is the self-triggering quantifier.
@@ -472,7 +489,7 @@ fn resident_bisect_localises_and_leaves_the_session_unchanged() {
         assert_eq!(log.matches("(push").count(), log.matches("(pop").count());
         probes += log.matches("(check-sat-assuming").count();
     }
-    assert!(probes >= 10, "{probes}");
+    assert!(probes >= 10, "{}", probes);
 }
 
 /// With instantiation replay, every resident check that proves its query

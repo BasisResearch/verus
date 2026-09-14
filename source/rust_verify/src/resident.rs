@@ -471,6 +471,8 @@ struct BisectUnit {
 struct BisectProbe {
     /// How many units the probe switched off.
     removed: usize,
+    /// Which ones, by their `index` among the query's units.
+    removed_units: Vec<usize>,
     verdict: ProbeVerdict,
 }
 
@@ -493,8 +495,11 @@ struct BisectReport {
     /// have to stay for the query to remain valid when every other candidate
     /// is removed.
     minimal_statement_ids: Vec<BisectUnit>,
-    /// The probe of that configuration.
+    /// The probe of that configuration; null unless `status` is `found`.
     verdict_after_removal: Option<ProbeVerdict>,
+    /// The probe with every candidate removed, when the search ran it. For
+    /// `unreachable` it is what removing everything answered.
+    verdict_all_removed: Option<ProbeVerdict>,
     /// Whether restoring (flip) or removing (core) any one member was probed
     /// and loses the result. False when the budget ran out first.
     minimal: bool,
@@ -631,6 +636,7 @@ fn bisect(
         verdict_before: outcome.before.as_ref().map(ProbeVerdict::from),
         minimal_statement_ids: outcome.set.iter().map(|&i| describe(i)).collect(),
         verdict_after_removal: outcome.after.as_ref().map(ProbeVerdict::from),
+        verdict_all_removed: outcome.all_removed.as_ref().map(ProbeVerdict::from),
         minimal: outcome.minimal,
         non_monotone: outcome.non_monotone,
         checks_used: outcome.probes.len(),
@@ -641,7 +647,11 @@ fn bisect(
         probes: outcome
             .probes
             .iter()
-            .map(|p| BisectProbe { removed: p.disabled.len(), verdict: (&p.answer).into() })
+            .map(|p| BisectProbe {
+                removed: p.disabled.len(),
+                removed_units: p.disabled.clone(),
+                verdict: (&p.answer).into(),
+            })
             .collect(),
         elapsed_ms: 0,
         restore_ms: 0,

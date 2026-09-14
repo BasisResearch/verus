@@ -12,8 +12,9 @@
 //!   remove it.
 //! - a *goal*: a labelled assertion, the thing the query has to prove. A probe
 //!   removes it by assuming `(not label)`, the same toggle the multiple-error
-//!   search uses. The goal is then assumed rather than proved: whatever it
-//!   leaves behind for later goals stays.
+//!   search uses. The goal is then no longer proved. Later goals still get
+//!   it only through its fact (below), so a goal with no fact, such as a
+//!   call's precondition or a postcondition, is simply not checked.
 //! - a *fact*: what an assertion leaves behind. Verus spells `assert(e)` as an
 //!   `Assert` of `e` followed by an `Assume` of `e`; that `Assume` becomes
 //!   `(or drop e)`, and a probe assumes `(not drop)` to keep it, `drop` to
@@ -48,7 +49,8 @@ use std::sync::Arc;
 pub enum UnitKind {
     /// A tagged `hyp_k` axiom: `requires`, type invariant, fuel, trait bound.
     Hypothesis,
-    /// A labelled assertion. Removed, it is assumed instead of proved.
+    /// A labelled assertion. Removed, it is not proved; later goals still get
+    /// it only through its fact, if it has one.
     Goal,
     /// The assumption an assertion leaves behind for what follows it.
     Fact,
@@ -490,8 +492,10 @@ pub struct Outcome {
     /// removed.
     pub set: Vec<usize>,
     /// The probe of `set` (flip: removed; core: every other candidate
-    /// removed).
+    /// removed). `None` unless the status is `Found`.
     pub after: Option<Answer>,
+    /// The probe with every candidate removed, when the search ran it.
+    pub all_removed: Option<Answer>,
     /// Whether putting back any one member of `set` (flip), or removing any
     /// one (core), was probed and loses the result. Not a claim about sets the
     /// search did not try: probes need not be monotone.
@@ -620,11 +624,15 @@ pub fn search<E>(
         status: Status::BudgetExhausted,
         set: Vec::new(),
         after: None,
+        all_removed: None,
         minimal: false,
         non_monotone: false,
         probes: Vec::new(),
     };
     let finish = |mut outcome: Outcome, oracle: Oracle<'_, E>| {
+        if !candidates.is_empty() {
+            outcome.all_removed = oracle.memo.get(&candidates).cloned();
+        }
         outcome.probes = oracle.probes;
         Ok(outcome)
     };
@@ -674,7 +682,6 @@ pub fn search<E>(
                     None => {
                         outcome.status =
                             if exhausted { Status::BudgetExhausted } else { Status::Unreachable };
-                        outcome.after = Some(all);
                         return finish(outcome, oracle);
                     }
                 }
@@ -793,6 +800,7 @@ mod tests {
         assert!(!outcome.minimal);
         assert!(outcome.set.contains(&40) && outcome.set.len() > 1);
         assert_eq!(outcome.after, Some(Answer::Valid));
+        assert_eq!(outcome.all_removed, Some(Answer::Valid));
         assert_eq!(outcome.probes.len(), 4);
     }
 
@@ -820,6 +828,7 @@ mod tests {
         assert_eq!(outcome.status, Status::Found);
         assert_eq!(outcome.set, vec![2, 9]);
         assert!(outcome.minimal);
+        assert_eq!(outcome.all_removed, Some(Answer::Invalid));
         assert_eq!(outcome.after, Some(Answer::Valid));
     }
 
@@ -858,6 +867,8 @@ mod tests {
     fn unreachable_when_nothing_helps() {
         let outcome = run(Mode::Flip(Target::Valid), 4, 100, |_| unknown());
         assert_eq!(outcome.status, Status::Unreachable);
+        assert_eq!(outcome.after, None);
+        assert_eq!(outcome.all_removed, Some(unknown()));
         // before, all removed, then each unit alone
         assert_eq!(outcome.probes.len(), 2 + 4);
     }
