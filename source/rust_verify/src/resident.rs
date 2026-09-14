@@ -776,6 +776,7 @@ impl Server {
                         air.set_restore_instantiations(None, false);
                         air.set_import_instantiations(None);
                         drop(air.take_provenance());
+                        drop(air.take_inst_pressure());
                         match attempt {
                             ValidityResult::Valid(usage) => {
                                 certified = Some(ValidityResult::Valid(usage))
@@ -806,6 +807,8 @@ impl Server {
                     // The response describes round zero. Later error searches
                     // replace AIR's provenance, even when their verdict differs.
                     let first_provenance = air.take_provenance();
+                    // Sessions do not report instantiation pressure yet.
+                    drop(air.take_inst_pressure());
                     // Ask for further errors exactly as far as the original
                     // invocation did, so rechecking a function with several
                     // failing assertions reports the same ones rather than
@@ -888,6 +891,7 @@ impl Server {
                                     QueryContext::default(),
                                 );
                                 drop(air.take_provenance());
+                                drop(air.take_inst_pressure());
                             }
                             ValidityResult::TypeError(error) => {
                                 return fatal(&mut output, io::Error::other(error.to_string()));

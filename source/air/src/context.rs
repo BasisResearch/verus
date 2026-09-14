@@ -62,6 +62,49 @@ pub struct ProvenanceInfo {
 
 pub type VariableVersions = HashMap<String, (String, u32)>;
 
+/// What cvc5's `(get-info :inst-pressure)` reported for one `check-sat`
+/// (`-V inst-pressure`): per quantifier, by `:qid`, how often it was
+/// instantiated and how often an attempt was rejected as a duplicate. The
+/// join back to source happens in Verus.
+#[derive(Debug, Clone, Default)]
+pub struct InstPressure {
+    /// Instantiation rounds that sent lemmas.
+    pub rounds: u64,
+    /// Whether each row says how many of its instances the refutation used.
+    /// Only after `unsat` with proofs on, so not in an ordinary run.
+    pub refutation: bool,
+    /// Most instantiated first.
+    pub quantifiers: Vec<QuantPressure>,
+    /// The reply, when it did not parse.
+    pub unparsed: Option<String>,
+}
+
+/// One quantifier's row of `(get-info :inst-pressure)`. Counts are the
+/// solver's own, disaggregated: every attempt that reached the duplicate
+/// checks is counted once, as added or as one kind of duplicate.
+#[derive(Debug, Clone, Default)]
+pub struct QuantPressure {
+    /// The `:qid`, or a synthetic `quant_<n>` when `named` is false.
+    pub qid: String,
+    pub named: bool,
+    pub instantiations: u64,
+    /// Rejected: the same term vector was used before.
+    pub duplicate_eq: u64,
+    /// Rejected: the instance was already entailed.
+    pub duplicate_ent: u64,
+    /// Rejected: the same lemma was already sent.
+    pub duplicate_lemma: u64,
+    /// Instances made because they conflicted with, or propagated in, the
+    /// current assignment (conflict-based instantiation).
+    pub conflict: u64,
+    pub propagate: u64,
+    /// The rounds of the first and last instantiation; none without one.
+    pub first_round: Option<u64>,
+    pub last_round: Option<u64>,
+    /// Instances the refutation used, when `InstPressure::refutation`.
+    pub refutation: Option<u64>,
+}
+
 #[derive(Debug)]
 pub enum ValidityResult {
     Valid(UsageInfo),
@@ -176,6 +219,12 @@ pub struct Context {
     pub(crate) provenance: bool,
     /// The provenance of the last `check-sat`, until the caller takes it.
     pub(crate) last_provenance: Option<ProvenanceInfo>,
+    /// Ask cvc5 for `(get-info :inst-pressure)` after every `check-sat`
+    /// (`-V inst-pressure`). Read-only: the search is unchanged.
+    pub(crate) inst_pressure: bool,
+    /// The instantiation pressure of the last `check-sat`, until the caller
+    /// takes it.
+    pub(crate) last_inst_pressure: Option<InstPressure>,
     /// Whether this solver may save and restore instantiations across
     /// rechecks of a query (cvc5 only, fixed at launch).
     pub(crate) instantiation_replay: bool,
@@ -260,6 +309,8 @@ impl Context {
             anon_axiom_count: 0,
             provenance: false,
             last_provenance: None,
+            inst_pressure: false,
+            last_inst_pressure: None,
             instantiation_replay: false,
             restore_instantiations: None,
             saved_instantiations: HashSet::new(),
@@ -373,6 +424,19 @@ impl Context {
             info.variable_versions = self.variable_versions.clone();
             info
         })
+    }
+
+    /// The instantiation pressure cvc5 reported for the most recent
+    /// `check-sat`, if it was asked; each call returns it once.
+    pub fn take_inst_pressure(&mut self) -> Option<InstPressure> {
+        self.last_inst_pressure.take()
+    }
+
+    /// Ask for `(get-info :inst-pressure)` after every `check-sat` (cvc5 only).
+    /// It only reads counters, so the solver and its budget are unchanged.
+    pub fn set_inst_pressure(&mut self, enabled: bool) {
+        assert!(!enabled || matches!(self.solver, SmtSolver::Cvc5));
+        self.inst_pressure = enabled;
     }
 
     /// Turn provenance mode on (cvc5 only; must precede the first query).

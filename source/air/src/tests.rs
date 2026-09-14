@@ -2460,3 +2460,84 @@ fn type_error_in_declaration_closes_its_binder_scope() {
     air_context.pop();
     air_context.global(lambda).unwrap();
 }
+
+#[test]
+fn parse_inst_pressure_reply() {
+    let info = crate::smt_verify::parse_inst_pressure(
+        "(:inst-pressure (:rounds 3 :refutation true :quantifiers (\
+         (user_f_1 :instantiations 5 :duplicate-eq 2 :duplicate-ent 1 :duplicate-lemma 0 \
+         :conflict 1 :propagate 0 :first-round 0 :last-round 2 :refutation 1) \
+         (|user%g| :instantiations 0 :duplicate-eq 4 :duplicate-ent 0 :duplicate-lemma 0 \
+         :conflict 0 :propagate 0 :refutation 0) \
+         (quant_0 :named false :instantiations 1 :duplicate-eq 0 :duplicate-ent 0 \
+         :duplicate-lemma 0 :conflict 0 :propagate 1 :first-round 1 :last-round 1 \
+         :refutation 0))))",
+    );
+    assert!(info.unparsed.is_none(), "{:?}", info.unparsed);
+    assert_eq!((info.rounds, info.refutation, info.quantifiers.len()), (3, true, 3));
+    let f = &info.quantifiers[0];
+    assert_eq!(f.qid, "user_f_1");
+    assert!(f.named);
+    assert_eq!(
+        (f.instantiations, f.duplicate_eq, f.duplicate_ent, f.duplicate_lemma),
+        (5, 2, 1, 0)
+    );
+    assert_eq!(
+        (f.conflict, f.first_round, f.last_round, f.refutation),
+        (1, Some(0), Some(2), Some(1))
+    );
+    // only duplicates: no rounds; quoted symbols lose their bars
+    let q = &info.quantifiers[1];
+    assert_eq!((q.qid.as_str(), q.first_round, q.duplicate_eq), ("user%g", None, 4));
+    let u = &info.quantifiers[2];
+    assert_eq!((u.qid.as_str(), u.named, u.propagate), ("quant_0", false, 1));
+
+    // no quantifier instantiated; no refutation counts outside proof mode
+    let info = crate::smt_verify::parse_inst_pressure(
+        "(:inst-pressure (:rounds 0 :refutation false :quantifiers ()))",
+    );
+    assert!(info.unparsed.is_none() && info.quantifiers.is_empty() && !info.refutation);
+    // a solver without the key, or anything unforeseen, is kept whole
+    let info = crate::smt_verify::parse_inst_pressure("(:inst-pressure unsupported)");
+    assert_eq!(info.unparsed.as_deref(), Some("(:inst-pressure unsupported)"));
+}
+
+#[test]
+fn parse_inst_pressure_symbols() {
+    let row = |qid: &str| {
+        format!(
+            "(:inst-pressure (:rounds 1 :refutation false :quantifiers (({} :instantiations 1 \
+             :duplicate-eq 0 :duplicate-ent 0 :duplicate-lemma 0 :conflict 0 :propagate 0 \
+             :first-round 0 :last-round 0))))",
+            qid
+        )
+    };
+    let qids = |line: &str| {
+        let info = crate::smt_verify::parse_inst_pressure(line);
+        assert!(info.unparsed.is_none(), "{:?}", info.unparsed);
+        info.quantifiers.into_iter().map(|q| q.qid).collect::<Vec<_>>()
+    };
+    // a simple symbol may hold characters sise's atoms lack
+    assert_eq!(qids(&row("a^b")), vec!["a^b"]);
+    // a quoted one may hold anything but a bar, spaces and quotes included
+    assert_eq!(qids(&row("|a b|")), vec!["a b"]);
+    assert_eq!(qids(&row("|say \"hi\"|")), vec!["say \"hi\""]);
+    assert_eq!(qids(&row("||")), vec![""]);
+
+    // unbalanced, trailing, or cut short: kept whole
+    for line in [
+        "(:inst-pressure (:rounds 1 :refutation false :quantifiers ((a :instantiations 1)))",
+        "(:inst-pressure (:rounds 1)) x",
+        "(:inst-pressure (:rounds 1 :refutation false :quantifiers ((|a :instantiations 1))))",
+    ] {
+        let info = crate::smt_verify::parse_inst_pressure(line);
+        assert_eq!(info.unparsed.as_deref(), Some(line));
+    }
+    // a malformed row is reported, the others kept
+    let info = crate::smt_verify::parse_inst_pressure(
+        "(:inst-pressure (:rounds 2 :refutation false :quantifiers ((ok :instantiations 1) \
+         (bad :instantiations x))))",
+    );
+    assert!(info.unparsed.is_some());
+    assert_eq!(info.quantifiers.len(), 1);
+}
