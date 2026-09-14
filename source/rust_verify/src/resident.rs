@@ -103,6 +103,14 @@ pub(crate) struct QueryJournal {
     recorded_in_scope: bool,
 }
 
+/// The requests this worker serves, as `ready` reports them. A client reads
+/// the list rather than guessing from `protocol`: requests reach releases in
+/// their own order, and a worker that does not know a request answers exactly
+/// as it does a malformed one. Every `Request` variant belongs here, in the
+/// protocol's snake case, which `resident_ready_lists_the_requests_it_serves`
+/// checks by sending each one.
+const COMMANDS: &[&str] = &["list", "check", "close", "inst_graph"];
+
 #[derive(Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]
 enum Request {
@@ -416,6 +424,8 @@ pub(crate) struct SessionInfo {
 enum Response<'a> {
     Ready {
         protocol: u32,
+        /// The requests this worker serves; see `COMMANDS`.
+        commands: &'a [&'a str],
         session: &'a str,
         process_id: u32,
         invocation_succeeded: bool,
@@ -765,6 +775,7 @@ impl Server {
             &mut output,
             &Response::Ready {
                 protocol: 2,
+                commands: COMMANDS,
                 session,
                 process_id: std::process::id(),
                 invocation_succeeded,

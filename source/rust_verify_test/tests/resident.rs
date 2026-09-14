@@ -964,6 +964,38 @@ fn resident_rejects_bad_requests_and_accepts_eof() {
     worker.finish(true);
 }
 
+/// `ready` names the requests the worker serves, so a client can tell a
+/// request this build does not have from one it rejected: both answer with the
+/// same error otherwise.
+#[test]
+fn resident_ready_lists_the_requests_it_serves() {
+    let mut worker = Worker::start("use vstd::prelude::*; verus! { proof fn passing() {} }", &[]);
+    let ready = worker.receive();
+    let commands: Vec<String> = ready["commands"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{}", ready))
+        .iter()
+        .map(|command| command.as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(commands, ["list", "check", "close", "inst_graph"], "{ready}");
+    // Each listed request parses: a stale session is refused as a session,
+    // not as an unknown request, so the list cannot drift from `Request`.
+    for command in &commands {
+        let request = match command.as_str() {
+            "list" | "close" => json!({"command": command, "session": "stale"}),
+            "check" => json!({"command": command, "session": "stale", "bucket": 0, "query": 0}),
+            "inst_graph" => {
+                json!({"command": command, "session": "stale", "bucket": 0, "query": 0, "op": "cycles"})
+            }
+            _ => panic!("no request for {command}"),
+        };
+        let reply = worker.send(request);
+        assert_eq!(reply["event"], "error", "{command}: {reply}");
+        assert_ne!(reply["message"], "invalid resident request", "{command}: {reply}");
+    }
+    worker.finish(true);
+}
+
 #[test]
 fn resident_rejects_unsupported_modes() {
     for options in [
