@@ -2106,9 +2106,12 @@ impl Verifier {
                 air_context,
                 journal,
                 resident_spinoffs,
-                self.args.provenance.then(|| {
-                    crate::provenance::Symbols::capture(&ctx.global, ctx.name_ctxt.source_names())
-                }),
+                // E-graph readings render solver terms as source in every
+                // session, not only under provenance.
+                Some(crate::provenance::Symbols::capture(
+                    &ctx.global,
+                    ctx.name_ctxt.source_names(),
+                )),
             ));
         }
 

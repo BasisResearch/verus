@@ -19,19 +19,33 @@
 //! `ready.smt_options` echoes the ordered name/value pairs already applied at
 //! solver startup. Rechecks preserve those settings in the original contexts;
 //! only the recorded per-query resource budget is set again before a check.
+//!
+//! An `egraph` request checks a retained query once more and reads, after its
+//! `check-sat`, the equalities cvc5's e-graph holds in the classes of the
+//! query's own terms. With `inject`, it then checks the query again with one
+//! of those equalities asserted, named by the id the first reading gave it,
+//! and reports how the verdict and the equalities changed. The equality is
+//! one the solver itself reported for the same query, never text from the
+//! caller, and it is popped with the query's scope. Neither verdict is a
+//! `checked` one, and neither check saves a certificate.
 
 use crate::buckets::BucketId;
 use crate::commands::{QueryOp, Style};
 use air::ast::{CommandX, Commands, Query};
-use air::context::{Context, QueryContext, ValidityResult};
+use air::context::{
+    Context, EgraphReply, EgraphRequest, QueryContext, SmtSolver, ValidityResult, VariableVersions,
+};
 use air::instantiations::ImportInstantiations;
 use air::messages::{ArcDynMessage, Diagnostics, MessageLevel};
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::cell::RefCell;
+use std::collections::{BTreeSet, HashMap};
 use std::io::{self, BufRead, Read, Write};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use vir::air_names::SourceNames;
 use vir::ast_util::fun_as_friendly_rust_name;
 use vir::def::{CommandContext, CommandsWithContext};
 use vir::messages::{MessageX, VirMessageInterface};
@@ -103,9 +117,32 @@ pub(crate) struct QueryJournal {
 #[derive(Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]
 enum Request {
-    List { session: Option<String> },
-    Check { session: String, bucket: BucketIndex, query: QueryId },
-    Close { session: String },
+    List {
+        session: Option<String>,
+    },
+    Check {
+        session: String,
+        bucket: BucketIndex,
+        query: QueryId,
+    },
+    Egraph {
+        session: String,
+        bucket: BucketIndex,
+        query: QueryId,
+        /// The most equalities to list; default 20, at most 200.
+        #[serde(default)]
+        limit: Option<u32>,
+        /// List equalities with a side a quantifier was instantiated with.
+        #[serde(default)]
+        include_used: bool,
+        /// The id of an equality from this query's reading to assert in a
+        /// second check.
+        #[serde(default)]
+        inject: Option<String>,
+    },
+    Close {
+        session: String,
+    },
 }
 
 #[derive(Clone, Serialize)]
@@ -325,6 +362,13 @@ enum Response<'a> {
         /// Present when this check tried a certificate before searching.
         certificate: Option<CertificateAttempt>,
     },
+    Egraph {
+        session: &'a str,
+        bucket: BucketIndex,
+        query: QueryId,
+        #[serde(flatten)]
+        outcome: Box<EgraphOutcome>,
+    },
     Error {
         message: &'a str,
     },
@@ -352,7 +396,7 @@ struct CertificateAttempt {
     elapsed_ms: u128,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Copy, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum QueryResult {
     Valid,
@@ -475,6 +519,465 @@ fn fatal<T>(output: &mut impl Write, error: io::Error) -> io::Result<T> {
     let message = error.to_string();
     let _ = send(output, &Response::Error { message: &message });
     Err(error)
+}
+
+/// How many equalities one reading of the e-graph asks cvc5 for. A listing
+/// shows fewer; the rest let an injection find its equality again, and let
+/// the two checks' readings be compared.
+const EGRAPH_READ_LIMIT: u32 = 1000;
+/// The default and the most equalities a listing shows.
+const EGRAPH_LIST_DEFAULT: u32 = 20;
+const EGRAPH_LIST_MAX: u32 = 200;
+/// The most new equalities a frontier delta names.
+const FRONTIER_SHOWN: usize = 20;
+
+const INJECTION_CAVEAT: &str = "The equality was asserted in a scope popped right after this check, so the session's solver state is unchanged. This verdict is not a verification result: add the assert to the source and verify it normally.";
+
+/// What an e-graph request found.
+#[derive(Serialize)]
+struct EgraphOutcome {
+    /// The query checked as usual, with the e-graph read after `check-sat`.
+    before: EgraphRun,
+    summary: EgraphSummary,
+    equalities: Vec<ResolvedEquality>,
+    /// Present when the request named an equality to inject.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    injection: Option<Injection>,
+}
+
+/// One check an e-graph request made. Its verdict is never a `checked` one:
+/// an injected check asserts more than the query does.
+#[derive(Serialize)]
+struct EgraphRun {
+    result: QueryResult,
+    assert_id: Option<Vec<u64>>,
+    elapsed_ms: u128,
+    /// Why the e-graph could not be read, as after a valid check, which
+    /// leaves none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    egraph_error: Option<String>,
+}
+
+/// What one reading counted.
+#[derive(Serialize)]
+struct EgraphSummary {
+    /// The classes cvc5 listed from, and the equalities it found in them.
+    classes: u64,
+    candidates: u64,
+    /// The query's terms sent to focus the reading, and how many of them the
+    /// e-graph holds.
+    focus_terms: u64,
+    focus_found: u64,
+    /// Equalities read and shown to the caller, of which `equalities` lists
+    /// at most `limit`.
+    listed: usize,
+    /// Equalities not listed because a quantifier was already instantiated
+    /// with a side (see `include_used`).
+    used_omitted: usize,
+    /// Equalities not listed because both sides render alike (a box and the
+    /// value inside it), neither renders as source, or an equality listed
+    /// before reads the same (the same one between differently boxed terms).
+    hidden: usize,
+    /// Terms cvc5 left out because they print larger than its size limit.
+    too_large: u64,
+}
+
+#[derive(Clone, Serialize)]
+struct ResolvedEquality {
+    /// Names this equality in an `inject` request. The same two terms get the
+    /// same id in every reading of the same query.
+    id: String,
+    /// The two sides in source spelling, each mutable variable with its
+    /// assignment version.
+    lhs: String,
+    rhs: String,
+    /// `entailed`: follows from what the query asserts, which includes the
+    /// negated goal. `decision`: holds only on the branch the search was on.
+    /// `unknown`: no single theory explains it.
+    level: String,
+    /// Whether a quantifier a proof relies on, one the user wrote or one
+    /// defining a function, was instantiated with either side. Instances of
+    /// the encoding's own axioms (the prelude, boxing, type invariants, fuel)
+    /// do not count.
+    used_by_proof: bool,
+    /// Where those quantifiers are written.
+    used_by: Vec<String>,
+    /// How many of the two sides are terms of the query itself, 0 to 2.
+    focus: u32,
+    /// The literals the equality follows from, in source spelling, except
+    /// those `because_hidden` counts.
+    holds_because: Vec<String>,
+    /// Literals of the explanation cvc5 left out, as naming a skolem or
+    /// printing larger than its size limit. When present, `holds_because`
+    /// alone does not imply the equality.
+    #[serde(skip_serializing_if = "is_zero")]
+    because_hidden: u64,
+    /// `assert(lhs == rhs);` to add to the source, when the equality is
+    /// entailed, both sides render as source, and no variable appears at two
+    /// assignment versions. Variables are named without versions and the
+    /// crate's own items under `crate::`: place it where the variables hold
+    /// the versions `lhs` and `rhs` show.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    verus_assert: Option<String>,
+    /// The two sides as the solver spells them.
+    smt_lhs: String,
+    smt_rhs: String,
+}
+
+#[derive(Serialize)]
+struct Injection {
+    equality: ResolvedEquality,
+    after: EgraphRun,
+    /// The query failed without the equality and holds with it asserted.
+    closed: bool,
+    /// How the injected check's reading differs from the first, when the
+    /// injected check left an e-graph to read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    frontier_delta: Option<FrontierDelta>,
+    caveat: &'static str,
+}
+
+#[derive(Debug, PartialEq, Serialize)]
+struct FrontierDelta {
+    /// Equalities the injected check's reading holds between terms the first
+    /// reading held apart or did not hold, in source spelling.
+    new_equalities: Vec<(String, String)>,
+    new_equality_count: usize,
+    /// Equalities of the first reading whose sides the second holds apart:
+    /// the injected search went another way.
+    lost_equality_count: usize,
+    /// How many of the first reading's classes merged into another.
+    classes_merged: usize,
+}
+
+fn is_zero(count: &u64) -> bool {
+    *count == 0
+}
+
+/// Names this equality in an `inject` request: FNV-1a over the two terms as
+/// the solver spells them, so it survives a second reading of the same query.
+fn equality_id(lhs: &str, rhs: &str) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for part in [lhs, rhs] {
+        for byte in part.bytes().chain(std::iter::once(0)) {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    format!("eq#{:012x}", hash >> 16)
+}
+
+/// Source names for rendering one query's solver terms.
+struct QueryNames<'a> {
+    symbols: Option<&'a crate::provenance::Symbols>,
+    /// SSA symbols as their variable with its assignment version, to show.
+    shown: Cow<'a, SourceNames>,
+    /// Source to paste: SSA symbols as their variable alone, and the crate's
+    /// own items under `crate::`.
+    plain: Cow<'a, SourceNames>,
+    /// Each SSA symbol's variable and version. Two versions of one variable
+    /// read alike in `plain`, so an assert naming both cannot be pasted.
+    versions: &'a VariableVersions,
+}
+
+impl<'a> QueryNames<'a> {
+    fn new(
+        symbols: Option<&'a crate::provenance::Symbols>,
+        versions: &'a VariableVersions,
+        empty: &'a SourceNames,
+    ) -> Self {
+        match symbols {
+            Some(symbols) => Self {
+                symbols: Some(symbols),
+                shown: symbols.query_names(versions, true),
+                plain: symbols.paste_names(versions),
+                versions,
+            },
+            None => Self {
+                symbols: None,
+                shown: Cow::Borrowed(empty),
+                plain: Cow::Borrowed(empty),
+                versions,
+            },
+        }
+    }
+
+    /// `assert(lhs == rhs);` to add to the source, when that assert says what
+    /// the equality says: it is entailed, both sides render as source, and no
+    /// variable appears in it at two assignment versions.
+    fn verus_assert(&self, equality: &air::context::EgraphEquality) -> Option<String> {
+        if equality.level != "entailed" {
+            return None;
+        }
+        let terms = [equality.lhs.as_str(), equality.rhs.as_str()];
+        if !terms.iter().all(|term| vir::air_names::renders_as_source(&self.plain, term)) {
+            return None;
+        }
+        // SSA symbols are plain SMT-LIB symbols, never quoted, so splitting
+        // on parentheses and spaces finds every one.
+        let mut version_of: HashMap<&str, u32> = HashMap::new();
+        for atom in terms.iter().flat_map(|term| term.split(['(', ')', ' ', '\n'])) {
+            if let Some((base, version)) = self.versions.get(atom) {
+                if *version_of.entry(base.as_str()).or_insert(*version) != *version {
+                    return None;
+                }
+            }
+        }
+        Some(format!(
+            "assert({} == {});",
+            vir::air_names::render_term(&self.plain, &equality.lhs),
+            vir::air_names::render_term(&self.plain, &equality.rhs)
+        ))
+    }
+
+    /// Where the quantifiers a proof relies on among `qids` are written.
+    /// Without symbols to tell which those are, every one, by its name.
+    fn proof_uses(&self, qids: &[String]) -> Vec<String> {
+        match self.symbols {
+            Some(symbols) => qids
+                .iter()
+                .filter_map(|qid| symbols.proof_quantifier_site(qid))
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect(),
+            None => qids.to_vec(),
+        }
+    }
+
+    fn show(&self, term: &str) -> String {
+        vir::air_names::render_term(&self.shown, term)
+    }
+
+    /// Whether an equality is worth showing: its sides render differently,
+    /// and at least one reads as source.
+    fn shows(&self, lhs: &str, rhs: &str) -> bool {
+        self.show(lhs) != self.show(rhs)
+            && (vir::air_names::renders_as_source(&self.plain, lhs)
+                || vir::air_names::renders_as_source(&self.plain, rhs))
+    }
+
+    /// The reading's equalities worth showing, in its order, and how many
+    /// were hidden.
+    fn resolve(&self, reply: &EgraphReply) -> (Vec<ResolvedEquality>, usize) {
+        let mut hidden = 0;
+        let mut resolved: Vec<ResolvedEquality> = Vec::new();
+        let mut seen: HashMap<(String, String), usize> = HashMap::new();
+        for equality in &reply.equalities {
+            if !self.shows(&equality.lhs, &equality.rhs) {
+                hidden += 1;
+                continue;
+            }
+            let (lhs, rhs) = (self.show(&equality.lhs), self.show(&equality.rhs));
+            let key =
+                if lhs <= rhs { (lhs.clone(), rhs.clone()) } else { (rhs.clone(), lhs.clone()) };
+            let used_by = self.proof_uses(&equality.used_by);
+            // The same equality between differently boxed terms reads the
+            // same; show it once, under the first reading's terms. A proof
+            // uses it when it uses either spelling, whichever came first.
+            if let Some(&index) = seen.get(&key) {
+                let kept = &mut resolved[index];
+                let merged: BTreeSet<String> = kept.used_by.drain(..).chain(used_by).collect();
+                kept.used_by = merged.into_iter().collect();
+                kept.used_by_proof = !kept.used_by.is_empty();
+                if kept.verus_assert.is_none() {
+                    kept.verus_assert = self.verus_assert(equality);
+                }
+                hidden += 1;
+                continue;
+            }
+            seen.insert(key, resolved.len());
+            resolved.push(ResolvedEquality {
+                id: equality_id(&equality.lhs, &equality.rhs),
+                lhs,
+                rhs,
+                level: equality.level.clone(),
+                used_by_proof: !used_by.is_empty(),
+                used_by,
+                focus: equality.focus,
+                holds_because: equality.because.iter().map(|lit| self.show(lit)).collect(),
+                because_hidden: equality.because_hidden,
+                verus_assert: self.verus_assert(equality),
+                smt_lhs: equality.lhs.clone(),
+                smt_rhs: equality.rhs.clone(),
+            });
+        }
+        (resolved, hidden)
+    }
+}
+
+/// Each term of a reading, mapped to its class: each listed equality joins
+/// its two sides.
+fn term_classes(reply: &EgraphReply) -> HashMap<&str, usize> {
+    fn find(parent: &mut Vec<usize>, mut i: usize) -> usize {
+        while parent[i] != i {
+            parent[i] = parent[parent[i]];
+            i = parent[i];
+        }
+        i
+    }
+    let mut index: HashMap<&str, usize> = HashMap::new();
+    let mut parent: Vec<usize> = Vec::new();
+    for equality in &reply.equalities {
+        let mut ids = [0; 2];
+        for (slot, term) in ids.iter_mut().zip([equality.lhs.as_str(), equality.rhs.as_str()]) {
+            *slot = *index.entry(term).or_insert_with(|| {
+                parent.push(parent.len());
+                parent.len() - 1
+            });
+        }
+        let (a, b) = (find(&mut parent, ids[0]), find(&mut parent, ids[1]));
+        if a != b {
+            parent[a] = b;
+        }
+    }
+    index.iter().map(|(term, &i)| (*term, find(&mut parent, i))).collect()
+}
+
+/// How the injected check's reading differs from the first. The injected
+/// equality itself is not new.
+fn frontier_delta(
+    before: &EgraphReply,
+    after: &EgraphReply,
+    injected: (&str, &str),
+    names: &QueryNames,
+) -> FrontierDelta {
+    let old = term_classes(before);
+    let new = term_classes(after);
+    let together = |classes: &HashMap<&str, usize>, lhs: &str, rhs: &str| matches!((classes.get(lhs), classes.get(rhs)), (Some(a), Some(b)) if a == b);
+    let mut new_equalities = Vec::new();
+    let mut new_equality_count = 0;
+    for equality in &after.equalities {
+        let (lhs, rhs) = (equality.lhs.as_str(), equality.rhs.as_str());
+        if (lhs, rhs) == injected || (rhs, lhs) == injected || together(&old, lhs, rhs) {
+            continue;
+        }
+        new_equality_count += 1;
+        if new_equalities.len() < FRONTIER_SHOWN && names.shows(lhs, rhs) {
+            new_equalities.push((names.show(lhs), names.show(rhs)));
+        }
+    }
+    let lost_equality_count = before
+        .equalities
+        .iter()
+        .filter(|e| {
+            new.contains_key(e.lhs.as_str())
+                && new.contains_key(e.rhs.as_str())
+                && !together(&new, &e.lhs, &e.rhs)
+        })
+        .count();
+    let mut joined: HashMap<usize, BTreeSet<usize>> = HashMap::new();
+    for (term, class) in &new {
+        if let Some(old_class) = old.get(term) {
+            joined.entry(*class).or_default().insert(*old_class);
+        }
+    }
+    FrontierDelta {
+        new_equalities,
+        new_equality_count,
+        lost_equality_count,
+        classes_merged: joined.values().map(|classes| classes.len() - 1).sum(),
+    }
+}
+
+/// Check a retained query for an e-graph request, with the e-graph read after
+/// its first `check-sat` and, when given, an equality asserted before it.
+/// Rounds for further errors are not run, and nothing is saved as a
+/// certificate. The caller has restored the query's prefix.
+fn egraph_check(
+    air: &mut Context,
+    query: &RetainedQuery,
+    inject: Option<(&str, &str)>,
+    set_rlimit: &impl Fn(&mut Context, f32),
+) -> io::Result<(EgraphRun, EgraphReply)> {
+    set_rlimit(air, query.rlimit);
+    air.set_egraph_request(Some(EgraphRequest { limit: EGRAPH_READ_LIMIT, include_used: true }));
+    if let Some((lhs, rhs)) = inject {
+        air.set_inject_equality(lhs, rhs).map_err(io::Error::other)?;
+    }
+    let start = Instant::now();
+    let outcome = air.check_valid(
+        &VirMessageInterface {},
+        &QueryDiagnostics::default(),
+        &query.query,
+        QueryContext::default(),
+    );
+    let elapsed_ms = start.elapsed().as_millis();
+    let reply = air.take_egraph();
+    air.set_egraph_request(None);
+    drop(air.take_provenance());
+    let (result, assert_id) = match outcome {
+        ValidityResult::Valid(_) => (QueryResult::Valid, None),
+        ValidityResult::Invalid(_, _, id) => (QueryResult::Invalid, id.map(|id| (*id).clone())),
+        ValidityResult::Canceled => (QueryResult::ResourceLimit, None),
+        ValidityResult::TypeError(error) => return Err(io::Error::other(error.to_string())),
+        ValidityResult::UnexpectedOutput(error) => return Err(io::Error::other(error)),
+    };
+    air.finish_query();
+    let reply = reply.unwrap_or_else(|| EgraphReply {
+        error: Some("the check did not reach check-sat".to_owned()),
+        ..EgraphReply::default()
+    });
+    let run = EgraphRun { result, assert_id, elapsed_ms, egraph_error: reply.error.clone() };
+    Ok((run, reply))
+}
+
+/// Serve an e-graph request for one query of `bucket`, whose address the
+/// caller has checked. `Ok(Err(_))` is a refusal to report; `Err` ends the
+/// session.
+fn serve_egraph(
+    bucket: &RetainedBucket,
+    id: QueryId,
+    limit: Option<u32>,
+    include_used: bool,
+    inject: Option<&str>,
+    set_rlimit: &impl Fn(&mut Context, f32),
+) -> io::Result<Result<EgraphOutcome, &'static str>> {
+    let mut state =
+        bucket.state.lock().map_err(|_| io::Error::other("resident bucket poisoned"))?;
+    let (solver, local) = bucket.addresses[id.0];
+    let SolverState { air, journal } = &mut state[solver];
+    if !matches!(air.get_solver(), SmtSolver::Cvc5) {
+        return Ok(Err("e-graph requests need cvc5"));
+    }
+    let prefix = journal.queries[local].prefix;
+    journal.restore_prefix(air, prefix)?;
+    let query = &journal.queries[local];
+    let (before, reading) = egraph_check(air, query, None, set_rlimit)?;
+    let empty = SourceNames::new();
+    let names = QueryNames::new(bucket.symbols.as_ref(), &reading.variable_versions, &empty);
+    let (listed, hidden) = names.resolve(&reading);
+    let injection = match inject {
+        None => None,
+        Some(wanted) => {
+            let Some(equality) = listed.iter().find(|equality| equality.id == wanted).cloned()
+            else {
+                return Ok(Err(
+                    "no equality has that id in this check's reading; list the equalities again",
+                ));
+            };
+            let injected = (equality.smt_lhs.as_str(), equality.smt_rhs.as_str());
+            let (after, second) = egraph_check(air, query, Some(injected), set_rlimit)?;
+            let frontier_delta =
+                second.error.is_none().then(|| frontier_delta(&reading, &second, injected, &names));
+            let closed = before.result != QueryResult::Valid && after.result == QueryResult::Valid;
+            Some(Injection { equality, after, closed, frontier_delta, caveat: INJECTION_CAVEAT })
+        }
+    };
+    let limit = limit.unwrap_or(EGRAPH_LIST_DEFAULT).clamp(1, EGRAPH_LIST_MAX) as usize;
+    let (shown, used): (Vec<_>, Vec<_>) =
+        listed.into_iter().partition(|equality| include_used || !equality.used_by_proof);
+    let summary = EgraphSummary {
+        classes: reading.classes,
+        candidates: reading.candidates,
+        focus_terms: reading.focus,
+        focus_found: reading.focus_found,
+        listed: shown.len(),
+        used_omitted: used.len(),
+        hidden,
+        too_large: reading.too_large,
+    };
+    let equalities = shown.into_iter().take(limit).collect();
+    Ok(Ok(EgraphOutcome { before, summary, equalities, injection }))
 }
 
 impl QueryJournal {
@@ -681,6 +1184,7 @@ impl Server {
             match request {
                 Request::List { session: Some(requested) }
                 | Request::Check { session: requested, .. }
+                | Request::Egraph { session: requested, .. }
                 | Request::Close { session: requested }
                     if requested != session =>
                 {
@@ -698,6 +1202,43 @@ impl Server {
                     }
                     send(&mut output, &Response::Closed { session })?;
                     return Ok(());
+                }
+                Request::Egraph {
+                    bucket: bucket_id,
+                    query: id,
+                    limit,
+                    include_used,
+                    inject,
+                    ..
+                } => {
+                    let Some(bucket) = self.buckets.get(bucket_id.0) else {
+                        send(&mut output, &Response::Error { message: "unknown bucket" })?;
+                        continue;
+                    };
+                    if bucket.queries.get(id.0).is_none() {
+                        send(&mut output, &Response::Error { message: "unknown query" })?;
+                        continue;
+                    }
+                    match serve_egraph(
+                        bucket,
+                        id,
+                        limit,
+                        include_used,
+                        inject.as_deref(),
+                        &set_rlimit,
+                    ) {
+                        Ok(Ok(outcome)) => send(
+                            &mut output,
+                            &Response::Egraph {
+                                session,
+                                bucket: bucket_id,
+                                query: id,
+                                outcome: Box::new(outcome),
+                            },
+                        )?,
+                        Ok(Err(message)) => send(&mut output, &Response::Error { message })?,
+                        Err(error) => return fatal(&mut output, error),
+                    }
                 }
                 Request::Check { bucket: bucket_id, query: id, .. } => {
                     let Some(bucket) = self.buckets.get(bucket_id.0) else {
@@ -1096,6 +1637,146 @@ mod tests {
             }
             air.finish_query();
         }
+    }
+
+    fn reading(pairs: &[(&str, &str)]) -> EgraphReply {
+        EgraphReply {
+            equalities: pairs
+                .iter()
+                .map(|(lhs, rhs)| air::context::EgraphEquality {
+                    lhs: lhs.to_string(),
+                    rhs: rhs.to_string(),
+                    level: "entailed".to_string(),
+                    used: false,
+                    used_by: Vec::new(),
+                    focus: 1,
+                    because: Vec::new(),
+                    because_hidden: 0,
+                })
+                .collect(),
+            ..EgraphReply::default()
+        }
+    }
+
+    #[test]
+    fn frontier_delta_counts_new_lost_and_merged_equalities() {
+        // Every symbol reads as source, so no new equality is hidden.
+        let recorded: SourceNames = ["a", "b", "c", "d", "e", "f", "e2", "f2"]
+            .iter()
+            .map(|x| (x.to_string(), vir::air_names::SourceName::Symbol(x.to_string())))
+            .collect();
+        let versions = VariableVersions::new();
+        let names = QueryNames {
+            symbols: None,
+            shown: Cow::Borrowed(&recorded),
+            plain: Cow::Borrowed(&recorded),
+            versions: &versions,
+        };
+        // Three classes, {a, b}, {c, d} and {e, f}; the second reading loses the last.
+        let before = reading(&[("a", "b"), ("c", "d"), ("e", "f")]);
+        // Injecting a = b merged both classes; e and f went apart.
+        let after = reading(&[("a", "b"), ("a", "c"), ("a", "d"), ("e", "e2"), ("f", "f2")]);
+        let delta = frontier_delta(&before, &after, ("a", "b"), &names);
+        assert_eq!(delta.new_equality_count, 4, "{delta:?}");
+        assert_eq!(delta.classes_merged, 1, "{delta:?}");
+        assert_eq!(delta.lost_equality_count, 1, "{delta:?}");
+        assert!(delta.new_equalities.contains(&("a".to_string(), "c".to_string())));
+        // Nothing changes when the second reading is the first.
+        let same = frontier_delta(&before, &before, ("a", "b"), &names);
+        assert_eq!(
+            (same.new_equality_count, same.lost_equality_count, same.classes_merged),
+            (0, 0, 0)
+        );
+    }
+
+    fn equality(
+        lhs: &str,
+        rhs: &str,
+        level: &str,
+        used_by: &[&str],
+    ) -> air::context::EgraphEquality {
+        air::context::EgraphEquality {
+            lhs: lhs.to_string(),
+            rhs: rhs.to_string(),
+            level: level.to_string(),
+            used: !used_by.is_empty(),
+            used_by: used_by.iter().map(|qid| qid.to_string()).collect(),
+            focus: 1,
+            because: Vec::new(),
+            because_hidden: 0,
+        }
+    }
+
+    /// Names as `Symbols::query_names` and `paste_names` give them, for a
+    /// query where `z@0` and `z@1` are two assignments of `z`.
+    fn versioned_names() -> (SourceNames, SourceNames, VariableVersions) {
+        let symbol = |name: &str| vir::air_names::SourceName::Symbol(name.to_string());
+        let mut plain: SourceNames =
+            ["x", "y"].iter().map(|x| (x.to_string(), symbol(x))).collect();
+        let mut shown = plain.clone();
+        let mut versions = VariableVersions::new();
+        for version in [0, 1] {
+            let ssa = format!("z@{version}");
+            plain.insert(ssa.clone(), symbol("z"));
+            shown.insert(ssa.clone(), symbol(&format!("z (version {version})")));
+            versions.insert(ssa, ("z".to_string(), version));
+        }
+        (plain, shown, versions)
+    }
+
+    #[test]
+    fn pasted_asserts_need_entailment_and_one_version_per_variable() {
+        let (plain, shown, versions) = versioned_names();
+        let names = QueryNames {
+            symbols: None,
+            shown: Cow::Borrowed(&shown),
+            plain: Cow::Borrowed(&plain),
+            versions: &versions,
+        };
+        assert_eq!(
+            names.verus_assert(&equality("z@1", "(+ x 1)", "entailed", &[])).as_deref(),
+            Some("assert(z == (x + 1));")
+        );
+        // `z == (z + 1)` would paste one name for two assignments.
+        assert_eq!(names.verus_assert(&equality("z@1", "(+ z@0 1)", "entailed", &[])), None);
+        // Holds only in the model the search ended on.
+        assert_eq!(names.verus_assert(&equality("z@1", "x", "decision", &[])), None);
+        // `tmp` renders as no source.
+        assert_eq!(names.verus_assert(&equality("z@1", "tmp", "entailed", &[])), None);
+    }
+
+    #[test]
+    fn differently_spelled_duplicates_merge_whichever_comes_first() {
+        let (plain, shown, versions) = versioned_names();
+        let names = QueryNames {
+            symbols: None,
+            shown: Cow::Borrowed(&shown),
+            plain: Cow::Borrowed(&plain),
+            versions: &versions,
+        };
+        // The same equality in two spellings, as between a boxed and an
+        // unboxed term; only the second has a quantifier instantiated with it.
+        let unused = equality("x", "y", "entailed", &[]);
+        let used = equality("y", "x", "entailed", &["user_q"]);
+        for pairs in [[&unused, &used], [&used, &unused]] {
+            let reply = EgraphReply {
+                equalities: pairs.iter().map(|e| (*e).clone()).collect(),
+                ..EgraphReply::default()
+            };
+            let (listed, hidden) = names.resolve(&reply);
+            assert_eq!((listed.len(), hidden), (1, 1));
+            assert!(listed[0].used_by_proof);
+            assert_eq!(listed[0].used_by, vec!["user_q"]);
+        }
+    }
+
+    #[test]
+    fn equality_ids_name_the_terms_in_order() {
+        assert_eq!(equality_id("(f b)", "c"), equality_id("(f b)", "c"));
+        assert_ne!(equality_id("(f b)", "c"), equality_id("c", "(f b)"));
+        // The separator keeps a split point from moving between the sides.
+        assert_ne!(equality_id("ab", "c"), equality_id("a", "bc"));
+        assert!(equality_id("x", "y").starts_with("eq#"));
     }
 
     /// A query's certificate names formulas of its prefix, and those mention

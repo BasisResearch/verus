@@ -197,6 +197,9 @@ pub(crate) struct Symbols {
     quantifiers: HashMap<String, Quantifier>,
     axiom_owners: HashMap<String, String>,
     source_names: vir::air_names::SourceNames,
+    /// The crate being verified, whose items the source names spell under
+    /// its own name, and source pasted into it must spell under `crate::`.
+    crate_name: String,
 }
 
 impl Symbols {
@@ -248,6 +251,69 @@ impl Symbols {
             quantifiers,
             axiom_owners: global.axiom_owners.borrow().clone(),
             source_names,
+            crate_name: vir::def::krate_to_string_ignore_stable_id(&global.crate_name),
+        }
+    }
+
+    /// The source names for one query's solver terms: each SSA symbol in
+    /// `versions` is named as its variable, followed by its assignment version
+    /// when `annotate`. SSA versions are query-local, so a display keeps
+    /// assignment identity, while source to paste into a function cannot.
+    pub(crate) fn query_names<'a>(
+        &'a self,
+        versions: &air::context::VariableVersions,
+        annotate: bool,
+    ) -> std::borrow::Cow<'a, vir::air_names::SourceNames> {
+        let mut names = std::borrow::Cow::Borrowed(&self.source_names);
+        for (symbol, (base, version)) in versions {
+            if let Some(name) = vir::air_names::source_symbol(&names, base) {
+                let name = if annotate { format!("{name} (version {version})") } else { name };
+                names.to_mut().insert(symbol.clone(), vir::air_names::SourceName::Symbol(name));
+            }
+        }
+        names
+    }
+
+    /// The source names for pasting one query's solver terms into the crate
+    /// they came from: SSA symbols as their variable alone, and the crate's
+    /// own items as `crate::` paths, since a crate cannot name itself.
+    pub(crate) fn paste_names<'a>(
+        &'a self,
+        versions: &air::context::VariableVersions,
+    ) -> std::borrow::Cow<'a, vir::air_names::SourceNames> {
+        use vir::air_names::SourceName;
+        let mut names = self.query_names(versions, false);
+        let own = format!("{}::", self.crate_name);
+        let renamed: Vec<(String, String)> = names
+            .iter()
+            .filter_map(|(symbol, name)| match name {
+                SourceName::Symbol(name) => {
+                    name.strip_prefix(&own).map(|rest| (symbol.clone(), format!("crate::{rest}")))
+                }
+                _ => None,
+            })
+            .collect();
+        if !renamed.is_empty() {
+            let names = names.to_mut();
+            for (symbol, name) in renamed {
+                names.insert(symbol, SourceName::Symbol(name));
+            }
+        }
+        names
+    }
+
+    /// Where the quantifier the solver names `qid` is written, when a proof
+    /// relies on it: the user wrote it, or it defines a function. `None` for
+    /// the encoding's own axioms (the prelude, boxing, type invariants, fuel)
+    /// and for a name this crate's encoders did not mint.
+    pub(crate) fn proof_quantifier_site(&self, qid: &str) -> Option<String> {
+        let info = self.quantifiers.get(qid)?;
+        match (&info.span, info.role) {
+            (Some(span), _) => Some(format!("the quantifier at {span}")),
+            (None, Some("definition" | "definition_unfold" | "definition_base")) => {
+                Some(format!("the definition of `{}`", info.fun))
+            }
+            _ => None,
         }
     }
 
@@ -312,20 +378,10 @@ impl Symbols {
     }
 
     pub(crate) fn resolve(&self, fun: &Fun, q: QueryProvenance) -> ResolvedQueryProvenance {
-        let air_source_names = &self.source_names;
         let tag_of = |fun: &Fun, symbol: &str| self.tag_of(fun, symbol);
         let is_hyp_kind =
             |k: &str| matches!(k, "requires" | "type_invariant" | "fuel" | "trait_bound");
-        // SSA versions are query-local. Preserve assignment identity in the display.
-        let mut source_names = std::borrow::Cow::Borrowed(air_source_names);
-        for (symbol, (base, version)) in &q.variable_versions {
-            if let Some(name) = vir::air_names::source_symbol(&source_names, base) {
-                source_names.to_mut().insert(
-                    symbol.clone(),
-                    vir::air_names::SourceName::Symbol(format!("{name} (version {version})")),
-                );
-            }
-        }
+        let source_names = self.query_names(&q.variable_versions, true);
         let mut hypotheses: Vec<ResolvedTag> = Vec::new();
         let mut sources: Vec<Vec<ResolvedTag>> = Vec::new();
         let mut axioms_in_scope = 0usize;

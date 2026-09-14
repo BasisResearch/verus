@@ -319,6 +319,176 @@ fn resident_rechecks_preserve_query_scopes_and_solver_process() {
     eprintln!("one verifier process, one cvc5 launch, {checks} checks, balanced scopes");
 }
 
+const EGRAPH_SOURCE: &str = r#"
+use vstd::prelude::*;
+verus! {
+    spec fn f(x: int) -> int;
+    spec fn g(x: int) -> int;
+
+    proof fn egraph_target(a: int, b: int)
+        requires f(a) == g(b), g(b) > 0,
+    {
+        assert(f(a) > 1);
+    }
+
+    proof fn egraph_passing(a: int, b: int)
+        requires a == b,
+    {
+        assert(b == a);
+    }
+
+    fn egraph_versions(v: &mut Vec<u64>, x: u64)
+        requires old(v).len() > 0, x < 100,
+    {
+        let y = x + 1;
+        v.set(0, y);
+        let mut z = y;
+        z = z + 1;
+        assert(v[0] == z);
+    }
+}
+"#;
+
+/// The variables `text` names with an assignment version, as `(name, version)`.
+fn versions_named(text: &str) -> Vec<(String, String)> {
+    const MARK: &str = " (version ";
+    let mut found = Vec::new();
+    let mut rest = text;
+    while let Some(at) = rest.find(MARK) {
+        let name = rest[..at].rsplit(|c: char| !(c.is_alphanumeric() || c == '_')).next();
+        let tail = &rest[at + MARK.len()..];
+        let version: String = tail.chars().take_while(|c| c.is_ascii_digit()).collect();
+        found.push((name.unwrap_or_default().to_string(), version));
+        rest = tail;
+    }
+    found
+}
+
+/// An `egraph` request lists the equalities a failing query's e-graph holds
+/// between the query's own terms, in source spelling. `f(a) == g(b)` survives
+/// preprocessing, which solves an equality with a variable side, such as
+/// `a == b`, by substitution instead. An injection checks the
+/// query again with one of them asserted, in a scope popped right after, so a
+/// later check of the retained query is unchanged. The equality to inject is
+/// named by the id the reading gave it; an unknown id is refused, and the
+/// session keeps serving.
+#[test]
+fn resident_egraph_lists_and_injects_equalities() {
+    let mut worker = Worker::start(EGRAPH_SOURCE, &[]);
+    let ready = worker.receive();
+    assert_eq!(ready["event"], "ready", "{ready}");
+    let session = ready["session"].clone();
+    let target = query_id(&ready, "::egraph_target");
+    let listed =
+        worker.send(json!({"command": "egraph", "session": session, "bucket": 0, "query": target}));
+    assert_eq!(listed["event"], "egraph", "{listed}");
+    assert_eq!(listed["before"]["result"], "invalid", "{listed}");
+    assert!(listed["summary"]["focus_found"].as_u64().unwrap() > 0, "{}", listed);
+    let pair = listed["equalities"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|equality| {
+            let sides = [equality["lhs"].as_str().unwrap(), equality["rhs"].as_str().unwrap()];
+            sides.iter().any(|side| side.ends_with("f(a)"))
+                && sides.iter().any(|side| side.ends_with("g(b)"))
+        })
+        .unwrap_or_else(|| panic!("no f(a) == g(b): {}", listed))
+        .clone();
+    assert_eq!(pair["level"], "entailed", "{pair}");
+    assert_eq!(pair["used_by_proof"], false, "{pair}");
+    assert!(!pair["holds_because"].as_array().unwrap().is_empty(), "{}", pair);
+    // Only an entailed equality is offered as an assert: `a == b` holds in
+    // the model the search ended on, and is listed without one.
+    let equalities = listed["equalities"].as_array().unwrap();
+    assert!(equalities.iter().any(|e| e["level"] == "decision"), "{}", listed);
+    for equality in equalities {
+        assert!(
+            equality["level"] == "entailed" || equality["verus_assert"].is_null(),
+            "{}",
+            equality
+        );
+    }
+    // The offered assert is source for the crate it came from, and it holds
+    // there: pasted in place of the failing assert, the function verifies.
+    let pasted = pair["verus_assert"].as_str().unwrap();
+    assert!(pasted.contains("crate::f(a)") && pasted.contains("crate::g(b)"), "{}", pair);
+    let mut paste_worker = Worker::start(&EGRAPH_SOURCE.replace("assert(f(a) > 1);", pasted), &[]);
+    let paste_ready = paste_worker.receive();
+    assert_eq!(paste_ready["event"], "ready", "{paste_ready}");
+    let pasted_check = paste_worker.send(json!({"command": "check",
+        "session": paste_ready["session"], "bucket": 0,
+        "query": query_id(&paste_ready, "::egraph_target")}));
+    assert_eq!(pasted_check["result"], "valid", "{pasted_check}");
+    paste_worker.send(json!({"command": "close", "session": paste_ready["session"]}));
+    paste_worker.finish(false);
+    // Differently boxed terms of the same equality read alike; it is listed once.
+    let mut rendered: Vec<(String, String)> = listed["equalities"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|equality| {
+            let lhs = equality["lhs"].as_str().unwrap().to_string();
+            let rhs = equality["rhs"].as_str().unwrap().to_string();
+            if lhs <= rhs { (lhs, rhs) } else { (rhs, lhs) }
+        })
+        .collect();
+    let listed_count = rendered.len();
+    rendered.sort();
+    rendered.dedup();
+    assert_eq!(rendered.len(), listed_count, "{listed}");
+
+    // A requires the query already entails changes nothing when injected.
+    let injected = worker.send(json!({"command": "egraph", "session": session, "bucket": 0,
+        "query": target, "inject": pair["id"]}));
+    assert_eq!(injected["injection"]["equality"]["id"], pair["id"], "{injected}");
+    assert_eq!(injected["injection"]["after"]["result"], "invalid", "{injected}");
+    assert_eq!(injected["injection"]["closed"], false, "{injected}");
+    assert!(injected["injection"]["frontier_delta"].is_object(), "{}", injected);
+
+    let refused = worker.send(json!({"command": "egraph", "session": session, "bucket": 0,
+        "query": target, "inject": "eq#000000000000"}));
+    assert_eq!(refused["event"], "error", "{refused}");
+    let checked =
+        worker.send(json!({"command": "check", "session": session, "bucket": 0, "query": target}));
+    assert_eq!(checked["result"], "invalid", "{checked}");
+
+    // A valid query leaves no e-graph to read.
+    let passing = query_id(&ready, "::egraph_passing");
+    let valid = worker
+        .send(json!({"command": "egraph", "session": session, "bucket": 0, "query": passing}));
+    assert_eq!(valid["before"]["result"], "valid", "{valid}");
+    assert!(valid["before"]["egraph_error"].is_string(), "{}", valid);
+    assert!(valid["equalities"].as_array().unwrap().is_empty(), "{}", valid);
+
+    // `z == (z + 1)` would name two assignments of `z` alike. The reading
+    // holds such an equality between versions of `z`, and offers no assert
+    // for it or any other that names one variable at two versions.
+    let versions = query_id(&ready, "::egraph_versions");
+    let versioned = worker
+        .send(json!({"command": "egraph", "session": session, "bucket": 0, "query": versions}));
+    assert_eq!(versioned["event"], "egraph", "{versioned}");
+    let mut mixed = 0;
+    for equality in versioned["equalities"].as_array().unwrap() {
+        let text = format!("{} {}", equality["lhs"], equality["rhs"]);
+        let named = versions_named(&text);
+        let two = named.iter().any(|(x, v)| named.iter().any(|(y, w)| x == y && v != w));
+        if two {
+            mixed += 1;
+            assert!(equality["verus_assert"].is_null(), "{}", equality);
+        }
+    }
+    assert!(mixed > 0, "{}", versioned);
+
+    assert_eq!(worker.send(json!({"command": "close", "session": session}))["event"], "closed");
+    worker.finish(false);
+    let launches = fs::read_to_string(worker.dir.path().join("launches")).unwrap();
+    assert_eq!(launches.lines().count(), 1, "{launches}");
+    for log in smt_logs(worker.dir.path()) {
+        assert_eq!(log.matches("(push").count(), log.matches("(pop").count());
+    }
+}
+
 /// With instantiation replay, every resident check that proves its query
 /// saves its instantiations, and a recheck of a query with saved ones first
 /// tries them alone (`:only`), falling back to the ordinary check unless that
