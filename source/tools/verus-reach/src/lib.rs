@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 
-pub const SCHEMA_VERSION: u32 = 3;
+pub const SCHEMA_VERSION: u32 = 4;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Report {
@@ -80,6 +80,9 @@ pub struct Node {
     pub proxy: bool,
     /// Part of the crate's public API
     pub exported: bool,
+    /// Marked `#[verifier::reach_root]`: always a root of the analysis
+    #[serde(default)]
+    pub root: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -195,14 +198,23 @@ fn load_file(path: &Path) -> Result<Report, String> {
     Ok(report)
 }
 
-/// How to pick the roots of the reachability analysis.
-#[derive(Default)]
+/// How to pick the roots of the reachability analysis. Functions marked
+/// `#[verifier::reach_root]` are always roots.
 pub struct Roots {
     /// Def paths to add
     pub add: Vec<String>,
-    /// Globs removing default roots, matched against `def_path` and
+    /// Globs removing implicit roots, matched against `def_path` and
     /// `module_path`
     pub exclude: Vec<glob::Pattern>,
+    /// Take the implicit roots too: the `main` of every executable crate,
+    /// or, when no crate has one, every exported function
+    pub implicit: bool,
+}
+
+impl Default for Roots {
+    fn default() -> Roots {
+        Roots { add: vec![], exclude: vec![], implicit: true }
+    }
 }
 
 impl Roots {
@@ -225,8 +237,9 @@ pub struct Graph {
 }
 
 impl Graph {
-    /// Default roots are the `main` of every executable crate, or, when no
-    /// crate has one, every exported function.
+    /// Roots are the functions marked `#[verifier::reach_root]`, plus, unless
+    /// `roots.implicit` is off, the `main` of every executable crate, or,
+    /// when no crate has one, every exported function.
     pub fn new(reports: &[Report], roots: &Roots) -> Result<Graph, String> {
         let nodes: BTreeMap<String, Node> = reports
             .iter()
@@ -235,13 +248,16 @@ impl Graph {
             .map(|n| (n.id.clone(), n.clone()))
             .collect();
         let mains: Vec<String> = reports.iter().filter_map(|r| r.main.clone()).collect();
-        let defaults: Vec<&Node> = if mains.is_empty() {
+        let implicit: Vec<&Node> = if !roots.implicit {
+            vec![]
+        } else if mains.is_empty() {
             nodes.values().filter(|n| n.exported).collect()
         } else {
             mains.iter().filter_map(|id| nodes.get(id)).collect()
         };
         let mut root_ids: Vec<String> =
-            defaults.into_iter().filter(|n| !roots.excludes(n)).map(|n| n.id.clone()).collect();
+            implicit.into_iter().filter(|n| !roots.excludes(n)).map(|n| n.id.clone()).collect();
+        root_ids.extend(nodes.values().filter(|n| n.root).map(|n| n.id.clone()));
         for def_path in &roots.add {
             let added: Vec<&Node> = nodes.values().filter(|n| &n.def_path == def_path).collect();
             if added.is_empty() {
@@ -333,6 +349,7 @@ pub mod fixture {
             external_body: false,
             proxy: false,
             exported,
+            root: false,
         }
     }
 
@@ -473,11 +490,39 @@ mod tests {
     }
 
     #[test]
+    fn marked_roots_are_always_roots() {
+        // A theorem about `wired`, never called, marked as a root
+        let mut reports = lib_and_bin();
+        let mut theorem = proof("lib::theorem");
+        theorem.root = true;
+        reports[0].nodes.push(theorem);
+        reports[0].edges.push(contract("lib::theorem", "lib::verified::spec_inc"));
+        let graph = Graph::new(&reports, &Roots::default()).unwrap();
+        assert_eq!(graph.roots, vec!["app(bin)::main", "lib::theorem"]);
+        assert!(graph.is_reachable(&graph.nodes["lib::verified::spec_inc"]));
+        assert!(!graph.reachable.contains("lib::verified::spec_inc"));
+
+        // Without implicit roots only the theorem is a root, and nothing runs
+        let roots = Roots { implicit: false, ..Roots::default() };
+        let graph = Graph::new(&reports, &roots).unwrap();
+        assert_eq!(graph.roots, vec!["lib::theorem"]);
+        assert!(!graph.is_reachable(&graph.nodes["lib::wired"]));
+        assert_eq!(graph.exec_coverage(), (0, 3));
+
+        // An exclusion glob does not remove a marked root
+        let roots =
+            Roots { exclude: vec![glob::Pattern::new("lib::*").unwrap()], ..Roots::default() };
+        let graph = Graph::new(&reports, &roots).unwrap();
+        assert_eq!(graph.roots, vec!["app(bin)::main", "lib::theorem"]);
+    }
+
+    #[test]
     fn exclude_and_add_roots() {
         let lib = lib_and_bin().remove(0);
         let roots = Roots {
             add: vec!["lib::helper".into()],
             exclude: vec![glob::Pattern::new("lib::verified::*").unwrap()],
+            implicit: true,
         };
         let graph = Graph::new(&[lib], &roots).unwrap();
         assert_eq!(graph.roots, vec!["lib::helper", "lib::inc", "lib::wired"]);
@@ -492,14 +537,16 @@ mod tests {
         method.def_path = "lib::Wrapper::fmt".into();
         method.module = "lib::verified".into();
         let lib = report("lib", "lib", None, vec![method], vec![]);
-        let roots =
-            Roots { add: vec![], exclude: vec![glob::Pattern::new("lib::verified::*").unwrap()] };
+        let roots = Roots {
+            exclude: vec![glob::Pattern::new("lib::verified::*").unwrap()],
+            ..Roots::default()
+        };
         assert!(Graph::new(&[lib], &roots).unwrap().roots.is_empty());
     }
 
     #[test]
     fn unknown_root_is_an_error() {
-        let roots = Roots { add: vec!["lib::nope".into()], exclude: vec![] };
+        let roots = Roots { add: vec!["lib::nope".into()], ..Roots::default() };
         assert!(Graph::new(&lib_and_bin(), &roots).is_err());
     }
 

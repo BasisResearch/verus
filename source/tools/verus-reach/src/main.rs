@@ -27,13 +27,18 @@ struct Args {
     /// A test report is rejected beside the lib or bin report of its crate.
     #[arg(required = true)]
     reports: Vec<PathBuf>,
-    /// Add a root (def path). Defaults: `main` of every executable crate,
-    /// or every exported function if there is none
+    /// Add a root (def path). Functions marked `#[verifier::reach_root]`
+    /// are always roots; the implicit roots are the `main` of every
+    /// executable crate, or every exported function if there is none
     #[arg(long = "root")]
     roots: Vec<String>,
-    /// Remove default roots matching a glob, e.g. 'mycrate::verified::*'
+    /// Remove implicit roots matching a glob, e.g. 'mycrate::verified::*'
     #[arg(long = "roots-exclude")]
     roots_exclude: Vec<String>,
+    /// Take no implicit roots: only functions marked
+    /// `#[verifier::reach_root]` and those passed with --root
+    #[arg(long)]
+    no_implicit_roots: bool,
     /// Exit with an error if fewer than this percentage of verified
     /// functions (exec, spec, and proof) are reachable
     #[arg(long)]
@@ -225,6 +230,7 @@ fn main() {
             .iter()
             .map(|g| glob::Pattern::new(g).unwrap_or_else(|e| fail(format!("bad glob {g}: {e}"))))
             .collect(),
+        implicit: !args.no_implicit_roots,
     };
     let graph = Graph::new(&reports, &roots).unwrap_or_else(|e| fail(e));
     let only = if args.only_verified_exec {

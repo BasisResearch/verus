@@ -134,7 +134,7 @@ fn total(files: &BTreeMap<&str, Vec<&Node>>, graph: &Graph, scope: fn(&Node) -> 
     json!({
         "fns": fns, "verified": verified, "reach": reach, "vreach": vreach,
         "exec": mode("exec"), "spec": mode("spec"), "proof": mode("proof"),
-        "dead": pct(verified - vreach, verified), "share": pct(vreach, reach), "all": pct(vreach, fns),
+        "dead": pct(verified - vreach, verified), "share": pct(vreach, reach),
     })
 }
 
@@ -204,7 +204,6 @@ mod tests {
         assert_eq!(exec["reach"], 4);
         assert_eq!(exec["dead"], 33);
         assert_eq!(exec["share"], 50);
-        assert_eq!(exec["all"], 40);
         assert_eq!(exec["proof"], json!([0, 0]));
         assert!(!out.path().join("src/src/main.rs.html").exists());
     }

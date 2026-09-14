@@ -35,7 +35,7 @@ fn edge_kinds(report: &Report, from: &str, to: &str) -> Vec<EdgeKind> {
 
 /// The test crate is a library, so `main` is not an entry point; make it the root.
 fn graph_from_main(report: &Report) -> Graph {
-    let roots = Roots { add: vec!["test_crate::main".into()], exclude: vec![] };
+    let roots = Roots { add: vec!["test_crate::main".into()], ..Roots::default() };
     Graph::new(std::slice::from_ref(report), &roots).unwrap()
 }
 
@@ -421,8 +421,8 @@ fn exported_roots() {
     assert!(all.is_reachable(node(&report, "test_crate::verified::inc")));
 
     let roots = Roots {
-        add: vec![],
         exclude: vec![glob::Pattern::new("test_crate::verified::*").unwrap()],
+        ..Roots::default()
     };
     let excluded = Graph::new(std::slice::from_ref(&report), &roots).unwrap();
     assert_eq!(excluded.roots, vec!["test_crate::inc"]);
@@ -569,10 +569,46 @@ fn a_spec_root_uses_but_does_not_run() {
         vec![EdgeKind::Proof],
         "a ghost body's references are ghost"
     );
-    let roots = Roots { add: vec!["test_crate::twice_len".into()], exclude: vec![] };
+    let roots = Roots { add: vec!["test_crate::twice_len".into()], ..Roots::default() };
     let graph = Graph::new(std::slice::from_ref(&report), &roots).unwrap();
     assert!(!graph.reachable.contains("test_crate::len"));
     assert!(graph.is_reachable(node(&report, "test_crate::spec_len")));
+}
+
+/// A function marked `#[verifier::reach_root]` is a root whether or not
+/// anything calls it: a theorem about important functions, say.
+#[test]
+fn marked_roots() {
+    let code = verus_code! {
+        spec fn good(x: u64) -> bool {
+            x < 10
+        }
+
+        fn important(x: u64) -> (r: u64)
+            ensures good(r),
+        {
+            1
+        }
+
+        #[verifier::reach_root]
+        proof fn theorem(x: u64)
+            ensures good(1),
+        {
+        }
+
+        fn main() {
+        }
+    };
+    let (result, report) = reach("marked_roots", code);
+    result.unwrap();
+    let theorem = node(&report, "test_crate::theorem");
+    assert!(theorem.root, "{:#?}", theorem);
+    assert!(!node(&report, "test_crate::important").root);
+    let roots = Roots { implicit: false, ..Roots::default() };
+    let graph = Graph::new(std::slice::from_ref(&report), &roots).unwrap();
+    assert_eq!(graph.roots, vec![theorem.id.clone()]);
+    assert!(graph.is_reachable(node(&report, "test_crate::good")));
+    assert!(!graph.is_reachable(node(&report, "test_crate::important")));
 }
 
 /// An uninterpreted spec has no body to check, like an `external_body`

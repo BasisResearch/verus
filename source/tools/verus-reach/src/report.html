@@ -163,7 +163,6 @@ table.cov tbody tr:hover td { background: color-mix(in srgb, var(--accent) 6%, t
     });
     s.dead = pct(s.verified - s.vreach, s.verified);
     s.share = pct(s.vreach, s.reach);
-    s.all = pct(s.vreach, s.fns);
     return s;
   }
 
@@ -187,12 +186,10 @@ table.cov tbody tr:hover td { background: color-mix(in srgb, var(--accent) 6%, t
 
   var COLS = [
     { key: "name", label: "Name" },
-    { key: "dead", label: "Dead verified", title: "verified functions nothing reaches / verified functions", metric: true,
+    { key: "dead", label: "Unreachable verified / verified", title: "verified functions nothing reaches, over all verified functions", metric: true,
       cell: function (s) { return barCell(s.dead, bandInv(s.dead), s.verified - s.vreach, s.verified); } },
-    { key: "share", label: "Verified share", title: "reachable verified functions / reachable functions", metric: true,
+    { key: "share", label: "Reachable verified / reachable", title: "reachable functions that are verified, over all reachable functions", metric: true,
       cell: function (s) { return barCell(s.share, band(s.share), s.vreach, s.reach); } },
-    { key: "all", label: "Verified reachable of all", title: "reachable verified functions / all functions in the file", metric: true,
-      cell: function (s) { return barCell(s.all, band(s.all), s.vreach, s.fns); } },
     { key: "fns", label: "Functions", num: true, cell: function (s) { return s.fns; } }
   ];
 
@@ -254,9 +251,8 @@ table.cov tbody tr:hover td { background: color-mix(in srgb, var(--accent) 6%, t
       '<button type="button" id="scope-exec" data-scope="exec" aria-pressed="' + (scope === "exec") + '">exec only</button></span>' +
       '<span class="muted">' + (scope === "all" ? "spec and proof functions count as verified code" : "spec and proof functions are left out of every count; reachability is unchanged") + '</span></div>';
     h += '<div class="tiles">' +
-      tile("Dead verified", TOTAL.dead, bandInv(TOTAL.dead), (TOTAL.verified - TOTAL.vreach) + " of " + TOTAL.verified + " verified functions nothing reaches · " + modes) +
-      tile("Verified share of reachable code", TOTAL.share, band(TOTAL.share), TOTAL.vreach + " of " + TOTAL.reach + " reachable functions are verified") +
-      tile("Verified reachable of all functions", TOTAL.all, band(TOTAL.all), TOTAL.vreach + " of " + TOTAL.fns + " functions are verified and reachable") +
+      tile("Unreachable verified / verified", TOTAL.dead, bandInv(TOTAL.dead), (TOTAL.verified - TOTAL.vreach) + " of " + TOTAL.verified + " verified functions nothing reaches · " + modes) +
+      tile("Reachable verified / reachable", TOTAL.share, band(TOTAL.share), TOTAL.vreach + " of " + TOTAL.reach + " reachable functions are verified") +
       '</div>';
     h += '<div class="legend"><span class="vr">verified and reachable</span><span class="vd">verified but nothing reaches it</span>' +
       '<span class="ur">reachable but unverified</span><span class="uu">neither</span>' +

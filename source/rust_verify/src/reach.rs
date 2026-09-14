@@ -336,6 +336,9 @@ fn node<'tcx>(
         f.x.attrs.is_external_body || matches!(f.x.body_visibility, BodyVisibility::Uninterpreted)
     });
     let module = tcx.parent_module_from_def_id(def_id).to_def_id();
+    let attrs = tcx.hir_attrs(tcx.local_def_id_to_hir_id(def_id));
+    let root =
+        crate::attributes::get_verifier_attrs_no_check(attrs, None).map_or(false, |a| a.reach_root);
     Node {
         id,
         def_path: vir::ast_util::path_as_friendly_rust_name(&path),
@@ -346,6 +349,7 @@ fn node<'tcx>(
         external_body,
         proxy,
         exported: tcx.effective_visibilities(()).is_exported(def_id),
+        root,
     }
 }
 
