@@ -372,13 +372,9 @@ fn versions_named(text: &str) -> Vec<(String, String)> {
 /// later check of the retained query is unchanged. The equality to inject is
 /// named by the id the reading gave it; an unknown id is refused, and the
 /// session keeps serving.
-///
-/// Needs a cvc5 with `get-egraph-equalities`. Until the pinned release has it,
-/// run with `--ignored` and `VERUS_CVC5_PATH` pointing at such a build.
 #[test]
-#[ignore]
 fn resident_egraph_lists_and_injects_equalities() {
-    let mut worker = Worker::start(EGRAPH_SOURCE, &["-V", "no-solver-version-check"]);
+    let mut worker = Worker::start(EGRAPH_SOURCE, &[]);
     let ready = worker.receive();
     assert_eq!(ready["event"], "ready", "{ready}");
     let session = ready["session"].clone();
@@ -417,10 +413,7 @@ fn resident_egraph_lists_and_injects_equalities() {
     // there: pasted in place of the failing assert, the function verifies.
     let pasted = pair["verus_assert"].as_str().unwrap();
     assert!(pasted.contains("crate::f(a)") && pasted.contains("crate::g(b)"), "{}", pair);
-    let mut paste_worker = Worker::start(
-        &EGRAPH_SOURCE.replace("assert(f(a) > 1);", pasted),
-        &["-V", "no-solver-version-check"],
-    );
+    let mut paste_worker = Worker::start(&EGRAPH_SOURCE.replace("assert(f(a) > 1);", pasted), &[]);
     let paste_ready = paste_worker.receive();
     assert_eq!(paste_ready["event"], "ready", "{paste_ready}");
     let pasted_check = paste_worker.send(json!({"command": "check",
