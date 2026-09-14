@@ -62,6 +62,71 @@ pub struct ProvenanceInfo {
 
 pub type VariableVersions = HashMap<String, (String, u32)>;
 
+/// What cvc5 reported for `(get-info :matching-loops)` after a `check-sat`
+/// answered unknown (`-V matching-loops`): the quantifiers whose
+/// instantiations fed themselves, symbols and SMT terms not yet joined to
+/// source. The fields mirror the reply (see cvc5's
+/// `theory/quantifiers/matching_loops.h`).
+#[derive(Debug, Clone, Default)]
+pub struct MatchingLoopsInfo {
+    /// SSA symbol -> original AIR variable and assignment version, recorded by lowering.
+    pub variable_versions: VariableVersions,
+    /// The last instantiation round of the check
+    pub rounds: u64,
+    /// Instantiations recorded, and those past cvc5's recording cap
+    pub instantiations: u64,
+    pub dropped: u64,
+    /// Whether the instantiation round limit stopped the check
+    pub max_inst_rounds: bool,
+    pub loops: Vec<MatchingLoop>,
+    /// Reply parts the parser did not recognise, kept rather than failed on.
+    pub unparsed: Vec<String>,
+}
+
+/// One self-feeding quantifier, as cvc5 reported it. Terms are SMT text.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct MatchingLoop {
+    pub qid: String,
+    /// high (the round limit cut the loop off while it climbed), medium, low
+    pub confidence: String,
+    /// linear-depth, exponential-fanout, or bounded
+    pub growth: String,
+    /// whether the chain follows instantiations that matched a term the
+    /// previous rung introduced, rather than the deepest one of each round
+    pub edges_confirmed: bool,
+    /// whether consecutive rungs generalise to one shape
+    pub stable: bool,
+    pub instantiations: u64,
+    pub rounds: u64,
+    pub first_round: u64,
+    pub last_round: u64,
+    pub chain: u64,
+    pub self_fed: u64,
+    pub depth_per_rung: f64,
+    pub depth_per_round: f64,
+    pub fanout_per_round: f64,
+    /// growth per step of the quantifier's own rounds: a loop that fires
+    /// every other round doubles per step while `fanout_per_round` reads 1.41
+    pub fanout_per_step: f64,
+    /// qids of the other quantifiers a step passed through
+    pub via: Vec<String>,
+    /// the trigger whose matches formed the rungs, one term per trigger term
+    pub trigger: Vec<String>,
+    /// what each rung wraps around the previous one's growing subterm,
+    /// generalised over the chain, `_0` marking that subterm; one per class
+    /// when the loop climbs several subterms (`(r _0)`, `(l _0)`), and empty
+    /// when the rungs do not grow into each other
+    pub context: Vec<String>,
+    /// the generalisation of every rung, and of every rung after the first
+    pub shape: Vec<String>,
+    pub step: Vec<String>,
+    /// the first rungs and the last, each the trigger instantiated
+    pub ladder: Vec<Vec<String>>,
+    pub ladder_length: u64,
+    /// instantiations of the quantifier per round, the last rounds
+    pub per_round: Vec<u64>,
+}
+
 /// What a query's first `check-sat` also asks cvc5 for: the equalities its
 /// e-graph holds between the query's own terms (`get-egraph-equalities`).
 #[derive(Debug, Clone, Copy)]
@@ -276,6 +341,16 @@ pub struct Context {
     pub(crate) provenance: bool,
     /// The provenance of the last `check-sat`, until the caller takes it.
     pub(crate) last_provenance: Option<ProvenanceInfo>,
+    /// Matching-loop mode (`-V matching-loops`): cvc5 records each
+    /// instantiation's round, terms and parents, and is asked for the loops
+    /// among them after every unknown. Recording spends no resource units,
+    /// so the verdict is a plain run's unless `inst_max_rounds` is set.
+    pub(crate) matching_loops: bool,
+    /// cvc5's `--inst-max-rounds`, only under matching-loop mode. A loop is
+    /// high confidence only when this limit stopped the check.
+    pub(crate) inst_max_rounds: Option<u32>,
+    /// The matching loops of the last unknown `check-sat`, until taken.
+    pub(crate) last_matching_loops: Option<MatchingLoopsInfo>,
     /// Ask cvc5 for `(get-info :inst-pressure)` after every `check-sat`
     /// (`-V inst-pressure`). Read-only: the search is unchanged.
     pub(crate) inst_pressure: bool,
@@ -376,6 +451,9 @@ impl Context {
             anon_axiom_count: 0,
             provenance: false,
             last_provenance: None,
+            matching_loops: false,
+            inst_max_rounds: None,
+            last_matching_loops: None,
             inst_pressure: false,
             last_inst_pressure: None,
             instantiation_replay: false,
@@ -408,6 +486,8 @@ impl Context {
                 transcript_log,
                 self.provenance,
                 self.instantiation_replay,
+                self.matching_loops,
+                self.inst_max_rounds,
             ));
         }
         self.smt_process.as_mut().unwrap()
@@ -517,6 +597,26 @@ impl Context {
         assert!(matches!(self.state, ContextState::NotStarted));
         assert!(!enabled || matches!(self.solver, SmtSolver::Cvc5));
         self.provenance = enabled;
+    }
+
+    /// The matching loops cvc5 reported after the most recent unknown
+    /// `check-sat`, if any; each call returns them once.
+    pub fn take_matching_loops(&mut self) -> Option<MatchingLoopsInfo> {
+        self.last_matching_loops.take().map(|mut info| {
+            info.variable_versions = self.variable_versions.clone();
+            info
+        })
+    }
+
+    /// Turn matching-loop mode on (cvc5 only; must precede the first query).
+    /// The solver is launched with `--matching-loops`, and with
+    /// `--inst-max-rounds` when `inst_max_rounds` is given; each unknown is
+    /// followed by `(get-info :matching-loops)`.
+    pub fn set_matching_loops(&mut self, enabled: bool, inst_max_rounds: Option<u32>) {
+        assert!(matches!(self.state, ContextState::NotStarted));
+        assert!(!enabled || matches!(self.solver, SmtSolver::Cvc5));
+        self.matching_loops = enabled;
+        self.inst_max_rounds = if enabled { inst_max_rounds } else { None };
     }
 
     /// Allow saving and restoring instantiations (cvc5 only; must precede the
@@ -795,6 +895,15 @@ impl Context {
                     self.comment(&format!(
                         "provenance mode: cvc5 args {}",
                         crate::smt_process::PROVENANCE_ARGS.join(" ")
+                    ));
+                }
+                if self.matching_loops {
+                    let rounds = match self.inst_max_rounds {
+                        Some(n) => format!(" --inst-max-rounds={n}"),
+                        None => String::new(),
+                    };
+                    self.comment(&format!(
+                        "matching-loop mode: cvc5 args --matching-loops{rounds}"
                     ));
                 }
                 self.comment("AIR prelude");

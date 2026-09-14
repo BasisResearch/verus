@@ -2344,6 +2344,77 @@ fn assert_id_roundtrip() {
     assert_eq!(printed, node);
 }
 
+/// cvc5's `(get-info :matching-loops)` reply, as it prints it: one loop per
+/// line after the header.
+#[test]
+fn matching_loops_reply_parses() {
+    let lines: Vec<String> = [
+        "(:matching-loops (:rounds 10 :instantiations 12 :dropped 0 :max-inst-rounds true :loops (",
+        "(loop :qid |user_f_grows_3| :confidence high :growth linear-depth :edges confirmed \
+         :stable true :instantiations 10 :rounds 10 :first-round 1 :last-round 10 :chain 10 \
+         :self-fed 9 :depth-per-rung 1.00 :depth-per-round 1.00 :fanout-per-round 1.00 \
+         :via () :trigger ((f x)) :context ((g _0)) :shape ((f _0)) :step ((f (g _0))) \
+         :ladder (((f a)) ((f (g a))) ((f (g (g a)))) ((f (g (g (g a)))))) :ladder-length 10 \
+         :per-round (1 1 1 1 1 1 1 1 1 1)))))",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    let info = crate::smt_verify::parse_matching_loops_lines(&lines);
+    assert!(info.unparsed.is_empty(), "{:?}", info.unparsed);
+    assert_eq!((info.rounds, info.instantiations, info.max_inst_rounds), (10, 12, true));
+    assert_eq!(info.loops.len(), 1);
+    let l = &info.loops[0];
+    assert_eq!(l.qid, "user_f_grows_3");
+    assert_eq!((l.confidence.as_str(), l.growth.as_str()), ("high", "linear-depth"));
+    assert!(l.edges_confirmed && l.stable);
+    assert_eq!((l.chain, l.self_fed, l.ladder_length), (10, 9, 10));
+    assert_eq!(l.depth_per_round, 1.0);
+    assert_eq!(l.trigger, vec!["(f x)"]);
+    assert_eq!(l.context, vec!["(g _0)"]);
+    assert_eq!(l.shape, vec!["(f _0)"]);
+    assert_eq!(l.step, vec!["(f (g _0))"]);
+    assert_eq!(l.ladder.len(), 4);
+    assert_eq!(l.ladder[1], vec!["(f (g a))"]);
+    assert_eq!(l.per_round.len(), 10);
+    // no loops; and a reply of another shape is kept, not failed on
+    let info = crate::smt_verify::parse_matching_loops_lines(&vec![
+        "(:matching-loops (:rounds 2 :instantiations 3 :dropped 0 :max-inst-rounds false :loops ()))"
+            .to_string(),
+    ]);
+    assert!(info.loops.is_empty() && info.unparsed.is_empty());
+    let info = crate::smt_verify::parse_matching_loops_lines(&vec!["(error \"no\")".to_string()]);
+    assert_eq!(info.unparsed, vec!["(error \"no\")".to_string()]);
+    // a quoted symbol sise cannot read bare, a bar inside a string literal,
+    // and a term broken across lines: the reply still parses, terms one line
+    let info = crate::smt_verify::parse_matching_loops_lines(&vec![
+        "(:matching-loops (:rounds 3 :instantiations 3 :dropped 0 :max-inst-rounds false :loops ("
+            .to_string(),
+        "(loop :qid |odd name| :confidence low :growth bounded :edges unconfirmed :stable false \
+         :via (|odd name|) :trigger ((str.++ s \"a|b\")) :shape ((f\n   (g _0))) :ladder-length 0))))"
+            .to_string(),
+    ]);
+    assert!(info.unparsed.is_empty(), "{:?}", info.unparsed);
+    let l = &info.loops[0];
+    assert_eq!((l.qid.as_str(), l.via.clone()), ("|odd name|", vec!["|odd name|".to_string()]));
+    assert_eq!(l.trigger, vec!["(str.++ s \"a|b\")"]);
+    assert_eq!(l.shape, vec!["(f (g _0))"]);
+    // `:fanout-per-step` beside `:fanout-per-round`, and one context per
+    // class of growing subterm (BasisResearch/cvc5#3 since ea27199)
+    let info = crate::smt_verify::parse_matching_loops_lines(&vec![
+        "(:matching-loops (:rounds 10 :instantiations 31 :dropped 0 :max-inst-rounds true :loops ("
+            .to_string(),
+        "(loop :qid |user_f_branches_1| :confidence high :growth exponential-fanout \
+         :edges confirmed :stable true :fanout-per-round 1.41 :fanout-per-step 2.00 \
+         :context ((r _0) (l _0)) :ladder-length 5))))"
+            .to_string(),
+    ]);
+    assert!(info.unparsed.is_empty(), "{:?}", info.unparsed);
+    let l = &info.loops[0];
+    assert_eq!((l.fanout_per_round, l.fanout_per_step), (1.41, 2.0));
+    assert_eq!(l.context, vec!["(r _0)", "(l _0)"]);
+}
+
 /// The extra lines provenance mode adds to a check-sat batch: instantiation
 /// dump forms and the tags-only sources reply, in the order cvc5 prints them.
 #[test]
