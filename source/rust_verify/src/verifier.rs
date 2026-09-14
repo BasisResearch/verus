@@ -334,6 +334,9 @@ pub struct Verifier {
     /// Under `-V nl-frontier`: what cvc5 reported for each query of each
     /// function, raw (solver terms, tag symbols and qids), in check order
     func_nl_frontier: HashMap<Fun, Vec<QueryNlFrontier>>,
+    /// Under `-V matching-loops`: what cvc5 reported after each unknown check
+    /// of each function, not yet joined to source.
+    pub func_matching_loops: HashMap<Fun, Vec<QueryMatchingLoops>>,
     /// Under `-V inst-pressure`: what cvc5 reported for each query of each
     /// function, by qid, in check order
     func_inst_pressure: HashMap<Fun, Vec<QueryInstPressure>>,
@@ -366,9 +369,9 @@ pub struct Verifier {
 }
 
 pub use crate::provenance::{
-    QueryInstPressure, QueryNlFrontier, QueryProvenance, ResolvedInstantiation,
-    ResolvedQuantPressure, ResolvedQueryInstPressure, ResolvedQueryNlFrontier,
-    ResolvedQueryProvenance, ResolvedTag,
+    QueryInstPressure, QueryMatchingLoops, QueryNlFrontier, QueryProvenance, ResolvedInstantiation,
+    ResolvedMatchingLoop, ResolvedQuantPressure, ResolvedQueryInstPressure,
+    ResolvedQueryMatchingLoops, ResolvedQueryNlFrontier, ResolvedQueryProvenance, ResolvedTag,
 };
 
 #[derive(serde::Serialize)]
@@ -381,6 +384,9 @@ pub struct FuncDetails {
     /// filled under `-V nl-frontier`
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub nl_frontier: Vec<ResolvedQueryNlFrontier>,
+    /// filled under `-V matching-loops`, one entry per unknown check
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub matching_loops: Vec<ResolvedQueryMatchingLoops>,
     /// filled under `-V inst-pressure`
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub inst_pressure: Vec<ResolvedQueryInstPressure>,
@@ -393,6 +399,7 @@ impl Default for FuncDetails {
             failed_proof_notes: Default::default(),
             provenance: Default::default(),
             nl_frontier: Default::default(),
+            matching_loops: Default::default(),
             inst_pressure: Default::default(),
         }
     }
@@ -404,6 +411,7 @@ impl FuncDetails {
         self.failed_proof_notes.extend(other.failed_proof_notes);
         self.provenance.extend(other.provenance);
         self.nl_frontier.extend(other.nl_frontier);
+        self.matching_loops.extend(other.matching_loops);
         self.inst_pressure.extend(other.inst_pressure);
     }
 
@@ -561,6 +569,7 @@ impl Verifier {
             func_details: HashMap::new(),
             func_provenance: HashMap::new(),
             func_nl_frontier: HashMap::new(),
+            func_matching_loops: HashMap::new(),
             func_inst_pressure: HashMap::new(),
             deferred_errors: Vec::new(),
 
@@ -616,6 +625,7 @@ impl Verifier {
             func_details: HashMap::new(),
             func_provenance: HashMap::new(),
             func_nl_frontier: HashMap::new(),
+            func_matching_loops: HashMap::new(),
             func_inst_pressure: HashMap::new(),
             deferred_errors: Vec::new(),
 
@@ -657,6 +667,9 @@ impl Verifier {
         for (fun, queries) in other.func_nl_frontier {
             self.func_nl_frontier.entry(fun).or_default().extend(queries);
         }
+        for (fun, queries) in other.func_matching_loops {
+            self.func_matching_loops.entry(fun).or_default().extend(queries);
+        }
         for (fun, queries) in other.func_inst_pressure {
             self.func_inst_pressure.entry(fun).or_default().extend(queries);
         }
@@ -684,6 +697,7 @@ impl Verifier {
             buckets,
             crate::resident::SessionInfo {
                 provenance: self.args.provenance,
+                matching_loops: self.args.matching_loops,
                 spinoff_all: self.args.spinoff_all,
                 multiple_errors: self.args.multiple_errors,
                 smt_options: self.args.smt_options.clone(),
@@ -955,6 +969,17 @@ impl Verifier {
                         round,
                         result: result_str(),
                         frontier,
+                    },
+                );
+            }
+            if let Some(info) = air_context.take_matching_loops() {
+                self.func_matching_loops.entry(context.fun.clone()).or_default().push(
+                    QueryMatchingLoops {
+                        desc: context.desc.clone(),
+                        span: context.span.as_string.clone(),
+                        round,
+                        result: result_str(),
+                        info,
                     },
                 );
             }
@@ -1294,6 +1319,15 @@ impl Verifier {
         }
     }
 
+    /// Resolve batch matching-loop replies the same way as provenance.
+    fn resolve_matching_loops(&mut self, symbols: &crate::provenance::Symbols) {
+        for (fun, queries) in std::mem::take(&mut self.func_matching_loops) {
+            let resolved =
+                queries.into_iter().map(|query| symbols.resolve_matching_loops(&fun, query));
+            self.func_details.entry(fun.clone()).or_default().matching_loops.extend(resolved);
+        }
+    }
+
     /// Join each query's instantiation pressure to source, per function.
     fn resolve_inst_pressure(&mut self, symbols: &crate::provenance::Symbols) {
         for (fun, queries) in std::mem::take(&mut self.func_inst_pressure) {
@@ -1352,6 +1386,9 @@ impl Verifier {
         }
         if self.args.nl_frontier {
             air_context.set_nl_frontier(true);
+        }
+        if self.args.matching_loops {
+            air_context.set_matching_loops(true, self.args.matching_loop_rounds);
         }
         if self.args.inst_pressure {
             air_context.set_inst_pressure(true);
@@ -2144,9 +2181,12 @@ impl Verifier {
                 air_context,
                 journal,
                 resident_spinoffs,
-                self.args.provenance.then(|| {
-                    crate::provenance::Symbols::capture(&ctx.global, ctx.name_ctxt.source_names())
-                }),
+                // E-graph readings render solver terms as source in every
+                // session, not only under provenance.
+                Some(crate::provenance::Symbols::capture(
+                    &ctx.global,
+                    ctx.name_ctxt.source_names(),
+                )),
             ));
         }
 
@@ -2797,15 +2837,22 @@ impl Verifier {
                 writeln!(file, "{:#?}", triggers).expect("error writing to trigger log file");
             }
         }
-        // Join what cvc5 reported (instantiation pressure, provenance,
-        // nonlinear frontiers) back to source, per function. All joins read
-        // the same symbols.
-        if self.args.inst_pressure || self.args.provenance || self.args.nl_frontier {
+        // Join what cvc5 reported (matching loops, instantiation pressure,
+        // provenance, nonlinear frontiers) back to source, per function. The
+        // joins read the same symbols.
+        if self.args.matching_loops
+            || self.args.inst_pressure
+            || self.args.provenance
+            || self.args.nl_frontier
+        {
             let symbols = crate::provenance::Symbols::capture(
                 &global_ctx,
                 global_ctx.air_source_names.borrow().clone(),
             )
             .with_function_spans(&krate.functions);
+            if self.args.matching_loops {
+                self.resolve_matching_loops(&symbols);
+            }
             if self.args.inst_pressure {
                 self.resolve_inst_pressure(&symbols);
             }
