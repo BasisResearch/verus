@@ -293,6 +293,10 @@ pub(crate) fn smt_check_assertion<'ctx>(
         ]));
     }
     context.smt_log.log_word("check-sat");
+    if context.nl_frontier {
+        // in the same batch, right after the answer it describes
+        context.smt_log.log_get_info("nl-frontier");
+    }
     if context.inst_pressure {
         // in the same batch, right after the answer it describes
         context.smt_log.log_get_info("inst-pressure");
@@ -342,6 +346,7 @@ pub(crate) fn smt_check_assertion<'ctx>(
     // Process SMT results
     let mut unsat = None;
     let mut provenance_lines: Vec<String> = Vec::new();
+    let mut nl_frontier = None;
     let mut egraph_lines: Vec<String> = Vec::new();
     let mut inst_pressure = None;
     for line in smt_output {
@@ -355,7 +360,13 @@ pub(crate) fn smt_check_assertion<'ctx>(
             egraph_lines.push(line);
             continue;
         }
-        if context.inst_pressure && line.starts_with("(:inst-pressure ") {
+        if context.nl_frontier && line.starts_with("(:nl-frontier ") {
+            nl_frontier = Some(parse_nl_frontier(&line));
+        } else if context.nl_frontier && nl_frontier.is_none() && line == "unsupported" {
+            // a cvc5 without the key; say so rather than fail the query
+            nl_frontier =
+                Some(crate::context::NlFrontier { unparsed: Some(line), ..Default::default() });
+        } else if context.inst_pressure && line.starts_with("(:inst-pressure ") {
             inst_pressure = Some(parse_inst_pressure(&line));
         } else if context.inst_pressure && inst_pressure.is_none() && line == "unsupported" {
             // a cvc5 without the key; say so rather than fail the query
@@ -397,6 +408,7 @@ pub(crate) fn smt_check_assertion<'ctx>(
     if context.provenance {
         context.last_provenance = Some(parse_provenance_lines(&provenance_lines));
     }
+    context.last_nl_frontier = nl_frontier;
     context.last_inst_pressure = inst_pressure;
     if egraph_asked {
         context.last_egraph = Some(parse_egraph_lines(&egraph_lines));
@@ -514,6 +526,220 @@ pub(crate) fn smt_check_assertion<'ctx>(
             }
         }
     }
+}
+
+/// Parse cvc5's `(:nl-frontier (:result R :reason R :enabled B :checks N
+/// :rounds N :punts N :last L :atoms (ATOM ...) :omitted N :truncated B))`.
+/// Each ATOM is `(:atom T :kind K :current B :rounds N :value V :from-args V
+/// [:lower BOUND] [:upper BOUND] :args ((:term T :value V [:lower BOUND]
+/// [:upper BOUND]) ...) :hosts (HOST ...))`, each BOUND `(:value C :strict B
+/// :fixed B)`, and each HOST `(:in input :term T :tags (T ...))` or `(:in
+/// instance :term T :qid Q :count N)`. Values are as cvc5 prints them
+/// (`-5`, `1/2`). Unknown keys are skipped; a reply that does not parse (a
+/// malformed value, a key without one) is kept whole in `unparsed`.
+pub(crate) fn parse_nl_frontier(line: &str) -> crate::context::NlFrontier {
+    use sise::TreeNode;
+    let mut out = crate::context::NlFrontier::default();
+    let text = bar_symbols_as_strings(line);
+    let mut parser = sise::Parser::new(&text);
+    let fields = match sise::parse_tree(&mut parser) {
+        Ok(TreeNode::List(items)) => match &items[..] {
+            [TreeNode::Atom(key), TreeNode::List(fields)] if key == ":nl-frontier" => {
+                fields.clone()
+            }
+            _ => Vec::new(),
+        },
+        _ => Vec::new(),
+    };
+    if fields.is_empty() {
+        out.unparsed = Some(line.to_owned());
+        return out;
+    }
+    let mut bad = false;
+    for pair in fields.chunks(2) {
+        match pair {
+            [TreeNode::Atom(k), TreeNode::Atom(v)] => match k.as_str() {
+                ":result" => out.result = v.clone(),
+                ":reason" => out.reason = v.clone(),
+                ":enabled" => out.enabled = v == "true",
+                ":last" => out.last = v.clone(),
+                ":truncated" => out.truncated = v == "true",
+                ":checks" | ":rounds" | ":punts" | ":omitted" => {
+                    let Some(n) = difficulty_count(v) else {
+                        bad = true;
+                        continue;
+                    };
+                    match k.as_str() {
+                        ":checks" => out.checks = n,
+                        ":rounds" => out.rounds = n,
+                        ":punts" => out.punts = n,
+                        _ => out.omitted = n,
+                    }
+                }
+                _ => {}
+            },
+            [TreeNode::Atom(k), TreeNode::List(atoms)] if k == ":atoms" => {
+                for atom in atoms {
+                    match parse_nl_atom(atom) {
+                        Some(a) => out.atoms.push(a),
+                        None => bad = true,
+                    }
+                }
+            }
+            [_] => bad = true,
+            _ => {}
+        }
+    }
+    if bad {
+        out.unparsed = Some(line.to_owned());
+    }
+    out
+}
+
+/// A reply subterm as text: lists re-joined, quoted symbols unquoted (see
+/// `bar_symbols_as_strings`), unless whitespace or parentheses in one mean
+/// only its bars keep it one symbol.
+fn sexp_text(node: &sise::TreeNode) -> String {
+    match node {
+        sise::TreeNode::Atom(a) => match a.strip_prefix('"').and_then(|t| t.strip_suffix('"')) {
+            Some(t) if t.contains(|c: char| c.is_whitespace() || c == '(' || c == ')') => {
+                format!("|{t}|")
+            }
+            Some(t) => t.to_owned(),
+            None => a.to_owned(),
+        },
+        sise::TreeNode::List(items) => {
+            format!("({})", items.iter().map(sexp_text).collect::<Vec<_>>().join(" "))
+        }
+    }
+}
+
+/// `(:value C :strict B :fixed B)`
+fn parse_nl_bound(node: &sise::TreeNode) -> Option<crate::context::NlBound> {
+    let sise::TreeNode::List(items) = node else { return None };
+    let mut b = crate::context::NlBound::default();
+    for pair in items.chunks(2) {
+        match pair {
+            [sise::TreeNode::Atom(k), v] if k == ":value" => b.value = sexp_text(v),
+            [sise::TreeNode::Atom(k), sise::TreeNode::Atom(v)] if k == ":strict" => {
+                b.strict = v == "true"
+            }
+            [sise::TreeNode::Atom(k), sise::TreeNode::Atom(v)] if k == ":fixed" => {
+                b.fixed = v == "true"
+            }
+            [_] => return None,
+            _ => {}
+        }
+    }
+    (!b.value.is_empty()).then_some(b)
+}
+
+/// `(:term T :value V [:lower BOUND] [:upper BOUND])`
+fn parse_nl_term(node: &sise::TreeNode) -> Option<crate::context::NlTerm> {
+    let sise::TreeNode::List(items) = node else { return None };
+    let mut t = crate::context::NlTerm::default();
+    for pair in items.chunks(2) {
+        match pair {
+            [sise::TreeNode::Atom(k), v] if k == ":term" => t.term = sexp_text(v),
+            [sise::TreeNode::Atom(k), v] if k == ":value" => t.value = sexp_text(v),
+            [sise::TreeNode::Atom(k), v] if k == ":lower" => t.lower = Some(parse_nl_bound(v)?),
+            [sise::TreeNode::Atom(k), v] if k == ":upper" => t.upper = Some(parse_nl_bound(v)?),
+            [_] => return None,
+            _ => {}
+        }
+    }
+    Some(t)
+}
+
+/// One ATOM of `(get-info :nl-frontier)`.
+fn parse_nl_atom(node: &sise::TreeNode) -> Option<crate::context::NlAtom> {
+    use sise::TreeNode;
+    let TreeNode::List(items) = node else { return None };
+    let mut a = crate::context::NlAtom::default();
+    for pair in items.chunks(2) {
+        match pair {
+            [TreeNode::Atom(k), v] if k == ":atom" => a.atom = sexp_text(v),
+            [TreeNode::Atom(k), TreeNode::Atom(v)] if k == ":kind" => a.kind = v.clone(),
+            [TreeNode::Atom(k), TreeNode::Atom(v)] if k == ":current" => a.current = v == "true",
+            [TreeNode::Atom(k), TreeNode::Atom(v)] if k == ":rounds" => {
+                a.rounds = difficulty_count(v)?
+            }
+            [TreeNode::Atom(k), v] if k == ":value" => a.value = sexp_text(v),
+            [TreeNode::Atom(k), v] if k == ":from-args" => a.from_args = sexp_text(v),
+            [TreeNode::Atom(k), v] if k == ":lower" => a.lower = Some(parse_nl_bound(v)?),
+            [TreeNode::Atom(k), v] if k == ":upper" => a.upper = Some(parse_nl_bound(v)?),
+            [TreeNode::Atom(k), TreeNode::List(args)] if k == ":args" => {
+                for arg in args {
+                    a.args.push(parse_nl_term(arg)?);
+                }
+            }
+            [TreeNode::Atom(k), TreeNode::List(hosts)] if k == ":hosts" => {
+                for host in hosts {
+                    let TreeNode::List(fields) = host else { return None };
+                    let mut h = crate::context::NlHost::default();
+                    for pair in fields.chunks(2) {
+                        match pair {
+                            [TreeNode::Atom(k), TreeNode::Atom(v)] if k == ":in" => {
+                                h.input = v == "input"
+                            }
+                            [TreeNode::Atom(k), v] if k == ":term" => h.term = sexp_text(v),
+                            [TreeNode::Atom(k), TreeNode::List(tags)] if k == ":tags" => {
+                                h.tags = tags.iter().map(sexp_text).collect()
+                            }
+                            [TreeNode::Atom(k), v] if k == ":qid" => {
+                                let qid = sexp_text(v);
+                                h.qid = (qid != "none").then_some(qid);
+                            }
+                            [TreeNode::Atom(k), TreeNode::Atom(v)] if k == ":count" => {
+                                h.count = difficulty_count(v)?
+                            }
+                            [_] => return None,
+                            _ => {}
+                        }
+                    }
+                    a.hosts.push(h);
+                }
+            }
+            [_] => return None,
+            _ => {}
+        }
+    }
+    (!a.atom.is_empty()).then_some(a)
+}
+
+/// A count from a solver reply. cvc5 prints arbitrary-precision integers, so
+/// one too large for u64 saturates rather than fails.
+fn difficulty_count(v: &str) -> Option<u64> {
+    (!v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| v.parse::<u64>().unwrap_or(u64::MAX))
+}
+
+/// cvc5 quotes a symbol that needs it as `|...|`, which sise cannot read, so
+/// spell each one as a sise string. A symbol that cannot be a sise string
+/// (it holds `"` or `\`) is left alone, and the reply stays unparsed.
+fn bar_symbols_as_strings(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut rest = line;
+    while let Some(start) = rest.find('|') {
+        out.push_str(&rest[..start]);
+        let tail = &rest[start + 1..];
+        match tail.find('|') {
+            Some(end)
+                if tail[..end].chars().all(|c| matches!(c, ' '..='~') && c != '"' && c != '\\') =>
+            {
+                out.push('"');
+                out.push_str(&tail[..end]);
+                out.push('"');
+                rest = &tail[end + 1..];
+            }
+            _ => {
+                out.push_str(&rest[start..]);
+                rest = "";
+            }
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Parse cvc5's `(:inst-pressure (:rounds R :refutation B :quantifiers (ROW

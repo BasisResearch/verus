@@ -130,6 +130,8 @@ pub struct ArgsX {
     pub no_bv_simplify: bool,
     pub no_assert_ids: bool,
     pub provenance: bool,
+    /// Record cvc5's nonlinear frontier after every query.
+    pub nl_frontier: bool,
     /// `-V matching-loops[=rounds]`: ask cvc5 for self-feeding quantifiers
     /// after every unknown, bounding instantiation rounds when given.
     pub matching_loops: bool,
@@ -188,6 +190,7 @@ impl ArgsX {
             no_bv_simplify: Default::default(),
             no_assert_ids: Default::default(),
             provenance: Default::default(),
+            nl_frontier: Default::default(),
             matching_loops: Default::default(),
             matching_loop_rounds: Default::default(),
             inst_pressure: Default::default(),
@@ -442,6 +445,7 @@ pub fn parse_args_with_imports(
     const EXTENDED_NO_BV_SIMPLIFY: &str = "no-bv-simplify";
     const EXTENDED_NO_ASSERT_IDS: &str = "no-assert-ids";
     const EXTENDED_PROVENANCE: &str = "provenance";
+    const EXTENDED_NL_FRONTIER: &str = "nl-frontier";
     const EXTENDED_MATCHING_LOOPS: &str = "matching-loops";
     const EXTENDED_INST_PRESSURE: &str = "inst-pressure";
     const EXTENDED_KEYS: &[(&str, &str)] = &[
@@ -468,6 +472,10 @@ pub fn parse_args_with_imports(
         (
             EXTENDED_PROVENANCE,
             "Provenance mode: run cvc5 with preprocessing proofs and twice the rlimit, and record which hypotheses, axioms and quantifiers each query used (diagnostic; verdicts may differ from a plain run)",
+        ),
+        (
+            EXTENDED_NL_FRONTIER,
+            "Record, per query, the nonlinear terms cvc5 could not reconcile with its linear model, with their values, asserted bounds and where they entered the problem (read-only: the search is the ordinary one)",
         ),
         (
             EXTENDED_MATCHING_LOOPS,
@@ -906,6 +914,7 @@ pub fn parse_args_with_imports(
         no_bv_simplify: extended.contains_key(EXTENDED_NO_BV_SIMPLIFY),
         no_assert_ids: extended.contains_key(EXTENDED_NO_ASSERT_IDS),
         provenance: extended.contains_key(EXTENDED_PROVENANCE),
+        nl_frontier: extended.contains_key(EXTENDED_NL_FRONTIER),
         matching_loops: extended.contains_key(EXTENDED_MATCHING_LOOPS),
         matching_loop_rounds: match extended.get(EXTENDED_MATCHING_LOOPS) {
             // zero rounds would instantiate nothing and fail every quantified check
@@ -920,6 +929,16 @@ pub fn parse_args_with_imports(
         inst_pressure: extended.contains_key(EXTENDED_INST_PRESSURE),
         resident: matches.opt_present(OPT_RESIDENT),
     };
+
+    if args.nl_frontier && !matches!(args.solver, SmtSolver::Cvc5) {
+        error(
+            "-V nl-frontier requires cvc5 (it is unavailable for vstd and internal test mode)"
+                .to_string(),
+        );
+    }
+    if args.nl_frontier && args.resident {
+        error("-V nl-frontier is not available in resident mode".to_string());
+    }
 
     if args.provenance && !matches!(args.solver, SmtSolver::Cvc5) {
         error(

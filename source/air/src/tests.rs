@@ -2455,6 +2455,70 @@ fn provenance_reply_parses() {
 }
 
 #[test]
+fn parse_nl_frontier_reply() {
+    // the shape cvc5's (get-info :nl-frontier) prints after a budget runs out
+    let f = crate::smt_verify::parse_nl_frontier(
+        "(:nl-frontier (:result unknown :reason resourceout :enabled true :checks 40 \
+         :rounds 38 :punts 0 :last lemma :atoms (\
+         (:atom (* x y) :kind product :current true :rounds 12 :value 5 :from-args -6 \
+         :lower (:value 0 :strict false :fixed true) \
+         :args ((:term x :value 2 :lower (:value 0 :strict false :fixed true)) \
+         (:term |y%1| :value -1/3 :upper (:value 10 :strict true :fixed false))) \
+         :hosts ((:in input :term (Mul x |y%1|) :tags (query hyp_2)) \
+         (:in instance :term (Mul x |y%1|) :qid prelude_mul :count 3)))) \
+         :omitted 0 :truncated false))",
+    );
+    assert!(f.unparsed.is_none(), "{:?}", f.unparsed);
+    assert_eq!(
+        (f.result.as_str(), f.reason.as_str(), f.last.as_str()),
+        ("unknown", "resourceout", "lemma")
+    );
+    assert_eq!((f.enabled, f.checks, f.rounds, f.punts, f.omitted), (true, 40, 38, 0, 0));
+    let a = &f.atoms[0];
+    assert_eq!(
+        (a.atom.as_str(), a.kind.as_str(), a.current, a.rounds),
+        ("(* x y)", "product", true, 12)
+    );
+    assert_eq!((a.value.as_str(), a.from_args.as_str()), ("5", "-6"));
+    assert_eq!(a.args[1].value, "-1/3");
+    assert!(a.lower.as_ref().is_some_and(|b| b.value == "0" && !b.strict && b.fixed));
+    assert!(a.upper.is_none());
+    // quoted symbols lose their bars
+    assert_eq!(a.args[1].term, "y%1");
+    assert!(a.args[1].upper.as_ref().is_some_and(|b| b.value == "10" && b.strict && !b.fixed));
+    assert_eq!(a.hosts.len(), 2);
+    assert!(a.hosts[0].input && a.hosts[0].tags == vec!["query", "hyp_2"]);
+    assert_eq!(a.hosts[0].term, "(Mul x y%1)");
+    assert!(!a.hosts[1].input && a.hosts[1].qid.as_deref() == Some("prelude_mul"));
+    assert_eq!(a.hosts[1].count, 3);
+
+    // nothing recorded; a solver without the key or anything unforeseen is kept whole
+    let f = crate::smt_verify::parse_nl_frontier(
+        "(:nl-frontier (:result unsat :reason none :enabled true :checks 0 :rounds 0 \
+         :punts 0 :last none :atoms () :omitted 0 :truncated false))",
+    );
+    assert!(f.unparsed.is_none() && f.atoms.is_empty() && f.result == "unsat");
+    let bad = "(:nl-frontier (:result sat :atoms ((:atom (* x y) :rounds many))))";
+    assert_eq!(crate::smt_verify::parse_nl_frontier(bad).unparsed.as_deref(), Some(bad));
+    let bad = "(:nl-frontier unsupported)";
+    assert_eq!(crate::smt_verify::parse_nl_frontier(bad).unparsed.as_deref(), Some(bad));
+    // a key without a value is malformed, at any depth
+    let bad = "(:nl-frontier (:result sat :checks))";
+    assert_eq!(crate::smt_verify::parse_nl_frontier(bad).unparsed.as_deref(), Some(bad));
+    let bad = "(:nl-frontier (:result sat :atoms ((:atom (* x y) :kind))))";
+    assert_eq!(crate::smt_verify::parse_nl_frontier(bad).unparsed.as_deref(), Some(bad));
+    // a quoted symbol that is not one word keeps its bars
+    let f = crate::smt_verify::parse_nl_frontier(
+        "(:nl-frontier (:result sat :atoms ((:atom (* x |a b|) :args ((:term |a b| :value 3)) \
+         :hosts ((:in input :term (Mul x |a b|) :tags (query)))))))",
+    );
+    assert!(f.unparsed.is_none(), "{:?}", f.unparsed);
+    assert_eq!(f.atoms[0].atom, "(* x |a b|)");
+    assert_eq!(f.atoms[0].args[0].term, "|a b|");
+    assert_eq!(f.atoms[0].hosts[0].term, "(Mul x |a b|)");
+}
+
+#[test]
 fn replayed_scope_reuses_generated_names() {
     // A resident session rebuilds a popped query prefix by replaying its
     // declarations. The replay must name AIR's generated symbols as the first
