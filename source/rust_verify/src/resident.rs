@@ -15,6 +15,8 @@
 //! bit-vector solvers remain prelude-free but use incremental query scopes.
 //! Checked provenance describes round zero, matching the result and assertion
 //! ID. Diagnostics can include further rounds requested by `--multiple-errors`.
+//! Under `-V matching-loops`, `ready.matching_loops` is true and a check whose
+//! round zero came back unknown carries its source-resolved `matching_loops`.
 //!
 //! `ready.smt_options` echoes the ordered name/value pairs already applied at
 //! solver startup. Rechecks preserve those settings in the original contexts;
@@ -320,6 +322,9 @@ pub(crate) struct Server {
 /// that would be right to fall back to.
 pub(crate) struct SessionInfo {
     pub(crate) provenance: bool,
+    /// Whether the retained solvers record instantiations for
+    /// `(get-info :matching-loops)` (`-V matching-loops`).
+    pub(crate) matching_loops: bool,
     pub(crate) spinoff_all: bool,
     /// How many errors one query may report, as `--multiple-errors` set it. A
     /// recheck looks for as many as the original invocation did.
@@ -342,6 +347,7 @@ enum Response<'a> {
         process_id: u32,
         invocation_succeeded: bool,
         provenance: bool,
+        matching_loops: bool,
         spinoff_all: bool,
         smt_options: &'a [(String, String)],
         instantiation_replay: bool,
@@ -365,6 +371,8 @@ enum Response<'a> {
         /// Present when the first round answered `unknown`: the solver's reason
         /// and candidate culprit quantifiers.
         unknown_reason: Option<&'a crate::provenance::ResolvedUnknownReason>,
+        /// Present when round zero came back unknown under `-V matching-loops`.
+        matching_loops: Option<&'a crate::provenance::ResolvedQueryMatchingLoops>,
         /// Present when this check tried a certificate before searching.
         certificate: Option<CertificateAttempt>,
     },
@@ -1148,6 +1156,7 @@ impl Server {
                 process_id: std::process::id(),
                 invocation_succeeded,
                 provenance: self.info.provenance,
+                matching_loops: self.info.matching_loops,
                 spinoff_all: self.info.spinoff_all,
                 smt_options: &self.info.smt_options,
                 instantiation_replay: self.info.instantiation_replay,
@@ -1324,6 +1333,7 @@ impl Server {
                         air.set_import_instantiations(None);
                         drop(air.take_provenance());
                         drop(air.take_unknown_reason());
+                        drop(air.take_matching_loops());
                         drop(air.take_inst_pressure());
                         match attempt {
                             ValidityResult::Valid(usage) => {
@@ -1356,6 +1366,7 @@ impl Server {
                     // replace AIR's provenance, even when their verdict differs.
                     let first_provenance = air.take_provenance();
                     let first_unknown_reason = air.take_unknown_reason();
+                    let first_matching_loops = air.take_matching_loops();
                     // Sessions do not report instantiation pressure yet.
                     drop(air.take_inst_pressure());
                     // Ask for further errors exactly as far as the original
@@ -1440,6 +1451,7 @@ impl Server {
                                     QueryContext::default(),
                                 );
                                 drop(air.take_provenance());
+                                drop(air.take_matching_loops());
                                 drop(air.take_inst_pressure());
                             }
                             ValidityResult::TypeError(error) => {
@@ -1499,6 +1511,25 @@ impl Server {
                             reason,
                         )
                     });
+                    let matching_loops = first_matching_loops.and_then(|info| {
+                        bucket.symbols.as_ref().map(|symbols| {
+                            symbols.resolve_matching_loops(
+                                &query.context.fun,
+                                crate::provenance::QueryMatchingLoops {
+                                    desc: query.context.desc.clone(),
+                                    span: query.context.span.as_string.clone(),
+                                    round: 0,
+                                    result: match result {
+                                        QueryResult::Valid => "valid",
+                                        QueryResult::Invalid => "invalid",
+                                        QueryResult::ResourceLimit => "canceled",
+                                    }
+                                    .to_owned(),
+                                    info,
+                                },
+                            )
+                        })
+                    });
                     // Only a proof is worth keeping. A failed check's instances
                     // are no certificate, and saving them would replace one
                     // that still closes the query once the failing edit is
@@ -1526,6 +1557,7 @@ impl Server {
                             restore_ms,
                             provenance: provenance.as_ref(),
                             unknown_reason: unknown_reason.as_ref(),
+                            matching_loops: matching_loops.as_ref(),
                             certificate: attempted,
                         },
                     )?;
@@ -1855,6 +1887,7 @@ mod tests {
             Vec::new(),
             SessionInfo {
                 provenance: false,
+                matching_loops: false,
                 spinoff_all: false,
                 multiple_errors: 2,
                 input_files: Vec::new(),

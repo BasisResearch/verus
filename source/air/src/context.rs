@@ -81,6 +81,104 @@ pub struct UnknownReason {
     pub culprit_qids: Vec<String>,
 }
 
+/// What cvc5's `(get-info :nl-frontier)` reported for one `check-sat`
+/// (`-V nl-frontier`): the nonlinear terms whose value in the linear model
+/// the nonlinear extension could not reconcile with their arguments' values,
+/// and where each entered the problem. Terms and tags are the solver's
+/// spelling; the join back to source happens in Verus.
+#[derive(Debug, Clone, Default)]
+pub struct NlFrontier {
+    /// SSA symbol -> original AIR variable and assignment version, recorded by lowering.
+    pub variable_versions: VariableVersions,
+    /// `unsat`, `sat` or `unknown` as cvc5 answered; `none` before a check.
+    pub result: String,
+    /// The unknown explanation in lower case (`incomplete`, `resourceout`,
+    /// ...), `none` unless `unknown`.
+    pub reason: String,
+    /// Whether cvc5's nonlinear extension was on.
+    pub enabled: bool,
+    /// Model-based refinement runs, runs with an assertion false in the
+    /// candidate model, and runs that gave up (no lemma, model unverified).
+    pub checks: u64,
+    pub rounds: u64,
+    pub punts: u64,
+    /// How the most recent run ended: `none`, `sat`, `lemma` or `punt`.
+    pub last: String,
+    /// Most recent round's atoms first, then by rounds wrong.
+    pub atoms: Vec<NlAtom>,
+    /// Atoms left out of `atoms`.
+    pub omitted: u64,
+    /// Whether the search for hosts in instantiations stopped early.
+    pub truncated: bool,
+    /// The reply, when it did not parse.
+    pub unparsed: Option<String>,
+}
+
+/// What cvc5 reported for `(get-info :matching-loops)` after a `check-sat`
+/// answered unknown (`-V matching-loops`): the quantifiers whose
+/// instantiations fed themselves, symbols and SMT terms not yet joined to
+/// source. The fields mirror the reply (see cvc5's
+/// `theory/quantifiers/matching_loops.h`).
+#[derive(Debug, Clone, Default)]
+pub struct MatchingLoopsInfo {
+    /// SSA symbol -> original AIR variable and assignment version, recorded by lowering.
+    pub variable_versions: VariableVersions,
+    /// The last instantiation round of the check
+    pub rounds: u64,
+    /// Instantiations recorded, and those past cvc5's recording cap
+    pub instantiations: u64,
+    pub dropped: u64,
+    /// Whether the instantiation round limit stopped the check
+    pub max_inst_rounds: bool,
+    pub loops: Vec<MatchingLoop>,
+    /// Reply parts the parser did not recognise, kept rather than failed on.
+    pub unparsed: Vec<String>,
+}
+
+/// One self-feeding quantifier, as cvc5 reported it. Terms are SMT text.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct MatchingLoop {
+    pub qid: String,
+    /// high (the round limit cut the loop off while it climbed), medium, low
+    pub confidence: String,
+    /// linear-depth, exponential-fanout, or bounded
+    pub growth: String,
+    /// whether the chain follows instantiations that matched a term the
+    /// previous rung introduced, rather than the deepest one of each round
+    pub edges_confirmed: bool,
+    /// whether consecutive rungs generalise to one shape
+    pub stable: bool,
+    pub instantiations: u64,
+    pub rounds: u64,
+    pub first_round: u64,
+    pub last_round: u64,
+    pub chain: u64,
+    pub self_fed: u64,
+    pub depth_per_rung: f64,
+    pub depth_per_round: f64,
+    pub fanout_per_round: f64,
+    /// growth per step of the quantifier's own rounds: a loop that fires
+    /// every other round doubles per step while `fanout_per_round` reads 1.41
+    pub fanout_per_step: f64,
+    /// qids of the other quantifiers a step passed through
+    pub via: Vec<String>,
+    /// the trigger whose matches formed the rungs, one term per trigger term
+    pub trigger: Vec<String>,
+    /// what each rung wraps around the previous one's growing subterm,
+    /// generalised over the chain, `_0` marking that subterm; one per class
+    /// when the loop climbs several subterms (`(r _0)`, `(l _0)`), and empty
+    /// when the rungs do not grow into each other
+    pub context: Vec<String>,
+    /// the generalisation of every rung, and of every rung after the first
+    pub shape: Vec<String>,
+    pub step: Vec<String>,
+    /// the first rungs and the last, each the trigger instantiated
+    pub ladder: Vec<Vec<String>>,
+    pub ladder_length: u64,
+    /// instantiations of the quantifier per round, the last rounds
+    pub per_round: Vec<u64>,
+}
+
 /// What a query's first `check-sat` also asks cvc5 for: the equalities its
 /// e-graph holds between the query's own terms (`get-egraph-equalities`).
 #[derive(Debug, Clone, Copy)]
@@ -153,6 +251,65 @@ pub struct InstPressure {
     pub quantifiers: Vec<QuantPressure>,
     /// The reply, when it did not parse.
     pub unparsed: Option<String>,
+}
+
+/// One nonlinear term of `(get-info :nl-frontier)`.
+#[derive(Debug, Clone, Default)]
+pub struct NlAtom {
+    /// The term as the input spelled it, e.g. `(* x y)`.
+    pub atom: String,
+    /// product, power, division, iand, pow2 or transcendental
+    pub kind: String,
+    /// Whether it was wrong in the most recent refinement round.
+    pub current: bool,
+    /// In how many rounds it was wrong.
+    pub rounds: u64,
+    /// Its value in the linear model, and the value its arguments give it
+    /// (they differ: that is why it is on the frontier). Each is a rational
+    /// as cvc5 prints it (`-5`, `1/2`), or `none`.
+    pub value: String,
+    pub from_args: String,
+    /// The bounds asserted on the atom itself.
+    pub lower: Option<NlBound>,
+    pub upper: Option<NlBound>,
+    /// Its distinct arguments with their values and asserted bounds.
+    pub args: Vec<NlTerm>,
+    /// Where it entered the problem.
+    pub hosts: Vec<NlHost>,
+}
+
+/// A term with its model value and asserted bounds.
+#[derive(Debug, Clone, Default)]
+pub struct NlTerm {
+    pub term: String,
+    pub value: String,
+    pub lower: Option<NlBound>,
+    pub upper: Option<NlBound>,
+}
+
+/// A constant bound read off an asserted literal.
+#[derive(Debug, Clone, Default)]
+pub struct NlBound {
+    /// A rational as cvc5 prints it, e.g. `5`, `-5` or `1/2`.
+    pub value: String,
+    pub strict: bool,
+    /// Whether the literal is implied by the assertions (fixed at SAT level
+    /// 0), rather than holding only in the branch the solver explored.
+    pub fixed: bool,
+}
+
+/// A term that applies one function to exactly an atom's factors: in a
+/// tagged input assertion, or in the instantiations of one quantifier.
+#[derive(Debug, Clone, Default)]
+pub struct NlHost {
+    /// `true` for an input assertion, `false` for an instantiation.
+    pub input: bool,
+    pub term: String,
+    /// Input hosts: the tags of the assertions holding the term.
+    pub tags: Vec<String>,
+    /// Instantiation hosts: the quantifier's `:qid`, and how many vectors.
+    pub qid: Option<String>,
+    pub count: u64,
 }
 
 /// One quantifier's row of `(get-info :inst-pressure)`. Counts are the
@@ -297,6 +454,22 @@ pub struct Context {
     pub(crate) last_provenance: Option<ProvenanceInfo>,
     /// Why the last `check-sat` answered `unknown`, until the caller takes it.
     pub(crate) last_unknown_reason: Option<UnknownReason>,
+    /// Nonlinear frontier mode (`-V nl-frontier`): cvc5 is asked for
+    /// `(get-info :nl-frontier)` after every `check-sat`. cvc5 records the
+    /// frontier during every check anyway, so the search is the ordinary one.
+    pub(crate) nl_frontier: bool,
+    /// The nonlinear frontier of the last `check-sat`, until the caller takes it.
+    pub(crate) last_nl_frontier: Option<NlFrontier>,
+    /// Matching-loop mode (`-V matching-loops`): cvc5 records each
+    /// instantiation's round, terms and parents, and is asked for the loops
+    /// among them after every unknown. Recording spends no resource units,
+    /// so the verdict is a plain run's unless `inst_max_rounds` is set.
+    pub(crate) matching_loops: bool,
+    /// cvc5's `--inst-max-rounds`, only under matching-loop mode. A loop is
+    /// high confidence only when this limit stopped the check.
+    pub(crate) inst_max_rounds: Option<u32>,
+    /// The matching loops of the last unknown `check-sat`, until taken.
+    pub(crate) last_matching_loops: Option<MatchingLoopsInfo>,
     /// Ask cvc5 for `(get-info :inst-pressure)` after every `check-sat`
     /// (`-V inst-pressure`). Read-only: the search is unchanged.
     pub(crate) inst_pressure: bool,
@@ -398,6 +571,11 @@ impl Context {
             provenance: false,
             last_provenance: None,
             last_unknown_reason: None,
+            nl_frontier: false,
+            last_nl_frontier: None,
+            matching_loops: false,
+            inst_max_rounds: None,
+            last_matching_loops: None,
             inst_pressure: false,
             last_inst_pressure: None,
             instantiation_replay: false,
@@ -430,6 +608,8 @@ impl Context {
                 transcript_log,
                 self.provenance,
                 self.instantiation_replay,
+                self.matching_loops,
+                self.inst_max_rounds,
             ));
         }
         self.smt_process.as_mut().unwrap()
@@ -525,6 +705,22 @@ impl Context {
         self.last_unknown_reason.take()
     }
 
+    /// The nonlinear frontier cvc5 reported for the most recent `check-sat`,
+    /// if it was asked; each call returns it once.
+    pub fn take_nl_frontier(&mut self) -> Option<NlFrontier> {
+        self.last_nl_frontier.take().map(|mut frontier| {
+            frontier.variable_versions = self.variable_versions.clone();
+            frontier
+        })
+    }
+
+    /// Ask cvc5 for `(get-info :nl-frontier)` after every `check-sat` (cvc5
+    /// only). Nothing about the solver's launch or budget changes.
+    pub fn set_nl_frontier(&mut self, enabled: bool) {
+        assert!(!enabled || matches!(self.solver, SmtSolver::Cvc5));
+        self.nl_frontier = enabled;
+    }
+
     /// The instantiation pressure cvc5 reported for the most recent
     /// `check-sat`, if it was asked; each call returns it once.
     pub fn take_inst_pressure(&mut self) -> Option<InstPressure> {
@@ -545,6 +741,26 @@ impl Context {
         assert!(matches!(self.state, ContextState::NotStarted));
         assert!(!enabled || matches!(self.solver, SmtSolver::Cvc5));
         self.provenance = enabled;
+    }
+
+    /// The matching loops cvc5 reported after the most recent unknown
+    /// `check-sat`, if any; each call returns them once.
+    pub fn take_matching_loops(&mut self) -> Option<MatchingLoopsInfo> {
+        self.last_matching_loops.take().map(|mut info| {
+            info.variable_versions = self.variable_versions.clone();
+            info
+        })
+    }
+
+    /// Turn matching-loop mode on (cvc5 only; must precede the first query).
+    /// The solver is launched with `--matching-loops`, and with
+    /// `--inst-max-rounds` when `inst_max_rounds` is given; each unknown is
+    /// followed by `(get-info :matching-loops)`.
+    pub fn set_matching_loops(&mut self, enabled: bool, inst_max_rounds: Option<u32>) {
+        assert!(matches!(self.state, ContextState::NotStarted));
+        assert!(!enabled || matches!(self.solver, SmtSolver::Cvc5));
+        self.matching_loops = enabled;
+        self.inst_max_rounds = if enabled { inst_max_rounds } else { None };
     }
 
     /// Allow saving and restoring instantiations (cvc5 only; must precede the
@@ -823,6 +1039,15 @@ impl Context {
                     self.comment(&format!(
                         "provenance mode: cvc5 args {}",
                         crate::smt_process::PROVENANCE_ARGS.join(" ")
+                    ));
+                }
+                if self.matching_loops {
+                    let rounds = match self.inst_max_rounds {
+                        Some(n) => format!(" --inst-max-rounds={n}"),
+                        None => String::new(),
+                    };
+                    self.comment(&format!(
+                        "matching-loop mode: cvc5 args --matching-loops{rounds}"
                     ));
                 }
                 self.comment("AIR prelude");

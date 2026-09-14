@@ -2344,6 +2344,77 @@ fn assert_id_roundtrip() {
     assert_eq!(printed, node);
 }
 
+/// cvc5's `(get-info :matching-loops)` reply, as it prints it: one loop per
+/// line after the header.
+#[test]
+fn matching_loops_reply_parses() {
+    let lines: Vec<String> = [
+        "(:matching-loops (:rounds 10 :instantiations 12 :dropped 0 :max-inst-rounds true :loops (",
+        "(loop :qid |user_f_grows_3| :confidence high :growth linear-depth :edges confirmed \
+         :stable true :instantiations 10 :rounds 10 :first-round 1 :last-round 10 :chain 10 \
+         :self-fed 9 :depth-per-rung 1.00 :depth-per-round 1.00 :fanout-per-round 1.00 \
+         :via () :trigger ((f x)) :context ((g _0)) :shape ((f _0)) :step ((f (g _0))) \
+         :ladder (((f a)) ((f (g a))) ((f (g (g a)))) ((f (g (g (g a)))))) :ladder-length 10 \
+         :per-round (1 1 1 1 1 1 1 1 1 1)))))",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    let info = crate::smt_verify::parse_matching_loops_lines(&lines);
+    assert!(info.unparsed.is_empty(), "{:?}", info.unparsed);
+    assert_eq!((info.rounds, info.instantiations, info.max_inst_rounds), (10, 12, true));
+    assert_eq!(info.loops.len(), 1);
+    let l = &info.loops[0];
+    assert_eq!(l.qid, "user_f_grows_3");
+    assert_eq!((l.confidence.as_str(), l.growth.as_str()), ("high", "linear-depth"));
+    assert!(l.edges_confirmed && l.stable);
+    assert_eq!((l.chain, l.self_fed, l.ladder_length), (10, 9, 10));
+    assert_eq!(l.depth_per_round, 1.0);
+    assert_eq!(l.trigger, vec!["(f x)"]);
+    assert_eq!(l.context, vec!["(g _0)"]);
+    assert_eq!(l.shape, vec!["(f _0)"]);
+    assert_eq!(l.step, vec!["(f (g _0))"]);
+    assert_eq!(l.ladder.len(), 4);
+    assert_eq!(l.ladder[1], vec!["(f (g a))"]);
+    assert_eq!(l.per_round.len(), 10);
+    // no loops; and a reply of another shape is kept, not failed on
+    let info = crate::smt_verify::parse_matching_loops_lines(&vec![
+        "(:matching-loops (:rounds 2 :instantiations 3 :dropped 0 :max-inst-rounds false :loops ()))"
+            .to_string(),
+    ]);
+    assert!(info.loops.is_empty() && info.unparsed.is_empty());
+    let info = crate::smt_verify::parse_matching_loops_lines(&vec!["(error \"no\")".to_string()]);
+    assert_eq!(info.unparsed, vec!["(error \"no\")".to_string()]);
+    // a quoted symbol sise cannot read bare, a bar inside a string literal,
+    // and a term broken across lines: the reply still parses, terms one line
+    let info = crate::smt_verify::parse_matching_loops_lines(&vec![
+        "(:matching-loops (:rounds 3 :instantiations 3 :dropped 0 :max-inst-rounds false :loops ("
+            .to_string(),
+        "(loop :qid |odd name| :confidence low :growth bounded :edges unconfirmed :stable false \
+         :via (|odd name|) :trigger ((str.++ s \"a|b\")) :shape ((f\n   (g _0))) :ladder-length 0))))"
+            .to_string(),
+    ]);
+    assert!(info.unparsed.is_empty(), "{:?}", info.unparsed);
+    let l = &info.loops[0];
+    assert_eq!((l.qid.as_str(), l.via.clone()), ("|odd name|", vec!["|odd name|".to_string()]));
+    assert_eq!(l.trigger, vec!["(str.++ s \"a|b\")"]);
+    assert_eq!(l.shape, vec!["(f (g _0))"]);
+    // `:fanout-per-step` beside `:fanout-per-round`, and one context per
+    // class of growing subterm (BasisResearch/cvc5#3 since ea27199)
+    let info = crate::smt_verify::parse_matching_loops_lines(&vec![
+        "(:matching-loops (:rounds 10 :instantiations 31 :dropped 0 :max-inst-rounds true :loops ("
+            .to_string(),
+        "(loop :qid |user_f_branches_1| :confidence high :growth exponential-fanout \
+         :edges confirmed :stable true :fanout-per-round 1.41 :fanout-per-step 2.00 \
+         :context ((r _0) (l _0)) :ladder-length 5))))"
+            .to_string(),
+    ]);
+    assert!(info.unparsed.is_empty(), "{:?}", info.unparsed);
+    let l = &info.loops[0];
+    assert_eq!((l.fanout_per_round, l.fanout_per_step), (1.41, 2.0));
+    assert_eq!(l.context, vec!["(r _0)", "(l _0)"]);
+}
+
 /// The extra lines provenance mode adds to a check-sat batch: instantiation
 /// dump forms and the tags-only sources reply, in the order cvc5 prints them.
 #[test]
@@ -2396,6 +2467,70 @@ fn incomplete_culprits_reply_parses() {
     // an unterminated quote ends the list rather than inventing a name
     assert_eq!(parse("(:incomplete-culprits (a |b))"), vec!["a"]);
     assert!(parse("unsupported").is_empty());
+}
+
+#[test]
+fn parse_nl_frontier_reply() {
+    // the shape cvc5's (get-info :nl-frontier) prints after a budget runs out
+    let f = crate::smt_verify::parse_nl_frontier(
+        "(:nl-frontier (:result unknown :reason resourceout :enabled true :checks 40 \
+         :rounds 38 :punts 0 :last lemma :atoms (\
+         (:atom (* x y) :kind product :current true :rounds 12 :value 5 :from-args -6 \
+         :lower (:value 0 :strict false :fixed true) \
+         :args ((:term x :value 2 :lower (:value 0 :strict false :fixed true)) \
+         (:term |y%1| :value -1/3 :upper (:value 10 :strict true :fixed false))) \
+         :hosts ((:in input :term (Mul x |y%1|) :tags (query hyp_2)) \
+         (:in instance :term (Mul x |y%1|) :qid prelude_mul :count 3)))) \
+         :omitted 0 :truncated false))",
+    );
+    assert!(f.unparsed.is_none(), "{:?}", f.unparsed);
+    assert_eq!(
+        (f.result.as_str(), f.reason.as_str(), f.last.as_str()),
+        ("unknown", "resourceout", "lemma")
+    );
+    assert_eq!((f.enabled, f.checks, f.rounds, f.punts, f.omitted), (true, 40, 38, 0, 0));
+    let a = &f.atoms[0];
+    assert_eq!(
+        (a.atom.as_str(), a.kind.as_str(), a.current, a.rounds),
+        ("(* x y)", "product", true, 12)
+    );
+    assert_eq!((a.value.as_str(), a.from_args.as_str()), ("5", "-6"));
+    assert_eq!(a.args[1].value, "-1/3");
+    assert!(a.lower.as_ref().is_some_and(|b| b.value == "0" && !b.strict && b.fixed));
+    assert!(a.upper.is_none());
+    // quoted symbols lose their bars
+    assert_eq!(a.args[1].term, "y%1");
+    assert!(a.args[1].upper.as_ref().is_some_and(|b| b.value == "10" && b.strict && !b.fixed));
+    assert_eq!(a.hosts.len(), 2);
+    assert!(a.hosts[0].input && a.hosts[0].tags == vec!["query", "hyp_2"]);
+    assert_eq!(a.hosts[0].term, "(Mul x y%1)");
+    assert!(!a.hosts[1].input && a.hosts[1].qid.as_deref() == Some("prelude_mul"));
+    assert_eq!(a.hosts[1].count, 3);
+
+    // nothing recorded; a solver without the key or anything unforeseen is kept whole
+    let f = crate::smt_verify::parse_nl_frontier(
+        "(:nl-frontier (:result unsat :reason none :enabled true :checks 0 :rounds 0 \
+         :punts 0 :last none :atoms () :omitted 0 :truncated false))",
+    );
+    assert!(f.unparsed.is_none() && f.atoms.is_empty() && f.result == "unsat");
+    let bad = "(:nl-frontier (:result sat :atoms ((:atom (* x y) :rounds many))))";
+    assert_eq!(crate::smt_verify::parse_nl_frontier(bad).unparsed.as_deref(), Some(bad));
+    let bad = "(:nl-frontier unsupported)";
+    assert_eq!(crate::smt_verify::parse_nl_frontier(bad).unparsed.as_deref(), Some(bad));
+    // a key without a value is malformed, at any depth
+    let bad = "(:nl-frontier (:result sat :checks))";
+    assert_eq!(crate::smt_verify::parse_nl_frontier(bad).unparsed.as_deref(), Some(bad));
+    let bad = "(:nl-frontier (:result sat :atoms ((:atom (* x y) :kind))))";
+    assert_eq!(crate::smt_verify::parse_nl_frontier(bad).unparsed.as_deref(), Some(bad));
+    // a quoted symbol that is not one word keeps its bars
+    let f = crate::smt_verify::parse_nl_frontier(
+        "(:nl-frontier (:result sat :atoms ((:atom (* x |a b|) :args ((:term |a b| :value 3)) \
+         :hosts ((:in input :term (Mul x |a b|) :tags (query)))))))",
+    );
+    assert!(f.unparsed.is_none(), "{:?}", f.unparsed);
+    assert_eq!(f.atoms[0].atom, "(* x |a b|)");
+    assert_eq!(f.atoms[0].args[0].term, "|a b|");
+    assert_eq!(f.atoms[0].hosts[0].term, "(Mul x |a b|)");
 }
 
 #[test]

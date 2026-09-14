@@ -68,6 +68,9 @@ pub(crate) fn func_bind_trig(
     let trigger: Trigger = Arc::new(trig_exprs.clone());
     let triggers: Triggers = Arc::new(vec![trigger]);
     let qid = new_internal_qid(ctx, name, role);
+    if let Some(qid) = &qid {
+        crate::sst_to_air::record_qid_type_binders(ctx, qid, &binders);
+    }
     Arc::new(BindX::Quant(Quant::Forall, Arc::new(binders), triggers, qid))
 }
 
@@ -581,14 +584,16 @@ pub fn func_name_to_air(
     function: &FunctionSst,
 ) -> Result<Commands, VirErr> {
     let mut commands: Vec<Command> = Vec::new();
+    // each type parameter is declared as a decoration and a type id before
+    // the value parameters, as `typ_to_ids` passes each type argument
+    let type_args = function.x.typ_params.len() * crate::def::types().len();
     let declare_rec = |commands: &mut Vec<Command>| {
         // Check whether we need to declare the recursive version too
         if function.x.has.has_body {
             if function.x.has.is_recursive {
-                let rec_f = suffix_global_id(&fun_to_air_ident(
-                    &ctx.name_ctxt,
-                    &prefix_recursive_fun(&function.x.name),
-                ));
+                let rec_fun = prefix_recursive_fun(&function.x.name);
+                let rec_f = suffix_global_id(&fun_to_air_ident(&ctx.name_ctxt, &rec_fun));
+                ctx.name_ctxt.record_source_function(&rec_f, &rec_fun, type_args);
                 let mut rec_typs =
                     vec_map(&*function.x.pars, |param| typ_to_air(ctx, &param.x.typ));
                 for _ in function.x.typ_params.iter() {
@@ -626,8 +631,9 @@ pub fn func_name_to_air(
         if let FunctionKind::TraitMethodDecl { .. } = &function.x.kind {
             names.push(crate::def::trait_default_name(&function.x.name));
         }
-        for name in names {
-            let name = suffix_global_id(&fun_to_air_ident(&ctx.name_ctxt, &name));
+        for fun in names {
+            let name = suffix_global_id(&fun_to_air_ident(&ctx.name_ctxt, &fun));
+            ctx.name_ctxt.record_source_function(&name, &fun, type_args);
             let decl = Arc::new(DeclX::Fun(name, all_typs.clone(), typ.clone()));
             commands.push(Arc::new(CommandX::Global(decl)));
         }

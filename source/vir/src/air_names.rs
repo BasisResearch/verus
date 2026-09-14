@@ -45,6 +45,13 @@ pub enum SourceName {
         style: crate::ast::CtorPrintStyle,
     },
     Field(String),
+    /// A function application's head. Its first `type_args` arguments are
+    /// the type arguments the encoder put before the value arguments (a
+    /// decoration and a type id for each), which the source does not write.
+    Function {
+        name: String,
+        type_args: usize,
+    },
 }
 
 impl SourceName {
@@ -53,7 +60,8 @@ impl SourceName {
             Self::Symbol(name)
             | Self::Field(name)
             | Self::Operator(name)
-            | Self::Constructor { name, .. } => name,
+            | Self::Constructor { name, .. }
+            | Self::Function { name, .. } => name,
             Self::Cast { symbol, .. } => symbol,
         }
     }
@@ -218,6 +226,13 @@ fn render_node(names: &SourceNames, node: &Node) -> String {
                             return constructor;
                         }
                     }
+                    // `(f.? $ INT s i)` is `f(s, i)`: the encoder recorded how
+                    // many leading arguments are type arguments
+                    Some(SourceName::Function { name, type_args }) if items.len() > *type_args => {
+                        let args: Vec<String> =
+                            items[1 + type_args..].iter().map(|i| render_node(names, i)).collect();
+                        return format!("{}({})", name, args.join(", "));
+                    }
                     _ => {}
                 }
             }
@@ -308,13 +323,92 @@ pub fn render_term(names: &SourceNames, term: &str) -> String {
     }
 }
 
+/// A term the solver built with its own arithmetic (`*`, `+`, `-`, `div`,
+/// `mod`, `/`), such as a nonlinear monomial, in source spelling: the
+/// arithmetic infix, `div` and `mod` as the `/` and `%` Verus writes for
+/// integers, everything else rendered as `render_term` does. The solver's
+/// arithmetic reads infix at any depth: under boxes, encoded operators and
+/// applications too.
+pub fn render_smt_arith(names: &SourceNames, term: &str) -> String {
+    fn go(names: &SourceNames, node: &Node, nested: bool) -> String {
+        let Node::List(items) = node else { return render_node(names, node) };
+        let [Node::Atom(head), args @ ..] = &items[..] else { return render_node(names, node) };
+        let op = match head.as_str() {
+            "*" => Some(" * "),
+            "+" => Some(" + "),
+            "-" => Some(" - "),
+            "div" | "/" => Some(" / "),
+            "mod" => Some(" % "),
+            _ => None,
+        };
+        if let Some(op) = op {
+            if args.len() >= 2 {
+                let s = args.iter().map(|a| go(names, a, true)).collect::<Vec<_>>();
+                let s = s.join(op);
+                return if nested { format!("({s})") } else { s };
+            }
+            if head == "-" && args.len() == 1 {
+                // a negated numeral is a number; any other negation keeps
+                // its grouping, so `(- (- a))` reads `-(-a)`
+                return match &args[0] {
+                    Node::Atom(a) if a.starts_with(|c: char| c.is_ascii_digit()) => format!("-{a}"),
+                    arg => {
+                        let s = format!("-{}", go(names, arg, true));
+                        if nested { format!("({s})") } else { s }
+                    }
+                };
+            }
+        }
+        if is_box_head(head) && args.len() == 1 {
+            return go(names, &args[0], nested);
+        }
+        match names.get(head) {
+            Some(SourceName::Operator(op)) if args.len() == 2 => {
+                format!("({} {} {})", go(names, &args[0], true), op, go(names, &args[1], true))
+            }
+            // as `render_node` writes a call, without its type arguments
+            Some(SourceName::Function { name, type_args }) if args.len() >= *type_args => {
+                let args = args[*type_args..].iter().map(|a| go(names, a, false));
+                format!("{}({})", name, args.collect::<Vec<_>>().join(", "))
+            }
+            // SMT-LIB's own operators (`ite`, `=`, ...) read as `render_node`
+            // writes them
+            None | Some(SourceName::Symbol(_))
+                if head != "let"
+                    && !args.is_empty()
+                    && !SMT_BUILTIN_HEADS.contains(&head.as_str()) =>
+            {
+                let args = args.iter().map(|a| go(names, a, false)).collect::<Vec<_>>();
+                format!("{}({})", render_node(names, &items[0]), args.join(", "))
+            }
+            _ => render_node(names, node),
+        }
+    }
+    let mut parser = sise::Parser::new(term);
+    match sise::parse_tree(&mut parser) {
+        Ok(node) => go(names, &node, false),
+        Err(_) => term.to_string(),
+    }
+}
+
 /// One instantiation vector (`(t1 t2)`) as a comma-separated source list.
 pub fn render_vector(names: &SourceNames, vector: &str) -> String {
+    render_vector_except(names, vector, &[])
+}
+
+/// One instantiation vector without its entries at `skip`: the positions of
+/// the quantifier's type binders (a decoration and a type id per type
+/// parameter), as the encoder recorded them where it emitted the quantifier.
+pub fn render_vector_except(names: &SourceNames, vector: &str, skip: &[usize]) -> String {
     let mut parser = sise::Parser::new(vector);
     match sise::parse_tree(&mut parser) {
-        Ok(Node::List(items)) => {
-            items.iter().map(|i| render_node(names, i)).collect::<Vec<_>>().join(", ")
-        }
+        Ok(Node::List(items)) => items
+            .iter()
+            .enumerate()
+            .filter(|(k, _)| !skip.contains(k))
+            .map(|(_, i)| render_node(names, i))
+            .collect::<Vec<_>>()
+            .join(", "),
         Ok(node) => render_node(names, &node),
         Err(_) => vector.to_string(),
     }
@@ -502,6 +596,40 @@ mod tests {
         }
     }
 
+    /// A nonlinear monomial comes back in the solver's own arithmetic (`*`,
+    /// `div`, `mod`), n-ary, around encoded operands.
+    #[test]
+    fn solver_arithmetic_reads_as_source() {
+        let ctx = NameCtxt::new();
+        let x = ctx.var_ident(&VarIdent(Arc::new("x".into()), VarIdentDisambiguate::VirParam));
+        let names = ctx.source_names();
+        assert_eq!(render_smt_arith(&names, &format!("(* {x} {x} y)")), "x * x * y");
+        assert_eq!(
+            render_smt_arith(&names, &format!("(* (div n {x}) (- y 1))")),
+            "(n / x) * (y - 1)"
+        );
+        assert_eq!(render_smt_arith(&names, "(mod a b)"), "a % b");
+        assert_eq!(render_smt_arith(&names, "(- a)"), "-a");
+        assert_eq!(render_smt_arith(&names, &format!("(* (%I (I {x})) y)")), "x * y");
+        // a term that does not parse comes back as it was
+        assert_eq!(render_smt_arith(&names, "(* a"), "(* a");
+    }
+
+    /// The solver's arithmetic stays infix under boxes and applications, and
+    /// a negation keeps its grouping.
+    #[test]
+    fn solver_arithmetic_reads_as_source_at_any_depth() {
+        let ctx = NameCtxt::new();
+        let names = ctx.source_names();
+        assert_eq!(render_smt_arith(&names, "(* (%I (I (+ a 1))) y)"), "(a + 1) * y");
+        assert_eq!(render_smt_arith(&names, "(* (f (+ a 1)) y)"), "f(a + 1) * y");
+        assert_eq!(render_smt_arith(&names, "(- (- a))"), "-(-a)");
+        assert_eq!(render_smt_arith(&names, "(* (- 2) x)"), "-2 * x");
+        assert_eq!(render_smt_arith(&names, "(* (- a) b)"), "(-a) * b");
+        // SMT-LIB's own operators read as source, not as calls
+        assert_eq!(render_smt_arith(&names, "(ite c (* a b) 0)"), "(if c { (a * b) } else { 0 })");
+    }
+
     /// `let` is SMT-LIB wire syntax, so it is rendered from its shape rather
     /// than looked up as an encoded name, and its bound body still is.
     #[test]
@@ -516,6 +644,42 @@ mod tests {
             render_term(&names, "(let ((a 1) (b 2)) (Add a b))"),
             "let a = 1, b = 2 in (a + b)"
         );
+    }
+
+    /// A call's type arguments are the ones the encoder put before its value
+    /// arguments, and it records how many. The rendering drops them, in a
+    /// call and in the generic trigger of the function's own axioms alike.
+    #[test]
+    fn type_arguments_are_dropped_as_recorded() {
+        let ctx = NameCtxt::new();
+        let segments = ["seq", "Seq", "index"].iter().map(|s| Arc::new(s.to_string())).collect();
+        let fun = Arc::new(crate::ast::FunX {
+            path: Arc::new(PathX { krate: CrateId::Vstd, segments: Arc::new(segments) }),
+        });
+        let head = crate::def::suffix_global_id(&Arc::new(ctx.fun_to_string(&fun)));
+        ctx.record_source_function(&head, &fun, 2);
+        let names = ctx.source_names();
+        let seq_index = "vstd::seq::Seq::index";
+        assert_eq!(
+            render_term(&names, &format!("({head} $ INT s (I 0))")),
+            format!("{seq_index}(s, 0)")
+        );
+        assert_eq!(
+            render_term(&names, &format!("({head} A&. A& self i)")),
+            format!("{seq_index}(self, i)")
+        );
+        // an application too short to hold the recorded type arguments is
+        // left as it was emitted
+        assert_eq!(render_term(&names, &format!("({head} $)")), format!("{seq_index}($)"));
+    }
+
+    /// A generic quantifier's instantiation vector binds its type binders
+    /// too; the positions the encoder recorded for them are left out.
+    #[test]
+    fn type_binders_are_left_out_of_vectors() {
+        let names = SourceNames::new();
+        assert_eq!(render_vector_except(&names, "($ INT s (I 1))", &[0, 1]), "s, 1");
+        assert_eq!(render_vector(&names, "($ INT s (I 1))"), "$, INT, s, 1");
     }
 
     #[test]
