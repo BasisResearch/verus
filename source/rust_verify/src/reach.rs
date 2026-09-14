@@ -13,11 +13,12 @@ use rustc_hir::def::{DefKind, Res};
 use rustc_hir::def_id::{DefId, LOCAL_CRATE, LocalDefId};
 use rustc_hir::intravisit::{self, Visitor};
 use rustc_hir::{BodyId, Expr, ExprKind};
-use rustc_middle::ty::{TyCtxt, TypeckResults};
+use rustc_middle::ty::{GenericArgKind, TyCtxt, TypeckResults};
 use rustc_session::config::CrateType;
+use rustc_span::hygiene::{ExpnKind, MacroKind};
 use std::collections::{BTreeSet, HashMap};
 use verus_reach::{Edge, EdgeKind, Node, Report, SCHEMA_VERSION, Span};
-use vir::ast::{Dt, Function, Krate, Mode, Path, TypX};
+use vir::ast::{BodyVisibility, Dt, Function, Krate, Mode, Path, TypX};
 
 /// Collects the definitions used by one body: the functions, constructors,
 /// and consts it names, the methods it calls, and the local types its
@@ -55,11 +56,17 @@ impl<'a, 'tcx> Visitor<'tcx> for Callees<'a, 'tcx> {
         if let Some(def_id) = self.typeck.type_dependent_def_id(expr.hir_id) {
             self.targets.push((def_id, self.kind));
         }
-        // A type with an expression of that type counts as used (see `dispatch_edges`)
-        if let Some(adt) = self.typeck.expr_ty_opt(expr).and_then(|ty| ty.peel_refs().ty_adt_def())
-        {
-            if adt.did().is_local() {
-                self.targets.push((adt.did(), self.kind));
+        // A type with an expression of that type counts as used (see
+        // `dispatch_edges`), including the types inside it: a `Vec<Item>`
+        // handed to serde uses `Item`'s impls
+        if let Some(ty) = self.typeck.expr_ty_opt(expr) {
+            for arg in ty.walk() {
+                let GenericArgKind::Type(t) = arg.kind() else { continue };
+                if let Some(adt) = t.peel_refs().ty_adt_def() {
+                    if adt.did().is_local() {
+                        self.targets.push((adt.did(), self.kind));
+                    }
+                }
             }
         }
         intravisit::walk_expr(self, expr);
@@ -97,10 +104,12 @@ impl<'a, 'tcx> Callees<'a, 'tcx> {
     }
 }
 
-fn callees<'tcx>(ctxt: &Context<'tcx>, def_id: LocalDefId) -> Vec<(DefId, EdgeKind)> {
+/// The references of one body. A spec or proof body is ghost code through
+/// and through, so everything it names is used, not called.
+fn callees<'tcx>(ctxt: &Context<'tcx>, def_id: LocalDefId, mode: Mode) -> Vec<(DefId, EdgeKind)> {
     let tcx = ctxt.tcx;
-    let mut visitor =
-        Callees { ctxt, typeck: tcx.typeck(def_id), kind: EdgeKind::Call, targets: vec![] };
+    let kind = if mode == Mode::Exec { EdgeKind::Call } else { EdgeKind::Proof };
+    let mut visitor = Callees { ctxt, typeck: tcx.typeck(def_id), kind, targets: vec![] };
     visitor.visit_body(tcx.hir_body_owned_by(def_id));
     visitor.targets
 }
@@ -155,11 +164,15 @@ fn has_own_body<'tcx>(tcx: TyCtxt<'tcx>, def_id: LocalDefId) -> bool {
     )
 }
 
-/// A function written by the user. Macro-generated functions still get
-/// edges, so what they call counts, but they are not reported themselves.
-fn is_user_fn<'tcx>(tcx: TyCtxt<'tcx>, def_id: LocalDefId) -> bool {
+/// A function written by the user, and where to report it. Functions a
+/// derive or an external macro expands to are not the user's: they still
+/// get edges, so what they call counts, but they are not reported. Functions
+/// the user's own `macro_rules!` expands to are the user's, reported at the
+/// invocation, which is where they are in the source; every function of one
+/// invocation shares that span.
+fn user_fn_span<'tcx>(tcx: TyCtxt<'tcx>, def_id: LocalDefId) -> Option<rustc_span::Span> {
     if !matches!(tcx.def_kind(def_id), DefKind::Fn | DefKind::AssocFn) {
-        return false;
+        return None;
     }
     let span = tcx.source_span(def_id);
     // The `verus!` macro synthesizes spec accessors for every enum field
@@ -168,7 +181,33 @@ fn is_user_fn<'tcx>(tcx: TyCtxt<'tcx>, def_id: LocalDefId) -> bool {
     // that holds them, which a written function's never is.
     let synthesized = tcx.def_kind(tcx.local_parent(def_id)) == DefKind::Impl { of_trait: false }
         && tcx.source_span(tcx.local_parent(def_id)) == span;
-    !span.from_expansion() && !synthesized
+    if synthesized {
+        return None;
+    }
+    if !span.from_expansion() {
+        return Some(span);
+    }
+    let expn = span.ctxt().outer_expn_data();
+    let local_macro = matches!(expn.kind, ExpnKind::Macro(MacroKind::Bang, _))
+        && expn.macro_def_id.map_or(false, |id| id.is_local());
+    local_macro.then(|| span.source_callsite())
+}
+
+/// The name a `verus!` twin stands for: `VERUS_SPEC__m` holds the spec of
+/// the trait method `m`, which the HIR names in calls.
+fn spec_twin_target(path: &Path) -> Option<Path> {
+    let last = path.last_segment();
+    let name = last.strip_prefix(vir::def::VERUS_SPEC)?;
+    Some(path.pop_segment().push_segment(std::sync::Arc::new(name.to_string())))
+}
+
+/// Helpers `reveal` synthesizes, nested in the revealing body
+fn is_reveal_helper(path: &Path) -> bool {
+    path.last_segment().ends_with("__VERUS_REVEAL_INTERNAL__")
+}
+
+fn is_local_path<'tcx>(ctxt: &Context<'tcx>, path: &Path) -> bool {
+    path.krate == crate::rust_to_vir_base::mk_crate_id(ctxt.tcx, LOCAL_CRATE)
 }
 
 /// A `verus_builtin` item: spec syntax (`requires`, `assert`, `spec_lt`,
@@ -211,9 +250,8 @@ fn id_of_path<'tcx>(ctxt: &Context<'tcx>, path: &Path, local: bool) -> String {
     format!("{krate}::{}", segments.join("::"))
 }
 
-fn span<'tcx>(tcx: TyCtxt<'tcx>, def_id: LocalDefId) -> Span {
+fn span<'tcx>(tcx: TyCtxt<'tcx>, span: rustc_span::Span) -> Span {
     let source_map = tcx.sess.source_map();
-    let span = tcx.source_span(def_id);
     let lo = source_map.lookup_char_pos(span.lo());
     let hi = source_map.lookup_char_pos(span.hi());
     let file = source_map.filename_for_diagnostics(&lo.file.name).to_string();
@@ -247,7 +285,16 @@ impl<'a> Labels<'a> {
     fn implied_edges<'tcx>(&self, ctxt: &Context<'tcx>, krate: &Krate) -> Vec<Edge> {
         let mut edges = vec![];
         for f in krate.functions.iter() {
-            let id = id_of_path(ctxt, &f.x.name.path, true);
+            // The target of an `assume_specification` may be foreign
+            let id = id_of_path(ctxt, &f.x.name.path, is_local_path(ctxt, &f.x.name.path));
+            if let Some(proxy) = &f.x.proxy {
+                // The contract is written on the proxy; callers name the target
+                edges.push(Edge::new(
+                    id.clone(),
+                    id_of_path(ctxt, &proxy.x, true),
+                    EdgeKind::Contract,
+                ));
+            }
             if let Some(spec) = &f.x.attrs.autospec {
                 let local = self.by_name.contains_key(&spec.path);
                 edges.push(Edge::new(id, id_of_path(ctxt, &spec.path, local), EdgeKind::Contract));
@@ -263,7 +310,13 @@ impl<'a> Labels<'a> {
     }
 }
 
-fn node<'tcx>(ctxt: &Context<'tcx>, labels: &Labels, def_id: LocalDefId, id: String) -> Node {
+fn node<'tcx>(
+    ctxt: &Context<'tcx>,
+    labels: &Labels,
+    def_id: LocalDefId,
+    id: String,
+    at: rustc_span::Span,
+) -> Node {
     let tcx = ctxt.tcx;
     let path = vir_path(ctxt, def_id.to_def_id()).expect("path of a named function");
     let (function, mut proxy, mut external_body) = match labels.by_name.get(&path) {
@@ -278,13 +331,16 @@ fn node<'tcx>(ctxt: &Context<'tcx>, labels: &Labels, def_id: LocalDefId, id: Str
     // `fixup_unerased_proxy_path`) shares the span of the function it
     // stands for and is not code of its own
     proxy |= path.last_segment().starts_with("VERUS_UNERASED_PROXY__");
-    external_body |= function.map_or(false, |f| f.x.attrs.is_external_body);
+    // No body to check: `external_body`, or an uninterpreted spec
+    external_body |= function.map_or(false, |f| {
+        f.x.attrs.is_external_body || matches!(f.x.body_visibility, BodyVisibility::Uninterpreted)
+    });
     let module = tcx.parent_module_from_def_id(def_id).to_def_id();
     Node {
         id,
         def_path: vir::ast_util::path_as_friendly_rust_name(&path),
         module: friendly_name(ctxt, module).unwrap_or_default(),
-        span: span(tcx, def_id),
+        span: span(tcx, at),
         mode: format!("{}", function.map(|f| f.x.mode).unwrap_or(Mode::Exec)),
         verified: function.is_some(),
         external_body,
@@ -305,8 +361,10 @@ pub(crate) fn run<'tcx>(ctxt: &Context<'tcx>, krate: &Krate) -> Result<(), Strin
         if !has_own_body(tcx, def_id) {
             continue;
         }
-        let Some(id) = id_of(ctxt, def_id.to_def_id()) else { continue };
-        for (target, kind) in callees(ctxt, def_id) {
+        let Some(path) = vir_path(ctxt, def_id.to_def_id()) else { continue };
+        let id = id_of_path(ctxt, &path, true);
+        let mode = labels.by_name.get(&path).map_or(Mode::Exec, |f| f.x.mode);
+        for (target, kind) in callees(ctxt, def_id, mode) {
             if is_builtin(ctxt, target) {
                 continue;
             }
@@ -315,8 +373,18 @@ pub(crate) fn run<'tcx>(ctxt: &Context<'tcx>, krate: &Krate) -> Result<(), Strin
                 edges.extend(id_of(ctxt, adt.to_def_id()).map(|t| Edge::new(id.clone(), t, kind)));
             }
         }
-        if is_user_fn(tcx, def_id) || entry == Some(def_id) {
-            nodes.push(node(ctxt, &labels, def_id, id));
+        if let Some(method) = spec_twin_target(&path) {
+            // The trait method's contract lives in its twin
+            edges.insert(Edge::new(id_of_path(ctxt, &method, true), id, EdgeKind::Contract));
+            continue;
+        }
+        if is_reveal_helper(&path) {
+            continue;
+        }
+        let at = user_fn_span(tcx, def_id)
+            .or_else(|| (entry == Some(def_id)).then(|| tcx.source_span(def_id)));
+        if let Some(at) = at {
+            nodes.push(node(ctxt, &labels, def_id, id, at));
         }
     }
     for (from, to) in dispatch_edges(tcx) {
@@ -326,6 +394,8 @@ pub(crate) fn run<'tcx>(ctxt: &Context<'tcx>, krate: &Krate) -> Result<(), Strin
     }
     edges.extend(labels.implied_edges(ctxt, krate));
     nodes.sort_by(|a, b| a.id.cmp(&b.id));
+    // Nested functions of the same name in one body share an id; keep one
+    nodes.dedup_by(|a, b| a.id == b.id);
 
     let report = Report {
         schema_version: SCHEMA_VERSION,

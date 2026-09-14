@@ -12,16 +12,6 @@ use verus_reach::{Graph, Node, Report};
 
 const TEMPLATE: &str = include_str!("report.html");
 
-/// Functions that are not code the user wrote: an `assume_specification`
-/// proxy, the twin `const fn` gets for its spec use (`VERUS_UNERASED_PROXY__`,
-/// labeled `proxy` by newer reports and by name for older ones), and the
-/// helpers `reveal` synthesizes.
-fn synthesized(n: &Node) -> bool {
-    n.proxy
-        || n.name().starts_with("VERUS_UNERASED_PROXY__")
-        || n.name().ends_with("__VERUS_REVEAL_INTERNAL__")
-}
-
 fn function(n: &Node, graph: &Graph) -> Value {
     json!({
         "name": n.name(),
@@ -30,29 +20,35 @@ fn function(n: &Node, graph: &Graph) -> Value {
         "start": n.span.start_line,
         "end": n.span.end_line,
         "verified": n.is_verified(),
+        "trusted": n.is_trusted(),
         "reachable": graph.is_reachable(n),
     })
 }
 
-/// Where a file's page goes, under the output directory
+/// Where a file's page goes, under the output directory: the file's path
+/// with `.html` appended, `..` and the root spelled out so that distinct
+/// paths get distinct pages.
 fn page_path(file: &str) -> PathBuf {
+    use std::path::Component::*;
     let mut p = PathBuf::from("src");
     for part in Path::new(file).components() {
-        if let std::path::Component::Normal(part) = part {
-            p.push(part);
+        match part {
+            Normal(part) => p.push(part),
+            ParentDir => p.push("__up__"),
+            RootDir | Prefix(_) => p.push("__root__"),
+            CurDir => {}
         }
     }
-    p.set_extension(format!(
-        "{}.html",
-        p.extension().map_or(String::new(), |e| e.to_string_lossy().into_owned())
-    ));
+    let name = p.file_name().map_or("_".to_string(), |n| n.to_string_lossy().into_owned());
+    p.set_file_name(format!("{name}.html"));
     p
 }
 
-/// The functions of every file, by file, with the labels the pages need
+/// The functions of every file, by file. The graph already leaves out the
+/// items nobody wrote.
 pub fn files<'a>(graph: &'a Graph) -> BTreeMap<&'a str, Vec<&'a Node>> {
     let mut files: BTreeMap<&str, Vec<&Node>> = BTreeMap::new();
-    for n in graph.nodes.values().filter(|n| !synthesized(n)) {
+    for n in graph.nodes.values() {
         files.entry(&n.span.file).or_default().push(n);
     }
     files
@@ -77,13 +73,11 @@ pub fn write(
     out: &Path,
 ) -> Result<(), String> {
     let files = files(graph);
-    let crates: Vec<String> =
-        reports.iter().map(|r| format!("{} ({})", r.krate, r.crate_type)).collect();
-    let roots: Vec<&str> = graph.roots.iter().map(|id| graph.nodes[id].def_path.as_str()).collect();
+    let crates: Vec<String> = reports.iter().map(|r| r.label()).collect();
     let common = json!({
         "title": title,
         "crates": crates,
-        "roots": roots,
+        "roots": graph.root_names(),
         "src_root": src.display().to_string(),
         "file_count": files.len(),
     });
@@ -164,11 +158,10 @@ mod tests {
 
     #[test]
     fn index_lists_every_file_and_pages_the_verified_ones() {
-        let (mut reports, graph) = graph();
+        let (mut reports, _) = graph();
         // The binary's main is in a file of its own with nothing verified
         reports[1].nodes[0].span.file = "src/main.rs".into();
         let graph2 = Graph::new(&reports, &Roots::default()).unwrap();
-        let _ = graph;
         let src = tempfile::tempdir().unwrap();
         std::fs::write(src.path().join("x.rs"), "fn a() {}\n").unwrap();
         let out = tempfile::tempdir().unwrap();
@@ -234,6 +227,24 @@ mod tests {
         let graph = Graph::new(&[lib], &Roots::default()).unwrap();
         let names: Vec<&str> = files(&graph)["x.rs"].iter().map(|n| n.name()).collect();
         assert_eq!(names, vec!["is_lt"]);
+    }
+
+    #[test]
+    fn distinct_paths_get_distinct_pages() {
+        let pages: Vec<String> = ["src/a.rs", "../a.rs", "/abs/a.rs", "a", "./a.rs"]
+            .iter()
+            .map(|f| page_path(f).to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            pages,
+            vec![
+                "src/src/a.rs.html",
+                "src/__up__/a.rs.html",
+                "src/__root__/abs/a.rs.html",
+                "src/a.html",
+                "src/a.rs.html"
+            ]
+        );
     }
 
     #[test]

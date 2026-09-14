@@ -72,7 +72,11 @@ pub struct Node {
     /// Verus checks this function. Whether the check passed is the exit
     /// status of the verus run.
     pub verified: bool,
+    /// The body is not checked: `external_body`, the target of an
+    /// `assume_specification`, or an uninterpreted spec
     pub external_body: bool,
+    /// Stands for another function: an `assume_specification` item, or the
+    /// twin `verus!` gives a `const fn`
     pub proxy: bool,
     /// Part of the crate's public API
     pub exported: bool,
@@ -103,6 +107,26 @@ impl Node {
         self.mode != "exec"
     }
 
+    /// A ghost function whose claim is assumed, not checked: an
+    /// `external_body` proof function (an axiom) or an uninterpreted spec.
+    /// Counted as verified, since the proofs around it rely on it, but
+    /// labeled.
+    pub fn is_trusted(&self) -> bool {
+        self.is_ghost() && self.external_body
+    }
+
+    /// Not code the user wrote: an `assume_specification` proxy, the twin
+    /// `verus!` gives a `const fn`, the twin holding a trait method's spec,
+    /// or a helper `reveal` synthesizes. Newer reports leave most of these
+    /// out; older ones carry them.
+    pub fn is_synthesized(&self) -> bool {
+        let name = self.name();
+        self.proxy
+            || name.starts_with("VERUS_UNERASED_PROXY__")
+            || name.starts_with("VERUS_SPEC__")
+            || name.ends_with("__VERUS_REVEAL_INTERNAL__")
+    }
+
     pub fn name(&self) -> &str {
         self.def_path.rfind("::").map_or(&self.def_path, |i| &self.def_path[i + 2..])
     }
@@ -117,6 +141,11 @@ impl Node {
 impl Report {
     pub fn file_name(&self) -> String {
         format!("{}.{}.json", self.krate, self.crate_type)
+    }
+
+    /// `name (type)`, for display
+    pub fn label(&self) -> String {
+        format!("{} ({})", self.krate, self.crate_type)
     }
 }
 
@@ -138,7 +167,18 @@ pub fn load(paths: &[PathBuf]) -> Result<Vec<Report>, String> {
             files.push(path.clone());
         }
     }
-    files.iter().map(|f| load_file(f)).collect()
+    let reports: Vec<Report> = files.iter().map(|f| load_file(f)).collect::<Result<_, _>>()?;
+    // A test build holds the library's functions again, under another id
+    for test in reports.iter().filter(|r| r.crate_type == "test") {
+        if reports.iter().any(|r| r.krate == test.krate && r.crate_type != "test") {
+            return Err(format!(
+                "crate `{}` has both a test report and a lib or bin report: a test build \
+                 includes the library's functions, which would count twice; keep one",
+                test.krate
+            ));
+        }
+    }
+    Ok(reports)
 }
 
 fn load_file(path: &Path) -> Result<Report, String> {
@@ -173,7 +213,8 @@ impl Roots {
 
 /// The merged reports of all crates.
 pub struct Graph {
-    /// Every function of every crate, by id
+    /// Every function the user wrote, of every crate, by id. Synthesized
+    /// items (see [`Node::is_synthesized`]) are left out; their edges stay.
     pub nodes: BTreeMap<String, Node>,
     pub roots: Vec<String>,
     /// Runs: reached from a root through calls only
@@ -190,6 +231,7 @@ impl Graph {
         let nodes: BTreeMap<String, Node> = reports
             .iter()
             .flat_map(|r| r.nodes.iter())
+            .filter(|n| !n.is_synthesized())
             .map(|n| (n.id.clone(), n.clone()))
             .collect();
         let mains: Vec<String> = reports.iter().filter_map(|r| r.main.clone()).collect();
@@ -217,7 +259,9 @@ impl Graph {
 
         // One search in two contexts. A call from running code runs its
         // target; anything referenced from ghost code, or from something
-        // ghost code reached, is only used.
+        // ghost code reached, is only used. A spec or proof function is
+        // ghost code whatever context it was entered in: a ghost root, or
+        // a dispatch edge to a spec-mode impl method.
         let mut reachable = HashSet::new();
         let mut used = HashSet::new();
         let mut queue: VecDeque<(&str, bool)> = VecDeque::new();
@@ -227,6 +271,7 @@ impl Graph {
             }
         }
         while let Some((id, ghost)) = queue.pop_front() {
+            let ghost = ghost || nodes.get(id).map_or(false, |n| n.is_ghost());
             for edge in out.get(id).map_or(&[][..], |v| v) {
                 let ghost = ghost || edge.kind != EdgeKind::Call;
                 let set = if ghost { &mut used } else { &mut reachable };
@@ -242,6 +287,11 @@ impl Graph {
     /// running code uses it.
     pub fn is_reachable(&self, node: &Node) -> bool {
         self.reachable.contains(&node.id) || (node.is_ghost() && self.used.contains(&node.id))
+    }
+
+    /// The roots, by display name
+    pub fn root_names(&self) -> Vec<&str> {
+        self.roots.iter().map(|id| self.nodes[id].def_path.as_str()).collect()
     }
 
     /// Verified functions, exec and ghost: (reachable, total)
@@ -436,9 +486,10 @@ mod tests {
 
     #[test]
     fn exclude_matches_the_module_of_a_method() {
-        // `def_path` files a method under its type, which may live elsewhere
+        // `def_path` files a method under its type (`lib::Wrapper::fmt`),
+        // which may be defined in another module than the impl
         let mut method = node("lib::verified::impl&%0::fmt", true, true);
-        method.def_path = "core::fmt::Display::fmt".into();
+        method.def_path = "lib::Wrapper::fmt".into();
         method.module = "lib::verified".into();
         let lib = report("lib", "lib", None, vec![method], vec![]);
         let roots =
@@ -450,6 +501,77 @@ mod tests {
     fn unknown_root_is_an_error() {
         let roots = Roots { add: vec!["lib::nope".into()], exclude: vec![] };
         assert!(Graph::new(&lib_and_bin(), &roots).is_err());
+    }
+
+    #[test]
+    fn a_ghost_root_uses_but_never_runs() {
+        // An exported spec fn, defined through a `when_used_as_spec` exec fn
+        let lib = report(
+            "lib",
+            "lib",
+            None,
+            vec![
+                {
+                    let mut n = spec("lib::spec_len");
+                    n.exported = true;
+                    n
+                },
+                node("lib::len", true, false),
+            ],
+            vec![call("lib::spec_len", "lib::len")],
+        );
+        let graph = Graph::new(&[lib], &Roots::default()).unwrap();
+        assert_eq!(graph.roots, vec!["lib::spec_len"]);
+        assert!(!graph.reachable.contains("lib::len"));
+        assert!(graph.used.contains("lib::len"));
+        assert!(!graph.is_reachable(&graph.nodes["lib::len"]));
+    }
+
+    #[test]
+    fn synthesized_items_are_not_nodes_but_keep_their_edges() {
+        let mut twin = node("lib::Tr::VERUS_SPEC__m", false, false);
+        twin.def_path = "lib::Tr::VERUS_SPEC__m".into();
+        let mut helper = node("lib::f::__VERUS_REVEAL_INTERNAL__", false, false);
+        helper.def_path = "lib::f::__VERUS_REVEAL_INTERNAL__".into();
+        let mut proxy = node("lib::ext_spec", true, false);
+        proxy.proxy = true;
+        let lib = report(
+            "lib",
+            "bin",
+            Some("lib(bin)::main"),
+            vec![node("lib(bin)::main", false, false), twin, helper, proxy, spec("lib::p")],
+            vec![
+                call("lib(bin)::main", "lib::Tr::m"),
+                contract("lib::Tr::m", "lib::Tr::VERUS_SPEC__m"),
+                contract("lib::Tr::VERUS_SPEC__m", "lib::p"),
+            ],
+        );
+        let graph = Graph::new(&[lib], &Roots::default()).unwrap();
+        let ids: Vec<&String> = graph.nodes.keys().collect();
+        assert_eq!(ids, vec!["lib(bin)::main", "lib::p"]);
+        assert!(graph.is_reachable(&graph.nodes["lib::p"]));
+    }
+
+    #[test]
+    fn a_test_report_beside_the_library_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, ty) in [("lib", "lib"), ("lib", "test")] {
+            let r = report(name, ty, None, vec![], vec![]);
+            std::fs::write(dir.path().join(r.file_name()), serde_json::to_string(&r).unwrap())
+                .unwrap();
+        }
+        let err = load(&[dir.path().to_path_buf()]).unwrap_err();
+        assert!(err.contains("test report"), "{err}");
+    }
+
+    #[test]
+    fn trusted_ghost_functions_are_labeled() {
+        let mut axiom = proof("lib::axiom");
+        axiom.external_body = true;
+        assert!(axiom.is_trusted() && axiom.is_verified());
+        let mut ext = node("lib::ext", true, false);
+        ext.external_body = true;
+        assert!(!ext.is_trusted() && !ext.is_verified());
     }
 
     #[test]

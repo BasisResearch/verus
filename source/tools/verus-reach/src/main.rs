@@ -22,7 +22,9 @@ use verus_reach::{Graph, Node, Report, Roots};
 #[derive(Parser)]
 struct Args {
     /// Report files or directories of reports. Clear a directory when
-    /// crates are renamed or removed; old reports are not overwritten.
+    /// crates are renamed or removed; old reports are not overwritten, and
+    /// crates of the same name from different workspaces share a file name.
+    /// A test report is rejected beside the lib or bin report of its crate.
     #[arg(required = true)]
     reports: Vec<PathBuf>,
     /// Add a root (def path). Defaults: `main` of every executable crate,
@@ -76,8 +78,13 @@ impl Only {
     }
 }
 
-fn pct(part: usize, total: usize) -> u64 {
-    (100 * part).checked_div(total).map_or(100, |p| p as u64)
+/// None when there is nothing to divide by
+fn pct(part: usize, total: usize) -> Option<u64> {
+    (total > 0).then(|| (100 * part / total) as u64)
+}
+
+fn show(pct: Option<u64>) -> String {
+    pct.map_or("n/a".to_string(), |p| format!("{p}%"))
 }
 
 fn loc(node: &Node) -> usize {
@@ -86,10 +93,9 @@ fn loc(node: &Node) -> usize {
 
 fn summary(reports: &[Report], graph: &Graph) -> String {
     let mut out = String::new();
-    let crates: Vec<String> =
-        reports.iter().map(|r| format!("{} ({})", r.krate, r.crate_type)).collect();
+    let crates: Vec<String> = reports.iter().map(|r| r.label()).collect();
     writeln!(out, "crates: {}", crates.join(", ")).unwrap();
-    let roots: Vec<&str> = graph.roots.iter().map(|id| graph.nodes[id].def_path.as_str()).collect();
+    let roots = graph.root_names();
     match roots.len() {
         0..=3 => writeln!(out, "roots: {}", roots.join(", ")).unwrap(),
         n => writeln!(out, "roots: {n} functions").unwrap(),
@@ -99,26 +105,35 @@ fn summary(reports: &[Report], graph: &Graph) -> String {
     let reached: Vec<&Node> = fns.iter().copied().filter(|n| graph.is_reachable(n)).collect();
     writeln!(
         out,
-        "\nverified functions: {:>6}   reachable: {:>6}  ({}%)",
+        "\nverified functions: {:>6}   reachable: {:>6}  ({})",
         fns.len(),
         reached.len(),
-        pct(reached.len(), fns.len())
+        show(pct(reached.len(), fns.len()))
     )
     .unwrap();
     for mode in ["exec", "spec", "proof"] {
         let total = fns.iter().filter(|n| n.mode == mode).count();
         let hit = reached.iter().filter(|n| n.mode == mode).count();
-        writeln!(out, "  {mode:<17} {total:>6}   reachable: {hit:>6}  ({}%)", pct(hit, total))
+        writeln!(out, "  {mode:<17} {total:>6}   reachable: {hit:>6}  ({})", show(pct(hit, total)))
             .unwrap();
     }
+    let trusted = fns.iter().filter(|n| n.is_trusted()).count();
+    let trusted_hit = reached.iter().filter(|n| n.is_trusted()).count();
+    writeln!(
+        out,
+        "  of which trusted  {trusted:>6}   reachable: {trusted_hit:>6}  ({})",
+        show(pct(trusted_hit, trusted))
+    )
+    .unwrap();
+    writeln!(out, "  (trusted: external_body proof functions and uninterpreted specs)").unwrap();
     let total_loc: usize = fns.iter().map(|n| loc(n)).sum();
     let reached_loc: usize = reached.iter().map(|n| loc(n)).sum();
     writeln!(
         out,
-        "verified LoC:       {:>6}   reachable: {:>6}  ({}%)",
+        "verified LoC:       {:>6}   reachable: {:>6}  ({})",
         total_loc,
         reached_loc,
-        pct(reached_loc, total_loc)
+        show(pct(reached_loc, total_loc))
     )
     .unwrap();
     writeln!(out, "(LoC counts every line of the function, including proof blocks)").unwrap();
@@ -185,7 +200,9 @@ fn lcov(graph: &Graph, only: Only) -> String {
 
 fn below_threshold(graph: &Graph, threshold: u64) -> Option<String> {
     let (reached, total) = graph.coverage();
-    let pct = pct(reached, total);
+    let Some(pct) = pct(reached, total) else {
+        return Some(format!("no verified functions to measure, below --fail-under {threshold}"));
+    };
     (pct < threshold).then(|| {
         format!(
             "{reached} of {total} verified functions reachable ({pct}%), below --fail-under {threshold}"
@@ -301,5 +318,21 @@ mod tests {
         assert_eq!(below_threshold(&graph, 66), None);
         let msg = below_threshold(&graph, 67).unwrap();
         assert!(msg.contains("4 of 6 verified functions reachable (66%)"), "{msg}");
+    }
+
+    #[test]
+    fn nothing_verified_fails_the_threshold_and_shows_no_rate() {
+        use verus_reach::fixture::{node, report};
+        let reports = vec![report(
+            "app",
+            "bin",
+            Some("app(bin)::main"),
+            vec![node("app(bin)::main", false, false)],
+            vec![],
+        )];
+        let graph = Graph::new(&reports, &Roots::default()).unwrap();
+        assert!(below_threshold(&graph, 1).unwrap().contains("no verified functions"));
+        let text = summary(&reports, &graph);
+        assert!(text.contains("verified functions:      0   reachable:      0  (n/a)"), "{text}");
     }
 }

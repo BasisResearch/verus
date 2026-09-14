@@ -4,8 +4,6 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>__TITLE__</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
 <style>
 :root {
   --bg: #f6f8f7; --surface: #ffffff; --ink: #1c2522; --muted: #60706a; --line: #d8dfdb;
@@ -40,7 +38,7 @@
 body {
   margin: 0; padding-inline: 24px; padding-block: 28px 48px;
   background: var(--bg); color: var(--ink);
-  font-family: "IBM Plex Sans", "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  font-family: system-ui, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
   font-size: 14px; line-height: 1.5;
 }
 .wrap { max-width: 1160px; margin: 0 auto; display: flex; flex-direction: column; gap: 22px; }
@@ -49,7 +47,7 @@ a:hover { text-decoration: underline; }
 a:focus-visible, th:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 h1 { font-size: 1.45rem; font-weight: 600; margin: 0; text-wrap: balance; }
 h2 { font-size: 1.05rem; font-weight: 600; margin: 0; }
-.mono, .num, td.num, .src { font-family: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-variant-numeric: tabular-nums; }
+.mono, .num, td.num, .src { font-family: ui-monospace, "Cascadia Mono", SFMono-Regular, Menlo, Consolas, monospace; font-variant-numeric: tabular-nums; }
 .muted { color: var(--muted); }
 .label { font-size: 0.72rem; letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted); font-weight: 500; }
 header { display: flex; flex-direction: column; gap: 10px; }
@@ -262,6 +260,7 @@ table.cov tbody tr:hover td { background: color-mix(in srgb, var(--accent) 6%, t
       '</div>';
     h += '<div class="legend"><span class="vr">verified and reachable</span><span class="vd">verified but nothing reaches it</span>' +
       '<span class="ur">reachable but unverified</span><span class="uu">neither</span>' +
+      '<span class="muted">trusted: an external_body proof or an uninterpreted spec, counted as verified</span>' +
       '<span class="muted">bars: green ≥ ' + HI + '%, amber ≥ ' + MED + '%, red below (genhtml limits)</span></div>';
     return h;
   }
@@ -276,7 +275,7 @@ table.cov tbody tr:hover td { background: color-mix(in srgb, var(--accent) 6%, t
     var totalLabel = "Total, all " + DATA.file_count + " files";
     return '<div class="section"><div class="section-head"><h2>Files with verified code</h2><span class="note">' +
       VERIFIED_FILES.length + ' of ' + DATA.file_count + ' files' +
-      (others ? '; the other ' + others + ' hold reachable code but nothing verified and count only in the totals' : '') + '</span></div>' +
+      (others ? '; the other ' + others + ' have no verified functions and count only in the totals' : '') + '</span></div>' +
       table(rows, function (r) { return encodeURI(r.href); }, TOTAL, totalLabel) + '</div>';
   }
   function viewFile() {
@@ -295,7 +294,7 @@ table.cov tbody tr:hover td { background: color-mix(in srgb, var(--accent) 6%, t
         ' <span class="mode">' + esc(fn.path) + '</span></td>' +
         '<td><span class="mode">' + esc(fn.mode) + '</span></td>' +
         '<td class="num">' + fn.start + (fn.end > fn.start ? "–" + fn.end : "") + '</td>' +
-        '<td><span class="state ' + st + '">' + STATE_LABEL[st] + '</span></td></tr>';
+        '<td><span class="state ' + st + '">' + STATE_LABEL[st] + (fn.trusted ? ' · trusted' : '') + '</span></td></tr>';
     });
     h += '</tbody></table></div></div></div>';
 

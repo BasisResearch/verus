@@ -437,8 +437,12 @@ fn proxies() {
             x
         }
 
+        spec fn same(a: u64, b: u64) -> bool {
+            a == b
+        }
+
         assume_specification [ext](x: u64) -> (r: u64)
-            ensures r == x;
+            ensures same(r, x);
 
         fn main() {
             let _ = ext(1);
@@ -454,6 +458,148 @@ fn proxies() {
     assert!(ext.verified);
     assert!(ext.external_body);
     assert!(!ext.is_verified_exec());
+    // The contract is written on the proxy, which callers never name
+    assert_eq!(edge_kinds(&report, &ext.id, &proxies[0].id), vec![EdgeKind::Contract]);
+    let graph = graph_from_main(&report);
+    assert!(graph.is_reachable(node(&report, "test_crate::same")));
+    assert!(!graph.nodes.contains_key(&proxies[0].id), "proxies are not graph nodes");
+}
+
+/// A `const fn` is checked through a twin `verus!` gives it, at the same
+/// span; a trait method's spec lives in a `VERUS_SPEC__` twin. Neither is
+/// code of its own: the first is a proxy, the second only lends the method
+/// its contract.
+#[test]
+fn trait_method_spec_is_used_through_the_method() {
+    let code = verus_code! {
+        spec fn small(x: u64) -> bool {
+            x < 10
+        }
+
+        trait Tr {
+            fn m(&self, x: u64)
+                requires small(x);
+        }
+
+        struct S;
+
+        impl Tr for S {
+            fn m(&self, x: u64) {
+            }
+        }
+
+        fn main() {
+            S.m(1);
+        }
+    };
+    let (result, report) = reach("trait_spec_twin", code);
+    result.unwrap();
+    assert!(
+        !report.nodes.iter().any(|n| n.def_path.contains("VERUS_SPEC__")),
+        "twins are not nodes: {:#?}",
+        report.nodes
+    );
+    assert!(has_edge(&report, "test_crate::Tr::m", "test_crate::Tr::VERUS_SPEC__m"));
+    let graph = graph_from_main(&report);
+    assert!(graph.is_reachable(node(&report, "test_crate::small")));
+}
+
+/// Functions the user's own `macro_rules!` expands to are the user's,
+/// reported at the invocation.
+#[test]
+fn macro_defined_functions_are_reported_at_the_invocation() {
+    let code = verus_code! {
+        macro_rules! twice {
+            ($name:ident) => {
+                fn $name(x: u64) -> (r: u64)
+                    requires x < 100,
+                    ensures r == x * 2,
+                {
+                    x * 2
+                }
+            };
+        }
+
+        twice!(double_a);
+        twice!(double_b);
+
+        fn main() {
+            let _ = double_a(1);
+        }
+    };
+    let (result, report) = reach("macro_fns", code);
+    result.unwrap();
+    let a = node(&report, "test_crate::double_a");
+    let b = node(&report, "test_crate::double_b");
+    assert!(a.is_verified_exec() && b.is_verified_exec());
+    assert_eq!(a.span.start_line, a.span.end_line, "reported at the one-line invocation");
+    assert_ne!(a.span.start_line, b.span.start_line);
+    let graph = graph_from_main(&report);
+    assert!(graph.is_reachable(a));
+    assert!(!graph.is_reachable(b));
+}
+
+/// A spec function's body is ghost code: what it names is used, not run,
+/// even when the spec function is itself a root.
+#[test]
+fn a_spec_root_uses_but_does_not_run() {
+    let code = verus_code! {
+        spec fn spec_len(x: u64) -> u64 {
+            x
+        }
+
+        #[verifier::when_used_as_spec(spec_len)]
+        fn len(x: u64) -> (r: u64)
+            ensures r == spec_len(x),
+        {
+            x
+        }
+
+        pub open spec fn twice_len(x: u64) -> u64 {
+            len(x) + len(x)
+        }
+
+        fn main() {
+        }
+    };
+    let (result, report) = reach("spec_root", code);
+    result.unwrap();
+    assert_eq!(
+        edge_kinds(&report, "test_crate::twice_len", "test_crate::len"),
+        vec![EdgeKind::Proof],
+        "a ghost body's references are ghost"
+    );
+    let roots = Roots { add: vec!["test_crate::twice_len".into()], exclude: vec![] };
+    let graph = Graph::new(std::slice::from_ref(&report), &roots).unwrap();
+    assert!(!graph.reachable.contains("test_crate::len"));
+    assert!(graph.is_reachable(node(&report, "test_crate::spec_len")));
+}
+
+/// An uninterpreted spec has no body to check, like an `external_body`
+/// proof: trusted, and labeled so.
+#[test]
+fn uninterpreted_specs_are_trusted() {
+    let code = verus_code! {
+        pub uninterp spec fn oracle(x: u64) -> bool;
+
+        #[verifier::external_body]
+        pub proof fn axiom_oracle(x: u64)
+            ensures oracle(x),
+        {
+        }
+
+        pub open spec fn plain(x: u64) -> bool {
+            x > 0
+        }
+
+        fn main() {
+        }
+    };
+    let (result, report) = reach("uninterp", code);
+    result.unwrap();
+    assert!(node(&report, "test_crate::oracle").is_trusted());
+    assert!(node(&report, "test_crate::axiom_oracle").is_trusted());
+    assert!(!node(&report, "test_crate::plain").is_trusted());
 }
 
 /// `verus!` splits a `const fn` in two: the erased item that runs, and a
