@@ -49,6 +49,14 @@ const DONE_QUOTED: &str = "\"<<DONE>>\"";
 /// and the mode is opt-in).
 pub const PROVENANCE_ARGS: &[&str] = &["--proof-mode=pp-only", "--dump-instantiations"];
 
+/// Extra cvc5 arguments in difficulty mode. Difficulty is tracked per
+/// preprocessed assertion and carried back to the input through the
+/// preprocessing proofs; unsat cores come from solving under assumptions,
+/// which needs no SAT proof. `pp-only` is explicit so that cvc5 does not
+/// upgrade the proofs to serve the cores.
+pub const DIFFICULTY_ARGS: &[&str] =
+    &["--produce-difficulty", "--unsat-cores-mode=assumptions", "--proof-mode=pp-only"];
+
 /// A separate thread writes data to the SMT solver over a pipe.
 /// (Rust's documentation says you need a separate thread; otherwise, it lets the pipes deadlock.)
 pub(crate) fn writer_thread(requests: Receiver<Vec<u8>>, mut smt_pipe_stdin: ChildStdin) {
@@ -110,10 +118,14 @@ impl SmtProcess {
         solver: &SmtSolver,
         transcript_log: Option<Box<dyn std::io::Write + Send>>,
         provenance: bool,
+        difficulty: bool,
         instantiation_replay: bool,
         inst_graph: bool,
+        matching_loops: bool,
+        inst_max_rounds: Option<u32>,
     ) -> Self {
         let solver_info = SolverInfo::new(solver);
+        let inst_max_rounds_arg = inst_max_rounds.map(|n| format!("--inst-max-rounds={n}"));
         let mut args: Vec<&str> = match solver {
             SmtSolver::Z3 => vec!["-smt2", "-in"],
             // No `--rlimit` here: cvc5's `--rlimit` is a *cumulative* budget for the
@@ -130,6 +142,15 @@ impl SmtProcess {
         if provenance {
             assert!(matches!(solver, SmtSolver::Cvc5));
             args.extend_from_slice(PROVENANCE_ARGS);
+        }
+        if difficulty {
+            assert!(matches!(solver, SmtSolver::Cvc5));
+            // provenance mode may already have passed `--proof-mode=pp-only`
+            for arg in DIFFICULTY_ARGS {
+                if !args.contains(arg) {
+                    args.push(arg);
+                }
+            }
         }
         if instantiation_replay {
             assert!(matches!(solver, SmtSolver::Cvc5));
@@ -149,6 +170,15 @@ impl SmtProcess {
             // default of a million; the rest are counted as dropped.
             args.push("--inst-graph");
             args.push("--inst-graph-max=100000");
+        }
+        if matching_loops {
+            assert!(matches!(solver, SmtSolver::Cvc5));
+            // Records each instantiation's round, terms and parents for
+            // `(get-info :matching-loops)`; spends no resource units.
+            args.push("--matching-loops");
+            if let Some(arg) = &inst_max_rounds_arg {
+                args.push(arg.as_str());
+            }
         }
         let mut child = match std::process::Command::new(solver_info.executable())
             .args(args)

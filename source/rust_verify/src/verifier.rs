@@ -331,6 +331,21 @@ pub struct Verifier {
     /// Under `-V provenance`: what cvc5 reported for each query of each
     /// function, raw (tag symbols and qids), in check order
     pub func_provenance: HashMap<Fun, Vec<QueryProvenance>>,
+    /// Under `-V difficulty`: what cvc5 reported for each query of each
+    /// function, raw (tag symbols), in check order
+    func_difficulty: HashMap<Fun, Vec<QueryDifficulty>>,
+    /// Why each query whose first check answered `unknown` did so, as the
+    /// solver said (description, span, reason), until joined to source
+    func_unknown_reasons: HashMap<Fun, Vec<(String, String, air::context::UnknownReason)>>,
+    /// Under `-V nl-frontier`: what cvc5 reported for each query of each
+    /// function, raw (solver terms, tag symbols and qids), in check order
+    func_nl_frontier: HashMap<Fun, Vec<QueryNlFrontier>>,
+    /// Under `-V matching-loops`: what cvc5 reported after each unknown check
+    /// of each function, not yet joined to source.
+    pub func_matching_loops: HashMap<Fun, Vec<QueryMatchingLoops>>,
+    /// Under `-V inst-pressure`: what cvc5 reported for each query of each
+    /// function, by qid, in check order
+    func_inst_pressure: HashMap<Fun, Vec<QueryInstPressure>>,
     /// Errors to report after verification has run
     deferred_errors: Vec<VirErr>,
 
@@ -360,7 +375,11 @@ pub struct Verifier {
 }
 
 pub use crate::provenance::{
-    QueryProvenance, ResolvedInstantiation, ResolvedQueryProvenance, ResolvedTag,
+    QueryDifficulty, QueryInstPressure, QueryMatchingLoops, QueryNlFrontier, QueryProvenance,
+    ResolvedCulprit, ResolvedDifficultyRow, ResolvedInstantiation, ResolvedMatchingLoop,
+    ResolvedQuantPressure, ResolvedQueryDifficulty, ResolvedQueryInstPressure,
+    ResolvedQueryMatchingLoops, ResolvedQueryNlFrontier, ResolvedQueryProvenance, ResolvedTag,
+    ResolvedUnknownReason,
 };
 
 #[derive(serde::Serialize)]
@@ -370,6 +389,21 @@ pub struct FuncDetails {
     /// filled under `-V provenance`
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub provenance: Vec<ResolvedQueryProvenance>,
+    /// filled under `-V difficulty`
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub difficulty: Vec<ResolvedQueryDifficulty>,
+    /// one entry per error-level query whose first check answered `unknown`
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub unknown_reasons: Vec<ResolvedUnknownReason>,
+    /// filled under `-V nl-frontier`
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub nl_frontier: Vec<ResolvedQueryNlFrontier>,
+    /// filled under `-V matching-loops`, one entry per unknown check
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub matching_loops: Vec<ResolvedQueryMatchingLoops>,
+    /// filled under `-V inst-pressure`
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub inst_pressure: Vec<ResolvedQueryInstPressure>,
 }
 
 impl Default for FuncDetails {
@@ -378,6 +412,11 @@ impl Default for FuncDetails {
             obligation_proof_notes: Default::default(),
             failed_proof_notes: Default::default(),
             provenance: Default::default(),
+            difficulty: Default::default(),
+            unknown_reasons: Default::default(),
+            nl_frontier: Default::default(),
+            matching_loops: Default::default(),
+            inst_pressure: Default::default(),
         }
     }
 }
@@ -387,6 +426,11 @@ impl FuncDetails {
         self.obligation_proof_notes.extend(other.obligation_proof_notes);
         self.failed_proof_notes.extend(other.failed_proof_notes);
         self.provenance.extend(other.provenance);
+        self.difficulty.extend(other.difficulty);
+        self.unknown_reasons.extend(other.unknown_reasons);
+        self.nl_frontier.extend(other.nl_frontier);
+        self.matching_loops.extend(other.matching_loops);
+        self.inst_pressure.extend(other.inst_pressure);
     }
 
     pub fn to_json(&self) -> serde_json::Value {
@@ -542,6 +586,11 @@ impl Verifier {
 
             func_details: HashMap::new(),
             func_provenance: HashMap::new(),
+            func_difficulty: HashMap::new(),
+            func_unknown_reasons: HashMap::new(),
+            func_nl_frontier: HashMap::new(),
+            func_matching_loops: HashMap::new(),
+            func_inst_pressure: HashMap::new(),
             deferred_errors: Vec::new(),
 
             dep_tracker: if via_cargo_args.is_some() { Some(dep_tracker) } else { None },
@@ -595,6 +644,11 @@ impl Verifier {
 
             func_details: HashMap::new(),
             func_provenance: HashMap::new(),
+            func_difficulty: HashMap::new(),
+            func_unknown_reasons: HashMap::new(),
+            func_nl_frontier: HashMap::new(),
+            func_matching_loops: HashMap::new(),
+            func_inst_pressure: HashMap::new(),
             deferred_errors: Vec::new(),
 
             via_cargo_args: self.via_cargo_args.clone(),
@@ -632,6 +686,21 @@ impl Verifier {
         for (fun, queries) in other.func_provenance {
             self.func_provenance.entry(fun).or_default().extend(queries);
         }
+        for (fun, reasons) in other.func_unknown_reasons {
+            self.func_unknown_reasons.entry(fun).or_default().extend(reasons);
+        }
+        for (fun, queries) in other.func_nl_frontier {
+            self.func_nl_frontier.entry(fun).or_default().extend(queries);
+        }
+        for (fun, queries) in other.func_matching_loops {
+            self.func_matching_loops.entry(fun).or_default().extend(queries);
+        }
+        for (fun, queries) in other.func_difficulty {
+            self.func_difficulty.entry(fun).or_default().extend(queries);
+        }
+        for (fun, queries) in other.func_inst_pressure {
+            self.func_inst_pressure.entry(fun).or_default().extend(queries);
+        }
         self.deferred_errors.extend(other.deferred_errors);
     }
 
@@ -656,6 +725,8 @@ impl Verifier {
             buckets,
             crate::resident::SessionInfo {
                 provenance: self.args.provenance,
+                matching_loops: self.args.matching_loops,
+                difficulty: self.args.difficulty,
                 spinoff_all: self.args.spinoff_all,
                 multiple_errors: self.args.multiple_errors,
                 smt_options: self.args.smt_options.clone(),
@@ -820,6 +891,8 @@ impl Verifier {
         command: &Command,
         context: &CommandContext,
         prover_choice: vir::def::ProverChoice,
+        query_op: QueryOp,
+        focus_assert_id: Option<&AssertId>,
         default_prover_failed_assert_ids: &mut Vec<AssertId>,
     ) -> RunCommandQueriesResult {
         let is_singular = prover_choice == vir::def::ProverChoice::Singular;
@@ -908,30 +981,95 @@ impl Verifier {
         let mut invalidity = false;
         let mut timed_out = false;
         let mut used_axioms = None;
-        let mut provenance_round = 0usize;
+        // 0 for the query's first check, then one per multi-error round
+        let mut round = 0usize;
         loop {
+            // Like the resident reply, this describes the first round only, and
+            // like the error count, only queries reported as errors: not
+            // recommends checks, expanded errors, or profile reruns.
+            if let Some(reason) = air_context.take_unknown_reason() {
+                if is_first_check && level == Some(MessageLevel::Error) {
+                    self.func_unknown_reasons.entry(context.fun.clone()).or_default().push((
+                        context.desc.clone(),
+                        context.span.as_string.clone(),
+                        reason,
+                    ));
+                }
+            }
+            let result_str = || match &result {
+                ValidityResult::Valid(_) => "valid".to_string(),
+                ValidityResult::Invalid(..) => "invalid".to_string(),
+                ValidityResult::Canceled => "canceled".to_string(),
+                ValidityResult::TypeError(e) => format!("type error: {}", e),
+                ValidityResult::UnexpectedOutput(s) => format!("unexpected output: {}", s),
+            };
+            if let Some(frontier) = air_context.take_nl_frontier() {
+                self.func_nl_frontier.entry(context.fun.clone()).or_default().push(
+                    QueryNlFrontier {
+                        desc: context.desc.clone(),
+                        span: context.span.as_string.clone(),
+                        kind: query_op.kind(),
+                        focus: focus_assert_id.map(air::def::assert_id_to_symbol),
+                        round,
+                        result: result_str(),
+                        frontier,
+                    },
+                );
+            }
+            if let Some(info) = air_context.take_matching_loops() {
+                self.func_matching_loops.entry(context.fun.clone()).or_default().push(
+                    QueryMatchingLoops {
+                        desc: context.desc.clone(),
+                        span: context.span.as_string.clone(),
+                        focus: focus_assert_id.map(air::def::assert_id_to_symbol),
+                        round,
+                        result: result_str(),
+                        info,
+                    },
+                );
+            }
+            if let Some(gradient) = air_context.take_difficulty() {
+                self.func_difficulty.entry(context.fun.clone()).or_default().push(
+                    QueryDifficulty {
+                        desc: context.desc.clone(),
+                        span: context.span.as_string.clone(),
+                        kind: query_op.kind(),
+                        focus: focus_assert_id.map(air::def::assert_id_to_symbol),
+                        round,
+                        result: result_str(),
+                        gradient,
+                    },
+                );
+            }
+            if let Some(pressure) = air_context.take_inst_pressure() {
+                self.func_inst_pressure.entry(context.fun.clone()).or_default().push(
+                    QueryInstPressure {
+                        desc: context.desc.clone(),
+                        span: context.span.as_string.clone(),
+                        kind: query_op.kind(),
+                        focus: focus_assert_id.map(air::def::assert_id_to_symbol),
+                        round,
+                        result: result_str(),
+                        pressure,
+                    },
+                );
+            }
             if let Some(info) = air_context.take_provenance() {
-                let result_str = match &result {
-                    ValidityResult::Valid(_) => "valid".to_string(),
-                    ValidityResult::Invalid(..) => "invalid".to_string(),
-                    ValidityResult::Canceled => "canceled".to_string(),
-                    ValidityResult::TypeError(e) => format!("type error: {}", e),
-                    ValidityResult::UnexpectedOutput(s) => format!("unexpected output: {}", s),
-                };
                 self.func_provenance.entry(context.fun.clone()).or_default().push(
                     QueryProvenance {
                         desc: context.desc.clone(),
                         span: context.span.as_string.clone(),
-                        round: provenance_round,
-                        result: result_str,
+                        focus: focus_assert_id.map(air::def::assert_id_to_symbol),
+                        round,
+                        result: result_str(),
                         sources: info.sources,
                         instantiations: info.instantiations,
                         variable_versions: info.variable_versions,
                         unparsed: info.unparsed,
                     },
                 );
-                provenance_round += 1;
             }
+            round += 1;
             match result {
                 ValidityResult::Valid(usage_info) => {
                     if (is_check_valid && is_first_check && level == Some(MessageLevel::Error))
@@ -1159,6 +1297,8 @@ impl Verifier {
         bucket_id: &BucketId,
         comment: &str,
         desc_prefix: Option<&str>,
+        query_op: QueryOp,
+        focus_assert_id: Option<&AssertId>,
         default_prover_failed_assert_ids: &mut Vec<AssertId>,
         includes_function: bool,
     ) -> RunCommandQueriesResult {
@@ -1199,6 +1339,8 @@ impl Verifier {
                     &command,
                     &context,
                     *prover_choice,
+                    query_op,
+                    focus_assert_id,
                     default_prover_failed_assert_ids,
                 );
         }
@@ -1223,14 +1365,78 @@ impl Verifier {
     }
 
     /// Resolve batch replies with the same owned metadata used by resident checks.
-    fn resolve_provenance(&mut self, global_ctx: &vir::context::GlobalCtx) {
-        let symbols = crate::provenance::Symbols::capture(
-            global_ctx,
-            global_ctx.air_source_names.borrow().clone(),
-        );
+    fn resolve_provenance(&mut self, symbols: &crate::provenance::Symbols) {
         for (fun, queries) in std::mem::take(&mut self.func_provenance) {
             let resolved = queries.into_iter().map(|query| symbols.resolve(&fun, query));
             self.func_details.entry(fun.clone()).or_default().provenance.extend(resolved);
+        }
+    }
+
+    /// Join the culprit quantifiers of each `unknown` answer back to source.
+    fn resolve_unknown_reasons(&mut self, global_ctx: &vir::context::GlobalCtx) {
+        if self.func_unknown_reasons.is_empty() {
+            return;
+        }
+        let quantifiers = crate::provenance::Quantifiers::capture(global_ctx);
+        for (fun, reasons) in std::mem::take(&mut self.func_unknown_reasons) {
+            let resolved = reasons
+                .into_iter()
+                .map(|(desc, span, reason)| quantifiers.resolve_unknown(&desc, &span, reason));
+            self.func_details.entry(fun).or_default().unknown_reasons.extend(resolved);
+        }
+    }
+
+    /// Join each query's nonlinear frontier to source, per function.
+    fn resolve_nl_frontier(&mut self, symbols: &crate::provenance::Symbols) {
+        for (fun, queries) in std::mem::take(&mut self.func_nl_frontier) {
+            let resolved =
+                queries.into_iter().map(|query| symbols.resolve_nl_frontier(&fun, query));
+            self.func_details.entry(fun.clone()).or_default().nl_frontier.extend(resolved);
+        }
+    }
+
+    /// Resolve batch matching-loop replies the same way as provenance.
+    fn resolve_matching_loops(&mut self, symbols: &crate::provenance::Symbols) {
+        for (fun, queries) in std::mem::take(&mut self.func_matching_loops) {
+            let resolved =
+                queries.into_iter().map(|query| symbols.resolve_matching_loops(&fun, query));
+            self.func_details.entry(fun.clone()).or_default().matching_loops.extend(resolved);
+        }
+    }
+
+    /// Join each query's difficulty gradient to source, per function. A cvc5
+    /// without the key answers `unsupported`; say so once, because those
+    /// records carry no rows although their checks still ran under difficulty
+    /// mode's options and budget.
+    fn resolve_difficulty(
+        &mut self,
+        symbols: &crate::provenance::Symbols,
+        reporter: &impl air::messages::Diagnostics,
+    ) {
+        let mut unsupported = 0usize;
+        for (fun, queries) in std::mem::take(&mut self.func_difficulty) {
+            let resolved: Vec<ResolvedQueryDifficulty> =
+                queries.into_iter().map(|query| symbols.resolve_difficulty(&fun, query)).collect();
+            unsupported +=
+                resolved.iter().filter(|r| r.unparsed.as_deref() == Some("unsupported")).count();
+            self.func_details.entry(fun.clone()).or_default().difficulty.extend(resolved);
+        }
+        if unsupported > 0 {
+            reporter.report(
+                &warning_bare(format!(
+                    "-V difficulty: this cvc5 answered `unsupported` to (get-info :difficulty-gradient) for {unsupported} check(s), so those records carry no rows; the checks still ran with difficulty mode's cvc5 options and twice the usual budget"
+                ))
+                .to_any(),
+            );
+        }
+    }
+
+    /// Join each query's instantiation pressure to source, per function.
+    fn resolve_inst_pressure(&mut self, symbols: &crate::provenance::Symbols) {
+        for (fun, queries) in std::mem::take(&mut self.func_inst_pressure) {
+            let resolved =
+                queries.into_iter().map(|query| symbols.resolve_inst_pressure(&fun, query));
+            self.func_details.entry(fun.clone()).or_default().inst_pressure.extend(resolved);
         }
     }
 
@@ -1256,7 +1462,10 @@ impl Verifier {
     /// provenance, which describes the ordinary search.
     fn instantiation_replay(&self) -> bool {
         self.args.resident
+            // Both of these launch cvc5 with `--proof-mode=pp-only`, and
+            // replay wants the full proofs `--produce-proofs` asks for.
             && !self.args.provenance
+            && !self.args.difficulty
             && matches!(self.args.solver, air::context::SmtSolver::Cvc5)
             && std::env::var_os("VERUS_RESIDENT_INST_REPLAY").is_some()
     }
@@ -1289,6 +1498,18 @@ impl Verifier {
         }
         if self.args.provenance {
             air_context.set_provenance(true);
+        }
+        if self.args.nl_frontier {
+            air_context.set_nl_frontier(true);
+        }
+        if self.args.matching_loops {
+            air_context.set_matching_loops(true, self.args.matching_loop_rounds);
+        }
+        if self.args.difficulty {
+            air_context.set_difficulty(true);
+        }
+        if self.args.inst_pressure {
+            air_context.set_inst_pressure(true);
         }
         if self.instantiation_replay() {
             air_context.set_instantiation_replay(true);
@@ -1650,6 +1871,7 @@ impl Verifier {
                         snap_map,
                         profile_rerun,
                         func_check_sst,
+                        focus_assert_id,
                     } => {
                         let level = query_op.message_level();
                         let function = &op.get_function();
@@ -1803,6 +2025,8 @@ impl Verifier {
                                 bucket_id,
                                 &op.to_air_comment(),
                                 None,
+                                *query_op,
+                                focus_assert_id.as_ref(),
                                 &mut default_prover_failed_assert_ids,
                                 includes_function,
                             );
@@ -2080,11 +2304,13 @@ impl Verifier {
                 air_context,
                 journal,
                 resident_spinoffs,
-                // Instantiation graphs name quantifiers by `:qid`; the symbols
-                // map each back to where it was written.
-                (self.args.provenance || self.inst_graph()).then(|| {
-                    crate::provenance::Symbols::capture(&ctx.global, ctx.name_ctxt.source_names())
-                }),
+                // E-graph readings render solver terms as source in every
+                // session, not only under provenance.
+                Some(crate::provenance::Symbols::capture(
+                    &ctx.global,
+                    ctx.name_ctxt.source_names(),
+                )),
+                crate::provenance::Quantifiers::capture(&ctx.global),
             ));
         }
 
@@ -2735,31 +2961,76 @@ impl Verifier {
                 writeln!(file, "{:#?}", triggers).expect("error writing to trigger log file");
             }
         }
-        // Join the provenance cvc5 reported back to source, per function
-        if self.args.provenance {
-            self.resolve_provenance(&global_ctx);
-            if self.args.log_all {
-                let mut file = self.create_log_file(None, crate::config::PROVENANCE_FILE_SUFFIX)?;
+        // Join why queries answered unknown back to source, in every mode
+        self.resolve_unknown_reasons(&global_ctx);
+        // Join what cvc5 reported (matching loops, instantiation pressure,
+        // difficulty, provenance, nonlinear frontiers) back to source, per
+        // function. The joins read the same symbols.
+        if self.args.matching_loops
+            || self.args.inst_pressure
+            || self.args.difficulty
+            || self.args.provenance
+            || self.args.nl_frontier
+        {
+            let symbols = crate::provenance::Symbols::capture(
+                &global_ctx,
+                global_ctx.air_source_names.borrow().clone(),
+            )
+            .with_function_spans(&krate.functions);
+            if self.args.matching_loops {
+                self.resolve_matching_loops(&symbols);
+            }
+            if self.args.inst_pressure {
+                self.resolve_inst_pressure(&symbols);
+            }
+            if self.args.difficulty {
+                self.resolve_difficulty(&symbols, &reporter);
+            }
+            if self.args.provenance {
+                self.resolve_provenance(&symbols);
+            }
+            if self.args.nl_frontier {
+                self.resolve_nl_frontier(&symbols);
+            }
+        }
+        // `--log-all`: per function, what each of them reported, as JSON
+        if self.args.log_all {
+            type Select = fn(&FuncDetails) -> Option<serde_json::Value>;
+            let logs: [(bool, &str, Select); 3] = [
+                (self.args.inst_pressure, crate::config::INST_PRESSURE_FILE_SUFFIX, |d| {
+                    (!d.inst_pressure.is_empty()).then(|| {
+                        serde_json::to_value(&d.inst_pressure).expect("inst-pressure json")
+                    })
+                }),
+                (self.args.difficulty, crate::config::DIFFICULTY_FILE_SUFFIX, |d| {
+                    (!d.difficulty.is_empty())
+                        .then(|| serde_json::to_value(&d.difficulty).expect("difficulty json"))
+                }),
+                (self.args.provenance, crate::config::PROVENANCE_FILE_SUFFIX, |d| {
+                    (!d.provenance.is_empty())
+                        .then(|| serde_json::to_value(&d.provenance).expect("provenance json"))
+                }),
+            ];
+            for (enabled, suffix, select) in logs {
+                if !enabled {
+                    continue;
+                }
+                let mut file = self.create_log_file(None, suffix)?;
                 let mut by_fun: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
                 let mut funs: Vec<&Fun> = self.func_details.keys().collect();
                 funs.sort();
                 for fun in funs {
-                    let details = &self.func_details[fun];
-                    if details.provenance.is_empty() {
-                        continue;
+                    if let Some(value) = select(&self.func_details[fun]) {
+                        by_fun.insert(fun_as_friendly_rust_name(fun), value);
                     }
-                    by_fun.insert(
-                        fun_as_friendly_rust_name(fun),
-                        serde_json::to_value(&details.provenance).expect("provenance json"),
-                    );
                 }
                 writeln!(
                     file,
                     "{}",
                     serde_json::to_string_pretty(&serde_json::Value::Object(by_fun))
-                        .expect("provenance json")
+                        .expect("func details json")
                 )
-                .expect("error writing to provenance log file");
+                .expect("error writing to log file");
             }
         }
         // Log the provenance joins: qid -> (function, owning tag, span), hyp -> (kind, span)

@@ -112,6 +112,28 @@ impl Emitter {
         }
     }
 
+    /// `(get-egraph-equalities :limit n [:include-used] [:focus (t ...)])`:
+    /// cvc5 replies with the equalities its e-graph holds after the last
+    /// `check-sat`, in the classes of the focus terms, or of every term when
+    /// there are none.
+    pub fn log_get_egraph_equalities(&mut self, focus: &[Node], limit: u32, include_used: bool) {
+        if !self.is_none() {
+            let mut items = vec![
+                Node::Atom("get-egraph-equalities".to_string()),
+                Node::Atom(":limit".to_string()),
+                Node::Atom(limit.to_string()),
+            ];
+            if include_used {
+                items.push(Node::Atom(":include-used".to_string()));
+            }
+            if !focus.is_empty() {
+                items.push(Node::Atom(":focus".to_string()));
+                items.push(Node::List(focus.to_vec()));
+            }
+            self.log_node(&Node::List(items));
+        }
+    }
+
     /// `(save-instantiations k)`: cvc5 keeps the instantiations of the current
     /// scope under `k` after it pops.
     pub fn log_save_instantiations(&mut self, key: &str) {
@@ -219,6 +241,18 @@ impl Emitter {
                 annotated.push(Node::Atom(tag.to_symbol()));
             }
             self.log_node(&nodes!(assert {Node::List(annotated)}));
+        }
+    }
+
+    /// `(check-sat-assuming (l ...))`, each literal a boolean constant or its
+    /// negation.
+    pub fn log_check_sat_assuming(&mut self, literals: &[Expr]) {
+        if !self.is_none() {
+            let literals = literals.iter().map(|l| self.printer.expr_to_node(l)).collect();
+            self.log_node(&Node::List(vec![
+                Node::Atom("check-sat-assuming".to_string()),
+                Node::List(literals),
+            ]));
         }
     }
 

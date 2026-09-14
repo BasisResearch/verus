@@ -319,6 +319,349 @@ fn resident_rechecks_preserve_query_scopes_and_solver_process() {
     eprintln!("one verifier process, one cvc5 launch, {checks} checks, balanced scopes");
 }
 
+const BISECT_SOURCE: &str = r#"
+use vstd::prelude::*;
+verus! {
+    uninterp spec fn f(i: int) -> int;
+    uninterp spec fn g(i: int) -> int;
+    uninterp spec fn a(i: int) -> int;
+
+    // a(0) in the goal seeds the trigger, and each instance adds a(i + 1)
+    proof fn looping()
+        requires
+            forall|i: int| #[trigger] a(i) < a(i + 1),
+        ensures
+            a(0) > 100,
+    {
+    }
+
+    proof fn needs_one(x: int, y: int)
+        requires
+            y > 100,
+            x > 3,
+    {
+        assert(x > 2);
+    }
+
+    proof fn fails_one(x: int)
+        requires
+            x > 3,
+    {
+        assert(x > 2);
+        assert(x > 5);
+        assert(x > 1);
+    }
+
+    proof fn unprovable(x: int)
+        requires
+            x > 0,
+            forall|i: int| #[trigger] f(i) < f(i + 1),
+    {
+        assert(g(x) == 0);
+    }
+}
+"#;
+
+const EGRAPH_SOURCE: &str = r#"
+use vstd::prelude::*;
+verus! {
+    spec fn f(x: int) -> int;
+    spec fn g(x: int) -> int;
+
+    proof fn egraph_target(a: int, b: int)
+        requires f(a) == g(b), g(b) > 0,
+    {
+        assert(f(a) > 1);
+    }
+
+    proof fn egraph_passing(a: int, b: int)
+        requires a == b,
+    {
+        assert(b == a);
+    }
+
+    fn egraph_versions(v: &mut Vec<u64>, x: u64)
+        requires old(v).len() > 0, x < 100,
+    {
+        let y = x + 1;
+        v.set(0, y);
+        let mut z = y;
+        z = z + 1;
+        assert(v[0] == z);
+    }
+}
+"#;
+
+/// `fixture.rs:<line>:`, the start of a span on the first line holding `needle`.
+fn span_of(needle: &str) -> String {
+    let line = BISECT_SOURCE.lines().position(|l| l.contains(needle)).unwrap() + 1;
+    format!("fixture.rs:{line}:")
+}
+
+/// Bisect finds the failing goal, the one `requires` a proof needs, and the
+/// quantifier behind a matching loop, and leaves the retained solver as it
+/// was: ordinary rechecks answer as before and every probe scope is popped.
+#[test]
+fn resident_bisect_localises_and_leaves_the_session_unchanged() {
+    let mut worker = Worker::start(BISECT_SOURCE, &["--rlimit", "2"]);
+    let ready = worker.receive();
+    let session = ready["session"].clone();
+    let request = |name: &str, extra: Value| {
+        let mut request = json!({
+            "command": "bisect", "session": session, "bucket": 0, "query": query_id(&ready, name),
+        });
+        request.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        request
+    };
+    let only = |reply: &Value| -> Value {
+        let set = reply["minimal_statement_ids"].as_array().unwrap();
+        assert_eq!(set.len(), 1, "{reply}");
+        set[0].clone()
+    };
+
+    // Assuming the one failing assertion makes the rest provable.
+    let reply = worker.send(request("::fails_one", json!({"mode": "flip"})));
+    assert_eq!(reply["event"], "bisected", "{reply}");
+    assert_eq!(reply["status"], "found");
+    assert_eq!(reply["target"], "valid");
+    // cvc5 answers a failing goal `unknown (incomplete)` rather than `sat`
+    // whenever quantified axioms are in scope; Verus reports both as invalid.
+    assert_ne!(reply["verdict_before"]["result"], "valid", "{reply}");
+    assert_eq!(reply["verdict_after_removal"]["result"], "valid");
+    assert_eq!(reply["minimal"], true);
+    let goal = only(&reply);
+    assert_eq!(goal["kind"], "goal");
+    assert!(goal["assert_id"].is_array(), "{}", goal);
+    assert!(goal["span"].as_str().unwrap().contains(&span_of("assert(x > 5)")), "{}", goal);
+    // Each probe names the units it switched off.
+    for probe in reply["probes"].as_array().unwrap() {
+        let units = probe["removed_units"].as_array().unwrap();
+        assert_eq!(units.len() as u64, probe["removed"].as_u64().unwrap(), "{probe}");
+    }
+    let removed: Vec<Value> = reply["probes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|probe| probe["removed_units"].clone())
+        .collect();
+    assert!(removed.contains(&json!([goal["index"]])), "{}", reply);
+    assert!(reply["checks_used"].as_u64().unwrap() <= reply["budget_checks"].as_u64().unwrap());
+
+    // The proof of `needs_one` cannot lose `x > 3`, and needs nothing else.
+    for mode in ["flip", "core"] {
+        let reply = worker.send(request("::needs_one", json!({"mode": mode})));
+        assert_eq!(reply["status"], "found", "{reply}");
+        assert_eq!(reply["verdict_before"]["result"], "valid");
+        assert_eq!(reply["minimal"], true);
+        let requires = only(&reply);
+        assert_eq!(requires["kind"], "hypothesis");
+        assert_eq!(requires["description"], "requires");
+        assert!(requires["span"].as_str().unwrap().contains(&span_of("x > 3,")), "{}", requires);
+        let valid_after = reply["verdict_after_removal"]["result"] == "valid";
+        assert_eq!(valid_after, mode == "core", "{reply}");
+    }
+
+    // Only the goal decides `unprovable`: its hypotheses, removed, change
+    // nothing, so a search restricted to them finds no set.
+    let reply = worker.send(request("::unprovable", json!({"mode": "flip", "target": "changed"})));
+    assert_eq!(reply["status"], "found", "{reply}");
+    assert_ne!(reply["verdict_before"]["result"], "valid");
+    let goal = only(&reply);
+    assert_eq!(goal["kind"], "goal");
+    assert!(goal["span"].as_str().unwrap().contains(&span_of("assert(g(x) == 0)")), "{}", goal);
+    let reply = worker.send(request(
+        "::unprovable",
+        json!({"mode": "flip", "target": "changed", "kinds": ["hypothesis"]}),
+    ));
+    assert_eq!(reply["status"], "unreachable", "{reply}");
+    assert_eq!(reply["minimal_statement_ids"], json!([]));
+    // No set, so no verdict for one; what removing everything answered is
+    // reported apart.
+    assert!(reply["verdict_after_removal"].is_null(), "{}", reply);
+    assert_ne!(reply["verdict_all_removed"]["result"], "valid", "{reply}");
+    assert!(reply["verdict_all_removed"]["result"].is_string(), "{}", reply);
+
+    // A matching loop runs the solver out of budget; the one hypothesis whose
+    // removal stops that is the self-triggering quantifier.
+    let reply = worker.send(request(
+        "::looping",
+        json!({"mode": "flip", "target": "changed", "kinds": ["hypothesis"]}),
+    ));
+    assert_eq!(reply["status"], "found", "{reply}");
+    assert_eq!(reply["verdict_before"]["reason"], "resourceout");
+    assert_ne!(reply["verdict_after_removal"]["reason"], "resourceout");
+    let quantifier = only(&reply);
+    assert_eq!(quantifier["kind"], "hypothesis");
+    assert_eq!(quantifier["description"], "requires");
+    assert!(quantifier["span"].as_str().unwrap().contains(&span_of("a(i) < a(i + 1)")));
+
+    // Bad requests are refused without ending the session.
+    let refused = worker.send(request("::needs_one", json!({"mode": "core", "target": "valid"})));
+    assert_eq!(refused["event"], "error", "{refused}");
+    let refused = worker.send(request("::needs_one", json!({"mode": "flip", "budget_checks": 0})));
+    assert_eq!(refused["event"], "error", "{refused}");
+
+    // A short budget still returns a verified set, marked not minimal.
+    let reply = worker.send(request("::fails_one", json!({"mode": "flip", "budget_checks": 2})));
+    assert_eq!(reply["checks_used"], 2, "{reply}");
+    assert_eq!(reply["minimal"], false);
+
+    for (name, expected) in [("::fails_one", "invalid"), ("::needs_one", "valid")] {
+        let query = query_id(&ready, name);
+        let result = worker
+            .send(json!({"command": "check", "session": session, "bucket": 0, "query": query}));
+        assert_eq!(result["result"], expected, "{result}");
+    }
+    assert_eq!(worker.send(json!({"command": "close", "session": session}))["event"], "closed");
+    worker.finish(false);
+    let mut probes = 0;
+    for log in smt_logs(worker.dir.path()) {
+        assert_eq!(log.matches("(push").count(), log.matches("(pop").count());
+        probes += log.matches("(check-sat-assuming").count();
+    }
+    assert!(probes >= 10, "{}", probes);
+}
+
+/// The variables `text` names with an assignment version, as `(name, version)`.
+fn versions_named(text: &str) -> Vec<(String, String)> {
+    const MARK: &str = " (version ";
+    let mut found = Vec::new();
+    let mut rest = text;
+    while let Some(at) = rest.find(MARK) {
+        let name = rest[..at].rsplit(|c: char| !(c.is_alphanumeric() || c == '_')).next();
+        let tail = &rest[at + MARK.len()..];
+        let version: String = tail.chars().take_while(|c| c.is_ascii_digit()).collect();
+        found.push((name.unwrap_or_default().to_string(), version));
+        rest = tail;
+    }
+    found
+}
+
+/// An `egraph` request lists the equalities a failing query's e-graph holds
+/// between the query's own terms, in source spelling. `f(a) == g(b)` survives
+/// preprocessing, which solves an equality with a variable side, such as
+/// `a == b`, by substitution instead. An injection checks the
+/// query again with one of them asserted, in a scope popped right after, so a
+/// later check of the retained query is unchanged. The equality to inject is
+/// named by the id the reading gave it; an unknown id is refused, and the
+/// session keeps serving.
+#[test]
+fn resident_egraph_lists_and_injects_equalities() {
+    let mut worker = Worker::start(EGRAPH_SOURCE, &[]);
+    let ready = worker.receive();
+    assert_eq!(ready["event"], "ready", "{ready}");
+    let session = ready["session"].clone();
+    let target = query_id(&ready, "::egraph_target");
+    let listed =
+        worker.send(json!({"command": "egraph", "session": session, "bucket": 0, "query": target}));
+    assert_eq!(listed["event"], "egraph", "{listed}");
+    assert_eq!(listed["before"]["result"], "invalid", "{listed}");
+    assert!(listed["summary"]["focus_found"].as_u64().unwrap() > 0, "{}", listed);
+    let pair = listed["equalities"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|equality| {
+            let sides = [equality["lhs"].as_str().unwrap(), equality["rhs"].as_str().unwrap()];
+            sides.iter().any(|side| side.ends_with("f(a)"))
+                && sides.iter().any(|side| side.ends_with("g(b)"))
+        })
+        .unwrap_or_else(|| panic!("no f(a) == g(b): {}", listed))
+        .clone();
+    assert_eq!(pair["level"], "entailed", "{pair}");
+    assert_eq!(pair["used_by_proof"], false, "{pair}");
+    assert!(!pair["holds_because"].as_array().unwrap().is_empty(), "{}", pair);
+    // Only an entailed equality is offered as an assert: `a == b` holds in
+    // the model the search ended on, and is listed without one.
+    let equalities = listed["equalities"].as_array().unwrap();
+    assert!(equalities.iter().any(|e| e["level"] == "decision"), "{}", listed);
+    for equality in equalities {
+        assert!(
+            equality["level"] == "entailed" || equality["verus_assert"].is_null(),
+            "{}",
+            equality
+        );
+    }
+    // The offered assert is source for the crate it came from, and it holds
+    // there: pasted in place of the failing assert, the function verifies.
+    let pasted = pair["verus_assert"].as_str().unwrap();
+    assert!(pasted.contains("crate::f(a)") && pasted.contains("crate::g(b)"), "{}", pair);
+    let mut paste_worker = Worker::start(&EGRAPH_SOURCE.replace("assert(f(a) > 1);", pasted), &[]);
+    let paste_ready = paste_worker.receive();
+    assert_eq!(paste_ready["event"], "ready", "{paste_ready}");
+    let pasted_check = paste_worker.send(json!({"command": "check",
+        "session": paste_ready["session"], "bucket": 0,
+        "query": query_id(&paste_ready, "::egraph_target")}));
+    assert_eq!(pasted_check["result"], "valid", "{pasted_check}");
+    paste_worker.send(json!({"command": "close", "session": paste_ready["session"]}));
+    paste_worker.finish(false);
+    // Differently boxed terms of the same equality read alike; it is listed once.
+    let mut rendered: Vec<(String, String)> = listed["equalities"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|equality| {
+            let lhs = equality["lhs"].as_str().unwrap().to_string();
+            let rhs = equality["rhs"].as_str().unwrap().to_string();
+            if lhs <= rhs { (lhs, rhs) } else { (rhs, lhs) }
+        })
+        .collect();
+    let listed_count = rendered.len();
+    rendered.sort();
+    rendered.dedup();
+    assert_eq!(rendered.len(), listed_count, "{listed}");
+
+    // A requires the query already entails changes nothing when injected.
+    let injected = worker.send(json!({"command": "egraph", "session": session, "bucket": 0,
+        "query": target, "inject": pair["id"]}));
+    assert_eq!(injected["injection"]["equality"]["id"], pair["id"], "{injected}");
+    assert_eq!(injected["injection"]["after"]["result"], "invalid", "{injected}");
+    assert_eq!(injected["injection"]["closed"], false, "{injected}");
+    assert!(injected["injection"]["frontier_delta"].is_object(), "{}", injected);
+
+    let refused = worker.send(json!({"command": "egraph", "session": session, "bucket": 0,
+        "query": target, "inject": "eq#000000000000"}));
+    assert_eq!(refused["event"], "error", "{refused}");
+    let checked =
+        worker.send(json!({"command": "check", "session": session, "bucket": 0, "query": target}));
+    assert_eq!(checked["result"], "invalid", "{checked}");
+
+    // A valid query leaves no e-graph to read.
+    let passing = query_id(&ready, "::egraph_passing");
+    let valid = worker
+        .send(json!({"command": "egraph", "session": session, "bucket": 0, "query": passing}));
+    assert_eq!(valid["before"]["result"], "valid", "{valid}");
+    assert!(valid["before"]["egraph_error"].is_string(), "{}", valid);
+    assert!(valid["equalities"].as_array().unwrap().is_empty(), "{}", valid);
+
+    // `z == (z + 1)` would name two assignments of `z` alike. The reading
+    // holds such an equality between versions of `z`, and offers no assert
+    // for it or any other that names one variable at two versions.
+    let versions = query_id(&ready, "::egraph_versions");
+    let versioned = worker
+        .send(json!({"command": "egraph", "session": session, "bucket": 0, "query": versions}));
+    assert_eq!(versioned["event"], "egraph", "{versioned}");
+    let mut mixed = 0;
+    for equality in versioned["equalities"].as_array().unwrap() {
+        let text = format!("{} {}", equality["lhs"], equality["rhs"]);
+        let named = versions_named(&text);
+        let two = named.iter().any(|(x, v)| named.iter().any(|(y, w)| x == y && v != w));
+        if two {
+            mixed += 1;
+            assert!(equality["verus_assert"].is_null(), "{}", equality);
+        }
+    }
+    assert!(mixed > 0, "{}", versioned);
+
+    assert_eq!(worker.send(json!({"command": "close", "session": session}))["event"], "closed");
+    worker.finish(false);
+    let launches = fs::read_to_string(worker.dir.path().join("launches")).unwrap();
+    assert_eq!(launches.lines().count(), 1, "{launches}");
+    for log in smt_logs(worker.dir.path()) {
+        assert_eq!(log.matches("(push").count(), log.matches("(pop").count());
+    }
+}
+
 /// With instantiation replay, every resident check that proves its query
 /// saves its instantiations, and a recheck of a query with saved ones first
 /// tries them alone (`:only`), falling back to the ordinary check unless that
@@ -770,6 +1113,111 @@ fn resident_spinoff_all_reuses_original_solvers() {
     }
 }
 
+/// A session under `-V matching-loops=N` reports, with a check that came back
+/// unknown, the quantifier that fed its own trigger, in source spelling; an
+/// unknown without a loop reports none.
+///
+/// Needs the pinned cvc5 to have `--matching-loops` and to report the
+/// trigger that matched (BasisResearch/cvc5#3 and #10).
+#[test]
+fn resident_matching_loops_name_the_self_feeding_quantifier() {
+    let source = r#"
+use vstd::prelude::*;
+verus! {
+    pub uninterp spec fn a(i: int) -> int;
+    pub uninterp spec fn h(x: int) -> int;
+
+    proof fn loops()
+        requires forall|i: int| #[trigger] a(i) < a(i + 1),
+        ensures a(0) > 100,
+    {
+    }
+
+    proof fn incomplete(x: int)
+        requires forall|y: int| #[trigger] h(y) > 0,
+        ensures h(x) > 1,
+    {
+    }
+
+    pub uninterp spec fn b(i: int) -> int;
+
+    proof fn twin()
+        requires
+            forall|i: int| #[trigger] a(i) < a(i + 1),
+            forall|i: int| #[trigger] b(i) < b(i - 1),
+        ensures a(0) + b(0) > 100,
+    {
+    }
+
+    proof fn indexed(s: Seq<int>)
+        requires forall|i: int| 0 <= i < s.len() - 1 ==> #[trigger] s[i] < s[i + 1],
+        ensures s.len() > 5 ==> s[0] + 100 < s[5],
+    {
+    }
+}
+"#;
+    let mut worker = Worker::start(source, &["-V", "matching-loops=20"]);
+    let ready = worker.receive();
+    assert_eq!(ready["matching_loops"], true, "{ready}");
+    let checked = worker.send(json!({"command":"check", "session":ready["session"], "bucket":0, "query":query_id(&ready, "loops")}));
+    assert_eq!(checked["result"], "invalid", "{checked}");
+    let report = &checked["matching_loops"];
+    assert_eq!(report["max_inst_rounds"], true, "{checked}");
+    let found = report["loops"].as_array().unwrap();
+    let culprit = found
+        .iter()
+        .find(|l| l["trigger"].as_str().is_some_and(|t| t.contains("a(i)")))
+        .unwrap_or_else(|| panic!("no loop on a: {}", checked));
+    assert_eq!(culprit["confidence"], "high", "{}", culprit);
+    assert_eq!(culprit["edges"], "confirmed", "{}", culprit);
+    assert!(culprit["fun"].as_str().unwrap().ends_with("::loops"), "{}", culprit);
+    assert!(culprit["span"].as_str().unwrap().contains("fixture.rs"), "{}", culprit);
+    assert!(culprit["growth_rate"].as_str().unwrap().starts_with("linear-depth"), "{}", culprit);
+    let ladder = culprit["term_ladder"].as_array().unwrap();
+    assert!(ladder.len() >= 3, "{}", culprit);
+    assert!(ladder[1].as_str().unwrap().contains("(0 + 1)"), "{}", culprit);
+    assert!(ladder[2].as_str().unwrap().contains("((0 + 1) + 1)"), "{}", culprit);
+    // cvc5 sends the first rungs and the last of the 20-round chain
+    assert!(ladder.iter().any(|rung| rung == "…"), "{}", culprit);
+    assert!(culprit["growth_rate"].as_str().unwrap().contains("solver term depth"), "{}", culprit);
+    // the prelude axioms the loop drags along are not loops of their own
+    assert!(
+        found.iter().all(|l| l["fun"].as_str().is_some_and(|f| f.ends_with("::loops"))),
+        "{}",
+        checked
+    );
+    let checked = worker.send(json!({"command":"check", "session":ready["session"], "bucket":0, "query":query_id(&ready, "incomplete")}));
+    assert_eq!(checked["result"], "invalid", "{checked}");
+    assert_eq!(checked["matching_loops"]["loops"], json!([]), "{checked}");
+    // two written loops, each reported on its own. cvc5 leaves out most
+    // formulas that only ride a loop; any it still lists follow a loop whose
+    // terms they share, so subtraction never follows a's loop
+    let checked = worker.send(json!({"command":"check", "session":ready["session"], "bucket":0, "query":query_id(&ready, "twin")}));
+    let found = checked["matching_loops"]["loops"].as_array().unwrap();
+    let on = |f: &str| {
+        found
+            .iter()
+            .find(|l| l["trigger"].as_str().is_some_and(|t| t.contains(f)))
+            .unwrap_or_else(|| panic!("no loop on {}: {}", f, checked))
+    };
+    let follows = |l: &serde_json::Value, qid: &str| {
+        l["followers"].as_array().is_some_and(|fs| fs.iter().any(|f| f == qid))
+    };
+    assert_eq!(found.len(), 2, "{}", checked);
+    on("b(i)");
+    assert!(!follows(on("a(i)"), "prelude_sub"), "{}", checked);
+    // the axiom Verus generates for `Seq::index` rides the written loop
+    let checked = worker.send(json!({"command":"check", "session":ready["session"], "bucket":0, "query":query_id(&ready, "indexed")}));
+    let found = checked["matching_loops"]["loops"].as_array().unwrap();
+    assert!(!found.is_empty(), "{}", checked);
+    assert!(found.iter().all(|l| l["qid"].as_str().unwrap().starts_with("user_")), "{}", checked);
+    assert_eq!(
+        worker.send(json!({"command":"close", "session":ready["session"]}))["event"],
+        "closed"
+    );
+    worker.finish(false);
+}
+
 /// Identical local hypothesis and quantifier ordinals in different buckets
 /// must resolve through that bucket's source maps after the compiler exits.
 #[test]
@@ -922,6 +1370,48 @@ set -eu
     }
 }
 
+/// The prelude's quantifiers keep cvc5 from confirming a model, so a failing
+/// query answers `unknown` (incomplete) rather than `sat`. The reply says why,
+/// in every mode; a query that was proved carries no reason.
+#[test]
+fn resident_checks_say_why_the_solver_answered_unknown() {
+    let mut worker = Worker::start(SOURCE, &[]);
+    let ready = worker.receive();
+    let session = ready["session"].clone();
+    for _ in 0..2 {
+        let failing = worker.send(
+            json!({"command":"check", "session":session, "bucket":0, "query":query_id(&ready, "::failing")}),
+        );
+        assert_eq!(failing["result"], "invalid", "{}", failing);
+        let reason = &failing["unknown_reason"];
+        assert_eq!(reason["reason"], "incomplete", "{}", failing);
+        assert!(reason["desc"].is_string() && reason["span"].is_string(), "{}", failing);
+        // A cvc5 older than the incomplete-id key answers `unsupported`, which
+        // leaves the id out and the culprits empty.
+        let culprits = reason["culprits"].as_array().unwrap();
+        if let Some(id) = reason.get("incomplete_id").and_then(|id| id.as_str()) {
+            assert!(id.starts_with("QUANTIFIERS"), "{}", failing);
+            // At least the prelude's quantifiers are asserted in every query.
+            assert!(!culprits.is_empty(), "{}", failing);
+        }
+        // Source-spanned culprits lead and the prelude's come last.
+        let rank = |culprit: &Value| match (culprit.get("span"), culprit["fun"].as_str()) {
+            (Some(_), _) => 0,
+            (None, Some("prelude")) => 2,
+            (None, _) => 1,
+        };
+        assert!(culprits.iter().all(|culprit| culprit["qid"].is_string()), "{}", failing);
+        assert!(culprits.windows(2).all(|pair| rank(&pair[0]) <= rank(&pair[1])), "{}", failing);
+        let passing = worker.send(
+            json!({"command":"check", "session":session, "bucket":0, "query":query_id(&ready, "::passing")}),
+        );
+        assert_eq!(passing["result"], "valid", "{}", passing);
+        assert!(passing["unknown_reason"].is_null(), "{}", passing);
+    }
+    assert_eq!(worker.send(json!({"command":"close", "session":session}))["event"], "closed");
+    worker.finish(false);
+}
+
 #[test]
 fn resident_rejects_bad_requests_and_accepts_eof() {
     let mut worker = Worker::start("use vstd::prelude::*; verus! { proof fn passing() {} }", &[]);
@@ -965,13 +1455,18 @@ fn resident_ready_lists_the_requests_it_serves() {
         .iter()
         .map(|command| command.as_str().unwrap().to_owned())
         .collect();
-    assert_eq!(commands, ["list", "check", "close", "inst_graph"], "{ready}");
+    assert_eq!(commands, ["list", "check", "bisect", "egraph", "close", "inst_graph"], "{ready}");
     // Each listed request parses: a stale session is refused as a session,
     // not as an unknown request, so the list cannot drift from `Request`.
     for command in &commands {
         let request = match command.as_str() {
             "list" | "close" => json!({"command": command, "session": "stale"}),
-            "check" => json!({"command": command, "session": "stale", "bucket": 0, "query": 0}),
+            "check" | "egraph" => {
+                json!({"command": command, "session": "stale", "bucket": 0, "query": 0})
+            }
+            "bisect" => {
+                json!({"command": command, "session": "stale", "bucket": 0, "query": 0, "mode": "flip"})
+            }
             "inst_graph" => {
                 json!({"command": command, "session": "stale", "bucket": 0, "query": 0, "op": "cycles"})
             }
@@ -1545,4 +2040,97 @@ fn resident_retains_function_buckets_alongside_module_buckets() {
     }
     worker.finish(true);
     assert_eq!(fs::read_to_string(worker.dir.path().join("launches")).unwrap().lines().count(), 2);
+}
+
+/// A session under `-V difficulty` reports, for every check it runs, what
+/// cvc5 attributed to each tagged assertion of that query, joined to source:
+/// the goal and the hypotheses are listed, the axioms that did no work are
+/// counted rather than listed, and a recheck names no focused obligation,
+/// since a session never expands an error.
+///
+/// Needs the pinned cvc5 to answer `(get-info :difficulty-gradient)`
+/// (BasisResearch/cvc5#5).
+#[test]
+fn resident_difficulty_reports_the_gradient_of_a_check() {
+    let source = r#"
+use vstd::prelude::*;
+verus! {
+    pub uninterp spec fn enc(k: int) -> int;
+    pub uninterp spec fn dec(v: int) -> int;
+
+    #[verifier::external_body]
+    pub broadcast proof fn roundtrip(k: int)
+        ensures #[trigger] dec(enc(k)) == k,
+    {
+    }
+
+    proof fn decode_ok(k: int, v: int, bound: int)
+        requires
+            v == enc(k),
+            bound < 100,
+        ensures
+            dec(v) == k,
+    {
+        broadcast use roundtrip;
+    }
+}
+"#;
+    let mut worker = Worker::start(source, &["-V", "difficulty"]);
+    let ready = worker.receive();
+    assert_eq!(ready["difficulty"], true, "{}", ready);
+    let checked = worker.send(json!({"command":"check", "session":ready["session"], "bucket":0, "query":query_id(&ready, "decode_ok")}));
+    assert_eq!(checked["result"], "valid", "{}", checked);
+    let report = &checked["difficulty"];
+    assert_eq!(report["kind"], "body", "{}", checked);
+    assert_eq!(report["round"], 0, "{}", checked);
+    assert_eq!(report["result"], "valid", "{}", checked);
+    assert_eq!(report["solver_result"], "unsat", "{}", checked);
+    assert_eq!(report["difficulty"], true, "{}", checked);
+    assert_eq!(report["core"], true, "{}", checked);
+    assert!(report["unparsed"].is_null(), "the pinned cvc5 answers the key: {}", checked);
+    assert!(report["focus"].is_null(), "a session expands no error: {}", checked);
+    let kinds = |row: &serde_json::Value| {
+        row["tags"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tag| tag["kind"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>()
+    };
+    let rows = report["rows"].as_array().unwrap();
+    let goal = rows
+        .iter()
+        .find(|row| kinds(row).iter().any(|kind| kind == "query"))
+        .unwrap_or_else(|| panic!("no goal row: {}", checked));
+    // the goal is in every refutation's core
+    assert_eq!(goal["in_core"], true, "{}", goal);
+    // both requires clauses are listed, whatever work they did
+    let requires = rows.iter().filter(|row| kinds(row).iter().any(|k| k == "requires")).count();
+    assert_eq!(requires, 2, "{}", checked);
+    // the axioms that did nothing are counted: most of what is in scope
+    assert!(report["idle_axioms"].as_u64().unwrap() > 0, "{}", checked);
+    assert_eq!(
+        worker.send(json!({"command":"close", "session":ready["session"]}))["event"],
+        "closed"
+    );
+    // every query of the fixture verifies, so the invocation succeeded
+    worker.finish(true);
+}
+
+/// Without `-V difficulty` a session says the mode is off and its checks
+/// carry no gradient, so a caller cannot mistake an absent reply for an empty
+/// one.
+#[test]
+fn resident_without_difficulty_reports_none() {
+    let mut worker = Worker::start(SOURCE, &[]);
+    let ready = worker.receive();
+    assert_eq!(ready["difficulty"], false, "{}", ready);
+    let checked = worker.send(json!({"command":"check", "session":ready["session"], "bucket":0, "query":query_id(&ready, "passing")}));
+    assert_eq!(checked["result"], "valid", "{}", checked);
+    assert!(checked["difficulty"].is_null(), "{}", checked);
+    assert_eq!(
+        worker.send(json!({"command":"close", "session":ready["session"]}))["event"],
+        "closed"
+    );
+    worker.finish(false);
 }

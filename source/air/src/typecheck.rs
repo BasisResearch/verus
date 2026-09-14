@@ -696,50 +696,12 @@ fn check_expr(typing: &mut Typing, expr: &Expr) -> Result<Typ, TypeError> {
                 BindX::Lambda(binders, _, _) => binders.clone(),
                 BindX::Choose(binders, _, _, _) => binders.clone(),
             };
-            // Collect all binder names, make sure they are unique
             typing.decls.push_scope(true);
-            for binder in binders.iter() {
-                let x = &binder.name;
-                let var = DeclaredX::Var { typ: binder.a.clone(), mutable: false };
-                typing.insert(x, Arc::new(var))?;
-            }
-            // Type-check triggers
-            match &**bind {
-                BindX::Let(_) => {}
-                BindX::Quant(_, _, triggers, _)
-                | BindX::Choose(_, triggers, _, _)
-                | BindX::Lambda(_, triggers, _) => {
-                    for trigger in triggers.iter() {
-                        for expr in trigger.iter() {
-                            check_expr(typing, expr)?;
-                        }
-                    }
-                }
-            }
-            // Type-check inner expressions
-            if let BindX::Choose(_, _, _, e2) = &**bind {
-                let t2 = check_expr(typing, e2)?;
-                if !typ_eq(&t2, &bt()) {
-                    return Err(format!(
-                        "in choose, condition has type {} instead of Bool",
-                        typ_name(&t2)
-                    ));
-                }
-            }
-            // Type-check expr
-            let t1 = check_expr(typing, e1)?;
-            let tb = match &**bind {
-                BindX::Let(_) => t1,
-                BindX::Quant(_, _, _, _) => {
-                    expect_typ(&t1, &bt(), "forall/exists body must have type bool")?;
-                    t1
-                }
-                BindX::Lambda(_, _, _) => Arc::new(TypX::Fun),
-                BindX::Choose(..) => t1,
-            };
-            // Done
+            let tb = check_bind_in_scope(typing, bind, &binders, e1);
+            // Close the binders' scope on a type error too, so that the
+            // caller's scopes stay balanced.
             typing.decls.pop_scope();
-            Ok(tb)
+            tb
         }
         ExprX::LabeledAssertion(_, _, _, expr) => check_expr(typing, expr),
         ExprX::LabeledAxiom(_, _, expr) => check_expr(typing, expr),
@@ -754,6 +716,51 @@ fn check_expr(typing: &mut Typing, expr: &Expr) -> Result<Typ, TypeError> {
             Err(format!("error '{}' in expression '{}'", err, node_str))
         }
     }
+}
+
+fn check_bind_in_scope(
+    typing: &mut Typing,
+    bind: &BindX,
+    binders: &Binders<Typ>,
+    e1: &Expr,
+) -> Result<Typ, TypeError> {
+    // Collect all binder names, make sure they are unique
+    for binder in binders.iter() {
+        let x = &binder.name;
+        let var = DeclaredX::Var { typ: binder.a.clone(), mutable: false };
+        typing.insert(x, Arc::new(var))?;
+    }
+    // Type-check triggers
+    match bind {
+        BindX::Let(_) => {}
+        BindX::Quant(_, _, triggers, _)
+        | BindX::Choose(_, triggers, _, _)
+        | BindX::Lambda(_, triggers, _) => {
+            for trigger in triggers.iter() {
+                for expr in trigger.iter() {
+                    check_expr(typing, expr)?;
+                }
+            }
+        }
+    }
+    // Type-check inner expressions
+    if let BindX::Choose(_, _, _, e2) = bind {
+        let t2 = check_expr(typing, e2)?;
+        if !typ_eq(&t2, &bt()) {
+            return Err(format!("in choose, condition has type {} instead of Bool", typ_name(&t2)));
+        }
+    }
+    // Type-check expr
+    let t1 = check_expr(typing, e1)?;
+    Ok(match bind {
+        BindX::Let(_) => t1,
+        BindX::Quant(_, _, _, _) => {
+            expect_typ(&t1, &bt(), "forall/exists body must have type bool")?;
+            t1
+        }
+        BindX::Lambda(_, _, _) => Arc::new(TypX::Fun),
+        BindX::Choose(..) => t1,
+    })
 }
 
 fn check_stmt(typing: &mut Typing, stmt: &Stmt) -> Result<(), TypeError> {
@@ -816,9 +823,9 @@ fn check_stmt(typing: &mut Typing, stmt: &Stmt) -> Result<(), TypeError> {
                 typing.break_labels_local.insert(label.clone());
                 typing.break_labels_in_scope.push_scope(false);
                 typing.break_labels_in_scope.insert(label.clone(), ()).expect("push break");
-                check_stmt(typing, s)?;
+                let result = check_stmt(typing, s);
                 typing.break_labels_in_scope.pop_scope();
-                Ok(())
+                result
             }
         }
         StmtX::Break(label) => {
@@ -949,6 +956,15 @@ pub(crate) fn add_decl<'ctx>(
 pub(crate) fn check_query(context: &mut Context, query: &Query) -> Result<Query, TypeError> {
     let num_scopes = context.typing.decls.num_scopes();
     context.push_name_scope();
+    let query = check_query_in_name_scope(context, query);
+    // Close the name scope on a type error too, so that the caller's next pop
+    // closes its own scope.
+    context.pop_name_scope();
+    assert_eq!(context.typing.decls.num_scopes(), num_scopes);
+    query
+}
+
+fn check_query_in_name_scope(context: &mut Context, query: &Query) -> Result<Query, TypeError> {
     let mut locals: Vec<Decl> = Vec::new();
     for decl in query.local.iter() {
         let (mut gen_decls, decl) = check_decl(context, decl)?;
@@ -965,9 +981,5 @@ pub(crate) fn check_query(context: &mut Context, query: &Query) -> Result<Query,
     let (mut gen_decls, assertion) = crate::closure::simplify_stmt(context, &query.assertion);
     assert_eq!(context.apply_map.num_scopes(), context.typing.decls.num_scopes());
     locals.append(&mut gen_decls);
-    let query = Arc::new(QueryX { local: Arc::new(locals), assertion });
-
-    context.pop_name_scope();
-    assert_eq!(context.typing.decls.num_scopes(), num_scopes);
-    Ok(query)
+    Ok(Arc::new(QueryX { local: Arc::new(locals), assertion }))
 }

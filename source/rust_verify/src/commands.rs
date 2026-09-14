@@ -71,6 +71,11 @@ pub enum OpKind {
         snap_map: Arc<Vec<(vir::messages::Span, SnapPos)>>,
         profile_rerun: bool,
         func_check_sst: Option<Arc<FuncCheckSst>>,
+        /// Under `--expand-errors`, the obligation this query was focused on
+        /// (`focus_commands_with_context_on_assert_id`). Without it the
+        /// expanded rechecks of one function are told apart only by what they
+        /// report, since they share its description, span and kind.
+        focus_assert_id: Option<AssertId>,
     },
 }
 
@@ -336,7 +341,11 @@ impl<'a> OpGenerator<'a> {
 
         self.ctx.fun = None;
 
-        Ok(Op::query(QueryOp::Body(Style::Expanded), commands, snap_map, &function, None))
+        let mut op = Op::query(QueryOp::Body(Style::Expanded), commands, snap_map, &function, None);
+        if let OpKind::Query { focus_assert_id, .. } = &mut op.kind {
+            *focus_assert_id = Some(assert_id.clone());
+        }
+        Ok(op)
     }
 }
 
@@ -434,6 +443,7 @@ impl<'a, 'b> FunctionOpGenerator<'a, 'b> {
                 snap_map,
                 profile_rerun: true,
                 func_check_sst,
+                focus_assert_id: None,
             },
             function: Some(function.clone()),
         };
@@ -564,6 +574,7 @@ impl Op {
                 snap_map: Arc::new(snap_map),
                 profile_rerun: false,
                 func_check_sst,
+                focus_assert_id: None,
             },
             function: Some(f.clone()),
         }
@@ -588,6 +599,20 @@ impl QueryOp {
             QueryOp::Body(Style::Normal) => false,
             QueryOp::Body(Style::Expanded) => true,
             QueryOp::Body(Style::CheckApiSafety) => false,
+        }
+    }
+
+    /// The wire spelling of the query's kind (`-V inst-pressure`), which
+    /// tells a recommends rerun or an expanded recheck of a function's body
+    /// from the body check itself: all three share `desc` and `span`.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            QueryOp::SpecTermination => "termination",
+            QueryOp::Body(Style::Normal) => "body",
+            QueryOp::Body(Style::RecommendsFollowupFromError) => "recommends",
+            QueryOp::Body(Style::RecommendsChecked) => "recommends_checked",
+            QueryOp::Body(Style::Expanded) => "expanded",
+            QueryOp::Body(Style::CheckApiSafety) => "api_safety",
         }
     }
 }
