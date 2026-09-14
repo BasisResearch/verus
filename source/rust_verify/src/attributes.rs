@@ -775,6 +775,7 @@ pub(crate) fn parse_attrs(
                 AttrTree::Fun(_, arg, None) if arg == "tracked_take_option_primitive" => {
                     v.push(Attr::TrackedTakeOption)
                 }
+                AttrTree::Fun(_, arg, None) if arg == "reach_root" => v.push(Attr::ReachRoot),
                 _ => return err_span(span, "unrecognized verifier attribute"),
             },
             AttrPrefix::Verus(verus_prefix) => match verus_prefix {
@@ -912,7 +913,6 @@ pub(crate) fn parse_attrs(
                     AttrTree::Fun(_, arg, None) if arg == "unerased_proxy" => {
                         v.push(Attr::UnerasedProxy)
                     }
-                    AttrTree::Fun(_, arg, None) if arg == "reach_root" => v.push(Attr::ReachRoot),
                     AttrTree::Fun(_, arg, None) if arg == "uses_unerased_proxy" => {
                         v.push(Attr::UsesUnerasedProxy)
                     }
