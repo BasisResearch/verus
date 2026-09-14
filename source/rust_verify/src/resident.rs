@@ -578,6 +578,8 @@ struct EgraphSummary {
     /// value inside it), neither renders as source, or an equality listed
     /// before reads the same (the same one between differently boxed terms).
     hidden: usize,
+    /// Terms cvc5 left out because they print larger than its size limit.
+    too_large: u64,
 }
 
 #[derive(Clone, Serialize)]
@@ -602,8 +604,14 @@ struct ResolvedEquality {
     used_by: Vec<String>,
     /// How many of the two sides are terms of the query itself, 0 to 2.
     focus: u32,
-    /// The literals the equality follows from, in source spelling.
+    /// The literals the equality follows from, in source spelling, except
+    /// those `because_hidden` counts.
     holds_because: Vec<String>,
+    /// Literals of the explanation cvc5 left out, as naming a skolem or
+    /// printing larger than its size limit. When present, `holds_because`
+    /// alone does not imply the equality.
+    #[serde(skip_serializing_if = "is_zero")]
+    because_hidden: u64,
     /// `assert(lhs == rhs);` to add to the source, when the equality is
     /// entailed, both sides render as source, and no variable appears at two
     /// assignment versions. Variables are named without versions and the
@@ -640,6 +648,10 @@ struct FrontierDelta {
     lost_equality_count: usize,
     /// How many of the first reading's classes merged into another.
     classes_merged: usize,
+}
+
+fn is_zero(count: &u64) -> bool {
+    *count == 0
 }
 
 /// Names this equality in an `inject` request: FNV-1a over the two terms as
@@ -783,6 +795,7 @@ impl<'a> QueryNames<'a> {
                 used_by,
                 focus: equality.focus,
                 holds_because: equality.because.iter().map(|lit| self.show(lit)).collect(),
+                because_hidden: equality.because_hidden,
                 verus_assert: self.verus_assert(equality),
                 smt_lhs: equality.lhs.clone(),
                 smt_rhs: equality.rhs.clone(),
@@ -961,6 +974,7 @@ fn serve_egraph(
         listed: shown.len(),
         used_omitted: used.len(),
         hidden,
+        too_large: reading.too_large,
     };
     let equalities = shown.into_iter().take(limit).collect();
     Ok(Ok(EgraphOutcome { before, summary, equalities, injection }))
@@ -1633,6 +1647,7 @@ mod tests {
                     used_by: Vec::new(),
                     focus: 1,
                     because: Vec::new(),
+                    because_hidden: 0,
                 })
                 .collect(),
             ..EgraphReply::default()
@@ -1684,6 +1699,7 @@ mod tests {
             used_by: used_by.iter().map(|qid| qid.to_string()).collect(),
             focus: 1,
             because: Vec::new(),
+            because_hidden: 0,
         }
     }
 

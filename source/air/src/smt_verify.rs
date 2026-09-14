@@ -600,6 +600,7 @@ pub(crate) fn parse_egraph_lines(lines: &[String]) -> crate::context::EgraphRepl
                                     ":focus" => reply.focus = number(value),
                                     ":focus-found" => reply.focus_found = number(value),
                                     ":used-omitted" => reply.used_omitted = number(value),
+                                    ":too-large" => reply.too_large = number(value),
                                     _ => {}
                                 }
                             }
@@ -613,6 +614,7 @@ pub(crate) fn parse_egraph_lines(lines: &[String]) -> crate::context::EgraphRepl
                                 used_by: Vec::new(),
                                 focus: 0,
                                 because: Vec::new(),
+                                because_hidden: 0,
                             };
                             for (key, value) in fields(&parts[3..]) {
                                 match (key, value) {
@@ -624,6 +626,9 @@ pub(crate) fn parse_egraph_lines(lines: &[String]) -> crate::context::EgraphRepl
                                     (":focus", value) => equality.focus = number(value) as u32,
                                     (":because", Node::List(lits)) => {
                                         equality.because = lits.iter().map(one_line).collect()
+                                    }
+                                    (":because-hidden", value) => {
+                                        equality.because_hidden = number(value)
                                     }
                                     _ => {}
                                 }
@@ -1044,15 +1049,20 @@ mod egraph_tests {
     fn egraph_reply_parses_summary_equalities_and_refusals() {
         let reply = parse_egraph_lines(&lines(&[
             "(egraph-equalities",
-            "(summary :classes 2 :candidates 3 :focus 4 :focus-found 3 :used-omitted 1)",
+            "(summary :classes 2 :candidates 3 :focus 4 :focus-found 3 :used-omitted 1 :too-large 5)",
             "(equality (f b) c :level entailed :used false :used-by () :focus 2 :because ((= a b) (= (f a) c)))",
-            "(equality d b :level decision :used true :used-by (prelude_box user_f_1) :focus 1 :because ())",
+            "(equality d b :level decision :used true :used-by (prelude_box user_f_1) :focus 1 :because () :because-hidden 2)",
             ")",
         ]));
         assert!(reply.error.is_none(), "{:?}", reply.error);
         assert_eq!(
             (reply.classes, reply.candidates, reply.focus, reply.focus_found, reply.used_omitted),
             (2, 3, 4, 3, 1)
+        );
+        assert_eq!(reply.too_large, 5);
+        assert_eq!(
+            (reply.equalities[0].because_hidden, reply.equalities[1].because_hidden),
+            (0, 2)
         );
         assert_eq!(reply.equalities.len(), 2);
         let first = &reply.equalities[0];

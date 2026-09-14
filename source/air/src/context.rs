@@ -88,8 +88,12 @@ pub struct EgraphEquality {
     pub used_by: Vec<String>,
     /// how many of the two sides are subterms of the query, 0 to 2
     pub focus: u32,
-    /// the literals the equality follows from
+    /// the literals the equality follows from, except those cvc5 left out
     pub because: Vec<String>,
+    /// how many literals of the explanation cvc5 left out, as naming a
+    /// skolem or printing larger than its size limit; when not 0, `because`
+    /// alone does not imply the equality
+    pub because_hidden: u64,
 }
 
 /// cvc5's reply to `(get-egraph-equalities)` after a query's first
@@ -106,6 +110,8 @@ pub struct EgraphReply {
     pub focus_found: u64,
     /// equalities left out because a quantifier was instantiated with a side
     pub used_omitted: u64,
+    /// terms left out because they print larger than cvc5's size limit
+    pub too_large: u64,
     /// The solver's refusal, as after `unsat`, where there is no e-graph to
     /// read, or a reply this parser did not recognise.
     pub error: Option<String>,
