@@ -983,9 +983,6 @@ pub fn parse_args_with_imports(
         // the rows are keyed by the ids; without them every row is untagged
         error("-V difficulty and -V no-assert-ids exclude each other".to_string());
     }
-    if args.difficulty && args.resident {
-        error("-V difficulty is not available in resident mode".to_string());
-    }
 
     if args.resident
         && (!matches!(args.solver, SmtSolver::Cvc5)

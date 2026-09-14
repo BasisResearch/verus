@@ -112,12 +112,9 @@ fn refusal(options: &[&str]) -> String {
 
 #[test]
 fn difficulty_refuses_what_it_cannot_serve() {
+    // the rows are keyed by the assert ids, so they have to be on
     assert!(
         refusal(&["-V", "difficulty", "-V", "no-assert-ids"])
             .contains("-V difficulty and -V no-assert-ids exclude each other")
-    );
-    assert!(
-        refusal(&["-V", "difficulty", "--resident"])
-            .contains("-V difficulty is not available in resident mode")
     );
 }

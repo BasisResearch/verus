@@ -726,6 +726,7 @@ impl Verifier {
             crate::resident::SessionInfo {
                 provenance: self.args.provenance,
                 matching_loops: self.args.matching_loops,
+                difficulty: self.args.difficulty,
                 spinoff_all: self.args.spinoff_all,
                 multiple_errors: self.args.multiple_errors,
                 smt_options: self.args.smt_options.clone(),
@@ -1460,7 +1461,10 @@ impl Verifier {
     /// provenance, which describes the ordinary search.
     fn instantiation_replay(&self) -> bool {
         self.args.resident
+            // Both of these launch cvc5 with `--proof-mode=pp-only`, and
+            // replay wants the full proofs `--produce-proofs` asks for.
             && !self.args.provenance
+            && !self.args.difficulty
             && matches!(self.args.solver, air::context::SmtSolver::Cvc5)
             && std::env::var_os("VERUS_RESIDENT_INST_REPLAY").is_some()
     }
