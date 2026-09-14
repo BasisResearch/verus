@@ -2380,3 +2380,30 @@ fn provenance_reply_parses() {
     let info = crate::smt_verify::parse_provenance_lines(&vec!["(surprise 1 2)".to_string()]);
     assert_eq!(info.unparsed, vec!["(surprise 1 2)".to_string()]);
 }
+
+#[test]
+fn replayed_scope_reuses_generated_names() {
+    // A resident session rebuilds a popped query prefix by replaying its
+    // declarations. The replay must name AIR's generated symbols as the first
+    // pass did, because instantiation certificates refer to formulas that
+    // mention them.
+    let message_interface = std::sync::Arc::new(crate::messages::AirMessageInterface {});
+    let mut nodes = Vec::new();
+    macro_push_node(
+        &mut nodes,
+        node!((axiom (= 10 (apply Int (lambda ((x Int) (y Int)) (+ x y 5)) 2 3)))),
+    );
+    let commands = Parser::new(message_interface.clone()).nodes_to_commands(&nodes).unwrap();
+    let CommandX::Global(decl) = &*commands[0] else { panic!("expected a declaration") };
+    let mut air_context = crate::context::Context::new(message_interface, SmtSolver::Z3);
+    let mut scope = |air_context: &mut crate::context::Context| {
+        air_context.push();
+        air_context.global(decl).unwrap();
+        air_context.pop();
+        String::from_utf8(air_context.smt_log.take_pipe_data()).unwrap()
+    };
+    let first = scope(&mut air_context);
+    let second = scope(&mut air_context);
+    assert!(first.contains("%%lambda%%0"), "{}", first);
+    assert!(second.contains("%%lambda%%0") && !second.contains("%%lambda%%1"), "{}", second);
+}
