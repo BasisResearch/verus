@@ -81,7 +81,9 @@ pub struct GlobalCtx {
     /// `:qid` -> owner (friendly path) for the internal quantifiers vir makes
     /// outside any function, which `qid_map` has no function for: a datatype's
     /// box and type axioms, a trait's or impl's bound axioms, an associated
-    /// type's or opaque type's axioms.
+    /// type's or opaque type's axioms. The axioms of spec function types and
+    /// arrays are owned by internal type paths that no user path contains, so
+    /// a `source_fn` filter never selects them.
     pub internal_qid_owners: RefCell<HashMap<String, String>>,
     /// AIR symbol -> source name, recorded by the encoders as they encode
     /// (see `crate::air_names`), collected here from each module's NameCtxt.

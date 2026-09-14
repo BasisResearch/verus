@@ -276,6 +276,63 @@ const MAX_CERTIFICATE_BYTES: u64 = 64 << 20;
 /// would otherwise take it for a dead worker and end the session.
 const MAX_GRAPH_REPLY_BYTES: usize = 8 << 20;
 
+/// The most instantiations a session's kept graphs hold together: about ten
+/// graphs at the solver's per-check cap (`--inst-graph-max=100000`). A graph at
+/// the cap takes about 34 MB, so without a budget a session that checks many
+/// looping queries would grow without bound.
+const MAX_KEPT_INSTANTIATIONS: usize = 1_000_000;
+
+/// Each query's instantiation graph from its last check, keyed by (bucket,
+/// query). Past `budget` instantiations in all, the graphs least recently
+/// checked or queried are dropped, never the one just kept.
+struct KeptGraphs {
+    graphs: HashMap<(usize, usize), (InstantiationGraph, u64)>,
+    budget: usize,
+    total: usize,
+    clock: u64,
+}
+
+impl KeptGraphs {
+    fn new(budget: usize) -> Self {
+        Self { graphs: HashMap::new(), budget, total: 0, clock: 0 }
+    }
+
+    fn tick(&mut self) -> u64 {
+        self.clock += 1;
+        self.clock
+    }
+
+    fn insert(&mut self, key: (usize, usize), graph: InstantiationGraph) {
+        self.remove(&key);
+        self.total += graph.nodes.len();
+        let used = self.tick();
+        self.graphs.insert(key, (graph, used));
+        while self.total > self.budget {
+            let oldest = self
+                .graphs
+                .iter()
+                .filter(|(other, _)| **other != key)
+                .min_by_key(|(_, (_, used))| *used)
+                .map(|(other, _)| *other);
+            let Some(oldest) = oldest else { break };
+            self.remove(&oldest);
+        }
+    }
+
+    fn remove(&mut self, key: &(usize, usize)) {
+        if let Some((graph, _)) = self.graphs.remove(key) {
+            self.total -= graph.nodes.len();
+        }
+    }
+
+    fn get(&mut self, key: &(usize, usize)) -> Option<&InstantiationGraph> {
+        let used = self.tick();
+        let (graph, last) = self.graphs.get_mut(key)?;
+        *last = used;
+        Some(graph)
+    }
+}
+
 /// The text of the certificate at `path`, if it is a regular file of at most
 /// `MAX_CERTIFICATE_BYTES`. The directory is shared, so anything may sit at
 /// that name. On unix the file is opened without blocking, so a FIFO there
@@ -326,9 +383,10 @@ pub(crate) struct Server {
     buckets: Vec<RetainedBucket>,
     info: SessionInfo,
     /// (bucket, query) -> the instantiation graph of its last check, when
-    /// the solvers record them. Queries read these; they never reach the
-    /// solver, so they cannot change its state.
-    graphs: HashMap<(usize, usize), InstantiationGraph>,
+    /// the solvers record them, within `MAX_KEPT_INSTANTIATIONS`. Queries
+    /// read these; they never reach the solver, so they cannot change its
+    /// state.
+    graphs: KeptGraphs,
 }
 
 /// What a session reports about the invocation behind it, and the settings a
@@ -645,7 +703,7 @@ impl Server {
         // Compilation can finish in any order. Protocol ordinals follow the
         // verifier's bucket identity, not worker completion order.
         buckets.sort_by(|left, right| left.id.cmp(&right.id));
-        Self { buckets, info, graphs: HashMap::new() }
+        Self { buckets, info, graphs: KeptGraphs::new(MAX_KEPT_INSTANTIATIONS) }
     }
 
     pub(crate) fn serve(
@@ -1088,12 +1146,10 @@ impl Server {
                         continue;
                     }
                     let Some(graph) = self.graphs.get(&(bucket_id.0, id.0)) else {
-                        send(
-                            &mut output,
-                            &Response::Error {
-                                message: "no instantiation graph for this query; check it first in a session that records them",
-                            },
-                        )?;
+                        let message = format!(
+                            "no instantiation graph for this query; check it in a session that records them. Past {MAX_KEPT_INSTANTIATIONS} instantiations in all, a session drops its least recently used graphs"
+                        );
+                        send(&mut output, &Response::Error { message: &message })?;
                         continue;
                     };
                     let op = match (op, to_inst) {
@@ -1178,6 +1234,29 @@ mod tests {
         air::parser::Parser::new(Arc::new(VirMessageInterface {}))
             .nodes_to_commands(&nodes)
             .unwrap()
+    }
+
+    #[test]
+    fn kept_graphs_drop_the_least_recently_used_past_the_budget() {
+        let graph = |n: usize| {
+            let mut lines = vec!["(instantiation-graph".to_owned(), "(quantifier 0 q)".to_owned()];
+            lines.extend((0..n).map(|i| format!("(node {i} 0 X 1 0 0 ())")));
+            lines.extend(["(dropped 0)".to_owned(), ")".to_owned()]);
+            InstantiationGraph::from_live(&lines).unwrap()
+        };
+        let mut kept = KeptGraphs::new(10);
+        kept.insert((0, 0), graph(4));
+        kept.insert((0, 1), graph(4));
+        // Reading (0, 0) leaves (0, 1) the least recently used.
+        assert!(kept.get(&(0, 0)).is_some());
+        kept.insert((0, 2), graph(4));
+        assert!(kept.get(&(0, 1)).is_none());
+        assert!(kept.get(&(0, 0)).is_some() && kept.get(&(0, 2)).is_some());
+        assert_eq!(kept.total, 8);
+        // A recheck replaces its query's graph, and the graph just kept stays
+        // even when it alone is over the budget.
+        kept.insert((0, 2), graph(12));
+        assert_eq!((kept.graphs.len(), kept.total), (1, 12));
     }
 
     #[test]

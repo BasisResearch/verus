@@ -743,13 +743,17 @@ impl InstantiationGraph {
                     counts[(step - 1) / width] += 1;
                 }
             }
-            (counts, width)
+            (counts, width, steps)
         };
         let by_round = rounds > 0;
-        let (per_round, round_width) =
-            if by_round { series(&mut kept.iter().copied(), true) } else { (vec![], 1) };
-        let (per_depth, depth_width) = series(&mut kept.iter().copied(), false);
-        let overall = fit(if by_round { &per_round } else { &per_depth });
+        let (per_round, round_width, round_steps) =
+            if by_round { series(&mut kept.iter().copied(), true) } else { (vec![], 1, 0) };
+        let (per_depth, depth_width, depth_steps) = series(&mut kept.iter().copied(), false);
+        let overall = if by_round {
+            fit_buckets(&per_round, round_width, round_steps)
+        } else {
+            fit_buckets(&per_depth, depth_width, depth_steps)
+        };
         let mut by_qid: BTreeMap<&str, Vec<NodeId>> = BTreeMap::new();
         for &node in &kept {
             by_qid.entry(self.name(node)).or_default().push(node);
@@ -761,13 +765,13 @@ impl InstantiationGraph {
         let quantifiers: Vec<QuantifierGrowth> = by_qid
             .into_iter()
             .map(|(qid, nodes)| {
-                let (per_step, _) = series(&mut nodes.iter().copied(), by_round);
+                let (per_step, width, steps) = series(&mut nodes.iter().copied(), by_round);
                 QuantifierGrowth {
                     qid: qid.to_owned(),
                     function: None,
                     source_span: None,
                     count: nodes.len() as u64,
-                    fit: fit(&per_step),
+                    fit: fit_buckets(&per_step, width, steps),
                     per_step,
                 }
             })
@@ -790,15 +794,30 @@ impl InstantiationGraph {
 /// the steps that keeps up with at least half of the first third's is linear;
 /// anything else is bounded.
 pub fn fit(counts: &[u64]) -> Fit {
-    let n = counts.len();
+    fit_values(counts.iter().map(|&c| c as f64).collect())
+}
+
+/// `fit` over a series whose entries each sum `width` of `steps` steps. The
+/// last entry may sum fewer; it is scaled up to a full entry, so a short final
+/// bucket does not read as production dying away.
+fn fit_buckets(counts: &[u64], width: usize, steps: usize) -> Fit {
+    let mut ys: Vec<f64> = counts.iter().map(|&c| c as f64).collect();
+    if let Some(last) = ys.last_mut() {
+        let short = steps - (counts.len() - 1) * width;
+        *last *= width as f64 / short as f64;
+    }
+    fit_values(ys)
+}
+
+fn fit_values(ys: Vec<f64>) -> Fit {
+    let n = ys.len();
     let xs: Vec<f64> = (1..=n).map(|x| x as f64).collect();
-    let ys: Vec<f64> = counts.iter().map(|&c| c as f64).collect();
     let round = |x: f64| (x * 1000.0).round() / 1000.0;
     let slope = round(least_squares(&xs, &ys).map_or(0.0, |(slope, _)| slope));
     if n < 3 {
         return Fit { label: "insufficient_data", slope, ratio: None, ratio_r2: None };
     }
-    let (ratio, ratio_r2) = if counts.iter().all(|&c| c > 0) {
+    let (ratio, ratio_r2) = if ys.iter().all(|&y| y > 0.0) {
         let logs: Vec<f64> = ys.iter().map(|y| y.ln()).collect();
         match least_squares(&xs, &logs) {
             Some((log_slope, r2)) => (Some(log_slope.exp()), Some(r2)),
@@ -811,7 +830,7 @@ pub fn fit(counts: &[u64]) -> Fit {
     let mean = |ys: &[f64]| ys.iter().sum::<f64>() / ys.len() as f64;
     let label = if ratio.is_some_and(|r| r >= 1.25) && ratio_r2.is_some_and(|r2| r2 >= 0.8) {
         "exponential"
-    } else if counts[n - 1] > 0 && mean(&ys[n - third..]) >= 0.5 * mean(&ys[..third]) {
+    } else if ys[n - 1] > 0.0 && mean(&ys[n - third..]) >= 0.5 * mean(&ys[..third]) {
         "linear"
     } else {
         "bounded"
@@ -1069,6 +1088,10 @@ mod tests {
         assert_eq!((growth.round_width, growth.per_round.len()), (3, 84));
         assert_eq!(growth.per_round.iter().sum::<u64>(), 250);
         assert_eq!((growth.depth_width, growth.quantifiers[0].per_step.len()), (3, 84));
+        // The last entry sums one round, not three; the fit scales it up, so
+        // steady production reads as flat rather than falling off at the end.
+        assert_eq!(growth.per_round[83], 1);
+        assert_eq!((growth.fit.slope, growth.fit.ratio), (0.0, Some(1.0)));
     }
 
     #[test]
