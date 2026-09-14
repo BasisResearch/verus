@@ -80,7 +80,10 @@ pub struct Node {
     pub proxy: bool,
     /// Part of the crate's public API
     pub exported: bool,
-    /// Marked `#[verifier::reach_root]`: always a root of the analysis
+    /// Marked `#[verifier::reach_root]`: always a root of the analysis. A
+    /// marked root is a statement, not an execution: what it mentions is
+    /// used, never run, even when the root is an exec function that calls
+    /// the functions it is about.
     #[serde(default)]
     pub root: bool,
 }
@@ -272,7 +275,8 @@ impl Graph {
         };
         let mut root_ids: Vec<String> =
             implicit.into_iter().filter(|n| !roots.excludes(n)).map(|n| n.id.clone()).collect();
-        root_ids.extend(nodes.values().filter(|n| n.root).map(|n| n.id.clone()));
+        let marked: Vec<String> = nodes.values().filter(|n| n.root).map(|n| n.id.clone()).collect();
+        root_ids.extend(marked.iter().cloned());
         for def_path in &roots.add {
             let added: Vec<&Node> = nodes.values().filter(|n| &n.def_path == def_path).collect();
             if added.is_empty() {
@@ -292,13 +296,16 @@ impl Graph {
         // target; anything referenced from ghost code, or from something
         // ghost code reached, is only used. A spec or proof function is
         // ghost code whatever context it was entered in: a ghost root, or
-        // a dispatch edge to a spec-mode impl method.
+        // a dispatch edge to a spec-mode impl method. A marked root is a
+        // statement about the functions it mentions, so it starts in ghost
+        // context: an exec round-trip property that calls the parser does
+        // not make the parser run.
         let mut reachable = HashSet::new();
         let mut used = HashSet::new();
         let mut queue: VecDeque<(&str, bool)> = VecDeque::new();
         for root in &root_ids {
             if reachable.insert(root.clone()) {
-                queue.push_back((root, false));
+                queue.push_back((root, marked.contains(root)));
             }
         }
         while let Some((id, ghost)) = queue.pop_front() {
@@ -638,6 +645,28 @@ mod tests {
             vec!["lib::lemma_for_theorem", "lib::theorem"]
         );
         assert_eq!(names(graph.suggested_roots()), vec!["lib::theorem"]);
+    }
+
+    #[test]
+    fn an_exec_marked_root_uses_what_it_calls_but_runs_nothing() {
+        // A round-trip property written as an exec function: its body calls
+        // the (otherwise dead) twin and the property is its postcondition
+        let mut reports = lib_and_bin();
+        let mut property = node("lib::roundtrip", true, false);
+        property.root = true;
+        reports[0].nodes.push(property);
+        reports[0].edges.push(call("lib::roundtrip", "lib::verified::inc"));
+        let roots = Roots { implicit: false, ..Roots::default() };
+        let graph = Graph::new(&reports, &roots).unwrap();
+        assert_eq!(graph.roots, vec!["lib::roundtrip"]);
+        assert!(graph.is_reachable(&graph.nodes["lib::roundtrip"]), "the property itself counts");
+        assert!(!graph.reachable.contains("lib::verified::inc"), "a statement runs nothing");
+        assert!(graph.used.contains("lib::verified::inc"));
+        assert!(!graph.is_reachable(&graph.nodes["lib::verified::inc"]));
+        assert!(
+            graph.is_reachable(&graph.nodes["lib::verified::spec_inc"]),
+            "its contract is used"
+        );
     }
 
     #[test]
