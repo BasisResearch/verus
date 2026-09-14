@@ -730,11 +730,9 @@ fn resident_spinoff_all_reuses_original_solvers() {
 /// unknown, the quantifier that fed its own trigger, in source spelling; an
 /// unknown without a loop reports none.
 ///
-/// Needs a cvc5 with `--matching-loops` (BasisResearch cvc5 branch
-/// `kg/matching-loop-scope`), which the pinned release lacks; run it with
-/// `VERUS_CVC5_PATH` pointing there and `--ignored`.
+/// Needs the pinned cvc5 to have `--matching-loops` and to report the
+/// trigger that matched (BasisResearch/cvc5#3 and #10).
 #[test]
-#[ignore = "needs a cvc5 with --matching-loops"]
 fn resident_matching_loops_name_the_self_feeding_quantifier() {
     let source = r#"
 use vstd::prelude::*;
@@ -771,8 +769,7 @@ verus! {
     }
 }
 "#;
-    let mut worker =
-        Worker::start(source, &["-V", "matching-loops=20", "-V", "no-solver-version-check"]);
+    let mut worker = Worker::start(source, &["-V", "matching-loops=20"]);
     let ready = worker.receive();
     assert_eq!(ready["matching_loops"], true, "{ready}");
     let checked = worker.send(json!({"command":"check", "session":ready["session"], "bucket":0, "query":query_id(&ready, "loops")}));
