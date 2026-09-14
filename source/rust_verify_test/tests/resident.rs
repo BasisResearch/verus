@@ -708,6 +708,40 @@ set -eu
     }
 }
 
+/// The prelude's quantifiers keep cvc5 from confirming a model, so a failing
+/// query answers `unknown` (incomplete) rather than `sat`. The reply says why,
+/// in every mode; a query that was proved carries no reason.
+#[test]
+fn resident_checks_say_why_the_solver_answered_unknown() {
+    let mut worker = Worker::start(SOURCE, &[]);
+    let ready = worker.receive();
+    let session = ready["session"].clone();
+    for _ in 0..2 {
+        let failing = worker.send(
+            json!({"command":"check", "session":session, "bucket":0, "query":query_id(&ready, "::failing")}),
+        );
+        assert_eq!(failing["result"], "invalid", "{failing}");
+        let reason = &failing["unknown_reason"];
+        assert_eq!(reason["reason"], "incomplete", "{failing}");
+        assert!(reason["desc"].is_string() && reason["span"].is_string(), "{failing}");
+        // A cvc5 older than the incomplete-id key answers `unsupported`, which
+        // leaves the id out and the culprits empty.
+        if let Some(id) = reason.get("incomplete_id").and_then(|id| id.as_str()) {
+            assert!(id.starts_with("QUANTIFIERS"), "{failing}");
+        }
+        for culprit in reason["culprits"].as_array().unwrap() {
+            assert!(culprit["qid"].is_string(), "{failing}");
+        }
+        let passing = worker.send(
+            json!({"command":"check", "session":session, "bucket":0, "query":query_id(&ready, "::passing")}),
+        );
+        assert_eq!(passing["result"], "valid", "{passing}");
+        assert!(passing["unknown_reason"].is_null(), "{passing}");
+    }
+    assert_eq!(worker.send(json!({"command":"close", "session":session}))["event"], "closed");
+    worker.finish(false);
+}
+
 #[test]
 fn resident_rejects_bad_requests_and_accepts_eof() {
     let mut worker = Worker::start("use vstd::prelude::*; verus! { proof fn passing() {} }", &[]);

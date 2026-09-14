@@ -170,7 +170,7 @@ impl SmtSolver {
                 "(:reason-unknown \"canceled\")",
                 "(:reason-unknown \"max. resource limit exceeded\")",
             ],
-            SmtSolver::Cvc5 => &["(:reason-unknown resourceout)"],
+            SmtSolver::Cvc5 => &["(:reason-unknown resourceout)", "(:reason-unknown timeout)"],
         }
     }
 
@@ -195,6 +195,7 @@ pub(crate) fn smt_check_assertion<'ctx>(
     only_check_earlier: bool,
     report_long_running: Option<&mut ReportLongRunning>,
 ) -> ValidityResult {
+    context.last_unknown_reason = None;
     let disabled_expr = if only_check_earlier {
         // disable all labels that come after the first known error
         let mut disabled: Vec<Expr> = Vec::new();
@@ -368,6 +369,12 @@ pub(crate) fn smt_check_assertion<'ctx>(
         SmtOutput::Sat => ResultDetermination::Undetermined(false),
         SmtOutput::Unknown => {
             context.smt_log.log_get_info("reason-unknown");
+            if matches!(context.solver, SmtSolver::Cvc5) {
+                // cvc5 records both when check-sat returns, so they describe
+                // this answer. A cvc5 without the keys answers `unsupported`.
+                context.smt_log.log_get_info("incomplete-id");
+                context.smt_log.log_get_info("incomplete-culprits");
+            }
             let smt_data = context.smt_log.take_pipe_data();
             let smt_output = context.get_smt_process().send_commands(smt_data);
 
@@ -379,7 +386,28 @@ pub(crate) fn smt_check_assertion<'ctx>(
             }
 
             let mut reason = None;
+            let mut unknown_reason = crate::context::UnknownReason::default();
             for line in smt_output {
+                if let Some(id) =
+                    line.strip_prefix("(:incomplete-id ").and_then(|s| s.strip_suffix(')'))
+                {
+                    if id != "NONE" {
+                        unknown_reason.incomplete_id = Some(id.to_owned());
+                    }
+                    continue;
+                }
+                if line.starts_with("(:incomplete-culprits ") {
+                    unknown_reason.culprit_qids = parse_incomplete_culprits(&line);
+                    continue;
+                }
+                if line == "unsupported" && matches!(context.solver, SmtSolver::Cvc5) {
+                    continue;
+                }
+                if let Some(r) =
+                    line.strip_prefix("(:reason-unknown ").and_then(|s| s.strip_suffix(')'))
+                {
+                    unknown_reason.reason = r.trim_matches('"').to_owned();
+                }
                 if context.solver.reason_unknown_canceled_strs().iter().any(|s| line == *s) {
                     assert!(reason == None);
                     reason = Some(SmtReasonUnknown::Canceled);
@@ -406,6 +434,7 @@ pub(crate) fn smt_check_assertion<'ctx>(
                 }
             }
 
+            context.last_unknown_reason = Some(unknown_reason);
             match reason.expect("expected :reason-unknown") {
                 SmtReasonUnknown::Canceled | SmtReasonUnknown::Unknown => {
                     context.state = ContextState::Canceled;
@@ -515,6 +544,33 @@ pub(crate) fn parse_provenance_lines(lines: &Vec<String>) -> crate::context::Pro
         }
     }
     info
+}
+
+/// The `:qid`s of a cvc5 `(:incomplete-culprits (q ...))` reply, each without
+/// the `|...|` quoting cvc5 adds to symbols that need it. Anything else parses
+/// to no culprits.
+pub(crate) fn parse_incomplete_culprits(line: &str) -> Vec<String> {
+    let Some(body) =
+        line.strip_prefix("(:incomplete-culprits (").and_then(|s| s.strip_suffix("))"))
+    else {
+        return Vec::new();
+    };
+    let mut qids = Vec::new();
+    let mut rest = body.trim_start();
+    while !rest.is_empty() {
+        let (qid, tail) = if let Some(quoted) = rest.strip_prefix('|') {
+            match quoted.find('|') {
+                Some(end) => (&quoted[..end], &quoted[end + 1..]),
+                None => break,
+            }
+        } else {
+            let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+            (&rest[..end], &rest[end..])
+        };
+        qids.push(qid.to_owned());
+        rest = tail.trim_start();
+    }
+    qids
 }
 
 pub(crate) fn smt_get_rlimit_count(context: &mut Context) -> Result<u64, ValidityResult> {

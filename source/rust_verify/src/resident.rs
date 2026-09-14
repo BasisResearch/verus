@@ -138,6 +138,8 @@ pub(crate) struct RetainedBucket {
     cert_keys: Vec<String>,
     state: Mutex<Vec<SolverState>>,
     symbols: Option<crate::provenance::Symbols>,
+    /// Joins an `unknown` answer's culprits to source; kept in every mode.
+    quantifiers: crate::provenance::Quantifiers,
 }
 
 pub(crate) struct SolverState {
@@ -158,6 +160,7 @@ impl RetainedBucket {
         journal: QueryJournal,
         mut spinoffs: Vec<SolverState>,
         symbols: Option<crate::provenance::Symbols>,
+        quantifiers: crate::provenance::Quantifiers,
     ) -> Self {
         let mut states = Vec::new();
         // Spinoff queries already own their declaration context. The unused
@@ -199,7 +202,7 @@ impl RetainedBucket {
                 addresses.push((solver, local));
             }
         }
-        Self { id, queries, addresses, cert_keys, state: Mutex::new(states), symbols }
+        Self { id, queries, addresses, cert_keys, state: Mutex::new(states), symbols, quantifiers }
     }
 }
 
@@ -322,6 +325,9 @@ enum Response<'a> {
         elapsed_ms: u128,
         restore_ms: u128,
         provenance: Option<&'a crate::provenance::ResolvedQueryProvenance>,
+        /// Present when the first round answered `unknown`: the solver's reason
+        /// and candidate culprit quantifiers.
+        unknown_reason: Option<&'a crate::provenance::ResolvedUnknownReason>,
         /// Present when this check tried a certificate before searching.
         certificate: Option<CertificateAttempt>,
     },
@@ -806,6 +812,7 @@ impl Server {
                     // The response describes round zero. Later error searches
                     // replace AIR's provenance, even when their verdict differs.
                     let first_provenance = air.take_provenance();
+                    let first_unknown_reason = air.take_unknown_reason();
                     // Ask for further errors exactly as far as the original
                     // invocation did, so rechecking a function with several
                     // failing assertions reports the same ones rather than
@@ -939,6 +946,13 @@ impl Server {
                             )
                         })
                     });
+                    let unknown_reason = first_unknown_reason.map(|reason| {
+                        bucket.quantifiers.resolve_unknown(
+                            &query.context.desc,
+                            &query.context.span.as_string,
+                            reason,
+                        )
+                    });
                     // Only a proof is worth keeping. A failed check's instances
                     // are no certificate, and saving them would replace one
                     // that still closes the query once the failing edit is
@@ -965,6 +979,7 @@ impl Server {
                             elapsed_ms: start.elapsed().as_millis(),
                             restore_ms,
                             provenance: provenance.as_ref(),
+                            unknown_reason: unknown_reason.as_ref(),
                             certificate: attempted,
                         },
                     )?;
