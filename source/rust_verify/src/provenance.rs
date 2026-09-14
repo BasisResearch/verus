@@ -97,6 +97,9 @@ pub struct QueryDifficulty {
     /// `body`, `recommends`, `expanded`, ...: a recommends rerun or an
     /// expanded recheck shares the body check's `desc` and `span`
     pub kind: &'static str,
+    /// Under `--expand-errors`, the obligation the recheck was focused on, as
+    /// the symbol its goal tag carries (`aid_3_1_2`).
+    pub focus: Option<String>,
     /// 0 for the first check of the query, then one per multi-error round
     pub round: usize,
     /// "valid", "invalid", "canceled", or the solver's unexpected output
@@ -136,14 +139,18 @@ fn is_idle_axiom(tags: &[ResolvedTag], difficulty: u64, in_core: Option<bool>) -
 /// (`-V difficulty`).
 ///
 /// Several records of one function can share `desc`, `span`, `kind` and
-/// `round`: a bit-vector or nonlinear subquery, a loop body check, and each
-/// recheck of an expanded error under `--expand-errors`. `result` and the
-/// rows tell those apart.
+/// `round`: a bit-vector or nonlinear subquery and a loop body check each
+/// come from the function's own check. Expanded rechecks carry `focus` to
+/// say which obligation they are about.
 #[derive(serde::Serialize, Clone, Debug)]
 pub struct ResolvedQueryDifficulty {
     pub desc: String,
     pub span: String,
     pub kind: &'static str,
+    /// Under `--expand-errors`, the obligation this recheck was focused on,
+    /// as the symbol its goal tag carries (`aid_3_1_2`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub focus: Option<String>,
     /// 0 for the first check, then one per multi-error round. The rounds of
     /// a query share its solver scope, and cvc5 keeps difficulty until that
     /// scope is popped, so a round's counts include the rounds before it.
@@ -492,6 +499,7 @@ impl Symbols {
             desc: q.desc,
             span: q.span,
             kind: q.kind,
+            focus: q.focus,
             round: q.round,
             result: q.result,
             solver_result: g.result,

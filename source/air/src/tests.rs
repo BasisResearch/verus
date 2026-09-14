@@ -2300,7 +2300,7 @@ fn assert_id_roundtrip() {
     let node = sise::parse_tree(&mut sise_parser).expect("sise");
     let message_interface = std::sync::Arc::new(crate::messages::AirMessageInterface {});
     let parser = Parser::new(message_interface.clone());
-    let commands = parser.nodes_to_commands(&[node.clone()]).expect("parses");
+    let commands = parser.nodes_to_commands(std::slice::from_ref(&node)).expect("parses");
     assert_eq!(commands.len(), 1);
     let query = match &*commands[0] {
         CommandX::CheckValid(query) => query.clone(),

@@ -848,6 +848,7 @@ impl Verifier {
         context: &CommandContext,
         prover_choice: vir::def::ProverChoice,
         query_op: QueryOp,
+        focus_assert_id: Option<&AssertId>,
         default_prover_failed_assert_ids: &mut Vec<AssertId>,
     ) -> RunCommandQueriesResult {
         let is_singular = prover_choice == vir::def::ProverChoice::Singular;
@@ -952,6 +953,7 @@ impl Verifier {
                         desc: context.desc.clone(),
                         span: context.span.as_string.clone(),
                         kind: query_op.kind(),
+                        focus: focus_assert_id.map(air::def::assert_id_to_symbol),
                         round,
                         result: result_str(),
                         gradient,
@@ -1213,6 +1215,7 @@ impl Verifier {
         comment: &str,
         desc_prefix: Option<&str>,
         query_op: QueryOp,
+        focus_assert_id: Option<&AssertId>,
         default_prover_failed_assert_ids: &mut Vec<AssertId>,
         includes_function: bool,
     ) -> RunCommandQueriesResult {
@@ -1254,6 +1257,7 @@ impl Verifier {
                     &context,
                     *prover_choice,
                     query_op,
+                    focus_assert_id,
                     default_prover_failed_assert_ids,
                 );
         }
@@ -1731,6 +1735,7 @@ impl Verifier {
                         snap_map,
                         profile_rerun,
                         func_check_sst,
+                        focus_assert_id,
                     } => {
                         let level = query_op.message_level();
                         let function = &op.get_function();
@@ -1885,6 +1890,7 @@ impl Verifier {
                                 &op.to_air_comment(),
                                 None,
                                 *query_op,
+                                focus_assert_id.as_ref(),
                                 &mut default_prover_failed_assert_ids,
                                 includes_function,
                             );
