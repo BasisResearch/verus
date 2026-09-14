@@ -590,4 +590,18 @@ impl QueryOp {
             QueryOp::Body(Style::CheckApiSafety) => false,
         }
     }
+
+    /// The wire spelling of the query's kind (`-V inst-pressure`), which
+    /// tells a recommends rerun or an expanded recheck of a function's body
+    /// from the body check itself: all three share `desc` and `span`.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            QueryOp::SpecTermination => "termination",
+            QueryOp::Body(Style::Normal) => "body",
+            QueryOp::Body(Style::RecommendsFollowupFromError) => "recommends",
+            QueryOp::Body(Style::RecommendsChecked) => "recommends_checked",
+            QueryOp::Body(Style::Expanded) => "expanded",
+            QueryOp::Body(Style::CheckApiSafety) => "api_safety",
+        }
+    }
 }

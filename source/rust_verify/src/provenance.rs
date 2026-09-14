@@ -94,14 +94,13 @@ pub struct ResolvedQueryProvenance {
 pub struct QueryNlFrontier {
     pub desc: String,
     pub span: String,
+    /// `body`, `recommends`, `expanded`, ...: a recommends rerun or an
+    /// expanded recheck shares the body check's `desc` and `span`
+    pub kind: &'static str,
     /// 0 for the first check of the query, then one per multi-error round
     pub round: usize,
     /// "valid", "invalid", "canceled", or the solver's unexpected output
     pub result: String,
-    /// "check" for the ordinary check, "recommends" for the recheck Verus
-    /// runs with recommends after a failure, "expand_errors" under
-    /// `--expand-errors`
-    pub pass: &'static str,
     pub frontier: air::context::NlFrontier,
 }
 
@@ -200,10 +199,9 @@ pub struct ResolvedNlAtom {
 pub struct ResolvedQueryNlFrontier {
     pub desc: String,
     pub span: String,
+    pub kind: &'static str,
     pub round: usize,
     pub result: String,
-    /// check, recommends (the recheck after a failure) or expand_errors
-    pub pass: &'static str,
     /// cvc5's own answer to the check: unsat, sat, unknown, or none
     pub solver_result: String,
     /// cvc5's unknown explanation (incomplete, resourceout, ...) or none
@@ -220,6 +218,79 @@ pub struct ResolvedQueryNlFrontier {
     pub atoms: Vec<ResolvedNlAtom>,
     pub omitted: u64,
     pub truncated: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unparsed: Option<String>,
+}
+
+/// One `check-sat` under `-V inst-pressure`, as cvc5 reported it: rows by
+/// `:qid`, not yet joined to source.
+#[derive(Clone, Debug)]
+pub struct QueryInstPressure {
+    pub desc: String,
+    pub span: String,
+    /// `body`, `recommends`, `expanded`, ...: a recommends rerun or an
+    /// expanded recheck shares the body check's `desc` and `span`
+    pub kind: &'static str,
+    /// 0 for the first check of the query, then one per multi-error round
+    pub round: usize,
+    /// "valid", "invalid", "canceled", or the solver's unexpected output
+    pub result: String,
+    pub pressure: air::context::InstPressure,
+}
+
+/// One quantifier's instantiation pressure in one query, joined to source.
+/// Every count is the solver's own; nothing here is derived.
+#[derive(serde::Serialize, Clone, Debug)]
+pub struct ResolvedQuantPressure {
+    pub qid: String,
+    /// false for a quantifier without a `:qid`: `qid` is then synthetic
+    pub named: bool,
+    /// prelude, or the function the quantifier was written in
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fun: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub span: Option<String>,
+    /// Where the quantifier is written, in prose (as in provenance).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub site: Option<String>,
+    /// Why the quantifier exists, as the encoder that emitted it said.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub role: Option<&'static str>,
+    pub instantiations: u64,
+    /// attempts rejected because the term vector was used before
+    pub duplicate_eq: u64,
+    /// attempts rejected because the instance was already entailed
+    pub duplicate_ent: u64,
+    /// attempts rejected because the same lemma was already sent
+    pub duplicate_lemma: u64,
+    /// instances made by conflict-based instantiation because they
+    /// conflicted with, or propagated in, the current assignment
+    pub conflict: u64,
+    pub propagate: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_round: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_round: Option<u64>,
+    /// instances the refutation used; only after `unsat` with proofs on
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refutation: Option<u64>,
+}
+
+/// A query's instantiation pressure with every quantifier joined to source
+/// (`-V inst-pressure`).
+#[derive(serde::Serialize, Clone, Debug)]
+pub struct ResolvedQueryInstPressure {
+    pub desc: String,
+    pub span: String,
+    pub kind: &'static str,
+    pub round: usize,
+    pub result: String,
+    /// instantiation rounds that sent lemmas
+    pub rounds: u64,
+    /// whether each row carries `refutation`
+    pub refutation: bool,
+    /// most instantiated first
+    pub quantifiers: Vec<ResolvedQuantPressure>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub unparsed: Option<String>,
 }
@@ -464,6 +535,54 @@ impl Symbols {
         }
     }
 
+    /// Join each quantifier of a query's instantiation pressure to source.
+    pub(crate) fn resolve_inst_pressure(
+        &self,
+        fun: &Fun,
+        q: QueryInstPressure,
+    ) -> ResolvedQueryInstPressure {
+        let quantifiers = q
+            .pressure
+            .quantifiers
+            .into_iter()
+            .map(|p| {
+                let join = if p.named {
+                    self.quantifier(fun, &p.qid)
+                } else {
+                    QuantifierJoin { fun: None, span: None, inside: None, site: None, role: None }
+                };
+                ResolvedQuantPressure {
+                    qid: p.qid,
+                    named: p.named,
+                    fun: join.fun,
+                    span: join.span,
+                    site: join.site,
+                    role: join.role,
+                    instantiations: p.instantiations,
+                    duplicate_eq: p.duplicate_eq,
+                    duplicate_ent: p.duplicate_ent,
+                    duplicate_lemma: p.duplicate_lemma,
+                    conflict: p.conflict,
+                    propagate: p.propagate,
+                    first_round: p.first_round,
+                    last_round: p.last_round,
+                    refutation: p.refutation,
+                }
+            })
+            .collect();
+        ResolvedQueryInstPressure {
+            desc: q.desc,
+            span: q.span,
+            kind: q.kind,
+            round: q.round,
+            result: q.result,
+            rounds: q.pressure.rounds,
+            refutation: q.pressure.refutation,
+            quantifiers,
+            unparsed: q.pressure.unparsed,
+        }
+    }
+
     /// Join a query's nonlinear frontier to source: atoms and arguments in
     /// source spelling, host tags and quantifiers joined, and each atom's
     /// best location.
@@ -562,7 +681,7 @@ impl Symbols {
             span: q.span,
             round: q.round,
             result: q.result,
-            pass: q.pass,
+            kind: q.kind,
             solver_result: f.result,
             reason: f.reason,
             enabled: f.enabled,
@@ -750,7 +869,7 @@ mod tests {
             span: "src/a.rs:5:1: 5:30 (#0)".to_string(),
             round: 0,
             result: "invalid".to_string(),
-            pass: "recommends",
+            kind: "recommends",
             frontier: air::context::NlFrontier { atoms: vec![atom], ..Default::default() },
         };
         let fun = std::sync::Arc::new(vir::ast::FunX {
@@ -760,7 +879,7 @@ mod tests {
             }),
         });
         let r = symbols.resolve_nl_frontier(&fun, query);
-        assert_eq!(r.pass, "recommends");
+        assert_eq!(r.kind, "recommends");
         let a = &r.atoms[0];
         assert_eq!(a.hosts[0].span.as_deref(), Some(def_span));
         assert_eq!(
