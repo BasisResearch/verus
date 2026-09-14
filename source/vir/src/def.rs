@@ -489,6 +489,20 @@ impl NameCtxt {
         );
     }
 
+    /// A function application's head `symbol`, and how many of its leading
+    /// arguments are type arguments (`typ_to_ids` of each, decoration and
+    /// type id), so a source rendering can drop them: `s[i]` is emitted as
+    /// `(vstd!seq.Seq.index.? $ INT s i)`.
+    pub(crate) fn record_source_function(&self, symbol: &str, fun: &Fun, type_args: usize) {
+        self.imp.borrow_mut().source_names.insert(
+            symbol.to_string(),
+            crate::air_names::SourceName::Function {
+                name: source_name_of_path(&fun.path),
+                type_args,
+            },
+        );
+    }
+
     /// Lower a source variable and record its spelling at the encoding boundary.
     pub(crate) fn var_ident(&self, ident: &VarIdent) -> Ident {
         use crate::ast::VarIdentDisambiguate as D;

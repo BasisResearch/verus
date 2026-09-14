@@ -1038,6 +1038,7 @@ pub(crate) fn exp_to_expr(ctx: &Ctx, exp: &Exp, expr_ctxt: &ExprCtxt) -> Result<
             };
             let name = suffix_global_id(&fun_to_air_ident(&ctx.name_ctxt, &x_name));
             let mut exprs: Vec<Expr> = typs.iter().flat_map(typ_to_ids).collect();
+            ctx.name_ctxt.record_source_function(&name, &x_name, exprs.len());
             for arg in args.iter() {
                 exprs.push(exp_to_expr(ctx, arg, expr_ctxt)?);
             }

@@ -45,6 +45,13 @@ pub enum SourceName {
         style: crate::ast::CtorPrintStyle,
     },
     Field(String),
+    /// A function application's head. Its first `type_args` arguments are
+    /// the type arguments the encoder put before the value arguments (a
+    /// decoration and a type id for each), which the source does not write.
+    Function {
+        name: String,
+        type_args: usize,
+    },
 }
 
 impl SourceName {
@@ -53,7 +60,8 @@ impl SourceName {
             Self::Symbol(name)
             | Self::Field(name)
             | Self::Operator(name)
-            | Self::Constructor { name, .. } => name,
+            | Self::Constructor { name, .. }
+            | Self::Function { name, .. } => name,
             Self::Cast { symbol, .. } => symbol,
         }
     }
@@ -217,6 +225,13 @@ fn render_node(names: &SourceNames, node: &Node) -> String {
                         if let Some(constructor) = name.constructor(&args) {
                             return constructor;
                         }
+                    }
+                    // `(f.? $ INT s i)` is `f(s, i)`: the encoder recorded how
+                    // many leading arguments are type arguments
+                    Some(SourceName::Function { name, type_args }) if items.len() > *type_args => {
+                        let args: Vec<String> =
+                            items[1 + type_args..].iter().map(|i| render_node(names, i)).collect();
+                        return format!("{}({})", name, args.join(", "));
                     }
                     _ => {}
                 }
@@ -435,6 +450,33 @@ mod tests {
             render_term(&names, "(let ((a 1) (b 2)) (Add a b))"),
             "let a = 1, b = 2 in (a + b)"
         );
+    }
+
+    /// A call's type arguments are the ones the encoder put before its value
+    /// arguments, and it records how many. The rendering drops them, in a
+    /// call and in the generic trigger of the function's own axioms alike.
+    #[test]
+    fn type_arguments_are_dropped_as_recorded() {
+        let ctx = NameCtxt::new();
+        let segments = ["seq", "Seq", "index"].iter().map(|s| Arc::new(s.to_string())).collect();
+        let fun = Arc::new(crate::ast::FunX {
+            path: Arc::new(PathX { krate: CrateId::Vstd, segments: Arc::new(segments) }),
+        });
+        let head = crate::def::suffix_global_id(&Arc::new(ctx.fun_to_string(&fun)));
+        ctx.record_source_function(&head, &fun, 2);
+        let names = ctx.source_names();
+        let seq_index = "vstd::seq::Seq::index";
+        assert_eq!(
+            render_term(&names, &format!("({head} $ INT s (I 0))")),
+            format!("{seq_index}(s, 0)")
+        );
+        assert_eq!(
+            render_term(&names, &format!("({head} A&. A& self i)")),
+            format!("{seq_index}(self, i)")
+        );
+        // an application too short to hold the recorded type arguments is
+        // left as it was emitted
+        assert_eq!(render_term(&names, &format!("({head} $)")), format!("{seq_index}($)"));
     }
 
     #[test]
