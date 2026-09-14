@@ -404,16 +404,11 @@ verus! {
 /// With `VERUS_RESIDENT_INST_GRAPH`, each check keeps its query's cvc5
 /// instantiation graph, and `inst_graph` requests answer from it with source
 /// spans. The loop's two quantifiers form the only cycle.
-///
-/// Needs a cvc5 with `--inst-graph` (BasisResearch/cvc5 `inst-graph/query`);
-/// run with `--ignored` and `VERUS_CVC5_PATH` pointing at it until the pinned
-/// release has it.
 #[test]
-#[ignore]
 fn resident_inst_graph_finds_the_matching_loop() {
     let mut worker = Worker::start_with_env(
         LOOP_SOURCE,
-        &["--rlimit", "1", "-V", "no-solver-version-check"],
+        &["--rlimit", "1"],
         &[("VERUS_RESIDENT_INST_GRAPH", "1")],
     );
     let ready = worker.receive();
@@ -518,7 +513,7 @@ fn resident_inst_graph_finds_the_matching_loop() {
     worker.finish(false);
 
     // Without the variable, no graph is recorded or served.
-    let mut plain = Worker::start(LOOP_SOURCE, &["--rlimit", "1", "-V", "no-solver-version-check"]);
+    let mut plain = Worker::start(LOOP_SOURCE, &["--rlimit", "1"]);
     let ready = plain.receive();
     assert_eq!(ready["inst_graph"], false);
     let session = ready["session"].clone();
@@ -536,10 +531,7 @@ fn resident_inst_graph_finds_the_matching_loop() {
 /// Every quantifier in a graph but the prelude's has an owner: a function's
 /// definition and pre/post axioms their function, a datatype's box and type
 /// axioms the datatype, so `source_fn` finds those too.
-///
-/// Needs a cvc5 with `--inst-graph`, like the test above.
 #[test]
-#[ignore]
 fn resident_inst_graph_names_internal_axiom_owners() {
     let source = r#"
 use vstd::prelude::*;
@@ -554,11 +546,7 @@ verus! {
     }
 }
 "#;
-    let mut worker = Worker::start_with_env(
-        source,
-        &["-V", "no-solver-version-check"],
-        &[("VERUS_RESIDENT_INST_GRAPH", "1")],
-    );
+    let mut worker = Worker::start_with_env(source, &[], &[("VERUS_RESIDENT_INST_GRAPH", "1")]);
     let ready = worker.receive();
     assert_eq!(ready["event"], "ready", "{}", ready);
     let succeeded = ready["invocation_succeeded"].as_bool().unwrap();
