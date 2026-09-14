@@ -1,6 +1,10 @@
 //! Renders the reports written by `verus --reach DIR`.
 //!
 //!   verus-reach DIR...            text summary
+//!   verus-reach --connected DIR... verified functions connected to a root
+//!                                 but not reachable, with the top-level
+//!                                 ones flagged as candidates for
+//!                                 #[verifier::reach_root]
 //!   verus-reach --lcov DIR...     LCOV, for grcov, genhtml, Codecov, IDE gutters
 //!   verus-reach --html OUT DIR...  a directory of pages like genhtml's:
 //!                                 the files with verified code and their
@@ -14,7 +18,7 @@
 mod html;
 
 use clap::Parser;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fmt::Write;
 use std::path::PathBuf;
 use verus_reach::{Graph, Node, Report, Roots};
@@ -46,6 +50,13 @@ struct Args {
     /// Write an LCOV trace file to stdout instead of the summary
     #[arg(long, conflicts_with = "html")]
     lcov: bool,
+    /// List the verified functions connected to a root through edges in
+    /// either direction but not reachable, instead of the summary. Ghost
+    /// functions among them that nothing refers to are flagged as
+    /// candidates for `#[verifier::reach_root]`: theorems about reachable
+    /// code that nothing calls
+    #[arg(long, conflicts_with_all = ["html", "lcov"])]
+    connected: bool,
     /// Write an HTML report into this directory (index.html and a page per
     /// file) instead of printing the summary
     #[arg(long, value_name = "OUT")]
@@ -182,6 +193,33 @@ fn summary(reports: &[Report], graph: &Graph) -> String {
     out
 }
 
+fn connected(graph: &Graph) -> String {
+    let mut out = String::new();
+    let (reached, total) = graph.coverage();
+    let connected =
+        graph.nodes.values().filter(|n| n.is_verified() && graph.connected.contains(&n.id)).count();
+    writeln!(
+        out,
+        "verified functions: {total}   reachable: {reached}   connected to a root: {connected}"
+    )
+    .unwrap();
+    let mut rest = graph.connected_unreachable();
+    rest.sort_by_key(|n| (&n.span.file, n.span.start_line));
+    let suggested: HashSet<&str> = graph.suggested_roots().iter().map(|n| n.id.as_str()).collect();
+    writeln!(
+        out,
+        "\nconnected but unreachable ({}; * = candidate root, referred to by nothing):",
+        rest.len()
+    )
+    .unwrap();
+    for n in rest {
+        let mark = if suggested.contains(n.id.as_str()) { "*" } else { " " };
+        writeln!(out, "{mark} {}:{}   {:<5} {}", n.span.file, n.span.start_line, n.mode, n.name())
+            .unwrap();
+    }
+    out
+}
+
 fn lcov(graph: &Graph, only: Only) -> String {
     use lcov::report::section::{function, line};
     let mut report = lcov::Report::new();
@@ -244,7 +282,13 @@ fn main() {
         html::write(&reports, &graph, &args.src, &args.title, out).unwrap_or_else(|e| fail(e));
         eprintln!("verus-reach: wrote {}", out.join("index.html").display());
     } else {
-        let text = if args.lcov { lcov(&graph, only) } else { summary(&reports, &graph) };
+        let text = if args.lcov {
+            lcov(&graph, only)
+        } else if args.connected {
+            connected(&graph)
+        } else {
+            summary(&reports, &graph)
+        };
         print!("{text}");
     }
     if let Some(msg) = args.fail_under.and_then(|t| below_threshold(&graph, t)) {

@@ -234,6 +234,14 @@ pub struct Graph {
     /// Used by ghost code: reached from a running function through a
     /// contract or proof, then through anything
     pub used: HashSet<String>,
+    /// Connected to a root through edges in either direction: the
+    /// reachable functions, plus whatever mentions them or is mentioned by
+    /// them, transitively. Reachable is a subset. The rest of it is where
+    /// explicit roots hide: theorems about reachable functions that nothing
+    /// calls.
+    pub connected: HashSet<String>,
+    /// Ids some function refers to
+    referred: HashSet<String>,
 }
 
 impl Graph {
@@ -296,7 +304,46 @@ impl Graph {
                 }
             }
         }
-        Ok(Graph { nodes, roots: root_ids, reachable, used })
+
+        // The same search ignoring direction and context
+        let mut adjacent: HashMap<&str, Vec<&str>> = HashMap::new();
+        let mut referred = HashSet::new();
+        for edge in reports.iter().flat_map(|r| r.edges.iter()) {
+            adjacent.entry(&edge.from).or_default().push(&edge.to);
+            adjacent.entry(&edge.to).or_default().push(&edge.from);
+            if nodes.contains_key(&edge.from) {
+                referred.insert(edge.to.clone());
+            }
+        }
+        let mut connected: HashSet<String> = root_ids.iter().cloned().collect();
+        let mut queue: VecDeque<&str> = root_ids.iter().map(String::as_str).collect();
+        while let Some(id) = queue.pop_front() {
+            for next in adjacent.get(id).map_or(&[][..], |v| v) {
+                if connected.insert(next.to_string()) {
+                    queue.push_back(next);
+                }
+            }
+        }
+        Ok(Graph { nodes, roots: root_ids, reachable, used, connected, referred })
+    }
+
+    /// Verified functions connected to a root but not reachable: what the
+    /// roots miss, one step of direction away.
+    pub fn connected_unreachable(&self) -> Vec<&Node> {
+        self.nodes
+            .values()
+            .filter(|n| n.is_verified() && self.connected.contains(&n.id) && !self.is_reachable(n))
+            .collect()
+    }
+
+    /// Candidates for `#[verifier::reach_root]`: ghost functions connected
+    /// to a root that nothing refers to, so they are top-level statements,
+    /// and that mention something reachable.
+    pub fn suggested_roots(&self) -> Vec<&Node> {
+        self.connected_unreachable()
+            .into_iter()
+            .filter(|n| n.is_ghost() && !self.referred.contains(&n.id))
+            .collect()
     }
 
     /// An exec function is reachable when it runs; a ghost function, when
@@ -514,6 +561,32 @@ mod tests {
             Roots { exclude: vec![glob::Pattern::new("lib::*").unwrap()], ..Roots::default() };
         let graph = Graph::new(&reports, &roots).unwrap();
         assert_eq!(graph.roots, vec!["app(bin)::main", "lib::theorem"]);
+    }
+
+    #[test]
+    fn connected_holds_the_reachable_and_the_theorems_about_it() {
+        // A theorem about `wired`, and a lemma the theorem uses; neither is
+        // called. A spec about the unreachable twin is connected to nothing.
+        let mut reports = lib_and_bin();
+        reports[0].nodes.push(proof("lib::theorem"));
+        reports[0].nodes.push(proof("lib::lemma_for_theorem"));
+        reports[0].edges.push(contract("lib::theorem", "lib::spec_wired"));
+        reports[0].edges.push(Edge::new("lib::theorem", "lib::lemma_for_theorem", EdgeKind::Proof));
+        let graph = Graph::new(&reports, &Roots::default()).unwrap();
+        for n in graph.nodes.values().filter(|n| graph.is_reachable(n)) {
+            assert!(graph.connected.contains(&n.id), "{} reachable but not connected", n.id);
+        }
+        assert!(graph.connected.contains("lib::theorem"));
+        assert!(graph.connected.contains("lib::lemma_for_theorem"));
+        assert!(!graph.connected.contains("lib::verified::spec_inc"));
+        fn names(v: Vec<&Node>) -> Vec<&str> {
+            v.iter().map(|n| n.id.as_str()).collect()
+        }
+        assert_eq!(
+            names(graph.connected_unreachable()),
+            vec!["lib::lemma_for_theorem", "lib::theorem"]
+        );
+        assert_eq!(names(graph.suggested_roots()), vec!["lib::theorem"]);
     }
 
     #[test]
