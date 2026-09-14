@@ -24,6 +24,8 @@ fn run_nodes_as_test(should_typecheck: bool, should_be_valid: bool, nodes: &[sis
                     &command,
                     Default::default(),
                 );
+                // A query that fails to type-check opens no query to finish.
+                let opened_query = !matches!(result, ValidityResult::TypeError(_));
                 match (&**command, should_typecheck, should_be_valid, result) {
                     (_, false, _, ValidityResult::TypeError(_)) => {}
                     (_, true, _, ValidityResult::TypeError(s)) => {
@@ -36,7 +38,7 @@ fn run_nodes_as_test(should_typecheck: bool, should_be_valid: bool, nodes: &[sis
                     }
                     _ => {}
                 }
-                if matches!(**command, CommandX::CheckValid(..)) {
+                if opened_query && matches!(**command, CommandX::CheckValid(..)) {
                     air_context.finish_query();
                 }
             }
@@ -2342,6 +2344,77 @@ fn assert_id_roundtrip() {
     assert_eq!(printed, node);
 }
 
+/// cvc5's `(get-info :matching-loops)` reply, as it prints it: one loop per
+/// line after the header.
+#[test]
+fn matching_loops_reply_parses() {
+    let lines: Vec<String> = [
+        "(:matching-loops (:rounds 10 :instantiations 12 :dropped 0 :max-inst-rounds true :loops (",
+        "(loop :qid |user_f_grows_3| :confidence high :growth linear-depth :edges confirmed \
+         :stable true :instantiations 10 :rounds 10 :first-round 1 :last-round 10 :chain 10 \
+         :self-fed 9 :depth-per-rung 1.00 :depth-per-round 1.00 :fanout-per-round 1.00 \
+         :via () :trigger ((f x)) :context ((g _0)) :shape ((f _0)) :step ((f (g _0))) \
+         :ladder (((f a)) ((f (g a))) ((f (g (g a)))) ((f (g (g (g a)))))) :ladder-length 10 \
+         :per-round (1 1 1 1 1 1 1 1 1 1)))))",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    let info = crate::smt_verify::parse_matching_loops_lines(&lines);
+    assert!(info.unparsed.is_empty(), "{:?}", info.unparsed);
+    assert_eq!((info.rounds, info.instantiations, info.max_inst_rounds), (10, 12, true));
+    assert_eq!(info.loops.len(), 1);
+    let l = &info.loops[0];
+    assert_eq!(l.qid, "user_f_grows_3");
+    assert_eq!((l.confidence.as_str(), l.growth.as_str()), ("high", "linear-depth"));
+    assert!(l.edges_confirmed && l.stable);
+    assert_eq!((l.chain, l.self_fed, l.ladder_length), (10, 9, 10));
+    assert_eq!(l.depth_per_round, 1.0);
+    assert_eq!(l.trigger, vec!["(f x)"]);
+    assert_eq!(l.context, vec!["(g _0)"]);
+    assert_eq!(l.shape, vec!["(f _0)"]);
+    assert_eq!(l.step, vec!["(f (g _0))"]);
+    assert_eq!(l.ladder.len(), 4);
+    assert_eq!(l.ladder[1], vec!["(f (g a))"]);
+    assert_eq!(l.per_round.len(), 10);
+    // no loops; and a reply of another shape is kept, not failed on
+    let info = crate::smt_verify::parse_matching_loops_lines(&vec![
+        "(:matching-loops (:rounds 2 :instantiations 3 :dropped 0 :max-inst-rounds false :loops ()))"
+            .to_string(),
+    ]);
+    assert!(info.loops.is_empty() && info.unparsed.is_empty());
+    let info = crate::smt_verify::parse_matching_loops_lines(&vec!["(error \"no\")".to_string()]);
+    assert_eq!(info.unparsed, vec!["(error \"no\")".to_string()]);
+    // a quoted symbol sise cannot read bare, a bar inside a string literal,
+    // and a term broken across lines: the reply still parses, terms one line
+    let info = crate::smt_verify::parse_matching_loops_lines(&vec![
+        "(:matching-loops (:rounds 3 :instantiations 3 :dropped 0 :max-inst-rounds false :loops ("
+            .to_string(),
+        "(loop :qid |odd name| :confidence low :growth bounded :edges unconfirmed :stable false \
+         :via (|odd name|) :trigger ((str.++ s \"a|b\")) :shape ((f\n   (g _0))) :ladder-length 0))))"
+            .to_string(),
+    ]);
+    assert!(info.unparsed.is_empty(), "{:?}", info.unparsed);
+    let l = &info.loops[0];
+    assert_eq!((l.qid.as_str(), l.via.clone()), ("|odd name|", vec!["|odd name|".to_string()]));
+    assert_eq!(l.trigger, vec!["(str.++ s \"a|b\")"]);
+    assert_eq!(l.shape, vec!["(f (g _0))"]);
+    // `:fanout-per-step` beside `:fanout-per-round`, and one context per
+    // class of growing subterm (BasisResearch/cvc5#3 since ea27199)
+    let info = crate::smt_verify::parse_matching_loops_lines(&vec![
+        "(:matching-loops (:rounds 10 :instantiations 31 :dropped 0 :max-inst-rounds true :loops ("
+            .to_string(),
+        "(loop :qid |user_f_branches_1| :confidence high :growth exponential-fanout \
+         :edges confirmed :stable true :fanout-per-round 1.41 :fanout-per-step 2.00 \
+         :context ((r _0) (l _0)) :ladder-length 5))))"
+            .to_string(),
+    ]);
+    assert!(info.unparsed.is_empty(), "{:?}", info.unparsed);
+    let l = &info.loops[0];
+    assert_eq!((l.fanout_per_round, l.fanout_per_step), (1.41, 2.0));
+    assert_eq!(l.context, vec!["(r _0)", "(l _0)"]);
+}
+
 /// The extra lines provenance mode adds to a check-sat batch: instantiation
 /// dump forms and the tags-only sources reply, in the order cvc5 prints them.
 #[test]
@@ -2379,4 +2452,163 @@ fn provenance_reply_parses() {
     // something unforeseen is kept, not failed on
     let info = crate::smt_verify::parse_provenance_lines(&vec!["(surprise 1 2)".to_string()]);
     assert_eq!(info.unparsed, vec!["(surprise 1 2)".to_string()]);
+}
+
+#[test]
+fn replayed_scope_reuses_generated_names() {
+    // A resident session rebuilds a popped query prefix by replaying its
+    // declarations. The replay must name AIR's generated symbols as the first
+    // pass did, because instantiation certificates refer to formulas that
+    // mention them.
+    let message_interface = std::sync::Arc::new(crate::messages::AirMessageInterface {});
+    let mut nodes = Vec::new();
+    macro_push_node(
+        &mut nodes,
+        node!((axiom (= 10 (apply Int (lambda ((x Int) (y Int)) (+ x y 5)) 2 3)))),
+    );
+    let commands = Parser::new(message_interface.clone()).nodes_to_commands(&nodes).unwrap();
+    let CommandX::Global(decl) = &*commands[0] else { panic!("expected a declaration") };
+    let mut air_context = crate::context::Context::new(message_interface, SmtSolver::Z3);
+    let scope = |air_context: &mut crate::context::Context| {
+        air_context.push();
+        air_context.global(decl).unwrap();
+        air_context.pop();
+        String::from_utf8(air_context.smt_log.take_pipe_data()).unwrap()
+    };
+    let first = scope(&mut air_context);
+    let second = scope(&mut air_context);
+    assert!(first.contains("%%lambda%%0"), "{}", first);
+    assert!(second.contains("%%lambda%%0") && !second.contains("%%lambda%%1"), "{}", second);
+}
+
+#[test]
+fn type_error_in_query_closes_its_name_scope() {
+    // A query that fails to type-check must close the name scope it opened.
+    // Otherwise the next pop closes that scope instead of the caller's, and a
+    // lambda declared in the caller's scope stays cached after the solver
+    // drops its declaration, so declaring it again emits nothing.
+    let message_interface = std::sync::Arc::new(crate::messages::AirMessageInterface {});
+    let mut nodes = Vec::new();
+    macro_push_node(
+        &mut nodes,
+        node!((axiom (= 10 (apply Int (lambda ((x Int) (y Int)) (+ x y 5)) 2 3)))),
+    );
+    macro_push_node(&mut nodes, node!((check-valid (assert (forall ((x Int)) (+ x true))))));
+    let commands = Parser::new(message_interface.clone()).nodes_to_commands(&nodes).unwrap();
+    let CommandX::Global(decl) = &*commands[0] else { panic!("expected a declaration") };
+    let mut air_context = crate::context::Context::new(message_interface.clone(), SmtSolver::Z3);
+    air_context.push();
+    air_context.global(decl).unwrap();
+    let result =
+        air_context.command(&*message_interface, &Reporter {}, &commands[1], Default::default());
+    assert!(matches!(result, ValidityResult::TypeError(_)), "{:?}", result);
+    air_context.pop();
+    let _ = air_context.smt_log.take_pipe_data();
+    air_context.global(decl).unwrap();
+    let again = String::from_utf8(air_context.smt_log.take_pipe_data()).unwrap();
+    assert!(again.contains("(declare-fun %%lambda%%0"), "{}", again);
+}
+
+#[test]
+fn type_error_in_declaration_closes_its_binder_scope() {
+    // A declaration whose type error is inside a binder must close the
+    // binder's typing scope. Otherwise the next pop leaves the typing scopes
+    // one deeper than the name maps, which lowering the next lambda asserts
+    // against.
+    let message_interface = std::sync::Arc::new(crate::messages::AirMessageInterface {});
+    let mut nodes = Vec::new();
+    macro_push_node(&mut nodes, node!((axiom (forall ((x Int)) (+ x true)))));
+    macro_push_node(
+        &mut nodes,
+        node!((axiom (= 10 (apply Int (lambda ((x Int) (y Int)) (+ x y 5)) 2 3)))),
+    );
+    let commands = Parser::new(message_interface.clone()).nodes_to_commands(&nodes).unwrap();
+    let CommandX::Global(ill_typed) = &*commands[0] else { panic!("expected a declaration") };
+    let CommandX::Global(lambda) = &*commands[1] else { panic!("expected a declaration") };
+    let mut air_context = crate::context::Context::new(message_interface, SmtSolver::Z3);
+    air_context.push();
+    assert!(air_context.global(ill_typed).is_err());
+    air_context.pop();
+    air_context.global(lambda).unwrap();
+}
+
+#[test]
+fn parse_inst_pressure_reply() {
+    let info = crate::smt_verify::parse_inst_pressure(
+        "(:inst-pressure (:rounds 3 :refutation true :quantifiers (\
+         (user_f_1 :instantiations 5 :duplicate-eq 2 :duplicate-ent 1 :duplicate-lemma 0 \
+         :conflict 1 :propagate 0 :first-round 0 :last-round 2 :refutation 1) \
+         (|user%g| :instantiations 0 :duplicate-eq 4 :duplicate-ent 0 :duplicate-lemma 0 \
+         :conflict 0 :propagate 0 :refutation 0) \
+         (quant_0 :named false :instantiations 1 :duplicate-eq 0 :duplicate-ent 0 \
+         :duplicate-lemma 0 :conflict 0 :propagate 1 :first-round 1 :last-round 1 \
+         :refutation 0))))",
+    );
+    assert!(info.unparsed.is_none(), "{:?}", info.unparsed);
+    assert_eq!((info.rounds, info.refutation, info.quantifiers.len()), (3, true, 3));
+    let f = &info.quantifiers[0];
+    assert_eq!(f.qid, "user_f_1");
+    assert!(f.named);
+    assert_eq!(
+        (f.instantiations, f.duplicate_eq, f.duplicate_ent, f.duplicate_lemma),
+        (5, 2, 1, 0)
+    );
+    assert_eq!(
+        (f.conflict, f.first_round, f.last_round, f.refutation),
+        (1, Some(0), Some(2), Some(1))
+    );
+    // only duplicates: no rounds; quoted symbols lose their bars
+    let q = &info.quantifiers[1];
+    assert_eq!((q.qid.as_str(), q.first_round, q.duplicate_eq), ("user%g", None, 4));
+    let u = &info.quantifiers[2];
+    assert_eq!((u.qid.as_str(), u.named, u.propagate), ("quant_0", false, 1));
+
+    // no quantifier instantiated; no refutation counts outside proof mode
+    let info = crate::smt_verify::parse_inst_pressure(
+        "(:inst-pressure (:rounds 0 :refutation false :quantifiers ()))",
+    );
+    assert!(info.unparsed.is_none() && info.quantifiers.is_empty() && !info.refutation);
+    // a solver without the key, or anything unforeseen, is kept whole
+    let info = crate::smt_verify::parse_inst_pressure("(:inst-pressure unsupported)");
+    assert_eq!(info.unparsed.as_deref(), Some("(:inst-pressure unsupported)"));
+}
+
+#[test]
+fn parse_inst_pressure_symbols() {
+    let row = |qid: &str| {
+        format!(
+            "(:inst-pressure (:rounds 1 :refutation false :quantifiers (({} :instantiations 1 \
+             :duplicate-eq 0 :duplicate-ent 0 :duplicate-lemma 0 :conflict 0 :propagate 0 \
+             :first-round 0 :last-round 0))))",
+            qid
+        )
+    };
+    let qids = |line: &str| {
+        let info = crate::smt_verify::parse_inst_pressure(line);
+        assert!(info.unparsed.is_none(), "{:?}", info.unparsed);
+        info.quantifiers.into_iter().map(|q| q.qid).collect::<Vec<_>>()
+    };
+    // a simple symbol may hold characters sise's atoms lack
+    assert_eq!(qids(&row("a^b")), vec!["a^b"]);
+    // a quoted one may hold anything but a bar, spaces and quotes included
+    assert_eq!(qids(&row("|a b|")), vec!["a b"]);
+    assert_eq!(qids(&row("|say \"hi\"|")), vec!["say \"hi\""]);
+    assert_eq!(qids(&row("||")), vec![""]);
+
+    // unbalanced, trailing, or cut short: kept whole
+    for line in [
+        "(:inst-pressure (:rounds 1 :refutation false :quantifiers ((a :instantiations 1)))",
+        "(:inst-pressure (:rounds 1)) x",
+        "(:inst-pressure (:rounds 1 :refutation false :quantifiers ((|a :instantiations 1))))",
+    ] {
+        let info = crate::smt_verify::parse_inst_pressure(line);
+        assert_eq!(info.unparsed.as_deref(), Some(line));
+    }
+    // a malformed row is reported, the others kept
+    let info = crate::smt_verify::parse_inst_pressure(
+        "(:inst-pressure (:rounds 2 :refutation false :quantifiers ((ok :instantiations 1) \
+         (bad :instantiations x))))",
+    );
+    assert!(info.unparsed.is_some());
+    assert_eq!(info.quantifiers.len(), 1);
 }

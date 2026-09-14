@@ -208,6 +208,9 @@ pub(crate) fn smt_check_assertion<'ctx>(
     only_check_earlier: bool,
     report_long_running: Option<&mut ReportLongRunning>,
 ) -> ValidityResult {
+    // a check that returns before reading the reply must not leave the
+    // previous check's pressure behind for its caller to take
+    context.last_inst_pressure = None;
     let disabled_expr = if only_check_earlier {
         // disable all labels that come after the first known error
         let mut disabled: Vec<Expr> = Vec::new();
@@ -287,12 +290,33 @@ pub(crate) fn smt_check_assertion<'ctx>(
     if let Some(certificate) = context.import_instantiations.take() {
         context.smt_log.log_import_instantiations(&certificate);
     }
+    // Likewise an injected equality, which goes with the scope's pop.
+    if let Some((lhs, rhs)) = context.inject_equality.take() {
+        context.smt_log.log_node(&sise::TreeNode::List(vec![
+            sise::TreeNode::Atom("assert".to_string()),
+            sise::TreeNode::List(vec![sise::TreeNode::Atom("=".to_string()), lhs, rhs]),
+        ]));
+    }
     context.smt_log.log_word("check-sat");
+    if context.inst_pressure {
+        // in the same batch, right after the answer it describes
+        context.smt_log.log_get_info("inst-pressure");
+    }
     if context.provenance {
         // in the same batch: the tag lists arrive after the result and the
         // instantiation dump, before the sentinel
         context.smt_log.log_get_assertion_sources();
     }
+    // The e-graph is read in the same batch too, after the tag lists and
+    // before `get-info` or `get-model` can run. Only a query's first check
+    // has focus terms, so later error rounds do not ask again.
+    let egraph_asked = match (context.egraph_focus.take(), context.egraph_request) {
+        (Some(focus), Some(request)) => {
+            context.smt_log.log_get_egraph_equalities(&focus, request.limit, request.include_used);
+            true
+        }
+        _ => false,
+    };
 
     // Run SMT solver
     let smt_run_start_time = std::time::Instant::now();
@@ -323,8 +347,26 @@ pub(crate) fn smt_check_assertion<'ctx>(
     // Process SMT results
     let mut unsat = None;
     let mut provenance_lines: Vec<String> = Vec::new();
+    let mut egraph_lines: Vec<String> = Vec::new();
+    let mut inst_pressure = None;
     for line in smt_output {
-        if line == "unsat" {
+        // The e-graph reply, or the solver's refusal of the request, is the
+        // batch's last: every line from its first on belongs to it.
+        if !egraph_lines.is_empty()
+            || (egraph_asked
+                && unsat.is_some()
+                && (line.starts_with("(egraph-equalities") || line.starts_with("(error")))
+        {
+            egraph_lines.push(line);
+            continue;
+        }
+        if context.inst_pressure && line.starts_with("(:inst-pressure ") {
+            inst_pressure = Some(parse_inst_pressure(&line));
+        } else if context.inst_pressure && inst_pressure.is_none() && line == "unsupported" {
+            // a cvc5 without the key; say so rather than fail the query
+            inst_pressure =
+                Some(crate::context::InstPressure { unparsed: Some(line), ..Default::default() });
+        } else if line == "unsat" {
             assert!(unsat == None);
             unsat = Some(SmtOutput::Unsat);
         } else if line == "sat" {
@@ -359,6 +401,10 @@ pub(crate) fn smt_check_assertion<'ctx>(
 
     if context.provenance {
         context.last_provenance = Some(parse_provenance_lines(&provenance_lines));
+    }
+    context.last_inst_pressure = inst_pressure;
+    if egraph_asked {
+        context.last_egraph = Some(parse_egraph_lines(&egraph_lines));
     }
 
     let unsat = unsat.expect("expected sat/unsat/unknown from SMT solver");
@@ -409,6 +455,15 @@ pub(crate) fn smt_check_assertion<'ctx>(
                 } else {
                     return ValidityResult::UnexpectedOutput(line);
                 }
+            }
+
+            if context.matching_loops {
+                // After the check, so it cannot perturb the check's budget.
+                // Read before the next check-sat, whose presolve clears it.
+                context.smt_log.log_get_info("matching-loops");
+                let smt_data = context.smt_log.take_pipe_data();
+                let lines = context.get_smt_process().send_commands(smt_data);
+                context.last_matching_loops = Some(parse_matching_loops_lines(&lines));
             }
 
             match reason.expect("expected :reason-unknown") {
@@ -466,6 +521,140 @@ pub(crate) fn smt_check_assertion<'ctx>(
     }
 }
 
+/// Parse cvc5's `(:inst-pressure (:rounds R :refutation B :quantifiers (ROW
+/// ...)))`, where each ROW is `(qid :key value ...)`. Unknown keys are
+/// skipped; a reply that does not parse is kept whole in `unparsed`.
+pub(crate) fn parse_inst_pressure(line: &str) -> crate::context::InstPressure {
+    use sise::TreeNode;
+    let mut out = crate::context::InstPressure::default();
+    let fields = match read_smt_sexp(line) {
+        Some(TreeNode::List(items)) => match &items[..] {
+            [TreeNode::Atom(key), TreeNode::List(fields)] if key == ":inst-pressure" => {
+                fields.clone()
+            }
+            _ => Vec::new(),
+        },
+        _ => Vec::new(),
+    };
+    if fields.is_empty() {
+        out.unparsed = Some(line.to_owned());
+        return out;
+    }
+    for pair in fields.chunks(2) {
+        match pair {
+            [TreeNode::Atom(k), TreeNode::Atom(v)] if k == ":rounds" => {
+                out.rounds = v.parse().unwrap_or(0);
+            }
+            [TreeNode::Atom(k), TreeNode::Atom(v)] if k == ":refutation" => {
+                out.refutation = v == "true";
+            }
+            [TreeNode::Atom(k), TreeNode::List(rows)] if k == ":quantifiers" => {
+                for row in rows {
+                    match parse_quant_pressure(row) {
+                        Some(q) => out.quantifiers.push(q),
+                        None => out.unparsed = Some(line.to_owned()),
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Read one SMT-LIB s-expression as a sise tree. sise cannot read cvc5's
+/// symbols: a quoted one is `|...|`, and a simple one may hold characters
+/// sise's atoms lack (`^`). A quoted symbol becomes an atom without its
+/// bars; a string literal keeps its quotes. `None` when the text is not
+/// exactly one balanced expression.
+fn read_smt_sexp(text: &str) -> Option<sise::TreeNode> {
+    use sise::TreeNode;
+    let mut stack: Vec<Vec<TreeNode>> = vec![Vec::new()];
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '(' => stack.push(Vec::new()),
+            ')' => {
+                let list = stack.pop()?;
+                stack.last_mut()?.push(TreeNode::List(list));
+            }
+            '|' => {
+                let mut symbol = String::new();
+                loop {
+                    match chars.next()? {
+                        '|' => break,
+                        c => symbol.push(c),
+                    }
+                }
+                stack.last_mut()?.push(TreeNode::Atom(symbol));
+            }
+            '"' => {
+                // `""` inside a string is an escaped quote
+                let mut literal = String::from('"');
+                loop {
+                    let c = chars.next()?;
+                    literal.push(c);
+                    if c == '"' {
+                        if chars.peek() == Some(&'"') {
+                            literal.push(chars.next()?);
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                stack.last_mut()?.push(TreeNode::Atom(literal));
+            }
+            c if c.is_whitespace() => {}
+            c => {
+                let mut atom = String::from(c);
+                while let Some(&c) = chars.peek() {
+                    if c.is_whitespace() || matches!(c, '(' | ')' | '|' | '"') {
+                        break;
+                    }
+                    atom.push(c);
+                    chars.next();
+                }
+                stack.last_mut()?.push(TreeNode::Atom(atom));
+            }
+        }
+    }
+    let mut top = stack.pop()?;
+    if !stack.is_empty() || top.len() != 1 {
+        return None;
+    }
+    top.pop()
+}
+
+/// One `(qid :key value ...)` row of `(get-info :inst-pressure)`.
+fn parse_quant_pressure(row: &sise::TreeNode) -> Option<crate::context::QuantPressure> {
+    use sise::TreeNode;
+    let TreeNode::List(items) = row else { return None };
+    let (TreeNode::Atom(qid), rest) = items.split_first()? else { return None };
+    let mut q =
+        crate::context::QuantPressure { qid: qid.to_owned(), named: true, ..Default::default() };
+    for pair in rest.chunks(2) {
+        let [TreeNode::Atom(k), TreeNode::Atom(v)] = pair else { return None };
+        if k == ":named" {
+            q.named = v != "false";
+            continue;
+        }
+        let n: u64 = v.parse().ok()?;
+        match k.as_str() {
+            ":instantiations" => q.instantiations = n,
+            ":duplicate-eq" => q.duplicate_eq = n,
+            ":duplicate-ent" => q.duplicate_ent = n,
+            ":duplicate-lemma" => q.duplicate_lemma = n,
+            ":conflict" => q.conflict = n,
+            ":propagate" => q.propagate = n,
+            ":first-round" => q.first_round = Some(n),
+            ":last-round" => q.last_round = Some(n),
+            ":refutation" => q.refutation = Some(n),
+            _ => {}
+        }
+    }
+    Some(q)
+}
+
 /// Parse what provenance mode adds to a `check-sat` batch's output: the
 /// `--dump-instantiations` forms (`(instantiations <qid> (<terms>)...)`,
 /// `(skolem ...)`, or `none`) and the `(get-assertion-sources :tags-only)`
@@ -520,6 +709,440 @@ pub(crate) fn parse_provenance_lines(lines: &Vec<String>) -> crate::context::Pro
         }
     }
     info
+}
+
+/// Parse cvc5's `(get-info :matching-loops)` reply:
+/// `(:matching-loops (:rounds n :instantiations n :dropped n
+/// :max-inst-rounds b :loops ((loop :qid q :key value ...) ...)))`.
+/// Keys it does not know, and replies of another shape, are kept verbatim
+/// in `unparsed` rather than failed on.
+pub(crate) fn parse_matching_loops_lines(lines: &Vec<String>) -> crate::context::MatchingLoopsInfo {
+    use crate::context::{MatchingLoop, MatchingLoopsInfo};
+    use sise::TreeNode as Node;
+    let mut info = MatchingLoopsInfo::default();
+    let text = unquote_symbols(&lines.join("\n"));
+    let mut parser = sise::Parser::new(text.as_str());
+    let body = match sise::parse_tree(&mut parser) {
+        Ok(Node::List(reply)) => match reply.as_slice() {
+            [Node::Atom(key), Node::List(body)] if key == ":matching-loops" => body.clone(),
+            _ => {
+                info.unparsed = lines.clone();
+                return info;
+            }
+        },
+        _ => {
+            info.unparsed = lines.clone();
+            return info;
+        }
+    };
+    let text_of = |n: &Node| node_to_line(n);
+    let symbol = |n: &Node| text_of(n);
+    let num = |n: &Node| text_of(n).parse::<u64>().ok();
+    let dec = |n: &Node| text_of(n).parse::<f64>().ok();
+    let flag = |n: &Node| text_of(n) == "true";
+    let terms = |n: &Node| match n {
+        Node::List(items) => items.iter().map(|t| text_of(t)).collect(),
+        _ => vec![],
+    };
+    // `:key value` pairs
+    let pairs = |items: &[Node]| -> Vec<(String, Node)> {
+        items
+            .chunks(2)
+            .filter_map(|kv| match kv {
+                [Node::Atom(k), v] if k.starts_with(':') => Some((k.clone(), v.clone())),
+                _ => None,
+            })
+            .collect()
+    };
+    let unknown = |k: &str, v: &Node, unparsed: &mut Vec<String>| {
+        unparsed.push(format!("{k} {}", text_of(v)));
+    };
+    for (key, value) in pairs(&body) {
+        match (key.as_str(), &value) {
+            (":rounds", v) => info.rounds = num(v).unwrap_or(0),
+            (":instantiations", v) => info.instantiations = num(v).unwrap_or(0),
+            (":dropped", v) => info.dropped = num(v).unwrap_or(0),
+            (":max-inst-rounds", v) => info.max_inst_rounds = flag(v),
+            (":loops", Node::List(loops)) => {
+                for form in loops {
+                    let items = match form {
+                        Node::List(items) if matches!(items.first(), Some(Node::Atom(h)) if h == "loop") => {
+                            &items[1..]
+                        }
+                        _ => {
+                            info.unparsed.push(text_of(form));
+                            continue;
+                        }
+                    };
+                    let mut l = MatchingLoop::default();
+                    for (k, v) in pairs(items) {
+                        match k.as_str() {
+                            ":qid" => l.qid = symbol(&v),
+                            ":confidence" => l.confidence = text_of(&v),
+                            ":growth" => l.growth = text_of(&v),
+                            ":edges" => l.edges_confirmed = text_of(&v) == "confirmed",
+                            ":stable" => l.stable = flag(&v),
+                            ":instantiations" => l.instantiations = num(&v).unwrap_or(0),
+                            ":rounds" => l.rounds = num(&v).unwrap_or(0),
+                            ":first-round" => l.first_round = num(&v).unwrap_or(0),
+                            ":last-round" => l.last_round = num(&v).unwrap_or(0),
+                            ":chain" => l.chain = num(&v).unwrap_or(0),
+                            ":self-fed" => l.self_fed = num(&v).unwrap_or(0),
+                            ":depth-per-rung" => l.depth_per_rung = dec(&v).unwrap_or(0.0),
+                            ":depth-per-round" => l.depth_per_round = dec(&v).unwrap_or(0.0),
+                            ":fanout-per-round" => l.fanout_per_round = dec(&v).unwrap_or(0.0),
+                            ":fanout-per-step" => l.fanout_per_step = dec(&v).unwrap_or(0.0),
+                            ":via" => {
+                                l.via = match &v {
+                                    Node::List(qs) => qs.iter().map(|q| symbol(q)).collect(),
+                                    _ => vec![],
+                                }
+                            }
+                            ":trigger" => l.trigger = terms(&v),
+                            ":context" => l.context = terms(&v),
+                            ":shape" => l.shape = terms(&v),
+                            ":step" => l.step = terms(&v),
+                            ":ladder" => {
+                                l.ladder = match &v {
+                                    Node::List(rungs) => rungs.iter().map(|r| terms(r)).collect(),
+                                    _ => vec![],
+                                }
+                            }
+                            ":ladder-length" => l.ladder_length = num(&v).unwrap_or(0),
+                            ":per-round" => {
+                                l.per_round = match &v {
+                                    Node::List(ns) => ns.iter().filter_map(|n| num(n)).collect(),
+                                    _ => vec![],
+                                }
+                            }
+                            _ => unknown(&k, &v, &mut info.unparsed),
+                        }
+                    }
+                    info.loops.push(l);
+                }
+            }
+            (k, v) => unknown(k, v, &mut info.unparsed),
+        }
+    }
+    info
+}
+
+/// One node on one line. The pretty printer breaks long terms across lines,
+/// and the resolver compares terms by their text. A quoted symbol that
+/// `unquote_symbols` had to carry as a sise string gets its bars back.
+fn node_to_line(n: &sise::TreeNode) -> String {
+    match n {
+        sise::TreeNode::Atom(a) => {
+            match a.strip_prefix("\"|").and_then(|a| a.strip_suffix("|\"")) {
+                Some(quoted) => format!("|{}|", quoted.replace("\\\"", "\"")),
+                None => a.clone(),
+            }
+        }
+        sise::TreeNode::List(items) => {
+            format!("({})", items.iter().map(node_to_line).collect::<Vec<_>>().join(" "))
+        }
+    }
+}
+
+/// cvc5 prints a symbol between bars when SMT-LIB needs it quoted, which
+/// sise cannot read. A quoted symbol sise can read bare loses its bars; any
+/// other becomes the sise string `"|...|"` (characters sise strings cannot
+/// hold become `?`), so one odd symbol does not cost the whole reply. String
+/// literals are copied as they are, so a bar inside one is left alone.
+fn unquote_symbols(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find(&['|', '"'][..]) {
+        out.push_str(&rest[..start]);
+        let open = &rest[start..start + 1];
+        let after = &rest[start + 1..];
+        let Some(end) = after.find(open) else {
+            out.push_str(&rest[start..]);
+            return out;
+        };
+        let inner = &after[..end];
+        if open == "\"" {
+            out.push_str(&rest[start..start + end + 2]);
+        } else if !inner.is_empty() && inner.chars().all(sise::is_atom_chr) {
+            out.push_str(inner);
+        } else {
+            out.push_str("\"|");
+            for c in inner.chars() {
+                match c {
+                    '"' => out.push_str("\\\""),
+                    c if sise::is_atom_string_chr(c) => out.push(c),
+                    _ => out.push('?'),
+                }
+            }
+            out.push_str("|\"");
+        }
+        rest = &after[end + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Parse cvc5's reply to `(get-egraph-equalities)`: `(egraph-equalities
+/// (summary :classes n ...) (equality <lhs> <rhs> :level l :used b :focus n
+/// :because (<lit> ...))*)`, or the `(error "...")` it gives instead.
+pub(crate) fn parse_egraph_lines(lines: &[String]) -> crate::context::EgraphReply {
+    use sise::TreeNode as Node;
+    /// The `:key value` pairs the summary and each equality spell fields as.
+    fn fields<'a>(items: &'a [Node]) -> impl Iterator<Item = (&'a str, &'a Node)> + 'a {
+        items.chunks(2).filter_map(|pair| match pair {
+            [Node::Atom(key), value] if key.starts_with(':') => Some((key.as_str(), value)),
+            _ => None,
+        })
+    }
+    fn number(node: &Node) -> u64 {
+        match node {
+            Node::Atom(a) => a.parse().unwrap_or(0),
+            Node::List(_) => 0,
+        }
+    }
+    /// A term on one line, as SMT-LIB spells it. The terms go back to the
+    /// solver and are hashed into equality ids, so they carry no layout.
+    fn one_line(node: &Node) -> String {
+        match node {
+            Node::Atom(a) => a.clone(),
+            Node::List(items) => {
+                format!("({})", items.iter().map(one_line).collect::<Vec<_>>().join(" "))
+            }
+        }
+    }
+    let mut reply = crate::context::EgraphReply::default();
+    let text = format!("({})", lines.join("\n"));
+    let mut parser = sise::Parser::new(text.as_str());
+    let forms = match sise::parse_tree(&mut parser) {
+        Ok(Node::List(forms)) => forms,
+        _ => Vec::new(),
+    };
+    let mut recognised = false;
+    for form in forms.iter() {
+        let Node::List(items) = form else { continue };
+        match items.first() {
+            Some(Node::Atom(head)) if head == "egraph-equalities" => {
+                recognised = true;
+                for item in &items[1..] {
+                    let Node::List(parts) = item else { continue };
+                    match parts.first() {
+                        Some(Node::Atom(head)) if head == "summary" => {
+                            for (key, value) in fields(&parts[1..]) {
+                                match key {
+                                    ":classes" => reply.classes = number(value),
+                                    ":candidates" => reply.candidates = number(value),
+                                    ":focus" => reply.focus = number(value),
+                                    ":focus-found" => reply.focus_found = number(value),
+                                    ":used-omitted" => reply.used_omitted = number(value),
+                                    ":too-large" => reply.too_large = number(value),
+                                    _ => {}
+                                }
+                            }
+                        }
+                        Some(Node::Atom(head)) if head == "equality" && parts.len() >= 3 => {
+                            let mut equality = crate::context::EgraphEquality {
+                                lhs: one_line(&parts[1]),
+                                rhs: one_line(&parts[2]),
+                                level: "unknown".to_string(),
+                                used: false,
+                                used_by: Vec::new(),
+                                focus: 0,
+                                because: Vec::new(),
+                                because_hidden: 0,
+                            };
+                            for (key, value) in fields(&parts[3..]) {
+                                match (key, value) {
+                                    (":level", Node::Atom(level)) => equality.level = level.clone(),
+                                    (":used", Node::Atom(used)) => equality.used = used == "true",
+                                    (":used-by", Node::List(qids)) => {
+                                        equality.used_by = qids.iter().map(one_line).collect()
+                                    }
+                                    (":focus", value) => equality.focus = number(value) as u32,
+                                    (":because", Node::List(lits)) => {
+                                        equality.because = lits.iter().map(one_line).collect()
+                                    }
+                                    (":because-hidden", value) => {
+                                        equality.because_hidden = number(value)
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            reply.equalities.push(equality);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Some(Node::Atom(head)) if head == "error" && !recognised => {
+                reply.error = Some(match items.get(1) {
+                    Some(Node::Atom(message)) => message.trim_matches('"').to_string(),
+                    _ => crate::printer::node_to_string(form),
+                });
+            }
+            _ => {}
+        }
+    }
+    if recognised {
+        reply.error = None;
+    } else if reply.error.is_none() {
+        reply.error = Some(format!("unrecognised e-graph reply: {}", lines.join(" ")));
+    }
+    reply
+}
+
+/// At most this many focus terms go with one e-graph request, in at most
+/// this many printed bytes; the smallest are kept.
+const EGRAPH_FOCUS_TERMS: usize = 4000;
+const EGRAPH_FOCUS_BYTES: usize = 1 << 20;
+/// A term of more nodes than this is not a focus term. Printing each focus
+/// term apart would otherwise cost the square of the query's depth.
+const EGRAPH_FOCUS_TERM_NODES: usize = 64;
+
+/// The query's own terms, which focus `(get-egraph-equalities)` on the
+/// classes the query is about: variables and non-Boolean applications that
+/// cvc5 can parse at the query's scope, so none that mentions a bound
+/// variable, a closure, or an assertion label. Boolean connectives and
+/// relations are left out; cvc5 does not list Boolean classes.
+fn egraph_focus_terms(expr: &Expr, printer: &crate::printer::Printer) -> Vec<sise::TreeNode> {
+    /// Collect `expr`'s focus terms into `out`. Returns its size in nodes if
+    /// it names no bound variable and can be printed at the query's scope.
+    fn walk(expr: &Expr, bound: &mut Vec<Ident>, out: &mut Vec<Expr>) -> Option<usize> {
+        // Every child is walked, whether or not an earlier one was closed.
+        fn all(sizes: Vec<Option<usize>>) -> Option<usize> {
+            sizes.into_iter().sum::<Option<usize>>().map(|size| size + 1)
+        }
+        let (size, boolean) = match &**expr {
+            ExprX::Const(_) => return Some(1),
+            ExprX::Var(x) => {
+                if bound.contains(x) {
+                    return None;
+                }
+                let label = x.starts_with(PREFIX_LABEL) || x.starts_with(GLOBAL_PREFIX_LABEL);
+                (Some(1), label)
+            }
+            ExprX::Old(..) => return None,
+            ExprX::Apply(_, args) => {
+                (all(args.iter().map(|arg| walk(arg, bound, out)).collect()), false)
+            }
+            ExprX::ApplyFun(_, fun, args) => {
+                walk(fun, bound, out);
+                for arg in args.iter() {
+                    walk(arg, bound, out);
+                }
+                return None;
+            }
+            ExprX::Array(args) => {
+                for arg in args.iter() {
+                    walk(arg, bound, out);
+                }
+                return None;
+            }
+            ExprX::Unary(op, arg) => (
+                all(vec![walk(arg, bound, out)]),
+                matches!(
+                    op,
+                    UnaryOp::Not
+                        | UnaryOp::FloatIsNormal
+                        | UnaryOp::FloatIsSubnormal
+                        | UnaryOp::FloatIsZero
+                        | UnaryOp::FloatIsInfinite
+                        | UnaryOp::FloatIsNaN
+                        | UnaryOp::FloatIsNegative
+                        | UnaryOp::FloatIsPositive
+                ),
+            ),
+            ExprX::Binary(op, lhs, rhs) => (
+                all(vec![walk(lhs, bound, out), walk(rhs, bound, out)]),
+                matches!(
+                    op,
+                    BinaryOp::Implies
+                        | BinaryOp::Eq
+                        | BinaryOp::Le
+                        | BinaryOp::Ge
+                        | BinaryOp::Lt
+                        | BinaryOp::Gt
+                        | BinaryOp::Relation(..)
+                        | BinaryOp::BitULt
+                        | BinaryOp::BitUGt
+                        | BinaryOp::BitULe
+                        | BinaryOp::BitUGe
+                        | BinaryOp::BitSLt
+                        | BinaryOp::BitSGt
+                        | BinaryOp::BitSLe
+                        | BinaryOp::BitSGe
+                        | BinaryOp::FloatEq
+                        | BinaryOp::FloatLt
+                        | BinaryOp::FloatGt
+                        | BinaryOp::FloatLe
+                        | BinaryOp::FloatGe
+                ),
+            ),
+            ExprX::Multi(op, args) => (
+                all(args.iter().map(|arg| walk(arg, bound, out)).collect()),
+                matches!(op, MultiOp::And | MultiOp::Or | MultiOp::Xor | MultiOp::Distinct),
+            ),
+            ExprX::IfElse(cond, lhs, rhs) => (
+                all(vec![walk(cond, bound, out), walk(lhs, bound, out), walk(rhs, bound, out)]),
+                false,
+            ),
+            ExprX::Bind(bind, body) => {
+                let depth = bound.len();
+                match &**bind {
+                    BindX::Let(binders) => {
+                        // a let's definitions are outside its own bindings
+                        for binder in binders.iter() {
+                            walk(&binder.a, bound, out);
+                        }
+                        bound.extend(binders.iter().map(|binder| binder.name.clone()));
+                        walk(body, bound, out);
+                    }
+                    BindX::Quant(_, binders, _, _) | BindX::Lambda(binders, _, _) => {
+                        bound.extend(binders.iter().map(|binder| binder.name.clone()));
+                        walk(body, bound, out);
+                    }
+                    BindX::Choose(binders, _, _, cond) => {
+                        bound.extend(binders.iter().map(|binder| binder.name.clone()));
+                        walk(cond, bound, out);
+                        walk(body, bound, out);
+                    }
+                }
+                bound.truncate(depth);
+                return None;
+            }
+            ExprX::LabeledAxiom(_, _, inner) | ExprX::LabeledAssertion(_, _, _, inner) => {
+                walk(inner, bound, out);
+                return None;
+            }
+        };
+        if let Some(nodes) = size {
+            if !boolean && nodes <= EGRAPH_FOCUS_TERM_NODES {
+                out.push(expr.clone());
+            }
+        }
+        size
+    }
+    let mut terms: Vec<Expr> = Vec::new();
+    walk(expr, &mut Vec::new(), &mut terms);
+    let mut seen = std::collections::HashSet::new();
+    let mut printed: Vec<(String, sise::TreeNode)> = Vec::new();
+    for term in terms {
+        let node = printer.expr_to_node(&term);
+        let text = crate::printer::node_to_string(&node);
+        if seen.insert(text.clone()) {
+            printed.push((text, node));
+        }
+    }
+    printed.sort_by(|a, b| a.0.len().cmp(&b.0.len()).then_with(|| a.0.cmp(&b.0)));
+    let mut bytes = 0;
+    printed
+        .into_iter()
+        .take(EGRAPH_FOCUS_TERMS)
+        .take_while(|(text, _)| {
+            bytes += text.len() + 1;
+            bytes <= EGRAPH_FOCUS_BYTES
+        })
+        .map(|(_, node)| node)
+        .collect()
 }
 
 pub(crate) fn smt_get_rlimit_count(context: &mut Context) -> Result<u64, ValidityResult> {
@@ -681,6 +1304,11 @@ pub(crate) fn smt_check_query<'ctx>(
     // add query-local declarations
     for decl in query.local.iter() {
         if let Err(err) = crate::typecheck::add_decl(context, decl, false) {
+            // A type error opens no query to finish, so close the scope opened above.
+            if !context.single_check_query {
+                context.pop_name_scope();
+                context.smt_log.log_pop();
+            }
             return ValidityResult::TypeError(err);
         }
         smt_add_decl(context, decl);
@@ -692,6 +1320,16 @@ pub(crate) fn smt_check_query<'ctx>(
         _ => panic!("internal error: query not lowered"),
     };
     let assertion = elim_zero_args_expr(assertion);
+
+    // An e-graph request is focused on the classes of this query's own terms.
+    if context.egraph_request.is_some() {
+        let printer = crate::printer::Printer::new(
+            context.message_interface.clone(),
+            true,
+            context.solver.clone(),
+        );
+        context.egraph_focus = Some(egraph_focus_terms(&assertion, &printer));
+    }
 
     // add labels to assertions for error reporting
     let mut infos: Vec<AssertionInfo> = Vec::new();
@@ -736,4 +1374,90 @@ pub(crate) fn smt_check_query<'ctx>(
     }
 
     result
+}
+
+#[cfg(test)]
+mod egraph_tests {
+    use super::*;
+
+    fn lines(text: &[&str]) -> Vec<String> {
+        text.iter().map(|line| line.to_string()).collect()
+    }
+
+    #[test]
+    fn egraph_reply_parses_summary_equalities_and_refusals() {
+        let reply = parse_egraph_lines(&lines(&[
+            "(egraph-equalities",
+            "(summary :classes 2 :candidates 3 :focus 4 :focus-found 3 :used-omitted 1 :too-large 5)",
+            "(equality (f b) c :level entailed :used false :used-by () :focus 2 :because ((= a b) (= (f a) c)))",
+            "(equality d b :level decision :used true :used-by (prelude_box user_f_1) :focus 1 :because () :because-hidden 2)",
+            ")",
+        ]));
+        assert!(reply.error.is_none(), "{:?}", reply.error);
+        assert_eq!(
+            (reply.classes, reply.candidates, reply.focus, reply.focus_found, reply.used_omitted),
+            (2, 3, 4, 3, 1)
+        );
+        assert_eq!(reply.too_large, 5);
+        assert_eq!(
+            (reply.equalities[0].because_hidden, reply.equalities[1].because_hidden),
+            (0, 2)
+        );
+        assert_eq!(reply.equalities.len(), 2);
+        let first = &reply.equalities[0];
+        assert_eq!(
+            (first.lhs.as_str(), first.rhs.as_str(), first.level.as_str(), first.used, first.focus),
+            ("(f b)", "c", "entailed", false, 2)
+        );
+        assert_eq!(first.because, vec!["(= a b)", "(= (f a) c)"]);
+        assert!(reply.equalities[1].used && reply.equalities[1].because.is_empty());
+        assert!(first.used_by.is_empty());
+        assert_eq!(reply.equalities[1].used_by, vec!["prelude_box", "user_f_1"]);
+
+        let refused = parse_egraph_lines(&lines(&[
+            "(error \"cannot get e-graph equalities unless after a SAT or UNKNOWN response.\")",
+        ]));
+        assert!(refused.equalities.is_empty());
+        assert!(refused.error.unwrap().contains("cannot get e-graph equalities"));
+        assert!(parse_egraph_lines(&Vec::new()).error.is_some());
+    }
+
+    #[test]
+    fn egraph_focus_skips_bound_variables_labels_and_connectives() {
+        let var = |x: &str| Arc::new(ExprX::Var(Arc::new(x.to_string())));
+        let apply = |f: &str, args: Vec<Expr>| {
+            Arc::new(ExprX::Apply(Arc::new(f.to_string()), Arc::new(args)))
+        };
+        let eq = |a: Expr, b: Expr| Arc::new(ExprX::Binary(BinaryOp::Eq, a, b));
+        let one = Arc::new(ExprX::Const(crate::ast::Constant::Nat(Arc::new("1".to_string()))));
+        let binder = Arc::new(crate::ast::BinderX {
+            name: Arc::new("i".to_string()),
+            a: Arc::new(TypX::Int),
+        });
+        let forall = Arc::new(ExprX::Bind(
+            Arc::new(BindX::Quant(Quant::Forall, Arc::new(vec![binder]), Arc::new(vec![]), None)),
+            eq(apply("g", vec![var("i")]), var("z")),
+        ));
+        let label = format!("{}0", PREFIX_LABEL);
+        let goal = Arc::new(ExprX::Binary(
+            BinaryOp::Implies,
+            var(&label),
+            Arc::new(ExprX::Binary(
+                BinaryOp::Lt,
+                Arc::new(ExprX::Multi(MultiOp::Add, Arc::new(vec![var("x"), one]))),
+                var("w"),
+            )),
+        ));
+        let query = mk_and(&vec![eq(apply("f", vec![var("x")]), var("y")), forall, goal]);
+        let printer = crate::printer::Printer::new(
+            Arc::new(crate::messages::AirMessageInterface {}),
+            true,
+            SmtSolver::Cvc5,
+        );
+        let focus: Vec<String> = egraph_focus_terms(&query, &printer)
+            .iter()
+            .map(crate::printer::node_to_string)
+            .collect();
+        assert_eq!(focus, vec!["w", "x", "y", "z", "(f x)", "(+ x 1)"]);
+    }
 }

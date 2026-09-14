@@ -42,6 +42,9 @@ pub const HYPS_FILE_SUFFIX: &str = ".hyps";
 /// `--log-all` under `-V provenance`: per function, what cvc5 reported for
 /// each query (tags, instantiations), as JSON.
 pub const PROVENANCE_FILE_SUFFIX: &str = ".provenance.json";
+/// `--log-all` under `-V inst-pressure`: per function, each query's
+/// instantiation pressure joined to source, as JSON.
+pub const INST_PRESSURE_FILE_SUFFIX: &str = ".inst_pressure.json";
 pub const IMPL_NAMES_SUFFIX: &str = ".impl_names";
 pub const CALL_GRAPH_FILE_SUFFIX_FULL_INITIAL: &str = "-call-graph-full-initial.dot";
 pub const CALL_GRAPH_FILE_SUFFIX_FULL_SIMPLIFIED: &str = "-call-graph-full-simplified.dot";
@@ -127,6 +130,12 @@ pub struct ArgsX {
     pub no_bv_simplify: bool,
     pub no_assert_ids: bool,
     pub provenance: bool,
+    /// `-V matching-loops[=rounds]`: ask cvc5 for self-feeding quantifiers
+    /// after every unknown, bounding instantiation rounds when given.
+    pub matching_loops: bool,
+    pub matching_loop_rounds: Option<u32>,
+    /// Record cvc5's per-quantifier instantiation pressure for every query.
+    pub inst_pressure: bool,
     pub reach: Option<String>,
     /// Serve retained AIR queries over stdin/stdout after compilation.
     pub resident: bool,
@@ -179,6 +188,9 @@ impl ArgsX {
             no_bv_simplify: Default::default(),
             no_assert_ids: Default::default(),
             provenance: Default::default(),
+            matching_loops: Default::default(),
+            matching_loop_rounds: Default::default(),
+            inst_pressure: Default::default(),
             reach: Default::default(),
             resident: false,
         }
@@ -430,7 +442,13 @@ pub fn parse_args_with_imports(
     const EXTENDED_NO_BV_SIMPLIFY: &str = "no-bv-simplify";
     const EXTENDED_NO_ASSERT_IDS: &str = "no-assert-ids";
     const EXTENDED_PROVENANCE: &str = "provenance";
+    const EXTENDED_MATCHING_LOOPS: &str = "matching-loops";
+    const EXTENDED_INST_PRESSURE: &str = "inst-pressure";
     const EXTENDED_KEYS: &[(&str, &str)] = &[
+        (
+            EXTENDED_INST_PRESSURE,
+            "Record each query's instantiation pressure from cvc5: per quantifier, instantiations, duplicates, rounds (read-only; the search is unchanged)",
+        ),
         (EXTENDED_IGNORE_UNEXPECTED_SMT, "Ignore unexpected SMT output"),
         (EXTENDED_DEBUG, "Enable debugging of proof failures"),
         (
@@ -450,6 +468,10 @@ pub fn parse_args_with_imports(
         (
             EXTENDED_PROVENANCE,
             "Provenance mode: run cvc5 with preprocessing proofs and twice the rlimit, and record which hypotheses, axioms and quantifiers each query used (diagnostic; verdicts may differ from a plain run)",
+        ),
+        (
+            EXTENDED_MATCHING_LOOPS,
+            "Matching-loop mode: after every unknown, ask cvc5 which quantifiers fed their own triggers, and on what growing terms (diagnostic). -V matching-loops=N also stops quantifier instantiation after N rounds, which can turn a resource-limit failure into an incomplete one",
         ),
         (EXTENDED_ALLOW_INLINE_AIR, "Allow the POTENTIALLY UNSOUND use of inline_air_stmt"),
         (
@@ -884,12 +906,36 @@ pub fn parse_args_with_imports(
         no_bv_simplify: extended.contains_key(EXTENDED_NO_BV_SIMPLIFY),
         no_assert_ids: extended.contains_key(EXTENDED_NO_ASSERT_IDS),
         provenance: extended.contains_key(EXTENDED_PROVENANCE),
+        matching_loops: extended.contains_key(EXTENDED_MATCHING_LOOPS),
+        matching_loop_rounds: match extended.get(EXTENDED_MATCHING_LOOPS) {
+            // zero rounds would instantiate nothing and fail every quantified check
+            Some(Some(rounds)) => Some(match rounds.parse::<u32>() {
+                Ok(n) if n > 0 => n,
+                _ => error(format!(
+                    "expected a positive number of instantiation rounds after -V {EXTENDED_MATCHING_LOOPS}=, found {rounds}"
+                )),
+            }),
+            _ => None,
+        },
+        inst_pressure: extended.contains_key(EXTENDED_INST_PRESSURE),
         resident: matches.opt_present(OPT_RESIDENT),
     };
 
     if args.provenance && !matches!(args.solver, SmtSolver::Cvc5) {
         error(
             "-V provenance requires cvc5 (it is unavailable for vstd and internal test mode)"
+                .to_string(),
+        );
+    }
+    if args.matching_loops && !matches!(args.solver, SmtSolver::Cvc5) {
+        error(
+            "-V matching-loops requires cvc5 (it is unavailable for vstd and internal test mode)"
+                .to_string(),
+        );
+    }
+    if args.inst_pressure && !matches!(args.solver, SmtSolver::Cvc5) {
+        error(
+            "-V inst-pressure requires cvc5 (it is unavailable for vstd and internal test mode)"
                 .to_string(),
         );
     }
