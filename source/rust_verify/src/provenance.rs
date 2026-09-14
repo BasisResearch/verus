@@ -94,6 +94,9 @@ pub struct ResolvedQueryProvenance {
 pub struct QueryInstPressure {
     pub desc: String,
     pub span: String,
+    /// `body`, `recommends`, `expanded`, ...: a recommends rerun or an
+    /// expanded recheck shares the body check's `desc` and `span`
+    pub kind: &'static str,
     /// 0 for the first check of the query, then one per multi-error round
     pub round: usize,
     /// "valid", "invalid", "canceled", or the solver's unexpected output
@@ -145,6 +148,7 @@ pub struct ResolvedQuantPressure {
 pub struct ResolvedQueryInstPressure {
     pub desc: String,
     pub span: String,
+    pub kind: &'static str,
     pub round: usize,
     pub result: String,
     /// instantiation rounds that sent lemmas
@@ -413,6 +417,7 @@ impl Symbols {
         ResolvedQueryInstPressure {
             desc: q.desc,
             span: q.span,
+            kind: q.kind,
             round: q.round,
             result: q.result,
             rounds: q.pressure.rounds,

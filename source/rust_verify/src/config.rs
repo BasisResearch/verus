@@ -42,6 +42,9 @@ pub const HYPS_FILE_SUFFIX: &str = ".hyps";
 /// `--log-all` under `-V provenance`: per function, what cvc5 reported for
 /// each query (tags, instantiations), as JSON.
 pub const PROVENANCE_FILE_SUFFIX: &str = ".provenance.json";
+/// `--log-all` under `-V inst-pressure`: per function, each query's
+/// instantiation pressure joined to source, as JSON.
+pub const INST_PRESSURE_FILE_SUFFIX: &str = ".inst_pressure.json";
 pub const IMPL_NAMES_SUFFIX: &str = ".impl_names";
 pub const CALL_GRAPH_FILE_SUFFIX_FULL_INITIAL: &str = "-call-graph-full-initial.dot";
 pub const CALL_GRAPH_FILE_SUFFIX_FULL_SIMPLIFIED: &str = "-call-graph-full-simplified.dot";

@@ -2421,3 +2421,43 @@ fn parse_inst_pressure_reply() {
     let info = crate::smt_verify::parse_inst_pressure("(:inst-pressure unsupported)");
     assert_eq!(info.unparsed.as_deref(), Some("(:inst-pressure unsupported)"));
 }
+
+#[test]
+fn parse_inst_pressure_symbols() {
+    let row = |qid: &str| {
+        format!(
+            "(:inst-pressure (:rounds 1 :refutation false :quantifiers (({} :instantiations 1 \
+             :duplicate-eq 0 :duplicate-ent 0 :duplicate-lemma 0 :conflict 0 :propagate 0 \
+             :first-round 0 :last-round 0))))",
+            qid
+        )
+    };
+    let qids = |line: &str| {
+        let info = crate::smt_verify::parse_inst_pressure(line);
+        assert!(info.unparsed.is_none(), "{:?}", info.unparsed);
+        info.quantifiers.into_iter().map(|q| q.qid).collect::<Vec<_>>()
+    };
+    // a simple symbol may hold characters sise's atoms lack
+    assert_eq!(qids(&row("a^b")), vec!["a^b"]);
+    // a quoted one may hold anything but a bar, spaces and quotes included
+    assert_eq!(qids(&row("|a b|")), vec!["a b"]);
+    assert_eq!(qids(&row("|say \"hi\"|")), vec!["say \"hi\""]);
+    assert_eq!(qids(&row("||")), vec![""]);
+
+    // unbalanced, trailing, or cut short: kept whole
+    for line in [
+        "(:inst-pressure (:rounds 1 :refutation false :quantifiers ((a :instantiations 1)))",
+        "(:inst-pressure (:rounds 1)) x",
+        "(:inst-pressure (:rounds 1 :refutation false :quantifiers ((|a :instantiations 1))))",
+    ] {
+        let info = crate::smt_verify::parse_inst_pressure(line);
+        assert_eq!(info.unparsed.as_deref(), Some(line));
+    }
+    // a malformed row is reported, the others kept
+    let info = crate::smt_verify::parse_inst_pressure(
+        "(:inst-pressure (:rounds 2 :refutation false :quantifiers ((ok :instantiations 1) \
+         (bad :instantiations x))))",
+    );
+    assert!(info.unparsed.is_some());
+    assert_eq!(info.quantifiers.len(), 1);
+}
