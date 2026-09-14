@@ -150,7 +150,8 @@ enum GraphOpName {
 struct GraphFilterRequest {
     /// Only instantiations of this `:qid`.
     quantifier: Option<String>,
-    /// Only quantifiers of functions whose path starts with this.
+    /// Only quantifiers owned at this path or inside it, by whole segments:
+    /// a function's, or for internal axioms a datatype's, trait's or impl's.
     source_fn: Option<String>,
     min_depth: Option<u64>,
 }

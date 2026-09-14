@@ -691,7 +691,7 @@ fn resident_instantiation_certificates_survive_a_new_session() {
     let exported = certificate_files(certificates.path());
     assert_eq!(exported.len(), 1, "{exported:?}");
     let name = exported[0].file_name().unwrap().to_str().unwrap();
-    assert!(name.starts_with('c') && name.ends_with(".smt2"), "{name}");
+    assert!(name.starts_with('c') && name.ends_with(".smt2"), "{}", name);
     let certificate = fs::read_to_string(&exported[0]).unwrap();
     // A new session: the solver has saved nothing, so the passing query's
     // first check imports the file the previous session exported.

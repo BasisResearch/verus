@@ -13,6 +13,7 @@ use crate::profiler::{InstInfo, InstantiationGraph, NodeId};
 use serde::Serialize;
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet, VecDeque};
+use std::sync::Arc;
 
 /// Most entries in a `growth` series. A longer one is summed into buckets, so
 /// the answer stays small however many rounds the solver ran.
@@ -104,11 +105,14 @@ pub struct QuantifierCost {
 
 #[derive(Debug, Serialize)]
 pub struct Subgraph {
+    /// At most `limit` instantiations, lowest first, and at most `limit` of
+    /// the edges between them.
     pub nodes: Vec<GraphNode>,
     pub edges: Vec<(u64, u64)>,
     /// Instantiations and edges that matched the filter, before `limit`.
     pub matching_nodes: usize,
     pub matching_edges: usize,
+    /// Whether `limit` left out instantiations or edges.
     pub truncated: bool,
 }
 
@@ -261,7 +265,10 @@ impl InstantiationGraph {
             info: HashMap::new(),
             dropped: 0,
         };
-        let mut quantifiers: Vec<String> = Vec::new();
+        // Names and strategies are shared by every instantiation that has
+        // them, so a graph of many instantiations holds few strings.
+        let mut quantifiers: Vec<Arc<str>> = Vec::new();
+        let mut strategies: HashMap<&str, Arc<str>> = HashMap::new();
         let (mut started, mut finished) = (false, false);
         for line in lines.iter().map(|line| line.trim()).filter(|line| !line.is_empty()) {
             if line.starts_with("(error") {
@@ -297,8 +304,8 @@ impl InstantiationGraph {
                     // cvc5 prints every formula without a qid as `_`. Named by
                     // index, distinct formulas stay distinct quantifier nodes.
                     quantifiers.push(match name {
-                        "_" => format!("_unnamed_{index}"),
-                        _ => name.to_owned(),
+                        "_" => format!("_unnamed_{index}").into(),
+                        _ => name.into(),
                     });
                 }
                 "node" => {
@@ -322,7 +329,12 @@ impl InstantiationGraph {
                     graph.info.insert(
                         id,
                         InstInfo {
-                            strategy: Some(strategy.to_owned()),
+                            strategy: Some(
+                                strategies
+                                    .entry(strategy)
+                                    .or_insert_with(|| strategy.into())
+                                    .clone(),
+                            ),
                             round: number(round, line)?,
                             depth: number(depth, line)?,
                             term_depth: Some(number(term_depth, line)?),
@@ -385,7 +397,7 @@ impl InstantiationGraph {
     }
 
     fn name(&self, id: NodeId) -> &str {
-        self.names.get(&id).map(String::as_str).unwrap_or("_")
+        self.names.get(&id).map(|name| &**name).unwrap_or("_")
     }
 
     fn info(&self, id: NodeId) -> InstInfo {
@@ -400,7 +412,7 @@ impl InstantiationGraph {
             depth: info.depth,
             round: info.round,
             term_depth: info.term_depth,
-            strategy: info.strategy,
+            strategy: info.strategy.map(|strategy| strategy.to_string()),
             function: None,
             source_span: None,
         }
@@ -638,12 +650,14 @@ impl InstantiationGraph {
             })
             .collect();
         edges.sort();
+        let truncated = matching_nodes > limit || edges.len() > limit;
+        edges.truncate(limit);
         Subgraph {
             nodes: matching.into_iter().map(|node| self.node(node)).collect(),
             edges,
             matching_nodes,
             matching_edges,
-            truncated: matching_nodes > limit,
+            truncated,
         }
     }
 
@@ -658,7 +672,7 @@ impl InstantiationGraph {
             return Err(format!("no instantiation {to_inst} in the graph"));
         }
         if let Some(qid) = from_qid {
-            if !self.names.values().any(|name| name == qid) {
+            if !self.names.values().any(|name| &**name == qid) {
                 return Err(format!("no instantiation of {qid} in the graph"));
             }
         }
@@ -912,7 +926,7 @@ mod tests {
         let graph = graph();
         assert_eq!(graph.nodes.len(), 6);
         assert_eq!(graph.edges[&(0, 0)], HashSet::from([(1, 0), (5, 0)]));
-        assert_eq!(graph.names[&(0, 0)], "internal root");
+        assert_eq!(&*graph.names[&(0, 0)], "internal root");
         assert_eq!(graph.info[&(4, 0)].depth, 4);
         let summary = graph.summary();
         assert_eq!((summary.edges, summary.quantifiers, summary.rounds), (5, 3, 4));
@@ -935,8 +949,8 @@ mod tests {
         // they would form a self-loop and report a cycle that is not there.
         let text = "(instantiation-graph\n(quantifier 0 _)\n(quantifier 1 _)\n(node 0 0 X 1 0 0 ())\n(node 1 1 X 2 1 1 (0))\n(dropped 0)\n)";
         let graph = InstantiationGraph::from_live(&lines(text)).unwrap();
-        assert_eq!(graph.names[&(0, 0)], "_unnamed_0");
-        assert_eq!(graph.names[&(1, 0)], "_unnamed_1");
+        assert_eq!(&*graph.names[&(0, 0)], "_unnamed_0");
+        assert_eq!(&*graph.names[&(1, 0)], "_unnamed_1");
         assert!(graph.cycles(&GraphFilter::default(), 10).is_empty());
     }
 
@@ -1017,6 +1031,18 @@ mod tests {
         let insts: Vec<u64> = sub.nodes.iter().map(|n| n.inst).collect();
         assert_eq!(insts, [1, 2, 3]);
         assert_eq!(sub.edges, [(1, 2), (2, 3)]);
+        // Four instantiations, each a child of every earlier one: six edges,
+        // of which a limit of four lists four.
+        let dense = "(instantiation-graph\n(quantifier 0 q)\n(node 0 0 X 1 0 0 ())\n\
+            (node 1 0 X 2 1 0 (0))\n(node 2 0 X 3 2 0 (0 1))\n(node 3 0 X 4 3 0 (0 1 2))\n\
+            (dropped 0)\n)";
+        let graph = InstantiationGraph::from_live(&lines(dense)).unwrap();
+        let sub = graph.subgraph(&GraphFilter::default(), 4);
+        assert_eq!((sub.nodes.len(), sub.edges.len(), sub.matching_edges), (4, 4, 6));
+        assert!(sub.truncated);
+        // One strategy string, shared by all four.
+        let strategy = |i| graph.info[&(i, 0)].strategy.clone().unwrap();
+        assert!(Arc::ptr_eq(&strategy(0), &strategy(3)));
     }
 
     #[test]
