@@ -1255,11 +1255,7 @@ impl Verifier {
     }
 
     /// Resolve batch replies with the same owned metadata used by resident checks.
-    fn resolve_provenance(&mut self, global_ctx: &vir::context::GlobalCtx) {
-        let symbols = crate::provenance::Symbols::capture(
-            global_ctx,
-            global_ctx.air_source_names.borrow().clone(),
-        );
+    fn resolve_provenance(&mut self, symbols: &crate::provenance::Symbols) {
         for (fun, queries) in std::mem::take(&mut self.func_provenance) {
             let resolved = queries.into_iter().map(|query| symbols.resolve(&fun, query));
             self.func_details.entry(fun.clone()).or_default().provenance.extend(resolved);
@@ -1267,11 +1263,7 @@ impl Verifier {
     }
 
     /// Resolve batch matching-loop replies the same way as provenance.
-    fn resolve_matching_loops(&mut self, global_ctx: &vir::context::GlobalCtx) {
-        let symbols = crate::provenance::Symbols::capture(
-            global_ctx,
-            global_ctx.air_source_names.borrow().clone(),
-        );
+    fn resolve_matching_loops(&mut self, symbols: &crate::provenance::Symbols) {
         for (fun, queries) in std::mem::take(&mut self.func_matching_loops) {
             let resolved =
                 queries.into_iter().map(|query| symbols.resolve_matching_loops(&fun, query));
@@ -2769,13 +2761,19 @@ impl Verifier {
                 writeln!(file, "{:#?}", triggers).expect("error writing to trigger log file");
             }
         }
-        // Join the matching loops cvc5 reported back to source, per function
+        // Join the matching loops and provenance cvc5 reported back to source,
+        // per function, through one capture of the source metadata
+        let symbols = (self.args.matching_loops || self.args.provenance).then(|| {
+            crate::provenance::Symbols::capture(
+                &global_ctx,
+                global_ctx.air_source_names.borrow().clone(),
+            )
+        });
         if self.args.matching_loops {
-            self.resolve_matching_loops(&global_ctx);
+            self.resolve_matching_loops(symbols.as_ref().expect("symbols captured"));
         }
-        // Join the provenance cvc5 reported back to source, per function
         if self.args.provenance {
-            self.resolve_provenance(&global_ctx);
+            self.resolve_provenance(symbols.as_ref().expect("symbols captured"));
             if self.args.log_all {
                 let mut file = self.create_log_file(None, crate::config::PROVENANCE_FILE_SUFFIX)?;
                 let mut by_fun: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();

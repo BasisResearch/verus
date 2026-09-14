@@ -492,9 +492,14 @@ impl NameCtxt {
     /// A function application's head `symbol`, and how many of its leading
     /// arguments are type arguments (`typ_to_ids` of each, decoration and
     /// type id), so a source rendering can drop them: `s[i]` is emitted as
-    /// `(vstd!seq.Seq.index.? $ INT s i)`.
+    /// `(vstd!seq.Seq.index.? $ INT s i)`. Called at every call site; a head's
+    /// type arguments never change, so only the first call records it.
     pub(crate) fn record_source_function(&self, symbol: &str, fun: &Fun, type_args: usize) {
-        self.imp.borrow_mut().source_names.insert(
+        let mut imp = self.imp.borrow_mut();
+        if let Some(crate::air_names::SourceName::Function { .. }) = imp.source_names.get(symbol) {
+            return;
+        }
+        imp.source_names.insert(
             symbol.to_string(),
             crate::air_names::SourceName::Function {
                 name: source_name_of_path(&fun.path),

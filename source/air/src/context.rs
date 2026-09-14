@@ -110,7 +110,7 @@ pub struct MatchingLoop {
     pub fanout_per_step: f64,
     /// qids of the other quantifiers a step passed through
     pub via: Vec<String>,
-    /// the first trigger, one term per trigger term
+    /// the trigger whose matches formed the rungs, one term per trigger term
     pub trigger: Vec<String>,
     /// what each rung wraps around the previous one's growing subterm,
     /// generalised over the chain, `_0` marking that subterm; one per class

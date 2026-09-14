@@ -140,7 +140,7 @@ pub struct ResolvedMatchingLoop {
     /// rounds), or bounded. The depth is the solver's, so it counts the boxes
     /// `term_ladder` leaves out.
     pub growth_rate: String,
-    /// the quantifier's first trigger, in source spelling
+    /// the trigger whose matches formed the rungs, in source spelling
     pub trigger: String,
     /// every rung generalised, then every rung after the first, with `_n`
     /// where they differ: `f(_0)  →  f(g(_0))`
@@ -203,7 +203,8 @@ pub struct ResolvedQueryMatchingLoops {
     pub dropped: u64,
     /// whether the instantiation round limit stopped the check
     pub max_inst_rounds: bool,
-    /// most confident first
+    /// most confident first: the quantifiers the user wrote, or, when none of
+    /// them looped, the others that did
     pub loops: Vec<ResolvedMatchingLoop>,
     /// quantifiers the user did not write that climbed alongside the written
     /// loops but share a term with none of them in particular
@@ -569,6 +570,8 @@ impl Symbols {
         // written quantifier feeds them new terms. When a check has a written
         // loop, each of the others follows the written loops whose own terms
         // it shares; terms every written loop has (`(I 0)`) pick out none.
+        // When it has none, the others are its loops, so the check still
+        // shows what climbed.
         let written =
             |l: &ResolvedMatchingLoop| l.qid.starts_with(air::profiler::USER_QUANT_PREFIX);
         let (mut loops, riders): (Vec<_>, Vec<_>) = loops.into_iter().partition(written);
