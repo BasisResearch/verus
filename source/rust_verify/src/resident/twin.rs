@@ -99,6 +99,9 @@ pub(super) struct TwinRequest {
 /// The default and the most rows a reply lists.
 pub(super) const DEFAULT_TWIN_LIMIT: usize = 20;
 pub(super) const MAX_TWIN_LIMIT: usize = 200;
+/// The `:qid` of the fuel hypothesis a twin writes when it hides a function
+/// in a query that hid none.
+const TWIN_FUEL_QID: &str = "internal_twin_nondefault_fuel";
 /// A twin's rlimit may be at most this many times the query's.
 const MAX_RLIMIT_FACTOR: f32 = 16.0;
 
@@ -433,7 +436,7 @@ fn run_branch(
         ValidityResult::TypeError(error) => {
             return Err(BranchError::Refused(format!(
                 "the edited query does not type-check: {}",
-                error.to_string()
+                error
             )));
         }
         ValidityResult::UnexpectedOutput(error) => {
@@ -660,7 +663,7 @@ struct FuelTarget {
 /// `toydb!encoding.decode.?` -> `toydb::encoding::decode`.
 fn friendly_path(ident: &str) -> String {
     let ident = ident.trim_end_matches('?').trim_end_matches('.');
-    ident.replace('!', "::").replace('.', "::")
+    ident.replace(['!', '.'], "::")
 }
 
 fn find_fuel(journal: &QueryJournal, prefix: usize, function: &str) -> Result<FuelTarget, String> {
@@ -809,13 +812,17 @@ fn flip_fuel(query: &Query, target: &FuelTarget, fuel: u32) -> Result<(Query, Fu
         let mut disjuncts =
             vec![mk_eq(&fuel_bool, &str_apply(vir::def::FUEL_BOOL_DEFAULT, &vec![x_id.clone()]))];
         disjuncts.extend(hidden.iter().map(|h| mk_eq(&x_id, h)));
+        // A query that hid nothing asserted `fuel_defaults`, whose
+        // quantifier is the prelude's; the replacement gets a name of its own,
+        // so the instantiation delta shows the one stop and the other start.
         let qid = match &*axiom.expr {
             ExprX::Bind(bind, _) => match &**bind {
                 BindX::Quant(_, _, _, qid) => qid.clone(),
                 _ => None,
             },
             _ => None,
-        };
+        }
+        .or_else(|| Some(Arc::new(TWIN_FUEL_QID.to_owned())));
         let binders = Arc::new(vec![Arc::new(BinderX {
             name: id,
             a: Arc::new(TypX::Named(Arc::new(vir::def::FUEL_ID.to_owned()))),
