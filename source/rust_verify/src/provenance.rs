@@ -733,6 +733,30 @@ impl Symbols {
         }
     }
 
+    /// Why the quantifier the solver names `qid` exists, as the encoder that
+    /// emitted it said (`definition`, `requires`, ...).
+    pub(crate) fn quantifier_role(&self, qid: &str) -> Option<&'static str> {
+        self.quantifiers.get(qid).and_then(|q| q.role)
+    }
+
+    /// The tags of the axioms `path` states, as a broadcast lemma states
+    /// its axiom: the function named `path`, or ending in `::path`.
+    pub(crate) fn axiom_tags_owned_by(&self, path: &str) -> Vec<String> {
+        let path = path.trim().strip_prefix("crate::").unwrap_or(path.trim());
+        if path.is_empty() {
+            return Vec::new();
+        }
+        let suffix = format!("::{path}");
+        let mut tags: Vec<String> = self
+            .axiom_owners
+            .iter()
+            .filter(|(_, owner)| owner.as_str() == path || owner.ends_with(&suffix))
+            .map(|(tag, _)| tag.clone())
+            .collect();
+        tags.sort();
+        tags
+    }
+
     /// Every `:qid` owned at `path` or inside it, matching whole segments:
     /// `a::S` takes `a::S`, `a::S::f` and `a::S<int.>` but not `a::Seq`. The
     /// prelude's quantifiers belong to nothing and are never found.
@@ -878,7 +902,7 @@ impl Symbols {
     }
 
     /// Join one tag from a reply about one of `fun`'s queries back to source.
-    fn tag_of(&self, fun: &Fun, symbol: &str) -> ResolvedTag {
+    pub(crate) fn tag_of(&self, fun: &Fun, symbol: &str) -> ResolvedTag {
         let mut r =
             ResolvedTag { tag: symbol.to_string(), kind: String::new(), owner: None, span: None };
         match air::def::ProvenanceTag::from_symbol(symbol) {

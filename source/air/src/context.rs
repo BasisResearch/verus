@@ -285,6 +285,36 @@ pub struct InstPressure {
     pub unparsed: Option<String>,
 }
 
+/// What cvc5's `(get-info :branch-profile)` reported for one `check-sat`:
+/// the resource units it spent and, per quantifier, its instances split by
+/// the inference that sent them (e-matching, conflict-based, model-based,
+/// ...). A counterfactual twin compares two of these.
+#[derive(Debug, Clone, Default)]
+pub struct BranchProfile {
+    /// Resource units the check spent, preprocessing and search together.
+    pub resource_units: u64,
+    /// The per-check resource limit it ran under; 0 for none.
+    pub resource_limit: u64,
+    /// Instantiation rounds that sent lemmas.
+    pub rounds: u64,
+    /// Most instantiated first, keyed as `InstPressure` keys its rows.
+    pub quantifiers: Vec<QuantInferences>,
+    /// The reply, when it did not parse.
+    pub unparsed: Option<String>,
+}
+
+/// One quantifier's row of `(get-info :branch-profile)`.
+#[derive(Debug, Clone, Default)]
+pub struct QuantInferences {
+    /// The `:qid`, or a synthetic `quant_<n>` when `named` is false.
+    pub qid: String,
+    pub named: bool,
+    pub instantiations: u64,
+    /// cvc5's inference id (`QUANTIFIERS_INST_E_MATCHING`, ...) and how
+    /// many instances it sent; the counts sum to `instantiations`.
+    pub inferences: Vec<(String, u64)>,
+}
+
 /// One nonlinear term of `(get-info :nl-frontier)`.
 #[derive(Debug, Clone, Default)]
 pub struct NlAtom {
@@ -530,6 +560,11 @@ pub struct Context {
     /// The instantiation pressure of the last `check-sat`, until the caller
     /// takes it.
     pub(crate) last_inst_pressure: Option<InstPressure>,
+    /// Ask cvc5 for `(get-info :branch-profile)` after every `check-sat`.
+    /// Read-only: the search is unchanged.
+    pub(crate) branch_profile: bool,
+    /// The branch profile of the last `check-sat`, until the caller takes it.
+    pub(crate) last_branch_profile: Option<BranchProfile>,
     /// Whether this solver may save and restore instantiations across
     /// rechecks of a query (cvc5 only, fixed at launch).
     pub(crate) instantiation_replay: bool,
@@ -647,6 +682,8 @@ impl Context {
             egraph_focus: None,
             last_egraph: None,
             inject_equality: None,
+            branch_profile: false,
+            last_branch_profile: None,
             solver,
         };
         context.axiom_infos.push_scope(false);
@@ -794,6 +831,44 @@ impl Context {
     pub fn set_inst_pressure(&mut self, enabled: bool) {
         assert!(!enabled || matches!(self.solver, SmtSolver::Cvc5));
         self.inst_pressure = enabled;
+    }
+
+    /// The branch profile cvc5 reported for the most recent `check-sat`, if
+    /// it was asked; each call returns it once.
+    pub fn take_branch_profile(&mut self) -> Option<BranchProfile> {
+        self.last_branch_profile.take()
+    }
+
+    /// Ask for `(get-info :branch-profile)` after every `check-sat` (cvc5
+    /// only). It only reads counters, so the solver and its budget are
+    /// unchanged.
+    pub fn set_branch_profile(&mut self, enabled: bool) {
+        assert!(!enabled || matches!(self.solver, SmtSolver::Cvc5));
+        self.branch_profile = enabled;
+    }
+
+    /// Whether `(get-info :inst-pressure)` follows every `check-sat`.
+    pub fn inst_pressure(&self) -> bool {
+        self.inst_pressure
+    }
+
+    /// Whether this solver tracks difficulty (`set_difficulty`).
+    pub fn difficulty(&self) -> bool {
+        self.difficulty
+    }
+
+    /// How many `push`es the solver has open, as it counts them (cvc5's
+    /// `(get-info :assertion-stack-levels)`). Flushes. `None` before the
+    /// solver has started, or when the reply does not parse.
+    pub fn assertion_stack_levels(&mut self) -> Option<u64> {
+        if self.smt_process.is_none() {
+            return None;
+        }
+        self.smt_log.log_get_info("assertion-stack-levels");
+        let lines = self.flush_commands();
+        lines.iter().find_map(|line| {
+            line.strip_prefix("(:assertion-stack-levels ")?.strip_suffix(')')?.trim().parse().ok()
+        })
     }
 
     /// Turn provenance mode on (cvc5 only; must precede the first query).

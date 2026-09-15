@@ -13,6 +13,7 @@ pub mod profiler;
 pub mod remove_asserts;
 pub mod scope_map;
 pub mod smt_process;
+pub mod twin;
 
 #[macro_use]
 pub mod printer;

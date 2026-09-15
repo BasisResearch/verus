@@ -522,6 +522,339 @@ fn resident_bisect_localises_and_leaves_the_session_unchanged() {
     assert!(probes >= 10, "{}", probes);
 }
 
+const TWIN_SOURCE: &str = r#"
+use vstd::prelude::*;
+verus! {
+    uninterp spec fn a(i: int) -> int;
+    pub uninterp spec fn f(i: int) -> int;
+
+    pub broadcast proof fn f_nonneg(i: int)
+        ensures #[trigger] f(i) >= 0,
+    { admit(); }
+
+    spec fn sum(n: nat) -> nat
+        decreases n,
+    {
+        if n == 0 { 0 } else { n + sum((n - 1) as nat) }
+    }
+
+    // a(0) in the goal seeds the trigger, and each instance adds a(i + 1)
+    proof fn looping()
+        requires
+            forall|i: int| #[trigger] a(i) < a(i + 1),
+        ensures
+            a(0) > 100,
+    {
+    }
+
+    proof fn uses_lemma(x: int)
+        ensures f(x) >= 0,
+    {
+        broadcast use f_nonneg;
+    }
+
+    proof fn unprovable(x: int)
+        requires x > 0,
+    {
+        assert(x > 7);
+    }
+
+    proof fn needs_fuel()
+        ensures sum(3) == 6,
+    {
+    }
+
+    proof fn ordered(x: int)
+        requires x > 3,
+    {
+        assert(x > 5);
+        assert(x > 9);
+    }
+}
+"#;
+
+/// A twin changes one thing about a query, checks both in their own scopes,
+/// and reports how the solver's behaviour changed; the session is the same
+/// afterwards.
+#[test]
+fn resident_twin_compares_a_query_with_its_edit() {
+    let mut worker = Worker::start(TWIN_SOURCE, &["--rlimit", "2"]);
+    let ready = worker.receive();
+    let session = ready["session"].clone();
+    let twin = |worker: &mut Worker<ChildStdin>, name: &str, edit: Value, extra: Value| {
+        let mut request = json!({
+            "command": "twin", "session": session, "bucket": 0, "query": query_id(&ready, name),
+            "edit": edit,
+        });
+        request.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        worker.send(request)
+    };
+    let intact = |reply: &Value| {
+        let integrity = &reply["integrity"];
+        assert_eq!(integrity["intact"], true, "{reply}");
+        assert!(integrity["stack_levels_before"].is_u64(), "{}", reply);
+    };
+
+    // More budget for a matching loop: still out of budget, with more of the
+    // same instantiations.
+    let reply = twin(&mut worker, "::looping", json!({"bump_rlimit": 8}), json!({}));
+    assert_eq!(reply["event"], "twin", "{reply}");
+    assert_eq!(reply["edit"]["kind"], "bump_rlimit");
+    assert_eq!(reply["base"]["class"], "resource_limit", "{reply}");
+    assert_eq!(reply["twin"]["class"], "resource_limit", "{reply}");
+    assert_eq!(reply["outcome_flip"]["flipped"], false);
+    let delta = &reply["inst_count_delta"];
+    assert!(delta["total"].as_i64().unwrap() > 0, "{}", reply);
+    // the prelude's boxing axioms ride the loop; the loop's own quantifier
+    // is the one written in `looping`
+    let looping = delta["by_quantifier"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|q| q["fun"].as_str().is_some_and(|f| f.ends_with("::looping")))
+        .unwrap_or_else(|| panic!("{}", reply));
+    assert!(looping["qid"].as_str().unwrap().starts_with("user_"), "{}", reply);
+    assert!(looping["span"].as_str().unwrap().contains("fixture.rs"), "{}", reply);
+    let qid = looping["qid"].as_str().unwrap().to_owned();
+    // outside a difficulty session, the difficulty comparison is unavailable
+    assert!(reply["difficulty_delta"].is_null());
+    assert!(reply["unavailable"].to_string().contains("difficulty"), "{}", reply);
+    intact(&reply);
+
+    // Removing the looping quantifier, named by its qid: the budget is no
+    // longer spent, its instantiations are gone, and the verdict changes.
+    let reply =
+        twin(&mut worker, "::looping", json!({"remove_axiom": qid}), json!({"recheck_base": true}));
+    assert_eq!(reply["event"], "twin", "{reply}");
+    assert_eq!(reply["edit"]["axioms"][0]["place"], "query", "{reply}");
+    assert_eq!(reply["edit"]["axioms"][0]["tag"]["kind"], "requires", "{reply}");
+    assert_eq!(reply["outcome_flip"]["base"], "resource_limit", "{reply}");
+    assert_eq!(reply["outcome_flip"]["flipped"], true, "{reply}");
+    let delta = &reply["inst_count_delta"];
+    assert_eq!(delta["by_quantifier"][0]["qid"], qid.as_str(), "{reply}");
+    assert!(delta["by_quantifier"][0]["delta"].as_i64().unwrap() < 0, "{}", reply);
+    assert_eq!(delta["by_quantifier"][0]["twin"], 0, "{reply}");
+    assert!(delta["stopped"].as_array().unwrap().contains(&json!(qid)), "{}", reply);
+    let recheck = &reply["integrity"]["recheck"];
+    assert_eq!(recheck["same_result"], true, "{reply}");
+    intact(&reply);
+
+    // A module-level broadcast axiom, named by its function: the prefix is
+    // rebuilt without it, and the lemma's postcondition no longer follows.
+    let reply = twin(&mut worker, "::uses_lemma", json!({"remove_axiom": "f_nonneg"}), json!({}));
+    assert_eq!(reply["event"], "twin", "{reply}");
+    assert_eq!(reply["edit"]["axioms"][0]["place"], "prefix", "{reply}");
+    assert!(reply["edit"]["rebuilt_scopes"].as_u64().unwrap() >= 1, "{}", reply);
+    assert_eq!(reply["outcome_flip"]["base"], "valid", "{reply}");
+    assert_ne!(reply["outcome_flip"]["twin"], "valid", "{reply}");
+    intact(&reply);
+
+    // An added contradiction proves anything, and is flagged as vacuous.
+    let reply = twin(&mut worker, "::unprovable", json!({"add_axiom": "(= 1 2)"}), json!({}));
+    assert_eq!(reply["event"], "twin", "{reply}");
+    assert_eq!(reply["outcome_flip"]["twin"], "valid", "{reply}");
+    let vacuity = &reply["vacuity"];
+    // cvc5 answers a satisfiable context with quantifiers `unknown`
+    assert_ne!(vacuity["base_hypotheses"], "valid", "{reply}");
+    assert_eq!(vacuity["twin_hypotheses"], "valid", "{reply}");
+    assert_eq!(vacuity["inconsistent"], true, "{reply}");
+    assert_eq!(vacuity["possibly_vacuous"], true, "{reply}");
+    intact(&reply);
+    // A harmless one changes nothing and is not flagged.
+    let reply = twin(&mut worker, "::unprovable", json!({"add_axiom": "(= 1 1)"}), json!({}));
+    assert_eq!(reply["outcome_flip"]["flipped"], false, "{reply}");
+    assert_eq!(reply["vacuity"]["possibly_vacuous"], false, "{reply}");
+
+    // Fuel: sum(3) needs more unrolling than the default, and hiding the
+    // function takes away even what the default gives.
+    let reply = twin(
+        &mut worker,
+        "::needs_fuel",
+        json!({"flip_fuel": {"fn": "sum", "fuel": 4}}),
+        json!({}),
+    );
+    assert_eq!(reply["event"], "twin", "{reply}");
+    assert_eq!(reply["edit"]["fuel"]["recursive"], true, "{reply}");
+    assert_ne!(reply["outcome_flip"]["base"], "valid", "{reply}");
+    assert_eq!(reply["outcome_flip"]["twin"], "valid", "{reply}");
+    let reply = twin(
+        &mut worker,
+        "::needs_fuel",
+        json!({"flip_fuel": {"fn": "sum", "fuel": 0}}),
+        json!({}),
+    );
+    assert_ne!(reply["outcome_flip"]["twin"], "valid", "{reply}");
+
+    // Reordering two assertions changes which one fails first.
+    let checked = worker.send(
+        json!({"command": "check", "session": session, "bucket": 0, "query": query_id(&ready, "::ordered")}),
+    );
+    let first = checked["assert_id"].as_array().unwrap().clone();
+    let mut second = first.clone();
+    *second.last_mut().unwrap() = json!(first.last().unwrap().as_u64().unwrap() + 1);
+    let reply =
+        twin(&mut worker, "::ordered", json!({"reorder_asserts": [second, first]}), json!({}));
+    assert_eq!(reply["event"], "twin", "{reply}");
+    assert_eq!(reply["base"]["assert_id"], json!(first), "{reply}");
+    assert_eq!(reply["twin"]["assert_id"], json!(second), "{reply}");
+
+    // Refusals leave the session serving.
+    for (name, edit, extra) in [
+        ("::unprovable", json!({"remove_axiom": "no_such_axiom"}), json!({})),
+        ("::unprovable", json!({"bump_rlimit": 1000}), json!({})),
+        ("::unprovable", json!({"flip_fuel": {"fn": "no_such_fn", "fuel": 1}}), json!({})),
+        ("::unprovable", json!({"add_axiom": "(= no_such_symbol 1)"}), json!({})),
+        ("::unprovable", json!({"bump_rlimit": 4}), json!({"limit": 0})),
+    ] {
+        let reply = twin(&mut worker, name, edit, extra);
+        assert_eq!(reply["event"], "error", "{reply}");
+        assert_ne!(reply["message"], "invalid resident request", "{reply}");
+    }
+    // Two edits at once is not a request.
+    let reply = twin(
+        &mut worker,
+        "::unprovable",
+        json!({"bump_rlimit": 4, "remove_axiom": "x"}),
+        json!({}),
+    );
+    assert_eq!(reply["message"], "invalid resident request", "{reply}");
+
+    for (name, expected) in
+        [("::uses_lemma", "valid"), ("::unprovable", "invalid"), ("::needs_fuel", "invalid")]
+    {
+        let query = query_id(&ready, name);
+        let result = worker
+            .send(json!({"command": "check", "session": session, "bucket": 0, "query": query}));
+        assert_eq!(result["result"], expected, "{result}");
+    }
+    assert_eq!(worker.send(json!({"command": "close", "session": session}))["event"], "closed");
+    worker.finish(false);
+    for log in smt_logs(worker.dir.path()) {
+        assert_eq!(log.matches("(push").count(), log.matches("(pop").count());
+    }
+}
+
+/// Each function with an edit, next to the function with the same edit made
+/// in source.
+const DIFFERENTIAL_SOURCE: &str = r#"
+use vstd::prelude::*;
+verus! {
+    uninterp spec fn a(i: int) -> int;
+
+    spec fn sum(n: nat) -> nat
+        decreases n,
+    {
+        if n == 0 { 0 } else { n + sum((n - 1) as nat) }
+    }
+
+    proof fn with_loop(x: int)
+        requires
+            x > 3,
+            forall|i: int| #[trigger] a(i) < a(i + 1),
+        ensures
+            x > 2 && a(0) > 100,
+    {
+    }
+
+    proof fn without_loop(x: int)
+        requires
+            x > 3,
+        ensures
+            x > 2 && a(0) > 100,
+    {
+    }
+
+    proof fn default_fuel()
+        ensures sum(3) == 6,
+    {
+    }
+
+    proof fn revealed_fuel()
+        ensures sum(3) == 6,
+    {
+        reveal_with_fuel(sum, 4);
+    }
+}
+"#;
+
+/// The differential harness: a twin of `f` with an edit answers as the
+/// ordinary check of `g`, the same function with the edit made in source,
+/// and instantiates about as much. A twin of `g` that changes nothing
+/// (the same rlimit) measures how much two checks of one query differ.
+#[test]
+fn resident_twin_matches_the_edit_made_in_source() {
+    let mut worker = Worker::start(DIFFERENTIAL_SOURCE, &["--rlimit", "2"]);
+    let ready = worker.receive();
+    let session = ready["session"].clone();
+    let mut twin = |name: &str, edit: Value| {
+        let reply = worker.send(json!({
+            "command": "twin", "session": session, "bucket": 0, "query": query_id(&ready, name),
+            "edit": edit,
+        }));
+        assert_eq!(reply["event"], "twin", "{reply}");
+        assert_eq!(reply["integrity"]["intact"], true, "{reply}");
+        reply
+    };
+    let instantiations = |branch: &Value| branch["instantiations"].as_u64().unwrap();
+
+    // the loop quantifier, as a twin with more budget names it
+    let probe = twin("::with_loop", json!({"bump_rlimit": 4}));
+    let qid = probe["inst_count_delta"]["by_quantifier"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|q| q["fun"].as_str().is_some_and(|f| f.ends_with("::with_loop")))
+        .and_then(|q| q["qid"].as_str())
+        .unwrap_or_else(|| panic!("{}", probe))
+        .to_owned();
+    let removed = twin("::with_loop", json!({"remove_axiom": qid}));
+    let cold = twin("::without_loop", json!({"bump_rlimit": 2}));
+    for (edited, cold) in [(&removed, &cold)] {
+        assert_eq!(edited["twin"]["class"], cold["base"]["class"], "{edited}\n{cold}");
+        let (t, c) = (instantiations(&edited["twin"]), instantiations(&cold["base"]));
+        let noise = instantiations(&cold["base"]).abs_diff(instantiations(&cold["twin"]));
+        eprintln!("remove: twin {t} instantiations, source edit {c}, repeat noise {noise}");
+        assert!(t.abs_diff(c) <= 3 * noise + c / 4 + 10, "{}\n{}", edited, cold);
+    }
+
+    let fueled = twin("::default_fuel", json!({"flip_fuel": {"fn": "sum", "fuel": 4}}));
+    let cold = twin("::revealed_fuel", json!({"bump_rlimit": 2}));
+    assert_eq!(fueled["twin"]["class"], "valid", "{fueled}");
+    assert_eq!(cold["base"]["class"], "valid", "{cold}");
+    let (t, c) = (instantiations(&fueled["twin"]), instantiations(&cold["base"]));
+    let noise = instantiations(&cold["base"]).abs_diff(instantiations(&cold["twin"]));
+    eprintln!("fuel: twin {t} instantiations, source edit {c}, repeat noise {noise}");
+    assert!(t.abs_diff(c) <= 3 * noise + c / 4 + 10, "{}\n{}", fueled, cold);
+
+    assert_eq!(worker.send(json!({"command": "close", "session": session}))["event"], "closed");
+    worker.finish(false);
+}
+
+/// In a difficulty session a twin also compares each input assertion's
+/// difficulty and relevance.
+#[test]
+fn resident_twin_compares_difficulty_in_a_difficulty_session() {
+    let mut worker = Worker::start(TWIN_SOURCE, &["--rlimit", "2", "-V", "difficulty"]);
+    let ready = worker.receive();
+    assert_eq!(ready["difficulty"], true, "{ready}");
+    let reply = worker.send(json!({
+        "command": "twin", "session": ready["session"], "bucket": 0,
+        "query": query_id(&ready, "::uses_lemma"), "edit": {"remove_axiom": "f_nonneg"},
+    }));
+    assert_eq!(reply["event"], "twin", "{reply}");
+    let difficulty = &reply["difficulty_delta"];
+    assert!(difficulty["total"]["base"].is_u64(), "{}", reply);
+    let relevance = &reply["did_relevant_delta"];
+    assert!(relevance["basis"].is_string(), "{}", reply);
+    assert!(!reply["unavailable"].to_string().contains("difficulty"), "{}", reply);
+    assert_eq!(reply["integrity"]["intact"], true, "{reply}");
+    assert_eq!(
+        worker.send(json!({"command": "close", "session": ready["session"]}))["event"],
+        "closed"
+    );
+    worker.finish(false);
+}
+
 /// The variables `text` names with an assignment version, as `(name, version)`.
 fn versions_named(text: &str) -> Vec<(String, String)> {
     const MARK: &str = " (version ";
@@ -1480,7 +1813,11 @@ fn resident_ready_lists_the_requests_it_serves() {
         .iter()
         .map(|command| command.as_str().unwrap().to_owned())
         .collect();
-    assert_eq!(commands, ["list", "check", "bisect", "egraph", "close", "inst_graph"], "{ready}");
+    assert_eq!(
+        commands,
+        ["list", "check", "bisect", "egraph", "close", "inst_graph", "twin"],
+        "{ready}"
+    );
     // Each listed request parses: a stale session is refused as a session,
     // not as an unknown request, so the list cannot drift from `Request`.
     for command in &commands {
@@ -1494,6 +1831,9 @@ fn resident_ready_lists_the_requests_it_serves() {
             }
             "inst_graph" => {
                 json!({"command": command, "session": "stale", "bucket": 0, "query": 0, "op": "cycles"})
+            }
+            "twin" => {
+                json!({"command": command, "session": "stale", "bucket": 0, "query": 0, "edit": {"bump_rlimit": 2}})
             }
             _ => panic!("no request for {}", command),
         };

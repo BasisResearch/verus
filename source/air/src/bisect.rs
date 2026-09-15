@@ -166,7 +166,7 @@ struct Fact {
 /// Whether two expressions are the same term. Verus asserts and then assumes
 /// one expression, usually a temporary, so the cheap checks nearly always
 /// decide.
-fn same_expr(a: &Expr, b: &Expr) -> bool {
+pub(crate) fn same_expr(a: &Expr, b: &Expr) -> bool {
     Arc::ptr_eq(a, b)
         || match (&**a, &**b) {
             (ExprX::Var(x), ExprX::Var(y)) => x == y,

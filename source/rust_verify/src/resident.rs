@@ -34,6 +34,8 @@
 //! caller, and it is popped with the query's scope. Neither verdict is a
 //! `checked` one, and neither check saves a certificate.
 
+mod twin;
+
 use crate::buckets::BucketId;
 use crate::commands::{QueryOp, Style};
 use air::ast::{CommandX, Commands, Query};
@@ -128,6 +130,11 @@ impl QueryKind {
 /// follow the number of retained queries rather than the number of declaration
 /// batches, which is roughly the size of the pruned call graph.
 pub(crate) struct QueryJournal {
+    /// The bucket's context from before the journal began (fuel constants,
+    /// datatypes, function declarations, module-level broadcast groups).
+    /// Never replayed: it lives below every scope. Kept so a twin can find
+    /// what it declares.
+    base: Vec<Commands>,
     contexts: Vec<Vec<Commands>>,
     queries: Vec<RetainedQuery>,
     applied: usize,
@@ -141,7 +148,7 @@ pub(crate) struct QueryJournal {
 /// as it does a malformed one. Every `Request` variant belongs here, in the
 /// protocol's snake case, which `resident_ready_lists_the_requests_it_serves`
 /// checks by sending each one.
-const COMMANDS: &[&str] = &["list", "check", "bisect", "egraph", "close", "inst_graph"];
+const COMMANDS: &[&str] = &["list", "check", "bisect", "egraph", "close", "inst_graph", "twin"];
 
 #[derive(Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]
@@ -202,6 +209,21 @@ enum Request {
         to_inst: Option<u64>,
         /// How many items the answer lists at most: 1 to 1000, default 20.
         limit: Option<usize>,
+    },
+    /// Check the query and a copy of it with one edit, and compare the two
+    /// checks (see `twin`).
+    Twin {
+        session: String,
+        bucket: BucketIndex,
+        query: QueryId,
+        edit: twin::TwinEdit,
+        /// How many quantifiers and assertions the reply lists at most:
+        /// 1 to 200, default 20.
+        limit: Option<usize>,
+        /// Check the query once more after the twin and compare it with the
+        /// first check.
+        #[serde(default)]
+        recheck_base: bool,
     },
 }
 
@@ -596,6 +618,13 @@ enum Response<'a> {
         query: QueryId,
         #[serde(flatten)]
         outcome: Box<EgraphOutcome>,
+    },
+    Twin {
+        session: &'a str,
+        bucket: BucketIndex,
+        query: QueryId,
+        #[serde(flatten)]
+        report: Box<twin::TwinReport>,
     },
     Error {
         message: &'a str,
@@ -1437,7 +1466,19 @@ fn serve_egraph(
 
 impl QueryJournal {
     pub(crate) fn new() -> Self {
-        Self { contexts: Vec::new(), queries: Vec::new(), applied: 0, recorded_in_scope: false }
+        Self {
+            base: Vec::new(),
+            contexts: Vec::new(),
+            queries: Vec::new(),
+            applied: 0,
+            recorded_in_scope: false,
+        }
+    }
+
+    /// Keep the context the solver already holds below the journal's first
+    /// scope, for lookups only.
+    pub(crate) fn record_base(&mut self, batches: impl Iterator<Item = Commands>) {
+        self.base.extend(batches);
     }
 
     /// Retain the next declaration batch, opening a scope when one is needed.
@@ -1647,6 +1688,7 @@ impl Server {
                 | Request::Egraph { session: requested, .. }
                 | Request::Close { session: requested }
                 | Request::InstGraph { session: requested, .. }
+                | Request::Twin { session: requested, .. }
                     if requested != session =>
                 {
                     send(
@@ -1765,6 +1807,42 @@ impl Server {
                             },
                         )?,
                         Ok(Err(message)) => send(&mut output, &Response::Error { message })?,
+                        Err(error) => return fatal(&mut output, error),
+                    }
+                }
+                Request::Twin {
+                    bucket: bucket_id, query: id, edit, limit, recheck_base, ..
+                } => {
+                    let Some(bucket) = self.buckets.get(bucket_id.0) else {
+                        send(&mut output, &Response::Error { message: "unknown bucket" })?;
+                        continue;
+                    };
+                    if bucket.queries.get(id.0).is_none() {
+                        send(&mut output, &Response::Error { message: "unknown query" })?;
+                        continue;
+                    }
+                    let limit = limit.unwrap_or(twin::DEFAULT_TWIN_LIMIT);
+                    if limit == 0 || limit > twin::MAX_TWIN_LIMIT {
+                        send(
+                            &mut output,
+                            &Response::Error { message: "limit must be between 1 and 200" },
+                        )?;
+                        continue;
+                    }
+                    let request = twin::TwinRequest { edit, limit, recheck_base };
+                    match twin::serve(bucket, id, request, &set_rlimit) {
+                        Ok(Ok(report)) => send(
+                            &mut output,
+                            &Response::Twin {
+                                session,
+                                bucket: bucket_id,
+                                query: id,
+                                report: Box::new(report),
+                            },
+                        )?,
+                        Ok(Err(message)) => {
+                            send(&mut output, &Response::Error { message: &message })?
+                        }
                         Err(error) => return fatal(&mut output, error),
                     }
                 }
