@@ -917,14 +917,15 @@ impl Context {
         self.strategy_ladder
     }
 
-    /// Run the next query's first `check-sat` with one instantiation strategy
-    /// (`ematch`, `conflict`, `pool`, `enum` or `mbqi`; cvc5 only), `alone`
-    /// or alongside the default schedule. The options are set right before
-    /// that `check-sat` and set back right after it, so they apply to that
-    /// check alone, and `(get-info :strategy-rung)` is read in between
-    /// (`take_strategy_rung`). A strategy the solver has no module for runs
-    /// nothing; one launched without `set_strategy_ladder` has E-matching and
-    /// pools only.
+    /// Run the next `check_valid`'s first `check-sat` with one instantiation
+    /// strategy (`ematch`, `conflict`, `pool`, `enum` or `mbqi`; cvc5 only),
+    /// `alone` or alongside the default schedule. The options are set right
+    /// before that `check-sat` and set back right after it, so they apply to
+    /// that check alone, and `(get-info :strategy-rung)` is read in between
+    /// (`take_strategy_rung`). That `check_valid` consumes the setting
+    /// whether or not it reaches the solver, so a later check never inherits
+    /// it. A strategy the solver has no module for runs nothing; one launched
+    /// without `set_strategy_ladder` has E-matching and pools only.
     pub fn set_quant_strategy(&mut self, strategy: Option<&str>, alone: bool) {
         assert!(strategy.is_none() || matches!(self.solver, SmtSolver::Cvc5));
         self.quant_strategy = strategy.map(|strategy| (strategy.to_owned(), alone));
@@ -936,15 +937,17 @@ impl Context {
         self.last_strategy_rung.take()
     }
 
-    /// Ask cvc5 for `(get-info :strategy-rung)` outside any check, starting
-    /// it if needed, and flush whatever was queued before. `None` when the
-    /// solver does not know the key, as a cvc5 without `:quant-strategy`
-    /// would not: setting that option on one would fail the next check.
-    /// Read-only.
+    /// Ask cvc5 for `(get-info :strategy-rung)` between queries, starting the
+    /// context and the solver if needed, and flush whatever was queued
+    /// before. `None` when the solver does not know the key, as a cvc5
+    /// without `:quant-strategy` would not: setting that option on one would
+    /// fail the next check. Read-only. The `available` list is filled in by
+    /// the solver's first `check-sat`, so it is empty before one has run.
     pub fn probe_strategy_rung(&mut self) -> Option<StrategyRung> {
         if !matches!(self.solver, SmtSolver::Cvc5) {
             return None;
         }
+        self.ensure_started();
         self.get_smt_process();
         self.smt_log.log_get_info("strategy-rung");
         let lines = self.flush_commands();
@@ -1308,7 +1311,11 @@ impl Context {
         self.air_initial_log.log_query(query);
         let query = match crate::typecheck::check_query(self, query) {
             Ok(query) => query,
-            Err(err) => return ValidityResult::TypeError(err),
+            Err(err) => {
+                // This check's strategy, whether or not it reached the solver.
+                self.quant_strategy = None;
+                return ValidityResult::TypeError(err);
+            }
         };
         let (query, snapshots, local_vars, variable_versions) = crate::var_to_const::lower_query(
             &query,
@@ -1328,6 +1335,9 @@ impl Context {
             query_context.report_long_running,
         );
         self.check_valid_used = true;
+        // Taken by this check's check-sat; cleared here too for a check that
+        // stopped before one, so the strategy never reaches a later check.
+        self.quant_strategy = None;
 
         validity
     }

@@ -304,7 +304,7 @@ pub(crate) fn smt_check_assertion<'ctx>(
         ]));
     }
     // `quant-strategy` is not scoped by push/pop: it is set back to `all`
-    // below, after every answer, before anything else reaches the solver.
+    // as soon as this batch has run, before anything else reaches the solver.
     if let Some((strategy, alone)) = &quant_strategy {
         context.smt_log.log_set_option("quant-strategy", strategy);
         if !alone {
@@ -363,6 +363,16 @@ pub(crate) fn smt_check_assertion<'ctx>(
         commands_handle.wait()
     };
     context.time_smt_run += smt_run_start_time.elapsed();
+    // `quant-strategy` is not scoped by push/pop, and its check-sat has run:
+    // set it back now, queued ahead of whatever is sent next, so no later
+    // command or check runs under it, whatever this reply turns out to be
+    // (an unexpected line below returns before anything else is queued).
+    if let Some((_, alone)) = &quant_strategy {
+        context.smt_log.log_set_option("quant-strategy", "all");
+        if !alone {
+            context.smt_log.log_set_option("quant-strategy-alone", "true");
+        }
+    }
 
     #[derive(PartialEq, Eq)]
     enum SmtOutput {
@@ -449,14 +459,6 @@ pub(crate) fn smt_check_assertion<'ctx>(
         }
         SmtSolver::Cvc5 => {
             context.smt_log.log_set_option("reproducible-resource-limit", "0");
-            if let Some((_, alone)) = &quant_strategy {
-                // Queued ahead of whatever is sent next, so no later
-                // command or check runs under the strategy.
-                context.smt_log.log_set_option("quant-strategy", "all");
-                if !alone {
-                    context.smt_log.log_set_option("quant-strategy-alone", "true");
-                }
-            }
         }
     }
 
