@@ -292,6 +292,8 @@ pub struct StrategyRung {
     /// The strategy the check ran: `all`, `ematch`, `conflict`, `pool`,
     /// `enum` or `mbqi`.
     pub strategy: String,
+    /// Whether alone, rather than alongside the default schedule.
+    pub alone: bool,
     /// The ladder strategies the solver has a module for.
     pub available: Vec<String>,
     /// Instantiation rounds that sent lemmas.
@@ -559,9 +561,10 @@ pub struct Context {
     /// Whether this solver was launched with every quantifier instantiation
     /// strategy available to `quant_strategy` (cvc5 only, fixed at launch).
     pub(crate) strategy_ladder: bool,
-    /// The instantiation strategy the next `check-sat` runs alone; reset to
-    /// `all` right after it, whatever it answers (cvc5 only).
-    pub(crate) quant_strategy: Option<String>,
+    /// The instantiation strategy the next `check-sat` runs, and whether
+    /// alone rather than alongside the default schedule; reset right after
+    /// it, whatever it answers (cvc5 only).
+    pub(crate) quant_strategy: Option<(String, bool)>,
     /// What the last `check-sat` run under `quant_strategy` reported, until
     /// the caller takes it.
     pub(crate) last_strategy_rung: Option<StrategyRung>,
@@ -915,15 +918,16 @@ impl Context {
     }
 
     /// Run the next query's first `check-sat` with one instantiation strategy
-    /// alone (`ematch`, `conflict`, `pool`, `enum` or `mbqi`; cvc5 only). The
-    /// option is set right before that `check-sat` and set back to `all`
-    /// right after it, so it applies to that check alone, and
-    /// `(get-info :strategy-rung)` is read in between (`take_strategy_rung`).
-    /// A strategy the solver has no module for runs nothing; one launched
-    /// without `set_strategy_ladder` has E-matching and pools only.
-    pub fn set_quant_strategy(&mut self, strategy: Option<&str>) {
+    /// (`ematch`, `conflict`, `pool`, `enum` or `mbqi`; cvc5 only), `alone`
+    /// or alongside the default schedule. The options are set right before
+    /// that `check-sat` and set back right after it, so they apply to that
+    /// check alone, and `(get-info :strategy-rung)` is read in between
+    /// (`take_strategy_rung`). A strategy the solver has no module for runs
+    /// nothing; one launched without `set_strategy_ladder` has E-matching and
+    /// pools only.
+    pub fn set_quant_strategy(&mut self, strategy: Option<&str>, alone: bool) {
         assert!(strategy.is_none() || matches!(self.solver, SmtSolver::Cvc5));
-        self.quant_strategy = strategy.map(str::to_owned);
+        self.quant_strategy = strategy.map(|strategy| (strategy.to_owned(), alone));
     }
 
     /// What the most recent `check-sat` run under `set_quant_strategy`

@@ -1571,12 +1571,13 @@ fn resident_strategy_ladder_finds_a_strategy_and_pins_it() {
     for name in after_winner {
         assert_eq!(rung(&ladder, name)["verdict"], "not_run", "{ladder}");
     }
-    assert_eq!(ladder["pinned"], solved.as_str(), "{ladder}");
+    assert_eq!(ladder["pinned"], json!({"rung": solved, "alongside": false}), "{ladder}");
 
     // The pinned rung closes the recheck before the full schedule runs.
     let pinned = worker.send(check.clone());
     assert_eq!(pinned["result"], "valid", "{pinned}");
     assert_eq!(pinned["pinned"]["rung"], solved.as_str(), "{pinned}");
+    assert_eq!(pinned["pinned"]["alongside"], false, "{pinned}");
     assert_eq!(pinned["pinned"]["closed"], true, "{pinned}");
 
     // An empty ladder removes the pin, and the default schedule answers as
@@ -1596,6 +1597,26 @@ fn resident_strategy_ladder_finds_a_strategy_and_pins_it() {
     assert_eq!(rung(&all, "pool")["verdict"], "unknown", "{all}");
     assert_eq!(rung(&all, "enum")["rlimit"], 5.0, "{all}");
     assert!(all["pinned"].is_null(), "{all}");
+
+    // Alongside E-matching the default rungs are the three the schedule
+    // lacks; the pin records how its rung ran, and the recheck runs it so.
+    let alongside = worker.send(json!({"command":"ladder", "session":session, "bucket":0,
+        "query":untriggered, "alongside":true}));
+    assert_eq!(alongside["alongside"], true, "{alongside}");
+    let names: Vec<&Value> =
+        alongside["rungs"].as_array().unwrap().iter().map(|rung| &rung["rung"]).collect();
+    assert_eq!(names, [&json!("conflict"), &json!("enum"), &json!("mbqi")], "{alongside}");
+    let alongside_solved =
+        alongside["solved_by"].as_str().unwrap_or_else(|| panic!("{alongside}")).to_owned();
+    assert_eq!(
+        alongside["pinned"],
+        json!({"rung": alongside_solved, "alongside": true}),
+        "{alongside}"
+    );
+    let rechecked = worker.send(check.clone());
+    assert_eq!(rechecked["result"], "valid", "{rechecked}");
+    assert_eq!(rechecked["pinned"]["alongside"], true, "{rechecked}");
+    assert_eq!(rechecked["pinned"]["closed"], true, "{rechecked}");
 
     // A query E-matching proves is solved on the first rung.
     let triggered = worker.send(json!({"command":"ladder", "session":session, "bucket":0,

@@ -305,8 +305,11 @@ pub(crate) fn smt_check_assertion<'ctx>(
     }
     // `quant-strategy` is not scoped by push/pop: it is set back to `all`
     // below, after every answer, before anything else reaches the solver.
-    if let Some(strategy) = &quant_strategy {
+    if let Some((strategy, alone)) = &quant_strategy {
         context.smt_log.log_set_option("quant-strategy", strategy);
+        if !alone {
+            context.smt_log.log_set_option("quant-strategy-alone", "false");
+        }
     }
     context.smt_log.log_word("check-sat");
     if context.difficulty {
@@ -446,10 +449,13 @@ pub(crate) fn smt_check_assertion<'ctx>(
         }
         SmtSolver::Cvc5 => {
             context.smt_log.log_set_option("reproducible-resource-limit", "0");
-            if quant_strategy.is_some() {
+            if let Some((_, alone)) = &quant_strategy {
                 // Queued ahead of whatever is sent next, so no later
                 // command or check runs under the strategy.
                 context.smt_log.log_set_option("quant-strategy", "all");
+                if !alone {
+                    context.smt_log.log_set_option("quant-strategy-alone", "true");
+                }
             }
         }
     }
@@ -958,8 +964,8 @@ pub(crate) fn parse_inst_pressure(line: &str) -> crate::context::InstPressure {
     out
 }
 
-/// Parse cvc5's `(:strategy-rung (:strategy S :available (S ...) :rounds R
-/// :resource-units U :instantiations (:S N ...)))`. Unknown keys are
+/// Parse cvc5's `(:strategy-rung (:strategy S :alone B :available (S ...)
+/// :rounds R :resource-units U :instantiations (:S N ...)))`. Unknown keys are
 /// skipped; a reply that does not parse is kept whole in `unparsed`.
 pub(crate) fn parse_strategy_rung(line: &str) -> crate::context::StrategyRung {
     use sise::TreeNode;
@@ -990,6 +996,9 @@ pub(crate) fn parse_strategy_rung(line: &str) -> crate::context::StrategyRung {
         match pair {
             [TreeNode::Atom(k), TreeNode::Atom(v)] if k == ":strategy" => {
                 out.strategy = v.clone();
+            }
+            [TreeNode::Atom(k), TreeNode::Atom(v)] if k == ":alone" => {
+                out.alone = v == "true";
             }
             [TreeNode::Atom(k), TreeNode::List(names)] if k == ":available" => {
                 out.available = atoms(names);
@@ -1865,24 +1874,25 @@ mod strategy_rung_tests {
     #[test]
     fn strategy_rung_reply_parses_counts_and_refusals() {
         let rung = parse_strategy_rung(
-            "(:strategy-rung (:strategy enum :available (ematch conflict pool enum mbqi) \
-             :rounds 2 :resource-units 640 :instantiations (:ematch 0 :conflict 0 :pool 0 \
-             :enum 34 :mbqi 0 :other 1)))",
+            "(:strategy-rung (:strategy enum :alone false :available (ematch conflict pool \
+             enum mbqi) :rounds 2 :resource-units 640 :instantiations (:ematch 3 :conflict 0 \
+             :pool 0 :enum 34 :mbqi 0 :other 1)))",
         );
-        assert!(rung.unparsed.is_none(), "{rung:?}");
-        assert_eq!(rung.strategy, "enum");
+        assert!(rung.unparsed.is_none(), "{:?}", rung);
+        assert_eq!((rung.strategy.as_str(), rung.alone), ("enum", false));
         assert_eq!(rung.available, ["ematch", "conflict", "pool", "enum", "mbqi"]);
         assert_eq!((rung.rounds, rung.resource_units), (2, 640));
         assert!(rung.instantiations.contains(&("enum".to_owned(), 34)));
         assert!(rung.instantiations.contains(&("other".to_owned(), 1)));
         // Before any check: nothing available, the strategy as set.
         let idle = parse_strategy_rung(
-            "(:strategy-rung (:strategy all :available () :rounds 0 :resource-units 0 \
-             :instantiations (:ematch 0 :conflict 0 :pool 0 :enum 0 :mbqi 0 :other 0)))",
+            "(:strategy-rung (:strategy all :alone true :available () :rounds 0 \
+             :resource-units 0 :instantiations (:ematch 0 :conflict 0 :pool 0 :enum 0 :mbqi 0 \
+             :other 0)))",
         );
-        assert!(idle.unparsed.is_none() && idle.available.is_empty(), "{idle:?}");
+        assert!(idle.unparsed.is_none() && idle.available.is_empty() && idle.alone, "{:?}", idle);
         for line in ["unsupported", "(:strategy-rung ())", "(:strategy-rung"] {
-            assert!(parse_strategy_rung(line).unparsed.is_some(), "{line}");
+            assert!(parse_strategy_rung(line).unparsed.is_some(), "{}", line);
         }
     }
 }

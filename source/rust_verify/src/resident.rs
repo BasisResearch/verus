@@ -203,14 +203,16 @@ enum Request {
         /// How many items the answer lists at most: 1 to 1000, default 20.
         limit: Option<usize>,
     },
-    /// Check the query once per instantiation strategy, each alone (see
-    /// `serve_ladder`), and pin the first that proves it.
+    /// Check the query once per instantiation strategy, each alone or
+    /// alongside the default schedule (see `serve_ladder`), and pin the
+    /// first that proves it.
     Ladder {
         session: String,
         bucket: BucketIndex,
         query: QueryId,
         /// The rungs to try, in order, each at most once. Default: every
-        /// rung, in `Rung::LADDER` order. An empty list runs nothing.
+        /// rung, in `Rung::LADDER` order, or `Rung::ALONGSIDE` alongside. An
+        /// empty list runs nothing.
         rungs: Option<Vec<Rung>>,
         /// A rung's rlimit, in `#[verifier::rlimit]` units, above 0 and at
         /// most `MAX_RUNG_RLIMIT`. Default: the query's own.
@@ -219,6 +221,10 @@ enum Request {
         /// Try the rungs after the first that proves the query too.
         #[serde(default)]
         run_all: bool,
+        /// Run each rung's strategy alongside the default schedule rather
+        /// than alone.
+        #[serde(default)]
+        alongside: bool,
         /// Pin the first rung that proved the query, or remove the pin when
         /// none did. Default true; false leaves the pin as it was.
         pin: Option<bool>,
@@ -520,7 +526,7 @@ pub(crate) struct Server {
     graphs: KeptGraphs,
     /// (bucket, query) -> the rung its checks try first, as its last ladder
     /// request found.
-    pins: HashMap<(usize, usize), Rung>,
+    pins: HashMap<(usize, usize), Pin>,
 }
 
 /// What a session reports about the invocation behind it, and the settings a
@@ -669,7 +675,7 @@ enum QueryResult {
 }
 
 /// One of cvc5's quantifier instantiation strategies, which a ladder request
-/// runs alone (`:quant-strategy`).
+/// runs alone or alongside the default schedule (`:quant-strategy`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum Rung {
@@ -685,6 +691,10 @@ impl Rung {
     /// strategies Verus's schedule leaves off or has nothing for, roughly by
     /// the effort each spends.
     const LADDER: [Rung; 5] = [Rung::Ematch, Rung::Conflict, Rung::Pool, Rung::Enum, Rung::Mbqi];
+
+    /// Alongside the default schedule, E-matching and pools are the schedule
+    /// itself, so only these add anything.
+    const ALONGSIDE: [Rung; 3] = [Rung::Conflict, Rung::Enum, Rung::Mbqi];
 
     /// The `:quant-strategy` value, which cvc5's replies also name it by.
     fn name(self) -> &'static str {
@@ -702,12 +712,21 @@ impl Rung {
 /// `#[verifier::rlimit]` units.
 const MAX_RUNG_RLIMIT: f32 = 1000.0;
 
-/// A pinned rung's attempt: `closed` when that strategy alone proved the
-/// query, otherwise the verdict comes from the ordinary check that followed.
-/// `elapsed_ms` is the attempt alone and is part of the check's.
+/// The rung a query's checks try first, run as the ladder that found it ran
+/// it: alone, or alongside the default schedule.
+#[derive(Clone, Copy, Serialize)]
+struct Pin {
+    rung: Rung,
+    alongside: bool,
+}
+
+/// A pinned rung's attempt: `closed` when that strategy, run as pinned,
+/// proved the query, otherwise the verdict comes from the ordinary check that
+/// followed. `elapsed_ms` is the attempt alone and is part of the check's.
 #[derive(Clone, Copy, Serialize)]
 struct PinnedAttempt {
     rung: Rung,
+    alongside: bool,
     closed: bool,
     elapsed_ms: u128,
     /// cvc5 resource units the attempt spent, when cvc5 said.
@@ -717,8 +736,9 @@ struct PinnedAttempt {
 /// The reply to a ladder request.
 #[derive(Serialize)]
 struct LadderReport {
-    /// The first rung, in the order tried, whose strategy alone proved the
-    /// query.
+    /// Whether each rung ran alongside the default schedule, not alone.
+    alongside: bool,
+    /// The first rung, in the order tried, whose strategy proved the query.
     solved_by: Option<Rung>,
     /// One per requested rung, in the order requested.
     rungs: Vec<RungReport>,
@@ -726,14 +746,14 @@ struct LadderReport {
     /// without the strategy ladder has E-matching and pools only.
     available: Vec<String>,
     /// The rung this query's checks try first, after this request.
-    pinned: Option<Rung>,
+    pinned: Option<Pin>,
     elapsed_ms: u128,
     restore_ms: u128,
 }
 
-/// What one rung's check answered. The rung ran its strategy without the
-/// others, so this says what that strategy does alone, not what it adds to
-/// the default schedule.
+/// What one rung's check answered. Alone, the rung ran its strategy without
+/// the others, so this says what that strategy does by itself, not what it
+/// adds to the default schedule; alongside, it says the latter.
 #[derive(Serialize)]
 struct RungReport {
     rung: Rung,
@@ -1586,13 +1606,15 @@ fn serve_egraph(
     Ok(Ok(EgraphOutcome { before, summary, equalities, injection }))
 }
 
-/// Check `query` once with `rung`'s strategy alone, at `rlimit`, and pop its
-/// scope. The option is set back to `all` right after the check-sat,
-/// whatever it answered (see `Context::set_quant_strategy`).
+/// Check `query` once with `rung`'s strategy, `alone` or alongside the
+/// default schedule, at `rlimit`, and pop its scope. The options are set back
+/// right after the check-sat, whatever it answered (see
+/// `Context::set_quant_strategy`).
 fn ladder_rung(
     air: &mut Context,
     query: &RetainedQuery,
     rung: Rung,
+    alone: bool,
     rlimit: f32,
     set_rlimit: &impl Fn(&mut Context, f32),
 ) -> io::Result<RungReport> {
@@ -1601,7 +1623,7 @@ fn ladder_rung(
         0 => None,
         budget => Some(u64::from(budget)),
     };
-    air.set_quant_strategy(Some(rung.name()));
+    air.set_quant_strategy(Some(rung.name()), alone);
     let start = Instant::now();
     let outcome = air.check_valid(
         &VirMessageInterface {},
@@ -1611,7 +1633,7 @@ fn ladder_rung(
     );
     let elapsed_ms = start.elapsed().as_millis();
     // Cleared by the check-sat; this covers a check that stopped before one.
-    air.set_quant_strategy(None);
+    air.set_quant_strategy(None, true);
     let info = air.take_strategy_rung();
     let unknown = air.take_unknown_reason();
     drop(air.take_provenance());
@@ -1653,18 +1675,19 @@ fn ladder_rung(
 }
 
 /// Serve a ladder request for one query of `bucket`, whose address the
-/// caller has checked. Each rung checks the query with its strategy alone,
-/// at its own budget, in the order given, until one proves the query or,
-/// with `run_all`, through every rung. Each check runs in the query's own
-/// scope and resets the strategy after itself, so the session's later checks
-/// are unchanged. `Ok(Err(_))` is a refusal to report; `Err` ends the
-/// session.
+/// caller has checked. Each rung checks the query with its strategy alone or,
+/// with `alongside`, together with the default schedule, at its own budget,
+/// in the order given, until one proves the query or, with `run_all`,
+/// through every rung. Each check runs in the query's own scope and resets
+/// the strategy after itself, so the session's later checks are unchanged.
+/// `Ok(Err(_))` is a refusal to report; `Err` ends the session.
 fn serve_ladder(
     bucket: &RetainedBucket,
     id: QueryId,
     rungs: &[Rung],
     budgets: &HashMap<Rung, f32>,
     run_all: bool,
+    alongside: bool,
     set_rlimit: &impl Fn(&mut Context, f32),
 ) -> io::Result<Result<LadderReport, &'static str>> {
     let mut state =
@@ -1696,7 +1719,7 @@ fn serve_ladder(
             reports.push(RungReport::skipped(rung, "unavailable"));
         } else {
             let rlimit = budgets.get(&rung).copied().unwrap_or(query.rlimit);
-            let report = ladder_rung(air, query, rung, rlimit, set_rlimit)?;
+            let report = ladder_rung(air, query, rung, !alongside, rlimit, set_rlimit)?;
             if report.verdict == "valid" && solved_by.is_none() {
                 solved_by = Some(rung);
             }
@@ -1705,6 +1728,7 @@ fn serve_ladder(
     }
     set_rlimit(air, query.rlimit);
     Ok(Ok(LadderReport {
+        alongside,
         solved_by,
         rungs: reports,
         available: probe.available,
@@ -2060,6 +2084,7 @@ impl Server {
                     rungs,
                     budgets,
                     run_all,
+                    alongside,
                     pin,
                     ..
                 } => {
@@ -2071,7 +2096,9 @@ impl Server {
                         send(&mut output, &Response::Error { message: "unknown query" })?;
                         continue;
                     }
-                    let rungs = rungs.unwrap_or_else(|| Rung::LADDER.to_vec());
+                    let rungs = rungs.unwrap_or_else(|| {
+                        if alongside { Rung::ALONGSIDE.to_vec() } else { Rung::LADDER.to_vec() }
+                    });
                     if rungs.iter().enumerate().any(|(i, rung)| rungs[..i].contains(rung)) {
                         send(
                             &mut output,
@@ -2089,12 +2116,22 @@ impl Server {
                         )?;
                         continue;
                     }
-                    match serve_ladder(bucket, id, &rungs, &budgets, run_all, &set_rlimit) {
+                    match serve_ladder(
+                        bucket,
+                        id,
+                        &rungs,
+                        &budgets,
+                        run_all,
+                        alongside,
+                        &set_rlimit,
+                    ) {
                         Ok(Ok(mut report)) => {
                             let key = (bucket_id.0, id.0);
                             if pin.unwrap_or(true) {
                                 match report.solved_by {
-                                    Some(rung) => drop(self.pins.insert(key, rung)),
+                                    Some(rung) => {
+                                        drop(self.pins.insert(key, Pin { rung, alongside }))
+                                    }
                                     None => drop(self.pins.remove(&key)),
                                 }
                             }
@@ -2213,24 +2250,25 @@ impl Server {
                         });
                     }
                     // Then the pinned rung, when a ladder request pinned one:
-                    // its strategy alone, at the query's own budget. It
-                    // changes which instances are tried, never what is
-                    // asserted, so a valid answer is sound. Any other answer
-                    // is discarded, with its diagnostics, before the ordinary
-                    // check, which runs the full schedule.
+                    // its strategy, alone or alongside as the ladder ran it,
+                    // at the query's own budget. It changes which instances
+                    // are tried, never what is asserted, so a valid answer
+                    // is sound. Any other answer is discarded, with its
+                    // diagnostics, before the ordinary check, which runs the
+                    // full schedule.
                     let mut pinned = None;
-                    if let Some(&rung) =
+                    if let Some(&pin) =
                         self.pins.get(&(bucket_id.0, id.0)).filter(|_| certified.is_none())
                     {
                         let attempt_start = Instant::now();
-                        air.set_quant_strategy(Some(rung.name()));
+                        air.set_quant_strategy(Some(pin.rung.name()), !pin.alongside);
                         let attempt = air.check_valid(
                             &VirMessageInterface {},
                             &QueryDiagnostics::default(),
                             &query.query,
                             QueryContext::default(),
                         );
-                        air.set_quant_strategy(None);
+                        air.set_quant_strategy(None, true);
                         let resource_units =
                             air.take_strategy_rung().map(|info| info.resource_units);
                         drop(air.take_provenance());
@@ -2251,7 +2289,8 @@ impl Server {
                             _ => air.finish_query(),
                         }
                         pinned = Some(PinnedAttempt {
-                            rung,
+                            rung: pin.rung,
+                            alongside: pin.alongside,
                             closed: certified.is_some(),
                             elapsed_ms: attempt_start.elapsed().as_millis(),
                             resource_units,
