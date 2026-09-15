@@ -1965,11 +1965,15 @@ impl Verifier {
 
                             let mut spinoff_journal = (retain_queries && do_spinoff)
                                 .then(crate::resident::QueryJournal::new);
-                            // A spinoff solver starts from the whole bucket
-                            // context so far, below its journal's scopes.
+                            // A spinoff solver starts from the bucket's
+                            // initial batches, below its journal's scopes; the
+                            // context ops after them go into its journal
+                            // (`new_air_context_with_bucket_context`).
                             if let Some(journal) = &mut spinoff_journal {
                                 journal.record_base(
-                                    bucket_context.iter().map(|batch| batch.commands.clone()),
+                                    bucket_context[..initial_batches]
+                                        .iter()
+                                        .map(|batch| batch.commands.clone()),
                                 );
                             }
 

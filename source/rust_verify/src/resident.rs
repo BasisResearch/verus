@@ -40,9 +40,12 @@
 //! the prefix asserted again in a scope of the ablation's own, each axiom a
 //! function or broadcast group owns guarded by that group's switch. After the
 //! search, vacuity probes ask goal by goal, last goal first, whether the
-//! assumptions are contradictory where that goal is checked, and the witness
-//! is checked once more the ordinary way with its removed axioms never asserted. Every scope is popped
-//! before the reply; the next request restores its own prefix.
+//! assumptions are contradictory where that goal is checked, and for a
+//! vacuous goal whether every goal is, with the contradiction already there
+//! before the first goal of every path. The witness is checked once more the
+//! ordinary way, with
+//! its removed axioms never asserted. Every scope is popped before the reply;
+//! the next request restores its own prefix.
 
 mod twin;
 
@@ -1226,7 +1229,10 @@ struct AblationVerdict {
 /// probes with one goal replaced by `false` and the other goals switched
 /// off, where `valid` means no path reaches that goal consistently, so the
 /// goal is proved vacuously. Goals are probed last first, up to
-/// `MAX_VACUITY_GOAL_CHECKS` per configuration.
+/// `MAX_VACUITY_GOAL_CHECKS` per configuration, and the scan stops at the
+/// first probe that runs out of resources. With quantifiers in the context
+/// the solver can rarely show assumptions consistent, so `unknown` is the
+/// usual answer when no contradiction was found.
 #[derive(Serialize)]
 struct Vacuity {
     /// Nothing removed: `valid` when some goal's assumptions are
@@ -1242,9 +1248,20 @@ struct Vacuity {
     /// `participated` is about), else the one found with nothing removed.
     #[serde(skip_serializing_if = "Option::is_none")]
     goal: Option<AblationGoal>,
+    /// With a vacuous `goal`, the same configuration with every goal `false`
+    /// at once, which counts only the first goal on each path: `valid` when
+    /// the assumptions before the first goal of every path contradict, so
+    /// every goal is vacuous, as when the requires or the broadcast lemmas
+    /// in use contradict each other. Otherwise the contradiction was not
+    /// found without what the vacuous goal's path adds: a branch condition
+    /// that cannot hold (as in a proof by contradiction), an `assume`, or a
+    /// called lemma's `ensures`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    every_goal: Option<ProbeVerdict>,
     /// Goals in the query.
     goals: usize,
-    /// Goals no vacuity probe reached when none was found vacuous.
+    /// Goals no vacuity probe reached when none was found vacuous: past the
+    /// cap, or after a probe that ran out of resources.
     #[serde(skip_serializing_if = "is_zero")]
     goals_unchecked: u64,
     /// For a vacuous load-bearing set, the members whose removal alone makes
@@ -1349,7 +1366,8 @@ struct VacuityScan {
     answer: air::bisect::Answer,
     /// The goal whose assumptions are contradictory.
     goal: Option<usize>,
-    /// Goals not probed, past `MAX_VACUITY_GOAL_CHECKS`.
+    /// Goals not probed, past `MAX_VACUITY_GOAL_CHECKS` or after a probe
+    /// that ran out of resources.
     unchecked: usize,
 }
 
@@ -1358,7 +1376,9 @@ struct VacuityScan {
 /// every other goal switched off, so an earlier goal reaches it only as the
 /// fact it leaves. `goals` is the order to probe in, last goal first:
 /// assumptions accumulate along a path, so a later goal is the likelier to
-/// see a contradiction. Stops at the first goal whose probe is `valid`.
+/// see a contradiction. Stops at the first goal whose probe is `valid`, and
+/// at the first that runs out of resources: the goals before it rarely fare
+/// better under the same budget, and each probe can cost the whole budget.
 /// Without goals, one probe asks about the assumptions alone.
 fn scan_vacuity(
     prober: &mut air::bisect::Prober<'_>,
@@ -1395,6 +1415,10 @@ fn scan_vacuity(
         if answer == Answer::Valid {
             return Ok(VacuityScan { answer, goal: Some(goal), unchecked: 0 });
         }
+        if answer.class() == "resource_limit" {
+            let unchecked = goals.len() - n - 1;
+            return Ok(VacuityScan { answer, goal: None, unchecked });
+        }
         if answer != Answer::Invalid && unknown.is_none() {
             unknown = Some(answer);
         }
@@ -1426,15 +1450,22 @@ fn ablate(
         .map_err(|error| io::Error::other(error.to_string()))?;
     let units = prober.units().to_vec();
     let count = units.len();
-    let no_candidate =
-        |&&i: &&usize| i >= count || matches!(units[i].kind, UnitKind::Goal | UnitKind::Fact);
+    let no_candidate = |&&i: &&usize| {
+        i >= count
+            || match units[i].kind {
+                UnitKind::Axiom => false,
+                UnitKind::Hypothesis => !request.hypotheses,
+                UnitKind::Goal | UnitKind::Fact => true,
+            }
+    };
     if let Some(index) = request.exclude.iter().find(no_candidate) {
         // A bad request, not a failure of the session.
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!(
                 "exclude names unit {index}, which is no candidate: the query has {count} \
-                 units, and its goals and facts are never switched"
+                 units, its goals and facts are never switched, and its hypotheses are not \
+                 with hypotheses: false"
             ),
         ));
     }
@@ -1541,6 +1572,24 @@ fn ablate(
         }
         vacuity_witness = Some(scan);
     }
+    // Where a goal is vacuous, whether every goal is: every goal false at
+    // once counts only the first goal on each path, so this is valid only
+    // when the contradiction is there before any path's first goal.
+    let vacuous_config = match &vacuity_witness {
+        Some(scan) if scan.answer == Answer::Valid => witness_removed.clone(),
+        _ if vacuity_before.answer == Answer::Valid => Some(Vec::new()),
+        _ => None,
+    };
+    let every_goal = match vacuous_config {
+        // with one goal, the scan's probe was this one
+        Some(_) if goals.len() == 1 => Some(Answer::Valid),
+        Some(removed) => {
+            let answer = prober.probe_vacuity(&mask(&removed)).map_err(io::Error::other)?;
+            extra_checks += 1;
+            Some(answer)
+        }
+        None => None,
+    };
     drop(prober);
 
     let absence_check = match &witness_removed {
@@ -1643,6 +1692,7 @@ fn ablate(
             witness: vacuity_witness.as_ref().map(|scan| (&scan.answer).into()),
             vacuous,
             goal: goal.map(describe_goal),
+            every_goal: every_goal.as_ref().map(ProbeVerdict::from),
             goals: goals.len(),
             goals_unchecked: if vacuous {
                 0
