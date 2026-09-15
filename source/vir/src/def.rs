@@ -136,6 +136,9 @@ pub const FUEL_PARAM: &str = "fuel%";
 pub const FUEL_BOOL: &str = "fuel_bool";
 pub const FUEL_BOOL_DEFAULT: &str = "fuel_bool_default";
 pub const FUEL_DEFAULTS: &str = "fuel_defaults";
+/// Ends the `axiom_owners` entry of a datatype's resolve axiom, whose owner
+/// is the datatype, not a function or broadcast group.
+pub const RESOLVE_AXIOM_OWNER_SUFFIX: &str = " (resolve axiom)";
 pub const RETURN_VALUE: &str = "%return";
 pub const DEFAULT_ENSURES: &str = "default_ensures";
 pub const U_HI: &str = "uHi";

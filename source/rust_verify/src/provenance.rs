@@ -892,6 +892,15 @@ impl Symbols {
         self.function_spans.get(name).map(String::as_str)
     }
 
+    /// The broadcast lemma or broadcast group that states the axiom `tag`
+    /// tags. The encoder tags three kinds of axiom: those two, and a
+    /// datatype's resolve axiom, which is the encoding's own.
+    pub(crate) fn broadcast_owner(&self, tag: &air::def::ProvenanceTag) -> Option<&str> {
+        let air::def::ProvenanceTag::Axiom(_) = tag else { return None };
+        let owner = self.axiom_owners.get(&tag.to_symbol())?;
+        (!owner.ends_with(vir::def::RESOLVE_AXIOM_OWNER_SUFFIX)).then_some(owner.as_str())
+    }
+
     /// The group an ablation switches a declaration-prefix axiom in: the
     /// function or broadcast group that owns it, by its tag or else by its
     /// quantifier's `:qid`. `None` for the encoding's own axioms (datatypes,
@@ -904,9 +913,7 @@ impl Symbols {
     /// those are not the function's.
     pub(crate) fn axiom_group(&self, axiom: &air::ast::Axiom) -> Option<&str> {
         if let Some(tag @ air::def::ProvenanceTag::Axiom(_)) = &axiom.tag {
-            if let Some(owner) = self.axiom_owners.get(&tag.to_symbol()) {
-                return Some(owner);
-            }
+            return self.broadcast_owner(tag);
         }
         let qid = air::bisect::axiom_qid(&axiom.expr)?;
         let q = self.quantifiers.get(&*qid)?;
@@ -917,8 +924,9 @@ impl Symbols {
         owned.then_some(q.fun.as_str())
     }
 
-    /// The role of the quantifier `qid` names (`definition`, `broadcast`,
-    /// ...), when the encoder recorded one.
+    /// The role of the quantifier `qid` names (`definition`,
+    /// `definition_unfold`, `return_type_invariant`, ...), when the encoder
+    /// recorded one.
     pub(crate) fn quantifier_role(&self, qid: &str) -> Option<&'static str> {
         self.quantifiers.get(qid).and_then(|q| q.role)
     }
@@ -1651,5 +1659,83 @@ mod tests {
         assert!(!is_idle_axiom(&[tag("axiom", None), tag("requires", None)], 0, None));
         // a row without tags is listed rather than lost in the count
         assert!(!is_idle_axiom(&[], 0, None));
+    }
+
+    #[test]
+    fn ablation_groups_only_a_function_or_broadcast_axiom() {
+        use air::def::ProvenanceTag;
+        use std::sync::Arc;
+        let quantifier = |fun: &str, span: Option<&str>, role: Option<&'static str>| Quantifier {
+            fun: fun.to_owned(),
+            span: span.map(str::to_owned),
+            tag: None,
+            role,
+            type_binders: Vec::new(),
+        };
+        let lemma = ProvenanceTag::Axiom(Arc::new("crate!lemma.".to_owned()));
+        let resolve = ProvenanceTag::Axiom(Arc::new("crate!P.resolved".to_owned()));
+        let symbols = Symbols {
+            hypotheses: HashMap::new(),
+            quantifiers: HashMap::from([
+                (
+                    "internal_crate__area_definition".to_owned(),
+                    quantifier("crate::area", None, Some("definition")),
+                ),
+                ("internal_crate__area_box".to_owned(), quantifier("crate::area", None, None)),
+                (
+                    "user_crate__lemma_0".to_owned(),
+                    quantifier("crate::lemma", Some("src/a.rs:9:5: 9:40 (#0)"), None),
+                ),
+            ]),
+            axiom_owners: HashMap::from([
+                (lemma.to_symbol(), "crate::lemma".to_owned()),
+                (resolve.to_symbol(), format!("crate::P{}", vir::def::RESOLVE_AXIOM_OWNER_SUFFIX)),
+            ]),
+            internal_qid_owners: HashMap::new(),
+            source_names: HashMap::new(),
+            function_spans: HashMap::new(),
+            crate_name: "crate".to_owned(),
+        };
+        let forall = |qid: Option<&str>| -> air::ast::Expr {
+            let x = Arc::new(air::ast::BinderX {
+                name: Arc::new("x".to_owned()),
+                a: Arc::new(air::ast::TypX::Int),
+            });
+            let bind = air::ast::BindX::Quant(
+                air::ast::Quant::Forall,
+                Arc::new(vec![x]),
+                Arc::new(Vec::new()),
+                qid.map(|qid| Arc::new(qid.to_owned())),
+            );
+            Arc::new(air::ast::ExprX::Bind(Arc::new(bind), air::ast_util::mk_true()))
+        };
+        let axiom = |tag: Option<ProvenanceTag>, expr: air::ast::Expr| air::ast::Axiom {
+            named: None,
+            tag,
+            expr,
+        };
+        let group = |axiom: &air::ast::Axiom| symbols.axiom_group(axiom).map(str::to_owned);
+        // a broadcast lemma, by its tag
+        let user = forall(Some("user_crate__lemma_0"));
+        assert_eq!(
+            group(&axiom(Some(lemma.clone()), user.clone())),
+            Some("crate::lemma".to_owned())
+        );
+        // a datatype's resolve axiom is tagged too, but is the encoding's
+        assert_eq!(group(&axiom(Some(resolve.clone()), forall(None))), None);
+        assert_eq!(symbols.broadcast_owner(&resolve), None);
+        // a definition, plain or fuel-guarded
+        let definition = forall(Some("internal_crate__area_definition"));
+        assert_eq!(group(&axiom(None, definition.clone())), Some("crate::area".to_owned()));
+        let guarded = air::ast_util::mk_implies(&air::ast_util::str_var("fuel_bool"), &definition);
+        assert_eq!(group(&axiom(None, guarded)), Some("crate::area".to_owned()));
+        // a quantifier the user wrote, even untagged
+        assert_eq!(group(&axiom(None, user)), Some("crate::lemma".to_owned()));
+        // the encoding's own: made while encoding `area` but with no role, or
+        // not in the table at all (prelude, fuel defaults, no qid)
+        assert_eq!(group(&axiom(None, forall(Some("internal_crate__area_box")))), None);
+        assert_eq!(group(&axiom(None, forall(Some("prelude_box_unbox_int")))), None);
+        assert_eq!(group(&axiom(None, forall(Some("fuel_defaults")))), None);
+        assert_eq!(group(&axiom(None, forall(None))), None);
     }
 }
