@@ -522,6 +522,305 @@ fn resident_bisect_localises_and_leaves_the_session_unchanged() {
     assert!(probes >= 10, "{}", probes);
 }
 
+const ABLATE_SOURCE: &str = r#"
+use vstd::prelude::*;
+verus! {
+    pub uninterp spec fn h(x: int) -> int;
+    pub uninterp spec fn g(x: int) -> int;
+
+    pub broadcast proof fn h_pos(x: int)
+        ensures #[trigger] h(x) > 0,
+    { admit(); }
+
+    pub broadcast proof fn h_neg(x: int)
+        ensures #[trigger] h(x) < 0,
+    { admit(); }
+
+    // every instance makes two new terms that trigger it again
+    pub broadcast proof fn g_splits(x: int)
+        ensures #[trigger] g(x) == g(2 * x) + g(2 * x + 1),
+    { admit(); }
+
+    pub uninterp spec fn c(n: int, x: int) -> int;
+
+    spec fn double(x: int) -> int { x + x }
+    spec fn quad(x: int) -> int { double(double(x)) }
+
+    proof fn quad_is_four(x: int)
+        requires
+            x > 0,
+    {
+        assert(quad(x) == x + x + x + x);
+    }
+
+    proof fn contradictory(x: int) {
+        broadcast use h_pos, h_neg;
+        assert(h(x) == 7);
+    }
+
+    // needs ten rounds of instantiation, and the loop lemma outruns them
+    proof fn buried(x: int)
+        requires
+            forall|n: int, x: int| 0 <= n < 10 ==> #[trigger] c(n, x) > c(n + 1, x),
+            forall|x: int| #[trigger] c(10, x) >= x,
+            g(x) == 0,
+    {
+        broadcast use g_splits;
+        assert(c(0, x) >= x + 10);
+    }
+
+    // two goals behind the same loop
+    proof fn twice_buried(x: int)
+        requires
+            forall|n: int, x: int| 0 <= n < 10 ==> #[trigger] c(n, x) > c(n + 1, x),
+            forall|x: int| #[trigger] c(10, x) >= x,
+            g(x) == 0,
+    {
+        broadcast use g_splits;
+        assert(c(0, x) >= x + 10);
+        assert(c(1, x) >= x + 9);
+    }
+}
+"#;
+
+/// `fixture.rs:<line>:` for the ablation fixture.
+fn ablate_span_of(needle: &str) -> String {
+    let line = ABLATE_SOURCE.lines().position(|l| l.contains(needle)).unwrap() + 1;
+    format!("fixture.rs:{line}:")
+}
+
+/// Ablation names the broadcast lemma behind a matching loop, the
+/// definitions a proof needs, and a contradictory pair of lemmas, confirms
+/// each witness with its axioms genuinely absent, and leaves the retained
+/// solver as it was.
+#[test]
+fn resident_ablation_finds_witnesses_and_leaves_the_session_unchanged() {
+    let mut worker = Worker::start(ABLATE_SOURCE, &["--rlimit", "2"]);
+    let ready = worker.receive();
+    let session = ready["session"].clone();
+    let check = |name: &str| -> Value {
+        json!({"command": "check", "session": session, "bucket": 0, "query": query_id(&ready, name)})
+    };
+    let ablate_request = |name: &str, extra: Value| -> Value {
+        let mut request = json!({
+            "command": "ablate", "session": session, "bucket": 0, "query": query_id(&ready, name),
+        });
+        request.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        request
+    };
+    macro_rules! ablate {
+        ($name:expr, $extra:expr) => {{
+            let reply = worker.send(ablate_request($name, $extra));
+            assert_eq!(reply["event"], "ablated", "{reply}");
+            reply
+        }};
+    }
+    let names = |reply: &Value| -> Vec<String> {
+        reply["witness"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|unit| unit["name"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    let before: Vec<Value> = ["::quad_is_four", "::contradictory", "::buried"]
+        .iter()
+        .map(|name| worker.send(check(name))["result"].clone())
+        .collect();
+    assert_eq!(before[0], "valid");
+    assert_eq!(before[1], "valid");
+    assert_ne!(before[2], "valid", "the matching loop should hide the proof");
+
+    // A healthy proof needs exactly the two definitions it unfolds.
+    let reply = ablate!("::quad_is_four", json!({"mode": "auto"}));
+    assert_eq!(reply["mode"], "load_bearing", "{reply}");
+    assert_eq!(reply["result"], "load_bearing_set", "{reply}");
+    assert_eq!(reply["minimal"], true, "{reply}");
+    // The two definitions, and the query's fuel setting that switches them on.
+    let groups: Vec<&Value> = reply["witness"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|unit| unit["kind"] == "axiom_group")
+        .collect();
+    let mut kept: Vec<&str> = groups.iter().map(|unit| unit["name"].as_str().unwrap()).collect();
+    kept.sort();
+    assert!(
+        kept.len() == 2 && kept[0].ends_with("::double") && kept[1].ends_with("::quad"),
+        "{}",
+        reply
+    );
+    for unit in groups {
+        assert!(unit["span"].as_str().unwrap().contains("fixture.rs:"), "{}", unit);
+        assert_eq!(unit["axioms"], 1, "{unit}");
+        assert_eq!(unit["roles"], json!(["definition"]), "{unit}");
+    }
+    for unit in reply["witness"].as_array().unwrap() {
+        if unit["kind"] == "hypothesis" {
+            assert_eq!(unit["name"], "fuel", "{unit}");
+        }
+    }
+    assert_eq!(reply["vacuity"]["vacuous"], false, "{reply}");
+    assert_eq!(reply["absence_check"]["result"], "valid", "{reply}");
+    assert_eq!(reply["absence_check"]["agrees"], true, "{reply}");
+    assert!(reply["switched_axioms"].as_u64().unwrap() < reply["prefix_axioms"].as_u64().unwrap());
+    let fuel_index = reply["witness"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|unit| unit["kind"] == "hypothesis")
+        .map(|unit| unit["index"].clone())
+        .unwrap_or_else(|| panic!("the fuel setting is load-bearing: {}", reply));
+
+    // Nothing to remove from a valid query.
+    let reply = ablate!("::quad_is_four", json!({"mode": "minimal_removal"}));
+    assert_eq!(reply["status"], "already_at_target", "{reply}");
+    assert_eq!(reply["result"], "none");
+
+    // With the hypotheses off limits, only axiom groups are candidates, and
+    // the fuel setting stays: the two definitions alone are load-bearing.
+    let reply = ablate!("::quad_is_four", json!({"mode": "load_bearing", "hypotheses": false}));
+    assert_eq!(reply["result"], "load_bearing_set", "{reply}");
+    assert_eq!(reply["candidates"], reply["axiom_groups"], "{reply}");
+    let mut kept = names(&reply);
+    kept.sort();
+    assert_eq!(kept.len(), 2, "{reply}");
+    assert!(kept[0].ends_with("::double") && kept[1].ends_with("::quad"), "{}", reply);
+    for unit in reply["witness"].as_array().unwrap() {
+        assert_eq!(unit["kind"], "axiom_group", "{unit}");
+    }
+    // A hypothesis is then no candidate, so excluding one is refused.
+    let refused = worker.send(ablate_request(
+        "::quad_is_four",
+        json!({"mode": "load_bearing", "hypotheses": false, "exclude": [fuel_index]}),
+    ));
+    assert_eq!(refused["event"], "error", "{refused}");
+
+    // Two contradictory lemmas prove anything: the proof is vacuous, and both
+    // take part in the contradiction.
+    let reply = ablate!("::contradictory", json!({"mode": "auto"}));
+    assert_eq!(reply["result"], "load_bearing_set", "{reply}");
+    let kept = names(&reply);
+    for lemma in ["::h_pos", "::h_neg"] {
+        assert!(kept.iter().any(|name| name.ends_with(lemma)), "{}: {}", lemma, reply);
+    }
+    for unit in reply["witness"].as_array().unwrap() {
+        if unit["kind"] == "axiom_group" {
+            // the lemma's group also defines its `ens%` predicate; the
+            // role is the lemma's
+            assert_eq!(unit["roles"], json!(["broadcast"]), "{unit}");
+        }
+    }
+    assert_eq!(reply["vacuity"]["vacuous"], true, "{reply}");
+    assert_eq!(reply["vacuity"]["before"]["result"], "valid", "{reply}");
+    // The lemmas contradict before any path is taken: every goal is vacuous.
+    assert_eq!(reply["vacuity"]["every_goal"]["result"], "valid", "{reply}");
+    let participated = reply["vacuity"]["participated"].as_array().unwrap();
+    for unit in reply["witness"].as_array().unwrap() {
+        if unit["kind"] == "axiom_group" {
+            assert!(participated.contains(&unit["index"]), "{}: {}", unit, reply);
+        }
+    }
+    assert_eq!(reply["absence_check"]["agrees"], true, "{reply}");
+
+    // The loop lemma hides a proof that needs a dozen rounds of unfolding:
+    // removing it alone makes the query valid, and it is not a vacuity.
+    // Removing every candidate loses the proof too, so the search tries one
+    // unit at a time, most instantiated first: the loop lemma comes first.
+    let reply = ablate!("::buried", json!({"mode": "auto"}));
+    assert_eq!(reply["non_monotone"], true, "{reply}");
+    assert!(reply["checks_used"].as_u64().unwrap() <= 5, "{}", reply);
+    assert_eq!(reply["mode"], "minimal_removal", "{reply}");
+    assert_eq!(reply["result"], "minimal_removal_that_proves", "{reply}");
+    assert_ne!(reply["verdict_before"]["result"], "valid", "{reply}");
+    assert_eq!(reply["verdict_with_witness"]["result"], "valid", "{reply}");
+    let removed = reply["witness"].as_array().unwrap();
+    assert_eq!(removed.len(), 1, "{reply}");
+    assert_eq!(removed[0]["kind"], "axiom_group", "{reply}");
+    assert!(removed[0]["name"].as_str().unwrap().ends_with("::g_splits"), "{}", reply);
+    assert_eq!(removed[0]["roles"], json!(["broadcast"]), "{reply}");
+    let span = removed[0]["span"].as_str().unwrap();
+    assert!(span.contains(&ablate_span_of("fn g_splits")), "{}", reply);
+    assert!(removed[0]["instantiations_before"].as_u64().unwrap() > 0, "{}", reply);
+    assert_eq!(reply["vacuity"]["vacuous"], false, "{reply}");
+    assert_eq!(reply["absence_check"]["result"], "valid", "{reply}");
+    assert_eq!(reply["absence_check"]["agrees"], true, "{reply}");
+    let used = reply["checks_used"].as_u64().unwrap();
+    assert!(used <= reply["budget_checks"].as_u64().unwrap(), "{}", reply);
+    // Every candidate is named, by the index the probes use.
+    let named = reply["candidate_units"].as_array().unwrap();
+    assert_eq!(named.len() as u64, reply["candidates"].as_u64().unwrap(), "{reply}");
+    let loop_index = removed[0]["index"].clone();
+    assert!(
+        named.iter().any(|unit| unit["index"] == loop_index && unit["name"] == removed[0]["name"])
+    );
+    let candidates = reply["candidates"].as_u64().unwrap();
+
+    // Excluded, the loop lemma is no candidate: it is neither tried nor
+    // named, whatever else the search finds within its budget.
+    let reply = ablate!(
+        "::buried",
+        json!({"mode": "minimal_removal", "budget_checks": 4, "exclude": [loop_index]})
+    );
+    assert_eq!(reply["excluded"], json!([loop_index]), "{reply}");
+    assert_eq!(reply["candidates"].as_u64().unwrap(), candidates - 1, "{reply}");
+    let named = reply["candidate_units"].as_array().unwrap();
+    assert!(named.iter().all(|unit| unit["index"] != loop_index), "{}", reply);
+    let witness = reply["witness"].as_array().unwrap();
+    assert!(witness.iter().all(|unit| unit["index"] != loop_index), "{}", reply);
+    for probe in reply["probes"].as_array().unwrap() {
+        assert!(!probe["removed_units"].as_array().unwrap().contains(&loop_index), "{}", reply);
+    }
+    // A unit the query does not have is refused without ending the session.
+    let refused =
+        worker.send(ablate_request("::buried", json!({"mode": "auto", "exclude": [999]})));
+    assert_eq!(refused["event"], "error", "{refused}");
+
+    // A budget of one probe goes to the probe with nothing removed. The
+    // vacuity probes, one per goal, are extra; there is no witness to check
+    // for absence.
+    let reply = ablate!("::buried", json!({"mode": "minimal_removal", "budget_checks": 1}));
+    assert_eq!(reply["status"], "budget_exhausted", "{reply}");
+    assert_eq!(reply["result"], "none", "{reply}");
+    assert_eq!(reply["checks_used"], 1, "{reply}");
+    assert_eq!(reply["extra_checks"], reply["vacuity"]["goals"], "{reply}");
+    assert!(reply["absence_check"].is_null(), "{}", reply);
+    assert!(reply["witness"].as_array().unwrap().is_empty(), "{}", reply);
+
+    // Two goals behind the loop: the vacuity probe of the last runs out of
+    // resources, and the scan stops there rather than spend the budget on
+    // the first as well.
+    let reply = ablate!("::twice_buried", json!({"mode": "minimal_removal", "budget_checks": 1}));
+    let vacuity = &reply["vacuity"];
+    let goals = vacuity["goals"].as_u64().unwrap();
+    assert!(goals >= 2, "{}", reply);
+    assert_eq!(vacuity["before"]["result"], "unknown", "{reply}");
+    assert!(
+        matches!(vacuity["before"]["reason"].as_str(), Some("resourceout" | "timeout")),
+        "{}",
+        reply
+    );
+    assert_eq!(vacuity["goals_unchecked"], goals - 1, "{reply}");
+    assert_eq!(reply["extra_checks"], 1, "{reply}");
+
+    // Bad requests are refused without ending the session.
+    let refused = worker.send(json!({"command": "ablate", "session": session, "bucket": 0,
+        "query": query_id(&ready, "::buried"), "mode": "auto", "budget_checks": 0}));
+    assert_eq!(refused["event"], "error", "{refused}");
+
+    // Ordinary rechecks answer as before.
+    for (name, expected) in
+        ["::quad_is_four", "::contradictory", "::buried"].iter().zip(before.iter())
+    {
+        assert_eq!(&worker.send(check(name))["result"], expected, "{name}");
+    }
+    assert_eq!(worker.send(json!({"command": "close", "session": session}))["event"], "closed");
+    worker.finish(false);
+    for log in smt_logs(worker.dir.path()) {
+        assert_eq!(log.matches("(push").count(), log.matches("(pop").count());
+    }
+}
+
 const TWIN_SOURCE: &str = r#"
 use vstd::prelude::*;
 verus! {
@@ -833,6 +1132,90 @@ fn resident_twin_compares_a_query_with_its_edit() {
     }
 }
 
+/// Ablation in a provenance session, where every asserted axiom carries a
+/// `:named` tag and the solver dumps instantiations after each check, and in
+/// a spinoff-all session, where the query has a solver of its own: the same
+/// witness, and rechecks answer as before.
+#[test]
+fn resident_ablation_works_under_provenance_and_spinoff() {
+    for mode in ["provenance", "spinoff-all"] {
+        let mut worker = Worker::start(ABLATE_SOURCE, &["--rlimit", "2", "-V", mode]);
+        let ready = worker.receive();
+        let session = ready["session"].clone();
+        let check = |name: &str| -> Value {
+            json!({"command": "check", "session": session, "bucket": 0, "query": query_id(&ready, name)})
+        };
+        let before = worker.send(check("::buried"))["result"].clone();
+        assert_ne!(before, "valid", "{}: the matching loop should hide the proof", mode);
+        let reply = worker.send(json!({
+            "command": "ablate", "session": session, "bucket": 0,
+            "query": query_id(&ready, "::buried"), "mode": "auto",
+        }));
+        assert_eq!(reply["event"], "ablated", "{mode}: {reply}");
+        assert_eq!(reply["result"], "minimal_removal_that_proves", "{mode}: {reply}");
+        let removed = reply["witness"].as_array().unwrap();
+        assert_eq!(removed.len(), 1, "{mode}: {reply}");
+        assert!(
+            removed[0]["name"].as_str().unwrap().ends_with("::g_splits"),
+            "{}: {}",
+            mode,
+            reply
+        );
+        assert_eq!(reply["absence_check"]["agrees"], true, "{mode}: {reply}");
+        assert_eq!(worker.send(check("::buried"))["result"], before, "{mode}");
+        assert_eq!(worker.send(check("::quad_is_four"))["result"], "valid", "{mode}");
+        assert_eq!(worker.send(json!({"command": "close", "session": session}))["event"], "closed");
+        worker.finish(false);
+        for log in smt_logs(worker.dir.path()) {
+            let head: Vec<&str> = log.lines().take(12).collect();
+            assert_eq!(
+                log.matches("(push").count(),
+                log.matches("(pop").count(),
+                "{mode}: {head:?}"
+            );
+        }
+    }
+}
+
+const VACUITY_SOURCE: &str = r#"
+use vstd::prelude::*;
+verus! {
+    proof fn bad(x: int)
+        requires
+            x > 0,
+        ensures
+            false,
+    { admit(); }
+
+    // the contradiction arrives after the first goal, bad's precondition
+    proof fn late(x: int)
+        requires
+            x > 0,
+    {
+        bad(x);
+        assert(x == x + 1);
+    }
+
+    proof fn consistent(x: int)
+        requires
+            x > 0,
+    {
+        assert(x > 0);
+        assert(x >= 1);
+    }
+
+    // the requires contradict each other before any path is taken
+    proof fn impossible(x: int)
+        requires
+            x > 0,
+            x < 0,
+    {
+        assert(x == 7);
+        assert(x == 8);
+    }
+}
+"#;
+
 /// Each function with an edit, next to the function with the same edit made
 /// in source.
 const DIFFERENTIAL_SOURCE: &str = r#"
@@ -875,6 +1258,78 @@ verus! {
     }
 }
 "#;
+
+/// A contradiction a lemma's ensures brings in after the first goal makes a
+/// later goal vacuous: ablation names that goal, and the lemma's contract as
+/// what the contradiction needs.
+#[test]
+fn resident_ablation_finds_a_contradiction_after_the_first_goal() {
+    let mut worker = Worker::start(VACUITY_SOURCE, &[]);
+    let ready = worker.receive();
+    let session = ready["session"].clone();
+    let request = |name: &str, extra: Value| -> Value {
+        let mut request = json!({
+            "command": "ablate", "session": session, "bucket": 0, "query": query_id(&ready, name),
+            "mode": "auto",
+        });
+        request.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        request
+    };
+
+    let reply = worker.send(request("::late", json!({})));
+    assert_eq!(reply["event"], "ablated", "{reply}");
+    assert_eq!(reply["result"], "load_bearing_set", "{reply}");
+    let vacuity = &reply["vacuity"];
+    assert_eq!(vacuity["vacuous"], true, "{reply}");
+    assert_eq!(vacuity["before"]["result"], "valid", "{reply}");
+    assert!(vacuity["goals"].as_u64().unwrap() >= 2, "{}", reply);
+    let line = VACUITY_SOURCE.lines().position(|l| l.contains("assert(x == x + 1)")).unwrap() + 1;
+    let span = vacuity["goal"]["span"].as_str().unwrap();
+    assert!(span.contains(&format!("fixture.rs:{line}:")), "{}", reply);
+    // Not every goal is vacuous: the path brings the contradiction in.
+    assert!(vacuity["every_goal"].is_object(), "{}", reply);
+    assert_ne!(vacuity["every_goal"]["result"], "valid", "{reply}");
+    // The lemma's ensures is the contradiction, and its group says it is a
+    // contract, not a definition.
+    let bad = reply["witness"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|unit| unit["name"].as_str().unwrap().ends_with("::bad"))
+        .unwrap_or_else(|| panic!("bad is load-bearing: {}", reply));
+    assert_eq!(bad["roles"], json!(["contract"]), "{reply}");
+    let participated = vacuity["participated"].as_array().unwrap();
+    assert!(participated.contains(&bad["index"]), "{}", reply);
+    assert_eq!(reply["absence_check"]["agrees"], true, "{reply}");
+
+    // A goal is no candidate, so excluding one is refused.
+    let goal = vacuity["goal"]["index"].clone();
+    let refused = worker.send(request("::late", json!({"exclude": [goal]})));
+    assert_eq!(refused["event"], "error", "{refused}");
+
+    // Consistent assumptions: every goal probed, none vacuous.
+    let reply = worker.send(request("::consistent", json!({})));
+    assert_eq!(reply["event"], "ablated", "{reply}");
+    let vacuity = &reply["vacuity"];
+    assert_eq!(vacuity["vacuous"], false, "{reply}");
+    assert!(vacuity["goals"].as_u64().unwrap() >= 2, "{}", reply);
+    assert!(vacuity["goal"].is_null(), "{}", reply);
+    assert!(vacuity["goals_unchecked"].is_null(), "{}", reply);
+    assert!(vacuity["every_goal"].is_null(), "{}", reply);
+
+    // Contradictory requires: every goal is vacuous, not only the last.
+    let reply = worker.send(request("::impossible", json!({})));
+    assert_eq!(reply["event"], "ablated", "{reply}");
+    assert_eq!(reply["vacuity"]["vacuous"], true, "{reply}");
+    assert!(reply["vacuity"]["goals"].as_u64().unwrap() >= 2, "{}", reply);
+    assert_eq!(reply["vacuity"]["every_goal"]["result"], "valid", "{reply}");
+
+    assert_eq!(worker.send(json!({"command": "close", "session": session}))["event"], "closed");
+    worker.finish(true);
+    for log in smt_logs(worker.dir.path()) {
+        assert_eq!(log.matches("(push").count(), log.matches("(pop").count());
+    }
+}
 
 /// The differential harness: a twin of `f` with an edit answers as the
 /// ordinary check of `g`, the same function with the edit made in source,
@@ -927,12 +1382,11 @@ fn resident_twin_matches_the_edit_made_in_source() {
     worker.finish(false);
 }
 
-/// A spinoff solver starts from the whole bucket context before it, so a
-/// module-level axiom lies below every scope of its journal and cannot be
-/// rebuilt away. A broadcast lemma's axiom is guarded by its fuel, so the
-/// twin hides the lemma instead, and says so.
+/// A spinoff solver journals the bucket context before it in one scope, as
+/// the main context does, so a module-level axiom is rebuilt away there too
+/// rather than hidden through the query's fuel.
 #[test]
-fn resident_twin_hides_a_base_context_lemma_under_spinoff_all() {
+fn resident_twin_rebuilds_a_lemma_away_under_spinoff_all() {
     let mut worker = Worker::start(TWIN_SOURCE, &["--rlimit", "2", "-V", "spinoff-all"]);
     let ready = worker.receive();
     assert_eq!(ready["spinoff_all"], true, "{ready}");
@@ -942,12 +1396,9 @@ fn resident_twin_hides_a_base_context_lemma_under_spinoff_all() {
         "query": query_id(&ready, "::uses_lemma"), "edit": {"remove_axiom": "f_nonneg"},
     }));
     assert_eq!(reply["event"], "twin", "{reply}");
-    assert_eq!(reply["edit"]["axioms"][0]["place"], "base", "{reply}");
-    assert!(reply["edit"]["rebuilt_scopes"].is_null(), "{}", reply);
-    let fuel = &reply["edit"]["fuel"];
-    assert_eq!(fuel["fuel"], 0, "{reply}");
-    assert!(fuel["function"].as_str().unwrap().ends_with("::f_nonneg"), "{}", reply);
-    assert_eq!(fuel["reveals_removed"], 1, "{reply}");
+    assert_eq!(reply["edit"]["axioms"][0]["place"], "prefix", "{reply}");
+    assert!(reply["edit"]["rebuilt_scopes"].as_u64().unwrap() >= 1, "{}", reply);
+    assert!(reply["edit"]["fuel"].is_null(), "{}", reply);
     assert_eq!(reply["outcome_flip"]["base"], "valid", "{reply}");
     assert_ne!(reply["outcome_flip"]["twin"], "valid", "{reply}");
     assert_eq!(reply["integrity"]["intact"], true, "{reply}");
@@ -2407,7 +2858,18 @@ fn resident_ready_lists_the_requests_it_serves() {
         .collect();
     assert_eq!(
         commands,
-        ["list", "check", "bisect", "egraph", "scaffold", "close", "inst_graph", "ladder", "twin"],
+        [
+            "list",
+            "check",
+            "bisect",
+            "ablate",
+            "egraph",
+            "scaffold",
+            "close",
+            "inst_graph",
+            "ladder",
+            "twin"
+        ],
         "{ready}"
     );
     // Each listed request parses: a stale session is refused as a session,
@@ -2420,6 +2882,9 @@ fn resident_ready_lists_the_requests_it_serves() {
             }
             "bisect" => {
                 json!({"command": command, "session": "stale", "bucket": 0, "query": 0, "mode": "flip"})
+            }
+            "ablate" => {
+                json!({"command": command, "session": "stale", "bucket": 0, "query": 0, "mode": "auto"})
             }
             "inst_graph" => {
                 json!({"command": command, "session": "stale", "bucket": 0, "query": 0, "op": "cycles"})

@@ -1658,6 +1658,11 @@ impl Verifier {
         bucket_id: &BucketId,
         query_function_path_counter: Option<(&vir::ast::Path, usize)>,
         bucket_context: &[CommandBatch],
+        // A retained spinoff records the context ops from this index of
+        // `bucket_context` on in its journal, in a scope a request can pop
+        // (ablation switches their axioms); the initial batches stay below,
+        // as the main context's do.
+        journal: Option<(&mut crate::resident::QueryJournal, usize)>,
         is_rerun: bool,
         span: &vir::messages::Span,
         profile_file_name: Option<&std::path::PathBuf>,
@@ -1683,7 +1688,24 @@ impl Verifier {
 
         // set up bucket context (skipped for a prelude-free bit_vector query)
         if prover_choice != vir::def::ProverChoice::BitVector {
-            self.run_command_batches(bucket_id, diagnostics, &mut air_context, bucket_context);
+            match journal {
+                Some((journal, ops_from)) => {
+                    let (initial, ops) = bucket_context.split_at(ops_from);
+                    self.run_command_batches(bucket_id, diagnostics, &mut air_context, initial);
+                    for batch in ops {
+                        journal
+                            .push_context(&mut air_context, batch.commands.clone())
+                            .map_err(vir::messages::error_bare)?;
+                        self.run_command_batch(bucket_id, diagnostics, &mut air_context, batch);
+                    }
+                }
+                None => self.run_command_batches(
+                    bucket_id,
+                    diagnostics,
+                    &mut air_context,
+                    bucket_context,
+                ),
+            }
         }
 
         Ok(air_context)
@@ -1810,6 +1832,8 @@ impl Verifier {
 
         // Insert initial bucket context.
         self.run_command_batches(bucket_id, reporter, &mut air_context, &bucket_context);
+        // The batches so far stay below every journal; context ops follow.
+        let initial_batches = bucket_context.len();
 
         let mut resident = self.args.resident.then(crate::resident::QueryJournal::new);
         if let Some(journal) = &mut resident {
@@ -1941,11 +1965,15 @@ impl Verifier {
 
                             let mut spinoff_journal = (retain_queries && do_spinoff)
                                 .then(crate::resident::QueryJournal::new);
-                            // A spinoff solver starts from the whole bucket
-                            // context so far, below its journal's scopes.
+                            // A spinoff solver starts from the bucket's
+                            // initial batches, below its journal's scopes; the
+                            // context ops after them go into its journal
+                            // (`new_air_context_with_bucket_context`).
                             if let Some(journal) = &mut spinoff_journal {
                                 journal.record_base(
-                                    bucket_context.iter().map(|batch| batch.commands.clone()),
+                                    bucket_context[..initial_batches]
+                                        .iter()
+                                        .map(|batch| batch.commands.clone()),
                                 );
                             }
 
@@ -1992,6 +2020,7 @@ impl Verifier {
                                         bucket_id,
                                         Some((&(function.x.name).path, spinoff_context_counter)),
                                         &bucket_context,
+                                        spinoff_journal.as_mut().map(|j| (j, initial_batches)),
                                         is_recommend,
                                         &cmds.context.span,
                                         profile_file_name.as_ref(),
@@ -2330,10 +2359,11 @@ impl Verifier {
                 resident_spinoffs,
                 // E-graph readings render solver terms as source in every
                 // session, not only under provenance.
-                Some(crate::provenance::Symbols::capture(
-                    &ctx.global,
-                    ctx.name_ctxt.source_names(),
-                )),
+                // Ablation locates the functions whose axioms it removes.
+                Some(
+                    crate::provenance::Symbols::capture(&ctx.global, ctx.name_ctxt.source_names())
+                        .with_sst_function_spans(&krate.functions),
+                ),
                 crate::provenance::Quantifiers::capture(&ctx.global),
             ));
         }

@@ -322,8 +322,9 @@ fn resolve_datatype_axiom(ctx: &Ctx, dt: &Dt) -> Vec<Command> {
             ctx.global.axiom_owners.borrow_mut().insert(
                 tag.to_symbol(),
                 format!(
-                    "{} (resolve axiom)",
-                    crate::ast_util::path_as_friendly_rust_name(&encode_dt_as_path(dt))
+                    "{}{}",
+                    crate::ast_util::path_as_friendly_rust_name(&encode_dt_as_path(dt)),
+                    crate::def::RESOLVE_AXIOM_OWNER_SUFFIX
                 ),
             );
             let axiom = Arc::new(DeclX::Axiom(Axiom { named: None, tag: Some(tag), expr: expr }));

@@ -188,9 +188,9 @@ struct MatchedAxiom {
     /// `query`: a local declaration of the query (a hypothesis has kind
     /// requires, type_invariant, fuel or trait_bound); `prefix`: a
     /// module-level axiom in the query's context; `base`: one below every
-    /// scope (declared before the bucket's first query, or before a spinoff
-    /// solver's first); `retained`: one the bucket declared after this
-    /// query's prefix.
+    /// scope (declared before the bucket's first query; a spinoff solver
+    /// journals the context it starts from, as the main one does);
+    /// `retained`: one the bucket declared after this query's prefix.
     place: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     tag: Option<ResolvedTag>,
