@@ -791,6 +791,16 @@ impl Symbols {
         }
     }
 
+    /// The source names the encoders recorded, AIR symbol -> source.
+    pub(crate) fn source_names(&self) -> &vir::air_names::SourceNames {
+        &self.source_names
+    }
+
+    /// The crate's own name, which source spells `crate`.
+    pub(crate) fn crate_name(&self) -> &str {
+        &self.crate_name
+    }
+
     /// The source of `hyp_k` of `fun`: the kind of hypothesis (`requires`,
     /// `type_invariant`, `fuel`, `trait_bound`) and its span. A bisect names
     /// the hypotheses it removes by this.
