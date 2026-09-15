@@ -1318,12 +1318,11 @@ fn resident_twin_matches_the_edit_made_in_source() {
     worker.finish(false);
 }
 
-/// A spinoff solver starts from the whole bucket context before it, so a
-/// module-level axiom lies below every scope of its journal and cannot be
-/// rebuilt away. A broadcast lemma's axiom is guarded by its fuel, so the
-/// twin hides the lemma instead, and says so.
+/// A spinoff solver journals the bucket context before it in one scope, as
+/// the main context does, so a module-level axiom is rebuilt away there too
+/// rather than hidden through the query's fuel.
 #[test]
-fn resident_twin_hides_a_base_context_lemma_under_spinoff_all() {
+fn resident_twin_rebuilds_a_lemma_away_under_spinoff_all() {
     let mut worker = Worker::start(TWIN_SOURCE, &["--rlimit", "2", "-V", "spinoff-all"]);
     let ready = worker.receive();
     assert_eq!(ready["spinoff_all"], true, "{ready}");
@@ -1333,12 +1332,9 @@ fn resident_twin_hides_a_base_context_lemma_under_spinoff_all() {
         "query": query_id(&ready, "::uses_lemma"), "edit": {"remove_axiom": "f_nonneg"},
     }));
     assert_eq!(reply["event"], "twin", "{reply}");
-    assert_eq!(reply["edit"]["axioms"][0]["place"], "base", "{reply}");
-    assert!(reply["edit"]["rebuilt_scopes"].is_null(), "{}", reply);
-    let fuel = &reply["edit"]["fuel"];
-    assert_eq!(fuel["fuel"], 0, "{reply}");
-    assert!(fuel["function"].as_str().unwrap().ends_with("::f_nonneg"), "{}", reply);
-    assert_eq!(fuel["reveals_removed"], 1, "{reply}");
+    assert_eq!(reply["edit"]["axioms"][0]["place"], "prefix", "{reply}");
+    assert!(reply["edit"]["rebuilt_scopes"].as_u64().unwrap() >= 1, "{}", reply);
+    assert!(reply["edit"]["fuel"].is_null(), "{}", reply);
     assert_eq!(reply["outcome_flip"]["base"], "valid", "{reply}");
     assert_ne!(reply["outcome_flip"]["twin"], "valid", "{reply}");
     assert_eq!(reply["integrity"]["intact"], true, "{reply}");
