@@ -12,7 +12,7 @@ use crate::verus_items::{SpecItem, VerusItem};
 use rustc_hir::def::{DefKind, Res};
 use rustc_hir::def_id::{DefId, LOCAL_CRATE, LocalDefId};
 use rustc_hir::intravisit::{self, Visitor};
-use rustc_hir::{BodyId, Expr, ExprKind};
+use rustc_hir::{BodyId, Expr, ExprKind, TraitFn, TraitItemKind};
 use rustc_middle::ty::{GenericArgKind, TyCtxt, TypeckResults};
 use rustc_session::config::CrateType;
 use rustc_span::hygiene::{ExpnKind, MacroKind};
@@ -197,10 +197,14 @@ fn user_fn_span<'tcx>(tcx: TyCtxt<'tcx>, def_id: LocalDefId) -> Option<rustc_spa
 }
 
 /// The name a `verus!` twin stands for: `VERUS_SPEC__m` holds the spec of
-/// the trait method `m`, which the HIR names in calls.
-fn spec_twin_target(path: &Path) -> Option<Path> {
+/// the trait method `m`, which the HIR names in calls;
+/// `VERUS_UNERASED_PROXY__f` holds the ghost code of the `const fn` `f`,
+/// which is erased from `f` itself (see `fixup_unerased_proxy_path`).
+fn twin_target(path: &Path) -> Option<Path> {
     let last = path.last_segment();
-    let name = last.strip_prefix(vir::def::VERUS_SPEC)?;
+    let name = last
+        .strip_prefix(vir::def::VERUS_SPEC)
+        .or_else(|| last.strip_prefix("VERUS_UNERASED_PROXY__"))?;
     Some(path.pop_segment().push_segment(std::sync::Arc::new(name.to_string())))
 }
 
@@ -223,6 +227,24 @@ fn vir_path<'tcx>(ctxt: &Context<'tcx>, def_id: DefId) -> Option<Path> {
     crate::rust_to_vir_base::def_id_to_vir_path_option(ctxt.tcx, Some(&ctxt.verus_items), def_id)
 }
 
+/// The path an id is built from. Functions of one name nested in one body
+/// share a VIR path; they get distinct ids. Nothing outside the crate can
+/// name a nested function, so the id needs no agreement with other crates.
+fn id_path<'tcx>(ctxt: &Context<'tcx>, def_id: DefId) -> Option<Path> {
+    use rustc_hir::definitions::DefPathData;
+    let tcx = ctxt.tcx;
+    let nested_twice = def_id.is_local()
+        && tcx.def_path(def_id).data.iter().any(|d| {
+            d.disambiguator > 0
+                && matches!(d.data, DefPathData::ValueNs(_) | DefPathData::TypeNs(_))
+        });
+    if nested_twice {
+        crate::rust_to_vir_base::def_path_to_vir_path_disambiguated(tcx, tcx.def_path(def_id))
+    } else {
+        vir_path(ctxt, def_id)
+    }
+}
+
 fn friendly_name<'tcx>(ctxt: &Context<'tcx>, def_id: DefId) -> Option<String> {
     vir_path(ctxt, def_id).map(|p| vir::ast_util::path_as_friendly_rust_name(&p))
 }
@@ -241,7 +263,7 @@ fn crate_type<'tcx>(tcx: TyCtxt<'tcx>) -> &'static str {
 /// items of an executable are tagged with its crate type, since a package's
 /// binary shares its name with the library.
 fn id_of<'tcx>(ctxt: &Context<'tcx>, def_id: DefId) -> Option<String> {
-    Some(id_of_path(ctxt, &vir_path(ctxt, def_id)?, def_id.is_local()))
+    Some(id_of_path(ctxt, &id_path(ctxt, def_id)?, def_id.is_local()))
 }
 
 fn id_of_path<'tcx>(ctxt: &Context<'tcx>, path: &Path, local: bool) -> String {
@@ -322,7 +344,7 @@ fn node<'tcx>(
 ) -> Node {
     let tcx = ctxt.tcx;
     let path = vir_path(ctxt, def_id.to_def_id()).expect("path of a named function");
-    let (function, mut proxy, mut external_body) = match labels.by_name.get(&path) {
+    let (function, proxy, mut external_body) = match labels.by_name.get(&path) {
         // The target of an `assume_specification` has a spec but an unchecked body
         Some(f) => (Some(*f), false, f.x.proxy.is_some()),
         None => match labels.by_proxy_path.get(&path) {
@@ -330,10 +352,6 @@ fn node<'tcx>(
             None => (None, false, false),
         },
     };
-    // The twin `verus!` gives a `const fn` for its use in spec code (see
-    // `fixup_unerased_proxy_path`) shares the span of the function it
-    // stands for and is not code of its own
-    proxy |= path.last_segment().starts_with("VERUS_UNERASED_PROXY__");
     // No body to check: `external_body`, or an uninterpreted spec
     external_body |= function.map_or(false, |f| {
         f.x.attrs.is_external_body || matches!(f.x.body_visibility, BodyVisibility::Uninterpreted)
@@ -369,7 +387,7 @@ pub(crate) fn run<'tcx>(ctxt: &Context<'tcx>, krate: &Krate) -> Result<(), Strin
             continue;
         }
         let Some(path) = vir_path(ctxt, def_id.to_def_id()) else { continue };
-        let id = id_of_path(ctxt, &path, true);
+        let Some(id) = id_of(ctxt, def_id.to_def_id()) else { continue };
         let mode = labels.by_name.get(&path).map_or(Mode::Exec, |f| f.x.mode);
         for (target, kind) in callees(ctxt, def_id, mode) {
             if is_builtin(ctxt, target) {
@@ -380,9 +398,10 @@ pub(crate) fn run<'tcx>(ctxt: &Context<'tcx>, krate: &Krate) -> Result<(), Strin
                 edges.extend(id_of(ctxt, adt.to_def_id()).map(|t| Edge::new(id.clone(), t, kind)));
             }
         }
-        if let Some(method) = spec_twin_target(&path) {
-            // The trait method's contract lives in its twin
-            edges.insert(Edge::new(id_of_path(ctxt, &method, true), id, EdgeKind::Contract));
+        if let Some(target) = twin_target(&path) {
+            // The trait method's contract, or the const fn's ghost code,
+            // lives in its twin, which is not code of its own
+            edges.insert(Edge::new(id_of_path(ctxt, &target, true), id, EdgeKind::Contract));
             continue;
         }
         if is_reveal_helper(&path) {
@@ -401,8 +420,16 @@ pub(crate) fn run<'tcx>(ctxt: &Context<'tcx>, krate: &Krate) -> Result<(), Strin
     }
     edges.extend(labels.implied_edges(ctxt, krate));
     nodes.sort_by(|a, b| a.id.cmp(&b.id));
-    // Nested functions of the same name in one body share an id; keep one
-    nodes.dedup_by(|a, b| a.id == b.id);
+
+    // Trait methods declared without a body are functions without a node;
+    // an edge onto one is still an edge between functions
+    let mut bodiless = vec![];
+    for item in tcx.hir_crate_items(()).trait_items() {
+        if let TraitItemKind::Fn(_, TraitFn::Required(_)) = tcx.hir_trait_item(item).kind {
+            bodiless.extend(id_of(ctxt, item.owner_id.to_def_id()));
+        }
+    }
+    bodiless.sort();
 
     let report = Report {
         schema_version: SCHEMA_VERSION,
@@ -410,6 +437,7 @@ pub(crate) fn run<'tcx>(ctxt: &Context<'tcx>, krate: &Krate) -> Result<(), Strin
         crate_type: crate_type(tcx).to_string(),
         main: entry.and_then(|def_id| id_of(ctxt, def_id.to_def_id())),
         nodes,
+        bodiless,
         edges: edges.into_iter().collect(),
     };
 

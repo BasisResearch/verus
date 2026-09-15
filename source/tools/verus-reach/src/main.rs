@@ -44,11 +44,13 @@ struct Args {
     #[arg(long)]
     no_implicit_roots: bool,
     /// Exit with an error if fewer than this percentage of verified
-    /// functions (exec, spec, and proof) are reachable
+    /// functions (exec, spec, and proof) are reachable. With no verified
+    /// function to measure, only 0 passes
     #[arg(long)]
     fail_under: Option<u64>,
     /// Exit with an error if more than this percentage of verified
-    /// functions (exec, spec, and proof) are unreachable
+    /// functions (exec, spec, and proof) are unreachable. With no verified
+    /// function to measure, only 100 passes
     #[arg(long)]
     fail_over: Option<u64>,
     /// Write an LCOV trace file to stdout instead of the summary
@@ -239,17 +241,26 @@ fn lcov(graph: &Graph, only: Only) -> String {
             function::Key { name: n.id.clone() },
             function::Value { start_line: Some(n.span.start_line as u32), count: hits },
         );
+        // A line is hit when every function on it is: the functions of one
+        // macro invocation share its span, and the lines of a nested
+        // function are its own, not the enclosing function's
         for l in n.span.start_line..=n.span.end_line {
-            section.lines.entry(line::Key { line: l as u32 }).or_default().count |= hits;
+            section
+                .lines
+                .entry(line::Key { line: l as u32 })
+                .and_modify(|v| v.count = v.count.min(hits))
+                .or_insert(line::Value { count: hits, checksum: None });
         }
     }
     report.into_records().map(|record| format!("{record}\n")).collect()
 }
 
+/// With nothing to measure, only the no-op ceiling of 100% passes
 fn above_threshold(graph: &Graph, threshold: u64) -> Option<String> {
     let (reached, total) = graph.coverage();
     let Some(pct) = pct(total - reached, total) else {
-        return Some(format!("no verified functions to measure, above --fail-over {threshold}"));
+        return (threshold < 100)
+            .then(|| format!("no verified functions to measure, above --fail-over {threshold}"));
     };
     (pct > threshold).then(|| {
         format!(
@@ -259,10 +270,12 @@ fn above_threshold(graph: &Graph, threshold: u64) -> Option<String> {
     })
 }
 
+/// With nothing to measure, only the no-op floor of 0% passes
 fn below_threshold(graph: &Graph, threshold: u64) -> Option<String> {
     let (reached, total) = graph.coverage();
     let Some(pct) = pct(reached, total) else {
-        return Some(format!("no verified functions to measure, below --fail-under {threshold}"));
+        return (threshold > 0)
+            .then(|| format!("no verified functions to measure, below --fail-under {threshold}"));
     };
     (pct < threshold).then(|| {
         format!(
@@ -384,6 +397,35 @@ mod tests {
     }
 
     #[test]
+    fn lcov_hits_a_line_only_when_every_function_on_it_is_hit() {
+        use verus_reach::fixture::{call, node, report};
+        // `a` and `dead_a` come from one macro invocation on line 1; `b` on
+        // line 5 has `inner`, never called, nested on line 6
+        let mut a = node("lib(bin)::a", true, false);
+        a.span.end_line = 1;
+        let mut dead_a = node("lib(bin)::dead_a", true, false);
+        dead_a.span.end_line = 1;
+        let mut b = node("lib(bin)::b", true, false);
+        (b.span.start_line, b.span.end_line) = (5, 7);
+        let mut inner = node("lib(bin)::b::inner", true, false);
+        (inner.span.start_line, inner.span.end_line) = (6, 6);
+        let main = node("lib(bin)::main", true, false);
+        let reports = vec![report(
+            "lib",
+            "bin",
+            Some("lib(bin)::main"),
+            vec![main, a, dead_a, b, inner],
+            vec![call("lib(bin)::main", "lib(bin)::a"), call("lib(bin)::main", "lib(bin)::b")],
+        )];
+        let graph = Graph::new(&reports, &Roots::default()).unwrap();
+        let text = lcov(&graph, Only::VerifiedExec);
+        assert!(text.contains("FNDA:1,lib(bin)::a\n"), "{text}");
+        assert!(text.contains("FNDA:0,lib(bin)::dead_a\n"), "{text}");
+        assert!(text.contains("DA:1,0\n"), "{text}");
+        assert!(text.contains("DA:5,1\nDA:6,0\nDA:7,1\n"), "{text}");
+    }
+
+    #[test]
     fn fail_under_uses_the_summary_percentage() {
         let (_, graph) = graph();
         assert_eq!(below_threshold(&graph, 66), None);
@@ -401,7 +443,7 @@ mod tests {
     }
 
     #[test]
-    fn nothing_verified_fails_the_threshold_and_shows_no_rate() {
+    fn nothing_verified_passes_only_the_no_op_thresholds_and_shows_no_rate() {
         use verus_reach::fixture::{node, report};
         let reports = vec![report(
             "app",
@@ -413,6 +455,8 @@ mod tests {
         let graph = Graph::new(&reports, &Roots::default()).unwrap();
         assert!(below_threshold(&graph, 1).unwrap().contains("no verified functions"));
         assert!(above_threshold(&graph, 99).unwrap().contains("no verified functions"));
+        assert_eq!(below_threshold(&graph, 0), None);
+        assert_eq!(above_threshold(&graph, 100), None);
         let text = summary(&reports, &graph);
         assert!(text.contains("verified functions:      0   reachable:      0  (n/a)"), "{text}");
     }

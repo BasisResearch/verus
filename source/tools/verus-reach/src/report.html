@@ -272,7 +272,7 @@ table.cov tbody tr:hover td { background: color-mix(in srgb, var(--accent) 6%, t
     return '<div class="section"><div class="section-head"><h2>Files with verified code</h2><span class="note">' +
       VERIFIED_FILES.length + ' of ' + DATA.file_count + ' files' +
       (others ? '; the other ' + others + ' have no verified functions and count only in the totals' : '') + '</span></div>' +
-      table(rows, function (r) { return encodeURI(r.href); }, TOTAL, totalLabel) + '</div>';
+      table(rows, function (r) { return r.href; }, TOTAL, totalLabel) + '</div>';
   }
   function viewFile() {
     var f = FILES[0];
@@ -300,10 +300,15 @@ table.cov tbody tr:hover td { background: color-mix(in srgb, var(--accent) 6%, t
     }
     var lines = f.source.split("\n");
     if (lines.length && lines[lines.length - 1] === "") lines.pop();
+    // Outer spans first, so that a function nested in another paints its
+    // own lines over the enclosing function's; on one shared span (the
+    // functions of one macro invocation) the worst state paints last
     var mark = new Array(lines.length + 1);
-    var painted = f.functions.slice().sort(function (a, b) { return (b.verified - a.verified) || (b.reachable - a.reachable); });
+    var painted = f.functions.slice().sort(function (a, b) {
+      return (a.start - b.start) || (b.end - a.end) || (STATE_ORDER[state(b)] - STATE_ORDER[state(a)]);
+    });
     painted.forEach(function (fn) {
-      for (var l = fn.start; l <= fn.end && l <= lines.length; l++) if (!mark[l]) mark[l] = fn;
+      for (var l = fn.start; l <= fn.end && l <= lines.length; l++) mark[l] = fn;
     });
     h += '<div class="section"><div class="section-head"><h2>Source</h2><span class="note">' + lines.length + ' lines</span></div><div class="panel src">';
     var hl = { block: false, str: false, raw: null };

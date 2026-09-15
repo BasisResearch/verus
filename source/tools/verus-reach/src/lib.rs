@@ -26,6 +26,11 @@ pub struct Report {
     pub main: Option<String>,
     /// The crate's own functions
     pub nodes: Vec<Node>,
+    /// Ids of the crate's functions that have no body, so no node: trait
+    /// methods declared without one. An edge onto one is an edge between
+    /// functions, unlike an edge onto a type.
+    #[serde(default)]
+    pub bodiless: Vec<String>,
     /// By id. Either end may be an item this crate does not define: a
     /// function of another crate, a trait method, a type.
     pub edges: Vec<Edge>,
@@ -75,8 +80,7 @@ pub struct Node {
     /// The body is not checked: `external_body`, the target of an
     /// `assume_specification`, or an uninterpreted spec
     pub external_body: bool,
-    /// Stands for another function: an `assume_specification` item, or the
-    /// twin `verus!` gives a `const fn`
+    /// Stands for another function: an `assume_specification` item
     pub proxy: bool,
     /// Part of the crate's public API
     pub exported: bool,
@@ -236,13 +240,14 @@ pub struct Graph {
     pub used: HashSet<String>,
     /// The used functions plus the functions that mention one directly,
     /// through an edge of any kind:
-    /// one hop against the edges' direction. Only edges between functions
-    /// of the analyzed crates count; a hop onto a type or a foreign item
-    /// (everything constructs an `Option`) would gather the whole crate.
-    /// Reachable is a subset. The rest is where explicit roots hide:
-    /// theorems about reachable functions that nothing calls.
+    /// one hop against the edges' direction. Only edges onto functions of
+    /// the analyzed crates count, with or without a body; a hop onto a type
+    /// or a foreign item (everything constructs an `Option`) would gather
+    /// the whole crate. Reachable is a subset. The rest is where explicit
+    /// roots hide: theorems about reachable functions that nothing calls.
     pub connected: HashSet<String>,
-    /// Ids some other function refers to
+    /// Ids something else refers to, synthesized items included: a spec
+    /// function named only in an `assume_specification` is not top-level
     referred: HashSet<String>,
 }
 
@@ -307,22 +312,26 @@ impl Graph {
             }
         }
 
-        // One hop against the edges, between functions only
-        let covered =
-            |id: &String| nodes.contains_key(id) && (reachable.contains(id) || used.contains(id));
+        // One hop against the edges, onto functions only
+        let functions: HashSet<&str> = nodes
+            .keys()
+            .map(String::as_str)
+            .chain(reports.iter().flat_map(|r| r.bodiless.iter().map(String::as_str)))
+            .collect();
+        let covered = |id: &String| {
+            functions.contains(id.as_str()) && (reachable.contains(id) || used.contains(id))
+        };
         let mut referred = HashSet::new();
         let mut connected: HashSet<String> =
             nodes.keys().filter(|id| covered(id)).cloned().collect();
         for edge in reports.iter().flat_map(|r| r.edges.iter()) {
-            if nodes.contains_key(&edge.from) {
-                // A function mentioning itself (its own result in its
-                // contract, recursion) has no referrer
-                if edge.from != edge.to {
-                    referred.insert(edge.to.clone());
-                }
-                if covered(&edge.to) {
-                    connected.insert(edge.from.clone());
-                }
+            // A function mentioning itself (its own result in its
+            // contract, recursion) has no referrer
+            if edge.from != edge.to {
+                referred.insert(edge.to.clone());
+            }
+            if nodes.contains_key(&edge.from) && covered(&edge.to) {
+                connected.insert(edge.from.clone());
             }
         }
         Ok(Graph { nodes, roots: root_ids, reachable, used, connected, referred })
@@ -442,6 +451,7 @@ pub mod fixture {
             crate_type: crate_type.into(),
             main: main.map(String::from),
             nodes,
+            bodiless: vec![],
             edges,
         }
     }
@@ -594,6 +604,46 @@ mod tests {
         }
         assert_eq!(names(graph.connected_unreachable()), vec!["lib::theorem"]);
         assert_eq!(names(graph.suggested_roots()), vec!["lib::theorem"]);
+    }
+
+    #[test]
+    fn a_reference_from_a_synthesized_item_is_a_reference() {
+        // `ok` is named only by the contract of an `assume_specification`
+        // (a proxy, not a node), `small` by reachable code and by `ok`: the
+        // spec of dead code mentions used code, but it is not top-level
+        let mut reports = lib_and_bin();
+        let mut proxy = proof("lib::ext_spec");
+        proxy.proxy = true;
+        reports[0].nodes.push(proxy);
+        reports[0].nodes.push(spec("lib::ok"));
+        reports[0].edges.push(contract("lib::ext_spec", "lib::ok"));
+        reports[0].edges.push(call("lib::ok", "lib::spec_wired"));
+        let graph = Graph::new(&reports, &Roots::default()).unwrap();
+        assert!(graph.connected.contains("lib::ok"));
+        assert!(graph.suggested_roots().is_empty());
+    }
+
+    #[test]
+    fn a_bodiless_trait_method_links_a_theorem_to_reachable_code() {
+        // `Tr::inv` has no body, so no node; reachable code mentions it in
+        // a contract, and a theorem about it mentions nothing else
+        let mut reports = lib_and_bin();
+        reports[0].bodiless.push("lib::Tr::inv".into());
+        reports[0].nodes.push(proof("lib::theorem"));
+        reports[0].edges.push(contract("lib::wired", "lib::Tr::inv"));
+        reports[0].edges.push(contract("lib::theorem", "lib::Tr::inv"));
+        let graph = Graph::new(&reports, &Roots::default()).unwrap();
+        assert!(graph.used.contains("lib::Tr::inv"));
+        assert!(!graph.nodes.contains_key("lib::Tr::inv"));
+        assert!(graph.connected.contains("lib::theorem"));
+        let names: Vec<&str> = graph.suggested_roots().iter().map(|n| n.id.as_str()).collect();
+        assert_eq!(names, vec!["lib::theorem"]);
+
+        // Without the declaration, an edge onto an unknown id is a hop onto
+        // a type or a foreign item and connects nothing
+        reports[0].bodiless.clear();
+        let graph = Graph::new(&reports, &Roots::default()).unwrap();
+        assert!(!graph.connected.contains("lib::theorem"));
     }
 
     #[test]

@@ -43,13 +43,35 @@ pub(crate) fn mk_crate_id<'tcx>(tcx: TyCtxt<'tcx>, krate: CrateNum) -> CrateId {
 }
 
 pub(crate) fn def_path_to_vir_path<'tcx>(tcx: TyCtxt<'tcx>, def_path: DefPath) -> Option<Path> {
+    def_path_to_vir_path_with(tcx, def_path, false)
+}
+
+/// Like `def_path_to_vir_path`, but keeps apart items of one name nested in
+/// one body (`fn f() { { fn g() {} } { fn g() {} } }`), which share a VIR
+/// path: the second `g` is named `g#1`, after rustc's disambiguator.
+pub(crate) fn def_path_to_vir_path_disambiguated<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    def_path: DefPath,
+) -> Option<Path> {
+    def_path_to_vir_path_with(tcx, def_path, true)
+}
+
+fn def_path_to_vir_path_with<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    def_path: DefPath,
+    disambiguate: bool,
+) -> Option<Path> {
     let krate = mk_crate_id(tcx, def_path.krate);
     let mut segments: Vec<vir::ast::Ident> = Vec::new();
     for d in def_path.data.iter() {
         use rustc_hir::definitions::DefPathData;
         match &d.data {
             DefPathData::ValueNs(symbol) | DefPathData::TypeNs(symbol) => {
-                segments.push(Arc::new(symbol.to_string()));
+                if disambiguate && d.disambiguator > 0 {
+                    segments.push(Arc::new(format!("{symbol}#{}", d.disambiguator)));
+                } else {
+                    segments.push(Arc::new(symbol.to_string()));
+                }
             }
             DefPathData::Ctor => {
                 segments.push(Arc::new(vir::def::RUST_DEF_CTOR.to_string()));

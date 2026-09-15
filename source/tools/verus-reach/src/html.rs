@@ -44,6 +44,24 @@ fn page_path(file: &str) -> PathBuf {
     p
 }
 
+/// A page's link from `index.html`: the components of its path joined with
+/// `/` whatever the OS, each percent-encoded, so `#` and `?` in a file name
+/// stay in the path
+fn page_href(rel: &Path) -> String {
+    let parts: Vec<String> = rel
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().bytes().map(encode_byte).collect())
+        .collect();
+    parts.join("/")
+}
+
+fn encode_byte(b: u8) -> String {
+    match b {
+        b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => (b as char).into(),
+        _ => format!("%{b:02X}"),
+    }
+}
+
 /// The functions of every file, by file. The graph already leaves out the
 /// items nobody wrote.
 pub fn files<'a>(graph: &'a Graph) -> BTreeMap<&'a str, Vec<&'a Node>> {
@@ -55,8 +73,10 @@ pub fn files<'a>(graph: &'a Graph) -> BTreeMap<&'a str, Vec<&'a Node>> {
 }
 
 fn page(data: Value, title: &str) -> String {
-    // The JSON sits in a <script> element, which only `</` can end early
-    let data = data.to_string().replace("</", "<\\/");
+    // The JSON sits in a <script> element, where `</script>` ends it early
+    // and `<!--<script` starts a run the next `</script>` does not end; a
+    // `<` only ever sits inside a JSON string, where its escape is legal
+    let data = data.to_string().replace('<', "\\u003c");
     let title = title.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
     TEMPLATE.replace("__TITLE__", &title).replace("__DATA__", &data)
 }
@@ -99,8 +119,7 @@ pub fn write(
     for (file, nodes) in &files {
         let functions: Vec<Value> = nodes.iter().map(|n| function(n, graph)).collect();
         let rel = page_path(file);
-        index_files
-            .push(json!({ "path": file, "href": rel.to_string_lossy(), "functions": functions }));
+        index_files.push(json!({ "path": file, "href": page_href(&rel), "functions": functions }));
         if !nodes.iter().any(|n| n.is_verified()) {
             continue;
         }
@@ -153,7 +172,7 @@ mod tests {
     fn data(text: &str) -> Value {
         let start = text.find("application/json\">").unwrap() + "application/json\">".len();
         let end = text[start..].find("</script>").unwrap() + start;
-        serde_json::from_str(&text[start..end].replace("<\\/", "</")).unwrap()
+        serde_json::from_str(&text[start..end]).unwrap()
     }
 
     #[test]
@@ -232,7 +251,7 @@ mod tests {
     fn distinct_paths_get_distinct_pages() {
         let pages: Vec<String> = ["src/a.rs", "../a.rs", "/abs/a.rs", "a", "./a.rs"]
             .iter()
-            .map(|f| page_path(f).to_string_lossy().into_owned())
+            .map(|f| page_href(&page_path(f)))
             .collect();
         assert_eq!(
             pages,
@@ -247,10 +266,20 @@ mod tests {
     }
 
     #[test]
+    fn links_are_urls_whatever_the_file_name() {
+        assert_eq!(page_href(&page_path("src/a#1?.rs")), "src/src/a%231%3F.rs.html");
+        assert_eq!(page_href(&page_path("my dir/ü.rs")), "src/my%20dir/%C3%BC.rs.html");
+        assert_eq!(page_href(&page_path("src/a.rs")), "src/src/a.rs.html");
+    }
+
+    #[test]
     fn page_keeps_the_script_element_intact() {
-        let text = page(json!({ "name": "a</script><b>" }), "a <b> & c");
+        let text = page(json!({ "name": "a</script><b>", "src": "<!--<script>" }), "a <b> & c");
         assert!(text.contains("<title>a &lt;b&gt; &amp; c</title>"), "{text}");
         assert!(!text.contains("</script><b>"), "{text}");
-        assert!(text.contains("<\\/script><b>"), "{text}");
+        assert!(!text.contains("<!--"), "{text}");
+        assert!(text.contains("\\u003c/script>\\u003cb>"), "{text}");
+        assert_eq!(data(&text)["name"], "a</script><b>");
+        assert_eq!(data(&text)["src"], "<!--<script>");
     }
 }

@@ -202,9 +202,10 @@ fn dead_ghost_functions() {
         vec![EdgeKind::Contract]
     );
     assert_eq!(edge_kinds(&report, "test_crate::main", "test_crate::lemma"), vec![EdgeKind::Proof]);
+    // A spec body is ghost code: what it names is used, not called
     assert_eq!(
         edge_kinds(&report, "test_crate::bounded", "test_crate::small"),
-        vec![EdgeKind::Call]
+        vec![EdgeKind::Proof]
     );
 
     let graph = graph_from_main(&report);
@@ -509,13 +510,17 @@ fn trait_method_spec_is_used_through_the_method() {
 #[test]
 fn macro_defined_functions_are_reported_at_the_invocation() {
     let code = verus_code! {
+        // `verus!` leaves a `macro_rules!` body alone: the expansion is
+        // Verus code only if it says so
         macro_rules! twice {
             ($name:ident) => {
-                fn $name(x: u64) -> (r: u64)
-                    requires x < 100,
-                    ensures r == x * 2,
-                {
-                    x * 2
+                verus! {
+                    fn $name(x: u64) -> (r: u64)
+                        requires x < 100,
+                        ensures r == x * 2,
+                    {
+                        x * 2
+                    }
                 }
             };
         }
@@ -544,18 +549,18 @@ fn macro_defined_functions_are_reported_at_the_invocation() {
 #[test]
 fn a_spec_root_uses_but_does_not_run() {
     let code = verus_code! {
-        spec fn spec_len(x: u64) -> u64 {
+        pub open spec fn spec_len(x: u64) -> u64 {
             x
         }
 
         #[verifier::when_used_as_spec(spec_len)]
-        fn len(x: u64) -> (r: u64)
+        pub fn len(x: u64) -> (r: u64)
             ensures r == spec_len(x),
         {
             x
         }
 
-        pub open spec fn twice_len(x: u64) -> u64 {
+        pub open spec fn twice_len(x: u64) -> int {
             len(x) + len(x)
         }
 
@@ -579,8 +584,11 @@ fn a_spec_root_uses_but_does_not_run() {
         edge_kinds(&report, "test_crate::lemma_len", "test_crate::spec_len"),
         vec![EdgeKind::Contract]
     );
-    let roots = Roots { add: vec!["test_crate::twice_len".into()], ..Roots::default() };
+    // `len` is exported, so it would be an implicit root of this library
+    let roots =
+        Roots { add: vec!["test_crate::twice_len".into()], implicit: false, ..Roots::default() };
     let graph = Graph::new(std::slice::from_ref(&report), &roots).unwrap();
+    assert_eq!(graph.roots, vec!["test_crate::twice_len"]);
     assert!(!graph.reachable.contains("test_crate::len"));
     assert!(graph.is_reachable(node(&report, "test_crate::spec_len")));
 }
@@ -650,13 +658,26 @@ fn uninterpreted_specs_are_trusted() {
 
 /// `verus!` splits a `const fn` in two: the erased item that runs, and a
 /// `VERUS_UNERASED_PROXY__` twin holding its ghost code, at the same span.
-/// Verus labels the erased item; the twin is not code of its own.
+/// Verus labels the erased item; the twin is not code of its own, but what
+/// its contract and proofs mention is used through the erased item.
 #[test]
-fn const_fn_twin_is_a_proxy() {
+fn const_fn_ghost_code_is_used_through_the_twin() {
     let code = verus_code! {
-        const fn is_lt(a: u64, b: u64) -> (r: bool)
-            ensures r == (a < b),
+        spec fn same(a: bool, b: bool) -> bool {
+            a == b
+        }
+
+        proof fn lemma_same(a: bool)
+            ensures same(a, a),
         {
+        }
+
+        const fn is_lt(a: u64, b: u64) -> (r: bool)
+            ensures same(r, a < b),
+        {
+            proof {
+                lemma_same(a < b);
+            }
             a < b
         }
 
@@ -668,11 +689,117 @@ fn const_fn_twin_is_a_proxy() {
     result.unwrap();
     let is_lt = node(&report, "test_crate::is_lt");
     assert!(is_lt.is_verified_exec(), "{:#?}", is_lt);
-    assert!(graph_from_main(&report).is_reachable(is_lt));
-    let twin = node(&report, "test_crate::VERUS_UNERASED_PROXY__is_lt");
-    assert!(twin.proxy, "{:#?}", twin);
-    assert!(!twin.is_verified_exec());
-    assert_eq!(twin.span.start_line, is_lt.span.start_line);
+    assert!(
+        !report.nodes.iter().any(|n| n.def_path.contains("VERUS_UNERASED_PROXY__")),
+        "twins are not nodes: {:#?}",
+        report.nodes
+    );
+    let twin = "test_crate::VERUS_UNERASED_PROXY__is_lt";
+    assert_eq!(edge_kinds(&report, "test_crate::is_lt", twin), vec![EdgeKind::Contract]);
+    assert_eq!(edge_kinds(&report, twin, "test_crate::same"), vec![EdgeKind::Contract]);
+    assert_eq!(edge_kinds(&report, twin, "test_crate::lemma_same"), vec![EdgeKind::Proof]);
+    let graph = graph_from_main(&report);
+    assert!(graph.is_reachable(is_lt));
+    assert!(graph.is_reachable(node(&report, "test_crate::same")));
+    assert!(graph.is_reachable(node(&report, "test_crate::lemma_same")));
+    // is_lt, same, lemma_same, and main
+    assert_eq!(graph.coverage(), (4, 4));
+}
+
+/// A trait method declared without a body has no node, but an edge onto it
+/// is an edge between functions: a theorem about it is connected to the
+/// reachable code that mentions it.
+#[test]
+fn bodiless_trait_method_connects_a_theorem() {
+    let code = verus_code! {
+        trait Tr {
+            spec fn inv(&self) -> bool;
+        }
+
+        struct S;
+
+        impl Tr for S {
+            spec fn inv(&self) -> bool {
+                true
+            }
+        }
+
+        fn use_it<T: Tr>(t: &T)
+            requires t.inv(),
+        {
+        }
+
+        proof fn theorem<T: Tr>(t: &T)
+            ensures t.inv() == t.inv(),
+        {
+        }
+
+        fn main() {
+            let s = S;
+            use_it(&s);
+        }
+    };
+    let (result, report) = reach("bodiless_trait_method", code);
+    result.unwrap();
+    assert!(report.bodiless.contains(&"test_crate::Tr::inv".to_string()), "{:#?}", report);
+    assert!(!report.nodes.iter().any(|n| n.def_path == "test_crate::Tr::inv"));
+    assert_eq!(
+        edge_kinds(&report, "test_crate::use_it", "test_crate::Tr::inv"),
+        vec![EdgeKind::Contract]
+    );
+    let graph = graph_from_main(&report);
+    assert!(graph.used.contains("test_crate::Tr::inv"));
+    let theorem = node(&report, "test_crate::theorem");
+    assert!(!graph.is_reachable(theorem));
+    assert!(graph.connected.contains(&theorem.id));
+    let suggested: Vec<&str> =
+        graph.suggested_roots().iter().map(|n| n.def_path.as_str()).collect();
+    assert_eq!(suggested, vec!["test_crate::theorem"]);
+}
+
+/// Two functions of one name nested in one body get ids of their own: what
+/// only the uncalled one calls is not reached.
+#[test]
+fn nested_functions_of_one_name_are_told_apart() {
+    let code = verus_code! {
+        fn only_by_second() -> u64 {
+            1
+        }
+
+        #[verifier::external]
+        fn main() {
+            {
+                fn helper() -> u64 {
+                    1
+                }
+                let _ = helper();
+            }
+            {
+                fn helper() -> u64 {
+                    only_by_second()
+                }
+            }
+        }
+    };
+    let (result, report) = reach("nested_twice", code);
+    result.unwrap();
+    let mut ids: Vec<&str> = report
+        .nodes
+        .iter()
+        .filter(|n| n.def_path == "test_crate::main::helper")
+        .map(|n| n.id.as_str())
+        .collect();
+    ids.sort();
+    assert_eq!(
+        ids,
+        vec!["test_crate::main::helper", "test_crate::main::helper#1"],
+        "{:#?}",
+        report
+    );
+    assert!(has_edge(&report, "test_crate::main", "test_crate::main::helper"));
+    assert!(!has_edge(&report, "test_crate::main", "test_crate::main::helper#1"));
+    assert!(has_edge(&report, "test_crate::main::helper#1", "test_crate::only_by_second"));
+    assert!(!graph_from_main(&report).is_reachable(node(&report, "test_crate::only_by_second")));
 }
 
 /// A library crate and a binary crate: the binary's `main` is the root, and
