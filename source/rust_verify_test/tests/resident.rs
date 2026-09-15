@@ -1655,7 +1655,6 @@ fn own_quantifier<E: Endpoint>(worker: &mut Worker<E>, session: &Value, query: &
 /// did before, and no probe launched a solver: the probes are the pasted
 /// source's differential check and the session's state check.
 #[test]
-#[ignore = "needs cvc5 with (speculate ...) (BasisResearch/cvc5 kg/speculative-probe); un-ignore when the pin moves"]
 fn resident_speculate_probes_and_leaves_the_session_unchanged() {
     let options = speculate_options();
     let mut worker = Worker::start(SPECULATE_SOURCE, &options);
@@ -2345,7 +2344,6 @@ fn cold_check(source: &str, function: &str, options: &[&str]) -> Value {
 /// read; and a snippet names no variable at another version than the
 /// goal's, so pasted before the goal it verifies.
 #[test]
-#[ignore = "needs cvc5 with (speculate ...) (BasisResearch/cvc5 kg/speculative-probe); un-ignore when the pin moves"]
 fn resident_speculate_reads_terms_at_the_goal() {
     let options = version_options();
     let mut worker = Worker::start(SPECULATE_GOAL_SOURCE, &options);
