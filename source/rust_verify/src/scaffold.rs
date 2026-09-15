@@ -139,6 +139,9 @@ enum Ast {
 struct Parser {
     toks: Vec<Tok>,
     pos: usize,
+    /// In an `if` condition, where `{` after a path opens the branch, as in
+    /// Rust, not a struct literal.
+    no_struct: bool,
 }
 
 impl Parser {
@@ -298,19 +301,33 @@ impl Parser {
         self.postfix()
     }
 
+    /// Parse with `no_struct` set as given, restoring it after.
+    fn with_no_struct<T>(
+        &mut self,
+        no_struct: bool,
+        parse: impl FnOnce(&mut Self) -> Result<T, String>,
+    ) -> Result<T, String> {
+        let saved = std::mem::replace(&mut self.no_struct, no_struct);
+        let result = parse(self);
+        self.no_struct = saved;
+        result
+    }
+
     fn args(&mut self) -> Result<Vec<Ast>, String> {
         self.expect("(")?;
-        let mut args = Vec::new();
-        if self.eat(")") {
-            return Ok(args);
-        }
-        loop {
-            args.push(self.expr()?);
-            if self.eat(")") {
+        self.with_no_struct(false, |p| {
+            let mut args = Vec::new();
+            if p.eat(")") {
                 return Ok(args);
             }
-            self.expect(",")?;
-        }
+            loop {
+                args.push(p.expr()?);
+                if p.eat(")") {
+                    return Ok(args);
+                }
+                p.expect(",")?;
+            }
+        })
     }
 
     fn postfix(&mut self) -> Result<Ast, String> {
@@ -356,7 +373,7 @@ impl Parser {
             }
             Some(Tok::Punct("(")) => {
                 self.pos += 1;
-                let e = self.expr()?;
+                let e = self.with_no_struct(false, Self::expr)?;
                 if self.is(",") {
                     return Err("tuples are not read; name a field instead".to_owned());
                 }
@@ -379,7 +396,7 @@ impl Parser {
                 }
                 "if" => {
                     self.pos += 1;
-                    let cond = self.expr()?;
+                    let cond = self.with_no_struct(true, Self::expr)?;
                     self.expect("{")?;
                     let then = self.expr()?;
                     self.expect("}")?;
@@ -408,7 +425,7 @@ impl Parser {
                         }
                         path.push(self.ident()?);
                     }
-                    if self.is("{") && path.len() > 1 {
+                    if self.is("{") && path.len() > 1 && !self.no_struct {
                         return Err("struct literals are not read".to_owned());
                     }
                     if self.is("(") {
@@ -424,7 +441,7 @@ impl Parser {
 }
 
 fn parse(text: &str) -> Result<Ast, String> {
-    let mut parser = Parser { toks: tokenize(text)?, pos: 0 };
+    let mut parser = Parser { toks: tokenize(text)?, pos: 0, no_struct: false };
     // `assert(P)` and `assert(P);` as well as `P`
     if parser.keyword("assert") && matches!(parser.toks.get(1), Some(Tok::Punct("("))) {
         parser.pos += 1;
@@ -901,6 +918,18 @@ impl<'e, 'a> Lowerer<'e, 'a> {
                 }
             }
         }
+        // What the query applies, or which sorts fit, is a guess at the
+        // reading, and the note says it was one. Spellings of one operation of
+        // one type (`spec_index` and `index`) are no choice between readings.
+        let mut guessed: Option<(&'static str, usize)> = None;
+        let one_type = |candidates: &[Candidate]| {
+            let parent = |c: &Candidate| {
+                let mut segs = segments(&c.source);
+                segs.pop();
+                segs
+            };
+            candidates.iter().all(|c| parent(c) == parent(&candidates[0]))
+        };
         if candidates.len() > 1 {
             let used: Vec<Candidate> = candidates
                 .iter()
@@ -908,6 +937,9 @@ impl<'e, 'a> Lowerer<'e, 'a> {
                 .cloned()
                 .collect();
             if !used.is_empty() {
+                if used.len() < candidates.len() && !one_type(&candidates) {
+                    guessed = Some(("the one this query applies", candidates.len()));
+                }
                 candidates = used;
             }
         }
@@ -920,6 +952,9 @@ impl<'e, 'a> Lowerer<'e, 'a> {
                 .cloned()
                 .collect();
             if !fitting.is_empty() {
+                if fitting.len() < candidates.len() && !one_type(&candidates) {
+                    guessed.get_or_insert(("the one whose parameter sorts fit", candidates.len()));
+                }
                 candidates = fitting;
             }
         }
@@ -948,7 +983,13 @@ impl<'e, 'a> Lowerer<'e, 'a> {
             ));
         }
         let c = candidates.remove(0);
-        if c.source != written
+        if let Some((how, of)) = guessed {
+            self.choices.push(format!(
+                "`{written}` read as {}, of {of} candidates {how}; check lowered_as if the \
+                 arguments have another type",
+                c.source
+            ));
+        } else if c.source != written
             && written != format!(".{}", c.source)
             && !c.source.ends_with(&format!("::{written}"))
         {
@@ -1379,9 +1420,23 @@ mod tests {
             SourceName::Function { name: "vstd::set::Set::len".into(), type_args: 2 },
         );
         names.insert("Add".into(), SourceName::Operator("+".into()));
+        // a struct `P` with field `x` (its plain accessor and the `/?` twin),
+        // another struct `Q` with a field `x`, and a pair's first position
+        names.insert("k!P./P/x".into(), SourceName::Field("x".into()));
+        names.insert("k!P./P/?x".into(), SourceName::Field("x".into()));
+        names.insert("k!Q./Q/x".into(), SourceName::Field("x".into()));
+        names.insert("tuple%2./tuple%2/0".into(), SourceName::Field("0".into()));
+        names.insert("p!".into(), sym("p"));
+        names.insert("q!".into(), sym("q"));
+        names.insert(
+            "vstd!view.View.view.?".into(),
+            SourceName::Function { name: "vstd::view::View::view".into(), type_args: 2 },
+        );
         let int: Typ = Arc::new(TypX::Int);
         let poly: Typ = Arc::new(TypX::Named(Arc::new("Poly".into())));
         let locals = vec![
+            (Arc::new("p!".to_owned()), Arc::new(TypX::Named(Arc::new("k!P.".into())))),
+            (Arc::new("q!".to_owned()), Arc::new(TypX::Named(Arc::new("tuple%2.".into())))),
             (Arc::new("x!".to_owned()), int.clone()),
             (Arc::new("v!".to_owned()), poly),
             (Arc::new("n@".to_owned()), int.clone()),
@@ -1410,6 +1465,14 @@ mod tests {
             ]),
         ));
         occurrences.statement_variables.insert(Arc::new("n$2@".to_owned()));
+        occurrences.applications.push((
+            Arc::new("vstd!view.View.view.?".to_owned()),
+            Arc::new(vec![
+                Arc::new(ExprX::Var(Arc::new("$".to_owned()))),
+                Arc::new(ExprX::Var(Arc::new("NAT".to_owned()))),
+                Arc::new(ExprX::Var(Arc::new("v!".to_owned()))),
+            ]),
+        ));
         // `s` is stated to be a sequence; `v` is boxed with no type stated
         let var = |x: &str| Arc::new(ExprX::Var(Arc::new(x.to_owned())));
         let seq_type = Arc::new(ExprX::Apply(
@@ -1458,6 +1521,16 @@ mod tests {
             "Add" => fun(vec![int.clone(), int.clone()], &int),
             "I" => fun(vec![int.clone()], &poly),
             "%I" => fun(vec![poly.clone()], &int),
+            "k!P./P/x" | "k!P./P/?x" => {
+                fun(vec![Arc::new(TypX::Named(Arc::new("k!P.".into())))], &int)
+            }
+            "k!Q./Q/x" => fun(vec![Arc::new(TypX::Named(Arc::new("k!Q.".into())))], &int),
+            "tuple%2./tuple%2/0" => {
+                fun(vec![Arc::new(TypX::Named(Arc::new("tuple%2.".into())))], &poly)
+            }
+            "vstd!view.View.view.?" => fun(vec![dcr.clone(), t.clone(), poly.clone()], &poly),
+            vir::def::NAT_CLIP => fun(vec![int.clone()], &int),
+            vir::def::U_CLIP | vir::def::I_CLIP => fun(vec![int.clone(), int.clone()], &int),
             _ => None,
         }
     }
@@ -1535,6 +1608,65 @@ mod tests {
             smt,
             "(= (%I (vstd!seq.Seq.index.? $ (UINT 8) (Poly%vstd!seq.Seq<u8.>. t!) (I 0))) 1)"
         );
+    }
+
+    /// A field is the plain accessor of the receiver's datatype, not the
+    /// `/?` twin nor another datatype's field of the same name; a pair's
+    /// position is an accessor too, its boxed value unboxed where compared.
+    #[test]
+    fn fields_read_the_receivers_accessor() {
+        let (smt, choices) = lowered("p.x == 1").unwrap();
+        assert_eq!(smt, "(= (k!P./P/x p!) 1)");
+        assert!(choices.is_empty(), "{choices:?}");
+        let (smt, _) = lowered("q.0 == 1").unwrap();
+        assert_eq!(smt, "(= (%I (tuple%2./tuple%2/0 q!)) 1)");
+    }
+
+    /// `old`, `@` and casts, as Verus writes them in a function body.
+    #[test]
+    fn old_view_and_casts() {
+        let (smt, _) = lowered("old(n) < n").unwrap();
+        assert_eq!(smt, "(< (old snap%PRE n$2@) n$2@)");
+        let (smt, _) = lowered("v@ == s").unwrap();
+        assert_eq!(smt, "(= (vstd!view.View.view.? $ NAT v!) s!)");
+        let (smt, _) = lowered("x as nat >= 0").unwrap();
+        assert_eq!(smt, "(>= (nClip x!) 0)");
+        let (smt, _) = lowered("x as u8 < 256").unwrap();
+        assert_eq!(smt, "(< (uClip 8 x!) 256)");
+        let (smt, _) = lowered("x as i32 < 0 || x as usize >= 0").unwrap();
+        assert_eq!(smt, "(or (< (iClip 32 x!) 0) (>= (uClip SZ x!) 0))");
+        let (smt, _) = lowered("x as int == x").unwrap();
+        assert_eq!(smt, "(= x! x!)");
+    }
+
+    /// When only the query's own applications decide which function a name
+    /// is, the reading is reported: `v`'s type is not stated, and the query
+    /// applies `Seq::len` only, so `v.len()` reads as it with a note.
+    #[test]
+    fn a_reading_the_query_decides_is_reported() {
+        let (names, locals, mut occurrences) = env_parts();
+        occurrences.applications.retain(|(head, _)| **head != "vstd!set.Set.len.?");
+        let env = Env {
+            names: &names,
+            crate_name: "k",
+            locals,
+            declared: &declared,
+            occurrences: &occurrences,
+        };
+        let lowered = lower("v.len() >= 0", &env).unwrap();
+        assert!(
+            lowered.choices.iter().any(|c| c.contains("Seq::len") && c.contains("applies")),
+            "{:?}",
+            lowered.choices
+        );
+    }
+
+    /// In an `if` condition, `{` after a path opens the branch.
+    #[test]
+    fn a_path_can_be_an_if_condition() {
+        let e = parse("if a::b { 1 } else { 2 } == 1").unwrap();
+        assert!(matches!(e, Ast::Bin(Op::Eq, ..)), "{e:?}");
+        assert!(parse("a::B { x: 1 } == c").unwrap_err().contains("struct literals"));
     }
 
     #[test]

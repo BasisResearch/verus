@@ -694,6 +694,33 @@ verus! {
             assert(x == x);
         }
     }
+
+    // A goal among the steps of `assert ... by` is checked where it is:
+    // `P` goes right before it.
+    proof fn scaffold_step(x: int)
+        requires
+            forall|i: int| #[trigger] g(f(i)) == i,
+    {
+        assert(x == x) by {
+            assert(f(x) != f(1 + x));
+        }
+    }
+
+    // A closure body is a dead end too, but no `by` follows its last goal.
+    fn scaffold_closure(x: u64)
+        requires
+            forall|i: int| #[trigger] g(f(i)) == i,
+    {
+        let c = |y: u64| {
+            assert(f(y as int) != f(y as int + 1));
+        };
+    }
+
+    // Two goals fail; Verus reports the earlier first.
+    proof fn scaffold_two_failing(x: int) {
+        assert(x != 7);
+        assert(x > 100);
+    }
 }
 "#;
 
@@ -951,19 +978,46 @@ fn resident_scaffold_addresses_a_goal_without_an_assert_id() {
     cold.finish(true);
 }
 
-/// A goal inside `assert ... by` is checked after the block's steps, and
-/// the reply places the snippet at the block's end, naming no span.
+/// The claim of `assert ... by` is checked after the block's steps, and the
+/// reply places the snippet at the block's end, naming no span. A goal
+/// among the steps, or in a closure body (also a dead end), is placed before
+/// its own span. Of two failing goals, the default is the earlier, as Verus
+/// reports it.
 #[test]
-fn resident_scaffold_places_p_after_a_proof_blocks_steps() {
+fn resident_scaffold_places_p_where_the_goal_is_checked() {
     let mut worker = Worker::start(SCAFFOLD_SOURCE, &[]);
     let ready = worker.receive();
-    let reply = worker.send(json!({"command": "scaffold", "session": ready["session"],
-        "bucket": 0, "query": query_id(&ready, "::scaffold_by"), "assert": SCAFFOLD_CASES[0].0}));
-    assert_eq!(reply["event"], "scaffold", "{}", reply);
-    assert_eq!(reply["target"]["chosen"], "first_failure", "{}", reply);
+    let scaffold = |worker: &mut Worker<ChildStdin>, name: &str, p: &str| {
+        let reply = worker.send(json!({"command": "scaffold", "session": ready["session"],
+            "bucket": 0, "query": query_id(&ready, name), "assert": p}));
+        assert_eq!(reply["event"], "scaffold", "{}", reply);
+        assert_eq!(reply["target"]["chosen"], "first_failure", "{}", reply);
+        reply
+    };
+    let reply = scaffold(&mut worker, "::scaffold_by", SCAFFOLD_CASES[0].0);
     assert_eq!(reply["target"]["placement"], "end_of_proof_block", "{}", reply);
     assert!(reply["target"]["insert_before"].is_null(), "{}", reply);
     assert_eq!(reply["case"], "scaffold", "{}", reply);
+
+    for (name, p, goal) in [
+        ("::scaffold_step", SCAFFOLD_CASES[0].0, "assert(f(x) != f(1 + x));"),
+        (
+            "::scaffold_closure",
+            "g(f(y as int)) == y as int",
+            "assert(f(y as int) != f(y as int + 1));",
+        ),
+    ] {
+        let reply = scaffold(&mut worker, name, p);
+        assert_eq!(reply["target"]["placement"], "before_span", "{}: {}", name, reply);
+        let at = reply["target"]["insert_before"].as_str().unwrap_or_default();
+        assert!(at.contains(&line_of(SCAFFOLD_SOURCE, goal)), "{}: {}", name, reply);
+        assert_eq!(reply["case"], "scaffold", "{}: {}", name, reply);
+    }
+
+    let reply = scaffold(&mut worker, "::scaffold_two_failing", "x > 100");
+    let at = reply["target"]["insert_before"].as_str().unwrap_or_default();
+    assert!(at.contains(&line_of(SCAFFOLD_SOURCE, "assert(x != 7);")), "{}", reply);
+    assert!(reply["query_check"]["rechecks"].as_u64().unwrap() >= 1, "{}", reply);
     worker.send(json!({"command": "close", "session": ready["session"]}));
     worker.finish(false);
 }
@@ -971,7 +1025,7 @@ fn resident_scaffold_places_p_after_a_proof_blocks_steps() {
 /// A matching loop runs the query out of budget, and a resource limit names
 /// no goal: the worker checks each goal alone and takes the first that
 /// fails, here the postcondition. Assuming it closes the goal; proving it
-/// runs out of budget again.
+/// runs out of budget again, which proves nothing, so P is undecided.
 #[test]
 fn resident_scaffold_finds_the_goal_behind_a_resource_limit() {
     let mut worker = Worker::start(BISECT_SOURCE, &["--rlimit", "2"]);
@@ -982,8 +1036,8 @@ fn resident_scaffold_finds_the_goal_behind_a_resource_limit() {
     assert_eq!(reply["query_check"]["result"], "resource_limit", "{}", reply);
     assert_eq!(reply["target"]["chosen"], "first_failing_alone", "{}", reply);
     assert!(reply["target"]["goals_probed"].as_u64().unwrap() >= 1, "{}", reply);
-    assert_eq!(reply["case"], "helpful_but_unprovable", "{}", reply);
-    assert_ne!(reply["p_provable"]["result"], "valid", "{}", reply);
+    assert_eq!(reply["case"], "helpful_but_undecided", "{}", reply);
+    assert_eq!(reply["p_provable"]["result"], "resource_limit", "{}", reply);
     worker.send(json!({"command": "close", "session": ready["session"]}));
     worker.finish(false);
 }

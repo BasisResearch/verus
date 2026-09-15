@@ -55,10 +55,12 @@ pub struct Scaffold {
     /// The target's error message, from its first occurrence. Its spans say
     /// where the target is.
     pub error: ArcDynMessage,
-    /// Whether the target's first occurrence sits inside a dead end, such as
-    /// the proof block of `assert ... by`: `P` is then checked after that
-    /// block's steps, and belongs at its end, not before the statement.
-    pub in_dead_end: bool,
+    /// Whether the target's first occurrence is the last assert of the dead
+    /// end it sits in, as the claim of `assert ... by` is: `P` is then checked
+    /// after that block's steps. A goal among the steps is not. The last
+    /// assert of a closure body ends its dead end too; the source tells the
+    /// two apart.
+    pub ends_dead_end: bool,
 }
 
 /// Which goal of a query to rewrite around.
@@ -77,8 +79,13 @@ struct Found {
     error: Option<ArcDynMessage>,
     /// `Assert` statements passed so far, the index of the next one.
     next_index: usize,
-    dead_ends: usize,
-    in_dead_end: bool,
+    /// The dead ends now open, innermost last, by the order they opened in.
+    open_dead_ends: Vec<usize>,
+    dead_ends_opened: usize,
+    /// The innermost dead end around the target's first occurrence, while it
+    /// is open and no other assert inside it has followed the target.
+    trailing_in: Option<usize>,
+    ends_dead_end: bool,
 }
 
 /// Rewrite `query` for `arm` around `target`. Fails when no goal matches.
@@ -88,15 +95,22 @@ pub fn scaffold_query(
     p: &Expr,
     arm: Arm,
 ) -> Result<Scaffold, String> {
-    let mut found =
-        Found { occurrences: 0, error: None, next_index: 0, dead_ends: 0, in_dead_end: false };
+    let mut found = Found {
+        occurrences: 0,
+        error: None,
+        next_index: 0,
+        open_dead_ends: Vec::new(),
+        dead_ends_opened: 0,
+        trailing_in: None,
+        ends_dead_end: false,
+    };
     let assertion = rewrite(&query.assertion, target, p, arm, &mut found);
     match found.error {
         Some(error) => Ok(Scaffold {
             query: Arc::new(QueryX { local: query.local.clone(), assertion }),
             occurrences: found.occurrences,
             error,
-            in_dead_end: found.in_dead_end,
+            ends_dead_end: found.ends_dead_end,
         }),
         None => Err(match target {
             Target::Id(id) => format!("the query has no goal with assert id {:?}", id),
@@ -113,6 +127,10 @@ fn rewrite(stmt: &Stmt, target: Target<'_>, p: &Expr, arm: Arm, found: &mut Foun
         StmtX::Assert(id, error, filter, expr) => {
             let index = found.next_index;
             found.next_index += 1;
+            if found.trailing_in.take().is_some() {
+                // another assert inside the target's dead end, after it
+                found.ends_dead_end = false;
+            }
             let matches = match target {
                 Target::Id(target) => id.as_ref().is_some_and(|id| **id == target),
                 Target::Index(target) => index == target,
@@ -123,7 +141,8 @@ fn rewrite(stmt: &Stmt, target: Target<'_>, p: &Expr, arm: Arm, found: &mut Foun
             found.occurrences += 1;
             if found.error.is_none() {
                 found.error = Some(error.clone());
-                found.in_dead_end = found.dead_ends > 0;
+                found.trailing_in = found.open_dead_ends.last().copied();
+                found.ends_dead_end = found.trailing_in.is_some();
             }
             match arm {
                 Arm::Provable => {
@@ -138,9 +157,15 @@ fn rewrite(stmt: &Stmt, target: Target<'_>, p: &Expr, arm: Arm, found: &mut Foun
         StmtX::Block(inner) => Arc::new(StmtX::Block(stmts(inner, found))),
         StmtX::Switch(inner) => Arc::new(StmtX::Switch(stmts(inner, found))),
         StmtX::DeadEnd(inner) => {
-            found.dead_ends += 1;
+            let serial = found.dead_ends_opened;
+            found.dead_ends_opened += 1;
+            found.open_dead_ends.push(serial);
             let inner = rewrite(inner, target, p, arm, found);
-            found.dead_ends -= 1;
+            found.open_dead_ends.pop();
+            if found.trailing_in == Some(serial) {
+                // the target's dead end closed with no assert after it
+                found.trailing_in = None;
+            }
             Arc::new(StmtX::DeadEnd(inner))
         }
         StmtX::Breakable(label, inner) => {
@@ -418,7 +443,7 @@ mod tests {
     }
 
     /// A goal without an id, as Verus emits a loop invariant at the loop's
-    /// end, is addressed by its index among the asserts, and one inside a
+    /// end, is addressed by its index among the asserts, and one ending a
     /// dead end says so.
     #[test]
     fn a_goal_without_an_id_is_addressed_by_index() {
@@ -450,9 +475,37 @@ mod tests {
         assert!(provable);
         assert!(original);
         let p = parser.node_to_expr(&one("true")).unwrap();
-        assert!(scaffold_query(query, Target::Index(1), &p, Arm::Provable).unwrap().in_dead_end);
-        assert!(!scaffold_query(query, Target::Index(2), &p, Arm::Provable).unwrap().in_dead_end);
+        assert!(scaffold_query(query, Target::Index(1), &p, Arm::Provable).unwrap().ends_dead_end);
+        assert!(!scaffold_query(query, Target::Index(2), &p, Arm::Provable).unwrap().ends_dead_end);
         assert!(scaffold_query(query, Target::Index(3), &p, Arm::Provable).is_err());
+    }
+
+    /// Only the last assert of a dead end ends it, as the claim of `assert
+    /// ... by` does after the block's steps: a goal among the steps is
+    /// followed by another assert, here one inside a nested dead end.
+    #[test]
+    fn only_a_dead_ends_last_goal_ends_it() {
+        let nodes = nodes(
+            r#"(check-valid
+                (declare-const a Int)
+                (block
+                    (deadend (block
+                        (assert ("step") () (> a 0))
+                        (deadend (block (assert ("inner") () (> a 1))))
+                        (assert ("claim") () (> a 2))))
+                    (assert ("after") () (> a 3))))"#,
+        );
+        let mi = Arc::new(AirMessageInterface {});
+        let parser = Parser::new(mi);
+        let commands = parser.nodes_to_commands(&nodes).unwrap();
+        let CommandX::CheckValid(query) = &*commands[0] else { panic!() };
+        let p = parser.node_to_expr(&one("true")).unwrap();
+        let ends: Vec<bool> = (0..4)
+            .map(|i| {
+                scaffold_query(query, Target::Index(i), &p, Arm::Provable).unwrap().ends_dead_end
+            })
+            .collect();
+        assert_eq!(ends, vec![false, true, true, false]);
     }
 
     /// A goal on both branches of a switch occurs twice, and `P` has to hold

@@ -1494,6 +1494,11 @@ struct ScaffoldRun {
     elapsed_ms: u128,
     /// None from a cvc5 that does not report `:check-effort`.
     cost: Option<CheckCost>,
+    /// For the query's own check: how many checks followed it to find the
+    /// earliest failing goal, as Verus does before reporting one. Their
+    /// time and cost are not in this run's.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rechecks: Option<usize>,
 }
 
 /// The goal a scaffold request placed `P` before.
@@ -1504,7 +1509,8 @@ struct ScaffoldTarget {
     assert_id: Vec<u64>,
     /// Its index among the query's asserts, which a request's `goal` names.
     goal: usize,
-    /// `requested`; `first_failure`, the goal the query's check failed at; or
+    /// `requested`; `first_failure`, the earliest goal the query's check
+    /// fails at, found as Verus finds the error it reports first; or
     /// after a resource limit, which names no goal, `first_failing_alone`,
     /// the first goal whose check alone failed.
     chosen: &'static str,
@@ -1524,7 +1530,8 @@ struct ScaffoldTarget {
     /// `insert_before`; `end_of_body`, at the end of the function body (a
     /// postcondition); `end_of_loop_body` or `before_loop` (a loop
     /// invariant, checked there, which no span names); `end_of_proof_block`
-    /// (a goal inside `assert ... by`, checked after that block's steps).
+    /// (the claim of `assert ... by`, checked after that block's steps; a
+    /// goal among the steps is `before_span`).
     placement: &'static str,
 }
 
@@ -1573,7 +1580,12 @@ struct ScaffoldReport {
     goal_given_p: ScaffoldRun,
     /// `scaffold`, `true_but_unhelpful`, `helpful_but_unprovable`,
     /// `dead_end`, `goal_already_holds`, or under `goal_only`
-    /// `goal_closes_given_p` / `goal_open_given_p`.
+    /// `goal_closes_given_p` / `goal_open_given_p`. When a check the case
+    /// turns on runs out of budget, which proves nothing either way:
+    /// `helpful_but_undecided` (the goal closes under `P`; `P`'s check ran
+    /// out), `unhelpful_and_undecided` (the goal stays open under `P`; `P`'s
+    /// check ran out), `undecided` (the goal's check under `P` ran out), or
+    /// under `goal_only` `goal_undecided_given_p`.
     case: &'static str,
     marginal_cost: Option<MarginalCost>,
     /// When the goal closed under `P` in a provenance session: what that
@@ -1600,13 +1612,18 @@ struct ArmOutcome {
     unknown: Option<air::context::UnknownReason>,
 }
 
-/// Check `query` once in the retained query's scope and finish it. `Ok(Err)`
-/// is a refusal (the query did not type-check, so no scope was opened).
+/// Check `query` once in the retained query's scope and finish it. With
+/// `earliest`, a failure is followed by checks for a failing goal before it,
+/// as Verus runs them before reporting, until none is left: the goal named
+/// is then the earliest failing one, not whichever the model showed first.
+/// `Ok(Err)` is a refusal (the query did not type-check, so no scope was
+/// opened).
 fn scaffold_check(
     air: &mut Context,
     query: &Query,
     rlimit: f32,
     set_rlimit: &impl Fn(&mut Context, f32),
+    earliest: bool,
 ) -> io::Result<Result<ArmOutcome, String>> {
     set_rlimit(air, rlimit);
     let start = Instant::now();
@@ -1624,18 +1641,50 @@ fn scaffold_check(
     drop(air.take_difficulty());
     drop(air.take_inst_pressure());
     drop(air.take_nl_frontier());
-    let (result, assert_id, error) = match outcome {
-        ValidityResult::Valid(_) => (QueryResult::Valid, None, None),
-        ValidityResult::Invalid(_, error, id) => {
-            (QueryResult::Invalid, id.map(|id| (*id).clone()), error)
+    let (result, mut assert_id, mut error, has_model) = match outcome {
+        ValidityResult::Valid(_) => (QueryResult::Valid, None, None, false),
+        ValidityResult::Invalid(model, error, id) => {
+            (QueryResult::Invalid, id.map(|id| (*id).clone()), error, model.is_some())
         }
-        ValidityResult::Canceled => (QueryResult::ResourceLimit, None, None),
+        ValidityResult::Canceled => (QueryResult::ResourceLimit, None, None, false),
         // A query that fails to type-check opens no scope to finish.
         ValidityResult::TypeError(error) => {
             return Ok(Err(format!("AIR rejected the assertion as lowered: {error}")));
         }
         ValidityResult::UnexpectedOutput(error) => return Err(io::Error::other(error)),
     };
+    let mut rechecks = None;
+    // A recheck needs the model of the failure before it.
+    if earliest && has_model {
+        let mut count = 0;
+        loop {
+            count += 1;
+            let again =
+                air.check_valid_again(&QueryDiagnostics::default(), true, QueryContext::default());
+            drop(air.take_provenance());
+            drop(air.take_unknown_reason());
+            drop(air.take_check_effort());
+            drop(air.take_matching_loops());
+            drop(air.take_difficulty());
+            drop(air.take_inst_pressure());
+            drop(air.take_nl_frontier());
+            match again {
+                ValidityResult::Invalid(model, again_error, id) => {
+                    if again_error.is_some() || id.is_some() {
+                        assert_id = id.map(|id| (*id).clone());
+                        error = again_error;
+                    }
+                    if model.is_none() {
+                        break;
+                    }
+                }
+                ValidityResult::UnexpectedOutput(error) => return Err(io::Error::other(error)),
+                // no failing goal before the last one found, or out of budget
+                _ => break,
+            }
+        }
+        rechecks = Some(count);
+    }
     air.finish_query();
     let reason = unknown.as_ref().map(|u| u.reason.clone()).filter(|r| !r.is_empty());
     let cost = effort.filter(|e| e.unparsed.is_none()).map(|e| CheckCost {
@@ -1644,7 +1693,7 @@ fn scaffold_check(
         inst_rounds: e.inst_rounds,
     });
     Ok(Ok(ArmOutcome {
-        run: ScaffoldRun { result, reason, elapsed_ms, cost },
+        run: ScaffoldRun { result, reason, elapsed_ms, cost, rechecks },
         assert_id,
         error,
         provenance,
@@ -1694,6 +1743,35 @@ fn assertion_snippet(text: &str) -> String {
         .and_then(|rest| rest.strip_suffix(')'))
         .unwrap_or(text);
     format!("assert({});", inner.trim())
+}
+
+/// Whether the source right after `span` (`path:line:col: line:col (#n)`,
+/// columns counted in characters from 1, the end just past the span) reads
+/// `by`, after the `)` of `assert(` if there is one: the span is then the
+/// claim of `assert ... by` or `assert forall ... by`. None when the span or
+/// its file cannot be read.
+fn followed_by_by(span: &str) -> Option<bool> {
+    let span = span.split(" (#").next()?;
+    let (start, end) = span.rsplit_once(": ")?;
+    let mut start = start.rsplitn(3, ':');
+    let (_, _, path) = (start.next()?, start.next()?, start.next()?);
+    let (line, col) = end.split_once(':')?;
+    let line: usize = line.trim().parse().ok()?;
+    let col: usize = col.trim().parse().ok()?;
+    let text = std::fs::read_to_string(path).ok()?;
+    let mut lines = text.split_inclusive('\n');
+    let mut offset = 0;
+    for _ in 1..line {
+        offset += lines.next()?.len();
+    }
+    let current = lines.next()?;
+    let within = current.char_indices().nth(col.checked_sub(1)?).map_or(current.len(), |(i, _)| i);
+    let rest = text[offset + within..].trim_start();
+    let rest = rest.strip_prefix(')').unwrap_or(rest).trim_start();
+    Some(
+        rest.strip_prefix("by")
+            .is_some_and(|after| !after.starts_with(|c: char| c.is_alphanumeric() || c == '_')),
+    )
 }
 
 /// Serve a scaffold request for one query of `bucket`, whose address the
@@ -1765,7 +1843,10 @@ fn scaffold_arms(
     use air::scaffold::Arm;
     macro_rules! check {
         ($query:expr) => {
-            match scaffold_check(air, $query, query.rlimit, set_rlimit)? {
+            check!($query, false)
+        };
+        ($query:expr, $earliest:expr) => {
+            match scaffold_check(air, $query, query.rlimit, set_rlimit, $earliest)? {
                 Ok(outcome) => outcome,
                 Err(refusal) => return Ok(Err(refusal)),
             }
@@ -1837,7 +1918,7 @@ fn scaffold_arms(
             }
         },
         (None, None) => {
-            let outcome = check!(&query.query);
+            let outcome = check!(&query.query, true);
             // By id, or by message for a goal without one: a failure's
             // message is the goal's, with labels appended.
             let failed = outcome.assert_id.as_ref().and_then(|id| by_id(id)).or_else(|| {
@@ -1914,14 +1995,38 @@ fn scaffold_arms(
     let goal_given_p = check!(&given.query);
 
     let holds = |run: &ScaffoldRun| run.result == QueryResult::Valid;
-    let case = match (holds(&baseline.run), p_provable.as_ref().map(|p| holds(&p.run))) {
-        (true, _) => "goal_already_holds",
-        (false, Some(true)) if holds(&goal_given_p.run) => "scaffold",
-        (false, Some(true)) => "true_but_unhelpful",
-        (false, Some(false)) if holds(&goal_given_p.run) => "helpful_but_unprovable",
-        (false, Some(false)) => "dead_end",
-        (false, None) if holds(&goal_given_p.run) => "goal_closes_given_p",
-        (false, None) => "goal_open_given_p",
+    // A check that ran out of budget proves nothing either way, so a case
+    // turning on one says so rather than calling P unprovable.
+    #[derive(Clone, Copy)]
+    enum Verdict {
+        Holds,
+        Fails,
+        OutOfBudget,
+    }
+    let verdict = |run: &ScaffoldRun| match run.result {
+        QueryResult::Valid => Verdict::Holds,
+        QueryResult::ResourceLimit => Verdict::OutOfBudget,
+        _ => Verdict::Fails,
+    };
+    let case = {
+        use Verdict::*;
+        match (
+            verdict(&baseline.run),
+            p_provable.as_ref().map(|p| verdict(&p.run)),
+            verdict(&goal_given_p.run),
+        ) {
+            (Holds, _, _) => "goal_already_holds",
+            (_, Some(_), OutOfBudget) => "undecided",
+            (_, Some(Holds), Holds) => "scaffold",
+            (_, Some(Holds), Fails) => "true_but_unhelpful",
+            (_, Some(Fails), Holds) => "helpful_but_unprovable",
+            (_, Some(Fails), Fails) => "dead_end",
+            (_, Some(OutOfBudget), Holds) => "helpful_but_undecided",
+            (_, Some(OutOfBudget), Fails) => "unhelpful_and_undecided",
+            (_, None, Holds) => "goal_closes_given_p",
+            (_, None, Fails) => "goal_open_given_p",
+            (_, None, OutOfBudget) => "goal_undecided_given_p",
+        }
     };
     let marginal_cost = match (baseline.run.cost, goal_given_p.run.cost) {
         (Some(before), Some(after)) => Some(MarginalCost {
@@ -1985,12 +2090,17 @@ fn scaffold_arms(
         .unwrap_or_default();
     let primary = message.and_then(|m| m.spans.first()).map(|s| s.as_string.clone());
     let description = message.map(|m| m.note.clone()).unwrap_or_default();
-    // Where the snippet goes. A goal inside `assert ... by` is checked after
-    // that block's steps; a postcondition at the end of the body, which its
-    // label names; a loop invariant at the end of the loop body or before
-    // the loop, which no span names, or at the break or continue its span
-    // is; anything else at its own span.
-    let (insert_before, placement) = if given.in_dead_end {
+    // Where the snippet goes. The claim of `assert ... by` is checked after
+    // that block's steps: it ends its dead end, and `by` follows its span. A
+    // closure body's last assert ends one too, with no `by`; when the source
+    // cannot be read, the dead end decides. A postcondition goes at the end
+    // of the body, which its label names; a loop invariant at the end of the
+    // loop body or before the loop, which no span names, or at the break or
+    // continue its span is; anything else, a step of a proof block included,
+    // at its own span.
+    let claim_of_assert_by =
+        given.ends_dead_end && primary.as_deref().and_then(followed_by_by).unwrap_or(true);
+    let (insert_before, placement) = if claim_of_assert_by {
         (None, "end_of_proof_block")
     } else if description.contains("postcondition") {
         let end = labels
