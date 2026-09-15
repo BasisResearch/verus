@@ -1836,6 +1836,9 @@ impl Verifier {
         let initial_batches = bucket_context.len();
 
         let mut resident = self.args.resident.then(crate::resident::QueryJournal::new);
+        if let Some(journal) = &mut resident {
+            journal.record_base(bucket_context.iter().map(|batch| batch.commands.clone()));
+        }
         let mut resident_spinoffs = Vec::new();
 
         let bucket = self.get_bucket(bucket_id);
@@ -1962,6 +1965,13 @@ impl Verifier {
 
                             let mut spinoff_journal = (retain_queries && do_spinoff)
                                 .then(crate::resident::QueryJournal::new);
+                            // A spinoff solver starts from the whole bucket
+                            // context so far, below its journal's scopes.
+                            if let Some(journal) = &mut spinoff_journal {
+                                journal.record_base(
+                                    bucket_context.iter().map(|batch| batch.commands.clone()),
+                                );
+                            }
 
                             let profile_file_name = if *profile_rerun
                                 || ((self.args.profile_all || self.args.capture_profiles)

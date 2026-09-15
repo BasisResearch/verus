@@ -26,6 +26,10 @@ pub const ABLATE_GUARD: &str = "%%ablate_guard%%";
 /// An ablation probe's switch that turns every goal into `false`, asking
 /// whether the assumptions alone are contradictory.
 pub const ABLATE_VACUITY: &str = "%%ablate_vacuity%%";
+/// A twin's vacuity switch: an unconstrained boolean each goal `e` is
+/// checked as `(and switch e)`, so the check is valid only where the
+/// context contradicts itself, with `e`'s terms still there to match on.
+pub const TWIN_OFF: &str = "%%twin_off%%";
 pub const SKOLEM_ID_PREFIX: &str = "skolem";
 pub const ARRAY_QID: &str = "__AIR_ARRAY_QID__";
 

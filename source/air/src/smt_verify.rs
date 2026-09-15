@@ -214,6 +214,7 @@ pub(crate) fn smt_check_assertion<'ctx>(
     // previous check's pressure or difficulty behind for its caller to take
     context.last_inst_pressure = None;
     context.last_difficulty = None;
+    context.last_branch_profile = None;
     context.last_check_effort = None;
     context.last_strategy_rung = None;
     // One check only: a later error round runs the default schedule.
@@ -326,6 +327,10 @@ pub(crate) fn smt_check_assertion<'ctx>(
         // in the same batch, right after the answer it describes
         context.smt_log.log_get_info("inst-pressure");
     }
+    if context.branch_profile {
+        // in the same batch, right after the answer it describes
+        context.smt_log.log_get_info("branch-profile");
+    }
     if context.check_effort {
         // in the same batch, right after the answer it describes
         context.smt_log.log_get_info("check-effort");
@@ -393,6 +398,7 @@ pub(crate) fn smt_check_assertion<'ctx>(
     let mut nl_frontier = None;
     let mut egraph_lines: Vec<String> = Vec::new();
     let mut inst_pressure = None;
+    let mut branch_profile = None;
     let mut check_effort = None;
     let mut strategy_rung = None;
     for line in smt_output {
@@ -407,7 +413,7 @@ pub(crate) fn smt_check_assertion<'ctx>(
             continue;
         }
         // The keys come in the order they were asked, difficulty first, then
-        // nl-frontier and inst-pressure, so a cvc5 without them answers
+        // nl-frontier, inst-pressure and branch-profile, so a cvc5 without them answers
         // `unsupported` to each in turn and these branches take them in order.
         if context.difficulty && line.starts_with("(:difficulty-gradient ") {
             difficulty = Some(parse_difficulty_gradient(&line));
@@ -429,6 +435,12 @@ pub(crate) fn smt_check_assertion<'ctx>(
             // a cvc5 without the key; say so rather than fail the query
             inst_pressure =
                 Some(crate::context::InstPressure { unparsed: Some(line), ..Default::default() });
+        } else if context.branch_profile && line.starts_with("(:branch-profile ") {
+            branch_profile = Some(parse_branch_profile(&line));
+        } else if context.branch_profile && branch_profile.is_none() && line == "unsupported" {
+            // a cvc5 without the key; say so rather than fail the query
+            branch_profile =
+                Some(crate::context::BranchProfile { unparsed: Some(line), ..Default::default() });
         } else if context.check_effort && line.starts_with("(:check-effort ") {
             check_effort = Some(parse_check_effort(&line));
         } else if context.check_effort && check_effort.is_none() && line == "unsupported" {
@@ -483,6 +495,7 @@ pub(crate) fn smt_check_assertion<'ctx>(
     context.last_nl_frontier = nl_frontier;
     context.last_difficulty = difficulty;
     context.last_inst_pressure = inst_pressure;
+    context.last_branch_profile = branch_profile;
     context.last_check_effort = check_effort;
     if egraph_asked {
         context.last_egraph = Some(parse_egraph_lines(&egraph_lines));
@@ -1166,6 +1179,87 @@ fn parse_quant_pressure(row: &sise::TreeNode) -> Option<crate::context::QuantPre
             ":first-round" => q.first_round = Some(n),
             ":last-round" => q.last_round = Some(n),
             ":refutation" => q.refutation = Some(n),
+            _ => {}
+        }
+    }
+    Some(q)
+}
+
+/// Parse cvc5's `(:branch-profile (:resource-units N :resource-limit N
+/// :rounds N :quantifiers (ROW ...)))`, where each ROW is `(qid [:named
+/// false] :instantiations N :inferences ((ID N) ...))`. Unknown keys are
+/// skipped; a reply that does not parse is kept whole in `unparsed`.
+pub(crate) fn parse_branch_profile(line: &str) -> crate::context::BranchProfile {
+    use sise::TreeNode;
+    let mut out = crate::context::BranchProfile::default();
+    let fields = match read_smt_sexp(line) {
+        Some(TreeNode::List(items)) => match &items[..] {
+            [TreeNode::Atom(key), TreeNode::List(fields)] if key == ":branch-profile" => {
+                fields.clone()
+            }
+            _ => Vec::new(),
+        },
+        _ => Vec::new(),
+    };
+    if fields.is_empty() {
+        out.unparsed = Some(line.to_owned());
+        return out;
+    }
+    let mut bad = false;
+    for pair in fields.chunks(2) {
+        match pair {
+            [TreeNode::Atom(k), TreeNode::Atom(v)] => {
+                let Some(n) = difficulty_count(v) else {
+                    bad = true;
+                    continue;
+                };
+                match k.as_str() {
+                    ":resource-units" => out.resource_units = n,
+                    ":resource-limit" => out.resource_limit = n,
+                    ":rounds" => out.rounds = n,
+                    _ => {}
+                }
+            }
+            [TreeNode::Atom(k), TreeNode::List(rows)] if k == ":quantifiers" => {
+                for row in rows {
+                    match parse_quant_inferences(row) {
+                        Some(q) => out.quantifiers.push(q),
+                        None => bad = true,
+                    }
+                }
+            }
+            [_] => bad = true,
+            _ => {}
+        }
+    }
+    if bad {
+        out.unparsed = Some(line.to_owned());
+    }
+    out
+}
+
+/// One `(qid [:named false] :instantiations N :inferences ((ID N) ...))` row
+/// of `(get-info :branch-profile)`.
+fn parse_quant_inferences(row: &sise::TreeNode) -> Option<crate::context::QuantInferences> {
+    use sise::TreeNode;
+    let TreeNode::List(items) = row else { return None };
+    let (TreeNode::Atom(qid), rest) = items.split_first()? else { return None };
+    let mut q =
+        crate::context::QuantInferences { qid: qid.to_owned(), named: true, ..Default::default() };
+    for pair in rest.chunks(2) {
+        match pair {
+            [TreeNode::Atom(k), TreeNode::Atom(v)] if k == ":named" => q.named = v != "false",
+            [TreeNode::Atom(k), TreeNode::Atom(v)] if k == ":instantiations" => {
+                q.instantiations = difficulty_count(v)?
+            }
+            [TreeNode::Atom(k), TreeNode::List(ids)] if k == ":inferences" => {
+                for id in ids {
+                    let TreeNode::List(pair) = id else { return None };
+                    let [TreeNode::Atom(name), TreeNode::Atom(n)] = &pair[..] else { return None };
+                    q.inferences.push((name.to_owned(), difficulty_count(n)?));
+                }
+            }
+            [_] => return None,
             _ => {}
         }
     }
