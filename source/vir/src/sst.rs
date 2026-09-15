@@ -34,6 +34,9 @@ pub struct BndInfoUser {
 pub enum QuantRole {
     /// A spec function's defining equation
     Definition,
+    /// The defining equation of a function's requires, ensures or mask
+    /// predicate (`req%f`, `ens%f`), which a call assumes or asserts
+    Contract,
     /// One unfolding step of a recursive spec function (costs fuel)
     DefinitionUnfold,
     /// A recursive spec function at zero fuel, where unfolding stops

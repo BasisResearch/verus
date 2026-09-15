@@ -43,6 +43,19 @@
 //! the hypothesis closed the query (it failed without it, and again right
 //! after), whether it introduced a matching loop, and what source to paste.
 //! No probe verdict is a `checked` one, and no probe saves a certificate.
+//!
+//! An `ablate` request delta-debugs a retained query's axioms and hypotheses
+//! (see `air::bisect`). Its declaration-prefix axioms are asserted below the
+//! query's scope, so the solver's journal is popped back to the prelude and
+//! the prefix asserted again in a scope of the ablation's own, each axiom a
+//! function or broadcast group owns guarded by that group's switch. After the
+//! search, vacuity probes ask goal by goal, last goal first, whether the
+//! assumptions are contradictory where that goal is checked, and for a
+//! vacuous goal whether every goal is, with the contradiction already there
+//! before the first goal of every path. The witness is checked once more the
+//! ordinary way, with
+//! its removed axioms never asserted. Every scope is popped before the reply;
+//! the next request restores its own prefix.
 
 mod twin;
 
@@ -164,6 +177,7 @@ const COMMANDS: &[&str] = &[
     "list",
     "check",
     "bisect",
+    "ablate",
     "egraph",
     "scaffold",
     "close",
@@ -200,6 +214,27 @@ enum Request {
         kinds: Option<Vec<BisectKind>>,
         /// Only units whose `AssertId` starts with this prefix.
         under: Option<Vec<u64>>,
+    },
+    /// Switch the query's declaration-prefix axioms (grouped by the function
+    /// or broadcast group that owns them) and its hypotheses on and off to
+    /// find a witness: what to remove for the query to be proved, or what
+    /// its proof cannot lose (see `air::bisect`, ablation).
+    Ablate {
+        session: String,
+        bucket: BucketIndex,
+        query: QueryId,
+        mode: AblateMode,
+        /// At most this many search probes, 1..=`MAX_BISECT_CHECKS`. The
+        /// vacuity and absence checks that follow the search are extra.
+        budget_checks: Option<usize>,
+        /// Also switch the query's own hypotheses (requires, type invariants,
+        /// fuel, trait bounds). Default true.
+        hypotheses: Option<bool>,
+        /// Units (by index, as `candidate_units` of an earlier reply about
+        /// this query lists them) to leave switched on: they are no
+        /// candidates. Lets a caller search past a witness the absence
+        /// check disowned.
+        exclude: Option<Vec<usize>>,
     },
     Egraph {
         session: String,
@@ -368,6 +403,7 @@ impl BisectKind {
             air::bisect::UnitKind::Hypothesis => Self::Hypothesis,
             air::bisect::UnitKind::Goal => Self::Goal,
             air::bisect::UnitKind::Fact => Self::Fact,
+            air::bisect::UnitKind::Axiom => unreachable!("bisect probers switch no prefix axioms"),
         }
     }
 }
@@ -434,6 +470,12 @@ impl RetainedBucket {
         // primary context need not stay alive when every query was spun off.
         if !journal.queries.is_empty() || spinoffs.is_empty() {
             states.push(SolverState::new(air, journal));
+        } else {
+            // Dropping the context pops nothing, so pop its journal first:
+            // the solver, and its log, end at the prelude. A complaint from
+            // a solver about to be closed is of no use.
+            let (mut air, mut journal) = (air, journal);
+            let _ = journal.restore_prefix(&mut air, 0);
         }
         states.append(&mut spinoffs);
         let mut queries = Vec::new();
@@ -711,6 +753,13 @@ enum Response<'a> {
         query: QueryId,
         #[serde(flatten)]
         report: BisectReport,
+    },
+    Ablated {
+        session: &'a str,
+        bucket: BucketIndex,
+        query: QueryId,
+        #[serde(flatten)]
+        report: Box<AblateReport>,
     },
     Egraph {
         session: &'a str,
@@ -1103,6 +1152,7 @@ fn bisect(
                     None => (String::new(), None, Vec::new()),
                 }
             }
+            UnitKind::Axiom => unreachable!("bisect probers switch no prefix axioms"),
         };
         BisectUnit {
             index,
@@ -1146,6 +1196,681 @@ fn bisect(
             .collect(),
         elapsed_ms: 0,
         restore_ms: 0,
+    })
+}
+
+#[derive(Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum AblateMode {
+    /// `load_bearing` when the probe with nothing removed is valid, else
+    /// `minimal_removal`.
+    Auto,
+    /// The smallest set whose removal makes the query valid.
+    MinimalRemoval,
+    /// For a valid query, the smallest set its proof cannot lose.
+    LoadBearing,
+}
+
+const DEFAULT_ABLATE_CHECKS: usize = 32;
+/// At most this many members of a vacuous load-bearing set are probed for
+/// their part in the contradiction.
+const MAX_PARTICIPATION_CHECKS: usize = 16;
+/// At most this many goals are probed for vacuity per configuration.
+const MAX_VACUITY_GOAL_CHECKS: usize = 8;
+
+/// One switchable part an ablation names: a group of declaration-prefix
+/// axioms, or one of the query's hypotheses.
+#[derive(Serialize)]
+struct AblationUnit {
+    /// Position among the query's units; probes name units by it.
+    index: usize,
+    /// `axiom_group` or `hypothesis`.
+    kind: &'static str,
+    /// An axiom group's owner (a function or broadcast group), or a
+    /// hypothesis's kind (`requires`, `type_invariant`, `fuel`, `trait_bound`).
+    name: String,
+    /// `broadcast` for a broadcast lemma's or group's axioms; otherwise the
+    /// roles the encoder recorded for the group's quantifiers (`definition`,
+    /// `definition_unfold`, `definition_base`, `return_type_invariant`, and
+    /// `contract` for the requires and ensures a call of the function uses).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    roles: Vec<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    span: Option<String>,
+    /// How many prefix axioms an axiom group switches.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    axioms: Option<usize>,
+    /// The `:qid`s of the unit's quantifiers.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    qids: Vec<String>,
+    /// Instances of those quantifiers during the probe with nothing removed,
+    /// when the solver reports them (cvc5). Zero: no part in that search.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    instantiations_before: Option<u64>,
+    /// The same during the probe of the witness, for a unit it keeps.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    instantiations_with_witness: Option<u64>,
+}
+
+/// A probe's answer, with cvc5's `IncompleteId` for an incomplete one.
+#[derive(Serialize)]
+struct AblationVerdict {
+    #[serde(flatten)]
+    verdict: ProbeVerdict,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    incomplete_id: Option<String>,
+}
+
+/// Whether the assumptions are contradictory where a goal is checked:
+/// probes with one goal replaced by `false` and the other goals switched
+/// off, where `valid` means no path reaches that goal consistently, so the
+/// goal is proved vacuously. Goals are probed last first, up to
+/// `MAX_VACUITY_GOAL_CHECKS` per configuration, and the scan stops at the
+/// first probe that runs out of resources. With quantifiers in the context
+/// the solver can rarely show assumptions consistent, so `unknown` is the
+/// usual answer when no contradiction was found.
+#[derive(Serialize)]
+struct Vacuity {
+    /// Nothing removed: `valid` when some goal's assumptions are
+    /// contradictory, `invalid` when every goal's were shown consistent, else
+    /// `unknown`.
+    before: ProbeVerdict,
+    /// The same for the witness configuration; absent without a witness.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    witness: Option<ProbeVerdict>,
+    /// Either configuration has a goal with contradictory assumptions.
+    vacuous: bool,
+    /// That goal: the witness configuration's when it is vacuous (the one
+    /// `participated` is about), else the one found with nothing removed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    goal: Option<AblationGoal>,
+    /// With a vacuous `goal`, the same configuration with every goal `false`
+    /// at once, which counts only the first goal on each path: `valid` when
+    /// the assumptions before the first goal of every path contradict, so
+    /// every goal is vacuous, as when the requires or the broadcast lemmas
+    /// in use contradict each other. Otherwise the contradiction was not
+    /// found without what the vacuous goal's path adds: a branch condition
+    /// that cannot hold (as in a proof by contradiction), an `assume`, or a
+    /// called lemma's `ensures`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    every_goal: Option<ProbeVerdict>,
+    /// Goals in the query.
+    goals: usize,
+    /// Goals no vacuity probe reached when none was found vacuous: past the
+    /// cap, or after a probe that ran out of resources.
+    #[serde(skip_serializing_if = "is_zero")]
+    goals_unchecked: u64,
+    /// For a vacuous load-bearing set, the members whose removal alone makes
+    /// the assumptions at `goal` consistent again: the ones the
+    /// contradiction needs.
+    participated: Vec<usize>,
+    /// Members not probed for participation, past `MAX_PARTICIPATION_CHECKS`.
+    #[serde(skip_serializing_if = "is_zero")]
+    participation_unchecked: u64,
+}
+
+/// The witness configuration checked the ordinary way, with the removed
+/// axioms and hypotheses never asserted rather than switched off.
+#[derive(Serialize)]
+struct AbsenceCheck {
+    result: QueryResult,
+    /// Whether it agrees with the witness probe about validity.
+    agrees: bool,
+    elapsed_ms: u128,
+}
+
+/// The reply to an ablate request. Every verdict after `verdict_before` is
+/// about a query with fewer axioms or hypotheses than the original, never
+/// about the original itself.
+#[derive(Serialize)]
+struct AblateReport {
+    requested: AblateMode,
+    /// The mode searched, after `auto`.
+    mode: AblateMode,
+    /// `found`, `already_at_target`, `unreachable`, `not_valid`,
+    /// `no_candidates` or `budget_exhausted`, as for bisect.
+    status: &'static str,
+    /// `minimal_removal_that_proves`, `load_bearing_set`, or `none`.
+    result: &'static str,
+    /// The probe with nothing removed. Axioms and hypotheses are guarded, so
+    /// near the resource limit it can differ from an ordinary check.
+    verdict_before: Option<AblationVerdict>,
+    /// minimal_removal: the units whose removal makes the query valid.
+    /// load_bearing: the units that must stay, every other candidate removed.
+    witness: Vec<AblationUnit>,
+    /// Every candidate, by the index `probes` and `participated` use, so a
+    /// reply without a witness still says what was tried, and a caller can
+    /// name units to `exclude`.
+    candidate_units: Vec<AblationUnit>,
+    /// The request's `exclude`: units left switched on.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    excluded: Vec<usize>,
+    /// The probe of the witness configuration; null without a witness.
+    verdict_with_witness: Option<AblationVerdict>,
+    verdict_all_removed: Option<ProbeVerdict>,
+    /// Restoring (minimal_removal) or removing (load_bearing) any one member
+    /// was probed and loses the result. False when the budget ran out first.
+    minimal: bool,
+    non_monotone: bool,
+    /// load_bearing only: the search started from the units the probe with
+    /// nothing removed instantiated (and those with no quantifier), because
+    /// they alone kept the query valid.
+    started_from_instantiated: bool,
+    vacuity: Vacuity,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    absence_check: Option<AbsenceCheck>,
+    /// Search probes, counted against `budget_checks`.
+    checks_used: usize,
+    /// Vacuity probes and the absence check, not counted against it.
+    extra_checks: usize,
+    budget_checks: usize,
+    candidates: usize,
+    axiom_groups: usize,
+    /// Axioms in the query's declaration prefix, and how many of them the
+    /// axiom groups switch; the rest (datatypes, the encoding's own axioms)
+    /// stay asserted.
+    prefix_axioms: usize,
+    switched_axioms: usize,
+    probes: Vec<BisectProbe>,
+    elapsed_ms: u128,
+    restore_ms: u128,
+}
+
+struct AblateRequest {
+    mode: AblateMode,
+    budget: usize,
+    hypotheses: bool,
+    exclude: Vec<usize>,
+}
+
+/// A goal the vacuity probes name.
+#[derive(Serialize)]
+struct AblationGoal {
+    /// Position among the query's units.
+    index: usize,
+    /// The goal's error message (`assertion failed`, ...).
+    description: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    span: Option<String>,
+}
+
+/// What the vacuity probes found in one configuration.
+struct VacuityScan {
+    /// `valid` when some goal's assumptions are contradictory (that goal's
+    /// probe), `invalid` when every goal's were shown consistent, else
+    /// `unknown`.
+    answer: air::bisect::Answer,
+    /// The goal whose assumptions are contradictory.
+    goal: Option<usize>,
+    /// Goals not probed, past `MAX_VACUITY_GOAL_CHECKS` or after a probe
+    /// that ran out of resources.
+    unchecked: usize,
+}
+
+/// Ask goal by goal whether the assumptions left under `removed` are
+/// contradictory where the goal is checked: that goal replaced by `false`,
+/// every other goal switched off, so an earlier goal reaches it only as the
+/// fact it leaves. `goals` is the order to probe in, last goal first:
+/// assumptions accumulate along a path, so a later goal is the likelier to
+/// see a contradiction. Stops at the first goal whose probe is `valid`, and
+/// at the first that runs out of resources: the goals before it rarely fare
+/// better under the same budget, and each probe can cost the whole budget.
+/// Without goals, one probe asks about the assumptions alone.
+fn scan_vacuity(
+    prober: &mut air::bisect::Prober<'_>,
+    goals: &[usize],
+    removed: &[usize],
+    checks: &mut usize,
+) -> Result<VacuityScan, String> {
+    use air::bisect::Answer;
+    let count = prober.units().len();
+    let mask = |off: &[usize]| {
+        let mut mask = vec![false; count];
+        for &i in off {
+            mask[i] = true;
+        }
+        mask
+    };
+    if goals.is_empty() {
+        let answer = prober.probe_vacuity(&mask(removed))?;
+        *checks += 1;
+        return Ok(VacuityScan { answer, goal: None, unchecked: 0 });
+    }
+    let mut unknown = None;
+    for (n, &goal) in goals.iter().enumerate() {
+        if n >= MAX_VACUITY_GOAL_CHECKS {
+            let unchecked = goals.len() - n;
+            let answer =
+                unknown.unwrap_or_else(|| Answer::Unknown(format!("{unchecked} goals unchecked")));
+            return Ok(VacuityScan { answer, goal: None, unchecked });
+        }
+        let mut off = removed.to_vec();
+        off.extend(goals.iter().copied().filter(|&g| g != goal));
+        let answer = prober.probe_vacuity(&mask(&off))?;
+        *checks += 1;
+        if answer == Answer::Valid {
+            return Ok(VacuityScan { answer, goal: Some(goal), unchecked: 0 });
+        }
+        if answer.class() == "resource_limit" {
+            let unchecked = goals.len() - n - 1;
+            return Ok(VacuityScan { answer, goal: None, unchecked });
+        }
+        if answer != Answer::Invalid && unknown.is_none() {
+            unknown = Some(answer);
+        }
+    }
+    Ok(VacuityScan { answer: unknown.unwrap_or(Answer::Invalid), goal: None, unchecked: 0 })
+}
+
+/// The sorted indices a probe mask switches off.
+fn switched_off(disabled: &[bool]) -> Vec<usize> {
+    disabled.iter().enumerate().filter(|(_, off)| **off).map(|(i, _)| i).collect()
+}
+
+/// Run one ablation over `query` in `air`, whose journal must be popped back
+/// to the prelude, given the declarations of the query's prefix. Every scope
+/// it opens is popped before it returns.
+fn ablate(
+    air: &mut Context,
+    prefix: &[air::ast::Decl],
+    query: &RetainedQuery,
+    symbols: Option<&crate::provenance::Symbols>,
+    request: AblateRequest,
+) -> io::Result<AblateReport> {
+    use air::bisect::{Answer, Mode, ProbeDetail, Status, Target, UnitKind};
+    let group_of = |axiom: &air::ast::Axiom| -> Option<String> {
+        symbols.and_then(|symbols| symbols.axiom_group(axiom)).map(str::to_owned)
+    };
+    let mut prober = air
+        .ablate_query(prefix, &mut |axiom| group_of(axiom), &query.query)
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    let units = prober.units().to_vec();
+    let count = units.len();
+    let no_candidate = |&&i: &&usize| {
+        i >= count
+            || match units[i].kind {
+                UnitKind::Axiom => false,
+                UnitKind::Hypothesis => !request.hypotheses,
+                UnitKind::Goal | UnitKind::Fact => true,
+            }
+    };
+    if let Some(index) = request.exclude.iter().find(no_candidate) {
+        // A bad request, not a failure of the session.
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "exclude names unit {index}, which is no candidate: the query has {count} \
+                 units, its goals and facts are never switched, and its hypotheses are not \
+                 with hypotheses: false"
+            ),
+        ));
+    }
+    let mask = |removed: &[usize]| {
+        let mut mask = vec![false; count];
+        for &i in removed {
+            mask[i] = true;
+        }
+        mask
+    };
+    let mut details: HashMap<Vec<usize>, ProbeDetail> = HashMap::new();
+    let (before, detail) = prober.probe_detailed(&mask(&[])).map_err(io::Error::other)?;
+    details.insert(Vec::new(), detail);
+    let mode = match request.mode {
+        AblateMode::Auto if before == Answer::Valid => AblateMode::LoadBearing,
+        AblateMode::Auto => AblateMode::MinimalRemoval,
+        mode => mode,
+    };
+    let candidates: Vec<usize> = (0..count)
+        .filter(|&i| match units[i].kind {
+            UnitKind::Axiom => true,
+            UnitKind::Hypothesis => request.hypotheses,
+            UnitKind::Goal | UnitKind::Fact => false,
+        })
+        .filter(|i| !request.exclude.contains(i))
+        .collect();
+    let search_mode = match mode {
+        AblateMode::LoadBearing => Mode::Core,
+        _ => Mode::Flip(Target::Valid),
+    };
+    // Should removing everything overshoot, single units are tried most
+    // instantiated first: a matching loop's lemma leads. A core search first
+    // tries keeping only what the probe with nothing removed instantiated,
+    // with the units that have no quantifier to instantiate: a proof's
+    // instantiation stream names what it used, and ddmin then shrinks a set
+    // of a few dozen rather than every group in the prefix.
+    let mut order = candidates.clone();
+    let mut core_start = Vec::new();
+    if let Some(counts) = details.get(&Vec::new()).and_then(|d| d.instantiations.as_ref()) {
+        let weight = |i: usize| -> u64 {
+            units[i].qids.iter().map(|qid| counts.get(qid).copied().unwrap_or(0)).sum()
+        };
+        order.sort_by_key(|&i| std::cmp::Reverse(weight(i)));
+        core_start = candidates
+            .iter()
+            .copied()
+            .filter(|&i| units[i].qids.is_empty() || weight(i) > 0)
+            .collect();
+    }
+    let outcome = air::bisect::search_ordered(
+        search_mode,
+        count,
+        &candidates,
+        &order,
+        &core_start,
+        request.budget,
+        Some(before),
+        &mut |disabled| -> Result<Answer, String> {
+            let (answer, detail) = prober.probe_detailed(disabled)?;
+            details.insert(switched_off(disabled), detail);
+            Ok(answer)
+        },
+    )
+    .map_err(io::Error::other)?;
+    // The witness configuration: the units it switches off.
+    let witness_removed = (outcome.status == Status::Found).then(|| match mode {
+        AblateMode::LoadBearing => {
+            candidates.iter().copied().filter(|i| !outcome.set.contains(i)).collect::<Vec<_>>()
+        }
+        _ => outcome.set.clone(),
+    });
+
+    // Goal units, last goal first.
+    let goals: Vec<usize> = (0..count).filter(|&i| units[i].kind == UnitKind::Goal).rev().collect();
+    let mut extra_checks = 0;
+    let vacuity_before =
+        scan_vacuity(&mut prober, &goals, &[], &mut extra_checks).map_err(io::Error::other)?;
+    let mut vacuity_witness = None;
+    let mut participated = Vec::new();
+    let mut participation_unchecked = 0;
+    if let Some(removed) = &witness_removed {
+        let scan = scan_vacuity(&mut prober, &goals, removed, &mut extra_checks)
+            .map_err(io::Error::other)?;
+        // A removal leaves its members out of the contradiction by
+        // definition; only kept members can take part in it. Each is tried
+        // at the goal the scan found contradictory.
+        if scan.answer == Answer::Valid && mode == AblateMode::LoadBearing {
+            let others: Vec<usize> =
+                goals.iter().copied().filter(|&g| Some(g) != scan.goal).collect();
+            for (n, &member) in outcome.set.iter().enumerate() {
+                if n >= MAX_PARTICIPATION_CHECKS {
+                    participation_unchecked = (outcome.set.len() - n) as u64;
+                    break;
+                }
+                let mut without = removed.clone();
+                without.extend(&others);
+                without.push(member);
+                let answer = prober.probe_vacuity(&mask(&without)).map_err(io::Error::other)?;
+                extra_checks += 1;
+                if answer != Answer::Valid {
+                    participated.push(member);
+                }
+            }
+        }
+        vacuity_witness = Some(scan);
+    }
+    // Where a goal is vacuous, whether every goal is: every goal false at
+    // once counts only the first goal on each path, so this is valid only
+    // when the contradiction is there before any path's first goal.
+    let vacuous_config = match &vacuity_witness {
+        Some(scan) if scan.answer == Answer::Valid => witness_removed.clone(),
+        _ if vacuity_before.answer == Answer::Valid => Some(Vec::new()),
+        _ => None,
+    };
+    let every_goal = match vacuous_config {
+        // with one goal, the scan's probe was this one
+        Some(_) if goals.len() == 1 => Some(Answer::Valid),
+        Some(removed) => {
+            let answer = prober.probe_vacuity(&mask(&removed)).map_err(io::Error::other)?;
+            extra_checks += 1;
+            Some(answer)
+        }
+        None => None,
+    };
+    drop(prober);
+
+    let absence_check = match &witness_removed {
+        Some(removed) => {
+            let probed_valid = outcome.after == Some(Answer::Valid);
+            let check =
+                absence_check(air, prefix, query, &group_of, &units, removed, probed_valid)?;
+            extra_checks += 1;
+            Some(check)
+        }
+        None => None,
+    };
+
+    let fun = &query.context.fun;
+    let instantiations = |index: usize, removed: &[usize]| -> Option<u64> {
+        let unit = &units[index];
+        if unit.qids.is_empty() {
+            return None;
+        }
+        let counts = details.get(removed)?.instantiations.as_ref()?;
+        Some(unit.qids.iter().map(|qid| counts.get(qid).copied().unwrap_or(0)).sum())
+    };
+    let describe = |index: usize| {
+        let unit = &units[index];
+        let (kind, name, span) = match unit.kind {
+            UnitKind::Axiom => {
+                let name = unit.group.clone().unwrap_or_default();
+                let span = symbols.and_then(|s| s.function_span(&name)).map(str::to_owned);
+                ("axiom_group", name, span)
+            }
+            _ => {
+                let found = match &unit.tag {
+                    Some(air::def::ProvenanceTag::Hyp(air::def::HypId(k))) => {
+                        symbols.and_then(|symbols| symbols.hypothesis(fun, *k))
+                    }
+                    _ => None,
+                };
+                match found {
+                    Some((kind, span)) => ("hypothesis", kind.to_owned(), Some(span.to_owned())),
+                    None => ("hypothesis", "hypothesis".to_owned(), None),
+                }
+            }
+        };
+        let mut roles: Vec<&'static str> = Vec::new();
+        let broadcast = unit.tag.as_ref().is_some_and(|tag| {
+            symbols.is_some_and(|symbols| symbols.broadcast_owner(tag).is_some())
+        });
+        if unit.kind == UnitKind::Axiom && broadcast {
+            // A lemma's group also defines its `ens%` predicate, a
+            // `definition` that is not what the lemma is.
+            roles.push("broadcast");
+        } else if unit.kind == UnitKind::Axiom {
+            for qid in &unit.qids {
+                if let Some(role) = symbols.and_then(|s| s.quantifier_role(qid)) {
+                    if !roles.contains(&role) {
+                        roles.push(role);
+                    }
+                }
+            }
+        }
+        let kept_by_witness = mode == AblateMode::LoadBearing && outcome.set.contains(&index);
+        AblationUnit {
+            index,
+            kind,
+            name,
+            roles,
+            span,
+            axioms: (unit.kind == UnitKind::Axiom).then_some(unit.axioms),
+            qids: unit.qids.clone(),
+            instantiations_before: instantiations(index, &[]),
+            instantiations_with_witness: match (&witness_removed, kept_by_witness) {
+                (Some(removed), true) => instantiations(index, removed),
+                _ => None,
+            },
+        }
+    };
+    let verdict = |answer: &Answer, removed: &[usize]| AblationVerdict {
+        verdict: answer.into(),
+        incomplete_id: details.get(removed).and_then(|d| d.incomplete_id.clone()),
+    };
+    let describe_goal = |index: usize| {
+        let message = units[index].error.as_ref().and_then(|e| e.downcast_ref::<MessageX>());
+        AblationGoal {
+            index,
+            description: message.map(|m| m.note.clone()).unwrap_or_default(),
+            span: message.and_then(|m| m.spans.first()).map(|s| s.as_string.clone()),
+        }
+    };
+    let vacuity = {
+        let witness_vacuous =
+            vacuity_witness.as_ref().is_some_and(|scan| scan.answer == Answer::Valid);
+        let vacuous = vacuity_before.answer == Answer::Valid || witness_vacuous;
+        let goal = match (&vacuity_witness, witness_vacuous) {
+            (Some(scan), true) => scan.goal,
+            _ => vacuity_before.goal,
+        };
+        let unchecked = vacuity_witness.as_ref().map_or(0, |scan| scan.unchecked);
+        Vacuity {
+            before: (&vacuity_before.answer).into(),
+            witness: vacuity_witness.as_ref().map(|scan| (&scan.answer).into()),
+            vacuous,
+            goal: goal.map(describe_goal),
+            every_goal: every_goal.as_ref().map(ProbeVerdict::from),
+            goals: goals.len(),
+            goals_unchecked: if vacuous {
+                0
+            } else {
+                vacuity_before.unchecked.max(unchecked) as u64
+            },
+            participated,
+            participation_unchecked,
+        }
+    };
+    let prefix_axioms =
+        prefix.iter().filter(|decl| matches!(&***decl, air::ast::DeclX::Axiom(_))).count();
+    Ok(AblateReport {
+        requested: request.mode,
+        mode,
+        status: match outcome.status {
+            Status::Found => "found",
+            Status::AlreadyAtTarget => "already_at_target",
+            Status::Unreachable => "unreachable",
+            Status::NotValid => "not_valid",
+            Status::NoCandidates => "no_candidates",
+            Status::BudgetExhausted => "budget_exhausted",
+        },
+        result: match (outcome.status, mode) {
+            (Status::Found, AblateMode::LoadBearing) => "load_bearing_set",
+            (Status::Found, _) => "minimal_removal_that_proves",
+            _ => "none",
+        },
+        verdict_before: outcome.before.as_ref().map(|answer| verdict(answer, &[])),
+        witness: outcome.set.iter().map(|&i| describe(i)).collect(),
+        candidate_units: candidates.iter().map(|&i| describe(i)).collect(),
+        excluded: request.exclude.clone(),
+        verdict_with_witness: match (&outcome.after, &witness_removed) {
+            (Some(answer), Some(removed)) => Some(verdict(answer, removed)),
+            _ => None,
+        },
+        verdict_all_removed: outcome.all_removed.as_ref().map(ProbeVerdict::from),
+        minimal: outcome.minimal,
+        non_monotone: outcome.non_monotone,
+        started_from_instantiated: outcome.hint_accepted,
+        vacuity,
+        absence_check,
+        checks_used: outcome.probes.len(),
+        extra_checks,
+        budget_checks: request.budget,
+        candidates: candidates.len(),
+        axiom_groups: units.iter().filter(|u| u.kind == UnitKind::Axiom).count(),
+        prefix_axioms,
+        switched_axioms: units.iter().map(|u| u.axioms).sum(),
+        probes: outcome
+            .probes
+            .iter()
+            .map(|p| BisectProbe {
+                removed: p.disabled.len(),
+                removed_units: p.disabled.clone(),
+                verdict: (&p.answer).into(),
+            })
+            .collect(),
+        elapsed_ms: 0,
+        restore_ms: 0,
+    })
+}
+
+/// Check `query` the ordinary way in a scope of its own, with its prefix
+/// asserted except the axiom groups `removed` names, and without the
+/// hypotheses it names: the differential against switching them off. The
+/// scope is popped before this returns.
+fn absence_check(
+    air: &mut Context,
+    prefix: &[air::ast::Decl],
+    query: &RetainedQuery,
+    group_of: &dyn Fn(&air::ast::Axiom) -> Option<String>,
+    units: &[air::bisect::Unit],
+    removed: &[usize],
+    probed_valid: bool,
+) -> io::Result<AbsenceCheck> {
+    use air::ast::DeclX;
+    let groups: HashSet<&str> = removed.iter().filter_map(|&i| units[i].group.as_deref()).collect();
+    let hypotheses: Vec<&air::def::ProvenanceTag> = removed
+        .iter()
+        .filter(|&&i| units[i].kind == air::bisect::UnitKind::Hypothesis)
+        .filter_map(|&i| units[i].tag.as_ref())
+        .collect();
+    // As the prober switches them: prefix axioms by group, the query's own
+    // axioms by hypothesis tag only.
+    let kept_prefix = |decl: &air::ast::Decl| match &**decl {
+        DeclX::Axiom(axiom) => {
+            !group_of(axiom).is_some_and(|group| groups.contains(group.as_str()))
+        }
+        _ => true,
+    };
+    let kept_local = |decl: &air::ast::Decl| match &**decl {
+        DeclX::Axiom(axiom) => !axiom.tag.as_ref().is_some_and(|tag| hypotheses.contains(&tag)),
+        _ => true,
+    };
+    let local: Vec<air::ast::Decl> =
+        query.query.local.iter().filter(|d| kept_local(d)).cloned().collect();
+    let stripped = std::sync::Arc::new(air::ast::QueryX {
+        local: std::sync::Arc::new(local),
+        assertion: query.query.assertion.clone(),
+    });
+    let start = Instant::now();
+    air.push();
+    let mut asserted = Ok(());
+    for decl in prefix.iter().filter(|d| kept_prefix(d)) {
+        if let Err(error) = air.global(decl) {
+            asserted = Err(error);
+            break;
+        }
+    }
+    let outcome = match asserted {
+        Ok(()) => air.check_valid(
+            &VirMessageInterface {},
+            &QueryDiagnostics::default(),
+            &stripped,
+            QueryContext::default(),
+        ),
+        Err(error) => ValidityResult::TypeError(error),
+    };
+    drop(air.take_provenance());
+    drop(air.take_unknown_reason());
+    drop(air.take_matching_loops());
+    drop(air.take_difficulty());
+    drop(air.take_inst_pressure());
+    let result = match outcome {
+        ValidityResult::Valid(_) => Ok(QueryResult::Valid),
+        ValidityResult::Canceled => Ok(QueryResult::ResourceLimit),
+        ValidityResult::Invalid(..) => Ok(QueryResult::Invalid),
+        ValidityResult::TypeError(error) => Err(io::Error::other(error.to_string())),
+        ValidityResult::UnexpectedOutput(error) => Err(io::Error::other(error)),
+    };
+    // Every answer, `valid` included, leaves the query open until finished,
+    // as the check request does. The errors end the session.
+    if result.is_ok() {
+        air.finish_query();
+    }
+    air.pop();
+    let result = result?;
+    Ok(AbsenceCheck {
+        agrees: (result == QueryResult::Valid) == probed_valid,
+        result,
+        elapsed_ms: start.elapsed().as_millis(),
     })
 }
 
@@ -3835,10 +4560,15 @@ fn scaffold_arms(
             },
         );
         let mut closing = resolved.instantiations;
-        // user quantifiers and function definitions first, the prelude last
+        // user quantifiers and function definitions (and contracts) first,
+        // the prelude last
         closing.sort_by_key(|q| match (&q.span, q.role, q.fun.as_deref()) {
             (Some(_), _, _) => 0,
-            (None, Some("definition" | "definition_unfold" | "definition_base"), _) => 1,
+            (
+                None,
+                Some("definition" | "definition_unfold" | "definition_base" | "contract"),
+                _,
+            ) => 1,
             (None, _, Some("prelude")) => 3,
             _ => 2,
         });
@@ -4146,6 +4876,20 @@ impl QueryJournal {
         Ok(())
     }
 
+    /// The declarations of the scopes below `prefix`, in the order they were
+    /// asserted.
+    fn prefix_decls(&self, prefix: usize) -> Vec<air::ast::Decl> {
+        self.contexts[..prefix]
+            .iter()
+            .flatten()
+            .flat_map(|batch| batch.iter())
+            .filter_map(|command| match &**command {
+                CommandX::Global(decl) => Some(decl.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
     fn restore_prefix(&mut self, air: &mut Context, prefix: usize) -> io::Result<()> {
         while self.applied > prefix {
             air.pop();
@@ -4305,6 +5049,7 @@ impl Server {
                 Request::List { session: Some(requested) }
                 | Request::Check { session: requested, .. }
                 | Request::Bisect { session: requested, .. }
+                | Request::Ablate { session: requested, .. }
                 | Request::Egraph { session: requested, .. }
                 | Request::Speculate { session: requested, .. }
                 | Request::Scaffold { session: requested, .. }
@@ -4394,6 +5139,83 @@ impl Server {
                     send(
                         &mut output,
                         &Response::Bisected { session, bucket: bucket_id, query: id, report },
+                    )?;
+                }
+                Request::Ablate {
+                    bucket: bucket_id,
+                    query: id,
+                    mode,
+                    budget_checks,
+                    hypotheses,
+                    exclude,
+                    ..
+                } => {
+                    let Some(bucket) = self.buckets.get(bucket_id.0) else {
+                        send(&mut output, &Response::Error { message: "unknown bucket" })?;
+                        continue;
+                    };
+                    if bucket.queries.get(id.0).is_none() {
+                        send(&mut output, &Response::Error { message: "unknown query" })?;
+                        continue;
+                    }
+                    let budget = budget_checks.unwrap_or(DEFAULT_ABLATE_CHECKS);
+                    if budget == 0 || budget > MAX_BISECT_CHECKS {
+                        send(
+                            &mut output,
+                            &Response::Error { message: "budget_checks must be between 1 and 256" },
+                        )?;
+                        continue;
+                    }
+                    let mut state = match bucket.state.lock() {
+                        Ok(state) => state,
+                        Err(_) => {
+                            return fatal(
+                                &mut output,
+                                io::Error::other("resident bucket poisoned"),
+                            );
+                        }
+                    };
+                    let (solver, local) = bucket.addresses[id.0];
+                    let SolverState { air, journal } = &mut state[solver];
+                    // Prefix axioms are asserted below the query's scope, so
+                    // the ablation asserts them again, switchable, above the
+                    // prelude. The next check restores the prefix as usual.
+                    let restore_start = Instant::now();
+                    if let Err(error) = journal.restore_prefix(air, 0) {
+                        return fatal(&mut output, error);
+                    }
+                    let restore_ms = restore_start.elapsed().as_millis();
+                    let query = &journal.queries[local];
+                    let prefix = journal.prefix_decls(query.prefix);
+                    set_rlimit(air, query.rlimit);
+                    let request = AblateRequest {
+                        mode,
+                        budget,
+                        hypotheses: hypotheses.unwrap_or(true),
+                        exclude: exclude.unwrap_or_default(),
+                    };
+                    let start = Instant::now();
+                    let report = match ablate(air, &prefix, query, bucket.symbols.as_ref(), request)
+                    {
+                        Ok(mut report) => {
+                            report.elapsed_ms = start.elapsed().as_millis();
+                            report.restore_ms = restore_ms;
+                            report
+                        }
+                        Err(error) if error.kind() == io::ErrorKind::InvalidInput => {
+                            send(&mut output, &Response::Error { message: &error.to_string() })?;
+                            continue;
+                        }
+                        Err(error) => return fatal(&mut output, error),
+                    };
+                    send(
+                        &mut output,
+                        &Response::Ablated {
+                            session,
+                            bucket: bucket_id,
+                            query: id,
+                            report: Box::new(report),
+                        },
                     )?;
                 }
                 Request::Egraph {
