@@ -1892,7 +1892,7 @@ fn resident_ready_lists_the_requests_it_serves() {
         .collect();
     assert_eq!(
         commands,
-        ["list", "check", "bisect", "egraph", "scaffold", "close", "inst_graph"],
+        ["list", "check", "bisect", "egraph", "scaffold", "close", "inst_graph", "ladder"],
         "{ready}"
     );
     // Each listed request parses: a stale session is refused as a session,
@@ -1900,7 +1900,7 @@ fn resident_ready_lists_the_requests_it_serves() {
     for command in &commands {
         let request = match command.as_str() {
             "list" | "close" => json!({"command": command, "session": "stale"}),
-            "check" | "egraph" => {
+            "check" | "egraph" | "ladder" => {
                 json!({"command": command, "session": "stale", "bucket": 0, "query": 0})
             }
             "bisect" => {
@@ -1919,6 +1919,276 @@ fn resident_ready_lists_the_requests_it_serves() {
         assert_ne!(reply["message"], "invalid resident request", "{command}: {reply}");
     }
     worker.finish(true);
+}
+
+const LADDER_SOURCE: &str = r#"
+use vstd::prelude::*;
+verus! {
+    uninterp spec fn f(i: int) -> int;
+    uninterp spec fn p(i: int) -> bool;
+
+    // The goal has no `f` term, so E-matching never instantiates the
+    // requirement; a strategy that needs no trigger can.
+    proof fn untriggered(a: int)
+        requires forall|x: int| #[trigger] f(x) >= 0 && p(x),
+    {
+        assert(p(a));
+    }
+
+    proof fn triggered(a: int)
+        requires forall|x: int| #[trigger] f(x) >= 0 && p(x),
+    {
+        assert(f(a) >= 0);
+    }
+}
+"#;
+
+fn rung<'a>(ladder: &'a Value, name: &str) -> &'a Value {
+    ladder["rungs"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{}", ladder))
+        .iter()
+        .find(|rung| rung["rung"] == name)
+        .unwrap_or_else(|| panic!("no {} rung: {}", name, ladder))
+}
+
+#[test]
+fn resident_strategy_ladder_finds_a_strategy_and_pins_it() {
+    let mut worker =
+        Worker::start_with_env(LADDER_SOURCE, &[], &[("VERUS_RESIDENT_STRATEGY_LADDER", "1")]);
+    let ready = worker.receive();
+    assert_eq!(ready["strategy_ladder"], true, "{ready}");
+    let session = ready["session"].clone();
+    let untriggered = query_id(&ready, "::untriggered");
+    let check = json!({"command":"check", "session":session, "bucket":0, "query":untriggered});
+    let before = worker.send(check.clone());
+    assert_eq!(before["result"], "invalid", "{before}");
+    assert!(before["pinned"].is_null(), "{}", before);
+
+    let ladder = worker
+        .send(json!({"command":"ladder", "session":session, "bucket":0, "query":untriggered}));
+    assert_eq!(ladder["event"], "laddered", "{ladder}");
+    assert_eq!(ladder["available"], json!(["ematch", "conflict", "pool", "enum", "mbqi"]));
+    // E-matching alone is the default schedule's own failure.
+    assert_eq!(rung(&ladder, "ematch")["verdict"], "unknown", "{ladder}");
+    assert_eq!(rung(&ladder, "ematch")["incomplete_id"], "QUANTIFIERS", "{ladder}");
+    let solved = ladder["solved_by"].as_str().unwrap_or_else(|| panic!("{}", ladder)).to_owned();
+    assert_ne!(solved, "ematch");
+    let winner = rung(&ladder, &solved);
+    assert_eq!(winner["verdict"], "valid", "{ladder}");
+    assert!(winner["instantiations"].as_u64().unwrap() > 0, "{}", ladder);
+    assert!(winner["resource_units"].as_u64().unwrap() > 0, "{}", ladder);
+    // Rungs after the winner wait for run_all.
+    let order = ["ematch", "conflict", "pool", "enum", "mbqi"];
+    let after_winner = order.iter().skip_while(|name| **name != solved).skip(1);
+    for name in after_winner {
+        assert_eq!(rung(&ladder, name)["verdict"], "not_run", "{ladder}");
+    }
+    assert_eq!(
+        ladder["pinned"],
+        json!({"rung": solved, "alongside": false, "rlimit": 10.0}),
+        "{ladder}"
+    );
+
+    // The pinned rung closes the recheck before the full schedule runs.
+    let pinned = worker.send(check.clone());
+    assert_eq!(pinned["result"], "valid", "{pinned}");
+    assert_eq!(pinned["pinned"]["rung"], solved.as_str(), "{pinned}");
+    assert_eq!(pinned["pinned"]["alongside"], false, "{pinned}");
+    assert_eq!(pinned["pinned"]["closed"], true, "{pinned}");
+
+    // An empty ladder removes the pin, and the default schedule answers as
+    // it did at first: no strategy setting outlived its rung.
+    let cleared = worker.send(
+        json!({"command":"ladder", "session":session, "bucket":0, "query":untriggered, "rungs":[]}),
+    );
+    assert!(cleared["pinned"].is_null() && cleared["solved_by"].is_null(), "{}", cleared);
+    let again = worker.send(check.clone());
+    assert_eq!(again["result"], "invalid", "{again}");
+    assert!(again["pinned"].is_null(), "{}", again);
+    // Nor does an alongside rung's `quant-strategy-alone`: after an alongside
+    // ladder that pins nothing, the default schedule still fails.
+    let unpinned = worker.send(json!({"command":"ladder", "session":session, "bucket":0,
+        "query":untriggered, "alongside":true, "pin":false}));
+    assert!(unpinned["solved_by"].is_string() && unpinned["pinned"].is_null(), "{}", unpinned);
+    let again = worker.send(check.clone());
+    assert_eq!(again["result"], "invalid", "{again}");
+    assert!(again["pinned"].is_null(), "{}", again);
+
+    // run_all tries every rung; pin false leaves no pin; budgets apply per rung.
+    let all = worker.send(json!({"command":"ladder", "session":session, "bucket":0,
+        "query":untriggered, "run_all":true, "pin":false, "budgets":{"enum":5}}));
+    assert!(all["rungs"].as_array().unwrap().iter().all(|r| r["verdict"] != "not_run"), "{}", all);
+    assert_eq!(rung(&all, "pool")["verdict"], "unknown", "{all}");
+    assert_eq!(rung(&all, "enum")["rlimit"], 5.0, "{all}");
+    assert!(rung(&all, "enum")["resource_limit"].as_u64().unwrap() > 0, "{}", all);
+    assert!(all["pinned"].is_null(), "{}", all);
+
+    // Alongside E-matching the default rungs are the three the schedule
+    // lacks; the pin records how its rung ran, and the recheck runs it so.
+    let alongside = worker.send(json!({"command":"ladder", "session":session, "bucket":0,
+        "query":untriggered, "alongside":true}));
+    assert_eq!(alongside["alongside"], true, "{alongside}");
+    let names: Vec<&Value> =
+        alongside["rungs"].as_array().unwrap().iter().map(|rung| &rung["rung"]).collect();
+    assert_eq!(names, [&json!("conflict"), &json!("enum"), &json!("mbqi")], "{alongside}");
+    let alongside_solved =
+        alongside["solved_by"].as_str().unwrap_or_else(|| panic!("{}", alongside)).to_owned();
+    assert_eq!(
+        alongside["pinned"],
+        json!({"rung": alongside_solved, "alongside": true, "rlimit": 10.0}),
+        "{alongside}"
+    );
+    let rechecked = worker.send(check.clone());
+    assert_eq!(rechecked["result"], "valid", "{rechecked}");
+    assert_eq!(rechecked["pinned"]["alongside"], true, "{rechecked}");
+    assert_eq!(rechecked["pinned"]["closed"], true, "{rechecked}");
+
+    // A query E-matching proves is solved on the first rung.
+    let triggered = worker.send(json!({"command":"ladder", "session":session, "bucket":0,
+        "query":query_id(&ready, "::triggered")}));
+    assert_eq!(triggered["solved_by"], "ematch", "{triggered}");
+
+    // Named alongside, E-matching is the default schedule itself, and runs
+    // as a baseline rather than being refused.
+    let baseline = worker.send(json!({"command":"ladder", "session":session, "bucket":0,
+        "query":untriggered, "alongside":true, "rungs":["ematch"], "pin":false}));
+    assert_eq!(rung(&baseline, "ematch")["verdict"], "unknown", "{baseline}");
+
+    for bad in [json!(["enum", "enum"]), json!(["nope"])] {
+        let reply = worker.send(json!({"command":"ladder", "session":session, "bucket":0,
+            "query":untriggered, "rungs":bad}));
+        assert_eq!(reply["event"], "error", "{reply}");
+    }
+    // Zero, above the cap, and a budget too small for one cvc5 resource unit
+    // (which would reach cvc5 as 0, no limit at all) are all refused.
+    for budget in [json!(0), json!(1001), json!(0.000001)] {
+        let reply = worker.send(json!({"command":"ladder", "session":session, "bucket":0,
+            "query":untriggered, "budgets":{"enum":budget}}));
+        assert_eq!(reply["event"], "error", "{reply}");
+    }
+    // The refusals left the pin and the session as they were.
+    let rechecked = worker.send(check.clone());
+    assert_eq!(rechecked["result"], "valid", "{rechecked}");
+    assert_eq!(rechecked["pinned"]["closed"], true, "{rechecked}");
+    assert_eq!(worker.send(json!({"command":"close", "session":session}))["event"], "closed");
+    worker.finish(false);
+}
+
+/// Without the ladder mode, Verus's cvc5 has only E-matching and pools: the
+/// other rungs are reported, not run.
+#[test]
+fn resident_ladder_without_the_mode_reports_what_is_missing() {
+    let mut worker = Worker::start(LADDER_SOURCE, &[]);
+    let ready = worker.receive();
+    assert_eq!(ready["strategy_ladder"], false, "{ready}");
+    let session = ready["session"].clone();
+    let ladder = worker.send(json!({"command":"ladder", "session":session, "bucket":0,
+        "query":query_id(&ready, "::untriggered")}));
+    assert_eq!(ladder["available"], json!(["ematch", "pool"]), "{ladder}");
+    for name in ["conflict", "enum", "mbqi"] {
+        assert_eq!(rung(&ladder, name)["verdict"], "unavailable", "{ladder}");
+    }
+    // The two the solver has still run: E-matching fails as the default
+    // schedule does, and pools, which Verus never emits, instantiate nothing.
+    assert_eq!(rung(&ladder, "ematch")["verdict"], "unknown", "{ladder}");
+    assert_eq!(rung(&ladder, "pool")["verdict"], "unknown", "{ladder}");
+    assert_eq!(rung(&ladder, "pool")["instantiations"], 0, "{ladder}");
+    assert!(ladder["solved_by"].is_null(), "{}", ladder);
+    worker.finish(false);
+}
+
+/// A pinned rung's proof decides the verdict, so the reply keeps that check's
+/// provenance, as it keeps its instantiation graph; only a pinned attempt
+/// that fails has its diagnostics discarded with it.
+#[test]
+fn resident_pinned_recheck_keeps_the_provenance_of_its_proof() {
+    let mut worker = Worker::start_with_env(
+        LADDER_SOURCE,
+        &["-V", "provenance"],
+        &[("VERUS_RESIDENT_STRATEGY_LADDER", "1")],
+    );
+    let ready = worker.receive();
+    assert_eq!(ready["provenance"], true, "{ready}");
+    let session = ready["session"].clone();
+    let untriggered = query_id(&ready, "::untriggered");
+    let ladder = worker
+        .send(json!({"command":"ladder", "session":session, "bucket":0, "query":untriggered}));
+    assert!(ladder["solved_by"].is_string(), "{}", ladder);
+    let checked =
+        worker.send(json!({"command":"check", "session":session, "bucket":0, "query":untriggered}));
+    assert_eq!(checked["result"], "valid", "{checked}");
+    assert_eq!(checked["pinned"]["closed"], true, "{checked}");
+    assert_eq!(checked["provenance"]["result"], "valid", "{checked}");
+    assert_eq!(checked["provenance"]["round"], 0, "{checked}");
+    let requires = checked["provenance"]["hypotheses"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{}", checked))
+        .iter()
+        .filter(|h| h["kind"] == "requires")
+        .count();
+    assert!(requires > 0, "{}", checked);
+    worker.finish(false);
+}
+
+const UNBOUNDED_SOURCE: &str = r#"
+use vstd::prelude::*;
+verus! {
+    uninterp spec fn f(i: int) -> int;
+    uninterp spec fn p(i: int) -> bool;
+
+    // The goal has no `f` term, so E-matching does nothing, but every
+    // enumerative instance of the requirement makes a new one.
+    #[verifier::rlimit(infinity)]
+    proof fn growing(a: int)
+        requires forall|x: int| #[trigger] f(x) < f(x + 1),
+    {
+        assert(p(a));
+    }
+
+    #[verifier::rlimit(infinity)]
+    proof fn untriggered(a: int)
+        requires forall|x: int| #[trigger] f(x) >= 0 && p(x),
+    {
+        assert(p(a));
+    }
+}
+"#;
+
+/// A query without an rlimit gives its rungs the default one rather than no
+/// limit at all, and a pinned attempt runs at the budget that proved it.
+#[test]
+fn resident_ladder_bounds_a_query_without_an_rlimit() {
+    let mut worker =
+        Worker::start_with_env(UNBOUNDED_SOURCE, &[], &[("VERUS_RESIDENT_STRATEGY_LADDER", "1")]);
+    let ready = worker.receive();
+    let session = ready["session"].clone();
+    // A pin found at a budget below the query's is tried at that budget.
+    // (Enumerative instantiation alone spends 5 on the prelude; alongside
+    // E-matching it proves this in a small part of it.) This runs before the
+    // `growing` rung below: the terms that rung's instances make outlast its
+    // check in cvc5, and make later checks on the solver far costlier.
+    let untriggered = query_id(&ready, "::untriggered");
+    let ladder = worker.send(json!({"command":"ladder", "session":session, "bucket":0,
+        "query":untriggered, "rungs":["enum"], "alongside":true, "budgets":{"enum":5}}));
+    assert_eq!(
+        ladder["pinned"],
+        json!({"rung": "enum", "alongside": true, "rlimit": 5.0}),
+        "{ladder}"
+    );
+    let checked =
+        worker.send(json!({"command":"check", "session":session, "bucket":0, "query":untriggered}));
+    assert_eq!(checked["result"], "valid", "{checked}");
+    assert_eq!(checked["pinned"]["rlimit"], 5.0, "{checked}");
+    assert_eq!(checked["pinned"]["closed"], true, "{checked}");
+    // Unbounded, enumerative instantiation would never answer this one.
+    let growing = worker.send(json!({"command":"ladder", "session":session, "bucket":0,
+        "query":query_id(&ready, "::growing"), "rungs":["enum"]}));
+    let enumerative = rung(&growing, "enum");
+    assert_eq!(enumerative["rlimit"], 10.0, "{growing}");
+    assert!(enumerative["resource_limit"].as_u64().unwrap() > 0, "{}", growing);
+    assert_ne!(enumerative["verdict"], "valid", "{growing}");
+    worker.finish(false);
 }
 
 #[test]

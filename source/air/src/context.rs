@@ -307,6 +307,28 @@ pub enum Declared {
     Fun(Typs, Typ),
 }
 
+/// What cvc5's `(get-info :strategy-rung)` reported for one `check-sat` run
+/// under `:quant-strategy` (see `Context::set_quant_strategy`).
+#[derive(Debug, Clone, Default)]
+pub struct StrategyRung {
+    /// The strategy the check ran: `all`, `ematch`, `conflict`, `pool`,
+    /// `enum` or `mbqi`.
+    pub strategy: String,
+    /// Whether alone, rather than alongside the default schedule.
+    pub alone: bool,
+    /// The ladder strategies the solver has a module for.
+    pub available: Vec<String>,
+    /// Instantiation rounds that sent lemmas.
+    pub rounds: u64,
+    /// The resources the check spent, in the unit of
+    /// `reproducible-resource-limit`.
+    pub resource_units: u64,
+    /// Instantiations added, per strategy (`other` for the rest).
+    pub instantiations: Vec<(String, u64)>,
+    /// The reply, when it did not parse.
+    pub unparsed: Option<String>,
+}
+
 /// One nonlinear term of `(get-info :nl-frontier)`.
 #[derive(Debug, Clone, Default)]
 pub struct NlAtom {
@@ -563,6 +585,16 @@ pub struct Context {
     /// Whether this solver records its instantiation graph (cvc5 only,
     /// fixed at launch).
     pub(crate) inst_graph: bool,
+    /// Whether this solver was launched with every quantifier instantiation
+    /// strategy available to `quant_strategy` (cvc5 only, fixed at launch).
+    pub(crate) strategy_ladder: bool,
+    /// The instantiation strategy the next `check-sat` runs, and whether
+    /// alone rather than alongside the default schedule; reset right after
+    /// it, whatever it answers (cvc5 only).
+    pub(crate) quant_strategy: Option<(String, bool)>,
+    /// What the last `check-sat` run under `quant_strategy` reported, until
+    /// the caller takes it.
+    pub(crate) last_strategy_rung: Option<StrategyRung>,
     /// The key under which the next query's scope restores saved
     /// instantiations, and whether they are the only ones allowed (cvc5
     /// only).
@@ -668,6 +700,9 @@ impl Context {
             last_check_effort: None,
             instantiation_replay: false,
             inst_graph: false,
+            strategy_ladder: false,
+            quant_strategy: None,
+            last_strategy_rung: None,
             restore_instantiations: None,
             saved_instantiations: HashSet::new(),
             import_instantiations: None,
@@ -701,6 +736,7 @@ impl Context {
                 self.inst_graph,
                 self.matching_loops,
                 self.inst_max_rounds,
+                self.strategy_ladder,
             ));
         }
         self.smt_process.as_mut().unwrap()
@@ -945,6 +981,65 @@ impl Context {
 
     pub fn inst_graph(&self) -> bool {
         self.inst_graph
+    }
+
+    /// Launch the solver with every quantifier instantiation strategy
+    /// available to `set_quant_strategy` (cvc5 only; must precede the first
+    /// query). The strategies the default schedule leaves off are created but
+    /// stay idle, so a check without a strategy runs that schedule.
+    pub fn set_strategy_ladder(&mut self, enabled: bool) {
+        assert!(matches!(self.state, ContextState::NotStarted));
+        assert!(!enabled || matches!(self.solver, SmtSolver::Cvc5));
+        self.strategy_ladder = enabled;
+    }
+
+    pub fn strategy_ladder(&self) -> bool {
+        self.strategy_ladder
+    }
+
+    /// Run the next `check_valid`'s first `check-sat` with one instantiation
+    /// strategy (`ematch`, `conflict`, `pool`, `enum` or `mbqi`; cvc5 only),
+    /// `alone` or alongside the default schedule. The options are set right
+    /// before that `check-sat` and set back right after it, so they apply to
+    /// that check alone, and `(get-info :strategy-rung)` is read in between
+    /// (`take_strategy_rung`). That `check_valid` consumes the setting
+    /// whether or not it reaches the solver, so a later check never inherits
+    /// it. A strategy the solver has no module for runs nothing; one launched
+    /// without `set_strategy_ladder` has E-matching and pools only.
+    pub fn set_quant_strategy(&mut self, strategy: Option<&str>, alone: bool) {
+        assert!(strategy.is_none() || matches!(self.solver, SmtSolver::Cvc5));
+        self.quant_strategy = strategy.map(|strategy| (strategy.to_owned(), alone));
+    }
+
+    /// What the most recent `check-sat` run under `set_quant_strategy`
+    /// reported, if one ran; each call returns it once.
+    pub fn take_strategy_rung(&mut self) -> Option<StrategyRung> {
+        self.last_strategy_rung.take()
+    }
+
+    /// Ask cvc5 for `(get-info :strategy-rung)` between queries, starting the
+    /// context and the solver if needed, and flush whatever was queued
+    /// before. `None` when the solver does not know the key, as a cvc5
+    /// without `:quant-strategy` would not: setting that option on one would
+    /// fail the next check. Read-only. The `available` list is filled in by
+    /// the solver's first `check-sat`, so it is empty before one has run.
+    pub fn probe_strategy_rung(&mut self) -> Option<StrategyRung> {
+        if !matches!(self.solver, SmtSolver::Cvc5) {
+            return None;
+        }
+        self.ensure_started();
+        self.get_smt_process();
+        self.smt_log.log_get_info("strategy-rung");
+        let lines = self.flush_commands();
+        let line = lines.iter().find(|line| line.starts_with("(:strategy-rung "))?;
+        let rung = crate::smt_verify::parse_strategy_rung(line);
+        rung.unparsed.is_none().then_some(rung)
+    }
+
+    /// The `reproducible-resource-limit` the next query's checks run with
+    /// (cvc5 only): the rlimit, doubled in the modes that pay for proofs.
+    pub fn cvc5_query_budget(&self) -> u32 {
+        crate::smt_verify::cvc5_query_budget(self)
     }
 
     /// Ask the solver for the instantiation graph of its last `check-sat` and
@@ -1296,7 +1391,11 @@ impl Context {
         self.air_initial_log.log_query(query);
         let query = match crate::typecheck::check_query(self, query) {
             Ok(query) => query,
-            Err(err) => return ValidityResult::TypeError(err),
+            Err(err) => {
+                // This check's strategy, whether or not it reached the solver.
+                self.quant_strategy = None;
+                return ValidityResult::TypeError(err);
+            }
         };
         let (query, snapshots, local_vars, variable_versions) = crate::var_to_const::lower_query(
             &query,
@@ -1316,6 +1415,9 @@ impl Context {
             query_context.report_long_running,
         );
         self.check_valid_used = true;
+        // Taken by this check's check-sat; cleared here too for a check that
+        // stopped before one, so the strategy never reaches a later check.
+        self.quant_strategy = None;
 
         validity
     }
