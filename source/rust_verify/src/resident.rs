@@ -196,6 +196,11 @@ enum Request {
         /// Also switch the query's own hypotheses (requires, type invariants,
         /// fuel, trait bounds). Default true.
         hypotheses: Option<bool>,
+        /// Units (by index, as `candidate_units` of an earlier reply about
+        /// this query lists them) to leave switched on: they are no
+        /// candidates. Lets a caller search past a witness the absence
+        /// check disowned.
+        exclude: Option<Vec<usize>>,
     },
     Egraph {
         session: String,
@@ -1008,6 +1013,13 @@ struct AblateReport {
     /// minimal_removal: the units whose removal makes the query valid.
     /// load_bearing: the units that must stay, every other candidate removed.
     witness: Vec<AblationUnit>,
+    /// Every candidate, by the index `probes` and `participated` use, so a
+    /// reply without a witness still says what was tried, and a caller can
+    /// name units to `exclude`.
+    candidate_units: Vec<AblationUnit>,
+    /// The request's `exclude`: units left switched on.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    excluded: Vec<usize>,
     /// The probe of the witness configuration; null without a witness.
     verdict_with_witness: Option<AblationVerdict>,
     verdict_all_removed: Option<ProbeVerdict>,
@@ -1043,6 +1055,7 @@ struct AblateRequest {
     mode: AblateMode,
     budget: usize,
     hypotheses: bool,
+    exclude: Vec<usize>,
 }
 
 /// The sorted indices a probe mask switches off.
@@ -1069,6 +1082,13 @@ fn ablate(
         .map_err(|error| io::Error::other(error.to_string()))?;
     let units = prober.units().to_vec();
     let count = units.len();
+    if let Some(index) = request.exclude.iter().find(|&&i| i >= count) {
+        // A bad request, not a failure of the session.
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("exclude names unit {index}, but the query has {count} units"),
+        ));
+    }
     let mask = |removed: &[usize]| {
         let mut mask = vec![false; count];
         for &i in removed {
@@ -1090,6 +1110,7 @@ fn ablate(
             UnitKind::Hypothesis => request.hypotheses,
             UnitKind::Goal | UnitKind::Fact => false,
         })
+        .filter(|i| !request.exclude.contains(i))
         .collect();
     let search_mode = match mode {
         AblateMode::LoadBearing => Mode::Core,
@@ -1265,6 +1286,8 @@ fn ablate(
         },
         verdict_before: outcome.before.as_ref().map(|answer| verdict(answer, &[])),
         witness: outcome.set.iter().map(|&i| describe(i)).collect(),
+        candidate_units: candidates.iter().map(|&i| describe(i)).collect(),
+        excluded: request.exclude.clone(),
         verdict_with_witness: match (&outcome.after, &witness_removed) {
             (Some(answer), Some(removed)) => Some(verdict(answer, removed)),
             _ => None,
@@ -2273,6 +2296,7 @@ impl Server {
                     mode,
                     budget_checks,
                     hypotheses,
+                    exclude,
                     ..
                 } => {
                     let Some(bucket) = self.buckets.get(bucket_id.0) else {
@@ -2313,8 +2337,12 @@ impl Server {
                     let query = &journal.queries[local];
                     let prefix = journal.prefix_decls(query.prefix);
                     set_rlimit(air, query.rlimit);
-                    let request =
-                        AblateRequest { mode, budget, hypotheses: hypotheses.unwrap_or(true) };
+                    let request = AblateRequest {
+                        mode,
+                        budget,
+                        hypotheses: hypotheses.unwrap_or(true),
+                        exclude: exclude.unwrap_or_default(),
+                    };
                     let start = Instant::now();
                     let report = match ablate(air, &prefix, query, bucket.symbols.as_ref(), request)
                     {
@@ -2322,6 +2350,10 @@ impl Server {
                             report.elapsed_ms = start.elapsed().as_millis();
                             report.restore_ms = restore_ms;
                             report
+                        }
+                        Err(error) if error.kind() == io::ErrorKind::InvalidInput => {
+                            send(&mut output, &Response::Error { message: &error.to_string() })?;
+                            continue;
                         }
                         Err(error) => return fatal(&mut output, error),
                     };

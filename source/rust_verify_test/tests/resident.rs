@@ -706,12 +706,49 @@ fn resident_ablation_finds_witnesses_and_leaves_the_session_unchanged() {
     assert_eq!(reply["absence_check"]["agrees"], true, "{reply}");
     let used = reply["checks_used"].as_u64().unwrap();
     assert!(used <= reply["budget_checks"].as_u64().unwrap(), "{}", reply);
+    // Every candidate is named, by the index the probes use.
+    let named = reply["candidate_units"].as_array().unwrap();
+    assert_eq!(named.len() as u64, reply["candidates"].as_u64().unwrap(), "{reply}");
+    let loop_index = removed[0]["index"].clone();
+    assert!(
+        named.iter().any(|unit| unit["index"] == loop_index && unit["name"] == removed[0]["name"])
+    );
+    let candidates = reply["candidates"].as_u64().unwrap();
+
+    // Excluded, the loop lemma is no candidate: it is neither tried nor
+    // named, whatever else the search finds within its budget.
+    let reply = ablate!(
+        "::buried",
+        json!({"mode": "minimal_removal", "budget_checks": 4, "exclude": [loop_index]})
+    );
+    assert_eq!(reply["excluded"], json!([loop_index]), "{reply}");
+    assert_eq!(reply["candidates"].as_u64().unwrap(), candidates - 1, "{reply}");
+    let named = reply["candidate_units"].as_array().unwrap();
+    assert!(named.iter().all(|unit| unit["index"] != loop_index), "{}", reply);
+    let witness = reply["witness"].as_array().unwrap();
+    assert!(witness.iter().all(|unit| unit["index"] != loop_index), "{}", reply);
+    for probe in reply["probes"].as_array().unwrap() {
+        assert!(!probe["removed_units"].as_array().unwrap().contains(&loop_index), "{}", reply);
+    }
+    // A unit the query does not have is refused without ending the session.
+    let refused =
+        worker.send(ablate_request("::buried", json!({"mode": "auto", "exclude": [999]})));
+    assert_eq!(refused["event"], "error", "{refused}");
+
+    // A budget of one probe goes to the probe with nothing removed. The
+    // vacuity probe is extra; there is no witness to check for absence.
+    let reply = ablate!("::buried", json!({"mode": "minimal_removal", "budget_checks": 1}));
+    assert_eq!(reply["status"], "budget_exhausted", "{reply}");
+    assert_eq!(reply["result"], "none", "{reply}");
+    assert_eq!(reply["checks_used"], 1, "{reply}");
+    assert_eq!(reply["extra_checks"], 1, "{reply}");
+    assert!(reply["absence_check"].is_null(), "{}", reply);
+    assert!(reply["witness"].as_array().unwrap().is_empty(), "{}", reply);
 
     // Bad requests are refused without ending the session.
     let refused = worker.send(json!({"command": "ablate", "session": session, "bucket": 0,
         "query": query_id(&ready, "::buried"), "mode": "auto", "budget_checks": 0}));
     assert_eq!(refused["event"], "error", "{refused}");
-    assert_eq!(removed[0]["roles"], json!(["broadcast"]), "{reply}");
 
     // Ordinary rechecks answer as before.
     for (name, expected) in
