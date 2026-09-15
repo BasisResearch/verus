@@ -679,6 +679,13 @@ fn resident_ablation_finds_witnesses_and_leaves_the_session_unchanged() {
     // The loop lemma hides a proof that needs a dozen rounds of unfolding:
     // removing it alone makes the query valid, and it is not a vacuity.
     // Removing every candidate loses the proof too, so the search tries one
+    for unit in reply["witness"].as_array().unwrap() {
+        if unit["kind"] == "axiom_group" {
+            // the lemma's group also defines its `ens%` predicate; the
+            // role is the lemma's
+            assert_eq!(unit["roles"], json!(["broadcast"]), "{unit}");
+        }
+    }
     // unit at a time, most instantiated first: the loop lemma comes first.
     let reply = ablate!("::buried", json!({"mode": "auto"}));
     assert_eq!(reply["non_monotone"], true, "{reply}");
@@ -704,6 +711,7 @@ fn resident_ablation_finds_witnesses_and_leaves_the_session_unchanged() {
     let refused = worker.send(json!({"command": "ablate", "session": session, "bucket": 0,
         "query": query_id(&ready, "::buried"), "mode": "auto", "budget_checks": 0}));
     assert_eq!(refused["event"], "error", "{refused}");
+    assert_eq!(removed[0]["roles"], json!(["broadcast"]), "{reply}");
 
     // Ordinary rechecks answer as before.
     for (name, expected) in

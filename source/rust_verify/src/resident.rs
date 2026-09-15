@@ -922,7 +922,9 @@ struct AblationUnit {
     /// An axiom group's owner (a function or broadcast group), or a
     /// hypothesis's kind (`requires`, `type_invariant`, `fuel`, `trait_bound`).
     name: String,
-    /// The roles the encoder recorded for an axiom group's quantifiers.
+    /// `broadcast` for a broadcast lemma's or group's axioms; otherwise the
+    /// roles the encoder recorded for the group's quantifiers (`definition`,
+    /// `definition_unfold`, `definition_base`, `return_type_invariant`).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     roles: Vec<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1201,7 +1203,14 @@ fn ablate(
             }
         };
         let mut roles: Vec<&'static str> = Vec::new();
-        if unit.kind == UnitKind::Axiom {
+        let broadcast = unit.tag.as_ref().is_some_and(|tag| {
+            symbols.is_some_and(|symbols| symbols.broadcast_owner(tag).is_some())
+        });
+        if unit.kind == UnitKind::Axiom && broadcast {
+            // A lemma's group also defines its `ens%` predicate, a
+            // `definition` that is not what the lemma is.
+            roles.push("broadcast");
+        } else if unit.kind == UnitKind::Axiom {
             for qid in &unit.qids {
                 if let Some(role) = symbols.and_then(|s| s.quantifier_role(qid)) {
                     if !roles.contains(&role) {

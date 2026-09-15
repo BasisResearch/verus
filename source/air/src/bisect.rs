@@ -72,7 +72,8 @@ pub enum UnitKind {
 #[derive(Clone, Debug)]
 pub struct Unit {
     pub kind: UnitKind,
-    /// A hypothesis's provenance tag.
+    /// A hypothesis's provenance tag, or the tag of the axiom in an axiom
+    /// group that carries one (a broadcast lemma's, or a broadcast group's).
     pub tag: Option<ProvenanceTag>,
     /// A goal's `AssertId`, and for a fact the id of the assertion it follows.
     pub assert_id: Option<AssertId>,
@@ -436,6 +437,9 @@ fn assert_groups(
         let unit = &mut units[at];
         unit.axioms += 1;
         collect_qids(&axiom.expr, &mut unit.qids);
+        if unit.tag.is_none() {
+            unit.tag = axiom.tag.clone();
+        }
         context.global(&Arc::new(DeclX::Axiom(Axiom {
             named: axiom.named.clone(),
             tag: axiom.tag.clone(),
