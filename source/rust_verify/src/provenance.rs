@@ -877,6 +877,52 @@ impl Symbols {
         self
     }
 
+    /// `with_function_spans` for the lowered functions a bucket verifies.
+    pub(crate) fn with_sst_function_spans(mut self, functions: &[vir::sst::FunctionSst]) -> Self {
+        self.function_spans = functions
+            .iter()
+            .map(|f| (fun_as_friendly_rust_name(&f.x.name), f.span.as_string.clone()))
+            .collect();
+        self
+    }
+
+    /// Where the function (or broadcast group) `name` is written, when this
+    /// crate defines it.
+    pub(crate) fn function_span(&self, name: &str) -> Option<&str> {
+        self.function_spans.get(name).map(String::as_str)
+    }
+
+    /// The group an ablation switches a declaration-prefix axiom in: the
+    /// function or broadcast group that owns it, by its tag or else by its
+    /// quantifier's `:qid`. `None` for the encoding's own axioms (datatypes,
+    /// traits, boxing, fuel defaults, the prelude), which stay asserted.
+    ///
+    /// By `:qid`, only a quantifier the encoder says belongs to a function (a
+    /// definition or return type invariant) or one the user wrote counts:
+    /// `qid_map` records the function being encoded for every quantifier,
+    /// including trait-impl and boxing axioms made while encoding it, and
+    /// those are not the function's.
+    pub(crate) fn axiom_group(&self, axiom: &air::ast::Axiom) -> Option<&str> {
+        if let Some(tag @ air::def::ProvenanceTag::Axiom(_)) = &axiom.tag {
+            if let Some(owner) = self.axiom_owners.get(&tag.to_symbol()) {
+                return Some(owner);
+            }
+        }
+        let qid = air::bisect::axiom_qid(&axiom.expr)?;
+        let q = self.quantifiers.get(&*qid)?;
+        let owned = match q.role {
+            Some(role) => role != "fuel_defaults",
+            None => q.span.is_some(),
+        };
+        owned.then_some(q.fun.as_str())
+    }
+
+    /// The role of the quantifier `qid` names (`definition`, `broadcast`,
+    /// ...), when the encoder recorded one.
+    pub(crate) fn quantifier_role(&self, qid: &str) -> Option<&'static str> {
+        self.quantifiers.get(qid).and_then(|q| q.role)
+    }
+
     /// Join one tag from a reply about one of `fun`'s queries back to source.
     fn tag_of(&self, fun: &Fun, symbol: &str) -> ResolvedTag {
         let mut r =

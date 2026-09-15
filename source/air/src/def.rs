@@ -19,6 +19,13 @@ pub const BISECT_GUARD: &str = "%%bisect_guard%%";
 /// is assumed as `(or switch fact)`, and each probe assumes the switch false
 /// unless it removes the fact.
 pub const BISECT_DROP: &str = "%%bisect_drop%%";
+/// An ablation probe's guard for one group of prefix axioms: each axiom of
+/// the group is asserted as `(=> guard a)`, and each probe assumes the guard
+/// or its negation.
+pub const ABLATE_GUARD: &str = "%%ablate_guard%%";
+/// An ablation probe's switch that turns every goal into `false`, asking
+/// whether the assumptions alone are contradictory.
+pub const ABLATE_VACUITY: &str = "%%ablate_vacuity%%";
 pub const SKOLEM_ID_PREFIX: &str = "skolem";
 pub const ARRAY_QID: &str = "__AIR_ARRAY_QID__";
 

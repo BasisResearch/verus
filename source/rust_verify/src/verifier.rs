@@ -2306,10 +2306,11 @@ impl Verifier {
                 resident_spinoffs,
                 // E-graph readings render solver terms as source in every
                 // session, not only under provenance.
-                Some(crate::provenance::Symbols::capture(
-                    &ctx.global,
-                    ctx.name_ctxt.source_names(),
-                )),
+                // Ablation locates the functions whose axioms it removes.
+                Some(
+                    crate::provenance::Symbols::capture(&ctx.global, ctx.name_ctxt.source_names())
+                        .with_sst_function_spans(&krate.functions),
+                ),
                 crate::provenance::Quantifiers::capture(&ctx.global),
             ));
         }

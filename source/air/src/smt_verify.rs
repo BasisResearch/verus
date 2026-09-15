@@ -135,7 +135,7 @@ pub(crate) fn smt_add_decl<'ctx>(context: &mut Context, decl: &Decl) {
 
 /// The `:qid` of the quantifier an axiom is, or guards: `(forall ...)`, or
 /// `(=> g (forall ...))` as fuel-guarded axioms are.
-fn axiom_qid(expr: &Expr) -> Option<Ident> {
+pub(crate) fn axiom_qid(expr: &Expr) -> Option<Ident> {
     match &**expr {
         ExprX::Bind(bind, _) => match &**bind {
             BindX::Quant(_, _, _, Some(qid)) => Some(qid.clone()),
