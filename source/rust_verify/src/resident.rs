@@ -350,6 +350,12 @@ impl RetainedBucket {
         // primary context need not stay alive when every query was spun off.
         if !journal.queries.is_empty() || spinoffs.is_empty() {
             states.push(SolverState::new(air, journal));
+        } else {
+            // Dropping the context pops nothing, so pop its journal first:
+            // the solver, and its log, end at the prelude. A complaint from
+            // a solver about to be closed is of no use.
+            let (mut air, mut journal) = (air, journal);
+            let _ = journal.restore_prefix(&mut air, 0);
         }
         states.append(&mut spinoffs);
         let mut queries = Vec::new();

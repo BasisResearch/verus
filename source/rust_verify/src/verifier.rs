@@ -1644,6 +1644,11 @@ impl Verifier {
         bucket_id: &BucketId,
         query_function_path_counter: Option<(&vir::ast::Path, usize)>,
         bucket_context: &[CommandBatch],
+        // A retained spinoff records the context ops from this index of
+        // `bucket_context` on in its journal, in a scope a request can pop
+        // (ablation switches their axioms); the initial batches stay below,
+        // as the main context's do.
+        journal: Option<(&mut crate::resident::QueryJournal, usize)>,
         is_rerun: bool,
         span: &vir::messages::Span,
         profile_file_name: Option<&std::path::PathBuf>,
@@ -1669,7 +1674,24 @@ impl Verifier {
 
         // set up bucket context (skipped for a prelude-free bit_vector query)
         if prover_choice != vir::def::ProverChoice::BitVector {
-            self.run_command_batches(bucket_id, diagnostics, &mut air_context, bucket_context);
+            match journal {
+                Some((journal, ops_from)) => {
+                    let (initial, ops) = bucket_context.split_at(ops_from);
+                    self.run_command_batches(bucket_id, diagnostics, &mut air_context, initial);
+                    for batch in ops {
+                        journal
+                            .push_context(&mut air_context, batch.commands.clone())
+                            .map_err(vir::messages::error_bare)?;
+                        self.run_command_batch(bucket_id, diagnostics, &mut air_context, batch);
+                    }
+                }
+                None => self.run_command_batches(
+                    bucket_id,
+                    diagnostics,
+                    &mut air_context,
+                    bucket_context,
+                ),
+            }
         }
 
         Ok(air_context)
@@ -1796,6 +1818,8 @@ impl Verifier {
 
         // Insert initial bucket context.
         self.run_command_batches(bucket_id, reporter, &mut air_context, &bucket_context);
+        // The batches so far stay below every journal; context ops follow.
+        let initial_batches = bucket_context.len();
 
         let mut resident = self.args.resident.then(crate::resident::QueryJournal::new);
         let mut resident_spinoffs = Vec::new();
@@ -1968,6 +1992,7 @@ impl Verifier {
                                         bucket_id,
                                         Some((&(function.x.name).path, spinoff_context_counter)),
                                         &bucket_context,
+                                        spinoff_journal.as_mut().map(|j| (j, initial_batches)),
                                         is_recommend,
                                         &cmds.context.span,
                                         profile_file_name.as_ref(),

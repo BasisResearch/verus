@@ -726,6 +726,51 @@ fn resident_ablation_finds_witnesses_and_leaves_the_session_unchanged() {
     }
 }
 
+/// Ablation in a provenance session, where every asserted axiom carries a
+/// `:named` tag and the solver dumps instantiations after each check, and in
+/// a spinoff-all session, where the query has a solver of its own: the same
+/// witness, and rechecks answer as before.
+#[test]
+fn resident_ablation_works_under_provenance_and_spinoff() {
+    for mode in ["provenance", "spinoff-all"] {
+        let mut worker = Worker::start(ABLATE_SOURCE, &["--rlimit", "2", "-V", mode]);
+        let ready = worker.receive();
+        let session = ready["session"].clone();
+        let check = |name: &str| -> Value {
+            json!({"command": "check", "session": session, "bucket": 0, "query": query_id(&ready, name)})
+        };
+        let before = worker.send(check("::buried"))["result"].clone();
+        assert_ne!(before, "valid", "{}: the matching loop should hide the proof", mode);
+        let reply = worker.send(json!({
+            "command": "ablate", "session": session, "bucket": 0,
+            "query": query_id(&ready, "::buried"), "mode": "auto",
+        }));
+        assert_eq!(reply["event"], "ablated", "{mode}: {reply}");
+        assert_eq!(reply["result"], "minimal_removal_that_proves", "{mode}: {reply}");
+        let removed = reply["witness"].as_array().unwrap();
+        assert_eq!(removed.len(), 1, "{mode}: {reply}");
+        assert!(
+            removed[0]["name"].as_str().unwrap().ends_with("::g_splits"),
+            "{}: {}",
+            mode,
+            reply
+        );
+        assert_eq!(reply["absence_check"]["agrees"], true, "{mode}: {reply}");
+        assert_eq!(worker.send(check("::buried"))["result"], before, "{mode}");
+        assert_eq!(worker.send(check("::quad_is_four"))["result"], "valid", "{mode}");
+        assert_eq!(worker.send(json!({"command": "close", "session": session}))["event"], "closed");
+        worker.finish(false);
+        for log in smt_logs(worker.dir.path()) {
+            let head: Vec<&str> = log.lines().take(12).collect();
+            assert_eq!(
+                log.matches("(push").count(),
+                log.matches("(pop").count(),
+                "{mode}: {head:?}"
+            );
+        }
+    }
+}
+
 /// The variables `text` names with an assignment version, as `(name, version)`.
 fn versions_named(text: &str) -> Vec<(String, String)> {
     const MARK: &str = " (version ";
