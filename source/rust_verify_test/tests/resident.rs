@@ -886,7 +886,7 @@ fn resident_ablation_finds_a_contradiction_after_the_first_goal() {
         .unwrap()
         .iter()
         .find(|unit| unit["name"].as_str().unwrap().ends_with("::bad"))
-        .unwrap_or_else(|| panic!("bad is load-bearing: {reply}"));
+        .unwrap_or_else(|| panic!("bad is load-bearing: {}", reply));
     assert_eq!(bad["roles"], json!(["contract"]), "{reply}");
     let participated = vacuity["participated"].as_array().unwrap();
     assert!(participated.contains(&bad["index"]), "{}", reply);
@@ -2283,7 +2283,17 @@ fn resident_ready_lists_the_requests_it_serves() {
         .collect();
     assert_eq!(
         commands,
-        ["list", "check", "bisect", "ablate", "egraph", "scaffold", "close", "inst_graph", "ladder"],
+        [
+            "list",
+            "check",
+            "bisect",
+            "ablate",
+            "egraph",
+            "scaffold",
+            "close",
+            "inst_graph",
+            "ladder"
+        ],
         "{ready}"
     );
     // Each listed request parses: a stale session is refused as a session,
