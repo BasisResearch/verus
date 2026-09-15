@@ -658,6 +658,19 @@ fn resident_ablation_finds_witnesses_and_leaves_the_session_unchanged() {
     assert_eq!(reply["status"], "already_at_target", "{reply}");
     assert_eq!(reply["result"], "none");
 
+    // With the hypotheses off limits, only axiom groups are candidates, and
+    // the fuel setting stays: the two definitions alone are load-bearing.
+    let reply = ablate!("::quad_is_four", json!({"mode": "load_bearing", "hypotheses": false}));
+    assert_eq!(reply["result"], "load_bearing_set", "{reply}");
+    assert_eq!(reply["candidates"], reply["axiom_groups"], "{reply}");
+    let mut kept = names(&reply);
+    kept.sort();
+    assert_eq!(kept.len(), 2, "{reply}");
+    assert!(kept[0].ends_with("::double") && kept[1].ends_with("::quad"), "{}", reply);
+    for unit in reply["witness"].as_array().unwrap() {
+        assert_eq!(unit["kind"], "axiom_group", "{unit}");
+    }
+
     // Two contradictory lemmas prove anything: the proof is vacuous, and both
     // take part in the contradiction.
     let reply = ablate!("::contradictory", json!({"mode": "auto"}));
@@ -665,6 +678,13 @@ fn resident_ablation_finds_witnesses_and_leaves_the_session_unchanged() {
     let kept = names(&reply);
     for lemma in ["::h_pos", "::h_neg"] {
         assert!(kept.iter().any(|name| name.ends_with(lemma)), "{}: {}", lemma, reply);
+    }
+    for unit in reply["witness"].as_array().unwrap() {
+        if unit["kind"] == "axiom_group" {
+            // the lemma's group also defines its `ens%` predicate; the
+            // role is the lemma's
+            assert_eq!(unit["roles"], json!(["broadcast"]), "{unit}");
+        }
     }
     assert_eq!(reply["vacuity"]["vacuous"], true, "{reply}");
     assert_eq!(reply["vacuity"]["before"]["result"], "valid", "{reply}");
@@ -679,13 +699,6 @@ fn resident_ablation_finds_witnesses_and_leaves_the_session_unchanged() {
     // The loop lemma hides a proof that needs a dozen rounds of unfolding:
     // removing it alone makes the query valid, and it is not a vacuity.
     // Removing every candidate loses the proof too, so the search tries one
-    for unit in reply["witness"].as_array().unwrap() {
-        if unit["kind"] == "axiom_group" {
-            // the lemma's group also defines its `ens%` predicate; the
-            // role is the lemma's
-            assert_eq!(unit["roles"], json!(["broadcast"]), "{unit}");
-        }
-    }
     // unit at a time, most instantiated first: the loop lemma comes first.
     let reply = ablate!("::buried", json!({"mode": "auto"}));
     assert_eq!(reply["non_monotone"], true, "{reply}");
@@ -698,6 +711,7 @@ fn resident_ablation_finds_witnesses_and_leaves_the_session_unchanged() {
     assert_eq!(removed.len(), 1, "{reply}");
     assert_eq!(removed[0]["kind"], "axiom_group", "{reply}");
     assert!(removed[0]["name"].as_str().unwrap().ends_with("::g_splits"), "{}", reply);
+    assert_eq!(removed[0]["roles"], json!(["broadcast"]), "{reply}");
     let span = removed[0]["span"].as_str().unwrap();
     assert!(span.contains(&ablate_span_of("fn g_splits")), "{}", reply);
     assert!(removed[0]["instantiations_before"].as_u64().unwrap() > 0, "{}", reply);

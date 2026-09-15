@@ -1168,25 +1168,30 @@ mod tests {
         let hits = |d: &[bool]| {
             if d[37] && !d[0] { Answer::Valid } else { unknown() }
         };
+        // unit 40 is not a candidate, so an order naming it skips it
         let candidates: Vec<usize> = (0..40).collect();
-        let mut probe = |d: &[bool]| -> Result<Answer, Infallible> { Ok(hits(d)) };
-        let outcome = search_ordered(
-            Mode::Flip(Target::Valid),
-            40,
-            &candidates,
-            &[37, 5],
-            &[],
-            100,
-            None,
-            &mut probe,
-        )
-        .unwrap();
+        let flip = |order: &[usize]| {
+            let mut probe = |d: &[bool]| -> Result<Answer, Infallible> { Ok(hits(d)) };
+            search_ordered(
+                Mode::Flip(Target::Valid),
+                41,
+                &candidates,
+                order,
+                &[],
+                100,
+                None,
+                &mut probe,
+            )
+            .unwrap()
+        };
+        let outcome = flip(&[40, 37, 5]);
         assert_eq!(outcome.set, vec![37]);
         assert!(outcome.non_monotone);
         // before, all removed, then 37 straight away
         assert_eq!(outcome.probes.len(), 3);
-        // without an order, every unit before 37 is tried first
-        let outcome = run(Mode::Flip(Target::Valid), 40, 100, hits);
+        assert_eq!(outcome.probes[2].disabled, vec![37]);
+        // without an order, every candidate before 37 is tried first
+        let outcome = flip(&[]);
         assert_eq!(outcome.set, vec![37]);
         assert_eq!(outcome.probes.len(), 2 + 38);
     }
@@ -1215,6 +1220,17 @@ mod tests {
         let wrong = core(&[3, 17], 100);
         assert!(!wrong.hint_accepted);
         assert_eq!(wrong.set, vec![3, 17, 41]);
+        // a hint of every candidate is no hint: the search is the plain one
+        let every = core(&candidates, 100);
+        assert!(!every.hint_accepted);
+        assert_eq!(every.probes.len(), plain.probes.len());
+        // the budget can run out on the hint's probe itself: every candidate
+        // is then the core, as without a hint, and not minimal
+        let starved = core(&[3, 17, 29, 41, 50], 2);
+        assert_eq!(starved.status, Status::Found);
+        assert!(!starved.hint_accepted);
+        assert!(!starved.minimal);
+        assert_eq!(starved.set, candidates);
     }
 
     #[test]
