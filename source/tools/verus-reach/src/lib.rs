@@ -6,13 +6,14 @@
 //! name items in other crates. This library merges the reports of all
 //! crates and computes what is reachable from the chosen roots: which
 //! functions run, and which ghost functions (specs and proofs) the running
-//! code's contracts and proofs use.
+//! code's contracts and proofs use. Coverage is the share of verified
+//! functions, exec and ghost alike, that are reachable.
 
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 
-pub const SCHEMA_VERSION: u32 = 3;
+pub const SCHEMA_VERSION: u32 = 4;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Report {
@@ -25,6 +26,11 @@ pub struct Report {
     pub main: Option<String>,
     /// The crate's own functions
     pub nodes: Vec<Node>,
+    /// Ids of the crate's functions that have no body, so no node: trait
+    /// methods declared without one. An edge onto one is an edge between
+    /// functions, unlike an edge onto a type.
+    #[serde(default)]
+    pub bodiless: Vec<String>,
     /// By id. Either end may be an item this crate does not define: a
     /// function of another crate, a trait method, a type.
     pub edges: Vec<Edge>,
@@ -71,10 +77,16 @@ pub struct Node {
     /// Verus checks this function. Whether the check passed is the exit
     /// status of the verus run.
     pub verified: bool,
+    /// The body is not checked: `external_body`, the target of an
+    /// `assume_specification`, or an uninterpreted spec
     pub external_body: bool,
+    /// Stands for another function: an `assume_specification` item
     pub proxy: bool,
     /// Part of the crate's public API
     pub exported: bool,
+    /// Marked `#[verifier::reach_root]`: always a root of the analysis
+    #[serde(default)]
+    pub root: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -85,6 +97,12 @@ pub struct Span {
 }
 
 impl Node {
+    /// The functions coverage counts: verified exec code with a real body,
+    /// and every spec and proof function.
+    pub fn is_verified(&self) -> bool {
+        self.is_verified_exec() || self.is_ghost()
+    }
+
     /// The functions we want wired in: verified exec code with a real body.
     pub fn is_verified_exec(&self) -> bool {
         self.verified && self.mode == "exec" && !self.external_body && !self.proxy
@@ -94,6 +112,26 @@ impl Node {
     /// without a body.
     pub fn is_ghost(&self) -> bool {
         self.mode != "exec"
+    }
+
+    /// A ghost function whose claim is assumed, not checked: an
+    /// `external_body` proof function (an axiom) or an uninterpreted spec.
+    /// Counted as verified, since the proofs around it rely on it, but
+    /// labeled.
+    pub fn is_trusted(&self) -> bool {
+        self.is_ghost() && self.external_body
+    }
+
+    /// Not code the user wrote: an `assume_specification` proxy, the twin
+    /// `verus!` gives a `const fn`, the twin holding a trait method's spec,
+    /// or a helper `reveal` synthesizes. Newer reports leave most of these
+    /// out; older ones carry them.
+    pub fn is_synthesized(&self) -> bool {
+        let name = self.name();
+        self.proxy
+            || name.starts_with("VERUS_UNERASED_PROXY__")
+            || name.starts_with("VERUS_SPEC__")
+            || name.ends_with("__VERUS_REVEAL_INTERNAL__")
     }
 
     pub fn name(&self) -> &str {
@@ -110,6 +148,11 @@ impl Node {
 impl Report {
     pub fn file_name(&self) -> String {
         format!("{}.{}.json", self.krate, self.crate_type)
+    }
+
+    /// `name (type)`, for display
+    pub fn label(&self) -> String {
+        format!("{} ({})", self.krate, self.crate_type)
     }
 }
 
@@ -131,7 +174,18 @@ pub fn load(paths: &[PathBuf]) -> Result<Vec<Report>, String> {
             files.push(path.clone());
         }
     }
-    files.iter().map(|f| load_file(f)).collect()
+    let reports: Vec<Report> = files.iter().map(|f| load_file(f)).collect::<Result<_, _>>()?;
+    // A test build holds the library's functions again, under another id
+    for test in reports.iter().filter(|r| r.crate_type == "test") {
+        if reports.iter().any(|r| r.krate == test.krate && r.crate_type != "test") {
+            return Err(format!(
+                "crate `{}` has both a test report and a lib or bin report: a test build \
+                 includes the library's functions, which would count twice; keep one",
+                test.krate
+            ));
+        }
+    }
+    Ok(reports)
 }
 
 fn load_file(path: &Path) -> Result<Report, String> {
@@ -148,14 +202,23 @@ fn load_file(path: &Path) -> Result<Report, String> {
     Ok(report)
 }
 
-/// How to pick the roots of the reachability analysis.
-#[derive(Default)]
+/// How to pick the roots of the reachability analysis. Functions marked
+/// `#[verifier::reach_root]` are always roots.
 pub struct Roots {
     /// Def paths to add
     pub add: Vec<String>,
-    /// Globs removing default roots, matched against `def_path` and
+    /// Globs removing implicit roots, matched against `def_path` and
     /// `module_path`
     pub exclude: Vec<glob::Pattern>,
+    /// Take the implicit roots too: the `main` of every executable crate,
+    /// or, when no crate has one, every exported function
+    pub implicit: bool,
+}
+
+impl Default for Roots {
+    fn default() -> Roots {
+        Roots { add: vec![], exclude: vec![], implicit: true }
+    }
 }
 
 impl Roots {
@@ -166,7 +229,8 @@ impl Roots {
 
 /// The merged reports of all crates.
 pub struct Graph {
-    /// Every function of every crate, by id
+    /// Every function the user wrote, of every crate, by id. Synthesized
+    /// items (see [`Node::is_synthesized`]) are left out; their edges stay.
     pub nodes: BTreeMap<String, Node>,
     pub roots: Vec<String>,
     /// Runs: reached from a root through calls only
@@ -174,25 +238,41 @@ pub struct Graph {
     /// Used by ghost code: reached from a running function through a
     /// contract or proof, then through anything
     pub used: HashSet<String>,
+    /// The used functions plus the functions that mention one directly,
+    /// through an edge of any kind:
+    /// one hop against the edges' direction. Only edges onto functions of
+    /// the analyzed crates count, with or without a body; a hop onto a type
+    /// or a foreign item (everything constructs an `Option`) would gather
+    /// the whole crate. Reachable is a subset. The rest is where explicit
+    /// roots hide: theorems about reachable functions that nothing calls.
+    pub connected: HashSet<String>,
+    /// Ids something else refers to, synthesized items included: a spec
+    /// function named only in an `assume_specification` is not top-level
+    referred: HashSet<String>,
 }
 
 impl Graph {
-    /// Default roots are the `main` of every executable crate, or, when no
-    /// crate has one, every exported function.
+    /// Roots are the functions marked `#[verifier::reach_root]`, plus, unless
+    /// `roots.implicit` is off, the `main` of every executable crate, or,
+    /// when no crate has one, every exported function.
     pub fn new(reports: &[Report], roots: &Roots) -> Result<Graph, String> {
         let nodes: BTreeMap<String, Node> = reports
             .iter()
             .flat_map(|r| r.nodes.iter())
+            .filter(|n| !n.is_synthesized())
             .map(|n| (n.id.clone(), n.clone()))
             .collect();
         let mains: Vec<String> = reports.iter().filter_map(|r| r.main.clone()).collect();
-        let defaults: Vec<&Node> = if mains.is_empty() {
+        let implicit: Vec<&Node> = if !roots.implicit {
+            vec![]
+        } else if mains.is_empty() {
             nodes.values().filter(|n| n.exported).collect()
         } else {
             mains.iter().filter_map(|id| nodes.get(id)).collect()
         };
         let mut root_ids: Vec<String> =
-            defaults.into_iter().filter(|n| !roots.excludes(n)).map(|n| n.id.clone()).collect();
+            implicit.into_iter().filter(|n| !roots.excludes(n)).map(|n| n.id.clone()).collect();
+        root_ids.extend(nodes.values().filter(|n| n.root).map(|n| n.id.clone()));
         for def_path in &roots.add {
             let added: Vec<&Node> = nodes.values().filter(|n| &n.def_path == def_path).collect();
             if added.is_empty() {
@@ -210,7 +290,9 @@ impl Graph {
 
         // One search in two contexts. A call from running code runs its
         // target; anything referenced from ghost code, or from something
-        // ghost code reached, is only used.
+        // ghost code reached, is only used. A spec or proof function is
+        // ghost code whatever context it was entered in: a ghost root, or
+        // a dispatch edge to a spec-mode impl method.
         let mut reachable = HashSet::new();
         let mut used = HashSet::new();
         let mut queue: VecDeque<(&str, bool)> = VecDeque::new();
@@ -220,6 +302,7 @@ impl Graph {
             }
         }
         while let Some((id, ghost)) = queue.pop_front() {
+            let ghost = ghost || nodes.get(id).map_or(false, |n| n.is_ghost());
             for edge in out.get(id).map_or(&[][..], |v| v) {
                 let ghost = ghost || edge.kind != EdgeKind::Call;
                 let set = if ghost { &mut used } else { &mut reachable };
@@ -228,17 +311,77 @@ impl Graph {
                 }
             }
         }
-        Ok(Graph { nodes, roots: root_ids, reachable, used })
+
+        // One hop against the edges, onto functions only
+        let functions: HashSet<&str> = nodes
+            .keys()
+            .map(String::as_str)
+            .chain(reports.iter().flat_map(|r| r.bodiless.iter().map(String::as_str)))
+            .collect();
+        let covered = |id: &String| {
+            functions.contains(id.as_str()) && (reachable.contains(id) || used.contains(id))
+        };
+        let mut referred = HashSet::new();
+        let mut connected: HashSet<String> =
+            nodes.keys().filter(|id| covered(id)).cloned().collect();
+        for edge in reports.iter().flat_map(|r| r.edges.iter()) {
+            // A function mentioning itself (its own result in its
+            // contract, recursion) has no referrer
+            if edge.from != edge.to {
+                referred.insert(edge.to.clone());
+            }
+            if nodes.contains_key(&edge.from) && covered(&edge.to) {
+                connected.insert(edge.from.clone());
+            }
+        }
+        Ok(Graph { nodes, roots: root_ids, reachable, used, connected, referred })
+    }
+
+    /// Verified functions that mention used code but are not used: what the
+    /// roots miss, one step against the edges.
+    pub fn connected_unreachable(&self) -> Vec<&Node> {
+        self.nodes
+            .values()
+            .filter(|n| n.is_verified() && self.connected.contains(&n.id) && !self.is_used(n))
+            .collect()
+    }
+
+    /// Candidates for `#[verifier::reach_root]`: functions that mention used
+    /// code and that nothing refers to, so they are top-level statements: a
+    /// theorem, or an exec round-trip check that calls the real code.
+    pub fn suggested_roots(&self) -> Vec<&Node> {
+        self.connected_unreachable()
+            .into_iter()
+            .filter(|n| !self.referred.contains(&n.id))
+            .collect()
     }
 
     /// An exec function is reachable when it runs; a ghost function, when
-    /// running code uses it.
+    /// running code uses it. Kept apart from [`Graph::is_used`] for
+    /// comparison with dynamic coverage, which sees only what runs.
     pub fn is_reachable(&self, node: &Node) -> bool {
         self.reachable.contains(&node.id) || (node.is_ghost() && self.used.contains(&node.id))
     }
 
-    /// Verified exec functions: (reachable, total)
+    /// The verification effort contributes to real behavior: the function
+    /// runs, or the contracts and proofs of code that runs or is used
+    /// mention it. What the outputs show, exec and ghost alike.
+    pub fn is_used(&self, node: &Node) -> bool {
+        self.reachable.contains(&node.id) || self.used.contains(&node.id)
+    }
+
+    /// The roots, by display name
+    pub fn root_names(&self) -> Vec<&str> {
+        self.roots.iter().map(|id| self.nodes[id].def_path.as_str()).collect()
+    }
+
+    /// Verified functions, exec and ghost: (used, total)
     pub fn coverage(&self) -> (usize, usize) {
+        self.count(Node::is_verified)
+    }
+
+    /// Verified exec functions: (used, total)
+    pub fn exec_coverage(&self) -> (usize, usize) {
         self.count(Node::is_verified_exec)
     }
 
@@ -250,7 +393,7 @@ impl Graph {
     fn count(&self, select: fn(&Node) -> bool) -> (usize, usize) {
         let fns = self.nodes.values().filter(|n| select(n));
         let total = fns.clone().count();
-        (fns.filter(|n| self.is_reachable(n)).count(), total)
+        (fns.filter(|n| self.is_used(n)).count(), total)
     }
 }
 
@@ -271,6 +414,7 @@ pub mod fixture {
             external_body: false,
             proxy: false,
             exported,
+            root: false,
         }
     }
 
@@ -307,6 +451,7 @@ pub mod fixture {
             crate_type: crate_type.into(),
             main: main.map(String::from),
             nodes,
+            bodiless: vec![],
             edges,
         }
     }
@@ -359,11 +504,13 @@ mod tests {
         assert!(graph.reachable.contains("lib::wired"));
         assert!(graph.reachable.contains("lib::helper"));
         assert!(!graph.reachable.contains("lib::verified::inc"));
-        assert_eq!(graph.coverage(), (2, 3));
+        assert_eq!(graph.exec_coverage(), (2, 3));
         assert!(graph.used.contains("lib::spec_wired"));
         assert!(graph.used.contains("lib::lemma"));
         assert!(!graph.used.contains("lib::verified::spec_inc"));
         assert_eq!(graph.ghost_coverage(), (2, 3));
+        // Coverage counts exec, spec, and proof functions alike
+        assert_eq!(graph.coverage(), (4, 6));
     }
 
     #[test]
@@ -409,11 +556,103 @@ mod tests {
     }
 
     #[test]
+    fn marked_roots_are_always_roots() {
+        // A theorem about `wired`, never called, marked as a root
+        let mut reports = lib_and_bin();
+        let mut theorem = proof("lib::theorem");
+        theorem.root = true;
+        reports[0].nodes.push(theorem);
+        reports[0].edges.push(contract("lib::theorem", "lib::verified::spec_inc"));
+        let graph = Graph::new(&reports, &Roots::default()).unwrap();
+        assert_eq!(graph.roots, vec!["app(bin)::main", "lib::theorem"]);
+        assert!(graph.is_reachable(&graph.nodes["lib::verified::spec_inc"]));
+        assert!(!graph.reachable.contains("lib::verified::spec_inc"));
+
+        // Without implicit roots only the theorem is a root, and nothing runs
+        let roots = Roots { implicit: false, ..Roots::default() };
+        let graph = Graph::new(&reports, &roots).unwrap();
+        assert_eq!(graph.roots, vec!["lib::theorem"]);
+        assert!(!graph.is_reachable(&graph.nodes["lib::wired"]));
+        assert_eq!(graph.exec_coverage(), (0, 3));
+
+        // An exclusion glob does not remove a marked root
+        let roots =
+            Roots { exclude: vec![glob::Pattern::new("lib::*").unwrap()], ..Roots::default() };
+        let graph = Graph::new(&reports, &roots).unwrap();
+        assert_eq!(graph.roots, vec!["app(bin)::main", "lib::theorem"]);
+    }
+
+    #[test]
+    fn connected_is_the_reached_code_and_what_mentions_it_directly() {
+        // A theorem about `wired`, and a lemma the theorem uses; neither is
+        // called. The lemma is two hops away, and a spec about the
+        // unreachable twin touches nothing reached.
+        let mut reports = lib_and_bin();
+        reports[0].nodes.push(proof("lib::theorem"));
+        reports[0].nodes.push(proof("lib::lemma_for_theorem"));
+        reports[0].edges.push(contract("lib::theorem", "lib::spec_wired"));
+        reports[0].edges.push(Edge::new("lib::theorem", "lib::lemma_for_theorem", EdgeKind::Proof));
+        let graph = Graph::new(&reports, &Roots::default()).unwrap();
+        for n in graph.nodes.values().filter(|n| graph.is_reachable(n)) {
+            assert!(graph.connected.contains(&n.id), "{} reachable but not connected", n.id);
+        }
+        assert!(graph.connected.contains("lib::theorem"));
+        assert!(!graph.connected.contains("lib::lemma_for_theorem"));
+        assert!(!graph.connected.contains("lib::verified::spec_inc"));
+        fn names(v: Vec<&Node>) -> Vec<&str> {
+            v.iter().map(|n| n.id.as_str()).collect()
+        }
+        assert_eq!(names(graph.connected_unreachable()), vec!["lib::theorem"]);
+        assert_eq!(names(graph.suggested_roots()), vec!["lib::theorem"]);
+    }
+
+    #[test]
+    fn a_reference_from_a_synthesized_item_is_a_reference() {
+        // `ok` is named only by the contract of an `assume_specification`
+        // (a proxy, not a node), `small` by reachable code and by `ok`: the
+        // spec of dead code mentions used code, but it is not top-level
+        let mut reports = lib_and_bin();
+        let mut proxy = proof("lib::ext_spec");
+        proxy.proxy = true;
+        reports[0].nodes.push(proxy);
+        reports[0].nodes.push(spec("lib::ok"));
+        reports[0].edges.push(contract("lib::ext_spec", "lib::ok"));
+        reports[0].edges.push(call("lib::ok", "lib::spec_wired"));
+        let graph = Graph::new(&reports, &Roots::default()).unwrap();
+        assert!(graph.connected.contains("lib::ok"));
+        assert!(graph.suggested_roots().is_empty());
+    }
+
+    #[test]
+    fn a_bodiless_trait_method_links_a_theorem_to_reachable_code() {
+        // `Tr::inv` has no body, so no node; reachable code mentions it in
+        // a contract, and a theorem about it mentions nothing else
+        let mut reports = lib_and_bin();
+        reports[0].bodiless.push("lib::Tr::inv".into());
+        reports[0].nodes.push(proof("lib::theorem"));
+        reports[0].edges.push(contract("lib::wired", "lib::Tr::inv"));
+        reports[0].edges.push(contract("lib::theorem", "lib::Tr::inv"));
+        let graph = Graph::new(&reports, &Roots::default()).unwrap();
+        assert!(graph.used.contains("lib::Tr::inv"));
+        assert!(!graph.nodes.contains_key("lib::Tr::inv"));
+        assert!(graph.connected.contains("lib::theorem"));
+        let names: Vec<&str> = graph.suggested_roots().iter().map(|n| n.id.as_str()).collect();
+        assert_eq!(names, vec!["lib::theorem"]);
+
+        // Without the declaration, an edge onto an unknown id is a hop onto
+        // a type or a foreign item and connects nothing
+        reports[0].bodiless.clear();
+        let graph = Graph::new(&reports, &Roots::default()).unwrap();
+        assert!(!graph.connected.contains("lib::theorem"));
+    }
+
+    #[test]
     fn exclude_and_add_roots() {
         let lib = lib_and_bin().remove(0);
         let roots = Roots {
             add: vec!["lib::helper".into()],
             exclude: vec![glob::Pattern::new("lib::verified::*").unwrap()],
+            implicit: true,
         };
         let graph = Graph::new(&[lib], &roots).unwrap();
         assert_eq!(graph.roots, vec!["lib::helper", "lib::inc", "lib::wired"]);
@@ -422,20 +661,94 @@ mod tests {
 
     #[test]
     fn exclude_matches_the_module_of_a_method() {
-        // `def_path` files a method under its type, which may live elsewhere
+        // `def_path` files a method under its type (`lib::Wrapper::fmt`),
+        // which may be defined in another module than the impl
         let mut method = node("lib::verified::impl&%0::fmt", true, true);
-        method.def_path = "core::fmt::Display::fmt".into();
+        method.def_path = "lib::Wrapper::fmt".into();
         method.module = "lib::verified".into();
         let lib = report("lib", "lib", None, vec![method], vec![]);
-        let roots =
-            Roots { add: vec![], exclude: vec![glob::Pattern::new("lib::verified::*").unwrap()] };
+        let roots = Roots {
+            exclude: vec![glob::Pattern::new("lib::verified::*").unwrap()],
+            ..Roots::default()
+        };
         assert!(Graph::new(&[lib], &roots).unwrap().roots.is_empty());
     }
 
     #[test]
     fn unknown_root_is_an_error() {
-        let roots = Roots { add: vec!["lib::nope".into()], exclude: vec![] };
+        let roots = Roots { add: vec!["lib::nope".into()], ..Roots::default() };
         assert!(Graph::new(&lib_and_bin(), &roots).is_err());
+    }
+
+    #[test]
+    fn a_ghost_root_uses_but_never_runs() {
+        // An exported spec fn, defined through a `when_used_as_spec` exec fn
+        let lib = report(
+            "lib",
+            "lib",
+            None,
+            vec![
+                {
+                    let mut n = spec("lib::spec_len");
+                    n.exported = true;
+                    n
+                },
+                node("lib::len", true, false),
+            ],
+            vec![call("lib::spec_len", "lib::len")],
+        );
+        let graph = Graph::new(&[lib], &Roots::default()).unwrap();
+        assert_eq!(graph.roots, vec!["lib::spec_len"]);
+        assert!(!graph.reachable.contains("lib::len"));
+        assert!(graph.used.contains("lib::len"));
+        assert!(!graph.is_reachable(&graph.nodes["lib::len"]));
+    }
+
+    #[test]
+    fn synthesized_items_are_not_nodes_but_keep_their_edges() {
+        let mut twin = node("lib::Tr::VERUS_SPEC__m", false, false);
+        twin.def_path = "lib::Tr::VERUS_SPEC__m".into();
+        let mut helper = node("lib::f::__VERUS_REVEAL_INTERNAL__", false, false);
+        helper.def_path = "lib::f::__VERUS_REVEAL_INTERNAL__".into();
+        let mut proxy = node("lib::ext_spec", true, false);
+        proxy.proxy = true;
+        let lib = report(
+            "lib",
+            "bin",
+            Some("lib(bin)::main"),
+            vec![node("lib(bin)::main", false, false), twin, helper, proxy, spec("lib::p")],
+            vec![
+                call("lib(bin)::main", "lib::Tr::m"),
+                contract("lib::Tr::m", "lib::Tr::VERUS_SPEC__m"),
+                contract("lib::Tr::VERUS_SPEC__m", "lib::p"),
+            ],
+        );
+        let graph = Graph::new(&[lib], &Roots::default()).unwrap();
+        let ids: Vec<&String> = graph.nodes.keys().collect();
+        assert_eq!(ids, vec!["lib(bin)::main", "lib::p"]);
+        assert!(graph.is_reachable(&graph.nodes["lib::p"]));
+    }
+
+    #[test]
+    fn a_test_report_beside_the_library_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, ty) in [("lib", "lib"), ("lib", "test")] {
+            let r = report(name, ty, None, vec![], vec![]);
+            std::fs::write(dir.path().join(r.file_name()), serde_json::to_string(&r).unwrap())
+                .unwrap();
+        }
+        let err = load(&[dir.path().to_path_buf()]).unwrap_err();
+        assert!(err.contains("test report"), "{err}");
+    }
+
+    #[test]
+    fn trusted_ghost_functions_are_labeled() {
+        let mut axiom = proof("lib::axiom");
+        axiom.external_body = true;
+        assert!(axiom.is_trusted() && axiom.is_verified());
+        let mut ext = node("lib::ext", true, false);
+        ext.external_body = true;
+        assert!(!ext.is_trusted() && !ext.is_verified());
     }
 
     #[test]

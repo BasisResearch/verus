@@ -35,7 +35,7 @@ fn edge_kinds(report: &Report, from: &str, to: &str) -> Vec<EdgeKind> {
 
 /// The test crate is a library, so `main` is not an entry point; make it the root.
 fn graph_from_main(report: &Report) -> Graph {
-    let roots = Roots { add: vec!["test_crate::main".into()], exclude: vec![] };
+    let roots = Roots { add: vec!["test_crate::main".into()], ..Roots::default() };
     Graph::new(std::slice::from_ref(report), &roots).unwrap()
 }
 
@@ -202,9 +202,10 @@ fn dead_ghost_functions() {
         vec![EdgeKind::Contract]
     );
     assert_eq!(edge_kinds(&report, "test_crate::main", "test_crate::lemma"), vec![EdgeKind::Proof]);
+    // A spec body is ghost code: what it names is used, not called
     assert_eq!(
         edge_kinds(&report, "test_crate::bounded", "test_crate::small"),
-        vec![EdgeKind::Call]
+        vec![EdgeKind::Proof]
     );
 
     let graph = graph_from_main(&report);
@@ -217,6 +218,8 @@ fn dead_ghost_functions() {
         assert!(!graph.is_reachable(ghost(name)), "{}", name);
     }
     assert_eq!(graph.ghost_coverage(), (4, 6));
+    assert_eq!(graph.exec_coverage(), (1, 2));
+    assert_eq!(graph.coverage(), (5, 8));
 }
 
 /// The spec accessors `verus!` synthesizes for enum fields are not the
@@ -419,8 +422,8 @@ fn exported_roots() {
     assert!(all.is_reachable(node(&report, "test_crate::verified::inc")));
 
     let roots = Roots {
-        add: vec![],
         exclude: vec![glob::Pattern::new("test_crate::verified::*").unwrap()],
+        ..Roots::default()
     };
     let excluded = Graph::new(std::slice::from_ref(&report), &roots).unwrap();
     assert_eq!(excluded.roots, vec!["test_crate::inc"]);
@@ -435,8 +438,12 @@ fn proxies() {
             x
         }
 
+        spec fn same(a: u64, b: u64) -> bool {
+            a == b
+        }
+
         assume_specification [ext](x: u64) -> (r: u64)
-            ensures r == x;
+            ensures same(r, x);
 
         fn main() {
             let _ = ext(1);
@@ -452,6 +459,347 @@ fn proxies() {
     assert!(ext.verified);
     assert!(ext.external_body);
     assert!(!ext.is_verified_exec());
+    // The contract is written on the proxy, which callers never name
+    assert_eq!(edge_kinds(&report, &ext.id, &proxies[0].id), vec![EdgeKind::Contract]);
+    let graph = graph_from_main(&report);
+    assert!(graph.is_reachable(node(&report, "test_crate::same")));
+    assert!(!graph.nodes.contains_key(&proxies[0].id), "proxies are not graph nodes");
+}
+
+/// A `const fn` is checked through a twin `verus!` gives it, at the same
+/// span; a trait method's spec lives in a `VERUS_SPEC__` twin. Neither is
+/// code of its own: the first is a proxy, the second only lends the method
+/// its contract.
+#[test]
+fn trait_method_spec_is_used_through_the_method() {
+    let code = verus_code! {
+        spec fn small(x: u64) -> bool {
+            x < 10
+        }
+
+        trait Tr {
+            fn m(&self, x: u64)
+                requires small(x);
+        }
+
+        struct S;
+
+        impl Tr for S {
+            fn m(&self, x: u64) {
+            }
+        }
+
+        fn main() {
+            S.m(1);
+        }
+    };
+    let (result, report) = reach("trait_spec_twin", code);
+    result.unwrap();
+    assert!(
+        !report.nodes.iter().any(|n| n.def_path.contains("VERUS_SPEC__")),
+        "twins are not nodes: {:#?}",
+        report.nodes
+    );
+    assert!(has_edge(&report, "test_crate::Tr::m", "test_crate::Tr::VERUS_SPEC__m"));
+    let graph = graph_from_main(&report);
+    assert!(graph.is_reachable(node(&report, "test_crate::small")));
+}
+
+/// Functions the user's own `macro_rules!` expands to are the user's,
+/// reported at the invocation.
+#[test]
+fn macro_defined_functions_are_reported_at_the_invocation() {
+    let code = verus_code! {
+        // `verus!` leaves a `macro_rules!` body alone: the expansion is
+        // Verus code only if it says so
+        macro_rules! twice {
+            ($name:ident) => {
+                verus! {
+                    fn $name(x: u64) -> (r: u64)
+                        requires x < 100,
+                        ensures r == x * 2,
+                    {
+                        x * 2
+                    }
+                }
+            };
+        }
+
+        twice!(double_a);
+        twice!(double_b);
+
+        fn main() {
+            let _ = double_a(1);
+        }
+    };
+    let (result, report) = reach("macro_fns", code);
+    result.unwrap();
+    let a = node(&report, "test_crate::double_a");
+    let b = node(&report, "test_crate::double_b");
+    assert!(a.is_verified_exec() && b.is_verified_exec());
+    assert_eq!(a.span.start_line, a.span.end_line, "reported at the one-line invocation");
+    assert_ne!(a.span.start_line, b.span.start_line);
+    let graph = graph_from_main(&report);
+    assert!(graph.is_reachable(a));
+    assert!(!graph.is_reachable(b));
+}
+
+/// A spec function's body is ghost code: what it names is used, not run,
+/// even when the spec function is itself a root.
+#[test]
+fn a_spec_root_uses_but_does_not_run() {
+    let code = verus_code! {
+        pub open spec fn spec_len(x: u64) -> u64 {
+            x
+        }
+
+        #[verifier::when_used_as_spec(spec_len)]
+        pub fn len(x: u64) -> (r: u64)
+            ensures r == spec_len(x),
+        {
+            x
+        }
+
+        pub open spec fn twice_len(x: u64) -> int {
+            len(x) + len(x)
+        }
+
+        proof fn lemma_len(x: u64)
+            ensures spec_len(x) == x,
+        {
+        }
+
+        fn main() {
+        }
+    };
+    let (result, report) = reach("spec_root", code);
+    result.unwrap();
+    assert_eq!(
+        edge_kinds(&report, "test_crate::twice_len", "test_crate::len"),
+        vec![EdgeKind::Proof],
+        "a ghost body's references are ghost"
+    );
+    // A proof function's own contract keeps its label
+    assert_eq!(
+        edge_kinds(&report, "test_crate::lemma_len", "test_crate::spec_len"),
+        vec![EdgeKind::Contract]
+    );
+    // `len` is exported, so it would be an implicit root of this library
+    let roots =
+        Roots { add: vec!["test_crate::twice_len".into()], implicit: false, ..Roots::default() };
+    let graph = Graph::new(std::slice::from_ref(&report), &roots).unwrap();
+    assert_eq!(graph.roots, vec!["test_crate::twice_len"]);
+    assert!(!graph.reachable.contains("test_crate::len"));
+    assert!(graph.is_reachable(node(&report, "test_crate::spec_len")));
+}
+
+/// A function marked `#[verifier::reach_root]` is a root whether or not
+/// anything calls it: a theorem about important functions, say.
+#[test]
+fn marked_roots() {
+    let code = verus_code! {
+        spec fn good(x: u64) -> bool {
+            x < 10
+        }
+
+        fn important(x: u64) -> (r: u64)
+            ensures good(r),
+        {
+            1
+        }
+
+        #[verifier::reach_root]
+        proof fn theorem(x: u64)
+            ensures good(1),
+        {
+        }
+
+        fn main() {
+        }
+    };
+    let (result, report) = reach("marked_roots", code);
+    result.unwrap();
+    let theorem = node(&report, "test_crate::theorem");
+    assert!(theorem.root, "{:#?}", theorem);
+    assert!(!node(&report, "test_crate::important").root);
+    let roots = Roots { implicit: false, ..Roots::default() };
+    let graph = Graph::new(std::slice::from_ref(&report), &roots).unwrap();
+    assert_eq!(graph.roots, vec![theorem.id.clone()]);
+    assert!(graph.is_reachable(node(&report, "test_crate::good")));
+    assert!(!graph.is_reachable(node(&report, "test_crate::important")));
+}
+
+/// An uninterpreted spec has no body to check, like an `external_body`
+/// proof: trusted, and labeled so.
+#[test]
+fn uninterpreted_specs_are_trusted() {
+    let code = verus_code! {
+        pub uninterp spec fn oracle(x: u64) -> bool;
+
+        #[verifier::external_body]
+        pub proof fn axiom_oracle(x: u64)
+            ensures oracle(x),
+        {
+        }
+
+        pub open spec fn plain(x: u64) -> bool {
+            x > 0
+        }
+
+        fn main() {
+        }
+    };
+    let (result, report) = reach("uninterp", code);
+    result.unwrap();
+    assert!(node(&report, "test_crate::oracle").is_trusted());
+    assert!(node(&report, "test_crate::axiom_oracle").is_trusted());
+    assert!(!node(&report, "test_crate::plain").is_trusted());
+}
+
+/// `verus!` splits a `const fn` in two: the erased item that runs, and a
+/// `VERUS_UNERASED_PROXY__` twin holding its ghost code, at the same span.
+/// Verus labels the erased item; the twin is not code of its own, but what
+/// its contract and proofs mention is used through the erased item.
+#[test]
+fn const_fn_ghost_code_is_used_through_the_twin() {
+    let code = verus_code! {
+        spec fn same(a: bool, b: bool) -> bool {
+            a == b
+        }
+
+        proof fn lemma_same(a: bool)
+            ensures same(a, a),
+        {
+        }
+
+        const fn is_lt(a: u64, b: u64) -> (r: bool)
+            ensures same(r, a < b),
+        {
+            proof {
+                lemma_same(a < b);
+            }
+            a < b
+        }
+
+        fn main() {
+            let _ = is_lt(1, 2);
+        }
+    };
+    let (result, report) = reach("const_fn_twin", code);
+    result.unwrap();
+    let is_lt = node(&report, "test_crate::is_lt");
+    assert!(is_lt.is_verified_exec(), "{:#?}", is_lt);
+    assert!(
+        !report.nodes.iter().any(|n| n.def_path.contains("VERUS_UNERASED_PROXY__")),
+        "twins are not nodes: {:#?}",
+        report.nodes
+    );
+    let twin = "test_crate::VERUS_UNERASED_PROXY__is_lt";
+    assert_eq!(edge_kinds(&report, "test_crate::is_lt", twin), vec![EdgeKind::Contract]);
+    assert_eq!(edge_kinds(&report, twin, "test_crate::same"), vec![EdgeKind::Contract]);
+    assert_eq!(edge_kinds(&report, twin, "test_crate::lemma_same"), vec![EdgeKind::Proof]);
+    let graph = graph_from_main(&report);
+    assert!(graph.is_reachable(is_lt));
+    assert!(graph.is_reachable(node(&report, "test_crate::same")));
+    assert!(graph.is_reachable(node(&report, "test_crate::lemma_same")));
+    // is_lt, same, lemma_same, and main
+    assert_eq!(graph.coverage(), (4, 4));
+}
+
+/// A trait method declared without a body has no node, but an edge onto it
+/// is an edge between functions: a theorem about it is connected to the
+/// reachable code that mentions it.
+#[test]
+fn bodiless_trait_method_connects_a_theorem() {
+    let code = verus_code! {
+        trait Tr {
+            spec fn inv(&self) -> bool;
+        }
+
+        struct S;
+
+        impl Tr for S {
+            spec fn inv(&self) -> bool {
+                true
+            }
+        }
+
+        fn use_it<T: Tr>(t: &T)
+            requires t.inv(),
+        {
+        }
+
+        proof fn theorem<T: Tr>(t: &T)
+            ensures t.inv() == t.inv(),
+        {
+        }
+
+        fn main() {
+            let s = S;
+            use_it(&s);
+        }
+    };
+    let (result, report) = reach("bodiless_trait_method", code);
+    result.unwrap();
+    assert!(report.bodiless.contains(&"test_crate::Tr::inv".to_string()), "{:#?}", report);
+    assert!(!report.nodes.iter().any(|n| n.def_path == "test_crate::Tr::inv"));
+    assert_eq!(
+        edge_kinds(&report, "test_crate::use_it", "test_crate::Tr::inv"),
+        vec![EdgeKind::Contract]
+    );
+    let graph = graph_from_main(&report);
+    assert!(graph.used.contains("test_crate::Tr::inv"));
+    let theorem = node(&report, "test_crate::theorem");
+    assert!(!graph.is_reachable(theorem));
+    assert!(graph.connected.contains(&theorem.id));
+    let suggested: Vec<&str> =
+        graph.suggested_roots().iter().map(|n| n.def_path.as_str()).collect();
+    assert_eq!(suggested, vec!["test_crate::theorem"]);
+}
+
+/// Two functions of one name nested in one body get ids of their own: what
+/// only the uncalled one calls is not reached.
+#[test]
+fn nested_functions_of_one_name_are_told_apart() {
+    let code = verus_code! {
+        fn only_by_second() -> u64 {
+            1
+        }
+
+        #[verifier::external]
+        fn main() {
+            {
+                fn helper() -> u64 {
+                    1
+                }
+                let _ = helper();
+            }
+            {
+                fn helper() -> u64 {
+                    only_by_second()
+                }
+            }
+        }
+    };
+    let (result, report) = reach("nested_twice", code);
+    result.unwrap();
+    let mut ids: Vec<&str> = report
+        .nodes
+        .iter()
+        .filter(|n| n.def_path == "test_crate::main::helper")
+        .map(|n| n.id.as_str())
+        .collect();
+    ids.sort();
+    assert_eq!(
+        ids,
+        vec!["test_crate::main::helper", "test_crate::main::helper#1"],
+        "{:#?}",
+        report
+    );
+    assert!(has_edge(&report, "test_crate::main", "test_crate::main::helper"));
+    assert!(!has_edge(&report, "test_crate::main", "test_crate::main::helper#1"));
+    assert!(has_edge(&report, "test_crate::main::helper#1", "test_crate::only_by_second"));
+    assert!(!graph_from_main(&report).is_reachable(node(&report, "test_crate::only_by_second")));
 }
 
 /// A library crate and a binary crate: the binary's `main` is the root, and
