@@ -847,6 +847,31 @@ fn resident_inst_graph_finds_the_matching_loop() {
     let pathless = graph(&mut worker, &looping, json!({"op": "path"}));
     assert_eq!(pathless["event"], "error", "{pathless}");
 
+    // A qid nothing was instantiated for is refused rather than answered: an
+    // op that found nothing would otherwise read like a graph holding nothing.
+    // A `source_fn` prefix owning no quantifier is a fair question with an
+    // empty answer, so it is answered, with `matching_nodes` saying as much.
+    let refused =
+        graph(&mut worker, &looping, json!({"op": "cycles", "filter": {"quantifier": "absent"}}));
+    assert_eq!(refused["event"], "error", "{refused}");
+    let empty =
+        graph(&mut worker, &looping, json!({"op": "cycles", "filter": {"source_fn": "no::such"}}));
+    assert_eq!(empty["result"]["matching_nodes"], 0, "{empty}");
+    // A filter that stands for something but selects nothing is answered, and
+    // says so: `matching_nodes` separates it from a graph with nothing in it.
+    let total = summary["instantiations"].as_u64().unwrap();
+    for op in ["cycles", "top_cost", "subgraph", "growth"] {
+        let deep = graph(&mut worker, &looping, json!({"op": op, "filter": {"min_depth": 9999}}));
+        assert_eq!(deep["result"]["matching_nodes"], 0, "{op}: {deep}");
+        assert_eq!(deep["result"]["total_instantiations"], total, "{op}: {deep}");
+        let all = graph(&mut worker, &looping, json!({"op": op}));
+        assert_eq!(all["result"]["matching_nodes"], total, "{op}: {all}");
+    }
+    // `path` takes no filter, and claims no count.
+    let walked =
+        graph(&mut worker, &looping, json!({"op": "path", "to_inst": deepest, "limit": 1000}));
+    assert!(walked["result"]["matching_nodes"].is_null(), "{}", walked);
+
     // A healthy query records its own, smaller graph.
     let healthy =
         worker.send(json!({"command": "check", "session": session, "bucket": 0, "query": passing}));
