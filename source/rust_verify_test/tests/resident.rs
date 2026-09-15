@@ -1842,6 +1842,15 @@ verus! {
     {
         assert(s[s.len() - 1] > 0);
     }
+
+    spec fn p<A>(x: A) -> bool;
+    spec fn r<A>(x: A, y: A) -> bool;
+
+    proof fn eliminated<A>(a: A)
+        requires forall|x: A, y: A| #![trigger r(x, y)] x == y ==> p(x),
+    {
+        assert(p(a));
+    }
 }
 "#;
 
@@ -1931,6 +1940,18 @@ fn resident_speculate_reads_terms_at_the_goal() {
         probe_own(&mut worker, &ready, "::last_of", instantiation(json!({"i": "s.len() - 1"})));
     assert_eq!(method["status"], "applied", "{method}");
     assert_eq!(method["closed"], true, "{method}");
+
+    // `x == y` lets cvc5 eliminate one of the variables; the instance goes
+    // without it, and a snippet offered is the instance cvc5 made.
+    let eliminated =
+        probe_own(&mut worker, &ready, "::eliminated", instantiation(json!({"x": "a", "y": "a"})));
+    println!("eliminated: {eliminated}");
+    assert_eq!(eliminated["closed"], true, "{eliminated}");
+    if let Some(snippet) = eliminated["verus_snippet"].as_str() {
+        let source = SPECULATE_GOAL_SOURCE
+            .replace("assert(p(a));", &format!("{snippet}\n        assert(p(a));"));
+        assert_eq!(cold_check(&source, "::eliminated", &options)["result"], "valid", "{snippet}");
+    }
 
     assert_eq!(
         worker.send(json!({"command": "close", "session": ready["session"]}))["event"],

@@ -1754,6 +1754,10 @@ fn serve_egraph(
     Ok(Ok(EgraphOutcome { before, summary, equalities, injection }))
 }
 
+/// How cvc5 begins the `mismatch` reason for a variable its formula no
+/// longer binds.
+const UNBOUND_VARIABLE: &str = "the formula binds no variable named ";
+
 /// The most rounds of rising depth a probe may ask to make a matching loop.
 const MAX_LOOP_THRESHOLD: u32 = 1000;
 /// The most quantifiers a probe lists as candidates.
@@ -1912,12 +1916,15 @@ struct SpeculationOutcome {
     #[serde(skip_serializing_if = "Option::is_none")]
     after: Option<SpeculationRun>,
     /// `applied`; `rejected` (the instantiation funnel refused the directed
-    /// instance: it was made already, it is a lemma already sent, or the
-    /// instantiation level limit refused a term; `reason` says which);
-    /// `mismatch` (the terms do not fit the variables); `unusable` (the
-    /// pattern cannot be a trigger); `no_quantifier`; `could_not_lower` (a
-    /// term that cannot be read in the query's scope, or that the solver
-    /// cannot read); `pending` (no instantiation round ran)
+    /// instance: it was made already, it is a lemma already sent, it
+    /// simplifies to true, or the instantiation level limit refused a term;
+    /// `reason` says which); `mismatch` (the terms do not fit the
+    /// variables); `unusable` (the pattern cannot be a trigger);
+    /// `no_quantifier` (cvc5 holds no formula with the qid, see `notes`);
+    /// `could_not_lower` (a term that cannot be read in the query's scope,
+    /// or that the solver cannot read); `pending` (no instantiation round
+    /// reached e-matching, for instance because conflict-based
+    /// instantiation closed every check first)
     #[serde(skip_serializing_if = "Option::is_none")]
     status: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1960,6 +1967,11 @@ struct SpeculationOutcome {
     /// one reading was possible.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     readings: Vec<String>,
+    /// Variables of the quantifier that cvc5 eliminated before the search
+    /// (an equality in its body fixes each), so the formula it holds no
+    /// longer binds them; the directed instance was sent without them.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    eliminated: Vec<String>,
     caveat: &'static str,
     elapsed_ms: u128,
     restore_ms: u128,
@@ -1988,6 +2000,7 @@ impl SpeculationOutcome {
             notes: String::new(),
             candidates: Vec::new(),
             readings: Vec::new(),
+            eliminated: Vec::new(),
             caveat: SPECULATION_CAVEAT,
             elapsed_ms: 0,
             restore_ms: 0,
@@ -3040,8 +3053,35 @@ fn serve_speculate(
         }
     };
 
-    let (after_result, after_ms, after_reply, _) =
-        speculation_check(air, query, lowered.clone(), loop_threshold, set_rlimit)?;
+    // cvc5 eliminates a variable an equality in the formula's body fixes
+    // (`x == y ==> ...`), and the formula it holds then no longer binds it.
+    // An instantiation that names one is sent again without it: the
+    // instance cvc5 makes is the rest's, with the equality's term for it.
+    let mut lowered = lowered;
+    let mut eliminated_smt: Vec<String> = Vec::new();
+    let (after_result, after_ms, after_reply) = loop {
+        let (result, ms, reply, _) =
+            speculation_check(air, query, lowered.clone(), loop_threshold, set_rlimit)?;
+        let unbound = reply
+            .hypotheses
+            .iter()
+            .find(|h| h.kind == "instantiate" && h.status == "mismatch")
+            .and_then(|h| h.reason.as_deref()?.strip_prefix(UNBOUND_VARIABLE))
+            .map(str::to_owned);
+        match (&mut lowered, unbound) {
+            (Hypothesis::Instantiate { subst, .. }, Some(name))
+                if subst.len() > 1 && subst.iter().any(|(v, _)| *v == name) =>
+            {
+                subst.retain(|(v, _)| *v != name);
+                eliminated_smt.push(name);
+            }
+            _ => break (result, ms, reply),
+        }
+    };
+    outcome.eliminated = eliminated_smt
+        .iter()
+        .map(|smt| vir::air_names::source_symbol(&unversioned.shown, smt).unwrap_or(smt.clone()))
+        .collect();
     if let Some(error) = &after_reply.error {
         outcome.status = Some("could_not_lower".to_owned());
         outcome.reason = Some(error_message(error));
@@ -3095,8 +3135,18 @@ fn serve_speculate(
         .unwrap_or_default();
     match &lowered {
         Hypothesis::Instantiate { .. } => {
-            if closed {
+            if closed && eliminated_smt.is_empty() {
                 outcome.verus_snippet = instance_assert(&quantifier, &subst, &names);
+            } else if closed {
+                // The requested term for an eliminated variable may not be
+                // the one its equality fixes, so the snippet is the instance
+                // cvc5 made, when that pastes.
+                outcome.verus_snippet = report.bodies.first().and_then(|body| {
+                    let body = flat(&without_type_guards(&parse_term(body)?));
+                    names
+                        .pasteable(&[&body])
+                        .then(|| format!("assert({});", names.render_plain(&body)))
+                });
             }
         }
         Hypothesis::Trigger { pattern, .. } => {
@@ -3111,6 +3161,11 @@ fn serve_speculate(
                 // an instance the trigger made, asserted, which needs no
                 // change to the quantifier
                 outcome.fallback_snippet = report.instances.first().and_then(|terms| {
+                    // after cvc5 eliminated a variable, the terms no longer
+                    // line up with the quantifier's variables
+                    if terms.len() != quantifier.binders.len() {
+                        return None;
+                    }
                     let parsed: Option<Vec<TreeNode>> =
                         terms.iter().map(|term| parse_term(term)).collect();
                     let subst: HashMap<String, TreeNode> = quantifier
@@ -3154,11 +3209,21 @@ fn serve_speculate(
             "{} instantiation(s) matching the fingerprint were refused; the query answers {with} with the block and {without} without it.",
             report.blocked
         )),
+        ("no-quantifier", _) => notes.push(format!(
+            "cvc5 holds no formula with this qid, though the query's scope asserts it: cvc5 registers alpha-equivalent formulas once, under the first one's qid, and drops a formula that rewrites away. The query answers {with}."
+        )),
         (status, _) => notes.push(format!(
             "The hypothesis did not apply ({}{}); the query answers {with}.",
             status.replace('-', "_"),
             report.reason.as_deref().map(|r| format!(": {r}")).unwrap_or_default()
         )),
+    }
+    if !outcome.eliminated.is_empty() {
+        notes.push(format!(
+            "cvc5 eliminated {} from the formula (an equality in its body fixes it), so the instance was sent without it{}.",
+            outcome.eliminated.join(", "),
+            if closed { "; the snippet asserts the instance cvc5 made" } else { "" }
+        ));
     }
     match &outcome.recheck {
         Some(recheck) if recheck.result == QueryResult::Valid => notes.push(

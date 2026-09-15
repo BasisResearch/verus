@@ -94,9 +94,13 @@ pub struct HypothesisReport {
     pub kind: String,
     pub qid: String,
     /// `applied`, `rejected` (the instantiation funnel refused the directed
-    /// instance), `mismatch` (the variables do not fit), `unusable` (the
-    /// pattern cannot be a trigger), `no-quantifier` or `pending` (no
-    /// instantiation round ran)
+    /// instance: it was made already, it is a lemma already sent, it
+    /// simplifies to true, or the instantiation level limit refused a term),
+    /// `mismatch` (the variables do not fit), `unusable` (the pattern cannot
+    /// be a trigger), `no-quantifier` (applied, but no asserted formula has
+    /// the qid) or `pending` (no instantiation round reached e-matching, for
+    /// instance because conflict-based instantiation closed every check
+    /// first)
     pub status: String,
     pub reason: Option<String>,
     /// how many asserted quantifiers have the qid
