@@ -2130,9 +2130,11 @@ impl Server {
                             if pin.unwrap_or(true) {
                                 match report.solved_by {
                                     Some(rung) => {
-                                        drop(self.pins.insert(key, Pin { rung, alongside }))
+                                        self.pins.insert(key, Pin { rung, alongside });
                                     }
-                                    None => drop(self.pins.remove(&key)),
+                                    None => {
+                                        self.pins.remove(&key);
+                                    }
                                 }
                             }
                             report.pinned = self.pins.get(&key).copied();

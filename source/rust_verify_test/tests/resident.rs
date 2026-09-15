@@ -1533,10 +1533,10 @@ verus! {
 fn rung<'a>(ladder: &'a Value, name: &str) -> &'a Value {
     ladder["rungs"]
         .as_array()
-        .unwrap_or_else(|| panic!("{ladder}"))
+        .unwrap_or_else(|| panic!("{}", ladder))
         .iter()
         .find(|rung| rung["rung"] == name)
-        .unwrap_or_else(|| panic!("no {name} rung: {ladder}"))
+        .unwrap_or_else(|| panic!("no {} rung: {}", name, ladder))
 }
 
 #[test]
@@ -1550,7 +1550,7 @@ fn resident_strategy_ladder_finds_a_strategy_and_pins_it() {
     let check = json!({"command":"check", "session":session, "bucket":0, "query":untriggered});
     let before = worker.send(check.clone());
     assert_eq!(before["result"], "invalid", "{before}");
-    assert!(before["pinned"].is_null(), "{before}");
+    assert!(before["pinned"].is_null(), "{}", before);
 
     let ladder = worker
         .send(json!({"command":"ladder", "session":session, "bucket":0, "query":untriggered}));
@@ -1559,12 +1559,12 @@ fn resident_strategy_ladder_finds_a_strategy_and_pins_it() {
     // E-matching alone is the default schedule's own failure.
     assert_eq!(rung(&ladder, "ematch")["verdict"], "unknown", "{ladder}");
     assert_eq!(rung(&ladder, "ematch")["incomplete_id"], "QUANTIFIERS", "{ladder}");
-    let solved = ladder["solved_by"].as_str().unwrap_or_else(|| panic!("{ladder}")).to_owned();
+    let solved = ladder["solved_by"].as_str().unwrap_or_else(|| panic!("{}", ladder)).to_owned();
     assert_ne!(solved, "ematch");
     let winner = rung(&ladder, &solved);
     assert_eq!(winner["verdict"], "valid", "{ladder}");
-    assert!(winner["instantiations"].as_u64().unwrap() > 0, "{ladder}");
-    assert!(winner["resource_units"].as_u64().unwrap() > 0, "{ladder}");
+    assert!(winner["instantiations"].as_u64().unwrap() > 0, "{}", ladder);
+    assert!(winner["resource_units"].as_u64().unwrap() > 0, "{}", ladder);
     // Rungs after the winner wait for run_all.
     let order = ["ematch", "conflict", "pool", "enum", "mbqi"];
     let after_winner = order.iter().skip_while(|name| **name != solved).skip(1);
@@ -1585,18 +1585,18 @@ fn resident_strategy_ladder_finds_a_strategy_and_pins_it() {
     let cleared = worker.send(
         json!({"command":"ladder", "session":session, "bucket":0, "query":untriggered, "rungs":[]}),
     );
-    assert!(cleared["pinned"].is_null() && cleared["solved_by"].is_null(), "{cleared}");
+    assert!(cleared["pinned"].is_null() && cleared["solved_by"].is_null(), "{}", cleared);
     let again = worker.send(check.clone());
     assert_eq!(again["result"], "invalid", "{again}");
-    assert!(again["pinned"].is_null(), "{again}");
+    assert!(again["pinned"].is_null(), "{}", again);
 
     // run_all tries every rung; pin false leaves no pin; budgets apply per rung.
     let all = worker.send(json!({"command":"ladder", "session":session, "bucket":0,
         "query":untriggered, "run_all":true, "pin":false, "budgets":{"enum":5}}));
-    assert!(all["rungs"].as_array().unwrap().iter().all(|r| r["verdict"] != "not_run"), "{all}");
+    assert!(all["rungs"].as_array().unwrap().iter().all(|r| r["verdict"] != "not_run"), "{}", all);
     assert_eq!(rung(&all, "pool")["verdict"], "unknown", "{all}");
     assert_eq!(rung(&all, "enum")["rlimit"], 5.0, "{all}");
-    assert!(all["pinned"].is_null(), "{all}");
+    assert!(all["pinned"].is_null(), "{}", all);
 
     // Alongside E-matching the default rungs are the three the schedule
     // lacks; the pin records how its rung ran, and the recheck runs it so.
@@ -1607,7 +1607,7 @@ fn resident_strategy_ladder_finds_a_strategy_and_pins_it() {
         alongside["rungs"].as_array().unwrap().iter().map(|rung| &rung["rung"]).collect();
     assert_eq!(names, [&json!("conflict"), &json!("enum"), &json!("mbqi")], "{alongside}");
     let alongside_solved =
-        alongside["solved_by"].as_str().unwrap_or_else(|| panic!("{alongside}")).to_owned();
+        alongside["solved_by"].as_str().unwrap_or_else(|| panic!("{}", alongside)).to_owned();
     assert_eq!(
         alongside["pinned"],
         json!({"rung": alongside_solved, "alongside": true}),
@@ -1649,7 +1649,7 @@ fn resident_ladder_without_the_mode_reports_what_is_missing() {
     for name in ["conflict", "enum", "mbqi"] {
         assert_eq!(rung(&ladder, name)["verdict"], "unavailable", "{ladder}");
     }
-    assert!(ladder["solved_by"].is_null(), "{ladder}");
+    assert!(ladder["solved_by"].is_null(), "{}", ladder);
     worker.finish(false);
 }
 
