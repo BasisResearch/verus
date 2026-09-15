@@ -214,6 +214,9 @@ pub(crate) fn smt_check_assertion<'ctx>(
     // previous check's pressure or difficulty behind for its caller to take
     context.last_inst_pressure = None;
     context.last_difficulty = None;
+    context.last_strategy_rung = None;
+    // One check only: a later error round runs the default schedule.
+    let quant_strategy = context.quant_strategy.take();
     let disabled_expr = if only_check_earlier {
         // disable all labels that come after the first known error
         let mut disabled: Vec<Expr> = Vec::new();
@@ -300,6 +303,11 @@ pub(crate) fn smt_check_assertion<'ctx>(
             sise::TreeNode::List(vec![sise::TreeNode::Atom("=".to_string()), lhs, rhs]),
         ]));
     }
+    // `quant-strategy` is not scoped by push/pop: it is set back to `all`
+    // below, after every answer, before anything else reaches the solver.
+    if let Some(strategy) = &quant_strategy {
+        context.smt_log.log_set_option("quant-strategy", strategy);
+    }
     context.smt_log.log_word("check-sat");
     if context.difficulty {
         // in the same batch, right after the answer it describes and before
@@ -313,6 +321,10 @@ pub(crate) fn smt_check_assertion<'ctx>(
     if context.inst_pressure {
         // in the same batch, right after the answer it describes
         context.smt_log.log_get_info("inst-pressure");
+    }
+    if quant_strategy.is_some() {
+        // in the same batch, right after the answer it describes
+        context.smt_log.log_get_info("strategy-rung");
     }
     if context.provenance {
         // in the same batch: the tag lists arrive after the result and the
@@ -363,6 +375,7 @@ pub(crate) fn smt_check_assertion<'ctx>(
     let mut nl_frontier = None;
     let mut egraph_lines: Vec<String> = Vec::new();
     let mut inst_pressure = None;
+    let mut strategy_rung = None;
     for line in smt_output {
         // The e-graph reply, or the solver's refusal of the request, is the
         // batch's last: every line from its first on belongs to it.
@@ -397,6 +410,12 @@ pub(crate) fn smt_check_assertion<'ctx>(
             // a cvc5 without the key; say so rather than fail the query
             inst_pressure =
                 Some(crate::context::InstPressure { unparsed: Some(line), ..Default::default() });
+        } else if quant_strategy.is_some() && line.starts_with("(:strategy-rung ") {
+            strategy_rung = Some(parse_strategy_rung(&line));
+        } else if quant_strategy.is_some() && strategy_rung.is_none() && line == "unsupported" {
+            // a cvc5 without the key; say so rather than fail the query
+            strategy_rung =
+                Some(crate::context::StrategyRung { unparsed: Some(line), ..Default::default() });
         } else if line == "unsat" {
             assert!(unsat == None);
             unsat = Some(SmtOutput::Unsat);
@@ -427,9 +446,15 @@ pub(crate) fn smt_check_assertion<'ctx>(
         }
         SmtSolver::Cvc5 => {
             context.smt_log.log_set_option("reproducible-resource-limit", "0");
+            if quant_strategy.is_some() {
+                // Queued ahead of whatever is sent next, so no later
+                // command or check runs under the strategy.
+                context.smt_log.log_set_option("quant-strategy", "all");
+            }
         }
     }
 
+    context.last_strategy_rung = strategy_rung;
     if context.provenance {
         context.last_provenance = Some(parse_provenance_lines(&provenance_lines));
     }
@@ -929,6 +954,65 @@ pub(crate) fn parse_inst_pressure(line: &str) -> crate::context::InstPressure {
             }
             _ => {}
         }
+    }
+    out
+}
+
+/// Parse cvc5's `(:strategy-rung (:strategy S :available (S ...) :rounds R
+/// :resource-units U :instantiations (:S N ...)))`. Unknown keys are
+/// skipped; a reply that does not parse is kept whole in `unparsed`.
+pub(crate) fn parse_strategy_rung(line: &str) -> crate::context::StrategyRung {
+    use sise::TreeNode;
+    let mut out = crate::context::StrategyRung::default();
+    let fields = match read_smt_sexp(line) {
+        Some(TreeNode::List(items)) => match &items[..] {
+            [TreeNode::Atom(key), TreeNode::List(fields)] if key == ":strategy-rung" => {
+                fields.clone()
+            }
+            _ => Vec::new(),
+        },
+        _ => Vec::new(),
+    };
+    if fields.is_empty() {
+        out.unparsed = Some(line.to_owned());
+        return out;
+    }
+    let atoms = |items: &[TreeNode]| -> Vec<String> {
+        items
+            .iter()
+            .filter_map(|item| match item {
+                TreeNode::Atom(a) => Some(a.clone()),
+                TreeNode::List(_) => None,
+            })
+            .collect()
+    };
+    for pair in fields.chunks(2) {
+        match pair {
+            [TreeNode::Atom(k), TreeNode::Atom(v)] if k == ":strategy" => {
+                out.strategy = v.clone();
+            }
+            [TreeNode::Atom(k), TreeNode::List(names)] if k == ":available" => {
+                out.available = atoms(names);
+            }
+            [TreeNode::Atom(k), TreeNode::Atom(v)] if k == ":rounds" => {
+                out.rounds = v.parse().unwrap_or(0);
+            }
+            [TreeNode::Atom(k), TreeNode::Atom(v)] if k == ":resource-units" => {
+                out.resource_units = v.parse().unwrap_or(0);
+            }
+            [TreeNode::Atom(k), TreeNode::List(counts)] if k == ":instantiations" => {
+                for count in atoms(counts).chunks(2) {
+                    if let [name, n] = count {
+                        let name = name.trim_start_matches(':').to_owned();
+                        out.instantiations.push((name, n.parse().unwrap_or(0)));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    if out.strategy.is_empty() {
+        out.unparsed = Some(line.to_owned());
     }
     out
 }
@@ -1772,6 +1856,35 @@ pub(crate) fn smt_check_query<'ctx>(
     }
 
     result
+}
+
+#[cfg(test)]
+mod strategy_rung_tests {
+    use super::parse_strategy_rung;
+
+    #[test]
+    fn strategy_rung_reply_parses_counts_and_refusals() {
+        let rung = parse_strategy_rung(
+            "(:strategy-rung (:strategy enum :available (ematch conflict pool enum mbqi) \
+             :rounds 2 :resource-units 640 :instantiations (:ematch 0 :conflict 0 :pool 0 \
+             :enum 34 :mbqi 0 :other 1)))",
+        );
+        assert!(rung.unparsed.is_none(), "{rung:?}");
+        assert_eq!(rung.strategy, "enum");
+        assert_eq!(rung.available, ["ematch", "conflict", "pool", "enum", "mbqi"]);
+        assert_eq!((rung.rounds, rung.resource_units), (2, 640));
+        assert!(rung.instantiations.contains(&("enum".to_owned(), 34)));
+        assert!(rung.instantiations.contains(&("other".to_owned(), 1)));
+        // Before any check: nothing available, the strategy as set.
+        let idle = parse_strategy_rung(
+            "(:strategy-rung (:strategy all :available () :rounds 0 :resource-units 0 \
+             :instantiations (:ematch 0 :conflict 0 :pool 0 :enum 0 :mbqi 0 :other 0)))",
+        );
+        assert!(idle.unparsed.is_none() && idle.available.is_empty(), "{idle:?}");
+        for line in ["unsupported", "(:strategy-rung ())", "(:strategy-rung"] {
+            assert!(parse_strategy_rung(line).unparsed.is_some(), "{line}");
+        }
+    }
 }
 
 #[cfg(test)]

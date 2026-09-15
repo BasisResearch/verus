@@ -123,6 +123,7 @@ impl SmtProcess {
         inst_graph: bool,
         matching_loops: bool,
         inst_max_rounds: Option<u32>,
+        strategy_ladder: bool,
     ) -> Self {
         let solver_info = SolverInfo::new(solver);
         let inst_max_rounds_arg = inst_max_rounds.map(|n| format!("--inst-max-rounds={n}"));
@@ -179,6 +180,13 @@ impl SmtProcess {
             if let Some(arg) = &inst_max_rounds_arg {
                 args.push(arg.as_str());
             }
+        }
+        if strategy_ladder {
+            assert!(matches!(solver, SmtSolver::Cvc5));
+            // Creates the conflict-based, enumerative and MBQI modules the
+            // options above leave off. They stay idle until a check selects
+            // one with `:quant-strategy`.
+            args.push("--quant-ladder");
         }
         let mut child = match std::process::Command::new(solver_info.executable())
             .args(args)
