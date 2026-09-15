@@ -1423,6 +1423,9 @@ struct QueryNames<'a> {
     /// Each SSA symbol's variable and version. Two versions of one variable
     /// read alike in `plain`, so an assert naming both cannot be pasted.
     versions: &'a VariableVersions,
+    /// Each variable's SSA symbol where a snippet goes, by its AIR name. A
+    /// snippet naming another version of it would read as this one there.
+    live: Option<&'a HashMap<String, String>>,
 }
 
 impl<'a> QueryNames<'a> {
@@ -1437,14 +1440,21 @@ impl<'a> QueryNames<'a> {
                 shown: symbols.query_names(versions, true),
                 plain: symbols.paste_names(versions),
                 versions,
+                live: None,
             },
             None => Self {
                 symbols: None,
                 shown: Cow::Borrowed(empty),
                 plain: Cow::Borrowed(empty),
                 versions,
+                live: None,
             },
         }
+    }
+
+    /// These names, for snippets pasted where each variable is `live`'s.
+    fn at(self, live: &'a HashMap<String, String>) -> Self {
+        Self { live: Some(live), ..self }
     }
 
     /// `assert(lhs == rhs);` to add to the source, when that assert says what
@@ -1460,9 +1470,10 @@ impl<'a> QueryNames<'a> {
         ))
     }
 
-    /// Whether `terms` paste as source together: each renders as source, and
-    /// no variable appears in them at two assignment versions, which would
-    /// read alike.
+    /// Whether `terms` paste as source together: each renders as source, no
+    /// variable appears in them at two assignment versions, which would read
+    /// alike, and none at a version other than the one where the snippet
+    /// goes, which it would read as.
     fn pasteable(&self, terms: &[&str]) -> bool {
         if !terms.iter().all(|term| vir::air_names::renders_as_source(&self.plain, term)) {
             return false;
@@ -1473,6 +1484,9 @@ impl<'a> QueryNames<'a> {
         for atom in terms.iter().flat_map(|term| term.split(['(', ')', ' ', '\n'])) {
             if let Some((base, version)) = self.versions.get(atom) {
                 if *version_of.entry(base.as_str()).or_insert(*version) != *version {
+                    return false;
+                }
+                if self.live.and_then(|live| live.get(base)).is_some_and(|here| here != atom) {
                     return false;
                 }
             }
@@ -1699,7 +1713,12 @@ fn serve_egraph(
     let query = &journal.queries[local];
     let (before, reading) = egraph_check(air, query, None, set_rlimit)?;
     let empty = SourceNames::new();
-    let names = QueryNames::new(bucket.symbols.as_ref(), &reading.variable_versions, &empty);
+    // An assert goes before the goal the check failed at (the query's last
+    // goal when it names none), where each variable holds the version then.
+    let goal = before.assert_id.clone().map(std::sync::Arc::new);
+    let live = air::GoalScope::of(&query.query, goal.as_ref()).live();
+    let names =
+        QueryNames::new(bucket.symbols.as_ref(), &reading.variable_versions, &empty).at(&live);
     let (listed, hidden) = names.resolve(&reading);
     let injection = match inject {
         None => None,
@@ -1742,11 +1761,15 @@ const MAX_CANDIDATES: usize = 40;
 
 const SPECULATION_CAVEAT: &str = "The hypothesis was sent in the query's own scope and popped right after the check, so the session's solver state is unchanged. A closed verdict is not a verification result: paste the snippet into the source and verify it normally.";
 
-/// A hypothesis as a `speculate` request names it. A term is an SMT term in
-/// the solver's spelling, as the `smt_*` fields of other replies give them,
-/// or with symbols named by their source names instead, which are looked up
-/// among the query's declarations. A variable of the quantifier may be
-/// named either way.
+/// A hypothesis as a `speculate` request names it. A term is a Verus
+/// expression, read as a scaffold request reads an assertion (see
+/// `crate::scaffold`) at the goal the query's check fails at, so a mutable
+/// local reads as its value there; or an SMT term in the solver's spelling,
+/// as the `smt_*` fields of other replies give them. An instantiation's
+/// terms stand where the quantifier is instantiated, so they never name its
+/// variables; a trigger's are over its variables, which shadow locals of the
+/// same name. A variable of the quantifier may be named by its source name
+/// or its own.
 #[derive(Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 enum HypothesisRequest {
@@ -1888,9 +1911,12 @@ struct SpeculationOutcome {
     /// The query checked with the hypothesis.
     #[serde(skip_serializing_if = "Option::is_none")]
     after: Option<SpeculationRun>,
-    /// `applied`; `rejected` (the instantiation was made already); `mismatch`
-    /// (the terms do not fit the variables); `unusable` (the pattern cannot
-    /// be a trigger); `no_quantifier`; `could_not_lower` (a term the solver
+    /// `applied`; `rejected` (the instantiation funnel refused the directed
+    /// instance: it was made already, it is a lemma already sent, or the
+    /// instantiation level limit refused a term; `reason` says which);
+    /// `mismatch` (the terms do not fit the variables); `unusable` (the
+    /// pattern cannot be a trigger); `no_quantifier`; `could_not_lower` (a
+    /// term that cannot be read in the query's scope, or that the solver
     /// cannot read); `pending` (no instantiation round ran)
     #[serde(skip_serializing_if = "Option::is_none")]
     status: Option<String>,
@@ -1930,6 +1956,10 @@ struct SpeculationOutcome {
     /// query's own first, when the request named none or one not there.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     candidates: Vec<QuantifierDescription>,
+    /// How names in the hypothesis's Verus terms were read, where more than
+    /// one reading was possible.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    readings: Vec<String>,
     caveat: &'static str,
     elapsed_ms: u128,
     restore_ms: u128,
@@ -1957,6 +1987,7 @@ impl SpeculationOutcome {
             suggestion: None,
             notes: String::new(),
             candidates: Vec::new(),
+            readings: Vec::new(),
             caveat: SPECULATION_CAVEAT,
             elapsed_ms: 0,
             restore_ms: 0,
@@ -2017,29 +2048,27 @@ fn sort_name(typ: &air::ast::Typ) -> String {
 /// The sort Verus boxes values into.
 const POLY: &str = "Poly";
 
-/// What the query's scope declares, with sorts: constants and variables,
-/// and functions (datatype constructors and fields included) with their
-/// argument and result sorts.
+/// What the query's scope declares, with sorts: constants and variables
+/// (each version of a variable too), and functions (datatype constructors
+/// and fields included) with their argument and result sorts. The prelude
+/// reaches each solver outside the journal; `Lowering` asks the AIR
+/// context about its names.
 #[derive(Default)]
 struct Declarations {
     constants: HashMap<String, String>,
     functions: HashMap<String, (Vec<String>, String)>,
+    /// Each variable's SSA symbol at the goal, by its AIR name.
+    live: HashMap<String, String>,
 }
 
 impl Declarations {
-    fn of(decls: &[&Decl], query: &Query) -> Self {
-        let mut out = Self::default();
-        // The prelude reaches each solver directly, never through the
-        // journal, so its boxes for integers and booleans are named here;
-        // a datatype's are the bucket's own declarations.
-        for (f, arg, result) in [
-            (vir::def::BOX_INT, "Int", POLY),
-            (vir::def::BOX_BOOL, "Bool", POLY),
-            (vir::def::UNBOX_INT, POLY, "Int"),
-            (vir::def::UNBOX_BOOL, POLY, "Bool"),
-        ] {
-            out.functions.insert(f.to_owned(), (vec![arg.to_owned()], result.to_owned()));
-        }
+    fn of(
+        decls: &[&Decl],
+        query: &Query,
+        live: HashMap<String, String>,
+        versions: &VariableVersions,
+    ) -> Self {
+        let mut out = Self { live, ..Self::default() };
         for decl in decls.iter().copied().chain(query.local.iter()) {
             match &**decl {
                 DeclX::Const(x, typ) | DeclX::Var(x, typ) => {
@@ -2068,6 +2097,11 @@ impl Declarations {
                 DeclX::Sort(_) | DeclX::Axiom(_) => {}
             }
         }
+        for (ssa, (variable, _)) in versions {
+            if let Some(sort) = out.constants.get(variable).cloned() {
+                out.constants.insert(ssa.clone(), sort);
+            }
+        }
         out
     }
 
@@ -2076,37 +2110,60 @@ impl Declarations {
     }
 }
 
-/// Turns the terms of a hypothesis into the solver's spelling: names
-/// resolved, and values boxed into `Poly` or unboxed out of it where a
-/// function, operator or variable takes the other, as Verus's encoding does.
-struct Lowering {
+/// Each of `binders`, by its own name and by its source name: its own name.
+fn binder_names(binders: &[(String, TreeNode)], names: &[&SourceNames]) -> HashMap<String, String> {
+    let mut out: HashMap<String, String> =
+        binders.iter().map(|(smt, _)| (smt.clone(), smt.clone())).collect();
+    for names in names {
+        for (smt, _) in binders {
+            if let Some(source) = vir::air_names::source_symbol(names, smt) {
+                out.entry(source).or_insert_with(|| smt.clone());
+            }
+        }
+    }
+    out
+}
+
+/// SMT-LIB's own operators, which head an SMT term rather than a call.
+const SMT_OPERATORS: &[&str] = &[
+    "+", "-", "*", "/", "div", "mod", "<", "<=", ">", ">=", "=", "distinct", "and", "or", "not",
+    "=>", "ite", "_",
+];
+
+/// Turns the terms of a hypothesis written in the solver's spelling, and its
+/// fingerprints, into terms the solver reads: names resolved, and values
+/// boxed into `Poly` or unboxed out of it where a function, operator or
+/// variable takes the other, as Verus's encoding does.
+struct Lowering<'a> {
     /// A variable of the quantifier, by its own name and by its source
-    /// name: its own name.
+    /// name: its own name. Empty for terms that stand outside it.
     binders: HashMap<String, String>,
     /// Each variable's sort, by its own name.
     binder_sorts: HashMap<String, String>,
     declared: Declarations,
     /// A declared symbol by its source name, whole and by its last path
     /// segment. Only symbols an encoder minted for the name itself count,
-    /// not the helpers named after it (a function's `req%`, `ens%`).
+    /// not the helpers named after it (a function's `req%`, `ens%`). A
+    /// variable counts as its symbol at the goal.
     by_source: HashMap<String, BTreeSet<String>>,
+    /// What the AIR context declares a name as: the prelude's names.
+    context: &'a dyn Fn(&str) -> Option<air::context::Declared>,
 }
 
-impl Lowering {
-    fn new(quantifier: &QuantifierSmt, declared: Declarations, names: &[&SourceNames]) -> Self {
-        let mut binders: HashMap<String, String> =
-            quantifier.binders.iter().map(|(smt, _)| (smt.clone(), smt.clone())).collect();
-        let binder_sorts =
-            quantifier.binders.iter().map(|(smt, sort)| (smt.clone(), flat(sort))).collect();
+impl<'a> Lowering<'a> {
+    /// `binders` are the quantifier's variables when the terms are over
+    /// them (a trigger), and none when they stand outside it.
+    fn new(
+        binders: &[(String, TreeNode)],
+        declared: Declarations,
+        names: &[&SourceNames],
+        context: &'a dyn Fn(&str) -> Option<air::context::Declared>,
+    ) -> Self {
+        let binder_sorts = binders.iter().map(|(smt, sort)| (smt.clone(), flat(sort))).collect();
         let mut by_source: HashMap<String, BTreeSet<String>> = HashMap::new();
         let symbols: Vec<&String> =
             declared.constants.keys().chain(declared.functions.keys()).collect();
         for names in names {
-            for (smt, _) in &quantifier.binders {
-                if let Some(source) = vir::air_names::source_symbol(names, smt) {
-                    binders.entry(source).or_insert_with(|| smt.clone());
-                }
-            }
             for &symbol in &symbols {
                 // A call head is recorded under its whole symbol, `?` and all,
                 // which `source_symbol` strips before looking up.
@@ -2118,19 +2175,73 @@ impl Lowering {
                         .and_then(|_| vir::air_names::source_symbol(names, symbol)),
                 };
                 let Some(source) = source else { continue };
+                let target = declared.live.get(symbol).unwrap_or(symbol).clone();
                 let last = source.rsplit("::").next().unwrap_or(&source).to_string();
-                by_source.entry(last).or_default().insert(symbol.clone());
-                by_source.entry(source).or_default().insert(symbol.clone());
+                by_source.entry(last).or_default().insert(target.clone());
+                by_source.entry(source).or_default().insert(target);
             }
         }
-        Self { binders, binder_sorts, declared, by_source }
+        Self { binders: binder_names(binders, names), binder_sorts, declared, by_source, context }
+    }
+
+    /// A function's argument and result sorts, the journal's declarations
+    /// first, then the AIR context's.
+    fn function(&self, head: &str) -> Option<(Vec<String>, String)> {
+        self.declared.functions.get(head).cloned().or_else(|| match (self.context)(head) {
+            Some(air::context::Declared::Fun(params, ret)) => {
+                Some((params.iter().map(sort_name).collect(), sort_name(&ret)))
+            }
+            _ => None,
+        })
+    }
+
+    /// A symbol's sort, when it is a variable or constant.
+    fn constant(&self, atom: &str) -> Option<String> {
+        self.binder_sorts.get(atom).or_else(|| self.declared.constants.get(atom)).cloned().or_else(
+            || match (self.context)(atom) {
+                Some(air::context::Declared::Var(typ)) => Some(sort_name(&typ)),
+                _ => None,
+            },
+        )
+    }
+
+    fn known(&self, atom: &str) -> bool {
+        self.binder_sorts.contains_key(atom)
+            || self.declared.declares(atom)
+            || self.declared.live.contains_key(atom)
+            || (self.context)(atom).is_some()
+    }
+
+    /// Whether `text` is a Verus expression rather than an SMT term. An SMT
+    /// term is a symbol the scope or the solver declares, or one no Rust
+    /// name could be (`$`, `a!`); or an application headed by an SMT
+    /// operator or a declared function.
+    fn reads_as_verus(&self, text: &str) -> bool {
+        let text = text.trim();
+        match parse_term(text) {
+            Some(TreeNode::Atom(atom)) => {
+                !self.known(&atom)
+                    && atom.chars().all(|c| c.is_ascii_alphanumeric() || "_:@".contains(c))
+            }
+            Some(TreeNode::List(items)) if text.starts_with('(') => match items.first() {
+                Some(TreeNode::Atom(head)) => {
+                    !(self.known(head) || SMT_OPERATORS.contains(&head.as_str()))
+                }
+                _ => true,
+            },
+            _ => true,
+        }
     }
 
     fn atom(&self, atom: &str) -> Result<String, String> {
         if let Some(binder) = self.binders.get(atom) {
             return Ok(binder.clone());
         }
-        if self.declared.declares(atom) || is_literal(atom) {
+        // a variable, spelled as AIR declares it, is its symbol at the goal
+        if let Some(live) = self.declared.live.get(atom) {
+            return Ok(live.clone());
+        }
+        if self.known(atom) || is_literal(atom) {
             return Ok(atom.to_string());
         }
         match self.by_source.get(atom) {
@@ -2170,7 +2281,7 @@ impl Lowering {
             (_, false) => format!("{}{sort}", vir::def::PREFIX_BOX),
             (_, true) => format!("{}{sort}", vir::def::PREFIX_UNBOX),
         };
-        self.declared.functions.contains_key(&head).then_some(head)
+        self.function(&head).is_some().then_some(head)
     }
 
     /// `node`, of sort `have`, as a value of sort `want`: boxed or unboxed
@@ -2192,18 +2303,13 @@ impl Lowering {
     fn typed(&self, node: &TreeNode) -> (TreeNode, Option<String>) {
         let items = match node {
             TreeNode::Atom(atom) => {
-                let sort = self
-                    .binder_sorts
-                    .get(atom)
-                    .or_else(|| self.declared.constants.get(atom))
-                    .cloned()
-                    .or_else(|| match atom.as_str() {
-                        "true" | "false" => Some("Bool".to_owned()),
-                        _ if !atom.is_empty() && atom.bytes().all(|b| b.is_ascii_digit()) => {
-                            Some("Int".to_owned())
-                        }
-                        _ => None,
-                    });
+                let sort = self.constant(atom).or_else(|| match atom.as_str() {
+                    "true" | "false" => Some("Bool".to_owned()),
+                    _ if !atom.is_empty() && atom.bytes().all(|b| b.is_ascii_digit()) => {
+                        Some("Int".to_owned())
+                    }
+                    _ => None,
+                });
                 return (node.clone(), sort);
             }
             TreeNode::List(items) => items,
@@ -2213,30 +2319,29 @@ impl Lowering {
         };
         let typed: Vec<(TreeNode, Option<String>)> = args.iter().map(|a| self.typed(a)).collect();
         let all = |sort: &str| vec![Some(sort.to_owned()); typed.len()];
-        let (wants, sort): (Vec<Option<String>>, Option<String>) =
-            match self.declared.functions.get(head) {
-                Some((params, result)) if params.len() == typed.len() => {
-                    (params.iter().cloned().map(Some).collect(), Some(result.clone()))
+        let (wants, sort): (Vec<Option<String>>, Option<String>) = match self.function(head) {
+            Some((params, result)) if params.len() == typed.len() => {
+                (params.into_iter().map(Some).collect(), Some(result))
+            }
+            Some(_) => (vec![None; typed.len()], None),
+            None => match head.as_str() {
+                "+" | "-" | "*" | "div" | "mod" => (all("Int"), Some("Int".to_owned())),
+                "<" | "<=" | ">" | ">=" => (all("Int"), Some("Bool".to_owned())),
+                "and" | "or" | "not" | "=>" => (all("Bool"), Some("Bool".to_owned())),
+                // both sides alike: boxed if either is
+                "=" | "distinct" => {
+                    let boxed = typed.iter().any(|(_, s)| s.as_deref() == Some(POLY));
+                    let side = if boxed { Some(POLY.to_owned()) } else { None };
+                    (vec![side; typed.len()], Some("Bool".to_owned()))
                 }
-                Some(_) => (vec![None; typed.len()], None),
-                None => match head.as_str() {
-                    "+" | "-" | "*" | "div" | "mod" => (all("Int"), Some("Int".to_owned())),
-                    "<" | "<=" | ">" | ">=" => (all("Int"), Some("Bool".to_owned())),
-                    "and" | "or" | "not" | "=>" => (all("Bool"), Some("Bool".to_owned())),
-                    // both sides alike: boxed if either is
-                    "=" | "distinct" => {
-                        let boxed = typed.iter().any(|(_, s)| s.as_deref() == Some(POLY));
-                        let side = if boxed { Some(POLY.to_owned()) } else { None };
-                        (vec![side; typed.len()], Some("Bool".to_owned()))
-                    }
-                    "ite" if typed.len() == 3 => {
-                        let boxed = typed[1..].iter().any(|(_, s)| s.as_deref() == Some(POLY));
-                        let branch = if boxed { Some(POLY.to_owned()) } else { typed[1].1.clone() };
-                        (vec![Some("Bool".to_owned()), branch.clone(), branch.clone()], branch)
-                    }
-                    _ => (vec![None; typed.len()], None),
-                },
-            };
+                "ite" if typed.len() == 3 => {
+                    let boxed = typed[1..].iter().any(|(_, s)| s.as_deref() == Some(POLY));
+                    let branch = if boxed { Some(POLY.to_owned()) } else { typed[1].1.clone() };
+                    (vec![Some("Bool".to_owned()), branch.clone(), branch.clone()], branch)
+                }
+                _ => (vec![None; typed.len()], None),
+            },
+        };
         let mut out = vec![TreeNode::Atom(head.clone())];
         for ((arg, have), want) in typed.into_iter().zip(wants) {
             out.push(self.coerce(arg, have.as_deref(), want.as_deref()));
@@ -2405,19 +2510,85 @@ impl Surface {
     }
 }
 
-/// The hypothesis in the solver's spelling, and for an instantiation, its
-/// term for each variable; or why it cannot be sent.
-fn lower_hypothesis(
+/// The AIR type of a sort as the solver is sent it.
+fn typ_of_sort(sort: &str) -> air::ast::Typ {
+    use air::ast::TypX;
+    std::sync::Arc::new(match sort {
+        "Int" => TypX::Int,
+        "Bool" => TypX::Bool,
+        "Real" => TypX::Real,
+        other => TypX::Named(std::sync::Arc::new(other.to_owned())),
+    })
+}
+
+/// A query's local constants and variables, with their types.
+fn query_locals(query: &Query) -> Vec<(air::ast::Ident, air::ast::Typ)> {
+    query
+        .local
+        .iter()
+        .filter_map(|decl| match &**decl {
+            DeclX::Const(x, typ) | DeclX::Var(x, typ) => Some((x.clone(), typ.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Reads a hypothesis's Verus terms as a scaffold request reads an assertion,
+/// then as the lowered query reads them at the goal: each mutable local at
+/// its version there.
+struct VerusReader<'e> {
+    env: crate::scaffold::Env<'e>,
+    goal: &'e air::GoalScope,
+    printer: air::printer::Printer,
+}
+
+impl VerusReader<'_> {
+    fn read(
+        &self,
+        text: &str,
+        want: Option<&str>,
+        readings: &mut Vec<String>,
+    ) -> Result<TreeNode, String> {
+        let want = want.map(typ_of_sort);
+        let lowered = crate::scaffold::lower_term(text, &self.env, want.as_ref())?;
+        readings.extend(lowered.choices);
+        Ok(self.printer.expr_to_node(&self.goal.lower_expr(&lowered.expr)))
+    }
+}
+
+/// A term of a hypothesis, of sort `want` when given, in the solver's
+/// spelling: a Verus expression through `reader` (when source names were
+/// recorded), else as `lowering` reads SMT terms.
+fn read_term(
+    text: &str,
+    want: Option<&str>,
+    lowering: &Lowering,
+    reader: Option<&VerusReader>,
+    readings: &mut Vec<String>,
+) -> Result<TreeNode, String> {
+    match reader {
+        Some(reader) if lowering.reads_as_verus(text) => reader.read(text, want, readings),
+        _ => lowering.term_as(text, want),
+    }
+}
+
+/// Whether `request` fits `quantifier`, checked before any solver time is
+/// spent: an instantiation names each variable once, by its own name or its
+/// source name, and a trigger has terms. For an instantiation, the variable
+/// each name means.
+fn check_hypothesis(
     request: &HypothesisRequest,
     quantifier: &QuantifierSmt,
-    lowering: &Lowering,
-) -> Result<(Hypothesis, HashMap<String, TreeNode>), (&'static str, String)> {
-    let qid = quantifier.qid.clone();
+    names: &[&SourceNames],
+) -> Result<HashMap<String, String>, (&'static str, String)> {
+    let qid = &quantifier.qid;
     match request {
         HypothesisRequest::Instantiation { subst, .. } => {
-            let mut terms: HashMap<String, TreeNode> = HashMap::new();
-            for (name, text) in subst {
-                let Some(smt) = lowering.binders.get(name.as_str()) else {
+            let binders = binder_names(&quantifier.binders, names);
+            let mut meant: HashMap<String, String> = HashMap::new();
+            let mut seen: HashSet<&str> = HashSet::new();
+            for name in subst.keys() {
+                let Some(smt) = binders.get(name.as_str()) else {
                     let binders: Vec<&str> =
                         quantifier.binders.iter().map(|(smt, _)| smt.as_str()).collect();
                     return Err((
@@ -2425,16 +2596,15 @@ fn lower_hypothesis(
                         format!("{qid} binds no variable {name}; it binds {}", binders.join(", ")),
                     ));
                 };
-                let sort = lowering.binder_sorts.get(smt).map(String::as_str);
-                let term = lowering.term_as(text, sort).map_err(|e| ("could_not_lower", e))?;
-                if terms.insert(smt.clone(), term).is_some() {
+                if !seen.insert(smt.as_str()) {
                     return Err(("mismatch", format!("two terms for the variable {smt}")));
                 }
+                meant.insert(name.clone(), smt.clone());
             }
             let missing: Vec<String> = quantifier
                 .binders
                 .iter()
-                .filter(|(smt, _)| !terms.contains_key(smt))
+                .filter(|(smt, _)| !seen.contains(smt.as_str()))
                 .map(|(smt, sort)| format!("{smt} ({})", flat(sort)))
                 .collect();
             if !missing.is_empty() {
@@ -2446,32 +2616,67 @@ fn lower_hypothesis(
                     ),
                 ));
             }
+            Ok(meant)
+        }
+        HypothesisRequest::TriggerPattern { pattern, .. } if pattern.terms().is_empty() => {
+            Err(("mismatch", "the pattern has no terms".to_string()))
+        }
+        HypothesisRequest::TriggerPattern { .. } | HypothesisRequest::BlockCycle { .. } => {
+            Ok(HashMap::new())
+        }
+    }
+}
+
+/// The hypothesis in the solver's spelling, for an instantiation its term
+/// for each variable, and how names were read where several readings were
+/// possible; or why it cannot be sent. `meant` is `check_hypothesis`'s.
+fn lower_hypothesis(
+    request: &HypothesisRequest,
+    quantifier: &QuantifierSmt,
+    meant: &HashMap<String, String>,
+    lowering: &Lowering,
+    reader: Option<&VerusReader>,
+) -> Result<(Hypothesis, HashMap<String, TreeNode>, Vec<String>), (&'static str, String)> {
+    let qid = quantifier.qid.clone();
+    let mut readings = Vec::new();
+    match request {
+        HypothesisRequest::Instantiation { subst, .. } => {
+            let mut terms: HashMap<String, TreeNode> = HashMap::new();
+            for (name, text) in subst {
+                let smt = &meant[name];
+                let sort = quantifier.binders.iter().find(|(v, _)| v == smt).map(|(_, s)| flat(s));
+                let term = read_term(text, sort.as_deref(), lowering, reader, &mut readings)
+                    .map_err(|e| ("could_not_lower", e))?;
+                terms.insert(smt.clone(), term);
+            }
             let subst = quantifier
                 .binders
                 .iter()
                 .map(|(smt, _)| (smt.clone(), flat(&terms[smt])))
                 .collect();
-            Ok((Hypothesis::Instantiate { qid, subst }, terms))
+            Ok((Hypothesis::Instantiate { qid, subst }, terms, readings))
         }
         HypothesisRequest::TriggerPattern { pattern, .. } => {
             let pattern: Vec<String> = pattern
                 .terms()
                 .into_iter()
-                .map(|term| lowering.term_as(term, None).map(|node| flat(&node)))
+                .map(|term| {
+                    read_term(term, None, lowering, reader, &mut readings).map(|node| flat(&node))
+                })
                 .collect::<Result<_, _>>()
                 .map_err(|e| ("could_not_lower", e))?;
-            if pattern.is_empty() {
-                return Err(("mismatch", "the pattern has no terms".to_string()));
-            }
             Ok((
                 Hypothesis::Trigger { qid, vars: quantifier.binders.clone(), pattern },
                 HashMap::new(),
+                readings,
             ))
         }
         HypothesisRequest::BlockCycle { fingerprint, .. } => {
+            // A fingerprint's holes are no Verus, so it is read as SMT or in
+            // the small surface syntax `surface_term` reads.
             let fingerprint =
                 flat(&lowering.term_as(fingerprint, None).map_err(|e| ("could_not_lower", e))?);
-            Ok((Hypothesis::Block { qid, fingerprint }, HashMap::new()))
+            Ok((Hypothesis::Block { qid, fingerprint }, HashMap::new(), readings))
         }
     }
 }
@@ -2602,15 +2807,16 @@ fn speculation_run(
 }
 
 /// Check a retained query with `hypothesis` in its scope, and read what cvc5
-/// reported about it. Rounds for further errors are not run, and nothing is
-/// saved as a certificate. The caller has restored the query's prefix.
+/// reported about it, and the goal it failed at, if it names one. Rounds for
+/// further errors are not run, and nothing is saved as a certificate. The
+/// caller has restored the query's prefix.
 fn speculation_check(
     air: &mut Context,
     query: &RetainedQuery,
     hypothesis: Hypothesis,
     loop_threshold: Option<u32>,
     set_rlimit: &impl Fn(&mut Context, f32),
-) -> io::Result<(QueryResult, u128, SpeculationReply)> {
+) -> io::Result<(QueryResult, u128, SpeculationReply, Option<air::ast::AssertId>)> {
     set_rlimit(air, query.rlimit);
     air.set_speculation(Some(SpeculationRequest { hypothesis, loop_threshold }));
     let start = Instant::now();
@@ -2629,10 +2835,10 @@ fn speculation_check(
     drop(air.take_matching_loops());
     drop(air.take_difficulty());
     drop(air.take_inst_pressure());
-    let result = match outcome {
-        ValidityResult::Valid(_) => QueryResult::Valid,
-        ValidityResult::Invalid(..) => QueryResult::Invalid,
-        ValidityResult::Canceled => QueryResult::ResourceLimit,
+    let (result, failed_at) = match outcome {
+        ValidityResult::Valid(_) => (QueryResult::Valid, None),
+        ValidityResult::Invalid(_, _, id) => (QueryResult::Invalid, id),
+        ValidityResult::Canceled => (QueryResult::ResourceLimit, None),
         ValidityResult::TypeError(error) => return Err(io::Error::other(error.to_string())),
         ValidityResult::UnexpectedOutput(error) => return Err(io::Error::other(error)),
     };
@@ -2641,7 +2847,7 @@ fn speculation_check(
         unparsed: Some("the check did not reach check-sat".to_owned()),
         ..SpeculationReply::default()
     });
-    Ok((result, elapsed_ms, reply))
+    Ok((result, elapsed_ms, reply, failed_at))
 }
 
 /// cvc5's `(error "...")` as its message.
@@ -2727,8 +2933,8 @@ fn serve_speculate(
         (listed, note)
     };
 
-    // The quantifier the hypothesis names, and the hypothesis in the
-    // solver's spelling, or why nothing will be checked.
+    // The quantifier the hypothesis names, and what its names mean, or why
+    // nothing will be checked.
     let mut target = None;
     if let Some(request) = &hypothesis {
         let Some(quantifier) =
@@ -2746,13 +2952,8 @@ fn serve_speculate(
             return Ok(Ok(outcome));
         };
         outcome.quantifier = Some(describe_quantifier(&quantifier, symbols, &unversioned));
-        let lowering = Lowering::new(
-            &quantifier,
-            Declarations::of(&decls, &query.query),
-            &[&unversioned.shown, &unversioned.plain],
-        );
-        match lower_hypothesis(request, &quantifier, &lowering) {
-            Ok((lowered, subst)) => target = Some((quantifier, lowered, subst)),
+        match check_hypothesis(request, &quantifier, &[&unversioned.shown, &unversioned.plain]) {
+            Ok(meant) => target = Some((request, quantifier, meant)),
             Err((status, reason)) => {
                 outcome.status = Some(status.to_owned());
                 outcome.notes = format!("Nothing was checked: {reason}.");
@@ -2763,13 +2964,13 @@ fn serve_speculate(
         }
     }
 
-    let (before_result, before_ms, before_reply) =
+    let (before_result, before_ms, before_reply, failed_at) =
         speculation_check(air, query, Hypothesis::Observe, loop_threshold, set_rlimit)?;
     let before = speculation_run(before_result, before_ms, &before_reply, symbols);
     let before_loops: HashSet<String> = before.loops.iter().map(|l| l.qid.clone()).collect();
     let before_loop_count = before.loops.len();
     outcome.before = Some(before);
-    let Some((quantifier, lowered, subst)) = target else {
+    let Some((request, quantifier, meant)) = target else {
         let (listed, note) = candidates(air);
         outcome.candidates = listed;
         outcome.notes = format!(
@@ -2780,7 +2981,66 @@ fn serve_speculate(
         return Ok(Ok(outcome));
     };
 
-    let (after_result, after_ms, after_reply) =
+    // The terms are read at the goal the check failed at (the query's last
+    // goal when it names none), where each mutable local holds the version
+    // a pasted snippet will see.
+    let goal = air::GoalScope::of(&query.query, failed_at.as_ref());
+    let live = goal.live();
+    let lowered = {
+        let context: &Context = air;
+        let declared = |name: &str| context.declared(name);
+        // A trigger's terms are over the quantifier's variables; the other
+        // hypotheses' terms stand outside it.
+        let binders: &[(String, TreeNode)] = match request {
+            HypothesisRequest::TriggerPattern { .. } => &quantifier.binders,
+            _ => &[],
+        };
+        let lowering = Lowering::new(
+            binders,
+            Declarations::of(&decls, &query.query, live.clone(), &before_reply.variable_versions),
+            &[&unversioned.shown, &unversioned.plain],
+            &declared,
+        );
+        let occurrences = air::scaffold::occurrences(&query.query);
+        let reader = symbols.map(|symbols| VerusReader {
+            env: crate::scaffold::Env {
+                names: symbols.source_names(),
+                crate_name: symbols.crate_name(),
+                locals: query_locals(&query.query),
+                bound: binders
+                    .iter()
+                    .map(|(smt, sort)| (std::sync::Arc::new(smt.clone()), typ_of_sort(&flat(sort))))
+                    .collect(),
+                declared: &declared,
+                occurrences: &occurrences,
+            },
+            goal: &goal,
+            printer: air::printer::Printer::new(
+                std::sync::Arc::new(VirMessageInterface {}),
+                true,
+                SmtSolver::Cvc5,
+            ),
+        });
+        lower_hypothesis(request, &quantifier, &meant, &lowering, reader.as_ref())
+    };
+    let (lowered, subst) = match lowered {
+        Ok((lowered, subst, readings)) => {
+            outcome.readings = readings;
+            (lowered, subst)
+        }
+        Err((status, reason)) => {
+            outcome.status = Some(status.to_owned());
+            outcome.notes = format!(
+                "The query was checked as usual and answers {}, but not with the hypothesis: {reason}.",
+                result_name(before_result)
+            );
+            outcome.reason = Some(reason);
+            outcome.elapsed_ms = start.elapsed().as_millis();
+            return Ok(Ok(outcome));
+        }
+    };
+
+    let (after_result, after_ms, after_reply, _) =
         speculation_check(air, query, lowered.clone(), loop_threshold, set_rlimit)?;
     if let Some(error) = &after_reply.error {
         outcome.status = Some("could_not_lower".to_owned());
@@ -2803,15 +3063,16 @@ fn serve_speculate(
     // own, so a close counts only if the query still fails right after.
     let mut closed = before_result != QueryResult::Valid && after_result == QueryResult::Valid;
     if closed {
-        let (result, elapsed_ms, reply) =
+        let (result, elapsed_ms, reply, _) =
             speculation_check(air, query, Hypothesis::Observe, loop_threshold, set_rlimit)?;
         closed = result != QueryResult::Valid;
         outcome.recheck = Some(speculation_run(result, elapsed_ms, &reply, symbols));
     }
     outcome.closed = closed;
 
-    // Source for the check's terms, SSA versions included.
-    let names = QueryNames::new(symbols, &after_reply.variable_versions, &empty);
+    // Source for the check's terms, SSA versions included, to paste at the
+    // goal the terms were read at.
+    let names = QueryNames::new(symbols, &after_reply.variable_versions, &empty).at(&live);
     if !matches!(lowered, Hypothesis::Block { .. }) {
         outcome.new_provenance = Some(NewProvenance {
             closing_instantiations: report
@@ -3316,17 +3577,7 @@ fn scaffold_arms(
     }
     // Read P before any check, so a refusal costs no solver time.
     let occurrences = air::scaffold::occurrences(&query.query);
-    let locals: Vec<_> = query
-        .query
-        .local
-        .iter()
-        .filter_map(|decl| match &**decl {
-            air::ast::DeclX::Const(x, typ) | air::ast::DeclX::Var(x, typ) => {
-                Some((x.clone(), typ.clone()))
-            }
-            _ => None,
-        })
-        .collect();
+    let locals = query_locals(&query.query);
     let lowered = {
         let context: &Context = air;
         let declared = |name: &str| context.declared(name);
@@ -3334,6 +3585,7 @@ fn scaffold_arms(
             names: symbols.source_names(),
             crate_name: symbols.crate_name(),
             locals,
+            bound: Vec::new(),
             declared: &declared,
             occurrences: &occurrences,
         };
@@ -5038,6 +5290,7 @@ mod tests {
             shown: Cow::Borrowed(&recorded),
             plain: Cow::Borrowed(&recorded),
             versions: &versions,
+            live: None,
         };
         // Three classes, {a, b}, {c, d} and {e, f}; the second reading loses the last.
         let before = reading(&[("a", "b"), ("c", "d"), ("e", "f")]);
@@ -5099,6 +5352,7 @@ mod tests {
             shown: Cow::Borrowed(&shown),
             plain: Cow::Borrowed(&plain),
             versions: &versions,
+            live: None,
         };
         assert_eq!(
             names.verus_assert(&equality("z@1", "(+ x 1)", "entailed", &[])).as_deref(),
@@ -5112,6 +5366,27 @@ mod tests {
         assert_eq!(names.verus_assert(&equality("z@1", "tmp", "entailed", &[])), None);
     }
 
+    /// Pasted where `z` holds its second version, an assert naming the first
+    /// would read as the second.
+    #[test]
+    fn pasted_asserts_name_variables_at_their_version_where_pasted() {
+        let (plain, shown, versions) = versioned_names();
+        let live = HashMap::from([("z".to_string(), "z@1".to_string())]);
+        let names = QueryNames {
+            symbols: None,
+            shown: Cow::Borrowed(&shown),
+            plain: Cow::Borrowed(&plain),
+            versions: &versions,
+            live: None,
+        }
+        .at(&live);
+        assert_eq!(
+            names.verus_assert(&equality("z@1", "(+ x 1)", "entailed", &[])).as_deref(),
+            Some("assert(z == (x + 1));")
+        );
+        assert_eq!(names.verus_assert(&equality("z@0", "(+ x 1)", "entailed", &[])), None);
+    }
+
     #[test]
     fn differently_spelled_duplicates_merge_whichever_comes_first() {
         let (plain, shown, versions) = versioned_names();
@@ -5120,6 +5395,7 @@ mod tests {
             shown: Cow::Borrowed(&shown),
             plain: Cow::Borrowed(&plain),
             versions: &versions,
+            live: None,
         };
         // The same equality in two spellings, as between a boxed and an
         // unboxed term; only the second has a quantifier instantiated with it.
@@ -5184,7 +5460,8 @@ mod tests {
         for (symbol, name) in [("a!", "a"), ("i$", "i"), ("m!f.", "m::f"), ("m!s.", "m::s")] {
             names.insert(symbol.to_owned(), vir::air_names::SourceName::Symbol(name.to_owned()));
         }
-        let lowering = Lowering::new(&quantifier, declared, &[&names]);
+        let nothing = |_: &str| None;
+        let lowering = Lowering::new(&quantifier.binders, declared, &[&names], &nothing);
         let lower = |text: &str, want: Option<&str>| flat(&lowering.term_as(text, want).unwrap());
         assert_eq!(lower("a", Some(POLY)), "(I a!)");
         assert_eq!(lower("a + 1", Some(POLY)), "(I (+ a! 1))");
@@ -5194,6 +5471,63 @@ mod tests {
         // a hole has no sort, so it is left as it is
         assert_eq!(lower("f(s(_))", None), "(m!f.? (I (m!s.? _)))");
         assert_eq!(lower("(m!f.? (I a!))", Some("Int")), "(m!f.? (I a!))");
+    }
+
+    /// Terms that stand outside the quantifier never name its variables; a
+    /// mutable local reads as its symbol at the goal; the prelude's
+    /// functions come from the AIR context; and SMT spelling is told apart
+    /// from Verus.
+    #[test]
+    fn lowering_reads_ground_terms_at_the_goal() {
+        let int = || std::sync::Arc::new(air::ast::TypX::Int);
+        let quantifier_binders = vec![("i$".to_owned(), parse_term("Poly").unwrap())];
+        let mut declared = Declarations {
+            live: HashMap::from([("y@".to_owned(), "y@1".to_owned())]),
+            ..Declarations::default()
+        };
+        for (constant, sort) in [("i!", "Int"), ("a!", "Int"), ("y@", "Int"), ("y@1", "Int")] {
+            declared.constants.insert(constant.to_owned(), sort.to_owned());
+        }
+        let mut names = SourceNames::new();
+        for (symbol, name) in [("i!", "i"), ("i$", "i"), ("a!", "a"), ("y@", "y")] {
+            names.insert(symbol.to_owned(), vir::air_names::SourceName::Symbol(name.to_owned()));
+        }
+        let context = |name: &str| match name {
+            "Add" => {
+                Some(air::context::Declared::Fun(std::sync::Arc::new(vec![int(), int()]), int()))
+            }
+            "I" => Some(air::context::Declared::Fun(
+                std::sync::Arc::new(vec![int()]),
+                typ_of_sort(POLY),
+            )),
+            _ => None,
+        };
+        // an instantiation's terms: `i` is the parameter, not the variable
+        let ground = Lowering::new(&[], declared, &[&names], &context);
+        let lower = |text: &str| flat(&ground.term_as(text, Some(POLY)).unwrap());
+        assert_eq!(lower("i"), "(I i!)");
+        assert_eq!(lower("y"), "(I y@1)");
+        assert_eq!(lower("y@"), "(I y@1)");
+        assert_eq!(lower("(Add a! 1)"), "(I (Add a! 1))");
+        // SMT spelling or Verus
+        for (text, verus) in [
+            ("a + 1", true),
+            ("(a + 1)", true),
+            ("s.len() - 1", true),
+            ("i", true),
+            ("(Add a! 1)", false),
+            ("i!", false),
+            ("y@1", false),
+            ("$", false),
+            ("(= a! 1)", false),
+        ] {
+            assert_eq!(ground.reads_as_verus(text), verus, "{text}");
+        }
+        // a trigger's terms: `i` is the variable
+        let mut declared = Declarations::default();
+        declared.constants.insert("i!".to_owned(), "Int".to_owned());
+        let over = Lowering::new(&quantifier_binders, declared, &[&names], &context);
+        assert_eq!(flat(&over.term_as("i", None).unwrap()), "i$");
     }
 
     #[test]

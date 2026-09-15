@@ -1765,6 +1765,128 @@ fn resident_scaffold_says_why_under_provenance() {
     worker.finish(false);
 }
 
+const SPECULATE_GOAL_SOURCE: &str = r#"
+use vstd::prelude::*;
+verus! {
+    spec fn f(x: int) -> int;
+    spec fn g(x: int) -> int;
+
+    proof fn shadowed(i: int)
+        requires forall|i: int| #![trigger g(i)] g(i) > 0 && f(i) > 0,
+    {
+        assert(f(i) > 0);
+    }
+
+    proof fn reassigned(a: int)
+        requires forall|i: int| #![trigger g(i)] g(i) > 0 && f(i) > 0,
+    {
+        let mut y = a;
+        y = y + 1;
+        assert(f(y) > 0);
+    }
+
+    proof fn last_of(s: Seq<int>)
+        requires s.len() > 0, forall|i: int| #![trigger g(i)] 0 <= i < s.len() ==> s[i] > 0,
+    {
+        assert(s[s.len() - 1] > 0);
+    }
+}
+"#;
+
+/// The options for a cvc5 build whose version differs from the pinned
+/// release, without `speculate_options`' small budget.
+fn version_options() -> Vec<&'static str> {
+    match std::env::var_os("RESIDENT_NO_SOLVER_VERSION_CHECK") {
+        Some(_) => vec!["-V", "no-solver-version-check"],
+        None => Vec::new(),
+    }
+}
+
+/// A probe of the quantifier in `function`'s own query.
+fn probe_own<E: Endpoint>(
+    worker: &mut Worker<E>,
+    ready: &Value,
+    function: &str,
+    hypothesis: impl FnOnce(&Value) -> Value,
+) -> Value {
+    let session = ready["session"].clone();
+    let query = query_id(ready, function);
+    let qid = own_quantifier(worker, &session, &query)["qid"].clone();
+    probe(worker, &session, &query, Some(hypothesis(&qid)))
+}
+
+/// `function`'s check in a fresh worker on `source`.
+fn cold_check(source: &str, function: &str, options: &[&str]) -> Value {
+    let mut worker = Worker::start(source, options);
+    let ready = worker.receive();
+    let checked = worker.send(json!({"command": "check", "session": ready["session"],
+        "bucket": 0, "query": query_id(&ready, function)}));
+    worker.send(json!({"command": "close", "session": ready["session"]}));
+    worker.finish(false);
+    checked
+}
+
+/// A hypothesis's terms are read at the goal the query fails at. An
+/// instantiation's never name the quantifier's own variable, so a parameter
+/// it shadows is the parameter; a mutable local reads as its value there;
+/// Verus method calls and the prelude's arithmetic in SMT spelling are
+/// read; and a snippet names no variable at another version than the
+/// goal's, so pasted before the goal it verifies.
+#[test]
+#[ignore = "needs cvc5 with (speculate ...) (BasisResearch/cvc5 kg/speculative-probe); un-ignore when the pin moves"]
+fn resident_speculate_reads_terms_at_the_goal() {
+    let options = version_options();
+    let mut worker = Worker::start(SPECULATE_GOAL_SOURCE, &options);
+    let ready = worker.receive();
+    assert_eq!(ready["event"], "ready", "{ready}");
+    let instantiation =
+        |subst: Value| move |qid: &Value| json!({"instantiation": {"qid": qid, "subst": subst}});
+
+    let shadowed = probe_own(&mut worker, &ready, "::shadowed", instantiation(json!({"i": "i"})));
+    assert_eq!(shadowed["closed"], true, "{shadowed}");
+    assert!(shadowed["verus_snippet"].as_str().unwrap().contains("crate::f(i)"), "{}", shadowed);
+
+    let local = probe_own(&mut worker, &ready, "::reassigned", instantiation(json!({"i": "y"})));
+    assert_eq!(local["status"], "applied", "{local}");
+    assert_eq!(local["closed"], true, "{local}");
+    let pasted = local["verus_snippet"].as_str().unwrap();
+    assert!(pasted.contains("crate::f(y)"), "{}", local);
+    let source = SPECULATE_GOAL_SOURCE
+        .replace("assert(f(y) > 0);", &format!("{pasted}\n        assert(f(y) > 0);"));
+    assert_eq!(cold_check(&source, "::reassigned", &options)["result"], "valid");
+
+    let spelled =
+        probe_own(&mut worker, &ready, "::reassigned", instantiation(json!({"i": "(Add a! 1)"})));
+    assert_eq!(spelled["closed"], true, "{spelled}");
+
+    // The trigger matches the goal's term as cvc5 holds it, over the first
+    // version of `y`; an assert of it could only paste as a claim about
+    // the second, so it is offered only when it names none.
+    let triggered = probe_own(
+        &mut worker,
+        &ready,
+        "::reassigned",
+        |qid| json!({"trigger_pattern": {"qid": qid, "pattern": "f(i)"}}),
+    );
+    assert_eq!(triggered["closed"], true, "{triggered}");
+    if let Some(fallback) = triggered["fallback_snippet"].as_str() {
+        let source = SPECULATE_GOAL_SOURCE
+            .replace("assert(f(y) > 0);", &format!("{fallback}\n        assert(f(y) > 0);"));
+        assert_eq!(cold_check(&source, "::reassigned", &options)["result"], "valid", "{fallback}");
+    }
+
+    let method =
+        probe_own(&mut worker, &ready, "::last_of", instantiation(json!({"i": "s.len() - 1"})));
+    assert_eq!(method["status"], "applied", "{method}");
+    assert_eq!(method["closed"], true, "{method}");
+
+    assert_eq!(
+        worker.send(json!({"command": "close", "session": ready["session"]}))["event"],
+        "closed"
+    );
+    worker.finish(false);
+}
+
 /// With instantiation replay, every resident check that proves its query
 /// saves its instantiations, and a recheck of a query with saved ones first
 /// tries them alone (`:only`), falling back to the ordinary check unless that

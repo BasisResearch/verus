@@ -200,6 +200,9 @@ pub type ReportLongRunning<'a> =
     (std::time::Duration, Box<dyn FnMut(std::time::Duration, bool) -> () + 'a>);
 
 const GET_VERSION_RESPONSE_PREFIX: &str = "(:version";
+/// Echoed just before a `(speculate ...)` command: the early flush's output
+/// after it is the command's.
+const SPECULATION_MARKER: &str = "air-speculate";
 
 pub(crate) fn smt_check_assertion<'ctx>(
     context: &mut Context,
@@ -246,12 +249,18 @@ pub(crate) fn smt_check_assertion<'ctx>(
 
     // A hypothesis goes in the query's scope before the flush below, so that a
     // term cvc5 cannot read is refused there, before any check-sat. Only the
-    // query's first check sends it: later rounds share its scope.
+    // query's first check sends it: later rounds share its scope. An echoed
+    // marker goes first, so that only an error after it is the hypothesis's.
     let speculation = context.speculation.take();
     if let Some(request) = &speculation {
         context.last_speculation = None;
+        context.smt_log.log_node(&sise::TreeNode::List(vec![
+            sise::TreeNode::Atom("echo".to_string()),
+            sise::TreeNode::Atom(format!("\"{SPECULATION_MARKER}\"")),
+        ]));
         context.smt_log.log_node(&request.to_node());
     }
+    let mut past_speculation_marker = false;
     let mut speculation_refused = None;
 
     context.smt_log.log_get_info("version");
@@ -277,7 +286,9 @@ pub(crate) fn smt_check_assertion<'ctx>(
                     );
                 }
             }
-        } else if speculation.is_some() && line.starts_with("(error") {
+        } else if speculation.is_some() && line.trim_matches('"') == SPECULATION_MARKER {
+            past_speculation_marker = true;
+        } else if past_speculation_marker && line.starts_with("(error") {
             speculation_refused = Some(line);
         } else if context.ignore_unexpected_smt {
             diagnostics.report(&context.message_interface.bare(
