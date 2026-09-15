@@ -2882,7 +2882,10 @@ impl Server {
                         )?;
                         continue;
                     }
-                    let request = twin::TwinRequest { edit, limit, recheck_base };
+                    // Reported, not followed: a twin predicts ordinary
+                    // verification, which has no pin.
+                    let pin = self.pins.get(&(bucket_id.0, id.0)).copied();
+                    let request = twin::TwinRequest { edit, limit, recheck_base, pin };
                     match twin::serve(bucket, id, request, &set_rlimit) {
                         Ok(Ok(report)) => send(
                             &mut output,

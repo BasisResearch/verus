@@ -2541,6 +2541,51 @@ fn resident_strategy_ladder_finds_a_strategy_and_pins_it() {
     worker.finish(false);
 }
 
+/// A twin predicts what an edit does under ordinary verification, so it runs
+/// the default schedule even for a query a ladder pinned, names the pin it
+/// did not follow, and leaves the session's pin working.
+#[test]
+fn resident_twin_runs_the_default_schedule_for_a_pinned_query() {
+    let mut worker =
+        Worker::start_with_env(LADDER_SOURCE, &[], &[("VERUS_RESIDENT_STRATEGY_LADDER", "1")]);
+    let ready = worker.receive();
+    let session = ready["session"].clone();
+    let untriggered = query_id(&ready, "::untriggered");
+    let twin = |edit: Value| json!({"command":"twin", "session":session, "bucket":0, "query":untriggered, "edit":edit});
+    let check = json!({"command":"check", "session":session, "bucket":0, "query":untriggered});
+
+    let reply = worker.send(twin(json!({"bump_rlimit": 20})));
+    assert_eq!(reply["event"], "twin", "{reply}");
+    assert!(reply["pin_ignored"].is_null(), "{}", reply);
+
+    let ladder = worker
+        .send(json!({"command":"ladder", "session":session, "bucket":0, "query":untriggered}));
+    let solved = ladder["solved_by"].as_str().unwrap_or_else(|| panic!("{}", ladder)).to_owned();
+    let pinned = worker.send(check.clone());
+    assert_eq!(pinned["result"], "valid", "{pinned}");
+
+    // check closes on the pin; the twin still predicts plain verification,
+    // where more budget does not help, and says which pin it left out.
+    let reply = worker.send(twin(json!({"bump_rlimit": 20})));
+    assert_eq!(reply["event"], "twin", "{reply}");
+    assert_eq!(reply["pin_ignored"], ladder["pinned"], "{reply}");
+    assert_eq!(reply["pin_ignored"]["rung"], solved.as_str(), "{reply}");
+    assert_ne!(reply["base"]["class"], "valid", "{reply}");
+    assert_ne!(reply["twin"]["class"], "valid", "{reply}");
+    assert!(reply["caveat"].as_str().unwrap().contains("pin_ignored"), "{}", reply);
+
+    // An edit the pinned rung could not prove either leaves the session's
+    // pin working: the twin never runs the rung.
+    let reply = worker.send(twin(json!({"remove_axiom": "hyp_1"})));
+    assert_eq!(reply["event"], "twin", "{reply}");
+    assert_eq!(reply["edit"]["axioms"][0]["tag"]["kind"], "requires", "{reply}");
+    let rechecked = worker.send(check.clone());
+    assert_eq!(rechecked["result"], "valid", "{rechecked}");
+    assert_eq!(rechecked["pinned"]["closed"], true, "{rechecked}");
+    assert_eq!(worker.send(json!({"command":"close", "session":session}))["event"], "closed");
+    worker.finish(false);
+}
+
 /// Without the ladder mode, Verus's cvc5 has only E-matching and pools: the
 /// other rungs are reported, not run.
 #[test]

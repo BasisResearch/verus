@@ -20,10 +20,18 @@
 //! before and after, and with `recheck_base` checks the base once more and
 //! compares it with the first base check.
 //!
+//! Both checks run the default instantiation schedule, even for a query a
+//! ladder request pinned: a twin predicts what the edit does when the source
+//! is verified normally, and ordinary verification has no pin. The reply
+//! names the pin it did not follow (`pin_ignored`), so that a base that
+//! disagrees with `check` is explained.
+//!
 //! Neither check is a verification result, and the twin's verdict licenses
 //! nothing: an added axiom is assumed, not proved.
 
-use super::{QueryDiagnostics, QueryId, QueryJournal, QueryResult, RetainedBucket, SolverState};
+use super::{
+    Pin, QueryDiagnostics, QueryId, QueryJournal, QueryResult, RetainedBucket, SolverState,
+};
 use crate::provenance::{ResolvedTag, Symbols};
 use air::ast::{
     AssertId, Axiom, BinaryOp, BindX, BinderX, CommandX, DeclX, Expr, ExprX, Ident, MultiOp, Quant,
@@ -99,6 +107,8 @@ pub(super) struct TwinRequest {
     pub(super) limit: usize,
     /// Check the base again after the twin, and compare.
     pub(super) recheck_base: bool,
+    /// The query's strategy pin, reported but not followed.
+    pub(super) pin: Option<Pin>,
 }
 
 /// The default and the most rows a reply lists.
@@ -112,7 +122,7 @@ const TWIN_FUEL_TAG: &str = "twin_fuel";
 /// A twin's rlimit may be at most this many times the query's.
 const MAX_RLIMIT_FACTOR: f32 = 16.0;
 
-const CAVEAT: &str = "Both checks ran in scopes popped right after them, so the session's assertion stack is as it was; the solver's caches are not. Neither is a verification result: make the edit in the source and verify it normally, and prove an added axiom before relying on it. Resource units and elapsed time of two checks in one solver differ by more than the edit (caches survive a pop): read instantiation counts first, and recheck_base to measure the noise.";
+const CAVEAT: &str = "Both checks ran in scopes popped right after them, so the session's assertion stack is as it was; the solver's caches are not. Both ran the default instantiation schedule, as verifying the source would, even for a query a ladder request pinned (see pin_ignored). Neither is a verification result: make the edit in the source and verify it normally, and prove an added axiom before relying on it. Resource units and elapsed time of two checks in one solver differ by more than the edit (caches survive a pop): read instantiation counts first, and recheck_base to measure the noise.";
 
 #[derive(Serialize)]
 pub(super) struct TwinReport {
@@ -133,6 +143,11 @@ pub(super) struct TwinReport {
     /// found (caches are not compared). Not `session`: the reply's event
     /// already names its session under that key.
     integrity: SessionCheck,
+    /// The query's strategy pin, when a ladder request pinned one. `check`
+    /// tries it first; a twin does not, so its base may disagree with
+    /// `check` where the pinned rung proves the query.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pin_ignored: Option<Pin>,
     /// Parts of the comparison this session could not make, and why.
     unavailable: Vec<String>,
     caveat: &'static str,
@@ -1431,6 +1446,7 @@ pub(super) fn serve(
             stack_levels_after: levels_after,
             recheck,
         },
+        pin_ignored: request.pin,
         unavailable,
         caveat: CAVEAT,
         elapsed_ms,
