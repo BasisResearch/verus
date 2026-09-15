@@ -148,7 +148,8 @@ pub(crate) struct QueryJournal {
 /// as it does a malformed one. Every `Request` variant belongs here, in the
 /// protocol's snake case, which `resident_ready_lists_the_requests_it_serves`
 /// checks by sending each one.
-const COMMANDS: &[&str] = &["list", "check", "bisect", "egraph", "close", "inst_graph", "twin"];
+const COMMANDS: &[&str] =
+    &["list", "check", "bisect", "egraph", "scaffold", "close", "inst_graph", "ladder", "twin"];
 
 #[derive(Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]
@@ -193,6 +194,28 @@ enum Request {
         #[serde(default)]
         inject: Option<String>,
     },
+    /// Try a proposed assertion `P` at one goal of the query: is `P`
+    /// provable there, and does the goal hold once `P` is assumed there
+    /// (see `air::scaffold`). Each check runs in the query's own scope.
+    Scaffold {
+        session: String,
+        bucket: BucketIndex,
+        query: QueryId,
+        /// `P` as Verus source: `P`, `assert(P)` or `assert(P);`.
+        assert: String,
+        /// The goal to place `P` before, by assert id. Default: the goal the
+        /// query's own check fails at first.
+        assert_id: Option<Vec<u64>>,
+        /// The goal by its index among the query's asserts (`target.goal` of
+        /// a reply, or a refusal's list), for one without an assert id, such
+        /// as a loop invariant at the end of the loop body. `assert_id` wins
+        /// when both are given.
+        #[serde(default)]
+        goal: Option<usize>,
+        /// Skip the check of `P` itself, when it is known to hold.
+        #[serde(default)]
+        goal_only: bool,
+    },
     Close {
         session: String,
     },
@@ -224,6 +247,34 @@ enum Request {
         /// first check.
         #[serde(default)]
         recheck_base: bool,
+    },
+    /// Check the query once per instantiation strategy, each alone or
+    /// alongside the default schedule (see `serve_ladder`), and pin the
+    /// first that proves it.
+    Ladder {
+        session: String,
+        bucket: BucketIndex,
+        query: QueryId,
+        /// The rungs to try, in order, each at most once. Default: every
+        /// rung, in `Rung::LADDER` order, or `Rung::ALONGSIDE` alongside. An
+        /// empty list runs nothing. `ematch` or `pool` named alongside runs
+        /// the default schedule itself, and is allowed as a baseline.
+        rungs: Option<Vec<Rung>>,
+        /// A rung's rlimit, in `#[verifier::rlimit]` units, above 0 and at
+        /// most `MAX_RUNG_RLIMIT`. Default: the query's own, or
+        /// `DEFAULT_RUNG_RLIMIT` for a query without one.
+        #[serde(default)]
+        budgets: HashMap<Rung, f32>,
+        /// Try the rungs after the first that proves the query too.
+        #[serde(default)]
+        run_all: bool,
+        /// Run each rung's strategy alongside the default schedule rather
+        /// than alone.
+        #[serde(default)]
+        alongside: bool,
+        /// Pin the first rung that proved the query, or remove the pin when
+        /// none did. Default true; false leaves the pin as it was.
+        pin: Option<bool>,
     },
 }
 
@@ -520,6 +571,9 @@ pub(crate) struct Server {
     /// read these; they never reach the solver, so they cannot change its
     /// state.
     graphs: KeptGraphs,
+    /// (bucket, query) -> the rung its checks try first, as its last ladder
+    /// request found.
+    pins: HashMap<(usize, usize), Pin>,
 }
 
 /// What a session reports about the invocation behind it, and the settings a
@@ -548,6 +602,9 @@ pub(crate) struct SessionInfo {
     /// Whether cvc5 solvers were launched recording instantiation graphs
     /// (`VERUS_RESIDENT_INST_GRAPH`), so each check keeps its graph.
     pub(crate) inst_graph: bool,
+    /// Whether cvc5 solvers were launched with every instantiation strategy a
+    /// ladder request can run (`VERUS_RESIDENT_STRATEGY_LADDER`).
+    pub(crate) strategy_ladder: bool,
 }
 
 #[derive(Serialize)]
@@ -567,6 +624,7 @@ enum Response<'a> {
         smt_options: &'a [(String, String)],
         instantiation_replay: bool,
         inst_graph: bool,
+        strategy_ladder: bool,
         input_files: &'a [String],
         buckets: &'a [BucketDescription],
     },
@@ -593,6 +651,10 @@ enum Response<'a> {
         difficulty: Option<&'a crate::provenance::ResolvedQueryDifficulty>,
         /// Present when this check tried a certificate before searching.
         certificate: Option<CertificateAttempt>,
+        /// Present when this check tried the query's pinned rung first. When
+        /// that attempt closed the query, `provenance` and `difficulty` are
+        /// its own, the check that decided.
+        pinned: Option<PinnedAttempt>,
         /// The size of the instantiation graph this check kept, in a
         /// session that records them.
         inst_graph: Option<GraphSummary>,
@@ -625,6 +687,20 @@ enum Response<'a> {
         query: QueryId,
         #[serde(flatten)]
         report: Box<twin::TwinReport>,
+    },
+    Scaffold {
+        session: &'a str,
+        bucket: BucketIndex,
+        query: QueryId,
+        #[serde(flatten)]
+        report: Box<ScaffoldReport>,
+    },
+    Laddered {
+        session: &'a str,
+        bucket: BucketIndex,
+        query: QueryId,
+        #[serde(flatten)]
+        report: LadderReport,
     },
     Error {
         message: &'a str,
@@ -659,6 +735,146 @@ enum QueryResult {
     Valid,
     Invalid,
     ResourceLimit,
+}
+
+/// One of cvc5's quantifier instantiation strategies, which a ladder request
+/// runs alone or alongside the default schedule (`:quant-strategy`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum Rung {
+    Ematch,
+    Conflict,
+    Pool,
+    Enum,
+    Mbqi,
+}
+
+impl Rung {
+    /// E-matching first, as the default schedule runs it, then the
+    /// strategies Verus's schedule leaves off or has nothing for, roughly by
+    /// the effort each spends.
+    const LADDER: [Rung; 5] = [Rung::Ematch, Rung::Conflict, Rung::Pool, Rung::Enum, Rung::Mbqi];
+
+    /// Alongside the default schedule, E-matching and pools are the schedule
+    /// itself, so only these add anything.
+    const ALONGSIDE: [Rung; 3] = [Rung::Conflict, Rung::Enum, Rung::Mbqi];
+
+    /// The `:quant-strategy` value, which cvc5's replies also name it by.
+    fn name(self) -> &'static str {
+        match self {
+            Rung::Ematch => "ematch",
+            Rung::Conflict => "conflict",
+            Rung::Pool => "pool",
+            Rung::Enum => "enum",
+            Rung::Mbqi => "mbqi",
+        }
+    }
+}
+
+/// The most rlimit a ladder request may give one rung, in
+/// `#[verifier::rlimit]` units.
+const MAX_RUNG_RLIMIT: f32 = 1000.0;
+
+/// The rlimit a rung runs at when the request gives it no budget and the
+/// query has none (`#[verifier::rlimit(infinity)]`): a strategy that makes
+/// new terms with each instance, as enumerative instantiation can, would
+/// otherwise never answer, and the session with it.
+const DEFAULT_RUNG_RLIMIT: f32 = crate::config::DEFAULT_RLIMIT_SECS;
+
+/// The rung a query's checks try first, run as the ladder that found it ran
+/// it: alone, or alongside the default schedule, at the budget it proved the
+/// query at (`#[verifier::rlimit]` units, always finite).
+#[derive(Clone, Copy, Serialize)]
+struct Pin {
+    rung: Rung,
+    alongside: bool,
+    rlimit: f32,
+}
+
+/// A pinned rung's attempt: `closed` when that strategy, run as pinned,
+/// proved the query, otherwise the verdict comes from the ordinary check that
+/// followed. `rlimit` is the pin's budget or the query's, whichever is
+/// smaller. `elapsed_ms` is the attempt alone and is part of the check's.
+#[derive(Clone, Copy, Serialize)]
+struct PinnedAttempt {
+    rung: Rung,
+    alongside: bool,
+    rlimit: f32,
+    closed: bool,
+    elapsed_ms: u128,
+    /// cvc5 resource units the attempt spent, when cvc5 said.
+    resource_units: Option<u64>,
+}
+
+/// The reply to a ladder request.
+#[derive(Serialize)]
+struct LadderReport {
+    /// Whether each rung ran alongside the default schedule, not alone.
+    alongside: bool,
+    /// The first rung, in the order tried, whose strategy proved the query.
+    solved_by: Option<Rung>,
+    /// One per requested rung, in the order requested.
+    rungs: Vec<RungReport>,
+    /// The strategies the solver has a module for. A session launched
+    /// without the strategy ladder has E-matching and pools only.
+    available: Vec<String>,
+    /// The rung this query's checks try first, after this request.
+    pinned: Option<Pin>,
+    elapsed_ms: u128,
+    restore_ms: u128,
+}
+
+/// What one rung's check answered. Alone, the rung ran its strategy without
+/// the others, so this says what that strategy does by itself, not what it
+/// adds to the default schedule; alongside, it says the latter.
+#[derive(Serialize)]
+struct RungReport {
+    rung: Rung,
+    /// `valid`, `invalid` (a counterexample), `unknown` (the strategy gave
+    /// up), `resource_limit`, `unavailable` (the solver has no module for
+    /// it; not run) or `not_run` (an earlier rung proved the query).
+    verdict: &'static str,
+    /// The rlimit it ran at, in `#[verifier::rlimit]` units; absent for a
+    /// rung that did not run.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rlimit: Option<f32>,
+    /// cvc5's resource budget for the check, null for none.
+    resource_limit: Option<u64>,
+    /// cvc5 resource units the check spent, preprocessing included.
+    resource_units: Option<u64>,
+    /// Instantiations the rung's strategy added.
+    instantiations: Option<u64>,
+    /// Instantiations added outside the ladder's strategies (modules the
+    /// options enable besides them).
+    other_instantiations: Option<u64>,
+    /// Instantiation rounds that sent lemmas.
+    rounds: Option<u64>,
+    /// For `unknown` and `resource_limit`: the solver's reason.
+    reason_unknown: Option<String>,
+    /// For `unknown`: cvc5's `IncompleteId`, as `why_unknown` reports it.
+    incomplete_id: Option<String>,
+    /// For `invalid` and `unknown`: the first assertion the answer failed.
+    assert_id: Option<Vec<u64>>,
+    elapsed_ms: u128,
+}
+
+impl RungReport {
+    fn skipped(rung: Rung, verdict: &'static str) -> Self {
+        RungReport {
+            rung,
+            verdict,
+            rlimit: None,
+            resource_limit: None,
+            resource_units: None,
+            instantiations: None,
+            other_instantiations: None,
+            rounds: None,
+            reason_unknown: None,
+            incomplete_id: None,
+            assert_id: None,
+            elapsed_ms: 0,
+        }
+    }
 }
 
 /// A solver answer to one bisect probe.
@@ -1464,6 +1680,835 @@ fn serve_egraph(
     Ok(Ok(EgraphOutcome { before, summary, equalities, injection }))
 }
 
+/// What a scaffold request asks.
+struct ScaffoldRequest {
+    assert: String,
+    assert_id: Option<Vec<u64>>,
+    goal: Option<usize>,
+    goal_only: bool,
+}
+
+/// What one check cost, as cvc5's `(get-info :check-effort)` reported it.
+#[derive(Clone, Copy, Serialize)]
+struct CheckCost {
+    /// Resource units: the units of the query's rlimit budget. Not comparable
+    /// unit for unit between consecutive checks on one solver: cvc5's
+    /// rewriter and term caches survive `pop`, so a check after another of
+    /// like work spends fewer.
+    resource_units: u64,
+    instantiations: u64,
+    inst_rounds: u64,
+}
+
+/// One check of a scaffold request.
+#[derive(Serialize)]
+struct ScaffoldRun {
+    result: QueryResult,
+    /// The solver's reason for giving up (`incomplete`, `resourceout`, ...).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+    elapsed_ms: u128,
+    /// None from a cvc5 that does not report `:check-effort`.
+    cost: Option<CheckCost>,
+    /// For the query's own check: how many checks followed it to find the
+    /// earliest failing goal, as Verus does before reporting one. Their
+    /// time and cost are not in this run's.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rechecks: Option<usize>,
+}
+
+/// The goal a scaffold request placed `P` before.
+#[derive(Serialize)]
+struct ScaffoldTarget {
+    /// Empty for a goal Verus emits without an assert id (a loop invariant
+    /// at the end of the loop body, `decreases`); `goal` addresses it.
+    assert_id: Vec<u64>,
+    /// Its index among the query's asserts, which a request's `goal` names.
+    goal: usize,
+    /// `requested`; `first_failure`, the earliest goal the query's check
+    /// fails at, found as Verus finds the error it reports first; or
+    /// after a resource limit, which names no goal, `first_failing_alone`,
+    /// the first goal whose check alone failed.
+    chosen: &'static str,
+    /// How many goals were checked alone to find it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    goals_probed: Option<usize>,
+    /// The goal's error message, such as `assertion failed`.
+    description: String,
+    span: Option<String>,
+    labels: Vec<SourceLabel>,
+    /// How often the goal occurs; `P` is placed before each occurrence.
+    occurrences: usize,
+    /// The span `placement` refers to, when it refers to one: the goal's own,
+    /// or for a postcondition the "end of the function body" label's.
+    insert_before: Option<String>,
+    /// Where `assert(P);` goes in the source: `before_span`, right before
+    /// `insert_before`; `end_of_body`, at the end of the function body (a
+    /// postcondition); `end_of_loop_body` or `before_loop` (a loop
+    /// invariant, checked there, which no span names); `end_of_proof_block`
+    /// (the claim of `assert ... by`, checked after that block's steps; a
+    /// goal among the steps is `before_span`).
+    placement: &'static str,
+}
+
+/// The goal's check with `P` assumed, less its check alone, run in that
+/// order on the same solver. Instantiations are the steadier comparator:
+/// resource units are not comparable between consecutive checks, since
+/// cvc5's rewriter and term caches survive `pop`, so the later check of
+/// like work spends fewer units and `rlimit_delta` reads low.
+#[derive(Serialize)]
+struct MarginalCost {
+    instantiations_delta: i64,
+    /// In resource units, the units of the query's rlimit budget; biased low
+    /// by the caches the earlier checks warmed.
+    rlimit_delta: i64,
+}
+
+/// What the goal's check under `P` drew on, from provenance: the hypotheses
+/// that reached the solver in that check, and the quantifiers it
+/// instantiated. Not an unsat core: the refutation need not have used every
+/// one of them.
+#[derive(Serialize)]
+struct ScaffoldWhy {
+    /// The hypotheses (`requires`, type invariants, ...) in the check.
+    explains_goal: Vec<crate::provenance::ResolvedTag>,
+    /// The quantifiers instantiated, those with a source span or defining a
+    /// function first, at most 12.
+    closing_quantifiers: Vec<crate::provenance::ResolvedInstantiation>,
+    closing_quantifiers_omitted: usize,
+}
+
+#[derive(Serialize)]
+struct ScaffoldReport {
+    target: ScaffoldTarget,
+    /// `P` as it was checked, rendered back from AIR as source.
+    lowered_as: String,
+    /// Names with more than one reading, and the reading taken.
+    choices: Vec<String>,
+    /// The query's own check, run to find the goal when none was named.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    query_check: Option<ScaffoldRun>,
+    /// The goal alone: every other goal assumed, nothing added.
+    baseline: ScaffoldRun,
+    /// `P` asserted in place of the goal. Absent under `goal_only`.
+    p_provable: Option<ScaffoldRun>,
+    /// The goal with `P` assumed right before it.
+    goal_given_p: ScaffoldRun,
+    /// `scaffold`, `true_but_unhelpful`, `helpful_but_unprovable`,
+    /// `dead_end`, `goal_already_holds`, or under `goal_only`
+    /// `goal_closes_given_p` / `goal_open_given_p`. When a check the case
+    /// turns on runs out of budget, which proves nothing either way:
+    /// `helpful_but_undecided` (the goal closes under `P`; `P`'s check ran
+    /// out), `unhelpful_and_undecided` (the goal stays open under `P`; `P`'s
+    /// check ran out), `undecided` (the goal's check under `P` ran out), or
+    /// under `goal_only` `goal_undecided_given_p`.
+    case: &'static str,
+    marginal_cost: Option<MarginalCost>,
+    /// When the goal closed under `P` in a provenance session: what that
+    /// check had and instantiated, not a core.
+    why: Option<ScaffoldWhy>,
+    /// Why the goal stayed open under `P`, when the solver gave up.
+    residual: Option<crate::provenance::ResolvedUnknownReason>,
+    /// `assert(P);` to add before `target.insert_before`, when the goal
+    /// closes under `P` (and `P` is provable, unless `goal_only`).
+    verus_snippet: Option<String>,
+    /// The solver's assertion stack before and after every check: equal, or
+    /// the session would have ended.
+    stack_levels: Option<u64>,
+    elapsed_ms: u128,
+    restore_ms: u128,
+}
+
+struct ArmOutcome {
+    run: ScaffoldRun,
+    assert_id: Option<Vec<u64>>,
+    /// The failing goal's error message, which names a goal without an id.
+    error: Option<air::messages::ArcDynMessage>,
+    provenance: Option<air::context::ProvenanceInfo>,
+    unknown: Option<air::context::UnknownReason>,
+}
+
+/// Check `query` once in the retained query's scope and finish it. With
+/// `earliest`, a failure is followed by checks for a failing goal before it,
+/// as Verus runs them before reporting, until none is left: the goal named
+/// is then the earliest failing one, not whichever the model showed first.
+/// `Ok(Err)` is a refusal (the query did not type-check, so no scope was
+/// opened).
+fn scaffold_check(
+    air: &mut Context,
+    query: &Query,
+    rlimit: f32,
+    set_rlimit: &impl Fn(&mut Context, f32),
+    earliest: bool,
+) -> io::Result<Result<ArmOutcome, String>> {
+    set_rlimit(air, rlimit);
+    let start = Instant::now();
+    let outcome = air.check_valid(
+        &VirMessageInterface {},
+        &QueryDiagnostics::default(),
+        query,
+        QueryContext::default(),
+    );
+    let elapsed_ms = start.elapsed().as_millis();
+    let provenance = air.take_provenance();
+    let unknown = air.take_unknown_reason();
+    let effort = air.take_check_effort();
+    drop(air.take_matching_loops());
+    drop(air.take_difficulty());
+    drop(air.take_inst_pressure());
+    drop(air.take_nl_frontier());
+    let (result, mut assert_id, mut error, has_model) = match outcome {
+        ValidityResult::Valid(_) => (QueryResult::Valid, None, None, false),
+        ValidityResult::Invalid(model, error, id) => {
+            (QueryResult::Invalid, id.map(|id| (*id).clone()), error, model.is_some())
+        }
+        ValidityResult::Canceled => (QueryResult::ResourceLimit, None, None, false),
+        // A query that fails to type-check opens no scope to finish.
+        ValidityResult::TypeError(error) => {
+            return Ok(Err(format!("AIR rejected the assertion as lowered: {error}")));
+        }
+        ValidityResult::UnexpectedOutput(error) => return Err(io::Error::other(error)),
+    };
+    let mut rechecks = None;
+    // A recheck needs the model of the failure before it.
+    if earliest && has_model {
+        let mut count = 0;
+        loop {
+            count += 1;
+            let again =
+                air.check_valid_again(&QueryDiagnostics::default(), true, QueryContext::default());
+            drop(air.take_provenance());
+            drop(air.take_unknown_reason());
+            drop(air.take_check_effort());
+            drop(air.take_matching_loops());
+            drop(air.take_difficulty());
+            drop(air.take_inst_pressure());
+            drop(air.take_nl_frontier());
+            match again {
+                ValidityResult::Invalid(model, again_error, id) => {
+                    if again_error.is_some() || id.is_some() {
+                        assert_id = id.map(|id| (*id).clone());
+                        error = again_error;
+                    }
+                    if model.is_none() {
+                        break;
+                    }
+                }
+                ValidityResult::UnexpectedOutput(error) => return Err(io::Error::other(error)),
+                // no failing goal before the last one found, or out of budget
+                _ => break,
+            }
+        }
+        rechecks = Some(count);
+    }
+    air.finish_query();
+    let reason = unknown.as_ref().map(|u| u.reason.clone()).filter(|r| !r.is_empty());
+    let cost = effort.filter(|e| e.unparsed.is_none()).map(|e| CheckCost {
+        resource_units: e.resource_units,
+        instantiations: e.instantiations,
+        inst_rounds: e.inst_rounds,
+    });
+    Ok(Ok(ArmOutcome {
+        run: ScaffoldRun { result, reason, elapsed_ms, cost, rechecks },
+        assert_id,
+        error,
+        provenance,
+        unknown,
+    }))
+}
+
+/// Whether two goal error messages describe the same goal: the same note at
+/// the same primary span. A failure's message is the goal's with labels
+/// appended, so this is how a failure names a goal without an assert id.
+fn same_goal(a: &air::messages::ArcDynMessage, b: &air::messages::ArcDynMessage) -> bool {
+    match (a.downcast_ref::<MessageX>(), b.downcast_ref::<MessageX>()) {
+        (Some(a), Some(b)) => {
+            a.note == b.note
+                && a.spans.first().map(|s| &s.as_string) == b.spans.first().map(|s| &s.as_string)
+        }
+        _ => false,
+    }
+}
+
+/// One line about a goal, for a refusal that lists them: its index, its
+/// assert id, its message and where it is.
+fn describe_goal(goal: &air::scaffold::Goal) -> String {
+    let message = goal.error.downcast_ref::<MessageX>();
+    let note = message.map(|m| m.note.as_str()).unwrap_or("goal");
+    let at = message
+        .and_then(|m| m.spans.first())
+        .map(|s| {
+            let s = s.as_string.rsplit('/').next().unwrap_or(&s.as_string);
+            format!(" at {}", s.split(" (#").next().unwrap_or(s))
+        })
+        .unwrap_or_default();
+    let id = match &goal.id {
+        Some(id) => format!("assert_id {:?}", **id),
+        None => "no assert id".to_owned(),
+    };
+    format!("goal {} ({id}) {note}{at}", goal.index)
+}
+
+/// `assert(P);` for the source, from `P` as the request wrote it.
+fn assertion_snippet(text: &str) -> String {
+    let text = text.trim().trim_end_matches(';').trim();
+    let inner = text
+        .strip_prefix("assert")
+        .map(str::trim_start)
+        .and_then(|rest| rest.strip_prefix('('))
+        .and_then(|rest| rest.strip_suffix(')'))
+        .unwrap_or(text);
+    format!("assert({});", inner.trim())
+}
+
+/// Whether the source right after `span` (`path:line:col: line:col (#n)`,
+/// columns counted in characters from 1, the end just past the span) reads
+/// `by`, after the `)` of `assert(` if there is one: the span is then the
+/// claim of `assert ... by` or `assert forall ... by`. None when the span or
+/// its file cannot be read.
+fn followed_by_by(span: &str) -> Option<bool> {
+    let span = span.split(" (#").next()?;
+    let (start, end) = span.rsplit_once(": ")?;
+    let mut start = start.rsplitn(3, ':');
+    let (_, _, path) = (start.next()?, start.next()?, start.next()?);
+    let (line, col) = end.split_once(':')?;
+    let line: usize = line.trim().parse().ok()?;
+    let col: usize = col.trim().parse().ok()?;
+    let text = std::fs::read_to_string(path).ok()?;
+    let mut lines = text.split_inclusive('\n');
+    let mut offset = 0;
+    for _ in 1..line {
+        offset += lines.next()?.len();
+    }
+    let current = lines.next()?;
+    let within = current.char_indices().nth(col.checked_sub(1)?).map_or(current.len(), |(i, _)| i);
+    let rest = text[offset + within..].trim_start();
+    let rest = rest.strip_prefix(')').unwrap_or(rest).trim_start();
+    Some(
+        rest.strip_prefix("by")
+            .is_some_and(|after| !after.starts_with(|c: char| c.is_alphanumeric() || c == '_')),
+    )
+}
+
+/// Serve a scaffold request for one query of `bucket`, whose address the
+/// caller has checked: read `P`, find the goal, and check the goal alone, `P`
+/// in its place, and the goal with `P` assumed. Every check runs in the
+/// query's own scope. If the solver's assertion stack is not exactly as
+/// before afterwards, `P` or its negation could reach later checks, so that
+/// ends the session (`Err`). `Ok(Err(_))` is a refusal to report.
+fn serve_scaffold(
+    bucket: &RetainedBucket,
+    id: QueryId,
+    request: ScaffoldRequest,
+    set_rlimit: &impl Fn(&mut Context, f32),
+) -> io::Result<Result<ScaffoldReport, String>> {
+    let mut state =
+        bucket.state.lock().map_err(|_| io::Error::other("resident bucket poisoned"))?;
+    let (solver, local) = bucket.addresses[id.0];
+    let SolverState { air, journal } = &mut state[solver];
+    if !matches!(air.get_solver(), SmtSolver::Cvc5) {
+        return Ok(Err("scaffold requests need cvc5".to_owned()));
+    }
+    let Some(symbols) = bucket.symbols.as_ref() else {
+        return Ok(Err("this bucket kept no source names to read the assertion with".to_owned()));
+    };
+    if matches!(
+        journal.queries[local].prover,
+        vir::def::ProverChoice::BitVector | vir::def::ProverChoice::Singular
+    ) {
+        return Ok(Err(
+            "a bit-vector or Singular query has no spec terms to read the assertion over"
+                .to_owned(),
+        ));
+    }
+    let prefix = journal.queries[local].prefix;
+    let restore_start = Instant::now();
+    journal.restore_prefix(air, prefix)?;
+    let restore_ms = restore_start.elapsed().as_millis();
+    let query = &journal.queries[local];
+    let levels = air.solver_stack_levels();
+    let depth = air.scope_depth();
+    let start = Instant::now();
+    air.set_check_effort(true);
+    let report = scaffold_arms(air, query, symbols, &bucket.quantifiers, request, set_rlimit);
+    air.set_check_effort(false);
+    let report = report?;
+    let (levels_after, depth_after) = (air.solver_stack_levels(), air.scope_depth());
+    if levels_after != levels || depth_after != depth {
+        return Err(io::Error::other(format!(
+            "a scaffold check left the solver at {levels_after:?} assertion levels and AIR at \
+             {depth_after} scopes, instead of {levels:?} and {depth}"
+        )));
+    }
+    Ok(report.map(|mut report| {
+        report.elapsed_ms = start.elapsed().as_millis();
+        report.restore_ms = restore_ms;
+        report.stack_levels = levels;
+        report
+    }))
+}
+
+fn scaffold_arms(
+    air: &mut Context,
+    query: &RetainedQuery,
+    symbols: &crate::provenance::Symbols,
+    quantifiers: &crate::provenance::Quantifiers,
+    request: ScaffoldRequest,
+    set_rlimit: &impl Fn(&mut Context, f32),
+) -> io::Result<Result<ScaffoldReport, String>> {
+    use air::scaffold::Arm;
+    macro_rules! check {
+        ($query:expr) => {
+            check!($query, false)
+        };
+        ($query:expr, $earliest:expr) => {
+            match scaffold_check(air, $query, query.rlimit, set_rlimit, $earliest)? {
+                Ok(outcome) => outcome,
+                Err(refusal) => return Ok(Err(refusal)),
+            }
+        };
+    }
+    // Read P before any check, so a refusal costs no solver time.
+    let occurrences = air::scaffold::occurrences(&query.query);
+    let locals: Vec<_> = query
+        .query
+        .local
+        .iter()
+        .filter_map(|decl| match &**decl {
+            air::ast::DeclX::Const(x, typ) | air::ast::DeclX::Var(x, typ) => {
+                Some((x.clone(), typ.clone()))
+            }
+            _ => None,
+        })
+        .collect();
+    let lowered = {
+        let context: &Context = air;
+        let declared = |name: &str| context.declared(name);
+        let env = crate::scaffold::Env {
+            names: symbols.source_names(),
+            crate_name: symbols.crate_name(),
+            locals,
+            declared: &declared,
+            occurrences: &occurrences,
+        };
+        match crate::scaffold::lower(&request.assert, &env) {
+            Ok(lowered) => lowered,
+            Err(error) => return Ok(Err(format!("cannot read the assertion: {error}"))),
+        }
+    };
+    let printer = air::printer::Printer::new(
+        std::sync::Arc::new(VirMessageInterface {}),
+        true,
+        SmtSolver::Cvc5,
+    );
+    let smt = air::printer::node_to_string(&printer.expr_to_node(&lowered.expr));
+    let lowered_as = vir::air_names::render_term(&symbols.paste_names(&HashMap::new()), &smt);
+
+    let goals = air::scaffold::goals(&query.query);
+    // The goals, for a refusal that asks the caller to name one.
+    let listed = || -> String {
+        const GOALS_LISTED: usize = 40;
+        let listed: Vec<String> = goals.iter().take(GOALS_LISTED).map(describe_goal).collect();
+        let more = goals.len().saturating_sub(GOALS_LISTED);
+        let more = if more > 0 { format!("; and {more} more") } else { String::new() };
+        format!("{}{more}", listed.join("; "))
+    };
+    let by_id = |id: &[u64]| goals.iter().find(|g| g.id.as_ref().is_some_and(|gid| **gid == id));
+    let (goal, chosen, query_check, goals_probed) = match (request.assert_id, request.goal) {
+        (Some(id), _) => match by_id(&id) {
+            Some(goal) => (goal.clone(), "requested", None, None),
+            None => {
+                return Ok(Err(format!(
+                    "no goal of this query has assert id {id:?}; its goals are {}",
+                    listed()
+                )));
+            }
+        },
+        (None, Some(index)) => match goals.iter().find(|g| g.index == index) {
+            Some(goal) => (goal.clone(), "requested", None, None),
+            None => {
+                return Ok(Err(format!(
+                    "no goal of this query has index {index}; its goals are {}",
+                    listed()
+                )));
+            }
+        },
+        (None, None) => {
+            let outcome = check!(&query.query, true);
+            // By id, or by message for a goal without one: a failure's
+            // message is the goal's, with labels appended.
+            let failed = outcome.assert_id.as_ref().and_then(|id| by_id(id)).or_else(|| {
+                let error = outcome.error.as_ref()?;
+                goals.iter().find(|g| same_goal(&g.error, error))
+            });
+            match (failed, outcome.run.result) {
+                (Some(goal), _) => (goal.clone(), "first_failure", Some(outcome.run), None),
+                (None, QueryResult::Valid) => {
+                    return Ok(Err("the query verifies; name a goal with assert_id or goal to \
+                                   scaffold it anyway"
+                        .to_owned()));
+                }
+                (None, result) => 'found: {
+                    // A resource limit names no goal. Check each goal alone,
+                    // in order, every other goal assumed, and take the first
+                    // that fails, as the earliest error is the one Verus
+                    // reports. Past the budget, list them instead.
+                    const GOALS_PROBED: usize = 64;
+                    let truth = air::ast_util::mk_true();
+                    for (probes, goal) in goals.iter().take(GOALS_PROBED).enumerate() {
+                        let alone = air::scaffold::scaffold_query(
+                            &query.query,
+                            goal.target(),
+                            &truth,
+                            Arm::GoalGiven,
+                        )
+                        .expect("a goal of this query");
+                        if check!(&alone.query).run.result != QueryResult::Valid {
+                            break 'found (
+                                goal.clone(),
+                                "first_failing_alone",
+                                Some(outcome.run),
+                                Some(probes + 1),
+                            );
+                        }
+                    }
+                    let why = match result {
+                        QueryResult::ResourceLimit if goals.len() <= GOALS_PROBED => format!(
+                            "the query ran out of budget, yet each of its {} goals holds alone \
+                             with the others assumed: the budget goes on the query as a whole, \
+                             not on one goal",
+                            goals.len()
+                        ),
+                        QueryResult::ResourceLimit => format!(
+                            "the query's check named no failing goal (a resource limit names \
+                             none), and of its first {GOALS_PROBED} goals each holds alone"
+                        ),
+                        _ => format!(
+                            "the query's check failed at a goal this worker could not match to \
+                             one of its {} asserts, and each of the first {GOALS_PROBED} holds \
+                             alone",
+                            goals.len()
+                        ),
+                    };
+                    return Ok(Err(format!(
+                        "{why}; name one with assert_id or goal to scaffold it: {}",
+                        listed()
+                    )));
+                }
+            }
+        }
+    };
+    let rewrite = |arm, p: &air::ast::Expr| {
+        air::scaffold::scaffold_query(&query.query, goal.target(), p, arm)
+            .expect("a goal of this query")
+    };
+    let alone = rewrite(Arm::GoalGiven, &air::ast_util::mk_true());
+    let given = rewrite(Arm::GoalGiven, &lowered.expr);
+    let provable = rewrite(Arm::Provable, &lowered.expr);
+
+    let baseline = check!(&alone.query);
+    let p_provable = if request.goal_only { None } else { Some(check!(&provable.query)) };
+    let goal_given_p = check!(&given.query);
+
+    let holds = |run: &ScaffoldRun| run.result == QueryResult::Valid;
+    // A check that ran out of budget proves nothing either way, so a case
+    // turning on one says so rather than calling P unprovable.
+    #[derive(Clone, Copy)]
+    enum Verdict {
+        Holds,
+        Fails,
+        OutOfBudget,
+    }
+    let verdict = |run: &ScaffoldRun| match run.result {
+        QueryResult::Valid => Verdict::Holds,
+        QueryResult::ResourceLimit => Verdict::OutOfBudget,
+        _ => Verdict::Fails,
+    };
+    let case = {
+        use Verdict::*;
+        match (
+            verdict(&baseline.run),
+            p_provable.as_ref().map(|p| verdict(&p.run)),
+            verdict(&goal_given_p.run),
+        ) {
+            (Holds, _, _) => "goal_already_holds",
+            (_, Some(_), OutOfBudget) => "undecided",
+            (_, Some(Holds), Holds) => "scaffold",
+            (_, Some(Holds), Fails) => "true_but_unhelpful",
+            (_, Some(Fails), Holds) => "helpful_but_unprovable",
+            (_, Some(Fails), Fails) => "dead_end",
+            (_, Some(OutOfBudget), Holds) => "helpful_but_undecided",
+            (_, Some(OutOfBudget), Fails) => "unhelpful_and_undecided",
+            (_, None, Holds) => "goal_closes_given_p",
+            (_, None, Fails) => "goal_open_given_p",
+            (_, None, OutOfBudget) => "goal_undecided_given_p",
+        }
+    };
+    let marginal_cost = match (baseline.run.cost, goal_given_p.run.cost) {
+        (Some(before), Some(after)) => Some(MarginalCost {
+            instantiations_delta: after.instantiations as i64 - before.instantiations as i64,
+            rlimit_delta: after.resource_units as i64 - before.resource_units as i64,
+        }),
+        _ => None,
+    };
+    let desc = &query.context.desc;
+    let span = &query.context.span.as_string;
+    let why = goal_given_p.provenance.filter(|_| holds(&goal_given_p.run)).map(|info| {
+        let resolved = symbols.resolve(
+            &query.context.fun,
+            crate::provenance::QueryProvenance {
+                desc: desc.clone(),
+                span: span.clone(),
+                focus: None,
+                round: 0,
+                result: "valid".to_owned(),
+                sources: info.sources,
+                instantiations: info.instantiations,
+                variable_versions: info.variable_versions,
+                unparsed: info.unparsed,
+            },
+        );
+        let mut closing = resolved.instantiations;
+        // user quantifiers and function definitions first, the prelude last
+        closing.sort_by_key(|q| match (&q.span, q.role, q.fun.as_deref()) {
+            (Some(_), _, _) => 0,
+            (None, Some("definition" | "definition_unfold" | "definition_base"), _) => 1,
+            (None, _, Some("prelude")) => 3,
+            _ => 2,
+        });
+        const CLOSING_SHOWN: usize = 12;
+        let omitted = closing.len().saturating_sub(CLOSING_SHOWN);
+        closing.truncate(CLOSING_SHOWN);
+        ScaffoldWhy {
+            explains_goal: resolved.hypotheses,
+            closing_quantifiers: closing,
+            closing_quantifiers_omitted: omitted,
+        }
+    });
+    let residual = goal_given_p
+        .unknown
+        .filter(|u| {
+            !holds(&goal_given_p.run) && (u.incomplete_id.is_some() || !u.culprit_qids.is_empty())
+        })
+        .map(|reason| {
+            let mut resolved = quantifiers.resolve_unknown(desc, span, reason);
+            resolved.culprits.truncate(20);
+            resolved
+        });
+    let message = given.error.downcast_ref::<MessageX>();
+    let labels: Vec<SourceLabel> = message
+        .map(|m| {
+            m.labels
+                .iter()
+                .map(|l| SourceLabel { message: l.note.clone(), span: l.span.as_string.clone() })
+                .collect()
+        })
+        .unwrap_or_default();
+    let primary = message.and_then(|m| m.spans.first()).map(|s| s.as_string.clone());
+    let description = message.map(|m| m.note.clone()).unwrap_or_default();
+    // Where the snippet goes. The claim of `assert ... by` is checked after
+    // that block's steps: it ends its dead end, and `by` follows its span. A
+    // closure body's last assert ends one too, with no `by`; when the source
+    // cannot be read, the dead end decides. A postcondition goes at the end
+    // of the body, which its label names; a loop invariant at the end of the
+    // loop body or before the loop, which no span names, or at the break or
+    // continue its span is; anything else, a step of a proof block included,
+    // at its own span.
+    let claim_of_assert_by =
+        given.ends_dead_end && primary.as_deref().and_then(followed_by_by).unwrap_or(true);
+    let (insert_before, placement) = if claim_of_assert_by {
+        (None, "end_of_proof_block")
+    } else if description.contains("postcondition") {
+        let end = labels
+            .iter()
+            .find(|l| l.message.contains("end of the function body"))
+            .map(|l| l.span.clone());
+        (end.or_else(|| primary.clone()), "end_of_body")
+    } else if description == vir::def::INV_FAIL_LOOP_END {
+        (None, "end_of_loop_body")
+    } else if description == vir::def::INV_FAIL_LOOP_FRONT {
+        (None, "before_loop")
+    } else {
+        // a loop invariant at a break or continue has that statement's span
+        (primary.clone(), "before_span")
+    };
+    let verus_snippet = matches!(case, "scaffold" | "goal_closes_given_p")
+        .then(|| assertion_snippet(&request.assert));
+    Ok(Ok(ScaffoldReport {
+        target: ScaffoldTarget {
+            assert_id: goal.id.as_ref().map(|id| (**id).clone()).unwrap_or_default(),
+            goal: goal.index,
+            chosen,
+            goals_probed,
+            description,
+            span: primary,
+            labels,
+            occurrences: given.occurrences,
+            insert_before,
+            placement,
+        },
+        lowered_as,
+        choices: lowered.choices,
+        query_check,
+        baseline: baseline.run,
+        p_provable: p_provable.map(|p| p.run),
+        goal_given_p: goal_given_p.run,
+        case,
+        marginal_cost,
+        why,
+        residual,
+        verus_snippet,
+        stack_levels: None,
+        elapsed_ms: 0,
+        restore_ms: 0,
+    }))
+}
+
+/// Check `query` once with `rung`'s strategy, `alone` or alongside the
+/// default schedule, at `rlimit`, and pop its scope. The options are set back
+/// right after the check-sat, whatever it answered (see
+/// `Context::set_quant_strategy`).
+fn ladder_rung(
+    air: &mut Context,
+    query: &RetainedQuery,
+    rung: Rung,
+    alone: bool,
+    rlimit: f32,
+    set_rlimit: &impl Fn(&mut Context, f32),
+) -> io::Result<RungReport> {
+    set_rlimit(air, rlimit);
+    let resource_limit = match air.cvc5_query_budget() {
+        0 => None,
+        budget => Some(u64::from(budget)),
+    };
+    air.set_quant_strategy(Some(rung.name()), alone);
+    let start = Instant::now();
+    let outcome = air.check_valid(
+        &VirMessageInterface {},
+        &QueryDiagnostics::default(),
+        &query.query,
+        QueryContext::default(),
+    );
+    let elapsed_ms = start.elapsed().as_millis();
+    let info = air.take_strategy_rung();
+    let unknown = air.take_unknown_reason();
+    drop(air.take_provenance());
+    drop(air.take_matching_loops());
+    drop(air.take_difficulty());
+    drop(air.take_inst_pressure());
+    let (verdict, assert_id) = match outcome {
+        ValidityResult::Valid(_) => ("valid", None),
+        // An incomplete answer comes back as invalid with a reason; a
+        // counterexample has none.
+        ValidityResult::Invalid(_, _, id) => {
+            (if unknown.is_some() { "unknown" } else { "invalid" }, id.map(|id| (*id).clone()))
+        }
+        ValidityResult::Canceled => ("resource_limit", None),
+        ValidityResult::TypeError(error) => return Err(io::Error::other(error.to_string())),
+        ValidityResult::UnexpectedOutput(error) => return Err(io::Error::other(error)),
+    };
+    air.finish_query();
+    let counts = info.as_ref().map(|info| &info.instantiations);
+    let count = |own: bool| {
+        counts.map(|counts| {
+            counts.iter().filter(|(name, _)| (name == rung.name()) == own).map(|(_, n)| n).sum()
+        })
+    };
+    Ok(RungReport {
+        rung,
+        verdict,
+        rlimit: Some(rlimit),
+        resource_limit,
+        resource_units: info.as_ref().map(|info| info.resource_units),
+        instantiations: count(true),
+        other_instantiations: count(false),
+        rounds: info.as_ref().map(|info| info.rounds),
+        reason_unknown: unknown.as_ref().map(|reason| reason.reason.clone()),
+        incomplete_id: unknown.and_then(|reason| reason.incomplete_id),
+        assert_id,
+        elapsed_ms,
+    })
+}
+
+/// Serve a ladder request for one query of `bucket`, whose address the
+/// caller has checked. Each rung checks the query with its strategy alone or,
+/// with `alongside`, together with the default schedule, at its own budget,
+/// in the order given, until one proves the query or, with `run_all`,
+/// through every rung. Each check runs in the query's own scope and resets
+/// the strategy after itself, so the session's later checks are unchanged.
+/// `Ok(Err(_))` is a refusal to report; `Err` ends the session.
+fn serve_ladder(
+    bucket: &RetainedBucket,
+    id: QueryId,
+    rungs: &[Rung],
+    budgets: &HashMap<Rung, f32>,
+    run_all: bool,
+    alongside: bool,
+    set_rlimit: &impl Fn(&mut Context, f32),
+) -> io::Result<Result<LadderReport, &'static str>> {
+    let mut state =
+        bucket.state.lock().map_err(|_| io::Error::other("resident bucket poisoned"))?;
+    let (solver, local) = bucket.addresses[id.0];
+    let SolverState { air, journal } = &mut state[solver];
+    if !matches!(air.get_solver(), SmtSolver::Cvc5) {
+        return Ok(Err("ladder requests need cvc5"));
+    }
+    let prefix = journal.queries[local].prefix;
+    let query_rlimit = journal.queries[local].rlimit;
+    // A budget is in `#[verifier::rlimit]` units, converted to cvc5's by
+    // `set_rlimit`. One too small for a single cvc5 unit converts to 0, which
+    // cvc5 takes as no limit at all, so it is refused before any rung runs.
+    for &rlimit in budgets.values() {
+        set_rlimit(air, rlimit);
+        if air.cvc5_query_budget() == 0 {
+            set_rlimit(air, query_rlimit);
+            return Ok(Err("a rung's budget is below one cvc5 resource unit"));
+        }
+    }
+    set_rlimit(air, query_rlimit);
+    let restore_start = Instant::now();
+    journal.restore_prefix(air, prefix)?;
+    let restore_ms = restore_start.elapsed().as_millis();
+    // Asked before any option is set: a cvc5 without `:quant-strategy`
+    // would answer the set-option with an error the check cannot survive.
+    let Some(probe) = air.probe_strategy_rung() else {
+        return Ok(Err(
+            "this cvc5 cannot run one instantiation strategy alone; it needs :quant-strategy",
+        ));
+    };
+    let query = &journal.queries[local];
+    // A rung without a budget gets the query's own, or, for a query without
+    // one, `DEFAULT_RUNG_RLIMIT`: every rung runs bounded.
+    let default_budget = if query.rlimit.is_finite() { query.rlimit } else { DEFAULT_RUNG_RLIMIT };
+    let start = Instant::now();
+    let mut solved_by = None;
+    let mut reports = Vec::new();
+    for &rung in rungs {
+        if solved_by.is_some() && !run_all {
+            reports.push(RungReport::skipped(rung, "not_run"));
+        } else if !probe.available.iter().any(|name| name == rung.name()) {
+            reports.push(RungReport::skipped(rung, "unavailable"));
+        } else {
+            let rlimit = budgets.get(&rung).copied().unwrap_or(default_budget);
+            let report = ladder_rung(air, query, rung, !alongside, rlimit, set_rlimit)?;
+            if report.verdict == "valid" && solved_by.is_none() {
+                solved_by = Some(rung);
+            }
+            reports.push(report);
+        }
+    }
+    set_rlimit(air, query.rlimit);
+    Ok(Ok(LadderReport {
+        alongside,
+        solved_by,
+        rungs: reports,
+        available: probe.available,
+        pinned: None,
+        elapsed_ms: start.elapsed().as_millis(),
+        restore_ms,
+    }))
+}
+
 impl QueryJournal {
     pub(crate) fn new() -> Self {
         Self {
@@ -1572,7 +2617,12 @@ impl Server {
         // Compilation can finish in any order. Protocol ordinals follow the
         // verifier's bucket identity, not worker completion order.
         buckets.sort_by(|left, right| left.id.cmp(&right.id));
-        Self { buckets, info, graphs: KeptGraphs::new(MAX_KEPT_INSTANTIATIONS) }
+        Self {
+            buckets,
+            info,
+            graphs: KeptGraphs::new(MAX_KEPT_INSTANTIATIONS),
+            pins: HashMap::new(),
+        }
     }
 
     pub(crate) fn serve(
@@ -1645,6 +2695,7 @@ impl Server {
                 smt_options: &self.info.smt_options,
                 instantiation_replay: self.info.instantiation_replay,
                 inst_graph: self.info.inst_graph,
+                strategy_ladder: self.info.strategy_ladder,
                 input_files: &self.info.input_files,
                 buckets: &buckets,
             },
@@ -1686,9 +2737,11 @@ impl Server {
                 | Request::Check { session: requested, .. }
                 | Request::Bisect { session: requested, .. }
                 | Request::Egraph { session: requested, .. }
+                | Request::Scaffold { session: requested, .. }
                 | Request::Close { session: requested }
                 | Request::InstGraph { session: requested, .. }
                 | Request::Twin { session: requested, .. }
+                | Request::Ladder { session: requested, .. }
                     if requested != session =>
                 {
                     send(
@@ -1846,6 +2899,121 @@ impl Server {
                         Err(error) => return fatal(&mut output, error),
                     }
                 }
+                Request::Scaffold {
+                    bucket: bucket_id,
+                    query: id,
+                    assert,
+                    assert_id,
+                    goal,
+                    goal_only,
+                    ..
+                } => {
+                    let Some(bucket) = self.buckets.get(bucket_id.0) else {
+                        send(&mut output, &Response::Error { message: "unknown bucket" })?;
+                        continue;
+                    };
+                    if bucket.queries.get(id.0).is_none() {
+                        send(&mut output, &Response::Error { message: "unknown query" })?;
+                        continue;
+                    }
+                    let request = ScaffoldRequest { assert, assert_id, goal, goal_only };
+                    match serve_scaffold(bucket, id, request, &set_rlimit) {
+                        Ok(Ok(report)) => send(
+                            &mut output,
+                            &Response::Scaffold {
+                                session,
+                                bucket: bucket_id,
+                                query: id,
+                                report: Box::new(report),
+                            },
+                        )?,
+                        Ok(Err(message)) => {
+                            send(&mut output, &Response::Error { message: &message })?
+                        }
+                        Err(error) => return fatal(&mut output, error),
+                    }
+                }
+                Request::Ladder {
+                    bucket: bucket_id,
+                    query: id,
+                    rungs,
+                    budgets,
+                    run_all,
+                    alongside,
+                    pin,
+                    ..
+                } => {
+                    let Some(bucket) = self.buckets.get(bucket_id.0) else {
+                        send(&mut output, &Response::Error { message: "unknown bucket" })?;
+                        continue;
+                    };
+                    if bucket.queries.get(id.0).is_none() {
+                        send(&mut output, &Response::Error { message: "unknown query" })?;
+                        continue;
+                    }
+                    let rungs = rungs.unwrap_or_else(|| {
+                        if alongside { Rung::ALONGSIDE.to_vec() } else { Rung::LADDER.to_vec() }
+                    });
+                    if rungs.iter().enumerate().any(|(i, rung)| rungs[..i].contains(rung)) {
+                        send(
+                            &mut output,
+                            &Response::Error { message: "each rung may be named once" },
+                        )?;
+                        continue;
+                    }
+                    if budgets.values().any(|&rlimit| !(rlimit > 0.0 && rlimit <= MAX_RUNG_RLIMIT))
+                    {
+                        send(
+                            &mut output,
+                            &Response::Error {
+                                message: "a rung's budget must be above 0 and at most 1000",
+                            },
+                        )?;
+                        continue;
+                    }
+                    match serve_ladder(
+                        bucket,
+                        id,
+                        &rungs,
+                        &budgets,
+                        run_all,
+                        alongside,
+                        &set_rlimit,
+                    ) {
+                        Ok(Ok(mut report)) => {
+                            let key = (bucket_id.0, id.0);
+                            if pin.unwrap_or(true) {
+                                match report.solved_by {
+                                    Some(rung) => {
+                                        // The budget it proved the query at.
+                                        let rlimit = report
+                                            .rungs
+                                            .iter()
+                                            .find(|report| report.rung == rung)
+                                            .and_then(|report| report.rlimit)
+                                            .expect("the rung that proved the query ran");
+                                        self.pins.insert(key, Pin { rung, alongside, rlimit });
+                                    }
+                                    None => {
+                                        self.pins.remove(&key);
+                                    }
+                                }
+                            }
+                            report.pinned = self.pins.get(&key).copied();
+                            send(
+                                &mut output,
+                                &Response::Laddered {
+                                    session,
+                                    bucket: bucket_id,
+                                    query: id,
+                                    report,
+                                },
+                            )?
+                        }
+                        Ok(Err(message)) => send(&mut output, &Response::Error { message })?,
+                        Err(error) => return fatal(&mut output, error),
+                    }
+                }
                 Request::Check { bucket: bucket_id, query: id, .. } => {
                     let Some(bucket) = self.buckets.get(bucket_id.0) else {
                         send(&mut output, &Response::Error { message: "unknown bucket" })?;
@@ -1945,6 +3113,62 @@ impl Server {
                             elapsed_ms: start.elapsed().as_millis(),
                         });
                     }
+                    // Then the pinned rung, when a ladder request pinned one:
+                    // its strategy, alone or alongside as the ladder ran it,
+                    // at the budget it proved the query at or the query's
+                    // own, whichever is smaller, so it is bounded even for a
+                    // query without an rlimit. It changes which instances
+                    // are tried, never what is asserted, so a valid answer
+                    // is sound, and that answer's diagnostics (provenance,
+                    // difficulty) describe the check that decided, so the
+                    // reply keeps them, as it keeps its graph. Any other
+                    // answer is discarded, with its diagnostics, before the
+                    // ordinary check, which runs the full schedule.
+                    let mut pinned = None;
+                    if let Some(&pin) =
+                        self.pins.get(&(bucket_id.0, id.0)).filter(|_| certified.is_none())
+                    {
+                        let attempt_start = Instant::now();
+                        let rlimit = pin.rlimit.min(query.rlimit);
+                        set_rlimit(air, rlimit);
+                        air.set_quant_strategy(Some(pin.rung.name()), !pin.alongside);
+                        let attempt = air.check_valid(
+                            &VirMessageInterface {},
+                            &QueryDiagnostics::default(),
+                            &query.query,
+                            QueryContext::default(),
+                        );
+                        set_rlimit(air, query.rlimit);
+                        let resource_units =
+                            air.take_strategy_rung().map(|info| info.resource_units);
+                        match attempt {
+                            ValidityResult::Valid(usage) => {
+                                certified = Some(ValidityResult::Valid(usage))
+                            }
+                            ValidityResult::TypeError(error) => {
+                                return fatal(&mut output, io::Error::other(error.to_string()));
+                            }
+                            ValidityResult::UnexpectedOutput(error) => {
+                                return fatal(&mut output, io::Error::other(error));
+                            }
+                            _ => {
+                                drop(air.take_provenance());
+                                drop(air.take_unknown_reason());
+                                drop(air.take_matching_loops());
+                                drop(air.take_difficulty());
+                                drop(air.take_inst_pressure());
+                                air.finish_query();
+                            }
+                        }
+                        pinned = Some(PinnedAttempt {
+                            rung: pin.rung,
+                            alongside: pin.alongside,
+                            rlimit,
+                            closed: certified.is_some(),
+                            elapsed_ms: attempt_start.elapsed().as_millis(),
+                            resource_units,
+                        });
+                    }
                     let mut outcome = match certified {
                         Some(outcome) => outcome,
                         None => air.check_valid(
@@ -1970,8 +3194,13 @@ impl Server {
                     let (graph_summary, graph_error) = match graph {
                         Some(Ok(graph)) => {
                             let mut summary = graph.summary();
-                            let certified = attempted.as_ref().is_some_and(|a| a.closed);
-                            summary.check = Some(if certified { "certificate" } else { "search" });
+                            summary.check = Some(if attempted.as_ref().is_some_and(|a| a.closed) {
+                                "certificate"
+                            } else if pinned.as_ref().is_some_and(|a| a.closed) {
+                                "pinned"
+                            } else {
+                                "search"
+                            });
                             self.graphs.insert((bucket_id.0, id.0), graph);
                             (Some(summary), None)
                         }
@@ -2204,6 +3433,7 @@ impl Server {
                             matching_loops: matching_loops.as_ref(),
                             difficulty: difficulty.as_ref(),
                             certificate: attempted,
+                            pinned,
                             inst_graph: graph_summary,
                             inst_graph_error: graph_error,
                         },
@@ -2696,6 +3926,7 @@ mod tests {
                 smt_options: Vec::new(),
                 instantiation_replay: false,
                 inst_graph: false,
+                strategy_ladder: false,
             },
         );
         let input = format!("{}\n{{\"command\":\"list\"}}\n", " ".repeat(65537));

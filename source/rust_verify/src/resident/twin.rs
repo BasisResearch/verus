@@ -1246,7 +1246,7 @@ pub(super) fn serve(
     let restore_start = Instant::now();
     journal.restore_prefix(air, prefix)?;
     let restore_ms = restore_start.elapsed().as_millis();
-    let levels_before = air.assertion_stack_levels();
+    let levels_before = air.solver_stack_levels();
     let start = Instant::now();
     let base = match run_branch(air, &base_query, rlimit, set_rlimit) {
         Ok(branch) => branch,
@@ -1326,7 +1326,7 @@ pub(super) fn serve(
     } else {
         None
     };
-    let levels_after = air.assertion_stack_levels();
+    let levels_after = air.solver_stack_levels();
     let elapsed_ms = start.elapsed().as_millis();
 
     let mut unavailable = Vec::new();

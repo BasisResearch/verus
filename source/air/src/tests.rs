@@ -2736,3 +2736,20 @@ fn parse_inst_pressure_symbols() {
     assert!(info.unparsed.is_some());
     assert_eq!(info.quantifiers.len(), 1);
 }
+
+#[test]
+fn parse_check_effort_reply() {
+    let effort = crate::smt_verify::parse_check_effort(
+        "(:check-effort (:resource-units 1234 :instantiations 7 :inst-rounds 2))",
+    );
+    assert_eq!(effort.resource_units, 1234);
+    assert_eq!(effort.instantiations, 7);
+    assert_eq!(effort.inst_rounds, 2);
+    assert!(effort.unparsed.is_none());
+    // a missing count, or a reply that is not one, is kept whole
+    for line in ["(:check-effort (:resource-units 1 :instantiations 2))", "(:check-effort ())"] {
+        let effort = crate::smt_verify::parse_check_effort(line);
+        assert_eq!(effort.unparsed.as_deref(), Some(line));
+        assert_eq!(effort.resource_units, 0);
+    }
+}

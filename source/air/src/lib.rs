@@ -17,6 +17,7 @@ pub mod twin;
 
 #[macro_use]
 pub mod printer;
+pub mod scaffold;
 
 mod block_to_assert;
 mod closure;

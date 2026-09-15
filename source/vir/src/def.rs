@@ -61,7 +61,7 @@ const PREFIX_PRE_VAR: &str = "pre%";
 /// reader rendering source terms has to drop them.
 pub const PREFIX_BOX: &str = "Poly%";
 pub const PREFIX_UNBOX: &str = "%Poly%";
-const PREFIX_TYPE_ID: &str = "TYPE%";
+pub const PREFIX_TYPE_ID: &str = "TYPE%";
 const PREFIX_DYN_ID: &str = "DYN%";
 const PREFIX_DCR_ID: &str = "DCR%";
 const PREFIX_FNDEF_TYPE_ID: &str = "FNDEF%";
