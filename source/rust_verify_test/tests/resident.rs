@@ -683,6 +683,45 @@ verus! {
     {
         assert(x >= 0);
     }
+
+    // The same goal inside a proof block: `P` is checked after the block's
+    // steps, and belongs at its end.
+    proof fn scaffold_by(x: int)
+        requires
+            forall|i: int| #[trigger] g(f(i)) == i,
+    {
+        assert(f(x) != f(x + 1)) by {
+            assert(x == x);
+        }
+    }
+}
+"#;
+
+/// A loop whose second invariant holds on entry (the second `requires`)
+/// and, at the end of the body, needs the inverse at the new `i`. The
+/// inverse is an invariant too: an isolated loop body sees no `requires`.
+/// Verus emits the check at the end of the body without an assert id.
+const INVARIANT_SOURCE: &str = r#"
+use vstd::prelude::*;
+verus! {
+    uninterp spec fn f(i: int) -> int;
+    uninterp spec fn g(i: int) -> int;
+
+    fn scaffold_loop(n: u64)
+        requires
+            forall|i: int| #[trigger] g(f(i)) == i,
+            f(0) != f(1),
+    {
+        let mut i: u64 = 0;
+        while i < n
+            invariant
+                forall|j: int| #[trigger] g(f(j)) == j,
+                f(i as int) != f(i as int + 1),
+            decreases n - i,
+        {
+            i = i + 1;
+        }
+    }
 }
 "#;
 
@@ -735,8 +774,10 @@ fn resident_scaffold_tells_the_four_cases_apart_as_cold_checks_do() {
     assert_ne!(first["query_check"]["result"], "valid", "{first}");
     let goal = first["target"]["assert_id"].clone();
     assert!(goal.is_array(), "{}", first);
-    let goal_line = line_of(SCAFFOLD_SOURCE, "assert(f(x) != f(x + 1))");
+    let goal_line = line_of(SCAFFOLD_SOURCE, "assert(f(x) != f(x + 1));");
     assert!(first["target"]["insert_before"].as_str().unwrap().contains(&goal_line), "{}", first);
+    assert_eq!(first["target"]["placement"], "before_span", "{}", first);
+    assert!(first["target"]["goal"].is_u64(), "{}", first);
     assert!(first["lowered_as"].as_str().unwrap().contains("g(crate::f(x))"), "{}", first);
     assert!(first["stack_levels"].is_u64(), "{}", first);
     // an ordinary session has no provenance to say why
@@ -837,6 +878,94 @@ fn resident_scaffold_tells_the_four_cases_apart_as_cold_checks_do() {
     assert!(checks_valid(&mut cold, &cold_ready, "::pasted"));
     cold.send(json!({"command": "close", "session": cold_ready["session"]}));
     cold.finish(false);
+}
+
+/// Every query of the function `name`, by id.
+fn query_ids(ready: &Value, name: &str) -> Vec<Value> {
+    ready["buckets"][0]["queries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|query| query["function"].as_str().unwrap().ends_with(name))
+        .map(|query| query["id"].clone())
+        .collect()
+}
+
+/// A goal Verus emits without an assert id, the invariant at the end of the
+/// loop body, is the one the query's check fails at, and is addressed by
+/// its index. `P` reads `i` after the increment, so the inverse at the new
+/// `i` scaffolds the goal, and pasted at the end of the body, where the
+/// reply says, it makes the function verify.
+#[test]
+fn resident_scaffold_addresses_a_goal_without_an_assert_id() {
+    let mut worker = Worker::start(INVARIANT_SOURCE, &[]);
+    let ready = worker.receive();
+    assert_eq!(ready["event"], "ready", "{}", ready);
+    let session = ready["session"].clone();
+    let queries = ready["buckets"][0]["queries"].as_array().unwrap();
+    let body = queries
+        .iter()
+        .find(|q| q["description"] == "while loop")
+        .unwrap_or_else(|| panic!("no loop query: {}", ready))["id"]
+        .clone();
+    let p = "g(f(i as int)) == i as int";
+    let reply = worker.send(json!({"command": "scaffold", "session": session, "bucket": 0,
+        "query": body, "assert": p}));
+    assert_eq!(reply["event"], "scaffold", "{}", reply);
+    assert_eq!(reply["target"]["chosen"], "first_failure", "{}", reply);
+    assert_eq!(reply["target"]["assert_id"], json!([]), "{}", reply);
+    assert_eq!(
+        reply["target"]["description"], "invariant not satisfied at end of loop body",
+        "{}",
+        reply
+    );
+    assert_eq!(reply["target"]["placement"], "end_of_loop_body", "{}", reply);
+    assert!(reply["target"]["insert_before"].is_null(), "{}", reply);
+    assert_eq!(reply["case"], "scaffold", "{}", reply);
+    let index = reply["target"]["goal"].as_u64().unwrap();
+    // the same goal by index, and P read at the old `i` is no help
+    let again = worker.send(json!({"command": "scaffold", "session": session, "bucket": 0,
+        "query": body, "assert": p, "goal": index}));
+    assert_eq!(again["target"]["chosen"], "requested", "{}", again);
+    assert_eq!(again["case"], "scaffold", "{}", again);
+    let old = worker.send(json!({"command": "scaffold", "session": session, "bucket": 0,
+        "query": body, "assert": "g(f(i as int - 1)) == i as int - 1", "goal": index}));
+    assert_eq!(old["case"], "true_but_unhelpful", "{}", old);
+    let missing = worker.send(json!({"command": "scaffold", "session": session, "bucket": 0,
+        "query": body, "assert": p, "goal": 999}));
+    let message = missing["message"].as_str().unwrap();
+    assert!(message.contains("its goals are") && message.contains("no assert id"), "{}", missing);
+    worker.send(json!({"command": "close", "session": session}));
+    worker.finish(false);
+
+    let pasted = INVARIANT_SOURCE.replace("i = i + 1;", &format!("i = i + 1; assert({p});"));
+    let mut cold = Worker::start(&pasted, &[]);
+    let cold_ready = cold.receive();
+    for id in query_ids(&cold_ready, "::scaffold_loop") {
+        let result = cold.send(json!({"command": "check", "session": cold_ready["session"],
+            "bucket": 0, "query": id}));
+        assert_eq!(result["result"], "valid", "{}", result);
+    }
+    cold.send(json!({"command": "close", "session": cold_ready["session"]}));
+    // the invocation verified everything, so the worker exits well
+    cold.finish(true);
+}
+
+/// A goal inside `assert ... by` is checked after the block's steps, and
+/// the reply places the snippet at the block's end, naming no span.
+#[test]
+fn resident_scaffold_places_p_after_a_proof_blocks_steps() {
+    let mut worker = Worker::start(SCAFFOLD_SOURCE, &[]);
+    let ready = worker.receive();
+    let reply = worker.send(json!({"command": "scaffold", "session": ready["session"],
+        "bucket": 0, "query": query_id(&ready, "::scaffold_by"), "assert": SCAFFOLD_CASES[0].0}));
+    assert_eq!(reply["event"], "scaffold", "{}", reply);
+    assert_eq!(reply["target"]["chosen"], "first_failure", "{}", reply);
+    assert_eq!(reply["target"]["placement"], "end_of_proof_block", "{}", reply);
+    assert!(reply["target"]["insert_before"].is_null(), "{}", reply);
+    assert_eq!(reply["case"], "scaffold", "{}", reply);
+    worker.send(json!({"command": "close", "session": ready["session"]}));
+    worker.finish(false);
 }
 
 /// A matching loop runs the query out of budget, and a resource limit names

@@ -12,13 +12,22 @@
 //!
 //! In both, every other goal of the query becomes an assumption of what it
 //! asserts. The answer is then about `P` or the target alone: no other goal
-//! can fail the check, and a goal before the target is available after it,
-//! as it is to the real verifier once that goal is proved. The real verifier
-//! still checks every one of them.
+//! can fail the check, and a goal before the target on its path is a
+//! hypothesis of the check. Verus itself assumes a source `assert` after
+//! checking it, but not a call's precondition, a loop invariant or a
+//! postcondition; here those are hypotheses too. When they hold, they follow
+//! from the context and change nothing but what the solver has at hand. A
+//! goal that fails, before a target the caller named, is assumed all the
+//! same, and a false one makes the answer vacuous: the query's own check
+//! says which goals fail. The real verifier still checks every one of them.
 //!
 //! `P` is placed among the query's statements rather than asserted beside
 //! the query, so its variables mean what they mean at the target: a variable
 //! assigned earlier is read at the version the target reads.
+//!
+//! A goal is addressed by its `AssertId`, or, for the asserts Verus emits
+//! without one (loop invariants at a loop's end, `decreases`), by its index
+//! among the query's `Assert` statements.
 //!
 //! The rewritten query is an ordinary query. Checked in the original query's
 //! scope, nothing it asserts outlives the check.
@@ -46,41 +55,76 @@ pub struct Scaffold {
     /// The target's error message, from its first occurrence. Its spans say
     /// where the target is.
     pub error: ArcDynMessage,
+    /// Whether the target's first occurrence sits inside a dead end, such as
+    /// the proof block of `assert ... by`: `P` is then checked after that
+    /// block's steps, and belongs at its end, not before the statement.
+    pub in_dead_end: bool,
+}
+
+/// Which goal of a query to rewrite around.
+#[derive(Clone, Copy, Debug)]
+pub enum Target<'a> {
+    /// Every `Assert` with this id.
+    Id(&'a [u64]),
+    /// The `Assert` at this index among the query's `Assert` statements, in
+    /// the order the statements reach them (`Goal::index`), for a goal
+    /// without an id.
+    Index(usize),
 }
 
 struct Found {
     occurrences: usize,
     error: Option<ArcDynMessage>,
+    /// `Assert` statements passed so far, the index of the next one.
+    next_index: usize,
+    dead_ends: usize,
+    in_dead_end: bool,
 }
 
-/// Rewrite `query` for `arm` around the goal whose `AssertId` is `target`.
-/// Fails when no goal has that id.
+/// Rewrite `query` for `arm` around `target`. Fails when no goal matches.
 pub fn scaffold_query(
     query: &Query,
-    target: &[u64],
+    target: Target<'_>,
     p: &Expr,
     arm: Arm,
 ) -> Result<Scaffold, String> {
-    let mut found = Found { occurrences: 0, error: None };
+    let mut found =
+        Found { occurrences: 0, error: None, next_index: 0, dead_ends: 0, in_dead_end: false };
     let assertion = rewrite(&query.assertion, target, p, arm, &mut found);
     match found.error {
         Some(error) => Ok(Scaffold {
             query: Arc::new(QueryX { local: query.local.clone(), assertion }),
             occurrences: found.occurrences,
             error,
+            in_dead_end: found.in_dead_end,
         }),
-        None => Err(format!("the query has no goal with assert id {:?}", target)),
+        None => Err(match target {
+            Target::Id(id) => format!("the query has no goal with assert id {:?}", id),
+            Target::Index(i) => format!("the query has no goal at index {i}"),
+        }),
     }
 }
 
-fn rewrite(stmt: &Stmt, target: &[u64], p: &Expr, arm: Arm, found: &mut Found) -> Stmt {
+fn rewrite(stmt: &Stmt, target: Target<'_>, p: &Expr, arm: Arm, found: &mut Found) -> Stmt {
     let stmts = |stmts: &[Stmt], found: &mut Found| -> Arc<Vec<Stmt>> {
         Arc::new(stmts.iter().map(|s| rewrite(s, target, p, arm, found)).collect())
     };
     match &**stmt {
-        StmtX::Assert(id, error, filter, _) if id.as_ref().is_some_and(|id| **id == target) => {
+        StmtX::Assert(id, error, filter, expr) => {
+            let index = found.next_index;
+            found.next_index += 1;
+            let matches = match target {
+                Target::Id(target) => id.as_ref().is_some_and(|id| **id == target),
+                Target::Index(target) => index == target,
+            };
+            if !matches {
+                return Arc::new(StmtX::Assume(expr.clone()));
+            }
             found.occurrences += 1;
-            found.error.get_or_insert_with(|| error.clone());
+            if found.error.is_none() {
+                found.error = Some(error.clone());
+                found.in_dead_end = found.dead_ends > 0;
+            }
             match arm {
                 Arm::Provable => {
                     Arc::new(StmtX::Assert(id.clone(), error.clone(), filter.clone(), p.clone()))
@@ -91,10 +135,14 @@ fn rewrite(stmt: &Stmt, target: &[u64], p: &Expr, arm: Arm, found: &mut Found) -
                 ]))),
             }
         }
-        StmtX::Assert(_, _, _, expr) => Arc::new(StmtX::Assume(expr.clone())),
         StmtX::Block(inner) => Arc::new(StmtX::Block(stmts(inner, found))),
         StmtX::Switch(inner) => Arc::new(StmtX::Switch(stmts(inner, found))),
-        StmtX::DeadEnd(inner) => Arc::new(StmtX::DeadEnd(rewrite(inner, target, p, arm, found))),
+        StmtX::DeadEnd(inner) => {
+            found.dead_ends += 1;
+            let inner = rewrite(inner, target, p, arm, found);
+            found.dead_ends -= 1;
+            Arc::new(StmtX::DeadEnd(inner))
+        }
         StmtX::Breakable(label, inner) => {
             Arc::new(StmtX::Breakable(label.clone(), rewrite(inner, target, p, arm, found)))
         }
@@ -106,23 +154,51 @@ fn rewrite(stmt: &Stmt, target: &[u64], p: &Expr, arm: Arm, found: &mut Found) -
     }
 }
 
-/// The query's goals, each id once, in the order the statements reach them,
-/// with the error message of its first occurrence.
-pub fn goals(query: &Query) -> Vec<(AssertId, ArcDynMessage)> {
-    fn walk(stmt: &Stmt, out: &mut Vec<(AssertId, ArcDynMessage)>) {
+/// One goal of a query, as `goals` lists them.
+#[derive(Clone, Debug)]
+pub struct Goal {
+    /// Its index among the query's `Assert` statements, in the order the
+    /// statements reach them; of a goal with several occurrences, the first.
+    pub index: usize,
+    /// `None` for the asserts Verus emits without an id.
+    pub id: Option<AssertId>,
+    /// The error message of its first occurrence.
+    pub error: ArcDynMessage,
+}
+
+impl Goal {
+    /// How to address this goal: by id when it has one, so that every
+    /// occurrence is rewritten, else by index.
+    pub fn target(&self) -> Target<'_> {
+        match &self.id {
+            Some(id) => Target::Id(id),
+            None => Target::Index(self.index),
+        }
+    }
+}
+
+/// The query's goals in the order the statements reach them: each id once,
+/// and each assert without an id.
+pub fn goals(query: &Query) -> Vec<Goal> {
+    fn walk(stmt: &Stmt, next_index: &mut usize, out: &mut Vec<Goal>) {
         match &**stmt {
-            StmtX::Assert(Some(id), error, _, _) => {
-                if !out.iter().any(|(seen, _)| seen == id) {
-                    out.push((id.clone(), error.clone()));
+            StmtX::Assert(id, error, _, _) => {
+                let index = *next_index;
+                *next_index += 1;
+                let seen = id.is_some() && out.iter().any(|goal| goal.id == *id);
+                if !seen {
+                    out.push(Goal { index, id: id.clone(), error: error.clone() });
                 }
             }
-            StmtX::Block(stmts) | StmtX::Switch(stmts) => stmts.iter().for_each(|s| walk(s, out)),
-            StmtX::DeadEnd(s) | StmtX::Breakable(_, s) => walk(s, out),
+            StmtX::Block(stmts) | StmtX::Switch(stmts) => {
+                stmts.iter().for_each(|s| walk(s, next_index, out))
+            }
+            StmtX::DeadEnd(s) | StmtX::Breakable(_, s) => walk(s, next_index, out),
             _ => {}
         }
     }
     let mut out = Vec::new();
-    walk(&query.assertion, &mut out);
+    walk(&query.assertion, &mut 0, &mut out);
     out
 }
 
@@ -248,7 +324,7 @@ mod tests {
 
     /// Declare everything before the query, then answer `arm` of the query
     /// for `target` and `p`, and the query itself, with z3.
-    fn answers(nodes: &[Node], target: &[u64], p: Node, arm: Arm) -> (bool, bool, usize) {
+    fn answers(nodes: &[Node], target: Target<'_>, p: Node, arm: Arm) -> (bool, bool, usize) {
         let mi = Arc::new(AirMessageInterface {});
         let parser = Parser::new(mi.clone());
         let commands = parser.nodes_to_commands(nodes).expect("parses");
@@ -314,11 +390,11 @@ mod tests {
     #[test]
     fn p_is_placed_at_the_target() {
         let (provable, original, occurrences) =
-            answers(&query(), &[1], one("(= y (+ a 1))"), Arm::Provable);
+            answers(&query(), Target::Id(&[1]), one("(= y (+ a 1))"), Arm::Provable);
         assert!(provable);
         assert!(!original);
         assert_eq!(occurrences, 1);
-        let (provable, _, _) = answers(&query(), &[1], one("(= y a)"), Arm::Provable);
+        let (provable, _, _) = answers(&query(), Target::Id(&[1]), one("(= y a)"), Arm::Provable);
         assert!(!provable);
     }
 
@@ -326,19 +402,57 @@ mod tests {
     #[test]
     fn a_helpful_p_need_not_be_provable() {
         let helpful = one("(> (g y) 0)");
-        assert!(answers(&query(), &[1], helpful.clone(), Arm::GoalGiven).0);
-        assert!(!answers(&query(), &[1], helpful, Arm::Provable).0);
+        assert!(answers(&query(), Target::Id(&[1]), helpful.clone(), Arm::GoalGiven).0);
+        assert!(!answers(&query(), Target::Id(&[1]), helpful, Arm::Provable).0);
         // true but no help
-        assert!(answers(&query(), &[1], one("(> y 1)"), Arm::Provable).0);
-        assert!(!answers(&query(), &[1], one("(> y 1)"), Arm::GoalGiven).0);
+        assert!(answers(&query(), Target::Id(&[1]), one("(> y 1)"), Arm::Provable).0);
+        assert!(!answers(&query(), Target::Id(&[1]), one("(> y 1)"), Arm::GoalGiven).0);
     }
 
     /// Other goals are assumed, not proved: `aid_0` (`y > 5`) is no fact,
     /// yet it holds for `aid_1`'s arm, and the answer is about `aid_1`.
     #[test]
     fn other_goals_are_assumed() {
-        let (given, _, _) = answers(&query(), &[1], one("(> y 6)"), Arm::Provable);
+        let (given, _, _) = answers(&query(), Target::Id(&[1]), one("(> y 6)"), Arm::Provable);
         assert!(given);
+    }
+
+    /// A goal without an id, as Verus emits a loop invariant at the loop's
+    /// end, is addressed by its index among the asserts, and one inside a
+    /// dead end says so.
+    #[test]
+    fn a_goal_without_an_id_is_addressed_by_index() {
+        let nodes = nodes(
+            r#"(check-valid
+                (declare-var y Int)
+                (declare-const a Int)
+                (axiom (> a 5))
+                (block
+                    (assign y a)
+                    (assert aid_0 ("first") () (> y 5))
+                    (deadend (block (assume (> y 6)) (assert ("second") () (> y 6))))
+                    (assert ("third") () (> y 2))))"#,
+        );
+        let mi = Arc::new(AirMessageInterface {});
+        let parser = Parser::new(mi);
+        let commands = parser.nodes_to_commands(&nodes).unwrap();
+        let CommandX::CheckValid(query) = &*commands[0] else { panic!() };
+        let listed = goals(query);
+        let ids: Vec<Option<Vec<u64>>> =
+            listed.iter().map(|g| g.id.as_ref().map(|id| (**id).clone())).collect();
+        assert_eq!(ids, vec![Some(vec![0]), None, None]);
+        assert_eq!(listed.iter().map(|g| g.index).collect::<Vec<_>>(), vec![0, 1, 2]);
+        assert!(matches!(listed[0].target(), Target::Id(&[0])));
+        assert!(matches!(listed[2].target(), Target::Index(2)));
+        // P at the third assert, addressed by index
+        let (provable, original, _) =
+            answers(&nodes, Target::Index(2), one("(= y a)"), Arm::Provable);
+        assert!(provable);
+        assert!(original);
+        let p = parser.node_to_expr(&one("true")).unwrap();
+        assert!(scaffold_query(query, Target::Index(1), &p, Arm::Provable).unwrap().in_dead_end);
+        assert!(!scaffold_query(query, Target::Index(2), &p, Arm::Provable).unwrap().in_dead_end);
+        assert!(scaffold_query(query, Target::Index(3), &p, Arm::Provable).is_err());
     }
 
     /// A goal on both branches of a switch occurs twice, and `P` has to hold
@@ -356,11 +470,11 @@ mod tests {
                             (assert aid_2 ("goal") () (> a 0))))))"#,
         );
         let (provable, original, occurrences) =
-            answers(&nodes, &[2], one("(= a 1)"), Arm::Provable);
+            answers(&nodes, Target::Id(&[2]), one("(= a 1)"), Arm::Provable);
         assert_eq!(occurrences, 2);
         assert!(original);
         assert!(!provable);
-        assert!(answers(&nodes, &[2], one("(>= a 1)"), Arm::Provable).0);
+        assert!(answers(&nodes, Target::Id(&[2]), one("(>= a 1)"), Arm::Provable).0);
     }
 
     #[test]
@@ -370,8 +484,9 @@ mod tests {
         let commands = parser.nodes_to_commands(&query()).unwrap();
         let CommandX::CheckValid(query) = &*commands[1] else { panic!() };
         let p = parser.node_to_expr(&one("true")).unwrap();
-        assert!(scaffold_query(query, &[7], &p, Arm::Provable).is_err());
-        let ids: Vec<Vec<u64>> = goals(query).into_iter().map(|(id, _)| (*id).clone()).collect();
+        assert!(scaffold_query(query, Target::Id(&[7]), &p, Arm::Provable).is_err());
+        let ids: Vec<Vec<u64>> =
+            goals(query).into_iter().map(|goal| (*goal.id.unwrap()).clone()).collect();
         assert_eq!(ids, vec![vec![0], vec![1]]);
         let seen = occurrences(query);
         assert!(seen.applications.iter().any(|(head, args)| &**head == "g" && args.len() == 1));
