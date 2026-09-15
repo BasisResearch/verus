@@ -216,7 +216,8 @@ enum Request {
         /// the default schedule itself, and is allowed as a baseline.
         rungs: Option<Vec<Rung>>,
         /// A rung's rlimit, in `#[verifier::rlimit]` units, above 0 and at
-        /// most `MAX_RUNG_RLIMIT`. Default: the query's own.
+        /// most `MAX_RUNG_RLIMIT`. Default: the query's own, or
+        /// `DEFAULT_RUNG_RLIMIT` for a query without one.
         #[serde(default)]
         budgets: HashMap<Rung, f32>,
         /// Try the rungs after the first that proves the query too.
@@ -715,21 +716,31 @@ impl Rung {
 /// `#[verifier::rlimit]` units.
 const MAX_RUNG_RLIMIT: f32 = 1000.0;
 
+/// The rlimit a rung runs at when the request gives it no budget and the
+/// query has none (`#[verifier::rlimit(infinity)]`): a strategy that makes
+/// new terms with each instance, as enumerative instantiation can, would
+/// otherwise never answer, and the session with it.
+const DEFAULT_RUNG_RLIMIT: f32 = crate::config::DEFAULT_RLIMIT_SECS;
+
 /// The rung a query's checks try first, run as the ladder that found it ran
-/// it: alone, or alongside the default schedule.
+/// it: alone, or alongside the default schedule, at the budget it proved the
+/// query at (`#[verifier::rlimit]` units, always finite).
 #[derive(Clone, Copy, Serialize)]
 struct Pin {
     rung: Rung,
     alongside: bool,
+    rlimit: f32,
 }
 
 /// A pinned rung's attempt: `closed` when that strategy, run as pinned,
 /// proved the query, otherwise the verdict comes from the ordinary check that
-/// followed. `elapsed_ms` is the attempt alone and is part of the check's.
+/// followed. `rlimit` is the pin's budget or the query's, whichever is
+/// smaller. `elapsed_ms` is the attempt alone and is part of the check's.
 #[derive(Clone, Copy, Serialize)]
 struct PinnedAttempt {
     rung: Rung,
     alongside: bool,
+    rlimit: f32,
     closed: bool,
     elapsed_ms: u128,
     /// cvc5 resource units the attempt spent, when cvc5 said.
@@ -764,7 +775,8 @@ struct RungReport {
     /// up), `resource_limit`, `unavailable` (the solver has no module for
     /// it; not run) or `not_run` (an earlier rung proved the query).
     verdict: &'static str,
-    /// The rlimit it ran at, in `#[verifier::rlimit]` units; absent for none.
+    /// The rlimit it ran at, in `#[verifier::rlimit]` units; absent for a
+    /// rung that did not run.
     #[serde(skip_serializing_if = "Option::is_none")]
     rlimit: Option<f32>,
     /// cvc5's resource budget for the check, null for none.
@@ -1662,7 +1674,7 @@ fn ladder_rung(
     Ok(RungReport {
         rung,
         verdict,
-        rlimit: rlimit.is_finite().then_some(rlimit),
+        rlimit: Some(rlimit),
         resource_limit,
         resource_units: info.as_ref().map(|info| info.resource_units),
         instantiations: count(true),
@@ -1722,6 +1734,9 @@ fn serve_ladder(
         ));
     };
     let query = &journal.queries[local];
+    // A rung without a budget gets the query's own, or, for a query without
+    // one, `DEFAULT_RUNG_RLIMIT`: every rung runs bounded.
+    let default_budget = if query.rlimit.is_finite() { query.rlimit } else { DEFAULT_RUNG_RLIMIT };
     let start = Instant::now();
     let mut solved_by = None;
     let mut reports = Vec::new();
@@ -1731,7 +1746,7 @@ fn serve_ladder(
         } else if !probe.available.iter().any(|name| name == rung.name()) {
             reports.push(RungReport::skipped(rung, "unavailable"));
         } else {
-            let rlimit = budgets.get(&rung).copied().unwrap_or(query.rlimit);
+            let rlimit = budgets.get(&rung).copied().unwrap_or(default_budget);
             let report = ladder_rung(air, query, rung, !alongside, rlimit, set_rlimit)?;
             if report.verdict == "valid" && solved_by.is_none() {
                 solved_by = Some(rung);
@@ -2143,7 +2158,14 @@ impl Server {
                             if pin.unwrap_or(true) {
                                 match report.solved_by {
                                     Some(rung) => {
-                                        self.pins.insert(key, Pin { rung, alongside });
+                                        // The budget it proved the query at.
+                                        let rlimit = report
+                                            .rungs
+                                            .iter()
+                                            .find(|report| report.rung == rung)
+                                            .and_then(|report| report.rlimit)
+                                            .expect("the rung that proved the query ran");
+                                        self.pins.insert(key, Pin { rung, alongside, rlimit });
                                     }
                                     None => {
                                         self.pins.remove(&key);
@@ -2266,7 +2288,9 @@ impl Server {
                     }
                     // Then the pinned rung, when a ladder request pinned one:
                     // its strategy, alone or alongside as the ladder ran it,
-                    // at the query's own budget. It changes which instances
+                    // at the budget it proved the query at or the query's
+                    // own, whichever is smaller, so it is bounded even for a
+                    // query without an rlimit. It changes which instances
                     // are tried, never what is asserted, so a valid answer
                     // is sound, and that answer's diagnostics (provenance,
                     // difficulty) describe the check that decided, so the
@@ -2278,6 +2302,8 @@ impl Server {
                         self.pins.get(&(bucket_id.0, id.0)).filter(|_| certified.is_none())
                     {
                         let attempt_start = Instant::now();
+                        let rlimit = pin.rlimit.min(query.rlimit);
+                        set_rlimit(air, rlimit);
                         air.set_quant_strategy(Some(pin.rung.name()), !pin.alongside);
                         let attempt = air.check_valid(
                             &VirMessageInterface {},
@@ -2285,6 +2311,7 @@ impl Server {
                             &query.query,
                             QueryContext::default(),
                         );
+                        set_rlimit(air, query.rlimit);
                         let resource_units =
                             air.take_strategy_rung().map(|info| info.resource_units);
                         match attempt {
@@ -2309,6 +2336,7 @@ impl Server {
                         pinned = Some(PinnedAttempt {
                             rung: pin.rung,
                             alongside: pin.alongside,
+                            rlimit,
                             closed: certified.is_some(),
                             elapsed_ms: attempt_start.elapsed().as_millis(),
                             resource_units,
