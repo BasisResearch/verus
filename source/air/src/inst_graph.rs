@@ -109,8 +109,8 @@ pub struct Subgraph {
     /// the edges between them.
     pub nodes: Vec<GraphNode>,
     pub edges: Vec<(u64, u64)>,
-    /// Instantiations and edges that matched the filter, before `limit`.
-    pub matching_nodes: usize,
+    /// Edges that matched the filter, before `limit`. The instantiations it
+    /// matched are `matching_nodes`, which every filtered answer reports.
     pub matching_edges: usize,
     /// Whether `limit` left out instantiations or edges.
     pub truncated: bool,
@@ -193,6 +193,11 @@ pub struct GraphReply {
     /// Instantiations recorded, whatever the filter.
     pub total_instantiations: usize,
     pub total_edges: usize,
+    /// Instantiations the filter matched, so an answer holding nothing can be
+    /// told from a filter that selected nothing. Absent for `path`, which
+    /// walks parents from one instantiation and takes no filter.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub matching_nodes: Option<usize>,
     /// Instantiations the solver made but did not record (its node limit).
     pub dropped: u64,
 }
@@ -404,10 +409,13 @@ impl InstantiationGraph {
             }
             GraphOp::Growth => GraphAnswer::Growth(self.growth(filter, limit)),
         };
+        let matching_nodes = (!matches!(op, GraphOp::Path { .. }))
+            .then(|| self.nodes.iter().filter(|&&node| self.keep(filter, node)).count());
         Ok(GraphReply {
             answer,
             total_instantiations: self.nodes.len(),
             total_edges: self.edges.values().map(HashSet::len).sum(),
+            matching_nodes,
             dropped: self.dropped,
         })
     }
@@ -432,6 +440,11 @@ impl InstantiationGraph {
             function: None,
             source_span: None,
         }
+    }
+
+    /// Whether this graph holds an instantiation of `qid`.
+    pub fn has_quantifier(&self, qid: &str) -> bool {
+        self.names.values().any(|name| &**name == qid)
     }
 
     fn keep(&self, filter: &GraphFilter, id: NodeId) -> bool {
@@ -671,7 +684,6 @@ impl InstantiationGraph {
         Subgraph {
             nodes: matching.into_iter().map(|node| self.node(node)).collect(),
             edges,
-            matching_nodes,
             matching_edges,
             truncated,
         }
@@ -688,7 +700,7 @@ impl InstantiationGraph {
             return Err(format!("no instantiation {to_inst} in the graph"));
         }
         if let Some(qid) = from_qid {
-            if !self.names.values().any(|name| &**name == qid) {
+            if !self.has_quantifier(qid) {
                 return Err(format!("no instantiation of {qid} in the graph"));
             }
         }
@@ -1075,10 +1087,31 @@ mod tests {
         assert!(graph.path(None, 99, 10).is_err());
     }
 
+    /// A filter that selects nothing is answered, so every filtered answer
+    /// says how many instantiations it had to work with. Without that, an op
+    /// that found nothing reads like a graph that holds nothing.
+    #[test]
+    fn every_filtered_answer_reports_what_the_filter_matched() {
+        let graph = graph();
+        let deep = GraphFilter { quantifiers: None, min_depth: Some(99) };
+        for op in [GraphOp::Cycles, GraphOp::TopCost, GraphOp::Subgraph, GraphOp::Growth] {
+            let reply = graph.query(&op, &deep, 10).unwrap();
+            assert_eq!(reply.matching_nodes, Some(0), "{op:?}");
+            // The graph itself is still reported, so the two are distinguishable.
+            assert!(reply.total_instantiations > 0, "{:?}", op);
+        }
+        let all = GraphFilter::default();
+        let reply = graph.query(&GraphOp::Cycles, &all, 10).unwrap();
+        assert_eq!(reply.matching_nodes, Some(reply.total_instantiations));
+        // `path` takes no filter, so it claims no count.
+        let path = GraphOp::Path { from_qid: None, to_inst: 4 };
+        assert_eq!(graph.query(&path, &all, 10).unwrap().matching_nodes, None);
+    }
+
     #[test]
     fn subgraph_limits_and_counts() {
         let sub = graph().subgraph(&GraphFilter { quantifiers: None, min_depth: Some(1) }, 3);
-        assert_eq!((sub.matching_nodes, sub.matching_edges), (5, 3));
+        assert_eq!(sub.matching_edges, 3);
         assert!(sub.truncated);
         let insts: Vec<u64> = sub.nodes.iter().map(|n| n.inst).collect();
         assert_eq!(insts, [1, 2, 3]);

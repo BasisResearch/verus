@@ -2170,6 +2170,17 @@ impl Server {
                             continue;
                         }
                     };
+                    // A filter that stands for nothing would select nothing, and
+                    // an op that found nothing reads exactly like a graph that
+                    // holds nothing. Refuse it instead, as `path` refuses a
+                    // `from_qid` no instantiation belongs to.
+                    if let Some(qid) = &filter.quantifier {
+                        if !graph.has_quantifier(qid) {
+                            let message = format!("no instantiation of {qid} in the graph");
+                            send(&mut output, &Response::Error { message: &message })?;
+                            continue;
+                        }
+                    }
                     let mut quantifiers = filter.quantifier.map(|qid| HashSet::from([qid]));
                     if let Some(prefix) = &filter.source_fn {
                         let Some(symbols) = &bucket.symbols else {
