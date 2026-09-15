@@ -1576,6 +1576,235 @@ fn resident_egraph_lists_and_injects_equalities() {
     }
 }
 
+const SPECULATE_SOURCE: &str = r#"
+use vstd::prelude::*;
+verus! {
+    spec fn f(x: int) -> int;
+    spec fn g(x: int) -> int;
+    spec fn h(x: int) -> int;
+    spec fn s(x: int) -> int;
+
+    proof fn speculate_target(a: int)
+        requires forall|i: int| #![trigger g(i)] g(i) > 0 && f(i) > 0,
+    {
+        assert(f(a) > 0);
+    }
+
+    proof fn speculate_loop(a: int)
+        requires forall|x: int| #![trigger h(x)] h(x) > h(s(x)), h(a) > 100,
+    {
+        assert(h(a) < 0);
+    }
+
+    proof fn speculate_introduces(a: int)
+        requires forall|x: int| #![trigger g(x)] h(x) > h(s(x)), h(a) > 0,
+    {
+        assert(h(a) < 0);
+    }
+}
+"#;
+
+/// A small budget, so the looping queries give up quickly. Set
+/// `RESIDENT_NO_SOLVER_VERSION_CHECK` to run against a cvc5 build whose
+/// version differs from the pinned release.
+fn speculate_options() -> Vec<&'static str> {
+    let mut options = vec!["--rlimit", "2"];
+    if std::env::var_os("RESIDENT_NO_SOLVER_VERSION_CHECK").is_some() {
+        options.extend(["-V", "no-solver-version-check"]);
+    }
+    options
+}
+
+fn probe<E: Endpoint>(
+    worker: &mut Worker<E>,
+    session: &Value,
+    query: &Value,
+    hypothesis: Option<Value>,
+) -> Value {
+    let mut request =
+        json!({"command": "speculate", "session": session, "bucket": 0, "query": query});
+    if let Some(hypothesis) = hypothesis {
+        request["hypothesis"] = hypothesis;
+    }
+    worker.send(request)
+}
+
+/// The quantifier written in `function`'s own query, from a probe without a
+/// hypothesis, which lists them.
+fn own_quantifier<E: Endpoint>(worker: &mut Worker<E>, session: &Value, query: &Value) -> Value {
+    let listed = probe(worker, session, query, None);
+    assert_eq!(listed["event"], "speculated", "{listed}");
+    assert_eq!(listed["hypothesis"], "none", "{listed}");
+    listed["candidates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|q| q["in_query"] == true)
+        .unwrap_or_else(|| panic!("no quantifier of the query: {}", listed))
+        .clone()
+}
+
+/// A `speculate` request checks a query as usual, then again with one
+/// hypothesis in the query's own scope. A directed instance that closes the
+/// goal comes back with an assert that, pasted into the source, verifies; a
+/// speculative trigger with an annotation that, pasted, verifies too. A block
+/// of a matching loop's later rungs ends the loop, and a trigger that makes a
+/// quantifier feed itself is reported as introducing one. A hypothesis that
+/// names no quantifier, a variable the quantifier lacks, or a term the solver
+/// cannot read, is refused in the reply. Afterwards the query rechecks as it
+/// did before, and no probe launched a solver: the probes are the pasted
+/// source's differential check and the session's state check.
+#[test]
+fn resident_speculate_probes_and_leaves_the_session_unchanged() {
+    let options = speculate_options();
+    let mut worker = Worker::start(SPECULATE_SOURCE, &options);
+    let ready = worker.receive();
+    assert_eq!(ready["event"], "ready", "{ready}");
+    let session = ready["session"].clone();
+    let target = query_id(&ready, "::speculate_target");
+    let first =
+        worker.send(json!({"command": "check", "session": session, "bucket": 0, "query": target}));
+    assert_eq!(first["result"], "invalid", "{first}");
+
+    // Listed without a hypothesis: the requires, with its variable.
+    let quantifier = own_quantifier(&mut worker, &session, &target);
+    assert_eq!(quantifier["binders"][0]["name"], "i", "{quantifier}");
+    assert!(quantifier["triggers"][0][0].as_str().unwrap().ends_with("g(i)"), "{}", quantifier);
+    let qid = quantifier["qid"].clone();
+
+    // A directed instance at i := a closes the goal, and the query still
+    // fails right after without it.
+    let instantiation = json!({"instantiation": {"qid": qid, "subst": {"i": "a"}}});
+    let probed = probe(&mut worker, &session, &target, Some(instantiation));
+    assert_eq!(probed["status"], "applied", "{probed}");
+    assert_eq!(probed["before"]["result"], "invalid", "{probed}");
+    assert_eq!(probed["after"]["result"], "valid", "{probed}");
+    assert_eq!(probed["recheck"]["result"], "invalid", "{probed}");
+    assert_eq!(probed["closed"], true, "{probed}");
+    assert_eq!(probed["introduced_loop"], false, "{probed}");
+    let instance = &probed["new_provenance"]["closing_instantiations"][0];
+    assert_eq!(instance["inference_id"], "LLM_DIRECTED", "{probed}");
+    assert_eq!(instance["terms"], json!(["a"]), "{probed}");
+    // The assert it offers verifies the function once pasted before the goal.
+    let pasted = probed["verus_snippet"].as_str().unwrap();
+    assert!(pasted.starts_with("assert(") && pasted.contains("crate::f(a)"), "{}", probed);
+    let source = SPECULATE_SOURCE
+        .replace("assert(f(a) > 0);", &format!("{pasted}\n        assert(f(a) > 0);"));
+    let mut paste_worker = Worker::start(&source, &options);
+    let paste_ready = paste_worker.receive();
+    let pasted_check = paste_worker.send(json!({"command": "check",
+        "session": paste_ready["session"], "bucket": 0,
+        "query": query_id(&paste_ready, "::speculate_target")}));
+    assert_eq!(pasted_check["result"], "valid", "{pasted_check}");
+    paste_worker.send(json!({"command": "close", "session": paste_ready["session"]}));
+    paste_worker.finish(false);
+
+    // A speculative trigger f(i) matches the goal's f(a); its annotation,
+    // added to the quantifier, verifies the function.
+    let trigger = json!({"trigger_pattern": {"qid": qid, "pattern": "f(i)"}});
+    let triggered = probe(&mut worker, &session, &target, Some(trigger));
+    assert_eq!(triggered["status"], "applied", "{triggered}");
+    assert_eq!(triggered["closed"], true, "{triggered}");
+    let annotation = triggered["verus_snippet"].as_str().unwrap();
+    assert!(annotation.starts_with("#![trigger ") && annotation.contains("f(i)"), "{}", triggered);
+    assert!(
+        triggered["fallback_snippet"].as_str().unwrap().starts_with("assert("),
+        "{}",
+        triggered
+    );
+    let source = SPECULATE_SOURCE
+        .replace("#![trigger g(i)] g(i) > 0", &format!("#![trigger g(i)] {annotation} g(i) > 0"));
+    let mut paste_worker = Worker::start(&source, &options);
+    let paste_ready = paste_worker.receive();
+    let pasted_check = paste_worker.send(json!({"command": "check",
+        "session": paste_ready["session"], "bucket": 0,
+        "query": query_id(&paste_ready, "::speculate_target")}));
+    assert_eq!(pasted_check["result"], "valid", "{pasted_check}");
+    paste_worker.send(json!({"command": "close", "session": paste_ready["session"]}));
+    paste_worker.finish(false);
+
+    // Refusals leave the query unchecked and the session serving.
+    let missing = probe(
+        &mut worker,
+        &session,
+        &target,
+        Some(json!({"instantiation": {"qid": "user_nothing_0", "subst": {"i": "a"}}})),
+    );
+    assert_eq!(missing["status"], "no_quantifier", "{missing}");
+    assert!(missing["before"].is_null(), "{}", missing);
+    assert!(!missing["candidates"].as_array().unwrap().is_empty(), "{}", missing);
+    let unbound = probe(
+        &mut worker,
+        &session,
+        &target,
+        Some(json!({"instantiation": {"qid": qid, "subst": {"j": "a"}}})),
+    );
+    assert_eq!(unbound["status"], "mismatch", "{unbound}");
+    let unreadable = probe(
+        &mut worker,
+        &session,
+        &target,
+        Some(json!({"instantiation": {"qid": qid, "subst": {"i": "nothing_declared(a)"}}})),
+    );
+    assert_eq!(unreadable["status"], "could_not_lower", "{unreadable}");
+    assert!(unreadable["reason"].as_str().unwrap().contains("nothing_declared"), "{}", unreadable);
+    let refused = worker.send(json!({"command": "speculate", "session": session, "bucket": 0,
+        "query": target, "loop_threshold": 0}));
+    assert_eq!(refused["event"], "error", "{refused}");
+
+    // The loop h(x) > h(s(x)) climbs until the budget runs out; blocked from
+    // its third rung on, it stops.
+    let looping = query_id(&ready, "::speculate_loop");
+    let loop_quantifier = own_quantifier(&mut worker, &session, &looping);
+    let loop_qid = loop_quantifier["qid"].clone();
+    let blocked = probe(
+        &mut worker,
+        &session,
+        &looping,
+        Some(json!({"block_cycle": {"qid": loop_qid, "fingerprint": "h(s(s(_)))"}})),
+    );
+    assert_eq!(blocked["status"], "applied", "{blocked}");
+    let has_loop =
+        |run: &Value| run["loops"].as_array().unwrap().iter().any(|l| l["qid"] == loop_qid);
+    assert!(has_loop(&blocked["before"]), "{}", blocked);
+    assert!(!has_loop(&blocked["after"]), "{}", blocked);
+    assert!(blocked["blocked"].as_u64().unwrap() > 0, "{}", blocked);
+    assert_eq!(blocked["introduced_loop"], false, "{blocked}");
+
+    // The same shape of quantifier, triggered on g, never fires; given the
+    // trigger h(x), it climbs.
+    let introducing = query_id(&ready, "::speculate_introduces");
+    let intro_quantifier = own_quantifier(&mut worker, &session, &introducing);
+    let intro_qid = intro_quantifier["qid"].clone();
+    let climbing = probe(
+        &mut worker,
+        &session,
+        &introducing,
+        Some(json!({"trigger_pattern": {"qid": intro_qid, "pattern": "h(x)"}})),
+    );
+    assert_eq!(climbing["status"], "applied", "{climbing}");
+    assert_eq!(climbing["introduced_loop"], true, "{climbing}");
+    assert!(
+        climbing["new_loops"].as_array().unwrap().iter().any(|l| l["qid"] == intro_qid),
+        "{}",
+        climbing
+    );
+    assert_eq!(climbing["closed"], false, "{climbing}");
+
+    // Nothing of the probes is left behind.
+    let last =
+        worker.send(json!({"command": "check", "session": session, "bucket": 0, "query": target}));
+    assert_eq!(last["result"], first["result"], "{last}");
+    assert_eq!(last["diagnostics"], first["diagnostics"], "{last}");
+    assert_eq!(worker.send(json!({"command": "close", "session": session}))["event"], "closed");
+    worker.finish(false);
+    let launches = fs::read_to_string(worker.dir.path().join("launches")).unwrap();
+    assert_eq!(launches.lines().count(), 1, "{launches}");
+    for log in smt_logs(worker.dir.path()) {
+        assert_eq!(log.matches("(push").count(), log.matches("(pop").count());
+    }
+}
+
 const SCAFFOLD_SOURCE: &str = r#"
 use vstd::prelude::*;
 verus! {
@@ -2035,6 +2264,149 @@ fn resident_scaffold_says_why_under_provenance() {
         reply
     );
     worker.send(json!({"command": "close", "session": ready["session"]}));
+    worker.finish(false);
+}
+
+const SPECULATE_GOAL_SOURCE: &str = r#"
+use vstd::prelude::*;
+verus! {
+    spec fn f(x: int) -> int;
+    spec fn g(x: int) -> int;
+
+    proof fn shadowed(i: int)
+        requires forall|i: int| #![trigger g(i)] g(i) > 0 && f(i) > 0,
+    {
+        assert(f(i) > 0);
+    }
+
+    proof fn reassigned(a: int)
+        requires forall|i: int| #![trigger g(i)] g(i) > 0 && f(i) > 0,
+    {
+        let mut y = a;
+        y = y + 1;
+        assert(f(y) > 0);
+    }
+
+    proof fn last_of(s: Seq<int>)
+        requires s.len() > 0, forall|i: int| #![trigger g(i)] 0 <= i < s.len() ==> s[i] > 0,
+    {
+        assert(s[s.len() - 1] > 0);
+    }
+
+    spec fn p<A>(x: A) -> bool;
+    spec fn r<A>(x: A, y: A) -> bool;
+
+    proof fn eliminated<A>(a: A)
+        requires forall|x: A, y: A| #![trigger r(x, y)] x == y ==> p(x),
+    {
+        assert(p(a));
+    }
+}
+"#;
+
+/// The options for a cvc5 build whose version differs from the pinned
+/// release, without `speculate_options`' small budget.
+fn version_options() -> Vec<&'static str> {
+    match std::env::var_os("RESIDENT_NO_SOLVER_VERSION_CHECK") {
+        Some(_) => vec!["-V", "no-solver-version-check"],
+        None => Vec::new(),
+    }
+}
+
+/// A probe of the quantifier in `function`'s own query.
+fn probe_own<E: Endpoint>(
+    worker: &mut Worker<E>,
+    ready: &Value,
+    function: &str,
+    hypothesis: impl FnOnce(&Value) -> Value,
+) -> Value {
+    let session = ready["session"].clone();
+    let query = query_id(ready, function);
+    let qid = own_quantifier(worker, &session, &query)["qid"].clone();
+    probe(worker, &session, &query, Some(hypothesis(&qid)))
+}
+
+/// `function`'s check in a fresh worker on `source`.
+fn cold_check(source: &str, function: &str, options: &[&str]) -> Value {
+    let mut worker = Worker::start(source, options);
+    let ready = worker.receive();
+    let checked = worker.send(json!({"command": "check", "session": ready["session"],
+        "bucket": 0, "query": query_id(&ready, function)}));
+    worker.send(json!({"command": "close", "session": ready["session"]}));
+    worker.finish(false);
+    checked
+}
+
+/// A hypothesis's terms are read at the goal the query fails at. An
+/// instantiation's never name the quantifier's own variable, so a parameter
+/// it shadows is the parameter; a mutable local reads as its value there;
+/// Verus method calls and the prelude's arithmetic in SMT spelling are
+/// read; and a snippet names no variable at another version than the
+/// goal's, so pasted before the goal it verifies.
+#[test]
+fn resident_speculate_reads_terms_at_the_goal() {
+    let options = version_options();
+    let mut worker = Worker::start(SPECULATE_GOAL_SOURCE, &options);
+    let ready = worker.receive();
+    assert_eq!(ready["event"], "ready", "{ready}");
+    let instantiation =
+        |subst: Value| move |qid: &Value| json!({"instantiation": {"qid": qid, "subst": subst}});
+
+    let shadowed = probe_own(&mut worker, &ready, "::shadowed", instantiation(json!({"i": "i"})));
+    assert_eq!(shadowed["closed"], true, "{shadowed}");
+    assert!(shadowed["verus_snippet"].as_str().unwrap().contains("crate::f(i)"), "{}", shadowed);
+
+    let local = probe_own(&mut worker, &ready, "::reassigned", instantiation(json!({"i": "y"})));
+    assert_eq!(local["status"], "applied", "{local}");
+    assert_eq!(local["closed"], true, "{local}");
+    let pasted = local["verus_snippet"].as_str().unwrap();
+    assert!(pasted.contains("crate::f(y)"), "{}", local);
+    let source = SPECULATE_GOAL_SOURCE
+        .replace("assert(f(y) > 0);", &format!("{pasted}\n        assert(f(y) > 0);"));
+    assert_eq!(cold_check(&source, "::reassigned", &options)["result"], "valid");
+
+    let spelled =
+        probe_own(&mut worker, &ready, "::reassigned", instantiation(json!({"i": "(Add a! 1)"})));
+    assert_eq!(spelled["closed"], true, "{spelled}");
+
+    // The trigger matches the goal's term as cvc5 holds it, over the first
+    // version of `y`; an assert of it could only paste as a claim about
+    // the second, so it is offered only when it names none.
+    let triggered = probe_own(
+        &mut worker,
+        &ready,
+        "::reassigned",
+        |qid| json!({"trigger_pattern": {"qid": qid, "pattern": "f(i)"}}),
+    );
+    assert_eq!(triggered["closed"], true, "{triggered}");
+    if let Some(fallback) = triggered["fallback_snippet"].as_str() {
+        let source = SPECULATE_GOAL_SOURCE
+            .replace("assert(f(y) > 0);", &format!("{fallback}\n        assert(f(y) > 0);"));
+        assert_eq!(cold_check(&source, "::reassigned", &options)["result"], "valid", "{fallback}");
+    }
+
+    let method =
+        probe_own(&mut worker, &ready, "::last_of", instantiation(json!({"i": "s.len() - 1"})));
+    assert_eq!(method["status"], "applied", "{method}");
+    assert_eq!(method["closed"], true, "{method}");
+
+    // A generic quantifier with an equality guard. cvc5 at da4b2b0073 keeps
+    // both variables of this one (the equality is between boxed values
+    // under type guards); where it eliminates one, the instance goes
+    // without it, and a snippet offered is the instance cvc5 made.
+    let eliminated =
+        probe_own(&mut worker, &ready, "::eliminated", instantiation(json!({"x": "a", "y": "a"})));
+    assert_eq!(eliminated["closed"], true, "{eliminated}");
+    if let Some(snippet) = eliminated["verus_snippet"].as_str() {
+        let source = SPECULATE_GOAL_SOURCE
+            .replace("assert(p(a));", &format!("{snippet}\n        assert(p(a));"));
+        assert_eq!(cold_check(&source, "::eliminated", &options)["result"], "valid", "{snippet}");
+    }
+
+    assert_eq!(
+        worker.send(json!({"command": "close", "session": ready["session"]}))["event"],
+        "closed"
+    );
     worker.finish(false);
 }
 
@@ -2868,7 +3240,8 @@ fn resident_ready_lists_the_requests_it_serves() {
             "close",
             "inst_graph",
             "ladder",
-            "twin"
+            "twin",
+            "speculate"
         ],
         "{ready}"
     );
@@ -2877,7 +3250,7 @@ fn resident_ready_lists_the_requests_it_serves() {
     for command in &commands {
         let request = match command.as_str() {
             "list" | "close" => json!({"command": command, "session": "stale"}),
-            "check" | "egraph" | "ladder" => {
+            "check" | "egraph" | "ladder" | "speculate" => {
                 json!({"command": command, "session": "stale", "bucket": 0, "query": 0})
             }
             "bisect" => {

@@ -1,6 +1,7 @@
 // Replace declare-var and assign with declare-const and assume
 use crate::ast::{
-    Axiom, BinaryOp, Decl, DeclX, Expr, ExprX, Ident, Query, QueryX, Snapshots, Stmt, StmtX, Typ,
+    AssertId, Axiom, BinaryOp, Decl, DeclX, Expr, ExprX, Ident, Query, QueryX, Snapshots, Stmt,
+    StmtX, Typ,
 };
 use crate::ast_util::string_var;
 use indexmap::IndexMap;
@@ -125,6 +126,46 @@ struct LowerStmtState {
     all_snapshots: Snapshots,
     variable_versions: crate::context::VariableVersions,
     record_versions: bool,
+    /// When kept, each assert reached, with the versions and snapshots in
+    /// force there.
+    goal_scopes: Option<Vec<(Option<AssertId>, GoalScope)>>,
+}
+
+/// The variable versions and snapshots in force at one assert of a query:
+/// what a variable, or `old` of one, reads as there once the query is
+/// lowered.
+#[derive(Clone, Debug, Default)]
+pub struct GoalScope {
+    versions: IndexMap<Ident, u32>,
+    snapshots: Snapshots,
+}
+
+impl GoalScope {
+    /// Where `query` reaches the assert with id `goal`, its first
+    /// occurrence; without a `goal`, or when no assert has it, the query's
+    /// last assert; before any statement when it has none.
+    pub fn of(query: &Query, goal: Option<&AssertId>) -> Self {
+        let (_, _, _, _, entry, scopes) = lower_query_with(query, false, true);
+        let scopes = scopes.unwrap_or_default();
+        let wanted = goal.and_then(|goal| {
+            scopes.iter().find(|(id, _)| id.as_ref().is_some_and(|id| **id == **goal))
+        });
+        match wanted.or(scopes.last()) {
+            Some((_, scope)) => scope.clone(),
+            None => entry,
+        }
+    }
+
+    /// `expr` as the lowered query reads it here: each variable at its
+    /// version, and `old(x)` at the snapshot's.
+    pub fn lower_expr(&self, expr: &Expr) -> Expr {
+        lower_expr(&self.versions, &self.snapshots, expr)
+    }
+
+    /// Each variable's symbol here, by its AIR name.
+    pub fn live(&self) -> HashMap<String, String> {
+        self.versions.iter().map(|(x, n)| (x.to_string(), rename_var(x, *n))).collect()
+    }
 }
 
 fn lower_stmt(
@@ -138,7 +179,14 @@ fn lower_stmt(
         lower_expr_visitor(versions, snapshots, e)
     });
     match &*stmt {
-        StmtX::Assume(_) | StmtX::Assert(..) => stmt,
+        StmtX::Assume(_) => stmt,
+        StmtX::Assert(id, ..) => {
+            if let Some(scopes) = &mut state.goal_scopes {
+                let scope = GoalScope { versions: versions.clone(), snapshots: snapshots.clone() };
+                scopes.push((id.clone(), scope));
+            }
+            stmt
+        }
         StmtX::Havoc(x) | StmtX::Assign(x, _) => {
             let n = find_version(&versions, x);
             let typ = types[x].clone();
@@ -228,6 +276,25 @@ pub(crate) fn lower_query(
     query: &Query,
     record_versions: bool,
 ) -> (Query, Snapshots, Vec<Decl>, crate::context::VariableVersions) {
+    let (query, snapshots, local_vars, versions, _, _) =
+        lower_query_with(query, record_versions, false);
+    (query, snapshots, local_vars, versions)
+}
+
+/// `lower_query`, and the scope before the first statement, and with
+/// `record_goal_scopes` the scope at each assert reached.
+fn lower_query_with(
+    query: &Query,
+    record_versions: bool,
+    record_goal_scopes: bool,
+) -> (
+    Query,
+    Snapshots,
+    Vec<Decl>,
+    crate::context::VariableVersions,
+    GoalScope,
+    Option<Vec<(Option<AssertId>, GoalScope)>>,
+) {
     let QueryX { local, assertion } = &**query;
     let mut decls: Vec<Decl> = Vec::new();
     let mut versions: IndexMap<Ident, u32> = IndexMap::new();
@@ -271,7 +338,9 @@ pub(crate) fn lower_query(
         all_snapshots,
         variable_versions,
         record_versions,
+        goal_scopes: record_goal_scopes.then(Vec::new),
     };
+    let entry = GoalScope { versions: versions.clone(), snapshots: snapshots.clone() };
     let assertion = lower_stmt(&mut state, &mut versions, &mut snapshots, &types, assertion);
     let local = Arc::new(state.decls);
     (
@@ -279,6 +348,8 @@ pub(crate) fn lower_query(
         state.all_snapshots,
         local_vars,
         state.variable_versions,
+        entry,
+        state.goal_scopes,
     )
 }
 
@@ -308,5 +379,44 @@ mod tests {
         let (_, _, _, versions) =
             lower_query(&query(vec![Arc::new(StmtX::Havoc(name.clone()))]), false);
         assert!(versions.is_empty());
+    }
+
+    /// A variable reads as the version in force at the assert asked about,
+    /// else at the last assert.
+    #[test]
+    fn goal_scopes_read_variables_where_the_goal_is() {
+        let name = Arc::new("y@".to_string());
+        let var = Arc::new(ExprX::Var(name.clone()));
+        let assert = |id: u64| {
+            Arc::new(StmtX::Assert(
+                Some(Arc::new(vec![id])),
+                crate::messages::MessageInterface::empty(&crate::messages::AirMessageInterface {}),
+                None,
+                var.clone(),
+            ))
+        };
+        let query = Arc::new(QueryX {
+            local: Arc::new(vec![Arc::new(DeclX::Var(
+                name.clone(),
+                Arc::new(crate::ast::TypX::Int),
+            ))]),
+            assertion: Arc::new(StmtX::Block(Arc::new(vec![
+                assert(0),
+                Arc::new(StmtX::Havoc(name.clone())),
+                assert(1),
+                Arc::new(StmtX::Havoc(name.clone())),
+            ]))),
+        });
+        let read = |goal: Option<AssertId>| {
+            let scope = GoalScope::of(&query, goal.as_ref());
+            match &*scope.lower_expr(&var) {
+                ExprX::Var(x) => (x.to_string(), scope.live()["y@"].clone()),
+                other => panic!("{:?}", other),
+            }
+        };
+        assert_eq!(read(Some(Arc::new(vec![0]))), ("y@0".to_string(), "y@0".to_string()));
+        assert_eq!(read(Some(Arc::new(vec![1]))), ("y@1".to_string(), "y@1".to_string()));
+        assert_eq!(read(None), ("y@1".to_string(), "y@1".to_string()));
+        assert_eq!(read(Some(Arc::new(vec![7]))), ("y@1".to_string(), "y@1".to_string()));
     }
 }

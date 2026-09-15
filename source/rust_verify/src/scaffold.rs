@@ -468,6 +468,9 @@ pub(crate) struct Env<'a> {
     pub crate_name: &'a str,
     /// The query's local constants and variables, with their sorts.
     pub locals: Vec<(Ident, Typ)>,
+    /// Variables bound around the text (a quantifier's), with their sorts,
+    /// which shadow the locals of the same source name.
+    pub bound: Vec<(Ident, Typ)>,
     /// What the solver context has declared a global name as.
     pub declared: &'a dyn Fn(&str) -> Option<Declared>,
     /// What the query's own text uses.
@@ -489,6 +492,23 @@ pub(crate) fn lower(text: &str, env: &Env) -> Result<Lowered, String> {
         .coerce(expr, &typ, &Arc::new(TypX::Bool))
         .map_err(|_| format!("the assertion is a {}, not a bool", sort_name(&typ)))?;
     // one note per reading, in the order they were made
+    let mut seen = std::collections::HashSet::new();
+    let choices = lowerer.choices.into_iter().filter(|c| seen.insert(c.clone())).collect();
+    Ok(Lowered { expr, choices })
+}
+
+/// A term written as Verus source, read as `lower` reads an assertion, and
+/// boxed or unboxed to `want` when that is given.
+pub(crate) fn lower_term(text: &str, env: &Env, want: Option<&Typ>) -> Result<Lowered, String> {
+    let ast = parse(text)?;
+    let mut lowerer = Lowerer { env, choices: Vec::new() };
+    let (expr, typ) = lowerer.lower(&ast)?;
+    let expr = match want {
+        Some(want) => lowerer.coerce(expr, &typ, want).map_err(|_| {
+            format!("the term is a {}, where a {} is wanted", sort_name(&typ), sort_name(want))
+        })?,
+        None => expr,
+    };
     let mut seen = std::collections::HashSet::new();
     let choices = lowerer.choices.into_iter().filter(|c| seen.insert(c.clone())).collect();
     Ok(Lowered { expr, choices })
@@ -789,6 +809,17 @@ impl<'e, 'a> Lowerer<'e, 'a> {
     /// The local `name` names: its recorded source name is `name`, or `name`
     /// with a binding number when shadowing renumbered it.
     fn local(&mut self, name: &str) -> Option<(Ident, Typ)> {
+        for (x, typ) in &self.env.bound {
+            let recorded = self
+                .env
+                .names
+                .get(&**x)
+                .map(|n| n.name().to_owned())
+                .or_else(|| source_symbol(self.env.names, x));
+            if **x == name || recorded.as_deref() == Some(name) {
+                return Some((x.clone(), typ.clone()));
+            }
+        }
         let binding = format!("{name} (binding ");
         let mut found: Vec<(u64, bool, &(Ident, Typ))> = Vec::new();
         for local in &self.env.locals {
@@ -1541,6 +1572,7 @@ mod tests {
             names: &names,
             crate_name: "k",
             locals,
+            bound: Vec::new(),
             declared: &declared,
             occurrences: &occurrences,
         };
@@ -1650,6 +1682,7 @@ mod tests {
             names: &names,
             crate_name: "k",
             locals,
+            bound: Vec::new(),
             declared: &declared,
             occurrences: &occurrences,
         };
@@ -1688,8 +1721,14 @@ mod tests {
         // a generic function applied nowhere in the query
         let (names, locals, _) = env_parts();
         let none = Occurrences::default();
-        let env =
-            Env { names: &names, crate_name: "k", locals, declared: &declared, occurrences: &none };
+        let env = Env {
+            names: &names,
+            crate_name: "k",
+            locals,
+            bound: Vec::new(),
+            declared: &declared,
+            occurrences: &none,
+        };
         let error = lower("Seq::len(v) > 0", &env).err().unwrap();
         assert!(error.contains("never applies"), "{error}");
         let _ = HashMap::<(), ()>::new();

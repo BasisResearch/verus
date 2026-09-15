@@ -29,22 +29,24 @@ asset_x86_linux = "z3-x86-linux"
 sha256_x86_linux = "99f5433928fa62adc3a19207d97b14111d62964e26b10b37d286f9e641e0dfbf"
 
 [cvc5]
-# Fork `main` at 79e8830406: carries `:assert-id` provenance tags through
+# Fork `main` at e68dc63e37: carries `:assert-id` provenance tags through
 # preprocessing, answers `(get-assertion-sources)`, saves, restores, exports
 # and imports quantifier instantiations (resident certificates), lists what
 # the e-graph holds after a check (`(get-egraph-equalities)`), reports
 # matching loops, per-quantifier instantiation pressure, per-assertion
 # difficulty, why a check gave up (`:incomplete-id`, its culprit
 # quantifiers), the nonlinear terms refinement could not settle
-# (`:nl-frontier`) and what the last check-sat cost (`:check-effort`)
-# through `(get-info ...)`, records the instantiation graph of a check
-# (`--inst-graph`, `(get-instantiation-graph)`), and runs one quantifier
-# instantiation strategy for a check-sat (`--quant-ladder`,
-# `:quant-strategy`, `(get-info :strategy-rung)`).
-version = "1.3.5.dev+main@79e8830"
+# (`:nl-frontier`), what the last check-sat cost (`:check-effort`) and
+# where its resources went (`:branch-profile`) through `(get-info ...)`,
+# records the instantiation graph of a check (`--inst-graph`,
+# `(get-instantiation-graph)`), runs one quantifier instantiation strategy
+# for a check-sat (`--quant-ladder`, `:quant-strategy`,
+# `(get-info :strategy-rung)`), and tests an instantiation hypothesis in
+# one scope (`(speculate ...)`, `(get-info :speculation)`).
+version = "1.3.5.dev+main@e68dc63"
 repo = "BasisResearch/cvc5"
-tag = "basis-79e8830406"
+tag = "basis-e68dc63e37"
 asset_arm64_macos = "cvc5-arm64-macos"
-sha256_arm64_macos = "61138a1301b2a54b6ed03ada47a6b3b75d433d298c32fdbdd92edd00bfd1e957"
+sha256_arm64_macos = "12a465c5f684e8b3a7170580047f6a66a517e86c10ea7dc484e74d0a3f78adc3"
 asset_x86_linux = "cvc5-x86-linux"
-sha256_x86_linux = "e5c2b763c1d20e66fcc23f060b8bcc5c7372ec7afeb7d11ffdd394b7895b31c2"
+sha256_x86_linux = "66aa2969667607a4852377cb39b1561b315aecd4045ab554f06e576fa95e3920"

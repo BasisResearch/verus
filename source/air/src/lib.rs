@@ -13,6 +13,7 @@ pub mod profiler;
 pub mod remove_asserts;
 pub mod scope_map;
 pub mod smt_process;
+pub mod speculate;
 pub mod twin;
 
 #[macro_use]
@@ -27,6 +28,7 @@ mod tests;
 mod typecheck;
 mod util;
 mod var_to_const;
+pub use var_to_const::GoalScope;
 mod visitor;
 
 #[cfg(feature = "singular")]
