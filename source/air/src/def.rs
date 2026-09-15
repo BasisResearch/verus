@@ -19,6 +19,10 @@ pub const BISECT_GUARD: &str = "%%bisect_guard%%";
 /// is assumed as `(or switch fact)`, and each probe assumes the switch false
 /// unless it removes the fact.
 pub const BISECT_DROP: &str = "%%bisect_drop%%";
+/// A twin's vacuity switch: an unconstrained boolean each goal `e` is
+/// checked as `(and switch e)`, so the check is valid only where the
+/// context contradicts itself, with `e`'s terms still there to match on.
+pub const TWIN_OFF: &str = "%%twin_off%%";
 pub const SKOLEM_ID_PREFIX: &str = "skolem";
 pub const ARRAY_QID: &str = "__AIR_ARRAY_QID__";
 

@@ -732,6 +732,7 @@ impl Verifier {
                 smt_options: self.args.smt_options.clone(),
                 instantiation_replay: self.instantiation_replay(),
                 inst_graph: self.inst_graph(),
+                strategy_ladder: self.strategy_ladder(),
                 input_files: std::mem::take(&mut self.resident_inputs),
             },
         )
@@ -1479,6 +1480,16 @@ impl Verifier {
             && std::env::var_os("VERUS_RESIDENT_INST_GRAPH").is_some()
     }
 
+    /// Resident cvc5 solvers get every instantiation strategy a `ladder`
+    /// request can run alone (see resident.rs). The ones Verus's schedule
+    /// leaves off are created idle, so an ordinary check still runs that
+    /// schedule.
+    fn strategy_ladder(&self) -> bool {
+        self.args.resident
+            && matches!(self.args.solver, air::context::SmtSolver::Cvc5)
+            && std::env::var_os("VERUS_RESIDENT_STRATEGY_LADDER").is_some()
+    }
+
     fn new_air_context_with_prelude<'m>(
         &mut self,
         ctx: &vir::context::Ctx,
@@ -1516,6 +1527,9 @@ impl Verifier {
         }
         if self.inst_graph() {
             air_context.set_inst_graph(true);
+        }
+        if self.strategy_ladder() {
+            air_context.set_strategy_ladder(true);
         }
         air_context.set_ignore_unexpected_smt(self.args.ignore_unexpected_smt);
         air_context.set_debug(self.args.debugger);
@@ -1799,9 +1813,7 @@ impl Verifier {
 
         let mut resident = self.args.resident.then(crate::resident::QueryJournal::new);
         if let Some(journal) = &mut resident {
-            for batch in &bucket_context {
-                journal.record_base(batch.commands.clone());
-            }
+            journal.record_base(bucket_context.iter().map(|batch| batch.commands.clone()));
         }
         let mut resident_spinoffs = Vec::new();
 
@@ -1929,12 +1941,12 @@ impl Verifier {
 
                             let mut spinoff_journal = (retain_queries && do_spinoff)
                                 .then(crate::resident::QueryJournal::new);
-                            // The spun-off solver is set up with the whole
-                            // bucket context so far, below the journal.
+                            // A spinoff solver starts from the whole bucket
+                            // context so far, below its journal's scopes.
                             if let Some(journal) = &mut spinoff_journal {
-                                for batch in &bucket_context {
-                                    journal.record_base(batch.commands.clone());
-                                }
+                                journal.record_base(
+                                    bucket_context.iter().map(|batch| batch.commands.clone()),
+                                );
                             }
 
                             let profile_file_name = if *profile_rerun

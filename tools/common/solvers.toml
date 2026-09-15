@@ -29,7 +29,7 @@ asset_x86_linux = "z3-x86-linux"
 sha256_x86_linux = "99f5433928fa62adc3a19207d97b14111d62964e26b10b37d286f9e641e0dfbf"
 
 [cvc5]
-# Fork `main` at b905873c8d: carries `:assert-id` provenance tags through
+# Fork `main` at 79e8830406: carries `:assert-id` provenance tags through
 # preprocessing, answers `(get-assertion-sources)`, saves, restores, exports
 # and imports quantifier instantiations (resident certificates), lists what
 # the e-graph holds after a check (`(get-egraph-equalities)`), reports
@@ -37,12 +37,14 @@ sha256_x86_linux = "99f5433928fa62adc3a19207d97b14111d62964e26b10b37d286f9e641e0
 # difficulty, why a check gave up (`:incomplete-id`, its culprit
 # quantifiers), the nonlinear terms refinement could not settle
 # (`:nl-frontier`) and what the last check-sat cost (`:check-effort`)
-# through `(get-info ...)`, and records the instantiation graph of a check
-# (`--inst-graph`, `(get-instantiation-graph)`).
-version = "1.3.5.dev+main@b905873"
+# through `(get-info ...)`, records the instantiation graph of a check
+# (`--inst-graph`, `(get-instantiation-graph)`), and runs one quantifier
+# instantiation strategy for a check-sat (`--quant-ladder`,
+# `:quant-strategy`, `(get-info :strategy-rung)`).
+version = "1.3.5.dev+main@79e8830"
 repo = "BasisResearch/cvc5"
-tag = "basis-b905873c8d"
+tag = "basis-79e8830406"
 asset_arm64_macos = "cvc5-arm64-macos"
-sha256_arm64_macos = "a7d1e75e26223e2d6c9c46c54e0d563cdf5bc575ba1cd740802b7e65b0e26d50"
+sha256_arm64_macos = "61138a1301b2a54b6ed03ada47a6b3b75d433d298c32fdbdd92edd00bfd1e957"
 asset_x86_linux = "cvc5-x86-linux"
-sha256_x86_linux = "749e13d17001ab5f07a620c382a4fc1ae15b07ef338207830d8df65101c5f78b"
+sha256_x86_linux = "e5c2b763c1d20e66fcc23f060b8bcc5c7372ec7afeb7d11ffdd394b7895b31c2"
