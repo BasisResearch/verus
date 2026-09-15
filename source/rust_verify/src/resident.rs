@@ -212,7 +212,8 @@ enum Request {
         query: QueryId,
         /// The rungs to try, in order, each at most once. Default: every
         /// rung, in `Rung::LADDER` order, or `Rung::ALONGSIDE` alongside. An
-        /// empty list runs nothing.
+        /// empty list runs nothing. `ematch` or `pool` named alongside runs
+        /// the default schedule itself, and is allowed as a baseline.
         rungs: Option<Vec<Rung>>,
         /// A rung's rlimit, in `#[verifier::rlimit]` units, above 0 and at
         /// most `MAX_RUNG_RLIMIT`. Default: the query's own.
@@ -604,7 +605,9 @@ enum Response<'a> {
         difficulty: Option<&'a crate::provenance::ResolvedQueryDifficulty>,
         /// Present when this check tried a certificate before searching.
         certificate: Option<CertificateAttempt>,
-        /// Present when this check tried the query's pinned rung first.
+        /// Present when this check tried the query's pinned rung first. When
+        /// that attempt closed the query, `provenance` and `difficulty` are
+        /// its own, the check that decided.
         pinned: Option<PinnedAttempt>,
         /// The size of the instantiation graph this check kept, in a
         /// session that records them.
@@ -1632,8 +1635,6 @@ fn ladder_rung(
         QueryContext::default(),
     );
     let elapsed_ms = start.elapsed().as_millis();
-    // Cleared by the check-sat; this covers a check that stopped before one.
-    air.set_quant_strategy(None, true);
     let info = air.take_strategy_rung();
     let unknown = air.take_unknown_reason();
     drop(air.take_provenance());
@@ -1698,6 +1699,18 @@ fn serve_ladder(
         return Ok(Err("ladder requests need cvc5"));
     }
     let prefix = journal.queries[local].prefix;
+    let query_rlimit = journal.queries[local].rlimit;
+    // A budget is in `#[verifier::rlimit]` units, converted to cvc5's by
+    // `set_rlimit`. One too small for a single cvc5 unit converts to 0, which
+    // cvc5 takes as no limit at all, so it is refused before any rung runs.
+    for &rlimit in budgets.values() {
+        set_rlimit(air, rlimit);
+        if air.cvc5_query_budget() == 0 {
+            set_rlimit(air, query_rlimit);
+            return Ok(Err("a rung's budget is below one cvc5 resource unit"));
+        }
+    }
+    set_rlimit(air, query_rlimit);
     let restore_start = Instant::now();
     journal.restore_prefix(air, prefix)?;
     let restore_ms = restore_start.elapsed().as_millis();
@@ -2255,9 +2268,11 @@ impl Server {
                     // its strategy, alone or alongside as the ladder ran it,
                     // at the query's own budget. It changes which instances
                     // are tried, never what is asserted, so a valid answer
-                    // is sound. Any other answer is discarded, with its
-                    // diagnostics, before the ordinary check, which runs the
-                    // full schedule.
+                    // is sound, and that answer's diagnostics (provenance,
+                    // difficulty) describe the check that decided, so the
+                    // reply keeps them, as it keeps its graph. Any other
+                    // answer is discarded, with its diagnostics, before the
+                    // ordinary check, which runs the full schedule.
                     let mut pinned = None;
                     if let Some(&pin) =
                         self.pins.get(&(bucket_id.0, id.0)).filter(|_| certified.is_none())
@@ -2270,14 +2285,8 @@ impl Server {
                             &query.query,
                             QueryContext::default(),
                         );
-                        air.set_quant_strategy(None, true);
                         let resource_units =
                             air.take_strategy_rung().map(|info| info.resource_units);
-                        drop(air.take_provenance());
-                        drop(air.take_unknown_reason());
-                        drop(air.take_matching_loops());
-                        drop(air.take_difficulty());
-                        drop(air.take_inst_pressure());
                         match attempt {
                             ValidityResult::Valid(usage) => {
                                 certified = Some(ValidityResult::Valid(usage))
@@ -2288,7 +2297,14 @@ impl Server {
                             ValidityResult::UnexpectedOutput(error) => {
                                 return fatal(&mut output, io::Error::other(error));
                             }
-                            _ => air.finish_query(),
+                            _ => {
+                                drop(air.take_provenance());
+                                drop(air.take_unknown_reason());
+                                drop(air.take_matching_loops());
+                                drop(air.take_difficulty());
+                                drop(air.take_inst_pressure());
+                                air.finish_query();
+                            }
                         }
                         pinned = Some(PinnedAttempt {
                             rung: pin.rung,

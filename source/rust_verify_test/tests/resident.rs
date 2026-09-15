@@ -1596,6 +1596,7 @@ fn resident_strategy_ladder_finds_a_strategy_and_pins_it() {
     assert!(all["rungs"].as_array().unwrap().iter().all(|r| r["verdict"] != "not_run"), "{}", all);
     assert_eq!(rung(&all, "pool")["verdict"], "unknown", "{all}");
     assert_eq!(rung(&all, "enum")["rlimit"], 5.0, "{all}");
+    assert!(rung(&all, "enum")["resource_limit"].as_u64().unwrap() > 0, "{}", all);
     assert!(all["pinned"].is_null(), "{}", all);
 
     // Alongside E-matching the default rungs are the three the schedule
@@ -1623,14 +1624,28 @@ fn resident_strategy_ladder_finds_a_strategy_and_pins_it() {
         "query":query_id(&ready, "::triggered")}));
     assert_eq!(triggered["solved_by"], "ematch", "{triggered}");
 
+    // Named alongside, E-matching is the default schedule itself, and runs
+    // as a baseline rather than being refused.
+    let baseline = worker.send(json!({"command":"ladder", "session":session, "bucket":0,
+        "query":untriggered, "alongside":true, "rungs":["ematch"], "pin":false}));
+    assert_eq!(rung(&baseline, "ematch")["verdict"], "unknown", "{baseline}");
+
     for bad in [json!(["enum", "enum"]), json!(["nope"])] {
         let reply = worker.send(json!({"command":"ladder", "session":session, "bucket":0,
             "query":untriggered, "rungs":bad}));
         assert_eq!(reply["event"], "error", "{reply}");
     }
-    let reply = worker.send(json!({"command":"ladder", "session":session, "bucket":0,
-        "query":untriggered, "budgets":{"enum":0}}));
-    assert_eq!(reply["event"], "error", "{reply}");
+    // Zero, above the cap, and a budget too small for one cvc5 resource unit
+    // (which would reach cvc5 as 0, no limit at all) are all refused.
+    for budget in [json!(0), json!(1001), json!(0.000001)] {
+        let reply = worker.send(json!({"command":"ladder", "session":session, "bucket":0,
+            "query":untriggered, "budgets":{"enum":budget}}));
+        assert_eq!(reply["event"], "error", "{reply}");
+    }
+    // The refusals left the pin and the session as they were.
+    let rechecked = worker.send(check.clone());
+    assert_eq!(rechecked["result"], "valid", "{rechecked}");
+    assert_eq!(rechecked["pinned"]["closed"], true, "{rechecked}");
     assert_eq!(worker.send(json!({"command":"close", "session":session}))["event"], "closed");
     worker.finish(false);
 }
@@ -1649,7 +1664,45 @@ fn resident_ladder_without_the_mode_reports_what_is_missing() {
     for name in ["conflict", "enum", "mbqi"] {
         assert_eq!(rung(&ladder, name)["verdict"], "unavailable", "{ladder}");
     }
+    // The two the solver has still run: E-matching fails as the default
+    // schedule does, and pools, which Verus never emits, instantiate nothing.
+    assert_eq!(rung(&ladder, "ematch")["verdict"], "unknown", "{ladder}");
+    assert_eq!(rung(&ladder, "pool")["verdict"], "unknown", "{ladder}");
+    assert_eq!(rung(&ladder, "pool")["instantiations"], 0, "{ladder}");
     assert!(ladder["solved_by"].is_null(), "{}", ladder);
+    worker.finish(false);
+}
+
+/// A pinned rung's proof decides the verdict, so the reply keeps that check's
+/// provenance, as it keeps its instantiation graph; only a pinned attempt
+/// that fails has its diagnostics discarded with it.
+#[test]
+fn resident_pinned_recheck_keeps_the_provenance_of_its_proof() {
+    let mut worker = Worker::start_with_env(
+        LADDER_SOURCE,
+        &["-V", "provenance"],
+        &[("VERUS_RESIDENT_STRATEGY_LADDER", "1")],
+    );
+    let ready = worker.receive();
+    assert_eq!(ready["provenance"], true, "{ready}");
+    let session = ready["session"].clone();
+    let untriggered = query_id(&ready, "::untriggered");
+    let ladder = worker
+        .send(json!({"command":"ladder", "session":session, "bucket":0, "query":untriggered}));
+    assert!(ladder["solved_by"].is_string(), "{}", ladder);
+    let checked =
+        worker.send(json!({"command":"check", "session":session, "bucket":0, "query":untriggered}));
+    assert_eq!(checked["result"], "valid", "{checked}");
+    assert_eq!(checked["pinned"]["closed"], true, "{checked}");
+    assert_eq!(checked["provenance"]["result"], "valid", "{checked}");
+    assert_eq!(checked["provenance"]["round"], 0, "{checked}");
+    let requires = checked["provenance"]["hypotheses"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{}", checked))
+        .iter()
+        .filter(|h| h["kind"] == "requires")
+        .count();
+    assert!(requires > 0, "{}", checked);
     worker.finish(false);
 }
 
