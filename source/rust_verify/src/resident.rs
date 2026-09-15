@@ -2914,10 +2914,15 @@ fn scaffold_arms(
             },
         );
         let mut closing = resolved.instantiations;
-        // user quantifiers and function definitions first, the prelude last
+        // user quantifiers and function definitions (and contracts) first,
+        // the prelude last
         closing.sort_by_key(|q| match (&q.span, q.role, q.fun.as_deref()) {
             (Some(_), _, _) => 0,
-            (None, Some("definition" | "definition_unfold" | "definition_base"), _) => 1,
+            (
+                None,
+                Some("definition" | "definition_unfold" | "definition_base" | "contract"),
+                _,
+            ) => 1,
             (None, _, Some("prelude")) => 3,
             _ => 2,
         });
