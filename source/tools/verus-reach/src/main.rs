@@ -47,6 +47,10 @@ struct Args {
     /// functions (exec, spec, and proof) are reachable
     #[arg(long)]
     fail_under: Option<u64>,
+    /// Exit with an error if more than this percentage of verified
+    /// functions (exec, spec, and proof) are unreachable
+    #[arg(long)]
+    fail_over: Option<u64>,
     /// Write an LCOV trace file to stdout instead of the summary
     #[arg(long, conflicts_with = "html")]
     lcov: bool,
@@ -242,6 +246,19 @@ fn lcov(graph: &Graph, only: Only) -> String {
     report.into_records().map(|record| format!("{record}\n")).collect()
 }
 
+fn above_threshold(graph: &Graph, threshold: u64) -> Option<String> {
+    let (reached, total) = graph.coverage();
+    let Some(pct) = pct(total - reached, total) else {
+        return Some(format!("no verified functions to measure, above --fail-over {threshold}"));
+    };
+    (pct > threshold).then(|| {
+        format!(
+            "{} of {total} verified functions unreachable ({pct}%), above --fail-over {threshold}",
+            total - reached
+        )
+    })
+}
+
 fn below_threshold(graph: &Graph, threshold: u64) -> Option<String> {
     let (reached, total) = graph.coverage();
     let Some(pct) = pct(reached, total) else {
@@ -293,6 +310,9 @@ fn main() {
         print!("{text}");
     }
     if let Some(msg) = args.fail_under.and_then(|t| below_threshold(&graph, t)) {
+        fail(msg);
+    }
+    if let Some(msg) = args.fail_over.and_then(|t| above_threshold(&graph, t)) {
         fail(msg);
     }
 }
@@ -372,6 +392,15 @@ mod tests {
     }
 
     #[test]
+    fn fail_over_bounds_the_unreachable_share() {
+        // 2 of 6 verified functions are unreachable: 33%
+        let (_, graph) = graph();
+        assert_eq!(above_threshold(&graph, 33), None);
+        let msg = above_threshold(&graph, 32).unwrap();
+        assert!(msg.contains("2 of 6 verified functions unreachable (33%)"), "{msg}");
+    }
+
+    #[test]
     fn nothing_verified_fails_the_threshold_and_shows_no_rate() {
         use verus_reach::fixture::{node, report};
         let reports = vec![report(
@@ -383,6 +412,7 @@ mod tests {
         )];
         let graph = Graph::new(&reports, &Roots::default()).unwrap();
         assert!(below_threshold(&graph, 1).unwrap().contains("no verified functions"));
+        assert!(above_threshold(&graph, 99).unwrap().contains("no verified functions"));
         let text = summary(&reports, &graph);
         assert!(text.contains("verified functions:      0   reachable:      0  (n/a)"), "{text}");
     }
