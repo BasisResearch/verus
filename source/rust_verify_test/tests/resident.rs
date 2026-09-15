@@ -1184,6 +1184,20 @@ verus! {
         assert(x != 7);
         assert(x > 100);
     }
+
+    // A postcondition is checked at each exit: the early `return`, and the
+    // end of the body, whose final expression is `x`.
+    proof fn scaffold_exit(x: int, b: bool) -> (r: int)
+        requires
+            forall|i: int| #[trigger] g(f(i)) == i,
+        ensures
+            f(r) != f(r + 1),
+    {
+        if b {
+            return x;
+        }
+        x
+    }
 }
 "#;
 
@@ -1481,8 +1495,46 @@ fn resident_scaffold_places_p_where_the_goal_is_checked() {
     let at = reply["target"]["insert_before"].as_str().unwrap_or_default();
     assert!(at.contains(&line_of(SCAFFOLD_SOURCE, "assert(x != 7);")), "{}", reply);
     assert!(reply["query_check"]["rechecks"].as_u64().unwrap() >= 1, "{}", reply);
+
+    // A postcondition at an early `return` is checked there, and P goes
+    // right before the `return`, not at the `ensures` clause (the message's
+    // primary span). At the end of the body P goes before the body's final
+    // expression, which the message's label names.
+    let exit = scaffold(&mut worker, "::scaffold_exit", SCAFFOLD_CASES[0].0);
+    assert_eq!(exit["target"]["placement"], "before_span", "{}", exit);
+    let at = exit["target"]["insert_before"].as_str().unwrap_or_default();
+    assert!(at.contains(&line_of(SCAFFOLD_SOURCE, "return x;")), "{}", exit);
+    assert_eq!(exit["case"], "scaffold", "{}", exit);
+    let exit_query = query_id(&ready, "::scaffold_exit");
+    let end = (0..4)
+        .map(|goal| {
+            worker.send(json!({"command": "scaffold", "session": ready["session"], "bucket": 0,
+                "query": exit_query, "assert": SCAFFOLD_CASES[0].0, "goal": goal}))
+        })
+        .find(|reply| reply["target"]["placement"] == "end_of_body")
+        .expect("a goal at the end of the body");
+    let tail = SCAFFOLD_SOURCE.lines().position(|l| l.trim() == "x").unwrap() + 1;
+    let at = end["target"]["insert_before"].as_str().unwrap_or_default();
+    assert!(at.contains(&format!("fixture.rs:{tail}:")), "{}", end);
+    assert_eq!(end["case"], "scaffold", "{}", end);
     worker.send(json!({"command": "close", "session": ready["session"]}));
     worker.finish(false);
+
+    // Pasted where the two replies say, the function verifies.
+    let snippet = exit["verus_snippet"].as_str().unwrap();
+    let pasted = SCAFFOLD_SOURCE
+        .replace("return x;", &format!("{snippet} return x;"))
+        .replace("        x\n    }", &format!("        {snippet} x\n    }}"));
+    assert_eq!(pasted.matches(snippet).count(), 2, "{}", pasted);
+    let mut cold = Worker::start(&pasted, &[]);
+    let cold_ready = cold.receive();
+    for id in query_ids(&cold_ready, "::scaffold_exit") {
+        let result = cold.send(json!({"command": "check", "session": cold_ready["session"],
+            "bucket": 0, "query": id}));
+        assert_eq!(result["result"], "valid", "{}", result);
+    }
+    cold.send(json!({"command": "close", "session": cold_ready["session"]}));
+    cold.finish(false);
 }
 
 /// A matching loop runs the query out of budget, and a resource limit names
