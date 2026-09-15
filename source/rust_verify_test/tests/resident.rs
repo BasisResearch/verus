@@ -553,6 +553,17 @@ verus! {
         broadcast use f_nonneg;
     }
 
+    pub broadcast group g_nonneg {
+        f_nonneg,
+    }
+
+    // reveals f_nonneg only through its group
+    proof fn uses_group(x: int)
+        ensures f(x) >= 0,
+    {
+        broadcast use g_nonneg;
+    }
+
     proof fn unprovable(x: int)
         requires x > 0,
     {
@@ -771,6 +782,14 @@ fn resident_twin_compares_a_query_with_its_edit() {
         ),
         // its axiom is in the context and the body reveals it
         ("::uses_lemma", json!({"add_axiom": "f_nonneg"}), json!({}), "already applies"),
+        // the body reveals it through a group
+        ("::uses_group", json!({"add_axiom": "f_nonneg"}), json!({}), "broadcast group"),
+        (
+            "::uses_group",
+            json!({"flip_fuel": {"fn": "f_nonneg", "fuel": 1}}),
+            json!({}),
+            "already visible",
+        ),
         // the prelude is asserted before the bucket's context
         (
             "::unprovable",
@@ -796,6 +815,7 @@ fn resident_twin_compares_a_query_with_its_edit() {
 
     for (name, expected) in [
         ("::uses_lemma", "valid"),
+        ("::uses_group", "valid"),
         ("::unprovable", "invalid"),
         ("::needs_fuel", "invalid"),
         ("::wants_more", "invalid"),
@@ -888,13 +908,11 @@ fn resident_twin_matches_the_edit_made_in_source() {
         .to_owned();
     let removed = twin("::with_loop", json!({"remove_axiom": qid}));
     let cold = twin("::without_loop", json!({"bump_rlimit": 2}));
-    for (edited, cold) in [(&removed, &cold)] {
-        assert_eq!(edited["twin"]["class"], cold["base"]["class"], "{edited}\n{cold}");
-        let (t, c) = (instantiations(&edited["twin"]), instantiations(&cold["base"]));
-        let noise = instantiations(&cold["base"]).abs_diff(instantiations(&cold["twin"]));
-        eprintln!("remove: twin {t} instantiations, source edit {c}, repeat noise {noise}");
-        assert!(t.abs_diff(c) <= 3 * noise + c / 4 + 10, "{}\n{}", edited, cold);
-    }
+    assert_eq!(removed["twin"]["class"], cold["base"]["class"], "{removed}\n{cold}");
+    let (t, c) = (instantiations(&removed["twin"]), instantiations(&cold["base"]));
+    let noise = instantiations(&cold["base"]).abs_diff(instantiations(&cold["twin"]));
+    eprintln!("remove: twin {t} instantiations, source edit {c}, repeat noise {noise}");
+    assert!(t.abs_diff(c) <= 3 * noise + c / 4, "{}\n{}", removed, cold);
 
     let fueled = twin("::default_fuel", json!({"flip_fuel": {"fn": "sum", "fuel": 4}}));
     let cold = twin("::revealed_fuel", json!({"bump_rlimit": 2}));
@@ -903,7 +921,7 @@ fn resident_twin_matches_the_edit_made_in_source() {
     let (t, c) = (instantiations(&fueled["twin"]), instantiations(&cold["base"]));
     let noise = instantiations(&cold["base"]).abs_diff(instantiations(&cold["twin"]));
     eprintln!("fuel: twin {t} instantiations, source edit {c}, repeat noise {noise}");
-    assert!(t.abs_diff(c) <= 3 * noise + c / 4 + 10, "{}\n{}", fueled, cold);
+    assert!(t.abs_diff(c) <= 3 * noise + c / 4, "{}\n{}", fueled, cold);
 
     assert_eq!(worker.send(json!({"command": "close", "session": session}))["event"], "closed");
     worker.finish(false);

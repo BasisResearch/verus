@@ -112,7 +112,7 @@ const TWIN_FUEL_TAG: &str = "twin_fuel";
 /// A twin's rlimit may be at most this many times the query's.
 const MAX_RLIMIT_FACTOR: f32 = 16.0;
 
-const CAVEAT: &str = "Both checks ran in scopes popped right after them; the session's solver state is unchanged. Neither is a verification result: make the edit in the source and verify it normally, and prove an added axiom before relying on it. Resource units and elapsed time of two checks in one solver differ by more than the edit (caches survive a pop): read instantiation counts first, and recheck_base to measure the noise.";
+const CAVEAT: &str = "Both checks ran in scopes popped right after them, so the session's assertion stack is as it was; the solver's caches are not. Neither is a verification result: make the edit in the source and verify it normally, and prove an added axiom before relying on it. Resource units and elapsed time of two checks in one solver differ by more than the edit (caches survive a pop): read instantiation counts first, and recheck_base to measure the noise.";
 
 #[derive(Serialize)]
 pub(super) struct TwinReport {
@@ -129,8 +129,9 @@ pub(super) struct TwinReport {
     /// because it contradicts itself.
     #[serde(skip_serializing_if = "Option::is_none")]
     vacuity: Option<Vacuity>,
-    /// Whether the solver was left as it was found. Not `session`: the
-    /// reply's event already names its session under that key.
+    /// Whether the solver's assertion stack was left as deep as it was
+    /// found (caches are not compared). Not `session`: the reply's event
+    /// already names its session under that key.
     integrity: SessionCheck,
     /// Parts of the comparison this session could not make, and why.
     unavailable: Vec<String>,
@@ -344,6 +345,7 @@ struct SessionCheck {
     /// as cvc5 counts them; equal when every edit was popped.
     stack_levels_before: Option<u64>,
     stack_levels_after: Option<u64>,
+    /// Both levels are known and equal. Only the depth is compared.
     intact: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     recheck: Option<Recheck>,
@@ -476,7 +478,8 @@ struct Plan {
     /// select, for a removed module-level axiom.
     rebuild: Option<(usize, Vec<String>)>,
     report: EditReport,
-    /// Check the hypotheses alone in both queries (an added axiom).
+    /// Check both queries again with every goal switched off (an added
+    /// axiom; see `air::twin::goals_off`).
     vacuity: bool,
 }
 
@@ -713,17 +716,19 @@ fn plan(
             // it. Adding the axiom means assuming that, as the source edit
             // would.
             let guard = fuel_guard(&found.expr);
+            let scan = FuelScan::of(journal, prefix);
             let assumed = guard.as_ref().and_then(|c| {
                 if body_reveals(query, c) {
-                    Some("the body already reveals it")
-                } else if FuelScan::of(journal, prefix).default_visible(c) && !query_hides(query, c)
-                {
-                    Some("its module reveals it by default")
+                    Some("the body already reveals it".to_owned())
+                } else if let Some(group) = scan.revealing_group(query, c) {
+                    Some(format!("the body reveals it with broadcast group {}", fuel_path(&group)))
+                } else if scan.default_visible(c) && !query_hides(query, c) {
+                    Some("its module reveals it by default".to_owned())
                 } else {
                     None
                 }
             });
-            match (place, &guard, assumed) {
+            match (place, &guard, &assumed) {
                 ("retained", _, _) => {
                     report.axioms.push(matched(place, &AxiomRef::of(found), fun, symbols));
                     let axiom = Axiom {
@@ -745,7 +750,7 @@ fn plan(
                     report.axioms.push(matched(place, &AxiomRef::of(found), fun, symbols));
                 }
             }
-            if let (Some(c), None) = (&guard, assumed) {
+            if let (Some(c), None) = (&guard, &assumed) {
                 let revealed = air::ast_util::str_apply(
                     vir::def::FUEL_BOOL,
                     &vec![air::ast_util::ident_var(c)],
@@ -792,13 +797,14 @@ fn plan(
             Ok(Plan { query: twin, rlimit, rebuild: None, report, vacuity: false })
         }
         TwinEdit::FlipFuel { function, fuel } => {
-            let target = FuelScan::of(journal, prefix).find(function)?;
+            let scan = FuelScan::of(journal, prefix);
+            let target = scan.find(function)?;
             let (twin, fuel_report) = flip_fuel(query, &target, *fuel)?;
-            if *fuel == 1
-                && fuel_report.default_visible
-                && !fuel_report.hidden_before
-                && fuel_report.reveals_removed == 0
-            {
+            // A group the body uses stays: flip_fuel removes only reveals of
+            // the function itself.
+            let visible = (fuel_report.default_visible && !fuel_report.hidden_before)
+                || scan.revealing_group(query, &target.ident).is_some();
+            if *fuel == 1 && visible && fuel_report.reveals_removed == 0 {
                 return Err(format!(
                     "{} is already visible in this query, so fuel 1 changes nothing; 0 hides it, and 2 or more unrolls a recursive function further",
                     target.name
@@ -842,13 +848,19 @@ struct FuelScan {
     constants: Vec<(Ident, String)>,
     nats: HashSet<Ident>,
     defaults: HashSet<Ident>,
+    /// Each broadcast group's fuel constant with its members'.
+    groups: Vec<(Ident, Vec<Ident>)>,
 }
 
 impl FuelScan {
     fn of(journal: &QueryJournal, prefix: usize) -> Self {
         let fuel_prefix = vir::def::prefix_fuel_id(&Arc::new(String::new()));
-        let mut scan =
-            FuelScan { constants: Vec::new(), nats: HashSet::new(), defaults: HashSet::new() };
+        let mut scan = FuelScan {
+            constants: Vec::new(),
+            nats: HashSet::new(),
+            defaults: HashSet::new(),
+            groups: Vec::new(),
+        };
         // `(=> (fuel_bool_default group) (and (fuel_bool_default member) ...))`
         // reveals the members with the group.
         let mut implied: Vec<(Ident, Vec<Ident>)> = Vec::new();
@@ -891,11 +903,47 @@ impl FuelScan {
                 }
             }
         }
+        scan.groups = implied;
         scan
     }
 
     fn default_visible(&self, ident: &Ident) -> bool {
         self.defaults.contains(ident)
+    }
+
+    /// The broadcast group whose `broadcast use` in the query's body reveals
+    /// `ident`, directly or through a group inside it. The body assumes the
+    /// group's `fuel_bool`, the fuel hypothesis equates that with its
+    /// `fuel_bool_default`, and the group's axiom passes that on to each
+    /// member's. `None` when the query hides the member or the group.
+    fn revealing_group(&self, query: &Query, ident: &Ident) -> Option<Ident> {
+        if query_hides(query, ident) {
+            return None;
+        }
+        self.groups
+            .iter()
+            .map(|(group, _)| group)
+            .filter(|group| body_reveals(query, group) && !query_hides(query, group))
+            .find(|group| self.group_holds(group, ident))
+            .cloned()
+    }
+
+    /// Whether `member` is in `group`, or in a group inside it.
+    fn group_holds(&self, group: &Ident, member: &Ident) -> bool {
+        let mut seen: HashSet<&Ident> = HashSet::new();
+        let mut todo = vec![group];
+        while let Some(next) = todo.pop() {
+            if !seen.insert(next) {
+                continue;
+            }
+            for (_, members) in self.groups.iter().filter(|(g, _)| g == next) {
+                if members.contains(member) {
+                    return true;
+                }
+                todo.extend(members.iter());
+            }
+        }
+        false
     }
 
     /// The function with fuel constant `ident`.
@@ -1598,6 +1646,44 @@ mod tests {
         let (hidden, _) = flip_fuel(&q, &target(true), 0).unwrap();
         assert!(query_hides(&hidden, &f));
         assert!(!body_reveals(&hidden, &f), "the reveals went with the hide");
+    }
+
+    #[test]
+    fn a_group_in_the_body_reveals_its_members() {
+        let journal = journal_with_base(
+            "
+            (declare-const fuel%crate!grp. FuelId)
+            (declare-const fuel%crate!inner. FuelId)
+            (declare-const fuel%crate!lem. FuelId)
+            (declare-const fuel%crate!deep. FuelId)
+            (declare-const fuel%crate!other. FuelId)
+            (axiom (=> (fuel_bool_default fuel%crate!grp.) (and (fuel_bool_default fuel%crate!lem.) (fuel_bool_default fuel%crate!inner.))))
+            (axiom (=> (fuel_bool_default fuel%crate!inner.) (and (fuel_bool_default fuel%crate!deep.))))",
+        );
+        let scan = FuelScan::of(&journal, 0);
+        let fuel = |name: &str| Arc::new(format!("fuel%crate!{name}."));
+        let q = query(
+            "(check-valid
+               (axiom fuel_defaults)
+               (block (assume (fuel_bool fuel%crate!grp.)) (assert true)))",
+        );
+        let (q, _) = air::twin::replace_local_axioms(&q, &mut |a: &Axiom| {
+            Some(Axiom {
+                named: None,
+                tag: Some(air::def::ProvenanceTag::Hyp(air::def::HypId(0))),
+                expr: a.expr.clone(),
+            })
+        });
+        // no module reveals them: only the body's use of the group does
+        assert!(!scan.default_visible(&fuel("lem")));
+        assert!(!body_reveals(&q, &fuel("lem")));
+        assert_eq!(scan.revealing_group(&q, &fuel("lem")), Some(fuel("grp")));
+        assert_eq!(scan.revealing_group(&q, &fuel("deep")), Some(fuel("grp")));
+        assert_eq!(scan.revealing_group(&q, &fuel("other")), None);
+        // a member the query hides stays hidden, whatever the group says
+        let (hidden, _) = flip_fuel(&q, &scan.target(&fuel("lem")).unwrap(), 0).unwrap();
+        assert_eq!(scan.revealing_group(&hidden, &fuel("lem")), None);
+        assert_eq!(scan.revealing_group(&hidden, &fuel("deep")), Some(fuel("grp")));
     }
 
     #[test]
