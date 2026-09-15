@@ -2450,18 +2450,32 @@ fn serve_speculate(
         hypothesis.as_ref().map(|h| h.qid().to_owned()),
     );
     outcome.restore_ms = restore_ms;
-    let candidates = |air: &Context| -> Vec<QuantifierDescription> {
+    // The first MAX_CANDIDATES quantifiers written in source, and a sentence
+    // saying so when the scope asserts more.
+    let candidates = |air: &Context| -> (Vec<QuantifierDescription>, String) {
         let written = |qid: &str, in_query: bool| {
             in_query
                 || symbols
                     .and_then(|symbols| symbols.quantifier_site(qid))
                     .is_some_and(|(_, span)| span.is_some())
         };
-        air.quantifiers(decls.iter().copied(), &query.query, written)
+        let all = air.quantifiers(decls.iter().copied(), &query.query, written);
+        let listed: Vec<QuantifierDescription> = all
             .iter()
             .take(MAX_CANDIDATES)
             .map(|q| describe_quantifier(q, symbols, &unversioned))
-            .collect()
+            .collect();
+        let note = if listed.len() < all.len() {
+            format!(
+                "The candidates are the first {} of the {} quantifiers written in source that this query's scope asserts.",
+                listed.len(),
+                all.len()
+            )
+        } else {
+            "The candidates are the quantifiers written in source that this query's scope asserts."
+                .to_owned()
+        };
+        (listed, note)
     };
 
     // The quantifier the hypothesis names, and the hypothesis in the
@@ -2476,8 +2490,9 @@ fn serve_speculate(
                 "no quantifier named {} is asserted in this query's scope",
                 request.qid()
             ));
-            outcome.candidates = candidates(air);
-            outcome.notes = "Nothing was checked. The candidates are the quantifiers written in source that this query's scope asserts.".to_owned();
+            let (listed, note) = candidates(air);
+            outcome.candidates = listed;
+            outcome.notes = format!("Nothing was checked. {note}");
             outcome.elapsed_ms = start.elapsed().as_millis();
             return Ok(Ok(outcome));
         };
@@ -2506,9 +2521,10 @@ fn serve_speculate(
     let before_loop_count = before.loops.len();
     outcome.before = Some(before);
     let Some((quantifier, lowered, subst)) = target else {
-        outcome.candidates = candidates(air);
+        let (listed, note) = candidates(air);
+        outcome.candidates = listed;
         outcome.notes = format!(
-            "No hypothesis: the query was checked as usual and answers {}, with {before_loop_count} matching loop(s). The candidates are the quantifiers written in source that its scope asserts.",
+            "No hypothesis: the query was checked as usual and answers {}, with {before_loop_count} matching loop(s). {note}",
             result_name(before_result)
         );
         outcome.elapsed_ms = start.elapsed().as_millis();
