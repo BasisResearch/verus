@@ -239,6 +239,16 @@ pub(crate) fn smt_check_assertion<'ctx>(
         None
     };
 
+    // A hypothesis goes in the query's scope before the flush below, so that a
+    // term cvc5 cannot read is refused there, before any check-sat. Only the
+    // query's first check sends it: later rounds share its scope.
+    let speculation = context.speculation.take();
+    if let Some(request) = &speculation {
+        context.last_speculation = None;
+        context.smt_log.log_node(&request.to_node());
+    }
+    let mut speculation_refused = None;
+
     context.smt_log.log_get_info("version");
     let smt_init_start_time = std::time::Instant::now();
     let smt_data = context.smt_log.take_pipe_data();
@@ -262,6 +272,8 @@ pub(crate) fn smt_check_assertion<'ctx>(
                     );
                 }
             }
+        } else if speculation.is_some() && line.starts_with("(error") {
+            speculation_refused = Some(line);
         } else if context.ignore_unexpected_smt {
             diagnostics.report(&context.message_interface.bare(
                 crate::messages::MessageLevel::Warning,
@@ -270,6 +282,14 @@ pub(crate) fn smt_check_assertion<'ctx>(
         } else {
             return ValidityResult::UnexpectedOutput(line);
         }
+    }
+
+    // cvc5 could not read the hypothesis, so there is nothing to check.
+    if let Some(error) = speculation_refused {
+        context.last_speculation =
+            Some(crate::speculate::SpeculationReply { error: Some(error), ..Default::default() });
+        context.state = ContextState::Canceled;
+        return ValidityResult::Canceled;
     }
 
     if let Some(disabled_expr) = disabled_expr {
@@ -313,6 +333,11 @@ pub(crate) fn smt_check_assertion<'ctx>(
     if context.inst_pressure {
         // in the same batch, right after the answer it describes
         context.smt_log.log_get_info("inst-pressure");
+    }
+    if speculation.is_some() {
+        // in the same batch, right after the answer it describes and before
+        // the scope holding the hypothesis is popped
+        context.smt_log.log_get_info("speculation");
     }
     if context.provenance {
         // in the same batch: the tag lists arrive after the result and the
@@ -363,6 +388,7 @@ pub(crate) fn smt_check_assertion<'ctx>(
     let mut nl_frontier = None;
     let mut egraph_lines: Vec<String> = Vec::new();
     let mut inst_pressure = None;
+    let mut speculation_reply = None;
     for line in smt_output {
         // The e-graph reply, or the solver's refusal of the request, is the
         // batch's last: every line from its first on belongs to it.
@@ -397,6 +423,8 @@ pub(crate) fn smt_check_assertion<'ctx>(
             // a cvc5 without the key; say so rather than fail the query
             inst_pressure =
                 Some(crate::context::InstPressure { unparsed: Some(line), ..Default::default() });
+        } else if speculation.is_some() && line.starts_with("(:speculation (") {
+            speculation_reply = Some(crate::speculate::parse_speculation(&line));
         } else if line == "unsat" {
             assert!(unsat == None);
             unsat = Some(SmtOutput::Unsat);
@@ -436,6 +464,13 @@ pub(crate) fn smt_check_assertion<'ctx>(
     context.last_nl_frontier = nl_frontier;
     context.last_difficulty = difficulty;
     context.last_inst_pressure = inst_pressure;
+    if speculation.is_some() {
+        context.last_speculation =
+            Some(speculation_reply.unwrap_or_else(|| crate::speculate::SpeculationReply {
+                unparsed: Some("no (:speculation ...) reply".to_string()),
+                ..Default::default()
+            }));
+    }
     if egraph_asked {
         context.last_egraph = Some(parse_egraph_lines(&egraph_lines));
     }
@@ -653,7 +688,7 @@ pub(crate) fn parse_nl_frontier(line: &str) -> crate::context::NlFrontier {
 /// A reply subterm as text: lists re-joined, quoted symbols unquoted (see
 /// `bar_symbols_as_strings`), unless whitespace or parentheses in one mean
 /// only its bars keep it one symbol.
-fn sexp_text(node: &sise::TreeNode) -> String {
+pub(crate) fn sexp_text(node: &sise::TreeNode) -> String {
     match node {
         sise::TreeNode::Atom(a) => match a.strip_prefix('"').and_then(|t| t.strip_suffix('"')) {
             Some(t) if t.contains(|c: char| c.is_whitespace() || c == '(' || c == ')') => {
@@ -763,7 +798,7 @@ fn parse_nl_atom(node: &sise::TreeNode) -> Option<crate::context::NlAtom> {
 
 /// A count from a solver reply. cvc5 prints arbitrary-precision integers, so
 /// one too large for u64 saturates rather than fails.
-fn difficulty_count(v: &str) -> Option<u64> {
+pub(crate) fn difficulty_count(v: &str) -> Option<u64> {
     (!v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()))
         .then(|| v.parse::<u64>().unwrap_or(u64::MAX))
 }
@@ -771,7 +806,7 @@ fn difficulty_count(v: &str) -> Option<u64> {
 /// cvc5 quotes a symbol that needs it as `|...|`, which sise cannot read, so
 /// spell each one as a sise string. A symbol that cannot be a sise string
 /// (it holds `"` or `\`) is left alone, and the reply stays unparsed.
-fn bar_symbols_as_strings(line: &str) -> String {
+pub(crate) fn bar_symbols_as_strings(line: &str) -> String {
     let mut out = String::with_capacity(line.len());
     let mut rest = line;
     while let Some(start) = rest.find('|') {

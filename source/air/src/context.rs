@@ -556,6 +556,13 @@ pub struct Context {
     /// An equality to assert in the next query's scope just before its first
     /// `check-sat` (cvc5 only).
     pub(crate) inject_equality: Option<(sise::TreeNode, sise::TreeNode)>,
+    /// A hypothesis to send in the next query's scope just before its first
+    /// `check-sat` (cvc5 only, see `speculate`).
+    pub(crate) speculation: Option<crate::speculate::SpeculationRequest>,
+    /// cvc5's reply to the last hypothesis sent, until the caller takes it.
+    pub(crate) last_speculation: Option<crate::speculate::SpeculationReply>,
+    /// Whether this solver serves `(speculate ...)`, once asked.
+    speculation_supported: Option<bool>,
 }
 
 impl Context {
@@ -647,6 +654,9 @@ impl Context {
             egraph_focus: None,
             last_egraph: None,
             inject_equality: None,
+            speculation: None,
+            last_speculation: None,
+            speculation_supported: None,
             solver,
         };
         context.axiom_infos.push_scope(false);
@@ -962,6 +972,74 @@ impl Context {
         Ok(())
     }
 
+    /// Whether this solver serves `(speculate ...)`, which it does if it
+    /// answers `(get-info :speculation)`; asked once (cvc5 only). A solver
+    /// without the command would end at it, so ask before `set_speculation`.
+    pub fn supports_speculation(&mut self) -> bool {
+        if !matches!(self.solver, SmtSolver::Cvc5) {
+            return false;
+        }
+        if let Some(supported) = self.speculation_supported {
+            return supported;
+        }
+        self.ensure_started();
+        self.smt_log.log_get_info("speculation");
+        let smt_data = self.smt_log.take_pipe_data();
+        let lines = self.get_smt_process().send_commands(smt_data);
+        let supported = lines.iter().any(|line| line.starts_with("(:speculation "));
+        self.speculation_supported = Some(supported);
+        supported
+    }
+
+    /// Send `request` in the next query's scope, after its assertions and
+    /// just before its first `check-sat`, and read `(get-info :speculation)`
+    /// right after that check (cvc5 with `supports_speculation` only).
+    /// `finish_query` pops the hypothesis with the scope. Take the reply with
+    /// `take_speculation`; when cvc5 refused the command, the reply carries
+    /// its error and the check answers `Canceled` without a `check-sat`.
+    /// `None` also drops a request that a check which never reached the
+    /// solver left behind.
+    pub fn set_speculation(&mut self, request: Option<crate::speculate::SpeculationRequest>) {
+        assert!(request.is_none() || matches!(self.solver, SmtSolver::Cvc5));
+        self.speculation = request;
+    }
+
+    /// The reply to the hypothesis of the most recent query, if one was sent;
+    /// each call returns it once.
+    pub fn take_speculation(&mut self) -> Option<crate::speculate::SpeculationReply> {
+        self.last_speculation.take().map(|mut reply| {
+            reply.variable_versions = self.variable_versions.clone();
+            reply
+        })
+    }
+
+    /// The universal quantifier named `qid` that `decls` or `query` asserts,
+    /// as the solver is sent it, the query's own first.
+    pub fn find_quantifier<'a>(
+        &self,
+        decls: impl Iterator<Item = &'a Decl>,
+        query: &Query,
+        qid: &str,
+    ) -> Option<crate::speculate::QuantifierSmt> {
+        let printer =
+            crate::printer::Printer::new(self.message_interface.clone(), true, self.solver.clone());
+        crate::speculate::find_quantifier(decls, query, qid, &printer)
+    }
+
+    /// The universal quantifiers `decls` and `query` assert that `keep`
+    /// accepts, by qid and whether the query asserts them, as the solver is
+    /// sent them: the query's own first, each qid once.
+    pub fn quantifiers<'a>(
+        &self,
+        decls: impl Iterator<Item = &'a Decl>,
+        query: &Query,
+        keep: impl Fn(&str, bool) -> bool,
+    ) -> Vec<crate::speculate::QuantifierSmt> {
+        let printer =
+            crate::printer::Printer::new(self.message_interface.clone(), true, self.solver.clone());
+        crate::speculate::quantifiers(decls, query, &printer, keep)
+    }
+
     pub fn set_profile_with_logfile_name(&mut self, file_name: String) {
         assert!(matches!(self.state, ContextState::NotStarted));
         self.profile_logfile_name = Some(file_name);
@@ -1220,7 +1298,7 @@ impl Context {
         };
         let (query, snapshots, local_vars, variable_versions) = crate::var_to_const::lower_query(
             &query,
-            self.provenance || self.egraph_request.is_some(),
+            self.provenance || self.egraph_request.is_some() || self.speculation.is_some(),
         );
         self.variable_versions = variable_versions;
         self.air_middle_log.log_query(&query);
