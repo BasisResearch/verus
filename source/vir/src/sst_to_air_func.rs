@@ -129,6 +129,7 @@ fn func_def_quant(
     extra_trigger_terms: &Vec<Typ>,
     extra_binder: Option<Bind>,
     body: Expr,
+    role: QuantRole,
 ) -> Result<Expr, VirErr> {
     let (opts, trait_default_ensures) = if is_trait_default_ensures {
         (
@@ -150,15 +151,7 @@ fn func_def_quant(
         trigs.push(crate::sst_to_air::typ_to_id(ctx, extra_trigger_term));
     }
     Ok(mk_bind_expr(
-        &func_bind_trig(
-            ctx,
-            qid_name.to_string(),
-            typ_params,
-            params,
-            &trigs,
-            opts,
-            Some(QuantRole::Definition),
-        ),
+        &func_bind_trig(ctx, qid_name.to_string(), typ_params, params, &trigs, opts, Some(role)),
         &f_imply,
     ))
 }
@@ -449,6 +442,7 @@ fn func_body_to_air(
         &extra_trigger_terms,
         substs,
         def_body,
+        QuantRole::Definition,
     )?;
     let fuel_bool = str_apply(FUEL_BOOL, &vec![ident_var(&id_fuel)]);
     let def_axiom = mk_unnamed_axiom(mk_implies(&fuel_bool, &e_forall));
@@ -566,6 +560,7 @@ fn req_ens_to_air(
             &vec![],
             None,
             body,
+            QuantRole::Contract,
         )?;
         let req_ens_axiom = mk_unnamed_axiom(e_forall);
         commands.push(Arc::new(CommandX::Global(req_ens_axiom)));
@@ -924,6 +919,7 @@ pub fn func_axioms_to_air(
                         &extra_trigger_terms,
                         substs,
                         body,
+                        QuantRole::Definition,
                     )?;
                     let def_axiom = mk_unnamed_axiom(e_forall);
                     decl_commands.push(Arc::new(CommandX::Global(def_axiom)));

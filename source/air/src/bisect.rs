@@ -40,8 +40,11 @@
 //! Prefix axioms are asserted below the query's scope in an ordinary check,
 //! so the prober asserts the whole prefix again in its own scope, above a
 //! context popped back to the prelude. It also has a vacuity switch that
-//! turns every goal into `false`: a probe with it on answers `valid` exactly
-//! when the assumptions left in are contradictory on every path to a goal.
+//! turns every goal into `false`. A goal's assertion and what follows it are
+//! one conjunction, so with every goal false only the first goal on each path
+//! counts; with the other goals switched off as well, a probe answers `valid`
+//! exactly when the assumptions are contradictory on every path to the one
+//! goal left, which is then proved vacuously.
 
 use crate::ast::{
     AssertId, Axiom, BinaryOp, BindX, Decl, DeclX, Expr, ExprX, Ident, MultiOp, Quant, Query,
@@ -549,7 +552,8 @@ impl<'c> Prober<'c> {
 
     /// `probe` with every goal replaced by `false` (ablation probers only):
     /// `valid` means the assumptions left under `disabled` contradict each
-    /// other on every path to a goal.
+    /// other on every path to the first goal it leaves on. To ask about one
+    /// goal, switch the others off in `disabled`.
     pub fn probe_vacuity(&mut self, disabled: &[bool]) -> Result<Answer, String> {
         if self.vacuity.is_none() {
             return Err("this prober has no vacuity switch".to_string());

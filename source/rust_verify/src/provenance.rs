@@ -862,6 +862,7 @@ impl Symbols {
             (None, Some("definition" | "definition_unfold" | "definition_base")) => {
                 Some(format!("the definition of `{}`", info.fun))
             }
+            (None, Some("contract")) => Some(format!("the requires/ensures of `{}`", info.fun)),
             _ => None,
         }
     }
@@ -1335,10 +1336,10 @@ impl Symbols {
                                 Some(j) => (j.fun, j.span, j.site, j.role),
                                 None => (None, None, None, None),
                             };
-                            // a definition axiom has no quantifier in source:
-                            // locate it at the spec function it defines
+                            // a definition or contract axiom has no quantifier
+                            // in source: locate it at the function it defines
                             let span = span.or_else(|| {
-                                role.filter(|r| r.starts_with("definition"))
+                                role.filter(|r| r.starts_with("definition") || *r == "contract")
                                     .and(qfun.as_ref())
                                     .and_then(|f| self.function_spans.get(f).cloned())
                             });
@@ -1456,6 +1457,7 @@ fn role_name(role: &vir::sst::QuantRole) -> &'static str {
     use vir::sst::QuantRole::*;
     match role {
         Definition => "definition",
+        Contract => "contract",
         DefinitionUnfold => "definition_unfold",
         DefinitionBase => "definition_base",
         FuelDefaults => "fuel_defaults",

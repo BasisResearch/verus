@@ -39,9 +39,9 @@
 //! query's scope, so the solver's journal is popped back to the prelude and
 //! the prefix asserted again in a scope of the ablation's own, each axiom a
 //! function or broadcast group owns guarded by that group's switch. After the
-//! search, two probes with every goal replaced by `false` say whether the
-//! assumptions are contradictory, and the witness is checked once more the
-//! ordinary way with its removed axioms never asserted. Every scope is popped
+//! search, vacuity probes ask goal by goal, last goal first, whether the
+//! assumptions are contradictory where that goal is checked, and the witness
+//! is checked once more the ordinary way with its removed axioms never asserted. Every scope is popped
 //! before the reply; the next request restores its own prefix.
 
 use crate::buckets::BucketId;
@@ -921,6 +921,8 @@ const DEFAULT_ABLATE_CHECKS: usize = 32;
 /// At most this many members of a vacuous load-bearing set are probed for
 /// their part in the contradiction.
 const MAX_PARTICIPATION_CHECKS: usize = 16;
+/// At most this many goals are probed for vacuity per configuration.
+const MAX_VACUITY_GOAL_CHECKS: usize = 8;
 
 /// One switchable part an ablation names: a group of declaration-prefix
 /// axioms, or one of the query's hypotheses.
@@ -935,7 +937,8 @@ struct AblationUnit {
     name: String,
     /// `broadcast` for a broadcast lemma's or group's axioms; otherwise the
     /// roles the encoder recorded for the group's quantifiers (`definition`,
-    /// `definition_unfold`, `definition_base`, `return_type_invariant`).
+    /// `definition_unfold`, `definition_base`, `return_type_invariant`, and
+    /// `contract` for the requires and ensures a call of the function uses).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     roles: Vec<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -964,20 +967,34 @@ struct AblationVerdict {
     incomplete_id: Option<String>,
 }
 
-/// Whether the assumptions are contradictory: probes with every goal
-/// replaced by `false`, where `valid` means no path reaches a goal
-/// consistently.
+/// Whether the assumptions are contradictory where a goal is checked:
+/// probes with one goal replaced by `false` and the other goals switched
+/// off, where `valid` means no path reaches that goal consistently, so the
+/// goal is proved vacuously. Goals are probed last first, up to
+/// `MAX_VACUITY_GOAL_CHECKS` per configuration.
 #[derive(Serialize)]
 struct Vacuity {
-    /// Nothing removed.
+    /// Nothing removed: `valid` when some goal's assumptions are
+    /// contradictory, `invalid` when every goal's were shown consistent, else
+    /// `unknown`.
     before: ProbeVerdict,
-    /// The witness configuration; absent without a witness.
+    /// The same for the witness configuration; absent without a witness.
     #[serde(skip_serializing_if = "Option::is_none")]
     witness: Option<ProbeVerdict>,
-    /// Either probe answered `valid`.
+    /// Either configuration has a goal with contradictory assumptions.
     vacuous: bool,
+    /// That goal: the witness configuration's when it is vacuous (the one
+    /// `participated` is about), else the one found with nothing removed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    goal: Option<AblationGoal>,
+    /// Goals in the query.
+    goals: usize,
+    /// Goals no vacuity probe reached when none was found vacuous.
+    #[serde(skip_serializing_if = "is_zero")]
+    goals_unchecked: u64,
     /// For a vacuous load-bearing set, the members whose removal alone makes
-    /// the assumptions consistent again: the ones the contradiction needs.
+    /// the assumptions at `goal` consistent again: the ones the
+    /// contradiction needs.
     participated: Vec<usize>,
     /// Members not probed for participation, past `MAX_PARTICIPATION_CHECKS`.
     #[serde(skip_serializing_if = "is_zero")]
@@ -1058,6 +1075,78 @@ struct AblateRequest {
     exclude: Vec<usize>,
 }
 
+/// A goal the vacuity probes name.
+#[derive(Serialize)]
+struct AblationGoal {
+    /// Position among the query's units.
+    index: usize,
+    /// The goal's error message (`assertion failed`, ...).
+    description: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    span: Option<String>,
+}
+
+/// What the vacuity probes found in one configuration.
+struct VacuityScan {
+    /// `valid` when some goal's assumptions are contradictory (that goal's
+    /// probe), `invalid` when every goal's were shown consistent, else
+    /// `unknown`.
+    answer: air::bisect::Answer,
+    /// The goal whose assumptions are contradictory.
+    goal: Option<usize>,
+    /// Goals not probed, past `MAX_VACUITY_GOAL_CHECKS`.
+    unchecked: usize,
+}
+
+/// Ask goal by goal whether the assumptions left under `removed` are
+/// contradictory where the goal is checked: that goal replaced by `false`,
+/// every other goal switched off, so an earlier goal reaches it only as the
+/// fact it leaves. `goals` is the order to probe in, last goal first:
+/// assumptions accumulate along a path, so a later goal is the likelier to
+/// see a contradiction. Stops at the first goal whose probe is `valid`.
+/// Without goals, one probe asks about the assumptions alone.
+fn scan_vacuity(
+    prober: &mut air::bisect::Prober<'_>,
+    goals: &[usize],
+    removed: &[usize],
+    checks: &mut usize,
+) -> Result<VacuityScan, String> {
+    use air::bisect::Answer;
+    let count = prober.units().len();
+    let mask = |off: &[usize]| {
+        let mut mask = vec![false; count];
+        for &i in off {
+            mask[i] = true;
+        }
+        mask
+    };
+    if goals.is_empty() {
+        let answer = prober.probe_vacuity(&mask(removed))?;
+        *checks += 1;
+        return Ok(VacuityScan { answer, goal: None, unchecked: 0 });
+    }
+    let mut unknown = None;
+    for (n, &goal) in goals.iter().enumerate() {
+        if n >= MAX_VACUITY_GOAL_CHECKS {
+            let unchecked = goals.len() - n;
+            let answer =
+                unknown.unwrap_or_else(|| Answer::Unknown(format!("{unchecked} goals unchecked")));
+            return Ok(VacuityScan { answer, goal: None, unchecked });
+        }
+        let mut off = removed.to_vec();
+        off.extend(goals.iter().copied().filter(|&g| g != goal));
+        let answer = prober.probe_vacuity(&mask(&off))?;
+        *checks += 1;
+        if answer == Answer::Valid {
+            return Ok(VacuityScan { answer, goal: Some(goal), unchecked: 0 });
+        }
+        if answer != Answer::Invalid && unknown.is_none() {
+            unknown = Some(answer);
+        }
+    }
+    Ok(VacuityScan { answer: unknown.unwrap_or(Answer::Invalid), goal: None, unchecked: 0 })
+}
+
 /// The sorted indices a probe mask switches off.
 fn switched_off(disabled: &[bool]) -> Vec<usize> {
     disabled.iter().enumerate().filter(|(_, off)| **off).map(|(i, _)| i).collect()
@@ -1082,11 +1171,16 @@ fn ablate(
         .map_err(|error| io::Error::other(error.to_string()))?;
     let units = prober.units().to_vec();
     let count = units.len();
-    if let Some(index) = request.exclude.iter().find(|&&i| i >= count) {
+    let no_candidate =
+        |&&i: &&usize| i >= count || matches!(units[i].kind, UnitKind::Goal | UnitKind::Fact);
+    if let Some(index) = request.exclude.iter().find(no_candidate) {
         // A bad request, not a failure of the session.
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            format!("exclude names unit {index}, but the query has {count} units"),
+            format!(
+                "exclude names unit {index}, which is no candidate: the query has {count} \
+                 units, and its goals and facts are never switched"
+            ),
         ));
     }
     let mask = |removed: &[usize]| {
@@ -1158,24 +1252,30 @@ fn ablate(
         _ => outcome.set.clone(),
     });
 
+    // Goal units, last goal first.
+    let goals: Vec<usize> = (0..count).filter(|&i| units[i].kind == UnitKind::Goal).rev().collect();
     let mut extra_checks = 0;
-    let vacuity_before = prober.probe_vacuity(&mask(&[])).map_err(io::Error::other)?;
-    extra_checks += 1;
+    let vacuity_before =
+        scan_vacuity(&mut prober, &goals, &[], &mut extra_checks).map_err(io::Error::other)?;
     let mut vacuity_witness = None;
     let mut participated = Vec::new();
     let mut participation_unchecked = 0;
     if let Some(removed) = &witness_removed {
-        let answer = prober.probe_vacuity(&mask(removed)).map_err(io::Error::other)?;
-        extra_checks += 1;
+        let scan = scan_vacuity(&mut prober, &goals, removed, &mut extra_checks)
+            .map_err(io::Error::other)?;
         // A removal leaves its members out of the contradiction by
-        // definition; only kept members can take part in it.
-        if answer == Answer::Valid && mode == AblateMode::LoadBearing {
+        // definition; only kept members can take part in it. Each is tried
+        // at the goal the scan found contradictory.
+        if scan.answer == Answer::Valid && mode == AblateMode::LoadBearing {
+            let others: Vec<usize> =
+                goals.iter().copied().filter(|&g| Some(g) != scan.goal).collect();
             for (n, &member) in outcome.set.iter().enumerate() {
                 if n >= MAX_PARTICIPATION_CHECKS {
                     participation_unchecked = (outcome.set.len() - n) as u64;
                     break;
                 }
                 let mut without = removed.clone();
+                without.extend(&others);
                 without.push(member);
                 let answer = prober.probe_vacuity(&mask(&without)).map_err(io::Error::other)?;
                 extra_checks += 1;
@@ -1184,7 +1284,7 @@ fn ablate(
                 }
             }
         }
-        vacuity_witness = Some(answer);
+        vacuity_witness = Some(scan);
     }
     drop(prober);
 
@@ -1266,6 +1366,38 @@ fn ablate(
         verdict: answer.into(),
         incomplete_id: details.get(removed).and_then(|d| d.incomplete_id.clone()),
     };
+    let describe_goal = |index: usize| {
+        let message = units[index].error.as_ref().and_then(|e| e.downcast_ref::<MessageX>());
+        AblationGoal {
+            index,
+            description: message.map(|m| m.note.clone()).unwrap_or_default(),
+            span: message.and_then(|m| m.spans.first()).map(|s| s.as_string.clone()),
+        }
+    };
+    let vacuity = {
+        let witness_vacuous =
+            vacuity_witness.as_ref().is_some_and(|scan| scan.answer == Answer::Valid);
+        let vacuous = vacuity_before.answer == Answer::Valid || witness_vacuous;
+        let goal = match (&vacuity_witness, witness_vacuous) {
+            (Some(scan), true) => scan.goal,
+            _ => vacuity_before.goal,
+        };
+        let unchecked = vacuity_witness.as_ref().map_or(0, |scan| scan.unchecked);
+        Vacuity {
+            before: (&vacuity_before.answer).into(),
+            witness: vacuity_witness.as_ref().map(|scan| (&scan.answer).into()),
+            vacuous,
+            goal: goal.map(describe_goal),
+            goals: goals.len(),
+            goals_unchecked: if vacuous {
+                0
+            } else {
+                vacuity_before.unchecked.max(unchecked) as u64
+            },
+            participated,
+            participation_unchecked,
+        }
+    };
     let prefix_axioms =
         prefix.iter().filter(|decl| matches!(&***decl, air::ast::DeclX::Axiom(_))).count();
     Ok(AblateReport {
@@ -1296,13 +1428,7 @@ fn ablate(
         minimal: outcome.minimal,
         non_monotone: outcome.non_monotone,
         started_from_instantiated: outcome.hint_accepted,
-        vacuity: Vacuity {
-            vacuous: vacuity_before == Answer::Valid || vacuity_witness == Some(Answer::Valid),
-            before: (&vacuity_before).into(),
-            witness: vacuity_witness.as_ref().map(ProbeVerdict::from),
-            participated,
-            participation_unchecked,
-        },
+        vacuity,
         absence_check,
         checks_used: outcome.probes.len(),
         extra_checks,
@@ -1345,16 +1471,20 @@ fn absence_check(
         .filter(|&&i| units[i].kind == air::bisect::UnitKind::Hypothesis)
         .filter_map(|&i| units[i].tag.as_ref())
         .collect();
-    let kept = |decl: &air::ast::Decl| match &**decl {
+    // As the prober switches them: prefix axioms by group, the query's own
+    // axioms by hypothesis tag only.
+    let kept_prefix = |decl: &air::ast::Decl| match &**decl {
         DeclX::Axiom(axiom) => {
-            let group = group_of(axiom);
-            !group.is_some_and(|group| groups.contains(group.as_str()))
-                && !axiom.tag.as_ref().is_some_and(|tag| hypotheses.contains(&tag))
+            !group_of(axiom).is_some_and(|group| groups.contains(group.as_str()))
         }
         _ => true,
     };
+    let kept_local = |decl: &air::ast::Decl| match &**decl {
+        DeclX::Axiom(axiom) => !axiom.tag.as_ref().is_some_and(|tag| hypotheses.contains(&tag)),
+        _ => true,
+    };
     let local: Vec<air::ast::Decl> =
-        query.query.local.iter().filter(|d| kept(d)).cloned().collect();
+        query.query.local.iter().filter(|d| kept_local(d)).cloned().collect();
     let stripped = std::sync::Arc::new(air::ast::QueryX {
         local: std::sync::Arc::new(local),
         assertion: query.query.assertion.clone(),
@@ -1362,7 +1492,7 @@ fn absence_check(
     let start = Instant::now();
     air.push();
     let mut asserted = Ok(());
-    for decl in prefix.iter().filter(|d| kept(d)) {
+    for decl in prefix.iter().filter(|d| kept_prefix(d)) {
         if let Err(error) = air.global(decl) {
             asserted = Err(error);
             break;

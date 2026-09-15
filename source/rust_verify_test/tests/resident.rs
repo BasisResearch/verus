@@ -750,12 +750,13 @@ fn resident_ablation_finds_witnesses_and_leaves_the_session_unchanged() {
     assert_eq!(refused["event"], "error", "{refused}");
 
     // A budget of one probe goes to the probe with nothing removed. The
-    // vacuity probe is extra; there is no witness to check for absence.
+    // vacuity probes, one per goal, are extra; there is no witness to check
+    // for absence.
     let reply = ablate!("::buried", json!({"mode": "minimal_removal", "budget_checks": 1}));
     assert_eq!(reply["status"], "budget_exhausted", "{reply}");
     assert_eq!(reply["result"], "none", "{reply}");
     assert_eq!(reply["checks_used"], 1, "{reply}");
-    assert_eq!(reply["extra_checks"], 1, "{reply}");
+    assert_eq!(reply["extra_checks"], reply["vacuity"]["goals"], "{reply}");
     assert!(reply["absence_check"].is_null(), "{}", reply);
     assert!(reply["witness"].as_array().unwrap().is_empty(), "{}", reply);
 
@@ -819,6 +820,96 @@ fn resident_ablation_works_under_provenance_and_spinoff() {
                 "{mode}: {head:?}"
             );
         }
+    }
+}
+
+const VACUITY_SOURCE: &str = r#"
+use vstd::prelude::*;
+verus! {
+    proof fn bad(x: int)
+        requires
+            x > 0,
+        ensures
+            false,
+    { admit(); }
+
+    // the contradiction arrives after the first goal, bad's precondition
+    proof fn late(x: int)
+        requires
+            x > 0,
+    {
+        bad(x);
+        assert(x == x + 1);
+    }
+
+    proof fn consistent(x: int)
+        requires
+            x > 0,
+    {
+        assert(x > 0);
+        assert(x >= 1);
+    }
+}
+"#;
+
+/// A contradiction a lemma's ensures brings in after the first goal makes a
+/// later goal vacuous: ablation names that goal, and the lemma's contract as
+/// what the contradiction needs.
+#[test]
+fn resident_ablation_finds_a_contradiction_after_the_first_goal() {
+    let mut worker = Worker::start(VACUITY_SOURCE, &[]);
+    let ready = worker.receive();
+    let session = ready["session"].clone();
+    let request = |name: &str, extra: Value| -> Value {
+        let mut request = json!({
+            "command": "ablate", "session": session, "bucket": 0, "query": query_id(&ready, name),
+            "mode": "auto",
+        });
+        request.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        request
+    };
+
+    let reply = worker.send(request("::late", json!({})));
+    assert_eq!(reply["event"], "ablated", "{reply}");
+    assert_eq!(reply["result"], "load_bearing_set", "{reply}");
+    let vacuity = &reply["vacuity"];
+    assert_eq!(vacuity["vacuous"], true, "{reply}");
+    assert_eq!(vacuity["before"]["result"], "valid", "{reply}");
+    assert!(vacuity["goals"].as_u64().unwrap() >= 2, "{}", reply);
+    let line = VACUITY_SOURCE.lines().position(|l| l.contains("assert(x == x + 1)")).unwrap() + 1;
+    let span = vacuity["goal"]["span"].as_str().unwrap();
+    assert!(span.contains(&format!("fixture.rs:{line}:")), "{}", reply);
+    // The lemma's ensures is the contradiction, and its group says it is a
+    // contract, not a definition.
+    let bad = reply["witness"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|unit| unit["name"].as_str().unwrap().ends_with("::bad"))
+        .unwrap_or_else(|| panic!("bad is load-bearing: {reply}"));
+    assert_eq!(bad["roles"], json!(["contract"]), "{reply}");
+    let participated = vacuity["participated"].as_array().unwrap();
+    assert!(participated.contains(&bad["index"]), "{}", reply);
+    assert_eq!(reply["absence_check"]["agrees"], true, "{reply}");
+
+    // A goal is no candidate, so excluding one is refused.
+    let goal = vacuity["goal"]["index"].clone();
+    let refused = worker.send(request("::late", json!({"exclude": [goal]})));
+    assert_eq!(refused["event"], "error", "{refused}");
+
+    // Consistent assumptions: every goal probed, none vacuous.
+    let reply = worker.send(request("::consistent", json!({})));
+    assert_eq!(reply["event"], "ablated", "{reply}");
+    let vacuity = &reply["vacuity"];
+    assert_eq!(vacuity["vacuous"], false, "{reply}");
+    assert!(vacuity["goals"].as_u64().unwrap() >= 2, "{}", reply);
+    assert!(vacuity["goal"].is_null(), "{}", reply);
+    assert!(vacuity["goals_unchecked"].is_null(), "{}", reply);
+
+    assert_eq!(worker.send(json!({"command": "close", "session": session}))["event"], "closed");
+    worker.finish(true);
+    for log in smt_logs(worker.dir.path()) {
+        assert_eq!(log.matches("(push").count(), log.matches("(pop").count());
     }
 }
 
