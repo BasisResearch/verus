@@ -733,6 +733,42 @@ impl Symbols {
         }
     }
 
+    /// Why the quantifier the solver names `qid` exists, as the encoder that
+    /// emitted it said (`definition`, `requires`, ...).
+    pub(crate) fn quantifier_role(&self, qid: &str) -> Option<&'static str> {
+        self.quantifiers.get(qid).and_then(|q| q.role)
+    }
+
+    /// The axioms `path` states, as a broadcast lemma or group states its
+    /// axiom, as `(tag, owner)`: the function at exactly that path (with or
+    /// without `crate::`), else every function whose path ends in `::path`,
+    /// so a bare name can match several functions.
+    pub(crate) fn axioms_owned_by(&self, path: &str) -> Vec<(String, String)> {
+        let path = path.trim();
+        let bare = path.strip_prefix("crate::").unwrap_or(path);
+        if bare.is_empty() {
+            return Vec::new();
+        }
+        let exact =
+            |owner: &str| owner == path || owner == bare || owner == format!("crate::{bare}");
+        let suffix = format!("::{bare}");
+        let pick = |select: &dyn Fn(&str) -> bool| {
+            let mut owned: Vec<(String, String)> = self
+                .axiom_owners
+                .iter()
+                .filter(|(_, owner)| select(owner))
+                .map(|(tag, owner)| (tag.clone(), owner.clone()))
+                .collect();
+            owned.sort();
+            owned
+        };
+        let found = pick(&exact);
+        if !found.is_empty() {
+            return found;
+        }
+        pick(&|owner: &str| owner.ends_with(&suffix))
+    }
+
     /// Every `:qid` owned at `path` or inside it, matching whole segments:
     /// `a::S` takes `a::S`, `a::S::f` and `a::S<int.>` but not `a::Seq`. The
     /// prelude's quantifiers belong to nothing and are never found.
@@ -888,7 +924,7 @@ impl Symbols {
     }
 
     /// Join one tag from a reply about one of `fun`'s queries back to source.
-    fn tag_of(&self, fun: &Fun, symbol: &str) -> ResolvedTag {
+    pub(crate) fn tag_of(&self, fun: &Fun, symbol: &str) -> ResolvedTag {
         let mut r =
             ResolvedTag { tag: symbol.to_string(), kind: String::new(), owner: None, span: None };
         match air::def::ProvenanceTag::from_symbol(symbol) {
