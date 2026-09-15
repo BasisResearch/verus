@@ -2423,12 +2423,15 @@ struct ScaffoldTarget {
     labels: Vec<SourceLabel>,
     /// How often the goal occurs; `P` is placed before each occurrence.
     occurrences: usize,
-    /// The span `placement` refers to, when it refers to one: the goal's own,
-    /// or for a postcondition the "end of the function body" label's.
+    /// The span `placement` refers to, when it refers to one: the goal's own;
+    /// for a postcondition at an early `return`, the return's ("at this
+    /// exit"); for one at the end of the body, the "end of the function body"
+    /// label's (the body's final expression, or with none the function).
     insert_before: Option<String>,
     /// Where `assert(P);` goes in the source: `before_span`, right before
-    /// `insert_before`; `end_of_body`, at the end of the function body (a
-    /// postcondition); `end_of_loop_body` or `before_loop` (a loop
+    /// `insert_before` (a postcondition at an early `return` included);
+    /// `end_of_body`, at the end of the function body (a postcondition
+    /// checked there); `end_of_loop_body` or `before_loop` (a loop
     /// invariant, checked there, which no span names); `end_of_proof_block`
     /// (the claim of `assert ... by`, checked after that block's steps; a
     /// goal among the steps is `before_span`).
@@ -2998,21 +3001,24 @@ fn scaffold_arms(
     // Where the snippet goes. The claim of `assert ... by` is checked after
     // that block's steps: it ends its dead end, and `by` follows its span. A
     // closure body's last assert ends one too, with no `by`; when the source
-    // cannot be read, the dead end decides. A postcondition goes at the end
-    // of the body, which its label names; a loop invariant at the end of the
-    // loop body or before the loop, which no span names, or at the break or
-    // continue its span is; anything else, a step of a proof block included,
-    // at its own span.
+    // cannot be read, the dead end decides. A postcondition is checked at
+    // each exit, which a label names (its primary span is the `ensures`
+    // clause): at an early `return`, right before it; at the end of the body
+    // (the body's final expression, or with none the function), there. A
+    // loop invariant goes at the end of the loop body or before the loop,
+    // which no span names, or at the break or continue its span is; anything
+    // else, a step of a proof block included, at its own span.
     let claim_of_assert_by =
         given.ends_dead_end && primary.as_deref().and_then(followed_by_by).unwrap_or(true);
+    let label =
+        |text: &str| labels.iter().find(|l| l.message.contains(text)).map(|l| l.span.clone());
     let (insert_before, placement) = if claim_of_assert_by {
         (None, "end_of_proof_block")
     } else if description.contains("postcondition") {
-        let end = labels
-            .iter()
-            .find(|l| l.message.contains("end of the function body"))
-            .map(|l| l.span.clone());
-        (end.or_else(|| primary.clone()), "end_of_body")
+        match label("at this exit") {
+            Some(exit) => (Some(exit), "before_span"),
+            None => (label("end of the function body").or_else(|| primary.clone()), "end_of_body"),
+        }
     } else if description == vir::def::INV_FAIL_LOOP_END {
         (None, "end_of_loop_body")
     } else if description == vir::def::INV_FAIL_LOOP_FRONT {
