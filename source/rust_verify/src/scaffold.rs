@@ -14,10 +14,12 @@
 //! - a call, method call, field or index is a function, constructor or field
 //!   accessor whose recorded source path ends with the path written, declared
 //!   in the query's scope, with the right number of value arguments. Several
-//!   candidates are narrowed to those the query applies, then to those whose
-//!   argument sorts fit. A generic function's type arguments are taken from
-//!   the query's own applications of it, so a function the query never
-//!   applies cannot be called generically;
+//!   candidates are narrowed to the receiver's type where the query names it
+//!   (a `has_type` fact, or a monomorphic sort), then to those the query
+//!   applies, then to those whose argument sorts fit. A generic function's
+//!   type arguments come from the receiver's stated type, else from the
+//!   query's own applications of it, so a function the query never applies
+//!   cannot be called generically;
 //! - values are boxed and unboxed (`I`, `%I`, `Poly%D`, ...) where sorts
 //!   differ, as the encoders do, and integer arithmetic uses the prelude's
 //!   `Add`, `Sub`, `Mul`, `EucDiv`, `EucMod`, so the solver's triggers see
@@ -492,6 +494,64 @@ fn is_poly(typ: &Typ) -> bool {
     matches!(&**typ, TypX::Named(name) if **name == vir::def::POLY)
 }
 
+/// A stated type as the query writes it, for a message.
+fn render_type(typ: &Expr) -> String {
+    let printer = air::printer::Printer::new(
+        Arc::new(vir::messages::VirMessageInterface {}),
+        true,
+        air::context::SmtSolver::Cvc5,
+    );
+    air::printer::node_to_string(&printer.expr_to_node(typ))
+}
+
+/// Whether a value of the stated type `typ` (`INT`, `BOOL`, `(UINT 8)`,
+/// `(TYPE%vstd!seq.Seq. $ (UINT 8))`) unboxes to sort `to`; `None` when the
+/// type does not say, as a type parameter does not.
+fn type_fits(typ: &Expr, to: &Typ) -> Option<bool> {
+    let head = match &**typ {
+        ExprX::Var(name) | ExprX::Apply(name, _) => name.as_str(),
+        _ => return None,
+    };
+    use vir::def::*;
+    let integer = matches!(
+        head,
+        TYPE_ID_INT
+            | TYPE_ID_NAT
+            | TYPE_ID_USIZE
+            | TYPE_ID_ISIZE
+            | TYPE_ID_CHAR
+            | TYPE_ID_UINT
+            | TYPE_ID_SINT
+            | TYPE_ID_CONST_INT
+    );
+    let path = head.strip_prefix(PREFIX_TYPE_ID);
+    if !integer && head != TYPE_ID_BOOL && path.is_none() {
+        return None;
+    }
+    Some(match &**to {
+        TypX::Int => integer,
+        TypX::Bool => head == TYPE_ID_BOOL,
+        TypX::Named(sort) => path.is_some_and(|path| path == sort_base(sort)),
+        _ => return None,
+    })
+}
+
+/// A sort's type path: a monomorphic sort (`vstd!seq.Seq<u8.>.`) carries
+/// the type arguments in angle brackets, which the path drops.
+fn sort_base(sort: &str) -> String {
+    let mut depth = 0usize;
+    sort.chars()
+        .filter(|c| {
+            match c {
+                '<' => depth += 1,
+                '>' => depth = depth.saturating_sub(1),
+                _ => return depth == 0,
+            }
+            false
+        })
+        .collect()
+}
+
 /// A source path's segments, with generic arguments dropped: `a::S<int>::f`
 /// is `a`, `S`, `f`.
 fn segments(path: &str) -> Vec<String> {
@@ -544,6 +604,10 @@ impl<'e, 'a> Lowerer<'e, 'a> {
         matches!((self.env.declared)(head), Some(Declared::Fun(..)))
     }
 
+    /// Box or unbox `expr` from one sort to another. A boxed local is not
+    /// unboxed to a sort the `has_type` facts say it isn't: `%I` of a
+    /// sequence would type-check and ask the solver about a different claim
+    /// than the one written.
     fn coerce(&self, expr: Expr, from: &Typ, to: &Typ) -> Result<Expr, String> {
         if from == to {
             return Ok(expr);
@@ -563,13 +627,28 @@ impl<'e, 'a> Lowerer<'e, 'a> {
                 TypX::Named(sort) => apply(format!("{}{}", vir::def::PREFIX_BOX, sort)),
                 _ => Err(format!("cannot box a {}", sort_name(from))),
             },
-            (_, _) if is_poly(from) => match &**to {
-                TypX::Int => apply(vir::def::UNBOX_INT.to_owned()),
-                TypX::Bool => apply(vir::def::UNBOX_BOOL.to_owned()),
-                TypX::Real => apply(vir::def::UNBOX_REAL.to_owned()),
-                TypX::Named(sort) => apply(format!("{}{}", vir::def::PREFIX_UNBOX, sort)),
-                _ => Err(format!("cannot unbox to a {}", sort_name(to))),
-            },
+            (_, _) if is_poly(from) => {
+                if let ExprX::Var(x) = &*expr {
+                    if let Some(typ) =
+                        self.stated_type(x).filter(|typ| type_fits(typ, to) == Some(false))
+                    {
+                        let name =
+                            source_symbol(self.env.names, x).unwrap_or_else(|| x.to_string());
+                        return Err(format!(
+                            "`{name}` is no {} (its type is {})",
+                            sort_name(to),
+                            render_type(typ)
+                        ));
+                    }
+                }
+                match &**to {
+                    TypX::Int => apply(vir::def::UNBOX_INT.to_owned()),
+                    TypX::Bool => apply(vir::def::UNBOX_BOOL.to_owned()),
+                    TypX::Real => apply(vir::def::UNBOX_REAL.to_owned()),
+                    TypX::Named(sort) => apply(format!("{}{}", vir::def::PREFIX_UNBOX, sort)),
+                    _ => Err(format!("cannot unbox to a {}", sort_name(to))),
+                }
+            }
             _ => Err(format!("expected a {}, found a {}", sort_name(to), sort_name(from))),
         }
     }
@@ -596,9 +675,9 @@ impl<'e, 'a> Lowerer<'e, 'a> {
 
     /// A boxed local's Verus type, from the `has_type` facts the query
     /// states about it, when one is stated.
-    fn boxed_type(&self, x: &Ident) -> Option<&Expr> {
+    fn stated_type(&self, x: &Ident) -> Option<&Expr> {
         self.env.occurrences.applications.iter().find_map(|(head, args)| match &args[..] {
-            [value, typ] if **head == "has_type" => match &**value {
+            [value, typ] if **head == vir::def::HAS_TYPE => match &**value {
                 ExprX::Var(y) if y == x => Some(typ),
                 _ => None,
             },
@@ -606,33 +685,65 @@ impl<'e, 'a> Lowerer<'e, 'a> {
         })
     }
 
-    /// An integer operand. A boxed value is unboxed, except a local the query
-    /// says is not an integer: unboxing a sequence would type-check and ask
-    /// the solver about a different claim than the one written.
-    fn int(&self, e: (Expr, Typ)) -> Result<Expr, String> {
-        if let (ExprX::Var(x), true) = (&*e.0, is_poly(&e.1)) {
-            let integer = |typ: &Expr| match &**typ {
-                ExprX::Var(name) => {
-                    matches!(name.as_str(), "INT" | "NAT" | "USIZE" | "ISIZE" | "CHAR")
-                }
-                ExprX::Apply(name, _) => matches!(name.as_str(), "UINT" | "SINT"),
-                _ => false,
-            };
-            if let Some(typ) = self.boxed_type(x).filter(|typ| !integer(typ)) {
-                let printer = air::printer::Printer::new(
-                    Arc::new(vir::messages::VirMessageInterface {}),
-                    true,
-                    air::context::SmtSolver::Cvc5,
-                );
-                let typ = air::printer::node_to_string(&printer.expr_to_node(typ));
-                let name = source_symbol(self.env.names, x).unwrap_or_else(|| x.to_string());
-                return Err(format!(
-                    "`{name}` is no integer (its type is {typ}); arithmetic and ordering read \
-                     integers only: write `a.add(b)` to concatenate, `s.len()` for a length"
-                ));
+    /// The stated type of a boxed local, as the mangled path of its type
+    /// (`vstd!seq.Seq.` from `TYPE%vstd!seq.Seq.`) and the type arguments
+    /// the fact applies it to. A method of that type takes those.
+    fn receiver_type(&self, receiver: &Expr) -> Option<(String, Vec<Expr>)> {
+        let ExprX::Var(x) = &**receiver else { return None };
+        let (head, args) = match &**self.stated_type(x)? {
+            ExprX::Apply(head, args) => (head, args.to_vec()),
+            ExprX::Var(head) => (head, Vec::new()),
+            _ => return None,
+        };
+        Some((head.strip_prefix(vir::def::PREFIX_TYPE_ID)?.to_owned(), args))
+    }
+
+    /// Whether a candidate is a method of a receiver's type, when the query
+    /// says that type: a boxed local's stated type or a monomorphic sort
+    /// (`vstd!seq.Seq<u8.>.`) names the type, whose methods' heads start
+    /// with it; a receiver that is itself a method's result (`s.subrange(i,
+    /// j)`) is of that method's impl, as `s.subrange(i, j).len()` is.
+    fn of_receivers_type(
+        &self,
+        receiver: &(Expr, Typ),
+    ) -> Option<Box<dyn Fn(&Candidate) -> bool + '_>> {
+        let (expr, typ) = receiver;
+        if is_poly(typ) {
+            if let Some((path, _)) = self.receiver_type(expr) {
+                return Some(Box::new(move |c| c.head.starts_with(&path)));
             }
+            let ExprX::Apply(head, _) = &**expr else { return None };
+            let SourceName::Function { name, .. } = self.env.names.get(&**head)? else {
+                return None;
+            };
+            let mut parent = segments(name);
+            parent.pop()?;
+            Some(Box::new(move |c| {
+                let mut theirs = segments(&c.source);
+                theirs.pop();
+                theirs == parent
+            }))
+        } else if let TypX::Named(sort) = &**typ {
+            let path = sort_base(sort);
+            Some(Box::new(move |c| c.head.starts_with(&path)))
+        } else {
+            None
         }
-        self.coerce(e.0, &e.1, &Arc::new(TypX::Int))
+    }
+
+    /// An integer operand: a boxed value is unboxed, unless the query says
+    /// it is no integer.
+    fn int(&self, e: (Expr, Typ)) -> Result<Expr, String> {
+        self.coerce(e.0, &e.1, &Arc::new(TypX::Int)).map_err(|error| {
+            if error.contains("is no integer") {
+                format!(
+                    "{error}; arithmetic and ordering read integers only: write `a.add(b)` to \
+                     concatenate, `s.len()` for a length"
+                )
+            } else {
+                error
+            }
+        })
     }
 
     fn bool(&self, e: (Expr, Typ)) -> Result<Expr, String> {
@@ -780,6 +891,17 @@ impl<'e, 'a> Lowerer<'e, 'a> {
         }
         candidates = arity;
         if candidates.len() > 1 {
+            // A receiver whose type the query names takes that type's
+            // methods: `s.len()` is `Seq::len`, not `Set::len`.
+            if let Some(of_type) = args.first().and_then(|r| self.of_receivers_type(r)) {
+                let of_type: Vec<Candidate> =
+                    candidates.iter().filter(|c| of_type(c)).cloned().collect();
+                if !of_type.is_empty() {
+                    candidates = of_type;
+                }
+            }
+        }
+        if candidates.len() > 1 {
             let used: Vec<Candidate> = candidates
                 .iter()
                 .filter(|c| self.applied(&c.head).next().is_some())
@@ -855,6 +977,13 @@ impl<'e, 'a> Lowerer<'e, 'a> {
     /// only type arguments they use, or those of an application to the same
     /// values, or failing that to the same first value.
     fn type_args(&mut self, c: &Candidate, values: &[Expr]) -> Result<Vec<Expr>, String> {
+        // A boxed receiver whose type the query states, `(has_type s (TYPE%T
+        // args))`, gives a method of `T` the type's own arguments.
+        if let Some((typ, args)) = values.first().and_then(|v| self.receiver_type(v)) {
+            if c.head.starts_with(&typ) && args.len() == c.type_args {
+                return Ok(args);
+            }
+        }
         // A receiver that is itself an application of a method of the same
         // impl, such as `s.subrange(i, j)` under `.len()`, carries the
         // impl's type arguments.
@@ -1245,6 +1374,10 @@ mod tests {
             "vstd!seq.Seq.len.?".into(),
             SourceName::Function { name: "vstd::seq::Seq::len".into(), type_args: 2 },
         );
+        names.insert(
+            "vstd!set.Set.len.?".into(),
+            SourceName::Function { name: "vstd::set::Set::len".into(), type_args: 2 },
+        );
         names.insert("Add".into(), SourceName::Operator("+".into()));
         let int: Typ = Arc::new(TypX::Int);
         let poly: Typ = Arc::new(TypX::Named(Arc::new("Poly".into())));
@@ -1267,6 +1400,15 @@ mod tests {
         occurrences
             .applications
             .push((Arc::new("vstd!seq.Seq.len.?".to_owned()), Arc::new(vec![dcr, ty, v])));
+        // a set's length too, so `len` alone names two applied methods
+        occurrences.applications.push((
+            Arc::new("vstd!set.Set.len.?".to_owned()),
+            Arc::new(vec![
+                Arc::new(ExprX::Var(Arc::new("$".to_owned()))),
+                Arc::new(ExprX::Var(Arc::new("INT".to_owned()))),
+                Arc::new(ExprX::Var(Arc::new("w!".to_owned()))),
+            ]),
+        ));
         occurrences.statement_variables.insert(Arc::new("n$2@".to_owned()));
         // `s` is stated to be a sequence; `v` is boxed with no type stated
         let var = |x: &str| Arc::new(ExprX::Var(Arc::new(x.to_owned())));
@@ -1306,7 +1448,10 @@ mod tests {
             "vstd!seq.Seq.index.?" => {
                 fun(vec![dcr.clone(), t.clone(), poly.clone(), poly.clone()], &poly)
             }
-            "vstd!seq.Seq.add.?" => fun(vec![dcr, t, poly.clone(), poly.clone()], &poly),
+            "vstd!seq.Seq.add.?" => {
+                fun(vec![dcr.clone(), t.clone(), poly.clone(), poly.clone()], &poly)
+            }
+            "vstd!set.Set.len.?" => fun(vec![dcr, t, poly.clone()], &int),
             "Poly%vstd!seq.Seq<u8.>." => {
                 fun(vec![Arc::new(TypX::Named(Arc::new("vstd!seq.Seq<u8.>.".into())))], &poly)
             }
@@ -1345,13 +1490,25 @@ mod tests {
         assert_eq!(smt, "(> (k!f.? (I (Add x! 1))) x!)");
         let (smt, _) = lowered("crate::f(x) == 0").unwrap();
         assert_eq!(smt, "(= (k!f.? (I x!)) 0)");
-        // type arguments from the query's own application
-        let (smt, _) = lowered("v.len() >= 0").unwrap();
-        assert_eq!(smt, "(>= (vstd!seq.Seq.len.? $ NAT v!) 0)");
         // the shadowing binding the statements use
         let (smt, choices) = lowered("n == 2").unwrap();
         assert_eq!(smt, "(= n$2@ 2)");
         assert_eq!(choices.len(), 1, "{choices:?}");
+    }
+
+    /// `s` is stated to be a `Seq<nat>`: `s.len()` is `Seq::len`, not the
+    /// `Set::len` the query also applies, at the stated type arguments. `v`
+    /// is boxed with no type stated, so `len` is ambiguous for it.
+    #[test]
+    fn a_stated_type_picks_the_method_and_its_type_arguments() {
+        let (smt, choices) = lowered("s.len() >= 0").unwrap();
+        assert_eq!(smt, "(>= (vstd!seq.Seq.len.? $ NAT s!) 0)");
+        assert!(choices.is_empty(), "{choices:?}");
+        let error = lowered("v.len() >= 0").unwrap_err();
+        assert!(error.contains("could be any of"), "{error}");
+        // named in full, the type arguments come from the query's application
+        let (smt, _) = lowered("Seq::len(v) >= 0").unwrap();
+        assert_eq!(smt, "(>= (vstd!seq.Seq.len.? $ NAT v!) 0)");
     }
 
     /// Verus declares a sequence local in a monomorphic sort and boxes it at
@@ -1387,9 +1544,11 @@ mod tests {
             ("f(x, x) > 0", "argument"),
             ("x", "not a bool"),
             ("y > 0", "no variable"),
-            ("x.len() > 0", "generic"),
+            ("x.len() > 0", "could be any of"),
             ("s + 1 > 0", "no integer"),
             ("s < x", "no integer"),
+            ("s == 1", "no integer"),
+            ("if x > 0 { s } else { 1 } == 1", "no integer"),
         ] {
             let error = lowered(text).unwrap_err();
             assert!(error.contains(reason), "{text}: {error}");
@@ -1399,7 +1558,7 @@ mod tests {
         let none = Occurrences::default();
         let env =
             Env { names: &names, crate_name: "k", locals, declared: &declared, occurrences: &none };
-        let error = lower("v.len() > 0", &env).err().unwrap();
+        let error = lower("Seq::len(v) > 0", &env).err().unwrap();
         assert!(error.contains("never applies"), "{error}");
         let _ = HashMap::<(), ()>::new();
     }
