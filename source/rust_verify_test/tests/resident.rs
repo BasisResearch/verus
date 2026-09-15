@@ -2156,18 +2156,27 @@ verus! {
 "#;
 
 /// A query without an rlimit gives its rungs the default one rather than no
-/// limit at all, and a pinned attempt runs at the budget that proved it.
+/// limit at all, and a pinned attempt runs at the budget that proved it, also
+/// after a rung on another query ran out of its budget.
 #[test]
 fn resident_ladder_bounds_a_query_without_an_rlimit() {
     let mut worker =
         Worker::start_with_env(UNBOUNDED_SOURCE, &[], &[("VERUS_RESIDENT_STRATEGY_LADDER", "1")]);
     let ready = worker.receive();
     let session = ready["session"].clone();
+    // Unbounded, enumerative instantiation would never answer this one.
+    let growing = worker.send(json!({"command":"ladder", "session":session, "bucket":0,
+        "query":query_id(&ready, "::growing"), "rungs":["enum"]}));
+    let enumerative = rung(&growing, "enum");
+    assert_eq!(enumerative["rlimit"], 10.0, "{growing}");
+    assert!(enumerative["resource_limit"].as_u64().unwrap() > 0, "{}", growing);
+    assert_ne!(enumerative["verdict"], "valid", "{growing}");
     // A pin found at a budget below the query's is tried at that budget.
     // (Enumerative instantiation alone spends 5 on the prelude; alongside
-    // E-matching it proves this in a small part of it.) This runs before the
-    // `growing` rung below: the terms that rung's instances make outlast its
-    // check in cvc5, and make later checks on the solver far costlier.
+    // E-matching it proves this in a small part of it.) It follows the rung
+    // above, cut off by its budget: a cvc5 before BasisResearch/cvc5#15 sent
+    // that rung's unsent instances into the next query, and this ladder then
+    // ran out of its budget.
     let untriggered = query_id(&ready, "::untriggered");
     let ladder = worker.send(json!({"command":"ladder", "session":session, "bucket":0,
         "query":untriggered, "rungs":["enum"], "alongside":true, "budgets":{"enum":5}}));
@@ -2181,13 +2190,6 @@ fn resident_ladder_bounds_a_query_without_an_rlimit() {
     assert_eq!(checked["result"], "valid", "{checked}");
     assert_eq!(checked["pinned"]["rlimit"], 5.0, "{checked}");
     assert_eq!(checked["pinned"]["closed"], true, "{checked}");
-    // Unbounded, enumerative instantiation would never answer this one.
-    let growing = worker.send(json!({"command":"ladder", "session":session, "bucket":0,
-        "query":query_id(&ready, "::growing"), "rungs":["enum"]}));
-    let enumerative = rung(&growing, "enum");
-    assert_eq!(enumerative["rlimit"], 10.0, "{growing}");
-    assert!(enumerative["resource_limit"].as_u64().unwrap() > 0, "{}", growing);
-    assert_ne!(enumerative["verdict"], "valid", "{growing}");
     worker.finish(false);
 }
 
