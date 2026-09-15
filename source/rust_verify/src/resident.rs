@@ -2483,6 +2483,17 @@ fn serve_egraph(
 /// longer binds.
 const UNBOUND_VARIABLE: &str = "the formula binds no variable named ";
 
+/// The variable an instantiation named that cvc5's formula no longer binds,
+/// when cvc5 refused the instance for that.
+fn unbound_variable(reply: &SpeculationReply) -> Option<String> {
+    reply
+        .hypotheses
+        .iter()
+        .find(|h| h.kind == "instantiate" && h.status == "mismatch")
+        .and_then(|h| h.reason.as_deref()?.strip_prefix(UNBOUND_VARIABLE))
+        .map(str::to_owned)
+}
+
 /// The most rounds of rising depth a probe may ask to make a matching loop.
 const MAX_LOOP_THRESHOLD: u32 = 1000;
 /// The most quantifiers a probe lists as candidates.
@@ -3787,13 +3798,7 @@ fn serve_speculate(
     let (after_result, after_ms, after_reply) = loop {
         let (result, ms, reply, _) =
             speculation_check(air, query, lowered.clone(), loop_threshold, set_rlimit)?;
-        let unbound = reply
-            .hypotheses
-            .iter()
-            .find(|h| h.kind == "instantiate" && h.status == "mismatch")
-            .and_then(|h| h.reason.as_deref()?.strip_prefix(UNBOUND_VARIABLE))
-            .map(str::to_owned);
-        match (&mut lowered, unbound) {
+        match (&mut lowered, unbound_variable(&reply)) {
             (Hypothesis::Instantiate { subst, .. }, Some(name))
                 if subst.len() > 1 && subst.iter().any(|(v, _)| *v == name) =>
             {
@@ -6364,6 +6369,36 @@ mod tests {
         // a hole has no sort, so it is left as it is
         assert_eq!(lower("f(s(_))", None), "(m!f.? (I (m!s.? _)))");
         assert_eq!(lower("(m!f.? (I a!))", Some("Int")), "(m!f.? (I a!))");
+    }
+
+    /// cvc5's refusal of an instance for a variable its formula no longer
+    /// binds names the variable to send the instance again without; no
+    /// other refusal does.
+    #[test]
+    fn an_eliminated_variable_is_read_from_the_refusal() {
+        let reply = |kind: &str, status: &str, reason: &str| SpeculationReply {
+            hypotheses: vec![
+                air::speculate::HypothesisReport { kind: "observe".into(), ..Default::default() },
+                air::speculate::HypothesisReport {
+                    kind: kind.into(),
+                    status: status.into(),
+                    reason: Some(reason.into()),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let unbound = format!("{UNBOUND_VARIABLE}y$");
+        assert_eq!(
+            unbound_variable(&reply("instantiate", "mismatch", &unbound)).as_deref(),
+            Some("y$")
+        );
+        assert_eq!(
+            unbound_variable(&reply("instantiate", "mismatch", "no term for the variable x$")),
+            None
+        );
+        assert_eq!(unbound_variable(&reply("instantiate", "rejected", &unbound)), None);
+        assert_eq!(unbound_variable(&reply("trigger", "mismatch", &unbound)), None);
     }
 
     /// Terms that stand outside the quantifier never name its variables; a

@@ -2392,11 +2392,12 @@ fn resident_speculate_reads_terms_at_the_goal() {
     assert_eq!(method["status"], "applied", "{method}");
     assert_eq!(method["closed"], true, "{method}");
 
-    // `x == y` lets cvc5 eliminate one of the variables; the instance goes
+    // A generic quantifier with an equality guard. cvc5 at da4b2b0073 keeps
+    // both variables of this one (the equality is between boxed values
+    // under type guards); where it eliminates one, the instance goes
     // without it, and a snippet offered is the instance cvc5 made.
     let eliminated =
         probe_own(&mut worker, &ready, "::eliminated", instantiation(json!({"x": "a", "y": "a"})));
-    println!("eliminated: {eliminated}");
     assert_eq!(eliminated["closed"], true, "{eliminated}");
     if let Some(snippet) = eliminated["verus_snippet"].as_str() {
         let source = SPECULATE_GOAL_SOURCE
