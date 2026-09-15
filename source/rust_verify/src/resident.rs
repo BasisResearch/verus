@@ -1007,6 +1007,10 @@ struct AblateReport {
     /// was probed and loses the result. False when the budget ran out first.
     minimal: bool,
     non_monotone: bool,
+    /// load_bearing only: the search started from the units the probe with
+    /// nothing removed instantiated (and those with no quantifier), because
+    /// they alone kept the query valid.
+    started_from_instantiated: bool,
     vacuity: Vacuity,
     #[serde(skip_serializing_if = "Option::is_none")]
     absence_check: Option<AbsenceCheck>,
@@ -1083,10 +1087,31 @@ fn ablate(
         AblateMode::LoadBearing => Mode::Core,
         _ => Mode::Flip(Target::Valid),
     };
-    let outcome = air::bisect::search(
+    // Should removing everything overshoot, single units are tried most
+    // instantiated first: a matching loop's lemma leads. A core search first
+    // tries keeping only what the probe with nothing removed instantiated,
+    // with the units that have no quantifier to instantiate: a proof's
+    // instantiation stream names what it used, and ddmin then shrinks a set
+    // of a few dozen rather than every group in the prefix.
+    let mut order = candidates.clone();
+    let mut core_start = Vec::new();
+    if let Some(counts) = details.get(&Vec::new()).and_then(|d| d.instantiations.as_ref()) {
+        let weight = |i: usize| -> u64 {
+            units[i].qids.iter().map(|qid| counts.get(qid).copied().unwrap_or(0)).sum()
+        };
+        order.sort_by_key(|&i| std::cmp::Reverse(weight(i)));
+        core_start = candidates
+            .iter()
+            .copied()
+            .filter(|&i| units[i].qids.is_empty() || weight(i) > 0)
+            .collect();
+    }
+    let outcome = air::bisect::search_ordered(
         search_mode,
         count,
         &candidates,
+        &order,
+        &core_start,
         request.budget,
         Some(before),
         &mut |disabled| -> Result<Answer, String> {
@@ -1232,6 +1257,7 @@ fn ablate(
         verdict_all_removed: outcome.all_removed.as_ref().map(ProbeVerdict::from),
         minimal: outcome.minimal,
         non_monotone: outcome.non_monotone,
+        started_from_instantiated: outcome.hint_accepted,
         vacuity: Vacuity {
             vacuous: vacuity_before == Answer::Valid || vacuity_witness == Some(Answer::Valid),
             before: (&vacuity_before).into(),

@@ -678,9 +678,11 @@ fn resident_ablation_finds_witnesses_and_leaves_the_session_unchanged() {
 
     // The loop lemma hides a proof that needs a dozen rounds of unfolding:
     // removing it alone makes the query valid, and it is not a vacuity.
-    // Removing every candidate loses the proof too, so the search tries
-    // one unit at a time, through every group in the prefix: a larger budget.
-    let reply = ablate!("::buried", json!({"mode": "auto", "budget_checks": 200}));
+    // Removing every candidate loses the proof too, so the search tries one
+    // unit at a time, most instantiated first: the loop lemma comes first.
+    let reply = ablate!("::buried", json!({"mode": "auto"}));
+    assert_eq!(reply["non_monotone"], true, "{reply}");
+    assert!(reply["checks_used"].as_u64().unwrap() <= 5, "{}", reply);
     assert_eq!(reply["mode"], "minimal_removal", "{reply}");
     assert_eq!(reply["result"], "minimal_removal_that_proves", "{reply}");
     assert_ne!(reply["verdict_before"]["result"], "valid", "{reply}");

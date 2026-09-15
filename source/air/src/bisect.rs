@@ -750,6 +750,9 @@ pub struct Outcome {
     /// Found only after removing everything failed, by trying one unit at a
     /// time: removals interact non-monotonically here.
     pub non_monotone: bool,
+    /// Core only: keeping just the `core_start` hint kept the query valid,
+    /// so the search shrank the hint rather than every candidate.
+    pub hint_accepted: bool,
     pub probes: Vec<ProbeRecord>,
 }
 
@@ -858,6 +861,27 @@ pub fn search<E>(
     before: Option<Answer>,
     probe: &mut dyn FnMut(&[bool]) -> Result<Answer, E>,
 ) -> Result<Outcome, E> {
+    search_ordered(mode, units, candidates, &[], &[], budget, before, probe)
+}
+
+/// `search`, with two hints. When removing every candidate misses a flip
+/// target and single units are tried instead, the units of `order` are tried
+/// first, in that order, and then the remaining candidates: an ablation
+/// orders them by how often the solver instantiated them, so a matching
+/// loop's lemma, the most instantiated by definition, comes up in the first
+/// few probes. A core search first tries keeping only `core_start`, and when
+/// that alone keeps the query valid, shrinks it instead of every candidate
+/// (`Outcome::hint_accepted`). Neither hint changes what counts as an answer.
+pub fn search_ordered<E>(
+    mode: Mode,
+    units: usize,
+    candidates: &[usize],
+    order: &[usize],
+    core_start: &[usize],
+    budget: usize,
+    before: Option<Answer>,
+    probe: &mut dyn FnMut(&[bool]) -> Result<Answer, E>,
+) -> Result<Outcome, E> {
     let mut candidates = candidates.to_vec();
     candidates.sort();
     candidates.dedup();
@@ -874,6 +898,7 @@ pub fn search<E>(
         all_removed: None,
         minimal: false,
         non_monotone: false,
+        hint_accepted: false,
         probes: Vec::new(),
     };
     let finish = |mut outcome: Outcome, oracle: Oracle<'_, E>| {
@@ -908,7 +933,13 @@ pub fn search<E>(
                 // try each candidate alone before giving up.
                 let mut single = None;
                 let mut exhausted = false;
-                for &c in &candidates {
+                let mut singles: Vec<usize> = Vec::with_capacity(candidates.len());
+                for &c in order.iter().chain(candidates.iter()) {
+                    if candidates.binary_search(&c).is_ok() && !singles.contains(&c) {
+                        singles.push(c);
+                    }
+                }
+                for &c in &singles {
                     match oracle.ask(&[c])? {
                         None => {
                             exhausted = true;
@@ -952,9 +983,26 @@ pub fn search<E>(
             let mut keeps = |kept: &[usize]| -> Result<Option<bool>, E> {
                 Ok(oracle.ask(&minus(&candidates, kept))?.map(|answer| answer == Answer::Valid))
             };
+            let mut hint: Vec<usize> = core_start
+                .iter()
+                .copied()
+                .filter(|c| candidates.binary_search(c).is_ok())
+                .collect();
+            hint.sort();
+            hint.dedup();
             let (set, minimal) = match keeps(&[])? {
                 None => (candidates.clone(), false),
                 Some(true) => (Vec::new(), true),
+                Some(false) if !hint.is_empty() && hint.len() < candidates.len() => {
+                    match keeps(&hint)? {
+                        None => (candidates.clone(), false),
+                        Some(true) => {
+                            outcome.hint_accepted = true;
+                            ddmin(hint, &mut keeps)?
+                        }
+                        Some(false) => ddmin(candidates.clone(), &mut keeps)?,
+                    }
+                }
                 Some(false) => ddmin(candidates.clone(), &mut keeps)?,
             };
             outcome.after = oracle.memo.get(&minus(&candidates, &set)).cloned();
@@ -1108,6 +1156,61 @@ mod tests {
         assert_eq!(outcome.status, Status::Found);
         assert!(outcome.non_monotone);
         assert_eq!(outcome.set, vec![7]);
+    }
+
+    #[test]
+    fn single_units_are_tried_in_the_given_order_first() {
+        // removing 37 fixes it, removing everything breaks it again
+        let hits = |d: &[bool]| {
+            if d[37] && !d[0] { Answer::Valid } else { unknown() }
+        };
+        let candidates: Vec<usize> = (0..40).collect();
+        let mut probe = |d: &[bool]| -> Result<Answer, Infallible> { Ok(hits(d)) };
+        let outcome = search_ordered(
+            Mode::Flip(Target::Valid),
+            40,
+            &candidates,
+            &[37, 5],
+            &[],
+            100,
+            None,
+            &mut probe,
+        )
+        .unwrap();
+        assert_eq!(outcome.set, vec![37]);
+        assert!(outcome.non_monotone);
+        // before, all removed, then 37 straight away
+        assert_eq!(outcome.probes.len(), 3);
+        // without an order, every unit before 37 is tried first
+        let outcome = run(Mode::Flip(Target::Valid), 40, 100, hits);
+        assert_eq!(outcome.set, vec![37]);
+        assert_eq!(outcome.probes.len(), 2 + 38);
+    }
+
+    #[test]
+    fn a_core_starts_from_the_hint_when_it_keeps_the_proof() {
+        // valid needs 3, 17 and 41 out of 60, scattered
+        let needs = |d: &[bool]| {
+            if !d[3] && !d[17] && !d[41] { Answer::Valid } else { Answer::Invalid }
+        };
+        let candidates: Vec<usize> = (0..60).collect();
+        let core = |hint: &[usize], budget: usize| {
+            let mut probe = |d: &[bool]| -> Result<Answer, Infallible> { Ok(needs(d)) };
+            search_ordered(Mode::Core, 60, &candidates, &[], hint, budget, None, &mut probe)
+                .unwrap()
+        };
+        let hinted = core(&[3, 17, 29, 41, 50], 100);
+        assert!(hinted.hint_accepted);
+        assert_eq!(hinted.set, vec![3, 17, 41]);
+        assert!(hinted.minimal);
+        let plain = core(&[], 100);
+        assert!(!plain.hint_accepted);
+        assert_eq!(plain.set, vec![3, 17, 41]);
+        assert!(hinted.probes.len() < plain.probes.len());
+        // a hint that loses the proof is dropped, and the search still finds the core
+        let wrong = core(&[3, 17], 100);
+        assert!(!wrong.hint_accepted);
+        assert_eq!(wrong.set, vec![3, 17, 41]);
     }
 
     #[test]
