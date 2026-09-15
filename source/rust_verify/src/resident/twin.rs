@@ -13,9 +13,12 @@
 //! Only the edit's own scope ever holds the edit. A module-level axiom is
 //! removed by rebuilding the prefix without it, from the first scope holding
 //! it, in scopes that are popped before the reply; the recorded prefix is
-//! then replayed as it was. The reply says how many scopes the solver has
-//! open before and after, and with `recheck_base` checks the base once more
-//! and compares it with the first base check.
+//! then replayed as it was. An axiom below every scope (the bucket's base
+//! context) cannot be rebuilt away; a fuel-guarded one, as a broadcast
+//! lemma's is, is hidden through the query's fuel hypothesis instead, and
+//! the reply says so. The reply says how many scopes the solver has open
+//! before and after, and with `recheck_base` checks the base once more and
+//! compares it with the first base check.
 //!
 //! Neither check is a verification result, and the twin's verdict licenses
 //! nothing: an added axiom is assumed, not proved.
@@ -30,9 +33,9 @@ use air::context::{
     BranchProfile, Context, DifficultyGradient, InstPressure, QueryContext, SmtSolver,
     UnknownReason, ValidityResult,
 };
-use air::messages::{MessageInterface, MessageLevel};
 use air::twin::{AxiomRef, InstCounts};
 use serde::{Deserialize, Serialize};
+use std::collections::{BTreeSet, HashSet};
 use std::io;
 use std::sync::Arc;
 use std::time::Instant;
@@ -44,8 +47,10 @@ use vir::messages::VirMessageInterface;
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub(super) enum TwinEdit {
-    /// An AIR expression, or the name of an axiom the bucket retained past
-    /// this query's prefix (a later function's broadcast lemma, say).
+    /// An AIR expression, or the name of a broadcast lemma or group (or
+    /// its axiom's tag or qid), which applies as `broadcast use` would: its
+    /// fuel is assumed, and its axiom added when the bucket declared it only
+    /// for a later query.
     AddAxiom(String),
     /// A hypothesis tag (`hyp_1`), an axiom tag (`ax_...`), a quantifier's
     /// `:qid`, or the function a broadcast axiom belongs to.
@@ -102,10 +107,12 @@ pub(super) const MAX_TWIN_LIMIT: usize = 200;
 /// The `:qid` of the fuel hypothesis a twin writes when it hides a function
 /// in a query that hid none.
 const TWIN_FUEL_QID: &str = "internal_twin_nondefault_fuel";
+/// The provenance tag (`ax_twin_fuel`) of a fuel assumption a twin adds.
+const TWIN_FUEL_TAG: &str = "twin_fuel";
 /// A twin's rlimit may be at most this many times the query's.
 const MAX_RLIMIT_FACTOR: f32 = 16.0;
 
-const CAVEAT: &str = "Both checks ran in scopes popped right after them; the session's solver state is unchanged. Neither is a verification result: make the edit in the source and verify it normally, and prove an added axiom before relying on it.";
+const CAVEAT: &str = "Both checks ran in scopes popped right after them; the session's solver state is unchanged. Neither is a verification result: make the edit in the source and verify it normally, and prove an added axiom before relying on it. Resource units and elapsed time of two checks in one solver differ by more than the edit (caches survive a pop): read instantiation counts first, and recheck_base to measure the noise.";
 
 #[derive(Serialize)]
 pub(super) struct TwinReport {
@@ -142,6 +149,12 @@ struct EditReport {
     /// An added AIR expression, as given.
     #[serde(skip_serializing_if = "Option::is_none")]
     expression: Option<String>,
+    /// The function whose fuel the twin assumes so that an added axiom
+    /// applies, as `broadcast use` of it would.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fuel_assumed: Option<String>,
+    /// For flip_fuel, and for remove_axiom of a base-context axiom, which
+    /// is hidden (fuel 0) rather than removed.
     #[serde(skip_serializing_if = "Option::is_none")]
     fuel: Option<FuelReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -158,8 +171,10 @@ struct EditReport {
 struct MatchedAxiom {
     /// `query`: a local declaration of the query (a hypothesis has kind
     /// requires, type_invariant, fuel or trait_bound); `prefix`: a
-    /// module-level axiom in the query's context; `retained`: one the bucket
-    /// declared after this query's prefix.
+    /// module-level axiom in the query's context; `base`: one below every
+    /// scope (declared before the bucket's first query, or before a spinoff
+    /// solver's first); `retained`: one the bucket declared after this
+    /// query's prefix.
     place: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     tag: Option<ResolvedTag>,
@@ -306,11 +321,15 @@ struct RelevanceReport {
 
 #[derive(Serialize)]
 struct Vacuity {
-    /// The class of a check of the hypotheses alone, with `false` as the
-    /// goal: `valid` means they contradict each other.
-    base_hypotheses: &'static str,
-    twin_hypotheses: &'static str,
-    /// The added axiom makes the hypotheses contradict each other.
+    /// The class of a check of the query with every goal switched off (each
+    /// goal also requires an unconstrained boolean) and every assumption
+    /// kept: `valid` means the hypotheses and the body's assumptions
+    /// contradict each other wherever a goal is reached, so any goal would
+    /// be proved.
+    base_goals_off: &'static str,
+    twin_goals_off: &'static str,
+    /// The added axiom makes the context contradictory where the base's
+    /// was not.
     inconsistent: bool,
     /// The twin needed at most a tenth of the base's instantiations.
     instantiation_collapse: bool,
@@ -339,7 +358,10 @@ struct Recheck {
     /// Same instantiations per quantifier as the first base check.
     same_instantiations: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
+    instantiations: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     resource_units: Option<u64>,
+    elapsed_ms: u128,
 }
 
 /// One check of a query, with what cvc5 reported about it.
@@ -375,8 +397,7 @@ impl Branch {
     }
 
     fn report(&self) -> BranchReport {
-        let instantiations = air::twin::diff_instantiations(&self.counts(), &self.counts())
-            .map(|delta| delta.base_total);
+        let instantiations = self.counts().total();
         BranchReport {
             result: self.result,
             class: self.class(),
@@ -491,13 +512,69 @@ fn base_axioms(journal: &QueryJournal) -> impl Iterator<Item = &Axiom> {
 }
 
 /// The names `name` stands for: itself, and the tags of the axioms a
-/// function of that name states.
-fn names_for(name: &str, symbols: Option<&Symbols>) -> Vec<String> {
+/// function of that name states. A bare name that fits functions of several
+/// paths is refused rather than taken for all of them.
+fn names_for(name: &str, symbols: Option<&Symbols>) -> Result<Vec<String>, String> {
     let mut names = vec![name.trim().to_owned()];
     if let Some(symbols) = symbols {
-        names.extend(symbols.axiom_tags_owned_by(name));
+        let owned = symbols.axioms_owned_by(name);
+        let owners: BTreeSet<&str> = owned.iter().map(|(_, owner)| owner.as_str()).collect();
+        if owners.len() > 1 {
+            return Err(format!(
+                "{name} names the axioms of {} functions ({}); give the full path",
+                owners.len(),
+                owners.into_iter().collect::<Vec<_>>().join(", ")
+            ));
+        }
+        names.extend(owned.into_iter().map(|(tag, _)| tag));
     }
-    names
+    Ok(names)
+}
+
+/// The fuel constant guarding `expr`, for an axiom of the shape Verus gives
+/// a broadcast lemma or group: `(=> (fuel_bool fuel%f) ...)`.
+fn fuel_guard(expr: &Expr) -> Option<Ident> {
+    let ExprX::Binary(BinaryOp::Implies, guard, _) = &**expr else { return None };
+    let ExprX::Apply(f, args) = &**guard else { return None };
+    match &args[..] {
+        [arg] if f.as_str() == vir::def::FUEL_BOOL => match &**arg {
+            ExprX::Var(x) => Some(x.clone()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Whether the query's body assumes `(fuel_bool ident)`, as a `reveal` or
+/// `broadcast use` in it does.
+fn body_reveals(query: &Query, ident: &Ident) -> bool {
+    fn any_assume(stmt: &air::ast::Stmt, wanted: &dyn Fn(&Expr) -> bool) -> bool {
+        match &**stmt {
+            air::ast::StmtX::Assume(e) => wanted(e),
+            air::ast::StmtX::Block(stmts) | air::ast::StmtX::Switch(stmts) => {
+                stmts.iter().any(|s| any_assume(s, wanted))
+            }
+            air::ast::StmtX::DeadEnd(s) | air::ast::StmtX::Breakable(_, s) => any_assume(s, wanted),
+            _ => false,
+        }
+    }
+    any_assume(&query.assertion, &|e| match &**e {
+        ExprX::Apply(f, args) => {
+            f.as_str() == vir::def::FUEL_BOOL && args.len() == 1 && is_var(&args[0], ident)
+        }
+        _ => false,
+    })
+}
+
+/// Whether the query's fuel hypothesis hides the function with fuel
+/// constant `ident`.
+fn query_hides(query: &Query, ident: &Ident) -> bool {
+    query.local.iter().any(|decl| match &**decl {
+        DeclX::Axiom(axiom) if matches!(axiom.tag, Some(air::def::ProvenanceTag::Hyp(_))) => {
+            matches!(fuel_hypothesis(&axiom.expr), Some(Some((_, hidden))) if hidden.iter().any(|h| is_var(h, ident)))
+        }
+        _ => false,
+    })
 }
 
 fn named_by(axiom: &Axiom, names: &[String]) -> bool {
@@ -527,6 +604,7 @@ fn empty_report(kind: &'static str) -> EditReport {
         kind,
         axioms: Vec::new(),
         expression: None,
+        fuel_assumed: None,
         fuel: None,
         rlimit: None,
         order: Vec::new(),
@@ -547,7 +625,7 @@ fn plan(
 ) -> Result<Plan, String> {
     match edit {
         TwinEdit::RemoveAxiom(name) => {
-            let names = names_for(name, symbols);
+            let names = names_for(name, symbols)?;
             let mut twin = query.clone();
             let mut report = empty_report("remove_axiom");
             for name in &names {
@@ -560,15 +638,42 @@ fn plan(
                 .map(|(scope, axiom)| (scope, AxiomRef::of(axiom)))
                 .collect();
             report.axioms.extend(in_prefix.iter().map(|(_, a)| matched("prefix", a, fun, symbols)));
-            if report.axioms.is_empty() && base_axioms(journal).any(|a| named_by(a, &names)) {
-                return Err(format!(
-                    "{name} is declared in the bucket's base context (with fuel, datatypes and module-level broadcast groups), below every scope the worker can rebuild; move its `broadcast use` into the function to remove it in a twin"
-                ));
-            }
             if report.axioms.is_empty() {
-                return Err(format!(
-                    "nothing in this query's context is named {name}: name a hypothesis tag (hyp_<k>), an axiom tag (ax_...), a quantifier qid, or the function that states a broadcast axiom"
-                ));
+                // Below every scope, so it cannot be rebuilt away. An axiom
+                // guarded by a function's fuel, as a broadcast lemma's or
+                // group's is, can be hidden instead.
+                let in_base: Vec<&Axiom> =
+                    base_axioms(journal).filter(|a| named_by(a, &names)).collect();
+                if in_base.is_empty() {
+                    // The prelude is asserted before the bucket's context and
+                    // is not journaled at all.
+                    if name.trim().trim_matches('|').starts_with("prelude_") {
+                        return Err(format!(
+                            "{name} is a prelude axiom, asserted before the bucket's context and below every scope; a twin cannot remove it"
+                        ));
+                    }
+                    return Err(format!(
+                        "nothing in this query's context is named {name}: name a hypothesis tag (hyp_<k>), an axiom tag (ax_...), a quantifier qid, or the function that states a broadcast axiom"
+                    ));
+                }
+                let guards: BTreeSet<Ident> =
+                    in_base.iter().filter_map(|a| fuel_guard(&a.expr)).collect();
+                let (Some(guard), true) = (guards.iter().next(), guards.len() == 1) else {
+                    return Err(format!(
+                        "{name} is in the bucket's base context (every declaration made before the bucket's first query), below every scope the worker can rebuild, and no function's fuel guards it; only a broadcast lemma's axiom there can be hidden"
+                    ));
+                };
+                let Some(target) = FuelScan::of(journal, prefix).target(guard) else {
+                    return Err(format!(
+                        "{name} is guarded by {guard}, which this query's context does not declare"
+                    ));
+                };
+                let (twin, fuel) = flip_fuel(query, &target, 0)?;
+                report.axioms.extend(
+                    in_base.iter().map(|a| matched("base", &AxiomRef::of(a), fun, symbols)),
+                );
+                report.fuel = Some(fuel);
+                return Ok(Plan { query: twin, rlimit, rebuild: None, report, vacuity: false });
             }
             let rebuild = in_prefix.iter().map(|(scope, _)| *scope).min().map(|first| {
                 report.rebuilt_scopes = Some(prefix - first);
@@ -578,32 +683,78 @@ fn plan(
         }
         TwinEdit::AddAxiom(text) => {
             let mut report = empty_report("add_axiom");
-            let axiom = if text.trim_start().starts_with('(') {
+            let mut twin = query.clone();
+            if text.trim_start().starts_with('(') {
                 report.expression = Some(text.clone());
-                air::twin::parse_axiom(Arc::new(VirMessageInterface {}), text)?
-            } else {
-                let names = names_for(text, symbols);
-                if base_axioms(journal).any(|axiom| named_by(axiom, &names))
-                    || prefix_axioms(journal, 0..prefix).any(|(_, axiom)| named_by(axiom, &names))
+                let axiom = air::twin::parse_axiom(Arc::new(VirMessageInterface {}), text)?;
+                twin = air::twin::with_local_axiom(&twin, axiom);
+                return Ok(Plan { query: twin, rlimit, rebuild: None, report, vacuity: true });
+            }
+            let names = names_for(text, symbols)?;
+            let in_base = base_axioms(journal).find(|a| named_by(a, &names)).map(|a| ("base", a));
+            let found = in_base
+                .or_else(|| {
+                    prefix_axioms(journal, 0..prefix)
+                        .find(|(_, a)| named_by(a, &names))
+                        .map(|(_, a)| ("prefix", a))
+                })
+                .or_else(|| {
+                    prefix_axioms(journal, prefix..journal.contexts.len())
+                        .find(|(_, a)| named_by(a, &names))
+                        .map(|(_, a)| ("retained", a))
+                });
+            let Some((place, found)) = found else {
+                return Err(format!(
+                    "no axiom of this bucket is named {text}; give an AIR expression in parentheses, or the tag, qid or function of a broadcast lemma or group"
+                ));
+            };
+            // The axiom of a broadcast lemma or group is guarded by its
+            // fuel, which the query assumes only where it `broadcast use`s
+            // it. Adding the axiom means assuming that, as the source edit
+            // would.
+            let guard = fuel_guard(&found.expr);
+            let assumed = guard.as_ref().and_then(|c| {
+                if body_reveals(query, c) {
+                    Some("the body already reveals it")
+                } else if FuelScan::of(journal, prefix).default_visible(c) && !query_hides(query, c)
                 {
+                    Some("its module reveals it by default")
+                } else {
+                    None
+                }
+            });
+            match (place, &guard, assumed) {
+                ("retained", _, _) => {
+                    report.axioms.push(matched(place, &AxiomRef::of(found), fun, symbols));
+                    let axiom = Axiom {
+                        named: found.named.clone(),
+                        tag: found.tag.clone(),
+                        expr: found.expr.clone(),
+                    };
+                    twin = air::twin::with_local_axiom(&twin, axiom);
+                }
+                (_, None, _) => {
                     return Err(format!("{text} is already in this query's context"));
                 }
-                let later = prefix_axioms(journal, prefix..journal.contexts.len())
-                    .find(|(_, axiom)| named_by(axiom, &names))
-                    .map(|(_, axiom)| axiom);
-                let Some(found) = later else {
+                (_, Some(_), Some(why)) => {
                     return Err(format!(
-                        "no axiom the bucket retained is named {text}; give an AIR expression in parentheses, or the tag, qid or function of an axiom declared for a later query of this bucket"
+                        "{text} already applies to this query: its axiom is in the context and {why}"
                     ));
-                };
-                report.axioms.push(matched("retained", &AxiomRef::of(found), fun, symbols));
-                Axiom {
-                    named: found.named.clone(),
-                    tag: found.tag.clone(),
-                    expr: found.expr.clone(),
                 }
-            };
-            let twin = air::twin::with_local_axiom(query, axiom);
+                (_, Some(_), None) => {
+                    report.axioms.push(matched(place, &AxiomRef::of(found), fun, symbols));
+                }
+            }
+            if let (Some(c), None) = (&guard, assumed) {
+                let revealed = air::ast_util::str_apply(
+                    vir::def::FUEL_BOOL,
+                    &vec![air::ast_util::ident_var(c)],
+                );
+                let tag = Some(air::def::ProvenanceTag::Axiom(Arc::new(TWIN_FUEL_TAG.to_owned())));
+                twin =
+                    air::twin::with_local_axiom(&twin, Axiom { named: None, tag, expr: revealed });
+                report.fuel_assumed = Some(fuel_path(c));
+            }
             Ok(Plan { query: twin, rlimit, rebuild: None, report, vacuity: true })
         }
         TwinEdit::BumpRlimit(twin_rlimit) => {
@@ -641,8 +792,18 @@ fn plan(
             Ok(Plan { query: twin, rlimit, rebuild: None, report, vacuity: false })
         }
         TwinEdit::FlipFuel { function, fuel } => {
-            let target = find_fuel(journal, prefix, function)?;
+            let target = FuelScan::of(journal, prefix).find(function)?;
             let (twin, fuel_report) = flip_fuel(query, &target, *fuel)?;
+            if *fuel == 1
+                && fuel_report.default_visible
+                && !fuel_report.hidden_before
+                && fuel_report.reveals_removed == 0
+            {
+                return Err(format!(
+                    "{} is already visible in this query, so fuel 1 changes nothing; 0 hides it, and 2 or more unrolls a recursive function further",
+                    target.name
+                ));
+            }
             let mut report = empty_report("flip_fuel");
             report.fuel = Some(fuel_report);
             Ok(Plan { query: twin, rlimit, rebuild: None, report, vacuity: false })
@@ -652,6 +813,7 @@ fn plan(
 
 /// A function with fuel in a query's context: its fuel constant, and for a
 /// recursive one the constant that counts its unrollings.
+#[derive(Debug)]
 struct FuelTarget {
     ident: Ident,
     fuel_nat: Option<Ident>,
@@ -666,70 +828,150 @@ fn friendly_path(ident: &str) -> String {
     ident.replace(['!', '.'], "::")
 }
 
-fn find_fuel(journal: &QueryJournal, prefix: usize, function: &str) -> Result<FuelTarget, String> {
+/// `fuel%crate!f.` -> `crate::f`.
+fn fuel_path(ident: &Ident) -> String {
     let fuel_prefix = vir::def::prefix_fuel_id(&Arc::new(String::new()));
-    let nat_prefix = vir::def::prefix_fuel_nat(&Arc::new(String::new()));
-    let wanted = function.trim().strip_prefix("crate::").unwrap_or(function.trim());
-    let suffix = format!("::{wanted}");
-    let mut candidates: Vec<(Ident, String)> = Vec::new();
-    let mut nats: Vec<Ident> = Vec::new();
-    let mut defaults: Vec<Ident> = Vec::new();
-    // fuel constants are declared in the base context, below every scope
-    for batch in journal.base.iter().chain(journal.contexts[..prefix].iter().flatten()) {
-        for command in batch.iter() {
-            let CommandX::Global(decl) = &**command else { continue };
-            match &**decl {
-                DeclX::Const(x, typ) => match &**typ {
-                    TypX::Named(t) if t.as_str() == vir::def::FUEL_ID => {
-                        if let Some(rest) = x.strip_prefix(fuel_prefix.as_str()) {
-                            candidates.push((x.clone(), friendly_path(rest)));
-                        }
-                    }
-                    TypX::Named(t) if t.as_str() == vir::def::FUEL_TYPE => nats.push(x.clone()),
-                    _ => {}
-                },
-                DeclX::Axiom(axiom) => {
-                    if let ExprX::Apply(f, args) = &*axiom.expr {
-                        if f.as_str() == vir::def::FUEL_BOOL_DEFAULT && args.len() == 1 {
-                            if let ExprX::Var(x) = &*args[0] {
-                                defaults.push(x.clone());
+    friendly_path(ident.strip_prefix(fuel_prefix.as_str()).unwrap_or(ident))
+}
+
+/// The fuel declarations of a query's context: every function's fuel
+/// constant, the unrolling constant of each recursive one, and the fuel
+/// constants its module reveals by default.
+struct FuelScan {
+    /// Each fuel constant with the function's path.
+    constants: Vec<(Ident, String)>,
+    nats: HashSet<Ident>,
+    defaults: HashSet<Ident>,
+}
+
+impl FuelScan {
+    fn of(journal: &QueryJournal, prefix: usize) -> Self {
+        let fuel_prefix = vir::def::prefix_fuel_id(&Arc::new(String::new()));
+        let mut scan =
+            FuelScan { constants: Vec::new(), nats: HashSet::new(), defaults: HashSet::new() };
+        // `(=> (fuel_bool_default group) (and (fuel_bool_default member) ...))`
+        // reveals the members with the group.
+        let mut implied: Vec<(Ident, Vec<Ident>)> = Vec::new();
+        // fuel constants are declared in the base context, below every scope
+        for batch in journal.base.iter().chain(journal.contexts[..prefix].iter().flatten()) {
+            for command in batch.iter() {
+                let CommandX::Global(decl) = &**command else { continue };
+                match &**decl {
+                    DeclX::Const(x, typ) => match &**typ {
+                        TypX::Named(t) if t.as_str() == vir::def::FUEL_ID => {
+                            if let Some(rest) = x.strip_prefix(fuel_prefix.as_str()) {
+                                scan.constants.push((x.clone(), friendly_path(rest)));
                             }
                         }
+                        TypX::Named(t) if t.as_str() == vir::def::FUEL_TYPE => {
+                            scan.nats.insert(x.clone());
+                        }
+                        _ => {}
+                    },
+                    DeclX::Axiom(axiom) => match &*axiom.expr {
+                        ExprX::Binary(BinaryOp::Implies, guard, members) => {
+                            if let Some(group) = fuel_default_of(guard) {
+                                implied.push((group, fuel_defaults_in(members)));
+                            }
+                        }
+                        _ => scan.defaults.extend(fuel_defaults_in(&axiom.expr)),
+                    },
+                    _ => {}
+                }
+            }
+        }
+        let mut grew = true;
+        while grew {
+            grew = false;
+            for (group, members) in &implied {
+                if scan.defaults.contains(group) {
+                    for member in members {
+                        grew |= scan.defaults.insert(member.clone());
                     }
                 }
-                _ => {}
+            }
+        }
+        scan
+    }
+
+    fn default_visible(&self, ident: &Ident) -> bool {
+        self.defaults.contains(ident)
+    }
+
+    /// The function with fuel constant `ident`.
+    fn target(&self, ident: &Ident) -> Option<FuelTarget> {
+        let nat_prefix = vir::def::prefix_fuel_nat(&Arc::new(String::new()));
+        let fuel_prefix = vir::def::prefix_fuel_id(&Arc::new(String::new()));
+        let (ident, name) = self.constants.iter().find(|(x, _)| x == ident)?;
+        let rest = ident.strip_prefix(fuel_prefix.as_str()).unwrap_or(ident);
+        let nat = Arc::new(format!("{nat_prefix}{rest}"));
+        Some(FuelTarget {
+            fuel_nat: self.nats.contains(&nat).then_some(nat),
+            default_visible: self.default_visible(ident),
+            ident: ident.clone(),
+            name: name.clone(),
+        })
+    }
+
+    /// The one function `function` names: by its whole path (with or
+    /// without `crate::`) or fuel constant, else by path suffix, which a
+    /// bare name shared by several functions fails.
+    fn find(&self, function: &str) -> Result<FuelTarget, String> {
+        let fuel_prefix = vir::def::prefix_fuel_id(&Arc::new(String::new()));
+        let given = function.trim();
+        let bare = given.strip_prefix("crate::").unwrap_or(given);
+        let whole = format!("crate::{bare}");
+        let suffix = format!("::{bare}");
+        let exact: Vec<&(Ident, String)> = self
+            .constants
+            .iter()
+            .filter(|(ident, name)| {
+                name == given
+                    || name == bare
+                    || *name == whole
+                    || ident.as_str() == given
+                    || ident.strip_prefix(fuel_prefix.as_str()) == Some(given)
+            })
+            .collect();
+        let found = if exact.is_empty() {
+            self.constants.iter().filter(|(_, name)| name.ends_with(&suffix)).collect()
+        } else {
+            exact
+        };
+        match &found[..] {
+            [(ident, _)] => Ok(self.target(ident).expect("a scanned constant")),
+            [] => Err(format!(
+                "no function named {function} has fuel in this query's context (spec functions with bodies and broadcast lemmas do)"
+            )),
+            many => {
+                let names: Vec<&str> =
+                    many.iter().take(10).map(|(_, name)| name.as_str()).collect();
+                Err(format!("{function} names {} functions: {}", many.len(), names.join(", ")))
             }
         }
     }
-    let found: Vec<&(Ident, String)> = candidates
-        .iter()
-        .filter(|(ident, name)| {
-            name == wanted
-                || name.ends_with(&suffix)
-                || ident.as_str() == wanted
-                || ident.strip_prefix(fuel_prefix.as_str()) == Some(wanted)
-        })
-        .collect();
-    let (ident, name) = match &found[..] {
-        [one] => (*one).clone(),
-        [] => {
-            return Err(format!(
-                "no function named {function} has fuel in this query's context (spec functions with bodies do)"
-            ));
-        }
-        many => {
-            let names: Vec<&str> = many.iter().take(10).map(|(_, name)| name.as_str()).collect();
-            return Err(format!("{function} names {} functions: {}", many.len(), names.join(", ")));
-        }
-    };
-    let rest = ident.strip_prefix(fuel_prefix.as_str()).unwrap_or(&ident);
-    let nat = format!("{nat_prefix}{rest}");
-    Ok(FuelTarget {
-        fuel_nat: nats.into_iter().find(|n| n.as_str() == nat),
-        default_visible: defaults.contains(&ident),
-        ident,
-        name,
-    })
+}
+
+/// `(fuel_bool_default fuel%f)` -> `fuel%f`.
+fn fuel_default_of(expr: &Expr) -> Option<Ident> {
+    let ExprX::Apply(f, args) = &**expr else { return None };
+    match &args[..] {
+        [arg] if f.as_str() == vir::def::FUEL_BOOL_DEFAULT => match &**arg {
+            ExprX::Var(x) => Some(x.clone()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// The fuel constants `expr` reveals by default: one `fuel_bool_default`
+/// application, or a conjunction of them as a module-level `broadcast use`
+/// makes.
+fn fuel_defaults_in(expr: &Expr) -> Vec<Ident> {
+    match &**expr {
+        ExprX::Multi(MultiOp::And, exprs) => exprs.iter().filter_map(fuel_default_of).collect(),
+        _ => fuel_default_of(expr).into_iter().collect(),
+    }
 }
 
 /// Whether `expr` is the fuel hypothesis of a query: `fuel_defaults`, or
@@ -840,7 +1082,7 @@ fn flip_fuel(query: &Query, target: &FuelTarget, fuel: u32) -> Result<(Query, Fu
         return Err("this query has no fuel hypothesis to hide the function in".to_owned());
     }
     let mut query = query;
-    let tag = || Some(air::def::ProvenanceTag::Axiom(Arc::new("twin_fuel".to_owned())));
+    let tag = || Some(air::def::ProvenanceTag::Axiom(Arc::new(TWIN_FUEL_TAG.to_owned())));
     if fuel >= 1 {
         let revealed = str_apply(vir::def::FUEL_BOOL, &vec![ident_var(&target.ident)]);
         query =
@@ -983,35 +1225,30 @@ pub(super) fn serve(
         Err(BranchError::Fatal(error)) => return Err(error),
     };
     let vacuity = if plan.vacuity {
-        let message = VirMessageInterface {}
-            .bare(MessageLevel::Error, "the hypotheses contradict each other");
-        let mut hypotheses = |query: &Query| -> io::Result<Result<&'static str, String>> {
-            let alone = air::twin::hypotheses_only(query, message.clone());
-            match run_branch(air, &alone, rlimit, set_rlimit) {
+        // Each query with every goal switched off: valid only by contradiction.
+        let mut falsified = |query: &Query| -> io::Result<Result<&'static str, String>> {
+            match run_branch(air, &air::twin::goals_off(query), rlimit, set_rlimit) {
                 Ok(branch) => Ok(Ok(branch.class())),
                 Err(BranchError::Refused(message)) => Ok(Err(message)),
                 Err(BranchError::Fatal(error)) => Err(error),
             }
         };
-        let base_hypotheses = match hypotheses(&base_query)? {
+        let base_goals_off = match falsified(&base_query)? {
             Ok(class) => class,
             Err(message) => return Ok(Err(message)),
         };
-        let twin_hypotheses = match hypotheses(&plan.query)? {
+        let twin_goals_off = match falsified(&plan.query)? {
             Ok(class) => class,
             Err(message) => return Ok(Err(message)),
         };
         let (base_total, twin_total) =
-            match air::twin::diff_instantiations(&base.counts(), &twin.counts()) {
-                Some(delta) => (delta.base_total, delta.twin_total),
-                None => (0, 0),
-            };
-        let inconsistent = twin_hypotheses == "valid" && base_hypotheses != "valid";
+            (base.counts().total().unwrap_or(0), twin.counts().total().unwrap_or(0));
+        let inconsistent = twin_goals_off == "valid" && base_goals_off != "valid";
         let instantiation_collapse = base_total > 0 && twin_total * 10 <= base_total;
         let flipped_to_valid = twin.class() == "valid" && base.class() != "valid";
         Some(Vacuity {
-            base_hypotheses,
-            twin_hypotheses,
+            base_goals_off,
+            twin_goals_off,
             inconsistent,
             instantiation_collapse,
             possibly_vacuous: flipped_to_valid && (inconsistent || instantiation_collapse),
@@ -1030,7 +1267,9 @@ pub(super) fn serve(
                     class: again.class(),
                     same_result: again.class() == base.class(),
                     same_instantiations,
+                    instantiations: again.counts().total(),
                     resource_units: again.resource_units(),
+                    elapsed_ms: again.elapsed_ms,
                 })
             }
             Err(BranchError::Refused(message)) => return Ok(Err(message)),
@@ -1156,8 +1395,13 @@ fn report_instantiations(
     symbols: Option<&Symbols>,
     limit: usize,
 ) -> InstCountDelta {
-    let changed: Vec<&air::twin::QuantDelta> =
+    let mut changed: Vec<&air::twin::QuantDelta> =
         delta.quantifiers.iter().filter(|q| q.delta() != 0).collect();
+    // The prelude's boxing axioms ride every user quantifier's instances and
+    // tie with it; on a tie the user's comes first (stable: the rest keep
+    // `air::twin`'s order).
+    let prelude = |q: &air::twin::QuantDelta| q.qid.starts_with("prelude_");
+    changed.sort_by(|a, b| b.delta().abs().cmp(&a.delta().abs()).then(prelude(a).cmp(&prelude(b))));
     let moved: u64 = changed.iter().map(|q| q.delta().unsigned_abs()).sum();
     let top_share = changed.first().filter(|_| moved > 0).map(|q| {
         let share = q.delta().unsigned_abs() as f64 / moved as f64;
@@ -1280,6 +1524,80 @@ mod tests {
         assert_eq!(text.matches("succ").count(), 2, "{}", text);
         assert!(flip_fuel(&q, &target(false), 2).is_err());
         assert!(flip_fuel(&q, &target(false), 1).is_ok());
+    }
+
+    fn journal_with_base(text: &str) -> QueryJournal {
+        let node = sise::parse_tree(&mut sise::Parser::new(&format!("({text})"))).unwrap();
+        let sise::TreeNode::List(nodes) = node else { panic!() };
+        let commands = air::parser::Parser::new(Arc::new(VirMessageInterface {}))
+            .nodes_to_commands(&nodes)
+            .unwrap();
+        let mut journal = QueryJournal::new();
+        journal.record_base(std::iter::once(commands));
+        journal
+    }
+
+    const BASE: &str = "
+        (declare-const fuel%crate!g. FuelId)
+        (declare-const fuel%crate!m. FuelId)
+        (declare-const fuel%crate!r. FuelId)
+        (declare-const fuel%crate!a.s. FuelId)
+        (declare-const fuel%crate!b.s. FuelId)
+        (declare-const fuel_nat%crate!r. Fuel)
+        (axiom (fuel_bool_default fuel%crate!g.))
+        (axiom (=> (fuel_bool_default fuel%crate!g.) (and (fuel_bool_default fuel%crate!m.))))
+        (axiom (=> (fuel_bool fuel%crate!r.) (forall ((x Int)) (> x 0))))";
+
+    #[test]
+    fn the_fuel_scan_reads_defaults_through_groups() {
+        let journal = journal_with_base(BASE);
+        let scan = FuelScan::of(&journal, 0);
+        let fuel = |name: &str| Arc::new(format!("fuel%crate!{name}."));
+        assert!(scan.default_visible(&fuel("g")));
+        // revealed with its group
+        assert!(scan.default_visible(&fuel("m")));
+        assert!(!scan.default_visible(&fuel("r")));
+        let r = scan.target(&fuel("r")).unwrap();
+        assert_eq!(
+            (r.name.as_str(), r.fuel_nat.is_some(), r.default_visible),
+            ("crate::r", true, false)
+        );
+        assert!(scan.target(&fuel("m")).unwrap().fuel_nat.is_none());
+        assert!(scan.target(&Arc::new("fuel%crate!none.".to_owned())).is_none());
+        // a whole path first, then a suffix, which a shared bare name fails
+        assert_eq!(scan.find("crate::r").unwrap().name, "crate::r");
+        assert_eq!(scan.find("r").unwrap().name, "crate::r");
+        assert_eq!(scan.find("a::s").unwrap().name, "crate::a::s");
+        assert!(scan.find("s").unwrap_err().contains("2 functions"));
+        assert!(scan.find("q").is_err());
+    }
+
+    #[test]
+    fn fuel_guards_and_reveals_are_recognised() {
+        let journal = journal_with_base(BASE);
+        let axioms: Vec<&Axiom> = base_axioms(&journal).collect();
+        assert_eq!(axioms.len(), 3);
+        assert!(fuel_guard(&axioms[0].expr).is_none());
+        assert!(fuel_guard(&axioms[1].expr).is_none(), "a default guard is not fuel");
+        assert_eq!(
+            fuel_guard(&axioms[2].expr).as_deref().map(String::as_str),
+            Some("fuel%crate!r.")
+        );
+        let q = query(QUERY);
+        let f = target(true).ident;
+        assert!(body_reveals(&q, &f));
+        assert!(!body_reveals(&q, &Arc::new("fuel%crate!g.".to_owned())));
+        assert!(!query_hides(&q, &f));
+        let (q, _) = air::twin::replace_local_axioms(&q, &mut |a: &Axiom| {
+            Some(Axiom {
+                named: None,
+                tag: Some(air::def::ProvenanceTag::Hyp(air::def::HypId(0))),
+                expr: a.expr.clone(),
+            })
+        });
+        let (hidden, _) = flip_fuel(&q, &target(true), 0).unwrap();
+        assert!(query_hides(&hidden, &f));
+        assert!(!body_reveals(&hidden, &f), "the reveals went with the hide");
     }
 
     #[test]

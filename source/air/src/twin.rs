@@ -13,12 +13,10 @@
 //! that know Verus's encoding, such as fuel, live with the worker. Nothing
 //! here talks to a solver.
 
-use crate::ast::{
-    AssertId, Axiom, Constant, DeclX, Expr, ExprX, Ident, Query, QueryX, Stmt, StmtX,
-};
+use crate::ast::{AssertId, Axiom, DeclX, Expr, Ident, Query, QueryX, Stmt, StmtX};
 use crate::context::{BranchProfile, DifficultyGradient, InstPressure};
 use crate::def::ProvenanceTag;
-use crate::messages::{ArcDynMessage, MessageInterface};
+use crate::messages::MessageInterface;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
@@ -135,17 +133,42 @@ pub fn parse_axiom(
     })
 }
 
-/// The query's hypotheses alone: its local declarations with `false` as the
-/// only goal. It is valid exactly when the hypotheses (with the declaration
-/// prefix) contradict each other, so a twin that adds an axiom checks this
-/// to tell a vacuous context from a proof. Assumptions inside the body are
-/// not included.
-pub fn hypotheses_only(query: &Query, error: ArcDynMessage) -> Query {
-    let falsity = Arc::new(ExprX::Const(Constant::Bool(false)));
+/// `query` with every goal switched off: each `Assert` of `e` keeps its id
+/// and message and asserts `(and %%twin_off%% e)`, where `%%twin_off%%` is
+/// a fresh unconstrained boolean, while every `Assume` (including the fact
+/// an assertion leaves behind) stays. Nothing proves the switch, so the
+/// check is valid exactly when the hypotheses and the body's assumptions
+/// contradict each other wherever a goal is reached; a twin that adds an
+/// axiom checks this to tell a vacuous context from a proof. Stronger than
+/// checking the hypotheses alone: it also finds an axiom that contradicts
+/// what a call's postcondition or an earlier assertion assumed. The goal
+/// stays in the formula (`false` in its place would be rewritten away with
+/// it) so that its terms still seed the quantifiers' triggers.
+pub fn goals_off(query: &Query) -> Query {
+    let switch = Arc::new(crate::def::TWIN_OFF.to_owned());
+    let mut local = (*query.local).clone();
+    local.push(Arc::new(DeclX::Const(switch.clone(), crate::ast_util::bool_typ())));
     Arc::new(QueryX {
-        local: query.local.clone(),
-        assertion: Arc::new(StmtX::Assert(None, error, None, falsity)),
+        local: Arc::new(local),
+        assertion: goals_off_in(&query.assertion, &crate::ast_util::ident_var(&switch)),
     })
+}
+
+fn goals_off_in(stmt: &Stmt, switch: &Expr) -> Stmt {
+    let recur = |s: &Stmt| goals_off_in(s, switch);
+    match &**stmt {
+        StmtX::Assert(id, error, filter, e) => {
+            let off = crate::ast_util::mk_and(&vec![switch.clone(), e.clone()]);
+            Arc::new(StmtX::Assert(id.clone(), error.clone(), filter.clone(), off))
+        }
+        StmtX::Block(stmts) => Arc::new(StmtX::Block(Arc::new(stmts.iter().map(recur).collect()))),
+        StmtX::Switch(stmts) => {
+            Arc::new(StmtX::Switch(Arc::new(stmts.iter().map(recur).collect())))
+        }
+        StmtX::DeadEnd(s) => Arc::new(StmtX::DeadEnd(recur(s))),
+        StmtX::Breakable(label, s) => Arc::new(StmtX::Breakable(label.clone(), recur(s))),
+        _ => stmt.clone(),
+    }
 }
 
 /// `stmt` without the `Assume`s `drop` selects, and how many were removed.
@@ -373,6 +396,11 @@ impl<'a> InstCounts<'a> {
         self.profile.filter(|p| p.unparsed.is_none())
     }
 
+    /// How many instances the check added in all, when it reported them.
+    pub fn total(&self) -> Option<u64> {
+        self.counts().map(|(rows, _)| rows.values().map(|c| c.added).sum())
+    }
+
     fn counts(&self) -> Option<(BTreeMap<String, Counts>, u64)> {
         let key =
             |qid: &str, named: bool| if named { qid.to_string() } else { UNNAMED.to_string() };
@@ -585,6 +613,7 @@ pub fn relevance_delta(delta: &DifficultyDelta) -> RelevanceDelta {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ast::{ExprX, MultiOp};
     use crate::context::{DifficultyRow, QuantInferences, QuantPressure};
     use crate::messages::AirMessageInterface;
 
@@ -675,6 +704,37 @@ mod tests {
         );
         let error = reorder_asserts(&q, &[aid(&[2]), aid(&[1])]).unwrap_err();
         assert!(error.contains("only 1 of the 2"), "{}", error);
+    }
+
+    #[test]
+    fn goals_switch_off_and_assumptions_stay() {
+        let q = query(
+            "(check-valid
+               (declare-const a Bool) (declare-const b Bool)
+               (block (assume a) (assert aid_1 (\"a\") () a) (assume a) (block (assert b))))",
+        );
+        let off = goals_off(&q);
+        let mut ids = Vec::new();
+        assert_ids(&off.assertion, &mut ids);
+        assert_eq!(ids, ["assume", "1", "assume"]);
+        fn goals(stmt: &Stmt, out: &mut Vec<Expr>) {
+            match &**stmt {
+                StmtX::Assert(_, _, _, e) => out.push(e.clone()),
+                StmtX::Block(stmts) => stmts.iter().for_each(|s| goals(s, out)),
+                _ => {}
+            }
+        }
+        let mut exprs = Vec::new();
+        goals(&off.assertion, &mut exprs);
+        assert_eq!(exprs.len(), 2);
+        for e in &exprs {
+            let ExprX::Multi(MultiOp::And, parts) = &**e else { panic!("{:?}", e) };
+            assert!(matches!(&*parts[0], ExprX::Var(x) if x.as_str() == crate::def::TWIN_OFF));
+            assert!(matches!(&*parts[1], ExprX::Var(_)));
+        }
+        // the switch is declared, and nothing constrains it
+        assert_eq!(off.local.len(), q.local.len() + 1);
+        assert!(matches!(&*off.local[2], DeclX::Const(x, _) if x.as_str() == crate::def::TWIN_OFF));
     }
 
     #[test]

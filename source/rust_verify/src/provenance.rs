@@ -739,22 +739,34 @@ impl Symbols {
         self.quantifiers.get(qid).and_then(|q| q.role)
     }
 
-    /// The tags of the axioms `path` states, as a broadcast lemma states
-    /// its axiom: the function named `path`, or ending in `::path`.
-    pub(crate) fn axiom_tags_owned_by(&self, path: &str) -> Vec<String> {
-        let path = path.trim().strip_prefix("crate::").unwrap_or(path.trim());
-        if path.is_empty() {
+    /// The axioms `path` states, as a broadcast lemma or group states its
+    /// axiom, as `(tag, owner)`: the function at exactly that path (with or
+    /// without `crate::`), else every function whose path ends in `::path`,
+    /// so a bare name can match several functions.
+    pub(crate) fn axioms_owned_by(&self, path: &str) -> Vec<(String, String)> {
+        let path = path.trim();
+        let bare = path.strip_prefix("crate::").unwrap_or(path);
+        if bare.is_empty() {
             return Vec::new();
         }
-        let suffix = format!("::{path}");
-        let mut tags: Vec<String> = self
-            .axiom_owners
-            .iter()
-            .filter(|(_, owner)| owner.as_str() == path || owner.ends_with(&suffix))
-            .map(|(tag, _)| tag.clone())
-            .collect();
-        tags.sort();
-        tags
+        let exact =
+            |owner: &str| owner == path || owner == bare || owner == format!("crate::{bare}");
+        let suffix = format!("::{bare}");
+        let pick = |select: &dyn Fn(&str) -> bool| {
+            let mut owned: Vec<(String, String)> = self
+                .axiom_owners
+                .iter()
+                .filter(|(_, owner)| select(owner))
+                .map(|(tag, owner)| (tag.clone(), owner.clone()))
+                .collect();
+            owned.sort();
+            owned
+        };
+        let found = pick(&exact);
+        if !found.is_empty() {
+            return found;
+        }
+        pick(&|owner: &str| owner.ends_with(&suffix))
     }
 
     /// Every `:qid` owned at `path` or inside it, matching whole segments:

@@ -570,6 +570,26 @@ verus! {
         assert(x > 5);
         assert(x > 9);
     }
+
+    // sum(0) unfolds once, which the default fuel allows, unless sum is hidden
+    proof fn hides_sum()
+        ensures sum(0) == 0,
+    {
+        hide(sum);
+    }
+
+    proof fn wants_more(x: int)
+        ensures f(x) >= 1,
+    {
+        broadcast use f_nonneg;
+    }
+
+    // Declared after every function above, so its axiom is retained for
+    // a later query than theirs. It contradicts f_nonneg wherever f(i) is
+    // mentioned, and nothing here uses it.
+    pub broadcast proof fn f_neg(i: int)
+        ensures #[trigger] f(i) < 0,
+    { admit(); }
 }
 "#;
 
@@ -637,6 +657,7 @@ fn resident_twin_compares_a_query_with_its_edit() {
     assert!(delta["stopped"].as_array().unwrap().contains(&json!(qid)), "{}", reply);
     let recheck = &reply["integrity"]["recheck"];
     assert_eq!(recheck["same_result"], true, "{reply}");
+    assert!(recheck["instantiations"].is_u64(), "{}", reply);
     intact(&reply);
 
     // A module-level broadcast axiom, named by its function: the prefix is
@@ -655,8 +676,8 @@ fn resident_twin_compares_a_query_with_its_edit() {
     assert_eq!(reply["outcome_flip"]["twin"], "valid", "{reply}");
     let vacuity = &reply["vacuity"];
     // cvc5 answers a satisfiable context with quantifiers `unknown`
-    assert_ne!(vacuity["base_hypotheses"], "valid", "{reply}");
-    assert_eq!(vacuity["twin_hypotheses"], "valid", "{reply}");
+    assert_ne!(vacuity["base_goals_off"], "valid", "{reply}");
+    assert_eq!(vacuity["twin_goals_off"], "valid", "{reply}");
     assert_eq!(vacuity["inconsistent"], true, "{reply}");
     assert_eq!(vacuity["possibly_vacuous"], true, "{reply}");
     intact(&reply);
@@ -664,6 +685,32 @@ fn resident_twin_compares_a_query_with_its_edit() {
     let reply = twin(&mut worker, "::unprovable", json!({"add_axiom": "(= 1 1)"}), json!({}));
     assert_eq!(reply["outcome_flip"]["flipped"], false, "{reply}");
     assert_eq!(reply["vacuity"]["possibly_vacuous"], false, "{reply}");
+
+    // A broadcast lemma named instead of an expression applies as
+    // `broadcast use` would: its fuel is assumed, and its axiom added when
+    // the bucket declared it only for a later query. f_neg contradicts
+    // f_nonneg at the goal, where f(x) is mentioned, but not in the
+    // hypotheses; the goals-off check catches that.
+    let before = |a: &str, b: &str| {
+        query_id(&ready, a).as_u64().unwrap() < query_id(&ready, b).as_u64().unwrap()
+    };
+    assert!(before("::wants_more", "::f_neg"), "{}", ready);
+    let reply = twin(&mut worker, "::wants_more", json!({"add_axiom": "f_neg"}), json!({}));
+    assert_eq!(reply["event"], "twin", "{reply}");
+    assert_eq!(reply["edit"]["axioms"][0]["place"], "retained", "{reply}");
+    assert!(reply["edit"]["fuel_assumed"].as_str().unwrap().ends_with("::f_neg"), "{}", reply);
+    assert_ne!(reply["outcome_flip"]["base"], "valid", "{reply}");
+    assert_eq!(reply["outcome_flip"]["twin"], "valid", "{reply}");
+    assert_eq!(reply["vacuity"]["inconsistent"], true, "{reply}");
+    assert_eq!(reply["vacuity"]["possibly_vacuous"], true, "{reply}");
+    intact(&reply);
+    // One whose axiom the context already holds needs only its fuel.
+    let place = if before("::f_nonneg", "::unprovable") { "prefix" } else { "retained" };
+    let reply = twin(&mut worker, "::unprovable", json!({"add_axiom": "f_nonneg"}), json!({}));
+    assert_eq!(reply["event"], "twin", "{reply}");
+    assert_eq!(reply["edit"]["axioms"][0]["place"], place, "{reply}");
+    assert!(reply["edit"]["fuel_assumed"].as_str().unwrap().ends_with("::f_nonneg"), "{}", reply);
+    assert_eq!(reply["vacuity"]["inconsistent"], false, "{reply}");
 
     // Fuel: sum(3) needs more unrolling than the default, and hiding the
     // function takes away even what the default gives.
@@ -684,6 +731,13 @@ fn resident_twin_compares_a_query_with_its_edit() {
         json!({}),
     );
     assert_ne!(reply["outcome_flip"]["twin"], "valid", "{reply}");
+    // A function the query hides is revealed again by fuel 1.
+    let reply =
+        twin(&mut worker, "::hides_sum", json!({"flip_fuel": {"fn": "sum", "fuel": 1}}), json!({}));
+    assert_eq!(reply["event"], "twin", "{reply}");
+    assert_eq!(reply["edit"]["fuel"]["hidden_before"], true, "{reply}");
+    assert_ne!(reply["outcome_flip"]["base"], "valid", "{reply}");
+    assert_eq!(reply["outcome_flip"]["twin"], "valid", "{reply}");
 
     // Reordering two assertions changes which one fails first.
     let checked = worker.send(
@@ -699,16 +753,37 @@ fn resident_twin_compares_a_query_with_its_edit() {
     assert_eq!(reply["twin"]["assert_id"], json!(second), "{reply}");
 
     // Refusals leave the session serving.
-    for (name, edit, extra) in [
-        ("::unprovable", json!({"remove_axiom": "no_such_axiom"}), json!({})),
-        ("::unprovable", json!({"bump_rlimit": 1000}), json!({})),
-        ("::unprovable", json!({"flip_fuel": {"fn": "no_such_fn", "fuel": 1}}), json!({})),
-        ("::unprovable", json!({"add_axiom": "(= no_such_symbol 1)"}), json!({})),
-        ("::unprovable", json!({"bump_rlimit": 4}), json!({"limit": 0})),
+    for (name, edit, extra, says) in [
+        ("::unprovable", json!({"remove_axiom": "no_such_axiom"}), json!({}), "nothing"),
+        ("::unprovable", json!({"bump_rlimit": 1000}), json!({}), "at most"),
+        (
+            "::unprovable",
+            json!({"flip_fuel": {"fn": "no_such_fn", "fuel": 1}}),
+            json!({}),
+            "no function",
+        ),
+        // already visible: fuel 1 would change nothing
+        (
+            "::needs_fuel",
+            json!({"flip_fuel": {"fn": "sum", "fuel": 1}}),
+            json!({}),
+            "already visible",
+        ),
+        // its axiom is in the context and the body reveals it
+        ("::uses_lemma", json!({"add_axiom": "f_nonneg"}), json!({}), "already applies"),
+        // the prelude is asserted before the bucket's context
+        (
+            "::unprovable",
+            json!({"remove_axiom": "prelude_fuel_defaults"}),
+            json!({}),
+            "prelude axiom",
+        ),
+        ("::unprovable", json!({"add_axiom": "(= no_such_symbol 1)"}), json!({}), "type-check"),
+        ("::unprovable", json!({"bump_rlimit": 4}), json!({"limit": 0}), "limit"),
     ] {
         let reply = twin(&mut worker, name, edit, extra);
         assert_eq!(reply["event"], "error", "{reply}");
-        assert_ne!(reply["message"], "invalid resident request", "{reply}");
+        assert!(reply["message"].as_str().unwrap().contains(says), "{}", reply);
     }
     // Two edits at once is not a request.
     let reply = twin(
@@ -719,9 +794,13 @@ fn resident_twin_compares_a_query_with_its_edit() {
     );
     assert_eq!(reply["message"], "invalid resident request", "{reply}");
 
-    for (name, expected) in
-        [("::uses_lemma", "valid"), ("::unprovable", "invalid"), ("::needs_fuel", "invalid")]
-    {
+    for (name, expected) in [
+        ("::uses_lemma", "valid"),
+        ("::unprovable", "invalid"),
+        ("::needs_fuel", "invalid"),
+        ("::wants_more", "invalid"),
+        ("::hides_sum", "invalid"),
+    ] {
         let query = query_id(&ready, name);
         let result = worker
             .send(json!({"command": "check", "session": session, "bucket": 0, "query": query}));
@@ -826,6 +905,39 @@ fn resident_twin_matches_the_edit_made_in_source() {
     eprintln!("fuel: twin {t} instantiations, source edit {c}, repeat noise {noise}");
     assert!(t.abs_diff(c) <= 3 * noise + c / 4 + 10, "{}\n{}", fueled, cold);
 
+    assert_eq!(worker.send(json!({"command": "close", "session": session}))["event"], "closed");
+    worker.finish(false);
+}
+
+/// A spinoff solver starts from the whole bucket context before it, so a
+/// module-level axiom lies below every scope of its journal and cannot be
+/// rebuilt away. A broadcast lemma's axiom is guarded by its fuel, so the
+/// twin hides the lemma instead, and says so.
+#[test]
+fn resident_twin_hides_a_base_context_lemma_under_spinoff_all() {
+    let mut worker = Worker::start(TWIN_SOURCE, &["--rlimit", "2", "-V", "spinoff-all"]);
+    let ready = worker.receive();
+    assert_eq!(ready["spinoff_all"], true, "{ready}");
+    let session = ready["session"].clone();
+    let reply = worker.send(json!({
+        "command": "twin", "session": session, "bucket": 0,
+        "query": query_id(&ready, "::uses_lemma"), "edit": {"remove_axiom": "f_nonneg"},
+    }));
+    assert_eq!(reply["event"], "twin", "{reply}");
+    assert_eq!(reply["edit"]["axioms"][0]["place"], "base", "{reply}");
+    assert!(reply["edit"]["rebuilt_scopes"].is_null(), "{}", reply);
+    let fuel = &reply["edit"]["fuel"];
+    assert_eq!(fuel["fuel"], 0, "{reply}");
+    assert!(fuel["function"].as_str().unwrap().ends_with("::f_nonneg"), "{}", reply);
+    assert_eq!(fuel["reveals_removed"], 1, "{reply}");
+    assert_eq!(reply["outcome_flip"]["base"], "valid", "{reply}");
+    assert_ne!(reply["outcome_flip"]["twin"], "valid", "{reply}");
+    assert_eq!(reply["integrity"]["intact"], true, "{reply}");
+    let checked = worker.send(json!({
+        "command": "check", "session": session, "bucket": 0,
+        "query": query_id(&ready, "::uses_lemma"),
+    }));
+    assert_eq!(checked["result"], "valid", "{checked}");
     assert_eq!(worker.send(json!({"command": "close", "session": session}))["event"], "closed");
     worker.finish(false);
 }
