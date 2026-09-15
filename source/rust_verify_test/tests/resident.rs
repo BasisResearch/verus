@@ -1053,6 +1053,416 @@ fn resident_egraph_lists_and_injects_equalities() {
     }
 }
 
+const SCAFFOLD_SOURCE: &str = r#"
+use vstd::prelude::*;
+verus! {
+    uninterp spec fn f(i: int) -> int;
+    uninterp spec fn g(i: int) -> int;
+
+    // No term of the goal matches `g(f(i))`, so the solver never uses the
+    // inverse; `g(f(x)) == x` gives it one, and congruence the other.
+    proof fn scaffold_target(x: int)
+        requires
+            forall|i: int| #[trigger] g(f(i)) == i,
+    {
+        assert(f(x) != f(x + 1));
+    }
+
+    proof fn scaffold_passing(x: int)
+        requires
+            x > 0,
+    {
+        assert(x >= 0);
+    }
+
+    // The same goal inside a proof block: `P` is checked after the block's
+    // steps, and belongs at its end.
+    proof fn scaffold_by(x: int)
+        requires
+            forall|i: int| #[trigger] g(f(i)) == i,
+    {
+        assert(f(x) != f(x + 1)) by {
+            assert(x == x);
+        }
+    }
+
+    // A goal among the steps of `assert ... by` is checked where it is:
+    // `P` goes right before it.
+    proof fn scaffold_step(x: int)
+        requires
+            forall|i: int| #[trigger] g(f(i)) == i,
+    {
+        assert(x == x) by {
+            assert(f(x) != f(1 + x));
+        }
+    }
+
+    // A closure body is a dead end too, but no `by` follows its last goal.
+    fn scaffold_closure(x: u64)
+        requires
+            forall|i: int| #[trigger] g(f(i)) == i,
+    {
+        let c = |y: u64| {
+            assert(f(y as int) != f(y as int + 1));
+        };
+    }
+
+    // Two goals fail; Verus reports the earlier first.
+    proof fn scaffold_two_failing(x: int) {
+        assert(x != 7);
+        assert(x > 100);
+    }
+}
+"#;
+
+/// A loop whose second invariant holds on entry (the second `requires`)
+/// and, at the end of the body, needs the inverse at the new `i`. The
+/// inverse is an invariant too: an isolated loop body sees no `requires`.
+/// Verus emits the check at the end of the body without an assert id.
+const INVARIANT_SOURCE: &str = r#"
+use vstd::prelude::*;
+verus! {
+    uninterp spec fn f(i: int) -> int;
+    uninterp spec fn g(i: int) -> int;
+
+    fn scaffold_loop(n: u64)
+        requires
+            forall|i: int| #[trigger] g(f(i)) == i,
+            f(0) != f(1),
+    {
+        let mut i: u64 = 0;
+        while i < n
+            invariant
+                forall|j: int| #[trigger] g(f(j)) == j,
+                f(i as int) != f(i as int + 1),
+            decreases n - i,
+        {
+            i = i + 1;
+        }
+    }
+}
+"#;
+
+/// One proposal per case: `P`, the case, whether `P` is provable where the
+/// goal is, and whether the goal closes with `P` assumed there.
+const SCAFFOLD_CASES: &[(&str, &str, bool, bool)] = &[
+    ("g(f(x)) == x", "scaffold", true, true),
+    ("x + 1 > x", "true_but_unhelpful", true, false),
+    ("f(x) < f(x + 1)", "helpful_but_unprovable", false, true),
+    ("f(x) == 0", "dead_end", false, false),
+];
+
+/// `fixture.rs:<line>:` for the first line of `source` holding `needle`.
+fn line_of(source: &str, needle: &str) -> String {
+    let line = source.lines().position(|l| l.contains(needle)).unwrap() + 1;
+    format!("fixture.rs:{line}:")
+}
+
+fn checks_valid(worker: &mut Worker<ChildStdin>, ready: &Value, name: &str) -> bool {
+    let result = worker.send(json!({"command": "check", "session": ready["session"],
+        "bucket": 0, "query": query_id(ready, name)}));
+    assert_eq!(result["event"], "checked", "{result}");
+    result["result"] == "valid"
+}
+
+/// A scaffold request answers each of the four cases, and each answer is the
+/// one the ordinary pipeline gives the edited source (the differential): `P`
+/// asserted where the goal is, and `P` assumed before the goal, each as a
+/// function of its own checked by a solver of its own. The printed snippet,
+/// pasted, makes the function verify. Refused proposals and every check leave
+/// the session as it was.
+#[test]
+fn resident_scaffold_tells_the_four_cases_apart_as_cold_checks_do() {
+    let mut worker = Worker::start(SCAFFOLD_SOURCE, &[]);
+    let ready = worker.receive();
+    assert_eq!(ready["event"], "ready", "{ready}");
+    let session = ready["session"].clone();
+    let target = query_id(&ready, "::scaffold_target");
+    let request = |extra: Value| {
+        let mut request =
+            json!({"command": "scaffold", "session": session, "bucket": 0, "query": target});
+        request.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        request
+    };
+
+    // Without assert_id, the goal the query fails at, found by one more check.
+    let first = worker.send(request(json!({"assert": SCAFFOLD_CASES[0].0})));
+    assert_eq!(first["event"], "scaffold", "{first}");
+    assert_eq!(first["target"]["chosen"], "first_failure", "{first}");
+    assert_ne!(first["query_check"]["result"], "valid", "{first}");
+    let goal = first["target"]["assert_id"].clone();
+    assert!(goal.is_array(), "{}", first);
+    let goal_line = line_of(SCAFFOLD_SOURCE, "assert(f(x) != f(x + 1));");
+    assert!(first["target"]["insert_before"].as_str().unwrap().contains(&goal_line), "{}", first);
+    assert_eq!(first["target"]["placement"], "before_span", "{}", first);
+    assert!(first["target"]["goal"].is_u64(), "{}", first);
+    assert!(first["lowered_as"].as_str().unwrap().contains("g(crate::f(x))"), "{}", first);
+    assert!(first["stack_levels"].is_u64(), "{}", first);
+    // an ordinary session has no provenance to say why
+    assert!(first["why"].is_null(), "{}", first);
+    let snippet = first["verus_snippet"].as_str().unwrap().to_owned();
+    assert_eq!(snippet, "assert(g(f(x)) == x);");
+    // The goal under P instantiated the inverse; alone it could not.
+    let under = &first["goal_given_p"]["cost"];
+    assert!(under["instantiations"].as_u64().unwrap() >= 1, "{}", first);
+    assert!(first["marginal_cost"]["instantiations_delta"].as_i64().unwrap() >= 1, "{}", first);
+
+    let mut warm = Vec::new();
+    for (p, case, provable, closes) in SCAFFOLD_CASES {
+        let reply = worker.send(request(json!({"assert": p, "assert_id": goal})));
+        assert_eq!(reply["event"], "scaffold", "{p}: {reply}");
+        assert_eq!(reply["target"]["chosen"], "requested", "{reply}");
+        assert!(reply["query_check"].is_null(), "{}", reply);
+        assert_ne!(reply["baseline"]["result"], "valid", "{reply}");
+        let answer =
+            (reply["p_provable"]["result"] == "valid", reply["goal_given_p"]["result"] == "valid");
+        assert_eq!(answer, (*provable, *closes), "{p}: {reply}");
+        assert_eq!(reply["case"], *case, "{reply}");
+        assert_eq!(reply["verus_snippet"].is_string(), *case == "scaffold", "{reply}");
+        for arm in ["baseline", "p_provable", "goal_given_p"] {
+            assert!(
+                reply[arm]["cost"]["resource_units"].as_u64().unwrap() > 0,
+                "{}: {}",
+                arm,
+                reply
+            );
+        }
+        warm.push(answer);
+    }
+
+    // P not checked: the goal's verdict alone, conditional on P.
+    let only = worker.send(request(
+        json!({"assert": SCAFFOLD_CASES[2].0, "assert_id": goal, "goal_only": true}),
+    ));
+    assert_eq!(only["case"], "goal_closes_given_p", "{only}");
+    assert!(only["p_provable"].is_null(), "{}", only);
+
+    // Refusals name the reason and keep the session.
+    for (text, reason) in [
+        ("h(x) > 0", "no function"),
+        ("forall|i: int| f(i) > 0", "quantifier-free"),
+        ("x +", "cannot read"),
+        ("f(x)", "not a bool"),
+    ] {
+        let refused = worker.send(request(json!({"assert": text, "assert_id": goal})));
+        assert_eq!(refused["event"], "error", "{}: {}", text, refused);
+        assert!(refused["message"].as_str().unwrap().contains(reason), "{}: {}", text, refused);
+    }
+    let missing = worker.send(request(json!({"assert": "x > 0", "assert_id": [999]})));
+    assert!(missing["message"].as_str().unwrap().contains("its goals are"), "{}", missing);
+    let passing = query_id(&ready, "::scaffold_passing");
+    let refused = worker
+        .send(json!({"command": "scaffold", "session": session, "bucket": 0, "query": passing,
+            "assert": "x > 0"}));
+    assert!(refused["message"].as_str().unwrap().contains("verifies"), "{}", refused);
+
+    assert!(!checks_valid(&mut worker, &ready, "::scaffold_target"));
+    assert!(checks_valid(&mut worker, &ready, "::scaffold_passing"));
+    assert_eq!(worker.send(json!({"command": "close", "session": session}))["event"], "closed");
+    worker.finish(false);
+    let launches = fs::read_to_string(worker.dir.path().join("launches")).unwrap();
+    assert_eq!(launches.lines().count(), 1, "{launches}");
+    for log in smt_logs(worker.dir.path()) {
+        assert_eq!(log.matches("(push").count(), log.matches("(pop").count());
+    }
+
+    // Cold: every case as source, through the ordinary pipeline, and the
+    // snippet pasted before the goal.
+    let requires = "requires forall|i: int| #[trigger] g(f(i)) == i,";
+    let mut functions = String::new();
+    for (n, (p, ..)) in SCAFFOLD_CASES.iter().enumerate() {
+        functions.push_str(&format!(
+            "proof fn cold_p_{n}(x: int) {requires} {{ assert({p}); }}\n\
+             proof fn cold_g_{n}(x: int) {requires} {{ assume({p}); assert(f(x) != f(x + 1)); }}\n"
+        ));
+    }
+    functions.push_str(&format!(
+        "proof fn pasted(x: int) {requires} {{ {snippet} assert(f(x) != f(x + 1)); }}\n"
+    ));
+    let cold_source = SCAFFOLD_SOURCE.replace(
+        "    proof fn scaffold_passing",
+        &format!("{functions}\n    proof fn scaffold_passing"),
+    );
+    let mut cold = Worker::start(&cold_source, &[]);
+    let cold_ready = cold.receive();
+    assert_eq!(cold_ready["event"], "ready", "{cold_ready}");
+    for (n, answer) in warm.iter().enumerate() {
+        let cold_answer = (
+            checks_valid(&mut cold, &cold_ready, &format!("::cold_p_{n}")),
+            checks_valid(&mut cold, &cold_ready, &format!("::cold_g_{n}")),
+        );
+        assert_eq!(*answer, cold_answer, "case {n}: warm {answer:?}, cold {cold_answer:?}");
+    }
+    assert!(checks_valid(&mut cold, &cold_ready, "::pasted"));
+    cold.send(json!({"command": "close", "session": cold_ready["session"]}));
+    cold.finish(false);
+}
+
+/// Every query of the function `name`, by id.
+fn query_ids(ready: &Value, name: &str) -> Vec<Value> {
+    ready["buckets"][0]["queries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|query| query["function"].as_str().unwrap().ends_with(name))
+        .map(|query| query["id"].clone())
+        .collect()
+}
+
+/// A goal Verus emits without an assert id, the invariant at the end of the
+/// loop body, is the one the query's check fails at, and is addressed by
+/// its index. `P` reads `i` after the increment, so the inverse at the new
+/// `i` scaffolds the goal, and pasted at the end of the body, where the
+/// reply says, it makes the function verify.
+#[test]
+fn resident_scaffold_addresses_a_goal_without_an_assert_id() {
+    let mut worker = Worker::start(INVARIANT_SOURCE, &[]);
+    let ready = worker.receive();
+    assert_eq!(ready["event"], "ready", "{}", ready);
+    let session = ready["session"].clone();
+    let queries = ready["buckets"][0]["queries"].as_array().unwrap();
+    let body = queries
+        .iter()
+        .find(|q| q["description"] == "while loop")
+        .unwrap_or_else(|| panic!("no loop query: {}", ready))["id"]
+        .clone();
+    let p = "g(f(i as int)) == i as int";
+    let reply = worker.send(json!({"command": "scaffold", "session": session, "bucket": 0,
+        "query": body, "assert": p}));
+    assert_eq!(reply["event"], "scaffold", "{}", reply);
+    assert_eq!(reply["target"]["chosen"], "first_failure", "{}", reply);
+    assert_eq!(reply["target"]["assert_id"], json!([]), "{}", reply);
+    assert_eq!(
+        reply["target"]["description"], "invariant not satisfied at end of loop body",
+        "{}",
+        reply
+    );
+    assert_eq!(reply["target"]["placement"], "end_of_loop_body", "{}", reply);
+    assert!(reply["target"]["insert_before"].is_null(), "{}", reply);
+    assert_eq!(reply["case"], "scaffold", "{}", reply);
+    let index = reply["target"]["goal"].as_u64().unwrap();
+    // the same goal by index, and P read at the old `i` is no help
+    let again = worker.send(json!({"command": "scaffold", "session": session, "bucket": 0,
+        "query": body, "assert": p, "goal": index}));
+    assert_eq!(again["target"]["chosen"], "requested", "{}", again);
+    assert_eq!(again["case"], "scaffold", "{}", again);
+    let old = worker.send(json!({"command": "scaffold", "session": session, "bucket": 0,
+        "query": body, "assert": "g(f(i as int - 1)) == i as int - 1", "goal": index}));
+    assert_eq!(old["case"], "true_but_unhelpful", "{}", old);
+    let missing = worker.send(json!({"command": "scaffold", "session": session, "bucket": 0,
+        "query": body, "assert": p, "goal": 999}));
+    let message = missing["message"].as_str().unwrap();
+    assert!(message.contains("its goals are") && message.contains("no assert id"), "{}", missing);
+    worker.send(json!({"command": "close", "session": session}));
+    worker.finish(false);
+
+    let pasted = INVARIANT_SOURCE.replace("i = i + 1;", &format!("i = i + 1; assert({p});"));
+    let mut cold = Worker::start(&pasted, &[]);
+    let cold_ready = cold.receive();
+    for id in query_ids(&cold_ready, "::scaffold_loop") {
+        let result = cold.send(json!({"command": "check", "session": cold_ready["session"],
+            "bucket": 0, "query": id}));
+        assert_eq!(result["result"], "valid", "{}", result);
+    }
+    cold.send(json!({"command": "close", "session": cold_ready["session"]}));
+    // the invocation verified everything, so the worker exits well
+    cold.finish(true);
+}
+
+/// The claim of `assert ... by` is checked after the block's steps, and the
+/// reply places the snippet at the block's end, naming no span. A goal
+/// among the steps, or in a closure body (also a dead end), is placed before
+/// its own span. Of two failing goals, the default is the earlier, as Verus
+/// reports it.
+#[test]
+fn resident_scaffold_places_p_where_the_goal_is_checked() {
+    let mut worker = Worker::start(SCAFFOLD_SOURCE, &[]);
+    let ready = worker.receive();
+    let scaffold = |worker: &mut Worker<ChildStdin>, name: &str, p: &str| {
+        let reply = worker.send(json!({"command": "scaffold", "session": ready["session"],
+            "bucket": 0, "query": query_id(&ready, name), "assert": p}));
+        assert_eq!(reply["event"], "scaffold", "{}", reply);
+        assert_eq!(reply["target"]["chosen"], "first_failure", "{}", reply);
+        reply
+    };
+    let reply = scaffold(&mut worker, "::scaffold_by", SCAFFOLD_CASES[0].0);
+    assert_eq!(reply["target"]["placement"], "end_of_proof_block", "{}", reply);
+    assert!(reply["target"]["insert_before"].is_null(), "{}", reply);
+    assert_eq!(reply["case"], "scaffold", "{}", reply);
+
+    for (name, p, goal) in [
+        ("::scaffold_step", SCAFFOLD_CASES[0].0, "assert(f(x) != f(1 + x));"),
+        (
+            "::scaffold_closure",
+            "g(f(y as int)) == y as int",
+            "assert(f(y as int) != f(y as int + 1));",
+        ),
+    ] {
+        let reply = scaffold(&mut worker, name, p);
+        assert_eq!(reply["target"]["placement"], "before_span", "{}: {}", name, reply);
+        let at = reply["target"]["insert_before"].as_str().unwrap_or_default();
+        assert!(at.contains(&line_of(SCAFFOLD_SOURCE, goal)), "{}: {}", name, reply);
+        assert_eq!(reply["case"], "scaffold", "{}: {}", name, reply);
+    }
+
+    let reply = scaffold(&mut worker, "::scaffold_two_failing", "x > 100");
+    let at = reply["target"]["insert_before"].as_str().unwrap_or_default();
+    assert!(at.contains(&line_of(SCAFFOLD_SOURCE, "assert(x != 7);")), "{}", reply);
+    assert!(reply["query_check"]["rechecks"].as_u64().unwrap() >= 1, "{}", reply);
+    worker.send(json!({"command": "close", "session": ready["session"]}));
+    worker.finish(false);
+}
+
+/// A matching loop runs the query out of budget, and a resource limit names
+/// no goal: the worker checks each goal alone and takes the first that
+/// fails, here the postcondition. Assuming it closes the goal; proving it
+/// runs out of budget again, which proves nothing, so P is undecided.
+#[test]
+fn resident_scaffold_finds_the_goal_behind_a_resource_limit() {
+    let mut worker = Worker::start(BISECT_SOURCE, &["--rlimit", "2"]);
+    let ready = worker.receive();
+    let reply = worker.send(json!({"command": "scaffold", "session": ready["session"],
+        "bucket": 0, "query": query_id(&ready, "::looping"), "assert": "a(0) > 100"}));
+    assert_eq!(reply["event"], "scaffold", "{}", reply);
+    assert_eq!(reply["query_check"]["result"], "resource_limit", "{}", reply);
+    assert_eq!(reply["target"]["chosen"], "first_failing_alone", "{}", reply);
+    assert!(reply["target"]["goals_probed"].as_u64().unwrap() >= 1, "{}", reply);
+    assert_eq!(reply["case"], "helpful_but_undecided", "{}", reply);
+    assert_eq!(reply["p_provable"]["result"], "resource_limit", "{}", reply);
+    worker.send(json!({"command": "close", "session": ready["session"]}));
+    worker.finish(false);
+}
+
+/// Under provenance, the goal that closes with `P` assumed says why: the
+/// `requires` it used, and the inverse's instantiations at their source.
+#[test]
+fn resident_scaffold_says_why_under_provenance() {
+    let mut worker = Worker::start(SCAFFOLD_SOURCE, &["-V", "provenance"]);
+    let ready = worker.receive();
+    assert_eq!(ready["provenance"], true, "{ready}");
+    let reply = worker.send(json!({"command": "scaffold", "session": ready["session"],
+        "bucket": 0, "query": query_id(&ready, "::scaffold_target"),
+        "assert": SCAFFOLD_CASES[0].0}));
+    assert_eq!(reply["case"], "scaffold", "{reply}");
+    let inverse = line_of(SCAFFOLD_SOURCE, "g(f(i)) == i");
+    let why = &reply["why"];
+    let explains = why["explains_goal"].as_array().unwrap();
+    assert!(
+        explains.iter().any(|tag| tag["kind"] == "requires"
+            && tag["span"].as_str().is_some_and(|span| span.contains(&inverse))),
+        "{}",
+        reply
+    );
+    let closing = why["closing_quantifiers"].as_array().unwrap();
+    assert!(
+        closing.iter().any(|q| q["span"].as_str().is_some_and(|span| span.contains(&inverse))),
+        "{}",
+        reply
+    );
+    worker.send(json!({"command": "close", "session": ready["session"]}));
+    worker.finish(false);
+}
+
 /// With instantiation replay, every resident check that proves its query
 /// saves its instantiations, and a recheck of a query with saved ones first
 /// tries them alone (`:only`), falling back to the ordinary check unless that
@@ -1873,7 +2283,7 @@ fn resident_ready_lists_the_requests_it_serves() {
         .collect();
     assert_eq!(
         commands,
-        ["list", "check", "bisect", "ablate", "egraph", "close", "inst_graph"],
+        ["list", "check", "bisect", "ablate", "egraph", "scaffold", "close", "inst_graph", "ladder"],
         "{ready}"
     );
     // Each listed request parses: a stale session is refused as a session,
@@ -1881,7 +2291,7 @@ fn resident_ready_lists_the_requests_it_serves() {
     for command in &commands {
         let request = match command.as_str() {
             "list" | "close" => json!({"command": command, "session": "stale"}),
-            "check" | "egraph" => {
+            "check" | "egraph" | "ladder" => {
                 json!({"command": command, "session": "stale", "bucket": 0, "query": 0})
             }
             "bisect" => {
@@ -1893,6 +2303,9 @@ fn resident_ready_lists_the_requests_it_serves() {
             "inst_graph" => {
                 json!({"command": command, "session": "stale", "bucket": 0, "query": 0, "op": "cycles"})
             }
+            "scaffold" => {
+                json!({"command": command, "session": "stale", "bucket": 0, "query": 0, "assert": "true"})
+            }
             _ => panic!("no request for {}", command),
         };
         let reply = worker.send(request);
@@ -1900,6 +2313,276 @@ fn resident_ready_lists_the_requests_it_serves() {
         assert_ne!(reply["message"], "invalid resident request", "{command}: {reply}");
     }
     worker.finish(true);
+}
+
+const LADDER_SOURCE: &str = r#"
+use vstd::prelude::*;
+verus! {
+    uninterp spec fn f(i: int) -> int;
+    uninterp spec fn p(i: int) -> bool;
+
+    // The goal has no `f` term, so E-matching never instantiates the
+    // requirement; a strategy that needs no trigger can.
+    proof fn untriggered(a: int)
+        requires forall|x: int| #[trigger] f(x) >= 0 && p(x),
+    {
+        assert(p(a));
+    }
+
+    proof fn triggered(a: int)
+        requires forall|x: int| #[trigger] f(x) >= 0 && p(x),
+    {
+        assert(f(a) >= 0);
+    }
+}
+"#;
+
+fn rung<'a>(ladder: &'a Value, name: &str) -> &'a Value {
+    ladder["rungs"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{}", ladder))
+        .iter()
+        .find(|rung| rung["rung"] == name)
+        .unwrap_or_else(|| panic!("no {} rung: {}", name, ladder))
+}
+
+#[test]
+fn resident_strategy_ladder_finds_a_strategy_and_pins_it() {
+    let mut worker =
+        Worker::start_with_env(LADDER_SOURCE, &[], &[("VERUS_RESIDENT_STRATEGY_LADDER", "1")]);
+    let ready = worker.receive();
+    assert_eq!(ready["strategy_ladder"], true, "{ready}");
+    let session = ready["session"].clone();
+    let untriggered = query_id(&ready, "::untriggered");
+    let check = json!({"command":"check", "session":session, "bucket":0, "query":untriggered});
+    let before = worker.send(check.clone());
+    assert_eq!(before["result"], "invalid", "{before}");
+    assert!(before["pinned"].is_null(), "{}", before);
+
+    let ladder = worker
+        .send(json!({"command":"ladder", "session":session, "bucket":0, "query":untriggered}));
+    assert_eq!(ladder["event"], "laddered", "{ladder}");
+    assert_eq!(ladder["available"], json!(["ematch", "conflict", "pool", "enum", "mbqi"]));
+    // E-matching alone is the default schedule's own failure.
+    assert_eq!(rung(&ladder, "ematch")["verdict"], "unknown", "{ladder}");
+    assert_eq!(rung(&ladder, "ematch")["incomplete_id"], "QUANTIFIERS", "{ladder}");
+    let solved = ladder["solved_by"].as_str().unwrap_or_else(|| panic!("{}", ladder)).to_owned();
+    assert_ne!(solved, "ematch");
+    let winner = rung(&ladder, &solved);
+    assert_eq!(winner["verdict"], "valid", "{ladder}");
+    assert!(winner["instantiations"].as_u64().unwrap() > 0, "{}", ladder);
+    assert!(winner["resource_units"].as_u64().unwrap() > 0, "{}", ladder);
+    // Rungs after the winner wait for run_all.
+    let order = ["ematch", "conflict", "pool", "enum", "mbqi"];
+    let after_winner = order.iter().skip_while(|name| **name != solved).skip(1);
+    for name in after_winner {
+        assert_eq!(rung(&ladder, name)["verdict"], "not_run", "{ladder}");
+    }
+    assert_eq!(
+        ladder["pinned"],
+        json!({"rung": solved, "alongside": false, "rlimit": 10.0}),
+        "{ladder}"
+    );
+
+    // The pinned rung closes the recheck before the full schedule runs.
+    let pinned = worker.send(check.clone());
+    assert_eq!(pinned["result"], "valid", "{pinned}");
+    assert_eq!(pinned["pinned"]["rung"], solved.as_str(), "{pinned}");
+    assert_eq!(pinned["pinned"]["alongside"], false, "{pinned}");
+    assert_eq!(pinned["pinned"]["closed"], true, "{pinned}");
+
+    // An empty ladder removes the pin, and the default schedule answers as
+    // it did at first: no strategy setting outlived its rung.
+    let cleared = worker.send(
+        json!({"command":"ladder", "session":session, "bucket":0, "query":untriggered, "rungs":[]}),
+    );
+    assert!(cleared["pinned"].is_null() && cleared["solved_by"].is_null(), "{}", cleared);
+    let again = worker.send(check.clone());
+    assert_eq!(again["result"], "invalid", "{again}");
+    assert!(again["pinned"].is_null(), "{}", again);
+    // Nor does an alongside rung's `quant-strategy-alone`: after an alongside
+    // ladder that pins nothing, the default schedule still fails.
+    let unpinned = worker.send(json!({"command":"ladder", "session":session, "bucket":0,
+        "query":untriggered, "alongside":true, "pin":false}));
+    assert!(unpinned["solved_by"].is_string() && unpinned["pinned"].is_null(), "{}", unpinned);
+    let again = worker.send(check.clone());
+    assert_eq!(again["result"], "invalid", "{again}");
+    assert!(again["pinned"].is_null(), "{}", again);
+
+    // run_all tries every rung; pin false leaves no pin; budgets apply per rung.
+    let all = worker.send(json!({"command":"ladder", "session":session, "bucket":0,
+        "query":untriggered, "run_all":true, "pin":false, "budgets":{"enum":5}}));
+    assert!(all["rungs"].as_array().unwrap().iter().all(|r| r["verdict"] != "not_run"), "{}", all);
+    assert_eq!(rung(&all, "pool")["verdict"], "unknown", "{all}");
+    assert_eq!(rung(&all, "enum")["rlimit"], 5.0, "{all}");
+    assert!(rung(&all, "enum")["resource_limit"].as_u64().unwrap() > 0, "{}", all);
+    assert!(all["pinned"].is_null(), "{}", all);
+
+    // Alongside E-matching the default rungs are the three the schedule
+    // lacks; the pin records how its rung ran, and the recheck runs it so.
+    let alongside = worker.send(json!({"command":"ladder", "session":session, "bucket":0,
+        "query":untriggered, "alongside":true}));
+    assert_eq!(alongside["alongside"], true, "{alongside}");
+    let names: Vec<&Value> =
+        alongside["rungs"].as_array().unwrap().iter().map(|rung| &rung["rung"]).collect();
+    assert_eq!(names, [&json!("conflict"), &json!("enum"), &json!("mbqi")], "{alongside}");
+    let alongside_solved =
+        alongside["solved_by"].as_str().unwrap_or_else(|| panic!("{}", alongside)).to_owned();
+    assert_eq!(
+        alongside["pinned"],
+        json!({"rung": alongside_solved, "alongside": true, "rlimit": 10.0}),
+        "{alongside}"
+    );
+    let rechecked = worker.send(check.clone());
+    assert_eq!(rechecked["result"], "valid", "{rechecked}");
+    assert_eq!(rechecked["pinned"]["alongside"], true, "{rechecked}");
+    assert_eq!(rechecked["pinned"]["closed"], true, "{rechecked}");
+
+    // A query E-matching proves is solved on the first rung.
+    let triggered = worker.send(json!({"command":"ladder", "session":session, "bucket":0,
+        "query":query_id(&ready, "::triggered")}));
+    assert_eq!(triggered["solved_by"], "ematch", "{triggered}");
+
+    // Named alongside, E-matching is the default schedule itself, and runs
+    // as a baseline rather than being refused.
+    let baseline = worker.send(json!({"command":"ladder", "session":session, "bucket":0,
+        "query":untriggered, "alongside":true, "rungs":["ematch"], "pin":false}));
+    assert_eq!(rung(&baseline, "ematch")["verdict"], "unknown", "{baseline}");
+
+    for bad in [json!(["enum", "enum"]), json!(["nope"])] {
+        let reply = worker.send(json!({"command":"ladder", "session":session, "bucket":0,
+            "query":untriggered, "rungs":bad}));
+        assert_eq!(reply["event"], "error", "{reply}");
+    }
+    // Zero, above the cap, and a budget too small for one cvc5 resource unit
+    // (which would reach cvc5 as 0, no limit at all) are all refused.
+    for budget in [json!(0), json!(1001), json!(0.000001)] {
+        let reply = worker.send(json!({"command":"ladder", "session":session, "bucket":0,
+            "query":untriggered, "budgets":{"enum":budget}}));
+        assert_eq!(reply["event"], "error", "{reply}");
+    }
+    // The refusals left the pin and the session as they were.
+    let rechecked = worker.send(check.clone());
+    assert_eq!(rechecked["result"], "valid", "{rechecked}");
+    assert_eq!(rechecked["pinned"]["closed"], true, "{rechecked}");
+    assert_eq!(worker.send(json!({"command":"close", "session":session}))["event"], "closed");
+    worker.finish(false);
+}
+
+/// Without the ladder mode, Verus's cvc5 has only E-matching and pools: the
+/// other rungs are reported, not run.
+#[test]
+fn resident_ladder_without_the_mode_reports_what_is_missing() {
+    let mut worker = Worker::start(LADDER_SOURCE, &[]);
+    let ready = worker.receive();
+    assert_eq!(ready["strategy_ladder"], false, "{ready}");
+    let session = ready["session"].clone();
+    let ladder = worker.send(json!({"command":"ladder", "session":session, "bucket":0,
+        "query":query_id(&ready, "::untriggered")}));
+    assert_eq!(ladder["available"], json!(["ematch", "pool"]), "{ladder}");
+    for name in ["conflict", "enum", "mbqi"] {
+        assert_eq!(rung(&ladder, name)["verdict"], "unavailable", "{ladder}");
+    }
+    // The two the solver has still run: E-matching fails as the default
+    // schedule does, and pools, which Verus never emits, instantiate nothing.
+    assert_eq!(rung(&ladder, "ematch")["verdict"], "unknown", "{ladder}");
+    assert_eq!(rung(&ladder, "pool")["verdict"], "unknown", "{ladder}");
+    assert_eq!(rung(&ladder, "pool")["instantiations"], 0, "{ladder}");
+    assert!(ladder["solved_by"].is_null(), "{}", ladder);
+    worker.finish(false);
+}
+
+/// A pinned rung's proof decides the verdict, so the reply keeps that check's
+/// provenance, as it keeps its instantiation graph; only a pinned attempt
+/// that fails has its diagnostics discarded with it.
+#[test]
+fn resident_pinned_recheck_keeps_the_provenance_of_its_proof() {
+    let mut worker = Worker::start_with_env(
+        LADDER_SOURCE,
+        &["-V", "provenance"],
+        &[("VERUS_RESIDENT_STRATEGY_LADDER", "1")],
+    );
+    let ready = worker.receive();
+    assert_eq!(ready["provenance"], true, "{ready}");
+    let session = ready["session"].clone();
+    let untriggered = query_id(&ready, "::untriggered");
+    let ladder = worker
+        .send(json!({"command":"ladder", "session":session, "bucket":0, "query":untriggered}));
+    assert!(ladder["solved_by"].is_string(), "{}", ladder);
+    let checked =
+        worker.send(json!({"command":"check", "session":session, "bucket":0, "query":untriggered}));
+    assert_eq!(checked["result"], "valid", "{checked}");
+    assert_eq!(checked["pinned"]["closed"], true, "{checked}");
+    assert_eq!(checked["provenance"]["result"], "valid", "{checked}");
+    assert_eq!(checked["provenance"]["round"], 0, "{checked}");
+    let requires = checked["provenance"]["hypotheses"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{}", checked))
+        .iter()
+        .filter(|h| h["kind"] == "requires")
+        .count();
+    assert!(requires > 0, "{}", checked);
+    worker.finish(false);
+}
+
+const UNBOUNDED_SOURCE: &str = r#"
+use vstd::prelude::*;
+verus! {
+    uninterp spec fn f(i: int) -> int;
+    uninterp spec fn p(i: int) -> bool;
+
+    // The goal has no `f` term, so E-matching does nothing, but every
+    // enumerative instance of the requirement makes a new one.
+    #[verifier::rlimit(infinity)]
+    proof fn growing(a: int)
+        requires forall|x: int| #[trigger] f(x) < f(x + 1),
+    {
+        assert(p(a));
+    }
+
+    #[verifier::rlimit(infinity)]
+    proof fn untriggered(a: int)
+        requires forall|x: int| #[trigger] f(x) >= 0 && p(x),
+    {
+        assert(p(a));
+    }
+}
+"#;
+
+/// A query without an rlimit gives its rungs the default one rather than no
+/// limit at all, and a pinned attempt runs at the budget that proved it.
+#[test]
+fn resident_ladder_bounds_a_query_without_an_rlimit() {
+    let mut worker =
+        Worker::start_with_env(UNBOUNDED_SOURCE, &[], &[("VERUS_RESIDENT_STRATEGY_LADDER", "1")]);
+    let ready = worker.receive();
+    let session = ready["session"].clone();
+    // A pin found at a budget below the query's is tried at that budget.
+    // (Enumerative instantiation alone spends 5 on the prelude; alongside
+    // E-matching it proves this in a small part of it.) This runs before the
+    // `growing` rung below: the terms that rung's instances make outlast its
+    // check in cvc5, and make later checks on the solver far costlier.
+    let untriggered = query_id(&ready, "::untriggered");
+    let ladder = worker.send(json!({"command":"ladder", "session":session, "bucket":0,
+        "query":untriggered, "rungs":["enum"], "alongside":true, "budgets":{"enum":5}}));
+    assert_eq!(
+        ladder["pinned"],
+        json!({"rung": "enum", "alongside": true, "rlimit": 5.0}),
+        "{ladder}"
+    );
+    let checked =
+        worker.send(json!({"command":"check", "session":session, "bucket":0, "query":untriggered}));
+    assert_eq!(checked["result"], "valid", "{checked}");
+    assert_eq!(checked["pinned"]["rlimit"], 5.0, "{checked}");
+    assert_eq!(checked["pinned"]["closed"], true, "{checked}");
+    // Unbounded, enumerative instantiation would never answer this one.
+    let growing = worker.send(json!({"command":"ladder", "session":session, "bucket":0,
+        "query":query_id(&ready, "::growing"), "rungs":["enum"]}));
+    let enumerative = rung(&growing, "enum");
+    assert_eq!(enumerative["rlimit"], 10.0, "{growing}");
+    assert!(enumerative["resource_limit"].as_u64().unwrap() > 0, "{}", growing);
+    assert_ne!(enumerative["verdict"], "valid", "{growing}");
+    worker.finish(false);
 }
 
 #[test]
