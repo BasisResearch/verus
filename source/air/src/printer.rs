@@ -657,7 +657,7 @@ impl NodeWriter {
     }
 }
 
-pub(crate) fn node_to_string(node: &Node) -> String {
+pub fn node_to_string(node: &Node) -> String {
     NodeWriter::new().node_to_string_indent(&"".to_string(), node)
 }
 
