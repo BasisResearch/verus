@@ -214,6 +214,7 @@ pub(crate) fn smt_check_assertion<'ctx>(
     // previous check's pressure or difficulty behind for its caller to take
     context.last_inst_pressure = None;
     context.last_difficulty = None;
+    context.last_check_effort = None;
     let disabled_expr = if only_check_earlier {
         // disable all labels that come after the first known error
         let mut disabled: Vec<Expr> = Vec::new();
@@ -314,6 +315,10 @@ pub(crate) fn smt_check_assertion<'ctx>(
         // in the same batch, right after the answer it describes
         context.smt_log.log_get_info("inst-pressure");
     }
+    if context.check_effort {
+        // in the same batch, right after the answer it describes
+        context.smt_log.log_get_info("check-effort");
+    }
     if context.provenance {
         // in the same batch: the tag lists arrive after the result and the
         // instantiation dump, before the sentinel
@@ -363,6 +368,7 @@ pub(crate) fn smt_check_assertion<'ctx>(
     let mut nl_frontier = None;
     let mut egraph_lines: Vec<String> = Vec::new();
     let mut inst_pressure = None;
+    let mut check_effort = None;
     for line in smt_output {
         // The e-graph reply, or the solver's refusal of the request, is the
         // batch's last: every line from its first on belongs to it.
@@ -397,6 +403,12 @@ pub(crate) fn smt_check_assertion<'ctx>(
             // a cvc5 without the key; say so rather than fail the query
             inst_pressure =
                 Some(crate::context::InstPressure { unparsed: Some(line), ..Default::default() });
+        } else if context.check_effort && line.starts_with("(:check-effort ") {
+            check_effort = Some(parse_check_effort(&line));
+        } else if context.check_effort && check_effort.is_none() && line == "unsupported" {
+            // a cvc5 without the key; asked last, so it is the last refusal
+            check_effort =
+                Some(crate::context::CheckEffort { unparsed: Some(line), ..Default::default() });
         } else if line == "unsat" {
             assert!(unsat == None);
             unsat = Some(SmtOutput::Unsat);
@@ -436,6 +448,7 @@ pub(crate) fn smt_check_assertion<'ctx>(
     context.last_nl_frontier = nl_frontier;
     context.last_difficulty = difficulty;
     context.last_inst_pressure = inst_pressure;
+    context.last_check_effort = check_effort;
     if egraph_asked {
         context.last_egraph = Some(parse_egraph_lines(&egraph_lines));
     }
@@ -929,6 +942,42 @@ pub(crate) fn parse_inst_pressure(line: &str) -> crate::context::InstPressure {
             }
             _ => {}
         }
+    }
+    out
+}
+
+/// Parse cvc5's `(:check-effort (:resource-units N :instantiations M
+/// :inst-rounds R))`. Unknown keys are skipped; a reply without the three
+/// counts is kept whole in `unparsed`.
+pub(crate) fn parse_check_effort(line: &str) -> crate::context::CheckEffort {
+    use sise::TreeNode;
+    let mut out = crate::context::CheckEffort::default();
+    let fields = match read_smt_sexp(line) {
+        Some(TreeNode::List(items)) => match &items[..] {
+            [TreeNode::Atom(key), TreeNode::List(fields)] if key == ":check-effort" => {
+                fields.clone()
+            }
+            _ => Vec::new(),
+        },
+        _ => Vec::new(),
+    };
+    let mut seen = 0;
+    for pair in fields.chunks(2) {
+        if let [TreeNode::Atom(k), TreeNode::Atom(v)] = pair {
+            let slot = match k.as_str() {
+                ":resource-units" => &mut out.resource_units,
+                ":instantiations" => &mut out.instantiations,
+                ":inst-rounds" => &mut out.inst_rounds,
+                _ => continue,
+            };
+            if let Ok(n) = v.parse() {
+                *slot = n;
+                seen += 1;
+            }
+        }
+    }
+    if seen != 3 {
+        out = crate::context::CheckEffort { unparsed: Some(line.to_owned()), ..Default::default() };
     }
     out
 }

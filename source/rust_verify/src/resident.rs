@@ -141,7 +141,7 @@ pub(crate) struct QueryJournal {
 /// as it does a malformed one. Every `Request` variant belongs here, in the
 /// protocol's snake case, which `resident_ready_lists_the_requests_it_serves`
 /// checks by sending each one.
-const COMMANDS: &[&str] = &["list", "check", "bisect", "egraph", "close", "inst_graph"];
+const COMMANDS: &[&str] = &["list", "check", "bisect", "egraph", "scaffold", "close", "inst_graph"];
 
 #[derive(Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]
@@ -185,6 +185,28 @@ enum Request {
         /// second check.
         #[serde(default)]
         inject: Option<String>,
+    },
+    /// Try a proposed assertion `P` at one goal of the query: is `P`
+    /// provable there, and does the goal hold once `P` is assumed there
+    /// (see `air::scaffold`). Each check runs in the query's own scope.
+    Scaffold {
+        session: String,
+        bucket: BucketIndex,
+        query: QueryId,
+        /// `P` as Verus source: `P`, `assert(P)` or `assert(P);`.
+        assert: String,
+        /// The goal to place `P` before, by assert id. Default: the goal the
+        /// query's own check fails at first.
+        assert_id: Option<Vec<u64>>,
+        /// The goal by its index among the query's asserts (`target.goal` of
+        /// a reply, or a refusal's list), for one without an assert id, such
+        /// as a loop invariant at the end of the loop body. `assert_id` wins
+        /// when both are given.
+        #[serde(default)]
+        goal: Option<usize>,
+        /// Skip the check of `P` itself, when it is known to hold.
+        #[serde(default)]
+        goal_only: bool,
     },
     Close {
         session: String,
@@ -596,6 +618,13 @@ enum Response<'a> {
         query: QueryId,
         #[serde(flatten)]
         outcome: Box<EgraphOutcome>,
+    },
+    Scaffold {
+        session: &'a str,
+        bucket: BucketIndex,
+        query: QueryId,
+        #[serde(flatten)]
+        report: Box<ScaffoldReport>,
     },
     Error {
         message: &'a str,
@@ -1435,6 +1464,690 @@ fn serve_egraph(
     Ok(Ok(EgraphOutcome { before, summary, equalities, injection }))
 }
 
+/// What a scaffold request asks.
+struct ScaffoldRequest {
+    assert: String,
+    assert_id: Option<Vec<u64>>,
+    goal: Option<usize>,
+    goal_only: bool,
+}
+
+/// What one check cost, as cvc5's `(get-info :check-effort)` reported it.
+#[derive(Clone, Copy, Serialize)]
+struct CheckCost {
+    /// Resource units: the units of the query's rlimit budget. Not comparable
+    /// unit for unit between consecutive checks on one solver: cvc5's
+    /// rewriter and term caches survive `pop`, so a check after another of
+    /// like work spends fewer.
+    resource_units: u64,
+    instantiations: u64,
+    inst_rounds: u64,
+}
+
+/// One check of a scaffold request.
+#[derive(Serialize)]
+struct ScaffoldRun {
+    result: QueryResult,
+    /// The solver's reason for giving up (`incomplete`, `resourceout`, ...).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+    elapsed_ms: u128,
+    /// None from a cvc5 that does not report `:check-effort`.
+    cost: Option<CheckCost>,
+    /// For the query's own check: how many checks followed it to find the
+    /// earliest failing goal, as Verus does before reporting one. Their
+    /// time and cost are not in this run's.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rechecks: Option<usize>,
+}
+
+/// The goal a scaffold request placed `P` before.
+#[derive(Serialize)]
+struct ScaffoldTarget {
+    /// Empty for a goal Verus emits without an assert id (a loop invariant
+    /// at the end of the loop body, `decreases`); `goal` addresses it.
+    assert_id: Vec<u64>,
+    /// Its index among the query's asserts, which a request's `goal` names.
+    goal: usize,
+    /// `requested`; `first_failure`, the earliest goal the query's check
+    /// fails at, found as Verus finds the error it reports first; or
+    /// after a resource limit, which names no goal, `first_failing_alone`,
+    /// the first goal whose check alone failed.
+    chosen: &'static str,
+    /// How many goals were checked alone to find it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    goals_probed: Option<usize>,
+    /// The goal's error message, such as `assertion failed`.
+    description: String,
+    span: Option<String>,
+    labels: Vec<SourceLabel>,
+    /// How often the goal occurs; `P` is placed before each occurrence.
+    occurrences: usize,
+    /// The span `placement` refers to, when it refers to one: the goal's own,
+    /// or for a postcondition the "end of the function body" label's.
+    insert_before: Option<String>,
+    /// Where `assert(P);` goes in the source: `before_span`, right before
+    /// `insert_before`; `end_of_body`, at the end of the function body (a
+    /// postcondition); `end_of_loop_body` or `before_loop` (a loop
+    /// invariant, checked there, which no span names); `end_of_proof_block`
+    /// (the claim of `assert ... by`, checked after that block's steps; a
+    /// goal among the steps is `before_span`).
+    placement: &'static str,
+}
+
+/// The goal's check with `P` assumed, less its check alone, run in that
+/// order on the same solver. Instantiations are the steadier comparator:
+/// resource units are not comparable between consecutive checks, since
+/// cvc5's rewriter and term caches survive `pop`, so the later check of
+/// like work spends fewer units and `rlimit_delta` reads low.
+#[derive(Serialize)]
+struct MarginalCost {
+    instantiations_delta: i64,
+    /// In resource units, the units of the query's rlimit budget; biased low
+    /// by the caches the earlier checks warmed.
+    rlimit_delta: i64,
+}
+
+/// What the goal's check under `P` drew on, from provenance: the hypotheses
+/// that reached the solver in that check, and the quantifiers it
+/// instantiated. Not an unsat core: the refutation need not have used every
+/// one of them.
+#[derive(Serialize)]
+struct ScaffoldWhy {
+    /// The hypotheses (`requires`, type invariants, ...) in the check.
+    explains_goal: Vec<crate::provenance::ResolvedTag>,
+    /// The quantifiers instantiated, those with a source span or defining a
+    /// function first, at most 12.
+    closing_quantifiers: Vec<crate::provenance::ResolvedInstantiation>,
+    closing_quantifiers_omitted: usize,
+}
+
+#[derive(Serialize)]
+struct ScaffoldReport {
+    target: ScaffoldTarget,
+    /// `P` as it was checked, rendered back from AIR as source.
+    lowered_as: String,
+    /// Names with more than one reading, and the reading taken.
+    choices: Vec<String>,
+    /// The query's own check, run to find the goal when none was named.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    query_check: Option<ScaffoldRun>,
+    /// The goal alone: every other goal assumed, nothing added.
+    baseline: ScaffoldRun,
+    /// `P` asserted in place of the goal. Absent under `goal_only`.
+    p_provable: Option<ScaffoldRun>,
+    /// The goal with `P` assumed right before it.
+    goal_given_p: ScaffoldRun,
+    /// `scaffold`, `true_but_unhelpful`, `helpful_but_unprovable`,
+    /// `dead_end`, `goal_already_holds`, or under `goal_only`
+    /// `goal_closes_given_p` / `goal_open_given_p`. When a check the case
+    /// turns on runs out of budget, which proves nothing either way:
+    /// `helpful_but_undecided` (the goal closes under `P`; `P`'s check ran
+    /// out), `unhelpful_and_undecided` (the goal stays open under `P`; `P`'s
+    /// check ran out), `undecided` (the goal's check under `P` ran out), or
+    /// under `goal_only` `goal_undecided_given_p`.
+    case: &'static str,
+    marginal_cost: Option<MarginalCost>,
+    /// When the goal closed under `P` in a provenance session: what that
+    /// check had and instantiated, not a core.
+    why: Option<ScaffoldWhy>,
+    /// Why the goal stayed open under `P`, when the solver gave up.
+    residual: Option<crate::provenance::ResolvedUnknownReason>,
+    /// `assert(P);` to add before `target.insert_before`, when the goal
+    /// closes under `P` (and `P` is provable, unless `goal_only`).
+    verus_snippet: Option<String>,
+    /// The solver's assertion stack before and after every check: equal, or
+    /// the session would have ended.
+    stack_levels: Option<u64>,
+    elapsed_ms: u128,
+    restore_ms: u128,
+}
+
+struct ArmOutcome {
+    run: ScaffoldRun,
+    assert_id: Option<Vec<u64>>,
+    /// The failing goal's error message, which names a goal without an id.
+    error: Option<air::messages::ArcDynMessage>,
+    provenance: Option<air::context::ProvenanceInfo>,
+    unknown: Option<air::context::UnknownReason>,
+}
+
+/// Check `query` once in the retained query's scope and finish it. With
+/// `earliest`, a failure is followed by checks for a failing goal before it,
+/// as Verus runs them before reporting, until none is left: the goal named
+/// is then the earliest failing one, not whichever the model showed first.
+/// `Ok(Err)` is a refusal (the query did not type-check, so no scope was
+/// opened).
+fn scaffold_check(
+    air: &mut Context,
+    query: &Query,
+    rlimit: f32,
+    set_rlimit: &impl Fn(&mut Context, f32),
+    earliest: bool,
+) -> io::Result<Result<ArmOutcome, String>> {
+    set_rlimit(air, rlimit);
+    let start = Instant::now();
+    let outcome = air.check_valid(
+        &VirMessageInterface {},
+        &QueryDiagnostics::default(),
+        query,
+        QueryContext::default(),
+    );
+    let elapsed_ms = start.elapsed().as_millis();
+    let provenance = air.take_provenance();
+    let unknown = air.take_unknown_reason();
+    let effort = air.take_check_effort();
+    drop(air.take_matching_loops());
+    drop(air.take_difficulty());
+    drop(air.take_inst_pressure());
+    drop(air.take_nl_frontier());
+    let (result, mut assert_id, mut error, has_model) = match outcome {
+        ValidityResult::Valid(_) => (QueryResult::Valid, None, None, false),
+        ValidityResult::Invalid(model, error, id) => {
+            (QueryResult::Invalid, id.map(|id| (*id).clone()), error, model.is_some())
+        }
+        ValidityResult::Canceled => (QueryResult::ResourceLimit, None, None, false),
+        // A query that fails to type-check opens no scope to finish.
+        ValidityResult::TypeError(error) => {
+            return Ok(Err(format!("AIR rejected the assertion as lowered: {error}")));
+        }
+        ValidityResult::UnexpectedOutput(error) => return Err(io::Error::other(error)),
+    };
+    let mut rechecks = None;
+    // A recheck needs the model of the failure before it.
+    if earliest && has_model {
+        let mut count = 0;
+        loop {
+            count += 1;
+            let again =
+                air.check_valid_again(&QueryDiagnostics::default(), true, QueryContext::default());
+            drop(air.take_provenance());
+            drop(air.take_unknown_reason());
+            drop(air.take_check_effort());
+            drop(air.take_matching_loops());
+            drop(air.take_difficulty());
+            drop(air.take_inst_pressure());
+            drop(air.take_nl_frontier());
+            match again {
+                ValidityResult::Invalid(model, again_error, id) => {
+                    if again_error.is_some() || id.is_some() {
+                        assert_id = id.map(|id| (*id).clone());
+                        error = again_error;
+                    }
+                    if model.is_none() {
+                        break;
+                    }
+                }
+                ValidityResult::UnexpectedOutput(error) => return Err(io::Error::other(error)),
+                // no failing goal before the last one found, or out of budget
+                _ => break,
+            }
+        }
+        rechecks = Some(count);
+    }
+    air.finish_query();
+    let reason = unknown.as_ref().map(|u| u.reason.clone()).filter(|r| !r.is_empty());
+    let cost = effort.filter(|e| e.unparsed.is_none()).map(|e| CheckCost {
+        resource_units: e.resource_units,
+        instantiations: e.instantiations,
+        inst_rounds: e.inst_rounds,
+    });
+    Ok(Ok(ArmOutcome {
+        run: ScaffoldRun { result, reason, elapsed_ms, cost, rechecks },
+        assert_id,
+        error,
+        provenance,
+        unknown,
+    }))
+}
+
+/// Whether two goal error messages describe the same goal: the same note at
+/// the same primary span. A failure's message is the goal's with labels
+/// appended, so this is how a failure names a goal without an assert id.
+fn same_goal(a: &air::messages::ArcDynMessage, b: &air::messages::ArcDynMessage) -> bool {
+    match (a.downcast_ref::<MessageX>(), b.downcast_ref::<MessageX>()) {
+        (Some(a), Some(b)) => {
+            a.note == b.note
+                && a.spans.first().map(|s| &s.as_string) == b.spans.first().map(|s| &s.as_string)
+        }
+        _ => false,
+    }
+}
+
+/// One line about a goal, for a refusal that lists them: its index, its
+/// assert id, its message and where it is.
+fn describe_goal(goal: &air::scaffold::Goal) -> String {
+    let message = goal.error.downcast_ref::<MessageX>();
+    let note = message.map(|m| m.note.as_str()).unwrap_or("goal");
+    let at = message
+        .and_then(|m| m.spans.first())
+        .map(|s| {
+            let s = s.as_string.rsplit('/').next().unwrap_or(&s.as_string);
+            format!(" at {}", s.split(" (#").next().unwrap_or(s))
+        })
+        .unwrap_or_default();
+    let id = match &goal.id {
+        Some(id) => format!("assert_id {:?}", **id),
+        None => "no assert id".to_owned(),
+    };
+    format!("goal {} ({id}) {note}{at}", goal.index)
+}
+
+/// `assert(P);` for the source, from `P` as the request wrote it.
+fn assertion_snippet(text: &str) -> String {
+    let text = text.trim().trim_end_matches(';').trim();
+    let inner = text
+        .strip_prefix("assert")
+        .map(str::trim_start)
+        .and_then(|rest| rest.strip_prefix('('))
+        .and_then(|rest| rest.strip_suffix(')'))
+        .unwrap_or(text);
+    format!("assert({});", inner.trim())
+}
+
+/// Whether the source right after `span` (`path:line:col: line:col (#n)`,
+/// columns counted in characters from 1, the end just past the span) reads
+/// `by`, after the `)` of `assert(` if there is one: the span is then the
+/// claim of `assert ... by` or `assert forall ... by`. None when the span or
+/// its file cannot be read.
+fn followed_by_by(span: &str) -> Option<bool> {
+    let span = span.split(" (#").next()?;
+    let (start, end) = span.rsplit_once(": ")?;
+    let mut start = start.rsplitn(3, ':');
+    let (_, _, path) = (start.next()?, start.next()?, start.next()?);
+    let (line, col) = end.split_once(':')?;
+    let line: usize = line.trim().parse().ok()?;
+    let col: usize = col.trim().parse().ok()?;
+    let text = std::fs::read_to_string(path).ok()?;
+    let mut lines = text.split_inclusive('\n');
+    let mut offset = 0;
+    for _ in 1..line {
+        offset += lines.next()?.len();
+    }
+    let current = lines.next()?;
+    let within = current.char_indices().nth(col.checked_sub(1)?).map_or(current.len(), |(i, _)| i);
+    let rest = text[offset + within..].trim_start();
+    let rest = rest.strip_prefix(')').unwrap_or(rest).trim_start();
+    Some(
+        rest.strip_prefix("by")
+            .is_some_and(|after| !after.starts_with(|c: char| c.is_alphanumeric() || c == '_')),
+    )
+}
+
+/// Serve a scaffold request for one query of `bucket`, whose address the
+/// caller has checked: read `P`, find the goal, and check the goal alone, `P`
+/// in its place, and the goal with `P` assumed. Every check runs in the
+/// query's own scope. If the solver's assertion stack is not exactly as
+/// before afterwards, `P` or its negation could reach later checks, so that
+/// ends the session (`Err`). `Ok(Err(_))` is a refusal to report.
+fn serve_scaffold(
+    bucket: &RetainedBucket,
+    id: QueryId,
+    request: ScaffoldRequest,
+    set_rlimit: &impl Fn(&mut Context, f32),
+) -> io::Result<Result<ScaffoldReport, String>> {
+    let mut state =
+        bucket.state.lock().map_err(|_| io::Error::other("resident bucket poisoned"))?;
+    let (solver, local) = bucket.addresses[id.0];
+    let SolverState { air, journal } = &mut state[solver];
+    if !matches!(air.get_solver(), SmtSolver::Cvc5) {
+        return Ok(Err("scaffold requests need cvc5".to_owned()));
+    }
+    let Some(symbols) = bucket.symbols.as_ref() else {
+        return Ok(Err("this bucket kept no source names to read the assertion with".to_owned()));
+    };
+    if matches!(
+        journal.queries[local].prover,
+        vir::def::ProverChoice::BitVector | vir::def::ProverChoice::Singular
+    ) {
+        return Ok(Err(
+            "a bit-vector or Singular query has no spec terms to read the assertion over"
+                .to_owned(),
+        ));
+    }
+    let prefix = journal.queries[local].prefix;
+    let restore_start = Instant::now();
+    journal.restore_prefix(air, prefix)?;
+    let restore_ms = restore_start.elapsed().as_millis();
+    let query = &journal.queries[local];
+    let levels = air.solver_stack_levels();
+    let depth = air.scope_depth();
+    let start = Instant::now();
+    air.set_check_effort(true);
+    let report = scaffold_arms(air, query, symbols, &bucket.quantifiers, request, set_rlimit);
+    air.set_check_effort(false);
+    let report = report?;
+    let (levels_after, depth_after) = (air.solver_stack_levels(), air.scope_depth());
+    if levels_after != levels || depth_after != depth {
+        return Err(io::Error::other(format!(
+            "a scaffold check left the solver at {levels_after:?} assertion levels and AIR at \
+             {depth_after} scopes, instead of {levels:?} and {depth}"
+        )));
+    }
+    Ok(report.map(|mut report| {
+        report.elapsed_ms = start.elapsed().as_millis();
+        report.restore_ms = restore_ms;
+        report.stack_levels = levels;
+        report
+    }))
+}
+
+fn scaffold_arms(
+    air: &mut Context,
+    query: &RetainedQuery,
+    symbols: &crate::provenance::Symbols,
+    quantifiers: &crate::provenance::Quantifiers,
+    request: ScaffoldRequest,
+    set_rlimit: &impl Fn(&mut Context, f32),
+) -> io::Result<Result<ScaffoldReport, String>> {
+    use air::scaffold::Arm;
+    macro_rules! check {
+        ($query:expr) => {
+            check!($query, false)
+        };
+        ($query:expr, $earliest:expr) => {
+            match scaffold_check(air, $query, query.rlimit, set_rlimit, $earliest)? {
+                Ok(outcome) => outcome,
+                Err(refusal) => return Ok(Err(refusal)),
+            }
+        };
+    }
+    // Read P before any check, so a refusal costs no solver time.
+    let occurrences = air::scaffold::occurrences(&query.query);
+    let locals: Vec<_> = query
+        .query
+        .local
+        .iter()
+        .filter_map(|decl| match &**decl {
+            air::ast::DeclX::Const(x, typ) | air::ast::DeclX::Var(x, typ) => {
+                Some((x.clone(), typ.clone()))
+            }
+            _ => None,
+        })
+        .collect();
+    let lowered = {
+        let context: &Context = air;
+        let declared = |name: &str| context.declared(name);
+        let env = crate::scaffold::Env {
+            names: symbols.source_names(),
+            crate_name: symbols.crate_name(),
+            locals,
+            declared: &declared,
+            occurrences: &occurrences,
+        };
+        match crate::scaffold::lower(&request.assert, &env) {
+            Ok(lowered) => lowered,
+            Err(error) => return Ok(Err(format!("cannot read the assertion: {error}"))),
+        }
+    };
+    let printer = air::printer::Printer::new(
+        std::sync::Arc::new(VirMessageInterface {}),
+        true,
+        SmtSolver::Cvc5,
+    );
+    let smt = air::printer::node_to_string(&printer.expr_to_node(&lowered.expr));
+    let lowered_as = vir::air_names::render_term(&symbols.paste_names(&HashMap::new()), &smt);
+
+    let goals = air::scaffold::goals(&query.query);
+    // The goals, for a refusal that asks the caller to name one.
+    let listed = || -> String {
+        const GOALS_LISTED: usize = 40;
+        let listed: Vec<String> = goals.iter().take(GOALS_LISTED).map(describe_goal).collect();
+        let more = goals.len().saturating_sub(GOALS_LISTED);
+        let more = if more > 0 { format!("; and {more} more") } else { String::new() };
+        format!("{}{more}", listed.join("; "))
+    };
+    let by_id = |id: &[u64]| goals.iter().find(|g| g.id.as_ref().is_some_and(|gid| **gid == id));
+    let (goal, chosen, query_check, goals_probed) = match (request.assert_id, request.goal) {
+        (Some(id), _) => match by_id(&id) {
+            Some(goal) => (goal.clone(), "requested", None, None),
+            None => {
+                return Ok(Err(format!(
+                    "no goal of this query has assert id {id:?}; its goals are {}",
+                    listed()
+                )));
+            }
+        },
+        (None, Some(index)) => match goals.iter().find(|g| g.index == index) {
+            Some(goal) => (goal.clone(), "requested", None, None),
+            None => {
+                return Ok(Err(format!(
+                    "no goal of this query has index {index}; its goals are {}",
+                    listed()
+                )));
+            }
+        },
+        (None, None) => {
+            let outcome = check!(&query.query, true);
+            // By id, or by message for a goal without one: a failure's
+            // message is the goal's, with labels appended.
+            let failed = outcome.assert_id.as_ref().and_then(|id| by_id(id)).or_else(|| {
+                let error = outcome.error.as_ref()?;
+                goals.iter().find(|g| same_goal(&g.error, error))
+            });
+            match (failed, outcome.run.result) {
+                (Some(goal), _) => (goal.clone(), "first_failure", Some(outcome.run), None),
+                (None, QueryResult::Valid) => {
+                    return Ok(Err("the query verifies; name a goal with assert_id or goal to \
+                                   scaffold it anyway"
+                        .to_owned()));
+                }
+                (None, result) => 'found: {
+                    // A resource limit names no goal. Check each goal alone,
+                    // in order, every other goal assumed, and take the first
+                    // that fails, as the earliest error is the one Verus
+                    // reports. Past the budget, list them instead.
+                    const GOALS_PROBED: usize = 64;
+                    let truth = air::ast_util::mk_true();
+                    for (probes, goal) in goals.iter().take(GOALS_PROBED).enumerate() {
+                        let alone = air::scaffold::scaffold_query(
+                            &query.query,
+                            goal.target(),
+                            &truth,
+                            Arm::GoalGiven,
+                        )
+                        .expect("a goal of this query");
+                        if check!(&alone.query).run.result != QueryResult::Valid {
+                            break 'found (
+                                goal.clone(),
+                                "first_failing_alone",
+                                Some(outcome.run),
+                                Some(probes + 1),
+                            );
+                        }
+                    }
+                    let why = match result {
+                        QueryResult::ResourceLimit if goals.len() <= GOALS_PROBED => format!(
+                            "the query ran out of budget, yet each of its {} goals holds alone \
+                             with the others assumed: the budget goes on the query as a whole, \
+                             not on one goal",
+                            goals.len()
+                        ),
+                        QueryResult::ResourceLimit => format!(
+                            "the query's check named no failing goal (a resource limit names \
+                             none), and of its first {GOALS_PROBED} goals each holds alone"
+                        ),
+                        _ => format!(
+                            "the query's check failed at a goal this worker could not match to \
+                             one of its {} asserts, and each of the first {GOALS_PROBED} holds \
+                             alone",
+                            goals.len()
+                        ),
+                    };
+                    return Ok(Err(format!(
+                        "{why}; name one with assert_id or goal to scaffold it: {}",
+                        listed()
+                    )));
+                }
+            }
+        }
+    };
+    let rewrite = |arm, p: &air::ast::Expr| {
+        air::scaffold::scaffold_query(&query.query, goal.target(), p, arm)
+            .expect("a goal of this query")
+    };
+    let alone = rewrite(Arm::GoalGiven, &air::ast_util::mk_true());
+    let given = rewrite(Arm::GoalGiven, &lowered.expr);
+    let provable = rewrite(Arm::Provable, &lowered.expr);
+
+    let baseline = check!(&alone.query);
+    let p_provable = if request.goal_only { None } else { Some(check!(&provable.query)) };
+    let goal_given_p = check!(&given.query);
+
+    let holds = |run: &ScaffoldRun| run.result == QueryResult::Valid;
+    // A check that ran out of budget proves nothing either way, so a case
+    // turning on one says so rather than calling P unprovable.
+    #[derive(Clone, Copy)]
+    enum Verdict {
+        Holds,
+        Fails,
+        OutOfBudget,
+    }
+    let verdict = |run: &ScaffoldRun| match run.result {
+        QueryResult::Valid => Verdict::Holds,
+        QueryResult::ResourceLimit => Verdict::OutOfBudget,
+        _ => Verdict::Fails,
+    };
+    let case = {
+        use Verdict::*;
+        match (
+            verdict(&baseline.run),
+            p_provable.as_ref().map(|p| verdict(&p.run)),
+            verdict(&goal_given_p.run),
+        ) {
+            (Holds, _, _) => "goal_already_holds",
+            (_, Some(_), OutOfBudget) => "undecided",
+            (_, Some(Holds), Holds) => "scaffold",
+            (_, Some(Holds), Fails) => "true_but_unhelpful",
+            (_, Some(Fails), Holds) => "helpful_but_unprovable",
+            (_, Some(Fails), Fails) => "dead_end",
+            (_, Some(OutOfBudget), Holds) => "helpful_but_undecided",
+            (_, Some(OutOfBudget), Fails) => "unhelpful_and_undecided",
+            (_, None, Holds) => "goal_closes_given_p",
+            (_, None, Fails) => "goal_open_given_p",
+            (_, None, OutOfBudget) => "goal_undecided_given_p",
+        }
+    };
+    let marginal_cost = match (baseline.run.cost, goal_given_p.run.cost) {
+        (Some(before), Some(after)) => Some(MarginalCost {
+            instantiations_delta: after.instantiations as i64 - before.instantiations as i64,
+            rlimit_delta: after.resource_units as i64 - before.resource_units as i64,
+        }),
+        _ => None,
+    };
+    let desc = &query.context.desc;
+    let span = &query.context.span.as_string;
+    let why = goal_given_p.provenance.filter(|_| holds(&goal_given_p.run)).map(|info| {
+        let resolved = symbols.resolve(
+            &query.context.fun,
+            crate::provenance::QueryProvenance {
+                desc: desc.clone(),
+                span: span.clone(),
+                focus: None,
+                round: 0,
+                result: "valid".to_owned(),
+                sources: info.sources,
+                instantiations: info.instantiations,
+                variable_versions: info.variable_versions,
+                unparsed: info.unparsed,
+            },
+        );
+        let mut closing = resolved.instantiations;
+        // user quantifiers and function definitions first, the prelude last
+        closing.sort_by_key(|q| match (&q.span, q.role, q.fun.as_deref()) {
+            (Some(_), _, _) => 0,
+            (None, Some("definition" | "definition_unfold" | "definition_base"), _) => 1,
+            (None, _, Some("prelude")) => 3,
+            _ => 2,
+        });
+        const CLOSING_SHOWN: usize = 12;
+        let omitted = closing.len().saturating_sub(CLOSING_SHOWN);
+        closing.truncate(CLOSING_SHOWN);
+        ScaffoldWhy {
+            explains_goal: resolved.hypotheses,
+            closing_quantifiers: closing,
+            closing_quantifiers_omitted: omitted,
+        }
+    });
+    let residual = goal_given_p
+        .unknown
+        .filter(|u| {
+            !holds(&goal_given_p.run) && (u.incomplete_id.is_some() || !u.culprit_qids.is_empty())
+        })
+        .map(|reason| {
+            let mut resolved = quantifiers.resolve_unknown(desc, span, reason);
+            resolved.culprits.truncate(20);
+            resolved
+        });
+    let message = given.error.downcast_ref::<MessageX>();
+    let labels: Vec<SourceLabel> = message
+        .map(|m| {
+            m.labels
+                .iter()
+                .map(|l| SourceLabel { message: l.note.clone(), span: l.span.as_string.clone() })
+                .collect()
+        })
+        .unwrap_or_default();
+    let primary = message.and_then(|m| m.spans.first()).map(|s| s.as_string.clone());
+    let description = message.map(|m| m.note.clone()).unwrap_or_default();
+    // Where the snippet goes. The claim of `assert ... by` is checked after
+    // that block's steps: it ends its dead end, and `by` follows its span. A
+    // closure body's last assert ends one too, with no `by`; when the source
+    // cannot be read, the dead end decides. A postcondition goes at the end
+    // of the body, which its label names; a loop invariant at the end of the
+    // loop body or before the loop, which no span names, or at the break or
+    // continue its span is; anything else, a step of a proof block included,
+    // at its own span.
+    let claim_of_assert_by =
+        given.ends_dead_end && primary.as_deref().and_then(followed_by_by).unwrap_or(true);
+    let (insert_before, placement) = if claim_of_assert_by {
+        (None, "end_of_proof_block")
+    } else if description.contains("postcondition") {
+        let end = labels
+            .iter()
+            .find(|l| l.message.contains("end of the function body"))
+            .map(|l| l.span.clone());
+        (end.or_else(|| primary.clone()), "end_of_body")
+    } else if description == vir::def::INV_FAIL_LOOP_END {
+        (None, "end_of_loop_body")
+    } else if description == vir::def::INV_FAIL_LOOP_FRONT {
+        (None, "before_loop")
+    } else {
+        // a loop invariant at a break or continue has that statement's span
+        (primary.clone(), "before_span")
+    };
+    let verus_snippet = matches!(case, "scaffold" | "goal_closes_given_p")
+        .then(|| assertion_snippet(&request.assert));
+    Ok(Ok(ScaffoldReport {
+        target: ScaffoldTarget {
+            assert_id: goal.id.as_ref().map(|id| (**id).clone()).unwrap_or_default(),
+            goal: goal.index,
+            chosen,
+            goals_probed,
+            description,
+            span: primary,
+            labels,
+            occurrences: given.occurrences,
+            insert_before,
+            placement,
+        },
+        lowered_as,
+        choices: lowered.choices,
+        query_check,
+        baseline: baseline.run,
+        p_provable: p_provable.map(|p| p.run),
+        goal_given_p: goal_given_p.run,
+        case,
+        marginal_cost,
+        why,
+        residual,
+        verus_snippet,
+        stack_levels: None,
+        elapsed_ms: 0,
+        restore_ms: 0,
+    }))
+}
+
 impl QueryJournal {
     pub(crate) fn new() -> Self {
         Self { contexts: Vec::new(), queries: Vec::new(), applied: 0, recorded_in_scope: false }
@@ -1645,6 +2358,7 @@ impl Server {
                 | Request::Check { session: requested, .. }
                 | Request::Bisect { session: requested, .. }
                 | Request::Egraph { session: requested, .. }
+                | Request::Scaffold { session: requested, .. }
                 | Request::Close { session: requested }
                 | Request::InstGraph { session: requested, .. }
                     if requested != session =>
@@ -1765,6 +2479,40 @@ impl Server {
                             },
                         )?,
                         Ok(Err(message)) => send(&mut output, &Response::Error { message })?,
+                        Err(error) => return fatal(&mut output, error),
+                    }
+                }
+                Request::Scaffold {
+                    bucket: bucket_id,
+                    query: id,
+                    assert,
+                    assert_id,
+                    goal,
+                    goal_only,
+                    ..
+                } => {
+                    let Some(bucket) = self.buckets.get(bucket_id.0) else {
+                        send(&mut output, &Response::Error { message: "unknown bucket" })?;
+                        continue;
+                    };
+                    if bucket.queries.get(id.0).is_none() {
+                        send(&mut output, &Response::Error { message: "unknown query" })?;
+                        continue;
+                    }
+                    let request = ScaffoldRequest { assert, assert_id, goal, goal_only };
+                    match serve_scaffold(bucket, id, request, &set_rlimit) {
+                        Ok(Ok(report)) => send(
+                            &mut output,
+                            &Response::Scaffold {
+                                session,
+                                bucket: bucket_id,
+                                query: id,
+                                report: Box::new(report),
+                            },
+                        )?,
+                        Ok(Err(message)) => {
+                            send(&mut output, &Response::Error { message: &message })?
+                        }
                         Err(error) => return fatal(&mut output, error),
                     }
                 }
