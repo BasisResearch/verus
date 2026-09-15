@@ -59,6 +59,7 @@ mod resident;
 mod resolve_traits;
 pub mod reveal_hide;
 mod rust_intrinsics_to_vir;
+mod scaffold;
 pub mod rust_to_vir;
 pub mod rust_to_vir_adts;
 pub mod rust_to_vir_base;

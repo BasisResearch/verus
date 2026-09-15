@@ -285,6 +285,28 @@ pub struct InstPressure {
     pub unparsed: Option<String>,
 }
 
+/// What cvc5's `(get-info :check-effort)` reported for one `check-sat`: the
+/// resource units it spent, in the units of `reproducible-resource-limit` and
+/// so of a query's rlimit budget, the instantiations it added and the
+/// instantiation rounds that sent lemmas.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CheckEffort {
+    pub resource_units: u64,
+    pub instantiations: u64,
+    pub inst_rounds: u64,
+    /// The reply, when it did not parse, such as `unsupported` from a cvc5
+    /// without the key.
+    pub unparsed: Option<String>,
+}
+
+/// What a context has declared a name as.
+#[derive(Debug, Clone)]
+pub enum Declared {
+    Type,
+    Var(Typ),
+    Fun(Typs, Typ),
+}
+
 /// One nonlinear term of `(get-info :nl-frontier)`.
 #[derive(Debug, Clone, Default)]
 pub struct NlAtom {
@@ -530,6 +552,11 @@ pub struct Context {
     /// The instantiation pressure of the last `check-sat`, until the caller
     /// takes it.
     pub(crate) last_inst_pressure: Option<InstPressure>,
+    /// Ask cvc5 for `(get-info :check-effort)` after every `check-sat`.
+    /// Read-only: the search is unchanged.
+    pub(crate) check_effort: bool,
+    /// The effort of the last `check-sat`, until the caller takes it.
+    pub(crate) last_check_effort: Option<CheckEffort>,
     /// Whether this solver may save and restore instantiations across
     /// rechecks of a query (cvc5 only, fixed at launch).
     pub(crate) instantiation_replay: bool,
@@ -637,6 +664,8 @@ impl Context {
             last_matching_loops: None,
             inst_pressure: false,
             last_inst_pressure: None,
+            check_effort: false,
+            last_check_effort: None,
             instantiation_replay: false,
             inst_graph: false,
             restore_instantiations: None,
@@ -794,6 +823,57 @@ impl Context {
     pub fn set_inst_pressure(&mut self, enabled: bool) {
         assert!(!enabled || matches!(self.solver, SmtSolver::Cvc5));
         self.inst_pressure = enabled;
+    }
+
+    /// The effort cvc5 reported for the most recent `check-sat`, if it was
+    /// asked; each call returns it once.
+    pub fn take_check_effort(&mut self) -> Option<CheckEffort> {
+        self.last_check_effort.take()
+    }
+
+    /// Ask for `(get-info :check-effort)` after every `check-sat` (cvc5 only).
+    /// It only reads counters, so the solver and its budget are unchanged.
+    pub fn set_check_effort(&mut self, enabled: bool) {
+        assert!(!enabled || matches!(self.solver, SmtSolver::Cvc5));
+        self.check_effort = enabled;
+    }
+
+    /// What this context has declared `name` as, in the scopes now open.
+    pub fn declared(&self, name: &str) -> Option<Declared> {
+        use crate::typecheck::DeclaredX;
+        Some(match self.typing.get(&Arc::new(name.to_string()))? {
+            DeclaredX::Type => Declared::Type,
+            DeclaredX::Var { typ, .. } => Declared::Var(typ.clone()),
+            DeclaredX::Fun { params, ret, .. } => Declared::Fun(params.clone(), ret.clone()),
+        })
+    }
+
+    /// How many scopes AIR has open: pushes not yet popped.
+    pub fn scope_depth(&self) -> usize {
+        self.typing.decls.num_scopes()
+    }
+
+    /// How many user scopes the solver holds, by `(get-info
+    /// :assertion-stack-levels)` (cvc5 only). `None` before the solver has
+    /// started, between a query and `finish_query`, or when the reply does
+    /// not parse. Only reads: the solver is unchanged.
+    pub fn solver_stack_levels(&mut self) -> Option<u64> {
+        if self.smt_process.is_none()
+            || !matches!(self.solver, SmtSolver::Cvc5)
+            || !matches!(self.state, ContextState::ReadyForQuery)
+        {
+            return None;
+        }
+        self.smt_log.log_get_info("assertion-stack-levels");
+        let smt_data = self.smt_log.take_pipe_data();
+        let lines = self.get_smt_process().send_commands(smt_data);
+        match &lines[..] {
+            [line] => line
+                .strip_prefix("(:assertion-stack-levels ")
+                .and_then(|rest| rest.strip_suffix(')'))
+                .and_then(|n| n.trim().parse().ok()),
+            _ => None,
+        }
     }
 
     /// Turn provenance mode on (cvc5 only; must precede the first query).
