@@ -1092,8 +1092,9 @@ impl Context {
     /// context and the solver if needed, and flush whatever was queued
     /// before. `None` when the solver does not know the key, as a cvc5
     /// without `:quant-strategy` would not: setting that option on one would
-    /// fail the next check. Read-only. The `available` list is filled in by
-    /// the solver's first `check-sat`, so it is empty before one has run.
+    /// fail the next check. Read-only. The `available` list is filled in once
+    /// the solver is initialized, which its first assertion or `push` does,
+    /// so it is empty only while the solver has been sent neither.
     pub fn probe_strategy_rung(&mut self) -> Option<StrategyRung> {
         if !matches!(self.solver, SmtSolver::Cvc5) {
             return None;

@@ -297,7 +297,9 @@ pub struct Verifier {
     /// Retain every selected query without checking any
     /// (`VERUS_RESIDENT_RETAIN_ONLY`): a resident session opened on edited
     /// source, whose caller carries over what it knew about the unchanged
-    /// queries and checks the changed ones itself (see resident.rs).
+    /// queries and checks the changed ones itself (see resident.rs). With no
+    /// answers to go by, it retains every recommends query a check could
+    /// have added (`retain_unchecked_recommends`).
     resident_retain_only: bool,
     /// this is the actual number of threads used for verification. This will be set to the
     /// minimum of the requested threads and the number of buckets to verify
@@ -1291,6 +1293,35 @@ impl Verifier {
         }
     }
 
+    /// The recommends queries a retain-only session retains after a body or
+    /// termination op it did not check: every one that checking it could
+    /// have added, whatever the checks would have answered. A failed check
+    /// adds the follow-up (unless `--no-auto-recommends-check`), and with
+    /// `check_recommends` a passing one adds the checked kind, so such a
+    /// function gets both. An op without commands (`could_fail` false, as
+    /// every proof and exec function's termination op is) never fails, and
+    /// adds only the checked kind. What is retained then depends on the
+    /// source alone, and a follow-up that a session on the source before an
+    /// edit retained because a check failed is still there to compare.
+    /// `--expand-errors` queries are the exception: they focus on the
+    /// assertion a check failed at, which only a check can name, so a
+    /// retain-only session has none.
+    fn retain_unchecked_recommends(
+        &self,
+        function_opgen: &mut crate::commands::FunctionOpGenerator,
+        op: &crate::commands::Op,
+        check_recommends: bool,
+        could_fail: bool,
+    ) -> Result<(), VirErr> {
+        if check_recommends {
+            function_opgen.retry_with_recommends(op, false)?;
+        }
+        if could_fail && (check_recommends || !self.args.no_auto_recommends_check) {
+            function_opgen.retry_with_recommends(op, true)?;
+        }
+        Ok(())
+    }
+
     /// Returns the status of running the provided queries
     /// invalidity: whether the command returned invalid or not
     /// timed_out: whether the command timed out or not
@@ -2251,7 +2282,21 @@ impl Verifier {
                             }
                         }
 
-                        if matches!(query_op, QueryOp::Body(Style::Normal)) {
+                        // Nothing was checked, so no answer can decide which
+                        // follow-ups to retain (see `retain_unchecked_recommends`).
+                        if self.resident_retain_only
+                            && matches!(
+                                query_op,
+                                QueryOp::Body(Style::Normal) | QueryOp::SpecTermination
+                            )
+                        {
+                            self.retain_unchecked_recommends(
+                                &mut function_opgen,
+                                &op,
+                                function.x.attrs.check_recommends,
+                                !commands_with_context_list.is_empty(),
+                            )?;
+                        } else if matches!(query_op, QueryOp::Body(Style::Normal)) {
                             if (any_invalid
                                 && !self.args.no_auto_recommends_check
                                 && !any_timed_out)
@@ -2283,7 +2328,9 @@ impl Verifier {
                             function_opgen.report_expand_error_result(res);
                         }
 
-                        if matches!(query_op, QueryOp::SpecTermination) {
+                        if matches!(query_op, QueryOp::SpecTermination)
+                            && !self.resident_retain_only
+                        {
                             if (any_invalid
                                 && !self.args.no_auto_recommends_check
                                 && !any_timed_out)

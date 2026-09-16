@@ -3536,6 +3536,200 @@ fn resident_pinned_recheck_keeps_the_provenance_of_its_proof() {
     worker.finish(false);
 }
 
+/// A pin request is refused where the query's checks could not follow it,
+/// as a ladder would skip the rung, and the refusals leave the session
+/// working: a rung the solver has no module for, and budgets out of range or
+/// below one cvc5 resource unit (which would reach cvc5 as no limit at all).
+#[test]
+fn resident_pin_is_refused_where_checks_could_not_follow_it() {
+    let mut worker = Worker::start(LADDER_SOURCE, &[]);
+    let ready = worker.receive();
+    assert_eq!(ready["strategy_ladder"], false, "{ready}");
+    let session = ready["session"].clone();
+    let untriggered = query_id(&ready, "::untriggered");
+    let pin = |rung: &str, rlimit: Value| {
+        json!({"command":"pin", "session":session, "bucket":0, "query":untriggered,
+            "rung":rung, "rlimit":rlimit})
+    };
+    for (rung, rlimit) in [
+        ("enum", json!(10)),
+        ("mbqi", json!(10)),
+        ("conflict", json!(10)),
+        ("pool", json!(0)),
+        ("pool", json!(1001)),
+        ("pool", json!(0.000001)),
+    ] {
+        let reply = worker.send(pin(rung, rlimit.clone()));
+        assert_eq!(reply["event"], "error", "{rung} at {rlimit}: {reply}");
+    }
+    for (bucket, query) in [(json!(1), untriggered.clone()), (json!(0), json!(99))] {
+        let reply = worker.send(json!({"command":"pin", "session":session, "bucket":bucket,
+            "query":query, "rung":"pool", "rlimit":10}));
+        assert_eq!(reply["event"], "error", "{reply}");
+    }
+    let check = json!({"command":"check", "session":session, "bucket":0, "query":untriggered});
+    let checked = worker.send(check.clone());
+    assert_eq!(checked["result"], "invalid", "{checked}");
+    assert!(checked["pinned"].is_null(), "{}", checked);
+    // A rung the solver has is pinned, and the next check tries it first.
+    let pinned = worker.send(pin("pool", json!(5)));
+    assert_eq!(pinned["event"], "pinned", "{pinned}");
+    assert_eq!(pinned["pin"], json!({"rung": "pool", "alongside": false, "rlimit": 5.0}));
+    let checked = worker.send(check);
+    assert_eq!(checked["result"], "invalid", "{checked}");
+    assert_eq!(checked["pinned"]["rung"], "pool", "{checked}");
+    assert_eq!(checked["pinned"]["closed"], false, "{checked}");
+    worker.finish(false);
+}
+
+/// A retain-only session has checked nothing when its first request arrives,
+/// and its solvers have not even started. A pin request for such a query
+/// still sees every rung the solver has and is followed by the check; a
+/// ladder request on another still runs its rungs and pins the one that
+/// proves it.
+#[test]
+fn resident_retain_only_session_pins_and_ladders_before_any_check() {
+    let mut worker = Worker::start_with_env(
+        LADDER_SOURCE,
+        &[],
+        &[("VERUS_RESIDENT_STRATEGY_LADDER", "1"), ("VERUS_RESIDENT_RETAIN_ONLY", "1")],
+    );
+    let ready = worker.receive();
+    assert_eq!(ready["retain_only"], true, "{ready}");
+    assert_eq!(ready["strategy_ladder"], true, "{ready}");
+    let session = ready["session"].clone();
+    let untriggered = query_id(&ready, "::untriggered");
+    let pinned = worker.send(json!({"command":"pin", "session":session, "bucket":0,
+        "query":untriggered, "rung":"enum", "alongside":true, "rlimit":10}));
+    assert_eq!(pinned["event"], "pinned", "{pinned}");
+    let checked =
+        worker.send(json!({"command":"check", "session":session, "bucket":0, "query":untriggered}));
+    assert_eq!(checked["result"], "valid", "{checked}");
+    assert_eq!(checked["pinned"]["closed"], true, "{checked}");
+
+    let triggered = query_id(&ready, "::triggered");
+    let ladder = worker.send(json!({"command":"ladder", "session":session, "bucket":0,
+        "query":triggered}));
+    assert_eq!(ladder["event"], "laddered", "{ladder}");
+    assert_eq!(ladder["available"], json!(["ematch", "conflict", "pool", "enum", "mbqi"]));
+    assert_eq!(ladder["solved_by"], "ematch", "{ladder}");
+    assert_eq!(ladder["pinned"]["rung"], "ematch", "{ladder}");
+    // The untriggered query's pin is its own.
+    let checked =
+        worker.send(json!({"command":"check", "session":session, "bucket":0, "query":untriggered}));
+    assert_eq!(checked["pinned"]["rung"], "enum", "{checked}");
+    worker.finish(true);
+}
+
+const RETAIN_ONLY_SOURCE: &str = r#"
+use vstd::prelude::*;
+verus! {
+    spec fn positive(x: int) -> int
+        recommends x > 0,
+    {
+        x
+    }
+
+    proof fn failing(x: int) {
+        assert(positive(x) > 0);
+    }
+
+    proof fn passing(x: int)
+        requires x > 0,
+    {
+        assert(positive(x) > 0);
+    }
+
+    spec(checked) fn checked_spec(x: int) -> int {
+        positive(x)
+    }
+
+    spec fn recursive(n: nat) -> nat
+        decreases n,
+    {
+        if n == 0 { 0 } else { recursive((n - 1) as nat) }
+    }
+
+    #[verifier::rlimit(20)]
+    proof fn bounded() {
+        assert(recursive(0) == 0);
+    }
+}
+"#;
+
+/// Every query of a function, by what a caller compares across sessions.
+fn catalogue(ready: &Value) -> Vec<(String, String, String, Value)> {
+    let mut queries: Vec<_> = ready["buckets"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{}", ready))
+        .iter()
+        .flat_map(|bucket| bucket["queries"].as_array().unwrap())
+        .map(|query| {
+            let text = |key: &str| query[key].as_str().unwrap().to_owned();
+            (text("function"), text("kind"), text("description"), query["fingerprint"].clone())
+        })
+        .collect();
+    queries.sort_by(|a, b| format!("{a:?}").cmp(&format!("{b:?}")));
+    queries
+}
+
+/// No check decides what a retain-only session retains, so it retains every
+/// recommends query a check could have added: a session that checked the same
+/// source retains a subset of it, with the same fingerprints, whichever of its
+/// checks failed. A follow-up that only a failed check adds is there, and so
+/// are both kinds for a `spec(checked)` function.
+#[test]
+fn resident_retain_only_session_retains_what_any_checked_session_could() {
+    let mut checked = Worker::start(RETAIN_ONLY_SOURCE, &[]);
+    let checked_ready = checked.receive();
+    assert_eq!(checked_ready["retain_only"], false, "{checked_ready}");
+    assert_eq!(checked_ready["invocation_succeeded"], false, "{checked_ready}");
+    checked.finish(false);
+    let mut retained =
+        Worker::start_with_env(RETAIN_ONLY_SOURCE, &[], &[("VERUS_RESIDENT_RETAIN_ONLY", "1")]);
+    let retained_ready = retained.receive();
+    assert_eq!(retained_ready["retain_only"], true, "{retained_ready}");
+    retained.finish(true);
+
+    let checked = catalogue(&checked_ready);
+    let mut retained = catalogue(&retained_ready);
+    for query in &checked {
+        let Some(at) = retained.iter().position(|kept| kept == query) else {
+            panic!(
+                "the checked session retained {:?}, the retain-only one did not: {:?}",
+                query, retained
+            )
+        };
+        retained.remove(at);
+    }
+    let has = |queries: &[(String, String, String, Value)], function: &str, kind: &str| {
+        queries.iter().any(|query| query.0.ends_with(function) && query.1 == kind)
+    };
+    // The failed check added its follow-up, the passing spec(checked) check
+    // the checked kind.
+    assert!(has(&checked, "::failing", "recommends_followup"), "{:?}", checked);
+    assert!(has(&checked, "::checked_spec", "recommends"), "{:?}", checked);
+    // What is left is what checks that passed did not add: the follow-up of
+    // every other check that could have failed, a recursive spec function's
+    // termination check among them. `checked_spec` and `positive` have no
+    // termination check to fail.
+    let mut left: Vec<(&str, &str)> = retained
+        .iter()
+        .map(|query| (query.0.rsplit("::").next().unwrap(), query.1.as_str()))
+        .collect();
+    left.sort();
+    assert_eq!(
+        left,
+        [
+            ("bounded", "recommends_followup"),
+            ("passing", "recommends_followup"),
+            ("recursive", "recommends_followup")
+        ],
+        "{:?}",
+        retained
+    );
+}
+
 const UNBOUNDED_SOURCE: &str = r#"
 use vstd::prelude::*;
 verus! {

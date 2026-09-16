@@ -63,7 +63,12 @@
 //! `VERUS_RESIDENT_RETAIN_ONLY` the invocation retains every selected query
 //! and checks none (`ready.retain_only`), which is what such a caller opens a
 //! session on the edited source with; it then carries what it knew about the
-//! unchanged queries over, a pinned rung with a `pin` request.
+//! unchanged queries over, a pinned rung with a `pin` request. Since no check
+//! decides which recommends follow-ups to retain, such a session retains
+//! every one a check could have added, including those for functions whose
+//! checks pass (a caller checks a follow-up when its function's body fails,
+//! as the batch run does), and none of the `--expand-errors` queries, which
+//! only a failed check can name.
 
 mod twin;
 
@@ -360,7 +365,9 @@ enum Request {
     },
     /// Give the query the rung its checks try first, as a ladder request
     /// pins one: what a caller carries over from a session on the source
-    /// before an edit for a query the edit left unchanged.
+    /// before an edit for a query the edit left unchanged. Refused, as a
+    /// ladder would skip it, when the solver cannot run the rung (see
+    /// `check_pin`).
     Pin {
         session: String,
         bucket: BucketIndex,
@@ -368,8 +375,8 @@ enum Request {
         rung: Rung,
         #[serde(default)]
         alongside: bool,
-        /// The pin's budget in `#[verifier::rlimit]` units, above 0 and at
-        /// most `MAX_RUNG_RLIMIT`.
+        /// The pin's budget in `#[verifier::rlimit]` units, above 0, at
+        /// most `MAX_RUNG_RLIMIT`, and at least one cvc5 resource unit.
         rlimit: f32,
     },
 }
@@ -4870,6 +4877,62 @@ fn ladder_rung(
     })
 }
 
+/// Whether `rlimit`, in `#[verifier::rlimit]` units, is too small for a
+/// single cvc5 resource unit: `set_rlimit` converts such a budget to 0, which
+/// cvc5 takes as no limit at all. Leaves the solver at `restore`.
+fn below_one_resource_unit(
+    air: &mut Context,
+    rlimit: f32,
+    restore: f32,
+    set_rlimit: &impl Fn(&mut Context, f32),
+) -> bool {
+    set_rlimit(air, rlimit);
+    let below = air.cvc5_query_budget() == 0;
+    set_rlimit(air, restore);
+    below
+}
+
+/// Refuse a pin request that the query's checks could not follow, for a
+/// query of `bucket` whose address the caller has checked. A check tries a
+/// pinned rung by setting `:quant-strategy` without asking first, so a pin on
+/// a cvc5 without that option would fail that check and end the session; a
+/// rung the solver has no module for would run nothing, at every check; and
+/// a budget below one cvc5 resource unit would run the attempt with no limit
+/// at all. A ladder pins only a rung it ran, so it has made these checks
+/// already.
+/// `Ok(Err(_))` is a refusal to report; `Err` ends the session.
+fn check_pin(
+    bucket: &RetainedBucket,
+    id: QueryId,
+    rung: Rung,
+    rlimit: f32,
+    set_rlimit: &impl Fn(&mut Context, f32),
+) -> io::Result<Result<(), &'static str>> {
+    let mut state =
+        bucket.state.lock().map_err(|_| io::Error::other("resident bucket poisoned"))?;
+    let (solver, local) = bucket.addresses[id.0];
+    let SolverState { air, journal } = &mut state[solver];
+    if !matches!(air.get_solver(), SmtSolver::Cvc5) {
+        return Ok(Err("pin requests need cvc5"));
+    }
+    let query_rlimit = journal.queries[local].rlimit;
+    if below_one_resource_unit(air, rlimit, query_rlimit, set_rlimit) {
+        return Ok(Err("the pin's budget is below one cvc5 resource unit"));
+    }
+    // The first probe of a solver that has not checked anything yet, as in a
+    // retain-only session, starts it and sends the context it was given, so
+    // the modules it has are known by the time it answers.
+    let Some(probe) = air.probe_strategy_rung() else {
+        return Ok(Err(
+            "this cvc5 cannot run one instantiation strategy alone; it needs :quant-strategy",
+        ));
+    };
+    if !probe.available.iter().any(|name| name == rung.name()) {
+        return Ok(Err("the solver has no module for this rung"));
+    }
+    Ok(Ok(()))
+}
+
 /// Serve a ladder request for one query of `bucket`, whose address the
 /// caller has checked. Each rung checks the query with its strategy alone or,
 /// with `alongside`, together with the default schedule, at its own budget,
@@ -4895,17 +4958,13 @@ fn serve_ladder(
     }
     let prefix = journal.queries[local].prefix;
     let query_rlimit = journal.queries[local].rlimit;
-    // A budget is in `#[verifier::rlimit]` units, converted to cvc5's by
-    // `set_rlimit`. One too small for a single cvc5 unit converts to 0, which
-    // cvc5 takes as no limit at all, so it is refused before any rung runs.
-    for &rlimit in budgets.values() {
-        set_rlimit(air, rlimit);
-        if air.cvc5_query_budget() == 0 {
-            set_rlimit(air, query_rlimit);
-            return Ok(Err("a rung's budget is below one cvc5 resource unit"));
-        }
+    // Refused before any rung runs.
+    if budgets
+        .values()
+        .any(|&rlimit| below_one_resource_unit(air, rlimit, query_rlimit, set_rlimit))
+    {
+        return Ok(Err("a rung's budget is below one cvc5 resource unit"));
     }
-    set_rlimit(air, query_rlimit);
     let restore_start = Instant::now();
     journal.restore_prefix(air, prefix)?;
     let restore_ms = restore_start.elapsed().as_millis();
@@ -5261,6 +5320,14 @@ impl Server {
                             &Response::Error { message: "rlimit must be above 0 and at most 1000" },
                         )?;
                         continue;
+                    }
+                    match check_pin(bucket, id, rung, rlimit, &set_rlimit) {
+                        Ok(Ok(())) => {}
+                        Ok(Err(message)) => {
+                            send(&mut output, &Response::Error { message })?;
+                            continue;
+                        }
+                        Err(error) => return fatal(&mut output, error),
                     }
                     let pin = Pin { rung, alongside, rlimit };
                     self.pins.insert((bucket_id.0, id.0), pin);
@@ -5748,10 +5815,10 @@ impl Server {
                             elapsed_ms: start.elapsed().as_millis(),
                         });
                     }
-                    // Then the pinned rung, when a ladder request pinned one:
-                    // its strategy, alone or alongside as the ladder ran it,
-                    // at the budget it proved the query at or the query's
-                    // own, whichever is smaller, so it is bounded even for a
+                    // Then the pinned rung, when a ladder or pin request set
+                    // one: its strategy, alone or alongside as pinned, at the
+                    // budget it was pinned at or the query's own, whichever
+                    // is smaller, so it is bounded even for a
                     // query without an rlimit. It changes which instances
                     // are tried, never what is asserted, so a valid answer
                     // is sound, and that answer's diagnostics (provenance,
