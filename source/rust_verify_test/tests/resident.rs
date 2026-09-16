@@ -845,7 +845,7 @@ fn resident_ablation_probes_take_their_own_budget() {
     assert_eq!(reply["event"], "ablated", "{reply}");
     assert_eq!(reply["result"], "load_bearing_set", "{reply}");
     assert_eq!(reply["partial"], false, "{reply}");
-    assert!(reply.get("skipped_probes").is_none(), "{reply}");
+    assert!(reply.get("skipped_probes").is_none(), "{}", reply);
     // A bad budget is refused without ending the session.
     for extra in [
         json!({"rlimit": 0}),
@@ -867,7 +867,7 @@ fn resident_ablation_probes_take_their_own_budget() {
     let skipped = reply["skipped_probes"].as_array().map_or(0, Vec::len);
     assert_eq!(reply["partial"], skipped > 0, "{reply}");
     if skipped > 0 {
-        assert!(reply.to_string().contains("timeout"), "{reply}");
+        assert!(reply.to_string().contains("timeout"), "{}", reply);
     }
     // The session answers as before: the probes' rlimit did not stick.
     let check = worker.send(json!({"command": "check", "session": session, "bucket": 0,
