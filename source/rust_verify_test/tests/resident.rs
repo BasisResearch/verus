@@ -3241,7 +3241,8 @@ fn resident_ready_lists_the_requests_it_serves() {
             "inst_graph",
             "ladder",
             "twin",
-            "speculate"
+            "speculate",
+            "pin"
         ],
         "{ready}"
     );
@@ -3267,6 +3268,9 @@ fn resident_ready_lists_the_requests_it_serves() {
             }
             "scaffold" => {
                 json!({"command": command, "session": "stale", "bucket": 0, "query": 0, "assert": "true"})
+            }
+            "pin" => {
+                json!({"command": command, "session": "stale", "bucket": 0, "query": 0, "rung": "ematch", "rlimit": 1.0})
             }
             _ => panic!("no request for {}", command),
         };
