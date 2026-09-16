@@ -553,12 +553,16 @@ impl RetainedBucket {
 /// bucket's base context and the journal scopes up to the query's own) and
 /// over the query itself, each printed as AIR. The printer writes an
 /// assertion's labels as their notes and never a span, so a query that only
-/// moved to other lines prints the same, and generated names carry
+/// moved to other lines prints the same, and generated local names carry
 /// per-function counters, not line numbers. A quantifier's triggers are
-/// hashed sorted and once each (see `sort_patterns`). The body hash also
+/// hashed sorted and once each (see `sort_patterns`), and its `:qid` and
+/// `:skolemid` without the counter they end in, which is the bucket's, not
+/// the function's (see `forget_quantifier_counters`). The body hash also
 /// covers the query's rlimit, since the budget a query checks at can change
 /// its verdict. Two queries with the same function, kind and description and
-/// the same fingerprint are, to the solver, the same query.
+/// the same fingerprint are, to the solver, the same query up to the names of
+/// their quantifiers: what a caller carries over by fingerprint must not name
+/// a quantifier by its `:qid`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize)]
 pub(crate) struct Fingerprint {
     prefix: u64,
@@ -583,6 +587,7 @@ impl Fnv {
     fn node(&mut self, node: &TreeNode) {
         let mut node = node.clone();
         sort_patterns(&mut node);
+        forget_quantifier_counters(&mut node);
         self.write(air::printer::node_to_string(&node).as_bytes());
         self.write(b"\n");
     }
@@ -645,6 +650,39 @@ fn sort_patterns(node: &mut TreeNode) {
     }
     rest.extend(tail);
     *items = rest;
+}
+
+/// Drop the counter from every user quantifier's `:qid` and `:skolemid`, in
+/// place: `user_f_12` becomes `user_f_`. The counter is kept per bucket, not
+/// per function (`new_user_qid`), so it moves with every quantifier lowered
+/// before this one in the bucket: one added to an earlier function, or a
+/// recommends query lowered for an earlier function, as a retain-only session
+/// lowers some a checked session does not and a check that starts or stops
+/// failing adds or drops one. None of those changes this quantifier, whose
+/// own text is hashed with its name.
+fn forget_quantifier_counters(node: &mut TreeNode) {
+    let TreeNode::List(items) = node else { return };
+    for item in items.iter_mut() {
+        forget_quantifier_counters(item);
+    }
+    if !matches!(items.first(), Some(TreeNode::Atom(bang)) if bang == "!") {
+        return;
+    }
+    let skolem_prefix = air::def::mk_skolem_id(air::profiler::USER_QUANT_PREFIX);
+    for i in 1..items.len() {
+        if !matches!(&items[i - 1], TreeNode::Atom(key) if key == ":qid" || key == ":skolemid") {
+            continue;
+        }
+        let TreeNode::Atom(name) = &mut items[i] else { continue };
+        if !name.starts_with(air::profiler::USER_QUANT_PREFIX) && !name.starts_with(&skolem_prefix)
+        {
+            continue;
+        }
+        let without = name.trim_end_matches(|c: char| c.is_ascii_digit()).len();
+        if without < name.len() && name[..without].ends_with('_') {
+            name.truncate(without);
+        }
+    }
 }
 
 /// The name a query's instantiation certificate goes by: FNV-1a over its
@@ -6928,5 +6966,19 @@ mod tests {
         // A trigger listed twice: the same query too.
         assert_eq!(one, quantified(":pattern ((g y)) :pattern ((> x y)) :pattern ((g y))"));
         assert_ne!(one[0].body, quantified(":pattern ((g y))")[0].body);
+        // A user quantifier numbered otherwise by the bucket's counter: the
+        // same query. One named for another function is not.
+        let named = |qid: &str| {
+            journal(
+                "a.rs:3:5",
+                "",
+                &format!(
+                    "(forall ((y Int)) (! (=> (g y) (> x y)) :pattern ((g y)) :qid {qid} :skolemid skolem_{qid}))"
+                ),
+            )
+        };
+        let numbered = named("user_crate__f_3");
+        assert_eq!(numbered, named("user_crate__f_17"));
+        assert_ne!(numbered[0].body, named("user_crate__g_3")[0].body);
     }
 }

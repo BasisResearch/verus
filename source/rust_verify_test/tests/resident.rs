@@ -3631,12 +3631,14 @@ verus! {
     }
 
     proof fn failing(x: int) {
+        assert(forall|y: int| y > 0 ==> #[trigger] positive(y) > 0);
         assert(positive(x) > 0);
     }
 
     proof fn passing(x: int)
         requires x > 0,
     {
+        assert(forall|y: int| y > 0 ==> #[trigger] positive(y) > 0);
         assert(positive(x) > 0);
     }
 
@@ -3653,6 +3655,12 @@ verus! {
     #[verifier::rlimit(20)]
     proof fn bounded() {
         assert(recursive(0) == 0);
+    }
+
+    proof fn later() {
+        passing(1);
+        bounded();
+        assert(forall|z: int| z > 0 ==> #[trigger] positive(z) == z);
     }
 }
 "#;
@@ -3677,7 +3685,10 @@ fn catalogue(ready: &Value) -> Vec<(String, String, String, Value)> {
 /// recommends query a check could have added: a session that checked the same
 /// source retains a subset of it, with the same fingerprints, whichever of its
 /// checks failed. A follow-up that only a failed check adds is there, and so
-/// are both kinds for a `spec(checked)` function.
+/// are both kinds for a `spec(checked)` function. The follow-ups a checked
+/// session skips have quantifiers, so a retain-only session numbers every
+/// quantifier lowered after them otherwise (`later`'s among them), and the
+/// fingerprints still agree.
 #[test]
 fn resident_retain_only_session_retains_what_any_checked_session_could() {
     let mut checked = Worker::start(RETAIN_ONLY_SOURCE, &[]);
@@ -3722,6 +3733,7 @@ fn resident_retain_only_session_retains_what_any_checked_session_could() {
         left,
         [
             ("bounded", "recommends_followup"),
+            ("later", "recommends_followup"),
             ("passing", "recommends_followup"),
             ("recursive", "recommends_followup")
         ],

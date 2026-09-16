@@ -2284,18 +2284,22 @@ impl Verifier {
 
                         // Nothing was checked, so no answer can decide which
                         // follow-ups to retain (see `retain_unchecked_recommends`).
+                        // A function the filter leaves out retains nothing, so
+                        // its follow-ups are not even generated.
                         if self.resident_retain_only
                             && matches!(
                                 query_op,
                                 QueryOp::Body(Style::Normal) | QueryOp::SpecTermination
                             )
                         {
-                            self.retain_unchecked_recommends(
-                                &mut function_opgen,
-                                &op,
-                                function.x.attrs.check_recommends,
-                                !commands_with_context_list.is_empty(),
-                            )?;
+                            if includes_function {
+                                self.retain_unchecked_recommends(
+                                    &mut function_opgen,
+                                    &op,
+                                    function.x.attrs.check_recommends,
+                                    !commands_with_context_list.is_empty(),
+                                )?;
+                            }
                         } else if matches!(query_op, QueryOp::Body(Style::Normal)) {
                             if (any_invalid
                                 && !self.args.no_auto_recommends_check
