@@ -821,6 +821,77 @@ fn resident_ablation_finds_witnesses_and_leaves_the_session_unchanged() {
     }
 }
 
+/// Ablation probes take a budget of their own: an `rlimit` for the probes
+/// alone, which the absence check and every later request do not see, and a
+/// wall-clock cap per probe past which the solver cancels the probe, which
+/// is then listed as skipped and marks the reply partial.
+#[test]
+fn resident_ablation_probes_take_their_own_budget() {
+    let mut worker = Worker::start(ABLATE_SOURCE, &["--rlimit", "2"]);
+    let ready = worker.receive();
+    let session = ready["session"].clone();
+    let request = |name: &str, extra: Value| -> Value {
+        let mut request = json!({
+            "command": "ablate", "session": session, "bucket": 0, "query": query_id(&ready, name),
+        });
+        request.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        request
+    };
+    // Both fields are taken; a generous cap skips nothing.
+    let reply = worker.send(request(
+        "::quad_is_four",
+        json!({"mode": "load_bearing", "rlimit": 4.0, "probe_timeout_ms": 600_000}),
+    ));
+    assert_eq!(reply["event"], "ablated", "{reply}");
+    assert_eq!(reply["result"], "load_bearing_set", "{reply}");
+    assert_eq!(reply["partial"], false, "{reply}");
+    assert!(reply.get("skipped_probes").is_none(), "{reply}");
+    // A bad budget is refused without ending the session.
+    for extra in [
+        json!({"rlimit": 0}),
+        json!({"rlimit": 5000}),
+        json!({"rlimit": 1e-9}),
+        json!({"probe_timeout_ms": 0}),
+    ] {
+        let refused = worker.send(request("::quad_is_four", extra.clone()));
+        assert_eq!(refused["event"], "error", "{extra}: {refused}");
+    }
+    // A cap of one millisecond: whatever the solver manages in that time,
+    // every probe it cancelled is listed, and the reply says it is partial
+    // exactly when some probe was.
+    let reply = worker.send(request(
+        "::buried",
+        json!({"mode": "minimal_removal", "budget_checks": 2, "probe_timeout_ms": 1}),
+    ));
+    assert_eq!(reply["event"], "ablated", "{reply}");
+    let skipped = reply["skipped_probes"].as_array().map_or(0, Vec::len);
+    assert_eq!(reply["partial"], skipped > 0, "{reply}");
+    if skipped > 0 {
+        assert!(reply.to_string().contains("timeout"), "{reply}");
+    }
+    // The session answers as before: the probes' rlimit did not stick.
+    let check = worker.send(json!({"command": "check", "session": session, "bucket": 0,
+        "query": query_id(&ready, "::quad_is_four")}));
+    assert_eq!(check["result"], "valid", "{check}");
+    assert_eq!(worker.send(json!({"command": "close", "session": session}))["event"], "closed");
+    worker.finish(false);
+    // The solvers saw exactly two budgets: the session's, and twice it for
+    // the probes that asked for rlimit 4.
+    let budgets = resource_budgets(&smt_logs(worker.dir.path()));
+    assert_eq!(budgets.len(), 2, "{budgets:?}");
+    let (low, high) = (*budgets.iter().next().unwrap(), *budgets.iter().last().unwrap());
+    assert_eq!(high, low * 2, "{budgets:?}");
+    for log in smt_logs(worker.dir.path()) {
+        assert_eq!(log.matches("(push").count(), log.matches("(pop").count());
+        // The cap is lifted after every probe it bounded.
+        assert_eq!(
+            log.matches("(set-option :tlimit-per 1)").count()
+                + log.matches("(set-option :tlimit-per 600000)").count(),
+            log.matches("(set-option :tlimit-per 0)").count()
+        );
+    }
+}
+
 const TWIN_SOURCE: &str = r#"
 use vstd::prelude::*;
 verus! {

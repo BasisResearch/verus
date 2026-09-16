@@ -218,6 +218,12 @@ impl Answer {
         }
     }
 
+    /// The solver cancelled the check at a wall-clock cap
+    /// (`Prober::set_probe_timeout`), so the probe says nothing.
+    pub fn timed_out(&self) -> bool {
+        matches!(self, Answer::Unknown(reason) if reason == "timeout")
+    }
+
     /// The classes a `Changed` search tells apart: the result, and for
     /// `unknown` whether the solver ran out of budget or gave up.
     pub fn class(&self) -> &'static str {
@@ -309,6 +315,8 @@ pub struct Prober<'c> {
     context: &'c mut Context,
     units: Vec<Unit>,
     checks: usize,
+    /// Wall-clock cap per probe, in milliseconds (see `set_probe_timeout`).
+    probe_timeout_ms: Option<u64>,
     /// The switch that turns every goal into `false` (ablation only).
     vacuity: Option<Ident>,
     /// The scope was opened with `Context::push`, so the AIR logs saw it too.
@@ -355,7 +363,14 @@ impl Context {
         match assert_switchable(self, &query, facts, None) {
             Ok(mut units) => {
                 units.sort_by_key(|u| u.sort_key());
-                Ok(Prober { context: self, units, checks: 0, vacuity: None, air_scope: false })
+                Ok(Prober {
+                    context: self,
+                    units,
+                    checks: 0,
+                    probe_timeout_ms: None,
+                    vacuity: None,
+                    air_scope: false,
+                })
             }
             Err(err) => {
                 self.pop_name_scope();
@@ -394,6 +409,7 @@ impl Context {
                     context: self,
                     units,
                     checks: 0,
+                    probe_timeout_ms: None,
                     vacuity: Some(vacuity),
                     air_scope: true,
                 })
@@ -537,6 +553,13 @@ impl<'c> Prober<'c> {
     }
 
     /// Ask the solver about the query with `disabled[i]` switching off
+    /// Cancel any probe that runs longer than `ms` milliseconds of wall-clock
+    /// time: it answers `unknown` with reason `timeout` (`Answer::timed_out`),
+    /// which the searches take as not valid. `None` lifts the cap.
+    pub fn set_probe_timeout(&mut self, ms: Option<u64>) {
+        self.probe_timeout_ms = ms;
+    }
+
     /// `units()[i]`, under the query's resource budget. An `Err` carries
     /// solver output this could not read.
     pub fn probe(&mut self, disabled: &[bool]) -> Result<Answer, String> {
@@ -585,6 +608,7 @@ impl<'c> Prober<'c> {
             let var = ident_var(switch);
             literals.push(if vacuous { var } else { mk_not(&var) });
         }
+        let probe_timeout_ms = self.probe_timeout_ms;
         let context = &mut *self.context;
         let detailed = detailed && matches!(context.solver, SmtSolver::Cvc5);
         match context.solver {
@@ -596,6 +620,9 @@ impl<'c> Prober<'c> {
                 let budget = crate::smt_verify::cvc5_query_budget(context);
                 context.smt_log.log_set_option("reproducible-resource-limit", &budget.to_string());
             }
+        }
+        if probe_timeout_ms.is_some() {
+            context.set_check_timeout(probe_timeout_ms);
         }
         context.smt_log.log_check_sat_assuming(&literals);
         if detailed {
@@ -613,6 +640,9 @@ impl<'c> Prober<'c> {
                 context.set_z3_param_u32("rlimit", 0, false);
             }
             SmtSolver::Cvc5 => context.smt_log.log_set_option("reproducible-resource-limit", "0"),
+        }
+        if probe_timeout_ms.is_some() {
+            context.set_check_timeout(None);
         }
         let mut answer = None;
         let mut detail = ProbeDetail::default();

@@ -1113,6 +1113,20 @@ impl Context {
         crate::smt_verify::cvc5_query_budget(self)
     }
 
+    /// Bound each following `check-sat`'s wall-clock time to `ms`
+    /// milliseconds (cvc5's `tlimit-per`, z3's `timeout`): a check that
+    /// reaches it is cancelled by the solver and answers `unknown` with
+    /// reason `timeout`. `None` lifts the bound. The option goes to the
+    /// solver with the next commands sent, and stays until set again.
+    pub fn set_check_timeout(&mut self, ms: Option<u64>) {
+        let ms = ms.unwrap_or(0).to_string();
+        let option = match self.solver {
+            SmtSolver::Z3 => "timeout",
+            SmtSolver::Cvc5 => "tlimit-per",
+        };
+        self.smt_log.log_set_option(option, &ms);
+    }
+
     /// Ask the solver for the instantiation graph of its last `check-sat` and
     /// return its reply lines (cvc5 with `set_inst_graph` only). Read-only:
     /// call it after a query's answer and before anything that checks again.
