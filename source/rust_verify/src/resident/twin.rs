@@ -173,6 +173,10 @@ struct EditReport {
     /// is hidden (fuel 0) rather than removed.
     #[serde(skip_serializing_if = "Option::is_none")]
     fuel: Option<FuelReport>,
+    /// For flip_fuel: the path the twin flipped, when the name given was
+    /// not one the context uses and a unique suffix match resolved it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    resolved_fn: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     rlimit: Option<Pair<f32>>,
     /// The assertions moved, in their new order.
@@ -624,6 +628,7 @@ fn empty_report(kind: &'static str) -> EditReport {
         expression: None,
         fuel_assumed: None,
         fuel: None,
+        resolved_fn: None,
         rlimit: None,
         order: Vec::new(),
         rebuilt_scopes: None,
@@ -826,6 +831,7 @@ fn plan(
                 ));
             }
             let mut report = empty_report("flip_fuel");
+            report.resolved_fn = target.resolved.clone();
             report.fuel = Some(fuel_report);
             Ok(Plan { query: twin, rlimit, rebuild: None, report, vacuity: false })
         }
@@ -841,6 +847,9 @@ struct FuelTarget {
     /// The function's path, read back from the constant's name.
     name: String,
     default_visible: bool,
+    /// `name`, when the request named the function by a suffix of it rather
+    /// than by a name the context uses; `None` for an exact name.
+    resolved: Option<String>,
 }
 
 /// `toydb!encoding.decode.?` -> `toydb::encoding::decode`.
@@ -973,18 +982,21 @@ impl FuelScan {
             default_visible: self.default_visible(ident),
             ident: ident.clone(),
             name: name.clone(),
+            resolved: None,
         })
     }
 
     /// The one function `function` names: by its whole path (with or
-    /// without `crate::`) or fuel constant, else by path suffix, which a
-    /// bare name shared by several functions fails.
+    /// without `crate::`) or fuel constant, else by a unique path suffix --
+    /// the whole name given, then its last segment, so that a guess with the
+    /// wrong crate or module prefix still lands. A name several functions
+    /// share is refused naming them; one no function has is refused naming
+    /// the functions that do have fuel here.
     fn find(&self, function: &str) -> Result<FuelTarget, String> {
         let fuel_prefix = vir::def::prefix_fuel_id(&Arc::new(String::new()));
         let given = function.trim();
         let bare = given.strip_prefix("crate::").unwrap_or(given);
         let whole = format!("crate::{bare}");
-        let suffix = format!("::{bare}");
         let exact: Vec<&(Ident, String)> = self
             .constants
             .iter()
@@ -996,23 +1008,68 @@ impl FuelScan {
                     || ident.strip_prefix(fuel_prefix.as_str()) == Some(given)
             })
             .collect();
-        let found = if exact.is_empty() {
-            self.constants.iter().filter(|(_, name)| name.ends_with(&suffix)).collect()
-        } else {
-            exact
-        };
-        match &found[..] {
-            [(ident, _)] => Ok(self.target(ident).expect("a scanned constant")),
-            [] => Err(format!(
-                "no function named {function} has fuel in this query's context (spec functions with bodies and broadcast lemmas do)"
-            )),
-            many => {
-                let names: Vec<&str> =
-                    many.iter().take(10).map(|(_, name)| name.as_str()).collect();
-                Err(format!("{function} names {} functions: {}", many.len(), names.join(", ")))
+        if !exact.is_empty() {
+            return self.the_one_of(&exact, function, false);
+        }
+        let last = bare.rsplit("::").next().unwrap_or(bare);
+        let tails = if last == bare { vec![bare] } else { vec![bare, last] };
+        for tail in tails {
+            let suffix = format!("::{tail}");
+            let found: Vec<&(Ident, String)> =
+                self.constants.iter().filter(|(_, name)| name.ends_with(&suffix)).collect();
+            if !found.is_empty() {
+                return self.the_one_of(&found, function, true);
             }
         }
+        Err(format!(
+            "no function named {function} has fuel in this query's context (spec functions with bodies and broadcast lemmas do); the {} that do: {}",
+            self.constants.len(),
+            listed(self.constants.iter().map(|(_, name)| name.as_str()))
+        ))
     }
+
+    /// The single function `found` holds, or a refusal naming them all.
+    /// `resolved`: `found` came from a suffix, so the reply reports the path
+    /// the request landed on.
+    fn the_one_of(
+        &self,
+        found: &[&(Ident, String)],
+        function: &str,
+        resolved: bool,
+    ) -> Result<FuelTarget, String> {
+        match found {
+            [(ident, _)] => {
+                let mut target = self.target(ident).expect("a scanned constant");
+                if resolved {
+                    target.resolved = Some(target.name.clone());
+                }
+                Ok(target)
+            }
+            many => Err(format!(
+                "{function} names {} functions: {}",
+                many.len(),
+                listed(many.iter().map(|(_, name)| name.as_str()))
+            )),
+        }
+    }
+}
+
+/// How many names a refusal lists before it only counts the rest.
+const LISTED_AT_MOST: usize = 40;
+
+/// `names`, sorted, at most `LISTED_AT_MOST` of them with a tail saying how
+/// many more there are.
+fn listed<'a>(names: impl Iterator<Item = &'a str>) -> String {
+    let mut names: Vec<&str> = names.collect();
+    names.sort_unstable();
+    names.dedup();
+    let more = names.len().saturating_sub(LISTED_AT_MOST);
+    names.truncate(LISTED_AT_MOST);
+    let mut text = names.join(", ");
+    if more > 0 {
+        text.push_str(&format!(", ... and {more} more"));
+    }
+    text
 }
 
 /// `(fuel_bool_default fuel%f)` -> `fuel%f`.
@@ -1542,6 +1599,7 @@ mod tests {
             fuel_nat: recursive.then(|| Arc::new("fuel_nat%crate!f.".to_owned())),
             name: "crate::f".to_owned(),
             default_visible: true,
+            resolved: None,
         }
     }
 
@@ -1634,6 +1692,63 @@ mod tests {
         assert_eq!(scan.find("a::s").unwrap().name, "crate::a::s");
         assert!(scan.find("s").unwrap_err().contains("2 functions"));
         assert!(scan.find("q").is_err());
+    }
+
+    /// Paths deep enough that a suffix of one is not a whole path with
+    /// `crate::` in front of it.
+    const DEEP: &str = "
+        (declare-const fuel%crate!x.y.interp. FuelId)
+        (declare-const fuel%crate!x.z.interp. FuelId)
+        (declare-const fuel%crate!x.y.uniq. FuelId)";
+
+    #[test]
+    fn an_unknown_fuel_name_resolves_by_suffix_or_is_refused_with_the_candidates() {
+        let journal = journal_with_base(DEEP);
+        let scan = FuelScan::of(&journal, 0);
+        // a name the context uses is not a resolution
+        let found = scan.find("crate::x::y::interp").unwrap();
+        assert_eq!((found.name.as_str(), found.resolved.as_deref()), ("crate::x::y::interp", None));
+        // a part of the path, landed by the whole name given as a suffix
+        let found = scan.find("y::interp").unwrap();
+        assert_eq!(
+            (found.name.as_str(), found.resolved.as_deref()),
+            ("crate::x::y::interp", Some("crate::x::y::interp"))
+        );
+        // the wrong crate in front of it, landed by the last segment
+        let found = scan.find("lib::x::y::uniq").unwrap();
+        assert_eq!(
+            (found.name.as_str(), found.resolved.as_deref()),
+            ("crate::x::y::uniq", Some("crate::x::y::uniq"))
+        );
+        // a last segment several functions share names just those
+        let refusal = scan.find("lib::spec::interp").unwrap_err();
+        assert!(refusal.contains("names 2 functions"), "{refusal}");
+        assert!(refusal.contains("crate::x::y::interp, crate::x::z::interp"), "{refusal}");
+        assert!(!refusal.contains("uniq"), "{refusal}");
+    }
+
+    #[test]
+    fn a_fuel_refusal_lists_the_functions_that_do_have_fuel() {
+        let journal = journal_with_base(BASE);
+        let scan = FuelScan::of(&journal, 0);
+        let refusal = scan.find("lib::spec_t::os::State::nope").unwrap_err();
+        assert!(refusal.contains("has fuel in this query's context"), "{refusal}");
+        assert!(
+            refusal
+                .contains("the 5 that do: crate::a::s, crate::b::s, crate::g, crate::m, crate::r"),
+            "{refusal}"
+        );
+    }
+
+    #[test]
+    fn a_long_listing_is_capped_with_a_count_of_the_rest() {
+        let names: Vec<String> = (0..LISTED_AT_MOST + 5).map(|i| format!("f{i:03}")).collect();
+        let text = listed(names.iter().map(String::as_str));
+        assert!(text.starts_with("f000, f001, "), "{text}");
+        assert!(text.ends_with(", ... and 5 more"), "{text}");
+        assert_eq!(text.matches("f0").count(), LISTED_AT_MOST);
+        // nothing omitted, nothing counted
+        assert_eq!(listed(["b", "a", "a"].into_iter()), "a, b");
     }
 
     #[test]
