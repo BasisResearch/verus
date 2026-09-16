@@ -2543,7 +2543,7 @@ impl HypothesisRequest {
 }
 
 /// One term, or a multi-trigger's several.
-#[derive(Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(untagged)]
 enum OneOrMore {
     One(String),
