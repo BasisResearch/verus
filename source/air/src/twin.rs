@@ -13,11 +13,14 @@
 //! that know Verus's encoding, such as fuel, live with the worker. Nothing
 //! here talks to a solver.
 
-use crate::ast::{AssertId, Axiom, DeclX, Expr, Ident, Query, QueryX, Stmt, StmtX};
+use crate::ast::{
+    AssertId, Axiom, BindX, Binders, DeclX, Expr, ExprX, Ident, Quant, Query, QueryX, Stmt, StmtX,
+    Triggers, Typ,
+};
 use crate::context::{BranchProfile, DifficultyGradient, InstPressure};
 use crate::def::ProvenanceTag;
 use crate::messages::MessageInterface;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 /// The provenance tag an axiom added by a twin carries: `ax_twin_added`.
@@ -131,6 +134,193 @@ pub fn parse_axiom(
         tag: Some(ProvenanceTag::Axiom(Arc::new(TWIN_ADDED.to_string()))),
         expr,
     })
+}
+
+/// One AIR expression from caller text, as the AIR parser reads it. It is
+/// only parsed here; whether it type-checks against a query's declarations is
+/// for the check that asserts it to find out.
+pub fn parse_expr(
+    message_interface: Arc<dyn MessageInterface>,
+    text: &str,
+) -> Result<Expr, String> {
+    let not_one = |_| format!("not one AIR term: {text}");
+    let mut parser = sise::Parser::new(text);
+    let node = sise::parse_tree(&mut parser).map_err(not_one)?;
+    parser.finish().map_err(not_one)?;
+    crate::parser::Parser::new(message_interface).node_to_expr(&node)
+}
+
+/// The variables and triggers of the first universal quantifier named `qid`
+/// under `expr`.
+pub fn quantifier_of(expr: &Expr, qid: &str) -> Option<(Binders<Typ>, Triggers)> {
+    let mut found = None;
+    crate::visitor::map_expr_visitor(expr, &mut |e| {
+        if let ExprX::Bind(bind, _) = &**e {
+            if let BindX::Quant(Quant::Forall, binders, triggers, Some(q)) = &**bind {
+                if found.is_none() && q.as_str() == qid {
+                    found = Some((binders.clone(), triggers.clone()));
+                }
+            }
+        }
+        e.clone()
+    });
+    found
+}
+
+/// The variables and triggers of the first universal quantifier named `qid`
+/// that `query`'s own declarations or its assertion assert.
+pub fn quantifier_in_query(query: &Query, qid: &str) -> Option<(Binders<Typ>, Triggers)> {
+    for decl in query.local.iter() {
+        if let DeclX::Axiom(axiom) = &**decl {
+            if let Some(found) = quantifier_of(&axiom.expr, qid) {
+                return Some(found);
+            }
+        }
+    }
+    let mut found = None;
+    crate::visitor::map_stmt_expr_visitor(&query.assertion, &mut |e| {
+        if found.is_none() {
+            found = quantifier_of(e, qid);
+        }
+        e.clone()
+    });
+    found
+}
+
+/// `expr` with the triggers of every universal quantifier named `qid`
+/// replaced by `triggers`, and how many it replaced.
+pub fn set_triggers(expr: &Expr, qid: &str, triggers: &Triggers) -> (Expr, usize) {
+    let mut replaced = 0;
+    let expr = crate::visitor::map_expr_visitor(expr, &mut |e| match &**e {
+        ExprX::Bind(bind, body) => match &**bind {
+            BindX::Quant(Quant::Forall, binders, _, Some(q)) if q.as_str() == qid => {
+                replaced += 1;
+                let bind = BindX::Quant(
+                    Quant::Forall,
+                    binders.clone(),
+                    triggers.clone(),
+                    Some(q.clone()),
+                );
+                Arc::new(ExprX::Bind(Arc::new(bind), body.clone()))
+            }
+            _ => e.clone(),
+        },
+        _ => e.clone(),
+    });
+    (expr, replaced)
+}
+
+/// Every variable `expr` binds, at any depth.
+pub fn bound_variables(expr: &Expr) -> BTreeSet<Ident> {
+    let mut names = BTreeSet::new();
+    crate::visitor::map_expr_visitor(expr, &mut |e| {
+        if let ExprX::Bind(bind, _) = &**e {
+            let binders: Vec<Ident> = match &**bind {
+                BindX::Let(binders) => binders.iter().map(|b| b.name.clone()).collect(),
+                BindX::Quant(_, binders, _, _)
+                | BindX::Lambda(binders, _, _)
+                | BindX::Choose(binders, _, _, _) => {
+                    binders.iter().map(|b| b.name.clone()).collect()
+                }
+            };
+            names.extend(binders);
+        }
+        e.clone()
+    });
+    names
+}
+
+/// `expr` with each variable `renaming` maps renamed, in its binders and
+/// wherever it occurs. AIR lets no name be bound twice along a path and no
+/// bound name stand for a declaration, so a renaming of names `expr` binds
+/// needs no capture check; it is how an axiom of the declaration prefix is
+/// asserted again inside a query whose own locals it would otherwise
+/// shadow.
+pub fn rename_bound(expr: &Expr, renaming: &BTreeMap<Ident, Ident>) -> Expr {
+    let rename = |binders: &Binders<Typ>| -> Binders<Typ> {
+        Arc::new(
+            binders
+                .iter()
+                .map(|b| match renaming.get(&b.name) {
+                    Some(to) => Arc::new(crate::ast::BinderX { name: to.clone(), a: b.a.clone() }),
+                    None => b.clone(),
+                })
+                .collect(),
+        )
+    };
+    crate::visitor::map_expr_visitor(expr, &mut |e| match &**e {
+        ExprX::Var(x) => match renaming.get(x) {
+            Some(to) => Arc::new(ExprX::Var(to.clone())),
+            None => e.clone(),
+        },
+        ExprX::Bind(bind, body) => {
+            let bind = match &**bind {
+                BindX::Let(binders) => BindX::Let(Arc::new(
+                    binders
+                        .iter()
+                        .map(|b| match renaming.get(&b.name) {
+                            Some(to) => Arc::new(crate::ast::BinderX {
+                                name: to.clone(),
+                                a: b.a.clone(),
+                            }),
+                            None => b.clone(),
+                        })
+                        .collect(),
+                )),
+                BindX::Quant(quant, binders, triggers, qid) => {
+                    BindX::Quant(*quant, rename(binders), triggers.clone(), qid.clone())
+                }
+                BindX::Lambda(binders, triggers, qid) => {
+                    BindX::Lambda(rename(binders), triggers.clone(), qid.clone())
+                }
+                BindX::Choose(binders, triggers, qid, cond) => BindX::Choose(
+                    rename(binders),
+                    triggers.clone(),
+                    qid.clone(),
+                    cond.clone(),
+                ),
+            };
+            Arc::new(ExprX::Bind(Arc::new(bind), body.clone()))
+        }
+        _ => e.clone(),
+    })
+}
+
+/// Whether `expr` holds a universal quantifier named `qid`.
+pub fn holds_quantifier(expr: &Expr, qid: &str) -> bool {
+    quantifier_of(expr, qid).is_some()
+}
+
+/// `axiom` with the quantifier named `qid` retriggered, and whether it held
+/// one.
+pub fn retrigger_axiom(axiom: &Axiom, qid: &str, triggers: &Triggers) -> (Axiom, usize) {
+    let (expr, replaced) = set_triggers(&axiom.expr, qid, triggers);
+    (Axiom { named: axiom.named.clone(), tag: axiom.tag.clone(), expr }, replaced)
+}
+
+/// `query` with the quantifier named `qid` retriggered wherever its own
+/// declarations or its assertion hold it, and how many it replaced. A
+/// quantifier a declaration before the query asserts is not reached here.
+pub fn retrigger_query(query: &Query, qid: &str, triggers: &Triggers) -> (Query, usize) {
+    let mut replaced = 0;
+    let local = query
+        .local
+        .iter()
+        .map(|decl| match &**decl {
+            DeclX::Axiom(axiom) => {
+                let (axiom, n) = retrigger_axiom(axiom, qid, triggers);
+                replaced += n;
+                Arc::new(DeclX::Axiom(axiom))
+            }
+            _ => decl.clone(),
+        })
+        .collect();
+    let assertion = crate::visitor::map_stmt_expr_visitor(&query.assertion, &mut |e| {
+        let (e, n) = set_triggers(e, qid, triggers);
+        replaced += n;
+        e
+    });
+    (Arc::new(QueryX { local: Arc::new(local), assertion }), replaced)
 }
 
 /// `query` with every goal switched off: each `Assert` of `e` keeps its id

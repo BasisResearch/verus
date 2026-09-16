@@ -2,7 +2,9 @@
 //!
 //! The request names one edit: remove or add an axiom (a hypothesis, a
 //! module-level axiom such as a broadcast lemma, or an AIR expression), set a
-//! function's fuel, raise the resource limit, or reorder assertions. The
+//! function's fuel, raise the resource limit, reorder assertions, or change
+//! one quantifier's triggers (`retrigger` for a whole trigger set,
+//! `drop_trigger` for one of its own, `add_trigger` for one more). The
 //! worker checks the query as it was retained (the base) and then the edited
 //! query (the twin), each as an ordinary check in its own scope on the same
 //! declaration prefix, and reports how the two checks differ: the answers,
@@ -26,6 +28,19 @@
 //! names the pin it did not follow (`pin_ignored`), so that a base that
 //! disagrees with `check` is explained.
 //!
+//! A trigger edit rewrites the quantifier where it is asserted: in the query
+//! itself, in a prefix axiom (the prefix is rebuilt without that axiom and
+//! the rewritten one is asserted in the query's scope), or in the bucket's
+//! base context, where the axioms its function's fuel guards are hidden
+//! through the fuel hypothesis and re-asserted unguarded, which is what the
+//! guard said for a query that reveals the function. Its terms are read as a
+//! `speculate` request reads them, Verus expressions or SMT terms, over the
+//! quantifier's own variables; a trigger that leaves one of them free, or a
+//! term that mentions none of them, is refused, since no instance could
+//! match it. In an `inst_graph` session both checks also record what they
+//! instantiated, so the reply says what the new triggers fired that the old
+//! ones did not, and whether the twin's run climbs (`loop`).
+//!
 //! Neither check is a verification result, and the twin's verdict licenses
 //! nothing: an added axiom is assumed, not proved.
 
@@ -34,19 +49,21 @@ use super::{
 };
 use crate::provenance::{ResolvedTag, Symbols};
 use air::ast::{
-    AssertId, Axiom, BinaryOp, BindX, BinderX, CommandX, DeclX, Expr, ExprX, Ident, MultiOp, Quant,
-    Query, TypX,
+    AssertId, Axiom, BinaryOp, BindX, BinderX, CommandX, Decl, DeclX, Expr, ExprX, Ident, MultiOp,
+    Quant, Query, TypX,
 };
 use air::context::{
     BranchProfile, Context, DifficultyGradient, InstPressure, QueryContext, SmtSolver,
-    UnknownReason, ValidityResult,
+    UnknownReason, ValidityResult, VariableVersions,
 };
+use air::profiler::InstantiationGraph;
 use air::twin::{AxiomRef, InstCounts};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io;
 use std::sync::Arc;
 use std::time::Instant;
+use vir::air_names::SourceNames;
 use vir::ast::Fun;
 use vir::messages::VirMessageInterface;
 
@@ -74,6 +91,35 @@ pub(super) enum TwinEdit {
     BumpRlimit(f32),
     /// These assertions of one block, by `AssertId`, in this order.
     ReorderAsserts(Vec<AssertName>),
+    /// Match the quantifier `qid` with exactly these triggers instead of its
+    /// own: each entry is one multi-pattern, a term or a list of terms over
+    /// the quantifier's variables. Without `triggers`, nothing is checked and
+    /// the reply lists the quantifier's variables and current triggers; with
+    /// no `qid`, or one this query's scope does not assert, it lists the
+    /// quantifiers written in source that it does.
+    Retrigger {
+        #[serde(default)]
+        qid: Option<String>,
+        #[serde(default)]
+        triggers: Option<Vec<super::OneOrMore>>,
+    },
+    /// Match the quantifier `qid` with its triggers except the `index`-th.
+    DropTrigger { qid: String, index: usize },
+    /// Match the quantifier `qid` with one more trigger, as
+    /// `speculative_probe`'s `trigger_pattern` does.
+    AddTrigger { qid: String, pattern: super::OneOrMore },
+}
+
+impl TwinEdit {
+    /// The quantifier a trigger edit names, and the edit's name on the wire.
+    fn trigger_edit(&self) -> Option<(&'static str, Option<&str>)> {
+        match self {
+            TwinEdit::Retrigger { qid, .. } => Some(("retrigger", qid.as_deref())),
+            TwinEdit::DropTrigger { qid, .. } => Some(("drop_trigger", Some(qid))),
+            TwinEdit::AddTrigger { qid, .. } => Some(("add_trigger", Some(qid))),
+            _ => None,
+        }
+    }
 }
 
 /// An `AssertId` as a request may spell it: `[3, 1]`, `"3.1"`, `"aid_3_1"`
@@ -127,9 +173,33 @@ const CAVEAT: &str = "Both checks ran in scopes popped right after them, so the 
 #[derive(Serialize)]
 pub(super) struct TwinReport {
     edit: EditReport,
-    base: BranchReport,
-    twin: BranchReport,
-    outcome_flip: OutcomeFlip,
+    /// Null for a `retrigger` listing, which checks nothing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    base: Option<BranchReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    twin: Option<BranchReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    outcome_flip: Option<OutcomeFlip>,
+    /// The quantifier a trigger edit names, as the query's scope asserts it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    quantifier: Option<super::QuantifierDescription>,
+    /// Quantifiers written in source that the query's scope asserts, when a
+    /// `retrigger` named none or one that is not there.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    candidates: Vec<super::QuantifierDescription>,
+    /// Instantiations of a retriggered quantifier that the twin made and the
+    /// base did not (`inst_graph` sessions).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    new_instantiations: Option<NewInstantiations>,
+    /// The retriggered quantifier's instantiating terms got deeper round
+    /// after round in the twin run: a matching loop, as `speculative_probe`
+    /// detects one (`inst_graph` sessions).
+    #[serde(rename = "loop", skip_serializing_if = "Option::is_none")]
+    loop_report: Option<super::ResolvedSpeculationLoop>,
+    /// Whether the twin run has a matching loop on that quantifier that the
+    /// base run does not.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    introduced_loop: Option<bool>,
     /// Null only when the solver reported no instantiation counters.
     inst_count_delta: Option<InstCountDelta>,
     /// Null outside a difficulty session (see `unavailable`).
@@ -185,6 +255,66 @@ struct EditReport {
     /// Scopes of the prefix rebuilt without a removed module-level axiom.
     #[serde(skip_serializing_if = "Option::is_none")]
     rebuilt_scopes: Option<usize>,
+    /// For a trigger edit: the quantifier it matched.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    qid: Option<String>,
+    /// For a trigger edit: the quantifier's triggers before and after it,
+    /// each a multi-pattern, in source spelling.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    triggers: Option<Pair<Vec<Vec<String>>>>,
+    /// The same, as the solver spells them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    smt_triggers: Option<Pair<Vec<Vec<String>>>>,
+    /// For drop_trigger: the pattern dropped, in source spelling.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dropped: Option<Vec<String>>,
+    /// Where the quantifier is asserted, and so how the edit reaches it:
+    /// `query` (rewritten in the query itself), `prefix` (the prefix is
+    /// rebuilt without the axiom holding it, and the rewritten axiom is
+    /// asserted in the query's scope) or `base` (below every scope: the
+    /// axioms its function's fuel guards are hidden through the fuel
+    /// hypothesis and re-asserted, unguarded and rewritten, in the query's
+    /// scope).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    place: Option<&'static str>,
+    /// How names in the given terms were read, where more than one reading
+    /// was possible.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    readings: Vec<String>,
+}
+
+/// Instantiations of a retriggered quantifier the twin made and the base did
+/// not.
+#[derive(Serialize)]
+struct NewInstantiations {
+    qid: String,
+    /// The quantifier's instantiations in each check.
+    count: Pair<usize>,
+    /// How many more the twin made.
+    added: i64,
+    /// Whether the rows carry the instantiating terms. Only a session opened
+    /// with provenance records them; without it the rows are the solver's
+    /// instantiation graph alone.
+    terms: bool,
+    /// The first `limit` of them.
+    rows: Vec<NewInstantiation>,
+}
+
+#[derive(Serialize)]
+struct NewInstantiation {
+    /// The terms the quantifier was instantiated with, in source spelling.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    terms: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    smt_terms: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    round: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    depth: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    term_depth: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    strategy: Option<String>,
 }
 
 #[derive(Clone, Serialize)]
@@ -395,6 +525,22 @@ struct Branch {
     profile: Option<BranchProfile>,
     difficulty: Option<DifficultyGradient>,
     unknown: Option<UnknownReason>,
+    /// The check's instantiation graph, in an `inst_graph` session.
+    graph: Option<InstantiationGraph>,
+    /// The quantifiers whose instantiating terms got deeper round after
+    /// round, from `(speculate :observe)`, in an `inst_graph` session.
+    loops: Vec<air::speculate::LoopReport>,
+    /// The instantiations cvc5 dumped, by qid, in a provenance session.
+    provenance: Option<air::context::ProvenanceInfo>,
+}
+
+/// What a branch check records beyond its answer: the instantiation graph
+/// and the depth-rise detector, for a trigger edit in an `inst_graph`
+/// session.
+#[derive(Clone, Copy, Default)]
+struct Observe {
+    graph: bool,
+    loops: bool,
 }
 
 impl Branch {
@@ -448,11 +594,18 @@ fn run_branch(
     query: &Query,
     rlimit: f32,
     set_rlimit: &impl Fn(&mut Context, f32),
+    observe: Observe,
 ) -> Result<Branch, BranchError> {
     set_rlimit(air, rlimit);
     let pressure_was = air.inst_pressure();
     air.set_inst_pressure(true);
     air.set_branch_profile(true);
+    if observe.loops {
+        air.set_speculation(Some(air::speculate::SpeculationRequest {
+            hypothesis: air::speculate::Hypothesis::Observe,
+            loop_threshold: None,
+        }));
+    }
     let start = Instant::now();
     let outcome = air.check_valid(
         &VirMessageInterface {},
@@ -463,13 +616,24 @@ fn run_branch(
     let elapsed_ms = start.elapsed().as_millis();
     air.set_inst_pressure(pressure_was);
     air.set_branch_profile(false);
+    // A check that never reached the solver leaves the request behind.
+    air.set_speculation(None);
+    let loops = air.take_speculation().map(|reply| reply.loops).unwrap_or_default();
     let pressure = air.take_inst_pressure();
     let profile = air.take_branch_profile();
     let difficulty = air.take_difficulty();
     let unknown = air.take_unknown_reason();
-    drop(air.take_provenance());
+    let provenance = air.take_provenance();
     drop(air.take_matching_loops());
     drop(air.take_nl_frontier());
+    // Read before `finish_query` pops the scope, and only after an answer.
+    let answered = matches!(
+        &outcome,
+        ValidityResult::Valid(_) | ValidityResult::Invalid(..) | ValidityResult::Canceled
+    );
+    let graph = (observe.graph && answered)
+        .then(|| InstantiationGraph::from_live(&air.instantiation_graph()).ok())
+        .flatten();
     let (result, assert_id) = match outcome {
         ValidityResult::Valid(_) => (QueryResult::Valid, None),
         ValidityResult::Invalid(_, _, id) => (QueryResult::Invalid, id.map(|id| (*id).clone())),
@@ -486,20 +650,43 @@ fn run_branch(
         }
     };
     air.finish_query();
-    Ok(Branch { result, assert_id, elapsed_ms, rlimit, pressure, profile, difficulty, unknown })
+    Ok(Branch {
+        result,
+        assert_id,
+        elapsed_ms,
+        rlimit,
+        pressure,
+        profile,
+        difficulty,
+        unknown,
+        graph,
+        loops,
+        provenance,
+    })
 }
 
 /// The edit, applied: the twin query, how to check it, and what to report.
 struct Plan {
     query: Query,
     rlimit: f32,
-    /// Rebuild the prefix from this scope without the axioms these names
-    /// select, for a removed module-level axiom.
-    rebuild: Option<(usize, Vec<String>)>,
+    /// Rebuild the prefix from a scope without some of its axioms, for a
+    /// module-level axiom removed or retriggered.
+    rebuild: Option<Rebuild>,
     report: EditReport,
     /// Check both queries again with every goal switched off (an added
     /// axiom; see `air::twin::goals_off`).
     vacuity: bool,
+    /// The quantifier a trigger edit changed.
+    qid: Option<String>,
+    /// That quantifier as the query's scope asserted it before the edit.
+    quantifier: Option<super::QuantifierDescription>,
+}
+
+/// Which axioms the rebuilt prefix leaves out, from which scope on.
+struct Rebuild {
+    first: usize,
+    /// Leave out an axiom this selects.
+    drop: Box<dyn Fn(&Axiom) -> bool>,
 }
 
 /// Every module-level axiom of `scopes`, with the scope it is in.
@@ -632,6 +819,12 @@ fn empty_report(kind: &'static str) -> EditReport {
         rlimit: None,
         order: Vec::new(),
         rebuilt_scopes: None,
+        qid: None,
+        triggers: None,
+        smt_triggers: None,
+        dropped: None,
+        place: None,
+        readings: Vec::new(),
     }
 }
 
@@ -696,13 +889,13 @@ fn plan(
                     in_base.iter().map(|a| matched("base", &AxiomRef::of(a), fun, symbols)),
                 );
                 report.fuel = Some(fuel);
-                return Ok(Plan { query: twin, rlimit, rebuild: None, report, vacuity: false });
+                return Ok(Plan { query: twin, rlimit, rebuild: None, report, vacuity: false, qid: None, quantifier: None });
             }
             let rebuild = in_prefix.iter().map(|(scope, _)| *scope).min().map(|first| {
                 report.rebuilt_scopes = Some(prefix - first);
-                (first, names)
+                Rebuild { first, drop: Box::new(move |axiom| named_by(axiom, &names)) }
             });
-            Ok(Plan { query: twin, rlimit, rebuild, report, vacuity: false })
+            Ok(Plan { query: twin, rlimit, rebuild, report, vacuity: false, qid: None, quantifier: None })
         }
         TwinEdit::AddAxiom(text) => {
             let mut report = empty_report("add_axiom");
@@ -711,7 +904,7 @@ fn plan(
                 report.expression = Some(text.clone());
                 let axiom = air::twin::parse_axiom(Arc::new(VirMessageInterface {}), text)?;
                 twin = air::twin::with_local_axiom(&twin, axiom);
-                return Ok(Plan { query: twin, rlimit, rebuild: None, report, vacuity: true });
+                return Ok(Plan { query: twin, rlimit, rebuild: None, report, vacuity: true, qid: None, quantifier: None });
             }
             let names = names_for(text, symbols)?;
             let in_base = base_axioms(journal).find(|a| named_by(a, &names)).map(|a| ("base", a));
@@ -780,7 +973,7 @@ fn plan(
                     air::twin::with_local_axiom(&twin, Axiom { named: None, tag, expr: revealed });
                 report.fuel_assumed = Some(fuel_path(c));
             }
-            Ok(Plan { query: twin, rlimit, rebuild: None, report, vacuity: true })
+            Ok(Plan { query: twin, rlimit, rebuild: None, report, vacuity: true, qid: None, quantifier: None })
         }
         TwinEdit::BumpRlimit(twin_rlimit) => {
             if !rlimit.is_finite() {
@@ -802,6 +995,8 @@ fn plan(
                 rebuild: None,
                 report,
                 vacuity: false,
+                qid: None,
+                quantifier: None,
             })
         }
         TwinEdit::ReorderAsserts(names) => {
@@ -814,7 +1009,7 @@ fn plan(
             let twin = air::twin::reorder_asserts(query, &ids)?;
             let mut report = empty_report("reorder_asserts");
             report.order = ids.iter().map(air::twin::assert_id_text).collect();
-            Ok(Plan { query: twin, rlimit, rebuild: None, report, vacuity: false })
+            Ok(Plan { query: twin, rlimit, rebuild: None, report, vacuity: false, qid: None, quantifier: None })
         }
         TwinEdit::FlipFuel { function, fuel } => {
             let scan = FuelScan::of(journal, prefix);
@@ -833,7 +1028,12 @@ fn plan(
             let mut report = empty_report("flip_fuel");
             report.resolved_fn = target.resolved.clone();
             report.fuel = Some(fuel_report);
-            Ok(Plan { query: twin, rlimit, rebuild: None, report, vacuity: false })
+            Ok(Plan { query: twin, rlimit, rebuild: None, report, vacuity: false, qid: None, quantifier: None })
+        }
+        // A trigger edit needs the solver's declarations to read its terms;
+        // `trigger_plan` makes it.
+        TwinEdit::Retrigger { .. } | TwinEdit::DropTrigger { .. } | TwinEdit::AddTrigger { .. } => {
+            unreachable!("a trigger edit is planned by trigger_plan")
         }
     }
 }
@@ -1236,6 +1436,401 @@ fn flip_fuel(query: &Query, target: &FuelTarget, fuel: u32) -> Result<(Query, Fu
     ))
 }
 
+/// A trigger edit planned, or the listing a `retrigger` without triggers
+/// asks for, which checks nothing.
+enum TriggerOutcome {
+    Listing(TriggerListing),
+    Plan(Box<Plan>),
+}
+
+struct TriggerListing {
+    quantifier: Option<air::speculate::QuantifierSmt>,
+    candidates: Vec<air::speculate::QuantifierSmt>,
+}
+
+/// The atoms of an SMT term: every symbol in it.
+fn atoms(term: &str) -> HashSet<&str> {
+    term.split(['(', ')', ' ', '\n']).filter(|a| !a.is_empty()).collect()
+}
+
+/// The first universal quantifier named `qid` that the query's own
+/// declarations, its assertion, the prefix or the bucket's base context
+/// asserts, as AIR holds it.
+fn current_quantifier(
+    journal: &QueryJournal,
+    prefix: usize,
+    query: &Query,
+    qid: &str,
+) -> Option<air::ast::Triggers> {
+    if let Some((_, triggers)) = air::twin::quantifier_in_query(query, qid) {
+        return Some(triggers);
+    }
+    prefix_axioms(journal, 0..prefix)
+        .map(|(_, axiom)| axiom)
+        .chain(base_axioms(journal))
+        .find_map(|axiom| air::twin::quantifier_of(&axiom.expr, qid))
+        .map(|(_, triggers)| triggers)
+}
+
+/// The quantifiers written in source that the query's scope asserts, the
+/// first `MAX_CANDIDATES`.
+fn trigger_candidates(
+    air: &Context,
+    decls: &[Decl],
+    query: &Query,
+    symbols: Option<&Symbols>,
+) -> Vec<air::speculate::QuantifierSmt> {
+    let written = |qid: &str, in_query: bool| {
+        in_query
+            || symbols
+                .and_then(|symbols| symbols.quantifier_site(qid))
+                .is_some_and(|(_, span)| span.is_some())
+    };
+    let mut all = air.quantifiers(decls.iter(), query, written);
+    all.truncate(super::MAX_CANDIDATES);
+    all
+}
+
+/// The names a query's scope declares: its own locals and every global
+/// before it. A bound variable may not shadow one of them.
+fn declared_names(decls: &[Decl], query: &Query) -> HashSet<String> {
+    let mut names = HashSet::new();
+    for decl in decls.iter().chain(query.local.iter()) {
+        match &**decl {
+            DeclX::Const(x, _) | DeclX::Var(x, _) | DeclX::Fun(x, _, _) => {
+                names.insert(x.to_string());
+            }
+            _ => {}
+        }
+    }
+    names
+}
+
+/// `axiom` ready to be asserted inside the query's scope: every variable it
+/// binds that the scope already declares is renamed, since AIR lets no bound
+/// name shadow a declaration, and an axiom of the prefix binds the names the
+/// query's own locals have (`self!`, `c!`).
+fn as_local_axiom(axiom: &Axiom, declared: &HashSet<String>) -> Axiom {
+    let mut renaming = std::collections::BTreeMap::new();
+    for name in air::twin::bound_variables(&axiom.expr) {
+        if declared.contains(name.as_str()) {
+            let mut fresh = format!("twin%{name}");
+            while declared.contains(&fresh) {
+                fresh = format!("twin%{fresh}");
+            }
+            renaming.insert(name, Arc::new(fresh));
+        }
+    }
+    match renaming.is_empty() {
+        true => Axiom {
+            named: axiom.named.clone(),
+            tag: axiom.tag.clone(),
+            expr: axiom.expr.clone(),
+        },
+        false => Axiom {
+            named: axiom.named.clone(),
+            tag: axiom.tag.clone(),
+            expr: air::twin::rename_bound(&axiom.expr, &renaming),
+        },
+    }
+}
+
+/// One multi-pattern from the request's terms, over the quantifier's
+/// variables: each term is read as a Verus expression or an SMT term, must
+/// mention at least one variable, and the pattern together must mention them
+/// all, since a trigger that leaves one free matches no instance.
+fn lower_trigger(
+    terms: &[&str],
+    quantifier: &air::speculate::QuantifierSmt,
+    lowering: &super::Lowering,
+    reader: Option<&super::VerusReader>,
+    readings: &mut Vec<String>,
+) -> Result<air::ast::Trigger, String> {
+    if terms.is_empty() {
+        return Err("a trigger needs at least one term".to_owned());
+    }
+    let variables: Vec<&str> = quantifier.binders.iter().map(|(v, _)| v.as_str()).collect();
+    let mut mentioned: HashSet<String> = HashSet::new();
+    let mut exprs = Vec::new();
+    for text in terms {
+        let node = super::read_term(text, None, lowering, reader, readings)?;
+        let smt = super::flat(&node);
+        let names = atoms(&smt);
+        let here: Vec<&str> =
+            variables.iter().copied().filter(|v| names.contains(v)).collect();
+        if here.is_empty() {
+            return Err(format!(
+                "the trigger term `{text}` reads as `{smt}`, which mentions none of {}'s variables ({}); a trigger term must mention the variables it matches",
+                quantifier.qid,
+                variables.join(", ")
+            ));
+        }
+        mentioned.extend(here.into_iter().map(str::to_owned));
+        let expr = air::twin::parse_expr(Arc::new(VirMessageInterface {}), &smt).map_err(|e| {
+            format!("the trigger term `{text}` reads as `{smt}`, which is not an AIR term: {e}")
+        })?;
+        exprs.push(expr);
+    }
+    let missing: Vec<&str> =
+        variables.iter().copied().filter(|v| !mentioned.contains(*v)).collect();
+    if !missing.is_empty() {
+        return Err(format!(
+            "this trigger mentions no term for {}: every variable of {} must appear in one of a trigger's terms, type variables included",
+            missing.join(", "),
+            quantifier.qid
+        ));
+    }
+    Ok(Arc::new(exprs))
+}
+
+/// Plan a trigger edit: the quantifier named `qid` matched with exactly the
+/// given triggers, with one of its own dropped, or with one more. Nothing
+/// here touches the solver.
+fn trigger_plan(
+    air: &Context,
+    journal: &QueryJournal,
+    decls: &[Decl],
+    prefix: usize,
+    query: &Query,
+    rlimit: f32,
+    edit: &TwinEdit,
+    symbols: Option<&Symbols>,
+) -> Result<TriggerOutcome, String> {
+    let (kind, named) = edit.trigger_edit().expect("a trigger edit");
+    let listing = matches!(edit, TwinEdit::Retrigger { triggers: None, .. });
+    let qid = named.map(str::trim).filter(|qid| !qid.is_empty());
+    let Some(qid) = qid else {
+        if !listing {
+            return Err(format!("{kind} needs the qid of a quantifier"));
+        }
+        return Ok(TriggerOutcome::Listing(TriggerListing {
+            quantifier: None,
+            candidates: trigger_candidates(air, decls, query, symbols),
+        }));
+    };
+    let Some(quantifier) = air.find_quantifier(decls.iter(), query, qid) else {
+        if listing {
+            return Ok(TriggerOutcome::Listing(TriggerListing {
+                quantifier: None,
+                candidates: trigger_candidates(air, decls, query, symbols),
+            }));
+        }
+        return Err(format!(
+            "no quantifier named {qid} is asserted in this query's scope; send retrigger without triggers to list the quantifiers written in source that it asserts"
+        ));
+    };
+    if listing {
+        return Ok(TriggerOutcome::Listing(TriggerListing {
+            quantifier: Some(quantifier),
+            candidates: Vec::new(),
+        }));
+    }
+    let Some(current) = current_quantifier(journal, prefix, query, qid) else {
+        return Err(format!(
+            "{qid} is asserted in this query's scope, but not by a declaration this worker recorded, so its triggers cannot be replaced"
+        ));
+    };
+
+    let no_versions = VariableVersions::new();
+    let empty = SourceNames::new();
+    let names = super::QueryNames::new(symbols, &no_versions, &empty);
+    let before = super::describe_quantifier(&quantifier, symbols, &names);
+
+    let mut report = empty_report(kind);
+    report.qid = Some(qid.to_owned());
+    let mut readings = Vec::new();
+    let declared_names = declared_names(decls, query);
+
+    // A trigger's terms are over the quantifier's variables, which shadow
+    // locals of the same source name.
+    let goal = air::GoalScope::of(query, None);
+    let live = goal.live();
+    let declared = |name: &str| air.declared(name);
+    let lowering = super::Lowering::new(
+        &quantifier.binders,
+        super::Declarations::of(&decls.iter().collect::<Vec<_>>(), query, live.clone(), &no_versions),
+        &[&names.shown, &names.plain],
+        &declared,
+    );
+    let occurrences = air::scaffold::occurrences(query);
+    let reader = symbols.map(|symbols| super::VerusReader {
+        env: crate::scaffold::Env {
+            names: symbols.source_names(),
+            crate_name: symbols.crate_name(),
+            locals: super::query_locals(query),
+            bound: quantifier
+                .binders
+                .iter()
+                .map(|(smt, sort)| {
+                    (Arc::new(smt.clone()), super::typ_of_sort(&super::flat(sort)))
+                })
+                .collect(),
+            declared: &declared,
+            occurrences: &occurrences,
+        },
+        goal: &goal,
+        printer: air::printer::Printer::new(
+            Arc::new(VirMessageInterface {}),
+            true,
+            SmtSolver::Cvc5,
+        ),
+    });
+
+    let patterns = |rows: &[Vec<String>]| -> String {
+        rows.iter()
+            .enumerate()
+            .map(|(i, row)| format!("{i}: {}", row.join(", ")))
+            .collect::<Vec<_>>()
+            .join("; ")
+    };
+    let triggers: air::ast::Triggers = match edit {
+        TwinEdit::DropTrigger { index, .. } => {
+            if current.len() < 2 {
+                return Err(format!(
+                    "{qid} has {} trigger(s) ({}); drop_trigger needs at least two, since a quantifier with none is matched by nothing",
+                    current.len(),
+                    patterns(&before.triggers)
+                ));
+            }
+            if *index >= current.len() {
+                return Err(format!(
+                    "{qid} has {} triggers, so there is no trigger {index}; they are {}",
+                    current.len(),
+                    patterns(&before.triggers)
+                ));
+            }
+            report.dropped = before.triggers.get(*index).cloned();
+            Arc::new(
+                current
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| i != index)
+                    .map(|(_, trigger)| trigger.clone())
+                    .collect(),
+            )
+        }
+        TwinEdit::AddTrigger { pattern, .. } => {
+            let added =
+                lower_trigger(&pattern.terms(), &quantifier, &lowering, reader.as_ref(), &mut readings)?;
+            let mut all = (*current).clone();
+            all.push(added);
+            Arc::new(all)
+        }
+        TwinEdit::Retrigger { triggers: Some(given), .. } => {
+            if given.is_empty() {
+                return Err(
+                    "retrigger needs at least one trigger: a quantifier with none is matched by nothing"
+                        .to_owned(),
+                );
+            }
+            let mut all = Vec::new();
+            for pattern in given {
+                all.push(lower_trigger(
+                    &pattern.terms(),
+                    &quantifier,
+                    &lowering,
+                    reader.as_ref(),
+                    &mut readings,
+                )?);
+            }
+            Arc::new(all)
+        }
+        _ => unreachable!("a trigger edit"),
+    };
+
+    // Where the quantifier is asserted decides how the edit reaches it.
+    let (twin, rebuild, place) = {
+        let (rewritten, replaced) = air::twin::retrigger_query(query, qid, &triggers);
+        if replaced > 0 {
+            (rewritten, None, "query")
+        } else if let Some((scope, axiom)) = prefix_axioms(journal, 0..prefix)
+            .find(|(_, axiom)| air::twin::holds_quantifier(&axiom.expr, qid))
+        {
+            let (retriggered, _) = air::twin::retrigger_axiom(axiom, qid, &triggers);
+            let twin =
+                air::twin::with_local_axiom(query, as_local_axiom(&retriggered, &declared_names));
+            report.rebuilt_scopes = Some(prefix - scope);
+            let wanted = qid.to_owned();
+            let drop: Box<dyn Fn(&Axiom) -> bool> =
+                Box::new(move |axiom| air::twin::holds_quantifier(&axiom.expr, &wanted));
+            (twin, Some(Rebuild { first: scope, drop }), "prefix")
+        } else {
+            let holder = base_axioms(journal)
+                .find(|axiom| air::twin::holds_quantifier(&axiom.expr, qid))
+                .ok_or_else(|| {
+                    format!(
+                        "{qid} is asserted in this query's scope, but the worker cannot find the declaration that asserts it"
+                    )
+                })?;
+            let Some(guard) = fuel_guard(&holder.expr) else {
+                return Err(format!(
+                    "{qid} is in the bucket's base context (every declaration made before the bucket's first query), below every scope the worker can rebuild, and no function's fuel guards the axiom that asserts it, so its triggers cannot be replaced"
+                ));
+            };
+            let scan = FuelScan::of(journal, prefix);
+            let Some(target) = scan.target(&guard) else {
+                return Err(format!(
+                    "{qid} is guarded by {guard}, which this query's context does not declare"
+                ));
+            };
+            if !target.default_visible || query_hides(query, &target.ident) {
+                return Err(format!(
+                    "{} is hidden in this query, so the axiom that asserts {qid} does not apply to it and there is nothing to retrigger",
+                    target.name
+                ));
+            }
+            // Hiding the function takes every axiom its fuel guards out of
+            // the query; each goes back in unguarded, which is what the
+            // guard said here, with the quantifier retriggered in the one
+            // that holds it.
+            let (mut twin, fuel) = flip_fuel(query, &target, 0)?;
+            let guarded: Vec<&Axiom> = base_axioms(journal)
+                .chain(prefix_axioms(journal, 0..prefix).map(|(_, axiom)| axiom))
+                .filter(|axiom| fuel_guard(&axiom.expr).as_ref() == Some(&guard))
+                .collect();
+            for axiom in guarded {
+                let (retriggered, _) = air::twin::retrigger_axiom(axiom, qid, &triggers);
+                let ExprX::Binary(BinaryOp::Implies, _, body) = &*retriggered.expr else {
+                    continue;
+                };
+                let unguarded = Axiom {
+                    named: retriggered.named.clone(),
+                    tag: retriggered.tag.clone(),
+                    expr: body.clone(),
+                };
+                twin = air::twin::with_local_axiom(
+                    &twin,
+                    as_local_axiom(&unguarded, &declared_names),
+                );
+            }
+            report.fuel = Some(fuel);
+            (twin, None, "base")
+        }
+    };
+
+    let after = air.find_quantifier(decls.iter(), &twin, qid);
+    let after = after.as_ref().map(|q| super::describe_quantifier(q, symbols, &names));
+    report.place = Some(place);
+    report.readings = readings;
+    report.triggers = Some(Pair {
+        base: before.triggers.clone(),
+        twin: after.as_ref().map(|a| a.triggers.clone()).unwrap_or_default(),
+    });
+    report.smt_triggers = Some(Pair {
+        base: before.smt_triggers.clone(),
+        twin: after.as_ref().map(|a| a.smt_triggers.clone()).unwrap_or_default(),
+    });
+    Ok(TriggerOutcome::Plan(Box::new(Plan {
+        query: twin,
+        rlimit,
+        rebuild,
+        report,
+        vacuity: false,
+        qid: Some(qid.to_owned()),
+        quantifier: Some(before),
+    })))
+}
+
 /// Run `check` on `prefix` rebuilt without the axioms `names` select, from
 /// scope `first` on. The rebuilt scopes are popped before this returns, and
 /// the journal is left at `first`, so the next restore replays the prefix
@@ -1246,7 +1841,7 @@ fn with_rebuilt_prefix<T>(
     air: &mut Context,
     prefix: usize,
     first: usize,
-    names: &[String],
+    drop: &dyn Fn(&Axiom) -> bool,
     check: impl FnOnce(&mut Context) -> T,
 ) -> io::Result<Result<T, String>> {
     journal.restore_prefix(air, first)?;
@@ -1259,7 +1854,7 @@ fn with_rebuilt_prefix<T>(
                 for command in batch.iter() {
                     let CommandX::Global(decl) = &**command else { continue };
                     if let DeclX::Axiom(axiom) = &**decl {
-                        if named_by(axiom, names) {
+                        if drop(axiom) {
                             continue;
                         }
                     }
@@ -1311,25 +1906,106 @@ pub(super) fn serve(
     let (base_query, rlimit, prefix, fun) =
         (retained.query.clone(), retained.rlimit, retained.prefix, retained.context.fun.clone());
     let symbols = bucket.symbols.as_ref();
-    let plan = match plan(&request.edit, journal, prefix, &base_query, rlimit, &fun, symbols) {
-        Ok(plan) => plan,
-        Err(message) => return Ok(Err(message)),
-    };
     let restore_start = Instant::now();
     journal.restore_prefix(air, prefix)?;
     let restore_ms = restore_start.elapsed().as_millis();
-    let levels_before = air.solver_stack_levels();
     let start = Instant::now();
-    let base = match run_branch(air, &base_query, rlimit, set_rlimit) {
+    // A trigger edit reads its terms against the query's declarations, so it
+    // is planned once the prefix is back.
+    let plan = if request.edit.trigger_edit().is_some() {
+        let decls: Vec<Decl> = journal
+            .base
+            .iter()
+            .chain(journal.contexts[..prefix].iter().flatten())
+            .flat_map(|batch| batch.iter())
+            .filter_map(|command| match &**command {
+                CommandX::Global(decl) => Some(decl.clone()),
+                _ => None,
+            })
+            .collect();
+        match trigger_plan(
+            air,
+            journal,
+            &decls,
+            prefix,
+            &base_query,
+            rlimit,
+            &request.edit,
+            symbols,
+        ) {
+            Ok(TriggerOutcome::Plan(plan)) => *plan,
+            Ok(TriggerOutcome::Listing(listing)) => {
+                let no_versions = VariableVersions::new();
+                let empty = SourceNames::new();
+                let names = super::QueryNames::new(symbols, &no_versions, &empty);
+                let levels = air.solver_stack_levels();
+                let mut report = empty_report("retrigger");
+                report.qid = listing.quantifier.as_ref().map(|q| q.qid.clone());
+                report.triggers = listing.quantifier.as_ref().map(|q| {
+                    let shown = super::describe_quantifier(q, symbols, &names).triggers;
+                    Pair { base: shown.clone(), twin: shown }
+                });
+                return Ok(Ok(TwinReport {
+                    edit: report,
+                    base: None,
+                    twin: None,
+                    outcome_flip: None,
+                    quantifier: listing
+                        .quantifier
+                        .as_ref()
+                        .map(|q| super::describe_quantifier(q, symbols, &names)),
+                    candidates: listing
+                        .candidates
+                        .iter()
+                        .map(|q| super::describe_quantifier(q, symbols, &names))
+                        .collect(),
+                    new_instantiations: None,
+                    loop_report: None,
+                    introduced_loop: None,
+                    inst_count_delta: None,
+                    difficulty_delta: None,
+                    did_relevant_delta: None,
+                    vacuity: None,
+                    integrity: SessionCheck {
+                        intact: levels.is_some(),
+                        stack_levels_before: levels,
+                        stack_levels_after: levels,
+                        recheck: None,
+                    },
+                    pin_ignored: request.pin,
+                    unavailable: vec![
+                        "the checks: a retrigger without triggers lists the quantifier and checks nothing"
+                            .to_owned(),
+                    ],
+                    caveat: CAVEAT,
+                    elapsed_ms: start.elapsed().as_millis(),
+                    restore_ms,
+                }));
+            }
+            Err(message) => return Ok(Err(message)),
+        }
+    } else {
+        match plan(&request.edit, journal, prefix, &base_query, rlimit, &fun, symbols) {
+            Ok(plan) => plan,
+            Err(message) => return Ok(Err(message)),
+        }
+    };
+    // Both branches record the same way, so their counts compare.
+    let observe = match plan.qid.is_some() && air.inst_graph() {
+        true => Observe { graph: true, loops: air.supports_speculation() },
+        false => Observe::default(),
+    };
+    let levels_before = air.solver_stack_levels();
+    let base = match run_branch(air, &base_query, rlimit, set_rlimit, observe) {
         Ok(branch) => branch,
         Err(BranchError::Refused(message)) => return Ok(Err(message)),
         Err(BranchError::Fatal(error)) => return Err(error),
     };
     let twin = match &plan.rebuild {
-        None => run_branch(air, &plan.query, plan.rlimit, set_rlimit),
-        Some((first, names)) => {
-            let outcome = with_rebuilt_prefix(journal, air, prefix, *first, names, |air| {
-                run_branch(air, &plan.query, plan.rlimit, set_rlimit)
+        None => run_branch(air, &plan.query, plan.rlimit, set_rlimit, observe),
+        Some(Rebuild { first, drop }) => {
+            let outcome = with_rebuilt_prefix(journal, air, prefix, *first, &**drop, |air| {
+                run_branch(air, &plan.query, plan.rlimit, set_rlimit, observe)
             })?;
             // Back to the recorded prefix before anything else is checked.
             journal.restore_prefix(air, prefix)?;
@@ -1347,7 +2023,7 @@ pub(super) fn serve(
     let vacuity = if plan.vacuity {
         // Each query with every goal switched off: valid only by contradiction.
         let mut falsified = |query: &Query| -> io::Result<Result<&'static str, String>> {
-            match run_branch(air, &air::twin::goals_off(query), rlimit, set_rlimit) {
+            match run_branch(air, &air::twin::goals_off(query), rlimit, set_rlimit, Observe::default()) {
                 Ok(branch) => Ok(Ok(branch.class())),
                 Err(BranchError::Refused(message)) => Ok(Err(message)),
                 Err(BranchError::Fatal(error)) => Err(error),
@@ -1377,7 +2053,7 @@ pub(super) fn serve(
         None
     };
     let recheck = if request.recheck_base {
-        match run_branch(air, &base_query, rlimit, set_rlimit) {
+        match run_branch(air, &base_query, rlimit, set_rlimit, observe) {
             Ok(again) => {
                 let same_instantiations =
                     air::twin::diff_instantiations(&base.counts(), &again.counts())
@@ -1484,15 +2160,66 @@ pub(super) fn serve(
         }
         None => (None, None),
     };
+    let (new_instantiations, loop_report, introduced_loop) = match &plan.qid {
+        Some(qid) if observe.graph || observe.loops => {
+            let no_versions = VariableVersions::new();
+            let empty = SourceNames::new();
+            let names = super::QueryNames::new(symbols, &no_versions, &empty);
+            if observe.graph && base.graph.is_none() {
+                unavailable.push(
+                    "new_instantiations: the solver reported no instantiation graph for one of the checks"
+                        .to_owned(),
+                );
+            }
+            if base.provenance.is_none() {
+                unavailable.push(
+                    "new_instantiations[].terms: only a session opened with provenance records each instantiation's terms"
+                        .to_owned(),
+                );
+            }
+            let site = symbols.and_then(|symbols| symbols.quantifier_site(qid));
+            let resolved = |l: &air::speculate::LoopReport| super::ResolvedSpeculationLoop {
+                qid: l.qid.clone(),
+                function: site.map(|(function, _)| function.to_owned()),
+                span: site.and_then(|(_, span)| span.map(str::to_owned)),
+                instantiations: l.instantiations,
+                directed: l.directed,
+                rounds: l.rounds,
+                rises: l.rises,
+                first_depth: l.first_depth,
+                max_depth: l.max_depth,
+            };
+            let twin_loop = twin.loops.iter().find(|l| &l.qid == qid);
+            let base_loop = base.loops.iter().find(|l| &l.qid == qid);
+            (
+                new_instantiations(qid, &base, &twin, &names, request.limit),
+                twin_loop.map(resolved),
+                observe.loops.then(|| twin_loop.is_some() && base_loop.is_none()),
+            )
+        }
+        Some(_) => {
+            unavailable.push(
+                "new_instantiations, loop: open the session with inst_graph to record what each check instantiated"
+                    .to_owned(),
+            );
+            (None, None, None)
+        }
+        None => (None, None, None),
+    };
     Ok(Ok(TwinReport {
         edit: plan.report,
-        outcome_flip: OutcomeFlip {
+        outcome_flip: Some(OutcomeFlip {
             base: base.class(),
             twin: twin.class(),
             flipped: base.class() != twin.class(),
-        },
-        base: base.report(),
-        twin: twin.report(),
+        }),
+        base: Some(base.report()),
+        twin: Some(twin.report()),
+        quantifier: plan.quantifier,
+        candidates: Vec::new(),
+        new_instantiations,
+        loop_report,
+        introduced_loop,
         inst_count_delta,
         difficulty_delta,
         did_relevant_delta,
@@ -1509,6 +2236,93 @@ pub(super) fn serve(
         elapsed_ms,
         restore_ms,
     }))
+}
+
+/// The instantiations of `qid` the twin made and the base did not: by their
+/// terms where the session records them (provenance), else by the solver's
+/// instantiation graph, which counts them and says when each was made but
+/// not with what.
+fn new_instantiations(
+    qid: &str,
+    base: &Branch,
+    twin: &Branch,
+    names: &super::QueryNames,
+    limit: usize,
+) -> Option<NewInstantiations> {
+    let dumped = |branch: &Branch| -> Option<Vec<String>> {
+        branch
+            .provenance
+            .as_ref()?
+            .instantiations
+            .iter()
+            .find(|(q, _)| q.trim_matches('|') == qid)
+            .map(|(_, vectors)| vectors.clone())
+    };
+    if let (Some(before), Some(after)) = (dumped(base), dumped(twin)) {
+        // Instantiations repeat, so the base's count of each term vector is
+        // what the twin has to exceed for one to be new.
+        let mut left: HashMap<&str, usize> = HashMap::new();
+        for vector in &before {
+            *left.entry(vector.as_str()).or_default() += 1;
+        }
+        let mut rows = Vec::new();
+        for vector in &after {
+            match left.get_mut(vector.as_str()) {
+                Some(count) if *count > 0 => *count -= 1,
+                _ if rows.len() < limit => rows.push(NewInstantiation {
+                    terms: Some(names.show(vector)),
+                    smt_terms: Some(vector.clone()),
+                    round: None,
+                    depth: None,
+                    term_depth: None,
+                    strategy: None,
+                }),
+                _ => {}
+            }
+        }
+        return Some(NewInstantiations {
+            qid: qid.to_owned(),
+            count: Pair { base: before.len(), twin: after.len() },
+            added: after.len() as i64 - before.len() as i64,
+            terms: true,
+            rows,
+        });
+    }
+    let (base_graph, twin_graph) = (base.graph.as_ref()?, twin.graph.as_ref()?);
+    let of = |graph: &InstantiationGraph| -> Vec<(u64, Option<air::profiler::InstInfo>)> {
+        let mut nodes: Vec<(u64, Option<air::profiler::InstInfo>)> = graph
+            .names
+            .iter()
+            .filter(|(_, name)| name.as_ref() == qid)
+            .map(|(id, _)| (id.0, graph.info.get(id).cloned()))
+            .collect();
+        nodes.sort_by_key(|(id, _)| *id);
+        nodes
+    };
+    let (before, after) = (of(base_graph), of(twin_graph));
+    // Without the terms, an instantiation has no identity across two checks:
+    // the rows are the twin's, the latest first, and `added` is the count.
+    let mut rows: Vec<NewInstantiation> = after
+        .iter()
+        .rev()
+        .take(limit)
+        .map(|(_, info)| NewInstantiation {
+            terms: None,
+            smt_terms: None,
+            round: info.as_ref().map(|i| i.round),
+            depth: info.as_ref().map(|i| i.depth),
+            term_depth: info.as_ref().and_then(|i| i.term_depth),
+            strategy: info.as_ref().and_then(|i| i.strategy.as_ref().map(|s| s.to_string())),
+        })
+        .collect();
+    rows.reverse();
+    Some(NewInstantiations {
+        qid: qid.to_owned(),
+        count: Pair { base: before.len(), twin: after.len() },
+        added: after.len() as i64 - before.len() as i64,
+        terms: false,
+        rows,
+    })
 }
 
 fn report_instantiations(
@@ -1836,6 +2650,96 @@ mod tests {
         assert_eq!(id(AssertName::Text("x".into())), None);
     }
 
+    /// A query whose own axiom asserts a quantifier with two triggers.
+    const TRIGGERED: &str = "(check-valid
+        (axiom (forall ((x$ Poly) (y$ Poly)) (!
+           (= (f x$ y$) (g y$ x$))
+           :pattern ((f x$ y$))
+           :pattern ((g y$ x$))
+           :qid user_f_g_0 :skolemid skolem_user_f_g_0)))
+        (block (assert true)))";
+
+    #[test]
+    fn a_quantifiers_triggers_are_read_dropped_and_replaced() {
+        let q = query(TRIGGERED);
+        let journal = journal_with_base("(declare-const nothing Bool)");
+        let current = current_quantifier(&journal, 0, &q, "user_f_g_0").expect("the quantifier");
+        assert_eq!(current.len(), 2);
+        assert_eq!(current[0].len(), 1);
+        // dropping the second leaves the first, in place
+        let kept: air::ast::Triggers = Arc::new(vec![current[0].clone()]);
+        let (dropped, replaced) = air::twin::retrigger_query(&q, "user_f_g_0", &kept);
+        assert_eq!(replaced, 1);
+        assert_eq!(current_quantifier(&journal, 0, &dropped, "user_f_g_0").unwrap().len(), 1);
+        // a qid the query does not assert is left alone
+        let (untouched, replaced) = air::twin::retrigger_query(&q, "user_other", &kept);
+        assert_eq!(replaced, 0);
+        assert_eq!(current_quantifier(&journal, 0, &untouched, "user_f_g_0").unwrap().len(), 2);
+        // and the body is the body it was
+        let DeclX::Axiom(before) = &*q.local[0] else { panic!() };
+        let DeclX::Axiom(after) = &*dropped.local[0] else { panic!() };
+        let body = |axiom: &Axiom| match &*axiom.expr {
+            ExprX::Bind(_, body) => format!("{:?}", body),
+            _ => panic!(),
+        };
+        assert_eq!(body(before), body(after));
+    }
+
+    #[test]
+    fn a_quantifier_of_the_prefix_and_of_the_base_is_found() {
+        let axiom = "(axiom (=> (fuel_bool fuel%crate!r.)
+            (forall ((x$ Poly)) (! (= (h x$) x$) :pattern ((h x$)) :qid user_h_1 :skolemid skolem_user_h_1))))";
+        let journal = journal_with_base(&format!("{BASE}\n{axiom}"));
+        let q = query("(check-valid (block (assert true)))");
+        let current = current_quantifier(&journal, 0, &q, "user_h_1").expect("the base quantifier");
+        assert_eq!(current.len(), 1);
+        // and the axiom that holds it is the one a rebuild would leave out
+        let holder = base_axioms(&journal)
+            .find(|a| air::twin::holds_quantifier(&a.expr, "user_h_1"))
+            .expect("the axiom");
+        assert_eq!(
+            fuel_guard(&holder.expr).as_deref().map(String::as_str),
+            Some("fuel%crate!r.")
+        );
+        assert!(current_quantifier(&journal, 0, &q, "user_missing").is_none());
+    }
+
+    #[test]
+    fn a_trigger_must_mention_the_quantifiers_variables() {
+        let quantifier = air::speculate::QuantifierSmt {
+            qid: "user_f_g_0".to_owned(),
+            binders: vec![
+                ("x$".to_owned(), sise::TreeNode::Atom("Poly".to_owned())),
+                ("y$".to_owned(), sise::TreeNode::Atom("Poly".to_owned())),
+            ],
+            triggers: Vec::new(),
+            body: sise::TreeNode::Atom("true".to_owned()),
+            in_query: true,
+        };
+        let mut declarations = super::super::Declarations::default();
+        declarations
+            .functions
+            .insert("f".to_owned(), (vec!["Poly".to_owned(), "Poly".to_owned()], "Poly".to_owned()));
+        declarations.constants.insert("a".to_owned(), "Poly".to_owned());
+        let empty = SourceNames::new();
+        let declared = |_: &str| None;
+        let lowering =
+            super::super::Lowering::new(&quantifier.binders, declarations, &[&empty], &declared);
+        let mut readings = Vec::new();
+        let lower = |terms: &[&str], readings: &mut Vec<String>| {
+            lower_trigger(terms, &quantifier, &lowering, None, readings)
+        };
+        let trigger = lower(&["(f x$ y$)"], &mut readings).expect("a whole trigger");
+        assert_eq!(trigger.len(), 1);
+        // two terms together may cover the variables
+        assert_eq!(lower(&["(f x$ a)", "(f y$ a)"], &mut readings).unwrap().len(), 2);
+        let refusal = lower(&["(f x$ a)"], &mut readings).unwrap_err();
+        assert!(refusal.contains("no term for y$"), "{refusal}");
+        let refusal = lower(&["(f a a)"], &mut readings).unwrap_err();
+        assert!(refusal.contains("mentions none of"), "{refusal}");
+        assert!(lower(&[], &mut readings).is_err());
+    }
+
     #[test]
     fn edits_parse_as_the_plan_spells_them() {
         let edit: TwinEdit =
@@ -1852,5 +2756,32 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn trigger_edits_parse_as_the_plan_spells_them() {
+        let edit: TwinEdit = serde_json::from_value(
+            serde_json::json!({"retrigger": {"qid": "user_q", "triggers": [["(f x)", "(g x)"], "(h x)"]}}),
+        )
+        .unwrap();
+        let TwinEdit::Retrigger { qid, triggers: Some(triggers) } = &edit else { panic!() };
+        assert_eq!(qid.as_deref(), Some("user_q"));
+        assert_eq!(triggers.len(), 2);
+        assert_eq!(triggers[0].terms(), vec!["(f x)", "(g x)"]);
+        assert_eq!(triggers[1].terms(), vec!["(h x)"]);
+        assert_eq!(edit.trigger_edit(), Some(("retrigger", Some("user_q"))));
+        // no triggers, and no qid: the listing
+        let edit: TwinEdit = serde_json::from_value(serde_json::json!({"retrigger": {}})).unwrap();
+        assert!(matches!(edit, TwinEdit::Retrigger { qid: None, triggers: None }));
+        let edit: TwinEdit =
+            serde_json::from_value(serde_json::json!({"drop_trigger": {"qid": "q", "index": 1}}))
+                .unwrap();
+        assert!(matches!(edit, TwinEdit::DropTrigger { index: 1, .. }));
+        assert_eq!(edit.trigger_edit(), Some(("drop_trigger", Some("q"))));
+        let edit: TwinEdit =
+            serde_json::from_value(serde_json::json!({"add_trigger": {"qid": "q", "pattern": "(f x)"}}))
+                .unwrap();
+        assert_eq!(edit.trigger_edit(), Some(("add_trigger", Some("q"))));
+        assert!(TwinEdit::BumpRlimit(1.0).trigger_edit().is_none());
     }
 }
