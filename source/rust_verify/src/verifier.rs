@@ -294,6 +294,11 @@ pub struct Verifier {
     resident_buckets: Vec<crate::resident::RetainedBucket>,
     resident_prepared: bool,
     resident_inputs: Vec<String>,
+    /// Retain every selected query without checking any
+    /// (`VERUS_RESIDENT_RETAIN_ONLY`): a resident session opened on edited
+    /// source, whose caller carries over what it knew about the unchanged
+    /// queries and checks the changed ones itself (see resident.rs).
+    resident_retain_only: bool,
     /// this is the actual number of threads used for verification. This will be set to the
     /// minimum of the requested threads and the number of buckets to verify
     pub num_threads: usize,
@@ -559,6 +564,8 @@ impl Verifier {
         dep_tracker: crate::cargo_verus_dep_tracker::DepTracker,
     ) -> Verifier {
         let compile = args.compile || via_cargo_compile;
+        let resident_retain_only =
+            args.resident && std::env::var_os("VERUS_RESIDENT_RETAIN_ONLY").is_some();
 
         Verifier {
             num_threads: 1,
@@ -566,6 +573,7 @@ impl Verifier {
             resident_buckets: Vec::new(),
             resident_prepared: false,
             resident_inputs: Vec::new(),
+            resident_retain_only,
             encountered_vir_error: false,
             count_verified: 0,
             count_errors: 0,
@@ -624,6 +632,7 @@ impl Verifier {
             resident_buckets: Vec::new(),
             resident_prepared: false,
             resident_inputs: Vec::new(),
+            resident_retain_only: self.resident_retain_only,
             encountered_vir_error: false,
             count_verified: 0,
             count_errors: 0,
@@ -733,6 +742,7 @@ impl Verifier {
                 instantiation_replay: self.instantiation_replay(),
                 inst_graph: self.inst_graph(),
                 strategy_ladder: self.strategy_ladder(),
+                retain_only: self.resident_retain_only,
                 input_files: std::mem::take(&mut self.resident_inputs),
             },
         )
@@ -1303,7 +1313,8 @@ impl Verifier {
         default_prover_failed_assert_ids: &mut Vec<AssertId>,
         includes_function: bool,
     ) -> RunCommandQueriesResult {
-        if !includes_function {
+        // A retain-only session records the queries and checks none of them.
+        if !includes_function || self.resident_retain_only {
             return RunCommandQueriesResult {
                 invalidity: false,
                 timed_out: false,

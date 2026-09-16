@@ -56,6 +56,14 @@
 //! ordinary way, with
 //! its removed axioms never asserted. Every scope is popped before the reply;
 //! the next request restores its own prefix.
+//!
+//! The catalogue names each query's `fingerprint` (see `Fingerprint`): what
+//! a caller compares the query by across compilations of edited source, to
+//! tell the queries an edit left alone from those it changed. Under
+//! `VERUS_RESIDENT_RETAIN_ONLY` the invocation retains every selected query
+//! and checks none (`ready.retain_only`), which is what such a caller opens a
+//! session on the edited source with; it then carries what it knew about the
+//! unchanged queries over, a pinned rung with a `pin` request.
 
 mod twin;
 
@@ -185,6 +193,7 @@ const COMMANDS: &[&str] = &[
     "ladder",
     "twin",
     "speculate",
+    "pin",
 ];
 
 #[derive(Deserialize)]
@@ -349,6 +358,20 @@ enum Request {
         /// none did. Default true; false leaves the pin as it was.
         pin: Option<bool>,
     },
+    /// Give the query the rung its checks try first, as a ladder request
+    /// pins one: what a caller carries over from a session on the source
+    /// before an edit for a query the edit left unchanged.
+    Pin {
+        session: String,
+        bucket: BucketIndex,
+        query: QueryId,
+        rung: Rung,
+        #[serde(default)]
+        alongside: bool,
+        /// The pin's budget in `#[verifier::rlimit]` units, above 0 and at
+        /// most `MAX_RUNG_RLIMIT`.
+        rlimit: f32,
+    },
 }
 
 #[derive(Clone, Copy, Deserialize)]
@@ -419,6 +442,7 @@ struct QueryDescription {
     kind: QueryKind,
     prover: &'static str,
     span: String,
+    fingerprint: Fingerprint,
 }
 
 #[derive(Serialize)]
@@ -483,6 +507,7 @@ impl RetainedBucket {
         let mut cert_keys = Vec::new();
         let mut repeats = std::collections::HashMap::new();
         for (solver, state) in states.iter().enumerate() {
+            let fingerprints = state.journal.fingerprints();
             for (local, query) in state.journal.queries.iter().enumerate() {
                 let function = fun_as_friendly_rust_name(&query.context.fun);
                 let repeat = repeats
@@ -507,11 +532,67 @@ impl RetainedBucket {
                         vir::def::ProverChoice::Singular => "singular",
                     },
                     span: query.context.span.as_string.clone(),
+                    fingerprint: fingerprints[local],
                 });
                 addresses.push((solver, local));
             }
         }
         Self { id, queries, addresses, cert_keys, state: Mutex::new(states), symbols, quantifiers }
+    }
+}
+
+/// What a caller compares a retained query by across compilations: FNV-1a
+/// over the AIR of the declarations asserted below it (its prefix: the
+/// bucket's base context and the journal scopes up to the query's own) and
+/// over the query itself, each printed as AIR. The printer writes an
+/// assertion's labels as their notes and never a span, so a query that only
+/// moved to other lines prints the same, and generated names carry
+/// per-function counters, not line numbers. Two queries with the same
+/// function, kind and description and the same fingerprint are, to the
+/// solver, the same query.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize)]
+pub(crate) struct Fingerprint {
+    prefix: u64,
+    body: u64,
+}
+
+/// FNV-1a over printed AIR.
+struct Fnv(u64);
+
+impl Fnv {
+    fn new() -> Self {
+        Self(0xcbf2_9ce4_8422_2325)
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for byte in bytes {
+            self.0 ^= u64::from(*byte);
+            self.0 = self.0.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+
+    fn node(&mut self, node: &TreeNode) {
+        self.write(air::printer::node_to_string(node).as_bytes());
+        self.write(b"\n");
+    }
+
+    fn commands(&mut self, printer: &air::printer::Printer, commands: &Commands) {
+        for command in commands.iter() {
+            match &**command {
+                CommandX::Global(decl) => self.node(&printer.decl_to_node(decl)),
+                CommandX::CheckValid(query) => self.node(&printer.query_to_node(query)),
+                CommandX::Push => self.write(b"push\n"),
+                CommandX::Pop => self.write(b"pop\n"),
+                CommandX::SetOption(name, value) => {
+                    self.write(name.as_bytes());
+                    self.write(b"=");
+                    self.write(value.as_bytes());
+                    self.write(b"\n");
+                }
+                #[cfg(feature = "singular")]
+                CommandX::CheckSingular(_) => self.write(b"singular\n"),
+            }
+        }
     }
 }
 
@@ -685,6 +766,10 @@ pub(crate) struct SessionInfo {
     /// Whether cvc5 solvers were launched with every instantiation strategy a
     /// ladder request can run (`VERUS_RESIDENT_STRATEGY_LADDER`).
     pub(crate) strategy_ladder: bool,
+    /// Whether the invocation retained its queries without checking any of
+    /// them (`VERUS_RESIDENT_RETAIN_ONLY`): its `invocation_succeeded` says
+    /// nothing about them, and no verdict is on record.
+    pub(crate) retain_only: bool,
 }
 
 #[derive(Serialize)]
@@ -705,12 +790,19 @@ enum Response<'a> {
         instantiation_replay: bool,
         inst_graph: bool,
         strategy_ladder: bool,
+        retain_only: bool,
         input_files: &'a [String],
         buckets: &'a [BucketDescription],
     },
     Queries {
         session: &'a str,
         buckets: &'a [BucketDescription],
+    },
+    Pinned {
+        session: &'a str,
+        bucket: BucketIndex,
+        query: QueryId,
+        pin: Pin,
     },
     Checked {
         session: &'a str,
@@ -4881,6 +4973,36 @@ impl QueryJournal {
         Ok(())
     }
 
+    /// Every retained query's fingerprint, in journal order: the running
+    /// hash of the base context and the scopes below the query's prefix,
+    /// and the hash of the query itself.
+    fn fingerprints(&self) -> Vec<Fingerprint> {
+        let printer = air::printer::Printer::new(
+            std::sync::Arc::new(VirMessageInterface {}),
+            false,
+            SmtSolver::Cvc5,
+        );
+        let mut hash = Fnv::new();
+        for batch in &self.base {
+            hash.commands(&printer, batch);
+        }
+        let mut prefixes = vec![hash.0];
+        for scope in &self.contexts {
+            for batch in scope {
+                hash.commands(&printer, batch);
+            }
+            prefixes.push(hash.0);
+        }
+        self.queries
+            .iter()
+            .map(|query| {
+                let mut body = Fnv::new();
+                body.node(&printer.query_to_node(&query.query));
+                Fingerprint { prefix: prefixes[query.prefix], body: body.0 }
+            })
+            .collect()
+    }
+
     /// The declarations of the scopes below `prefix`, in the order they were
     /// asserted.
     fn prefix_decls(&self, prefix: usize) -> Vec<air::ast::Decl> {
@@ -5014,6 +5136,7 @@ impl Server {
                 instantiation_replay: self.info.instantiation_replay,
                 inst_graph: self.info.inst_graph,
                 strategy_ladder: self.info.strategy_ladder,
+                retain_only: self.info.retain_only,
                 input_files: &self.info.input_files,
                 buckets: &buckets,
             },
@@ -5062,6 +5185,7 @@ impl Server {
                 | Request::InstGraph { session: requested, .. }
                 | Request::Twin { session: requested, .. }
                 | Request::Ladder { session: requested, .. }
+                | Request::Pin { session: requested, .. }
                     if requested != session =>
                 {
                     send(
@@ -5071,6 +5195,32 @@ impl Server {
                 }
                 Request::List { .. } => {
                     send(&mut output, &Response::Queries { session, buckets: &buckets })?
+                }
+                Request::Pin { bucket: bucket_id, query: id, rung, alongside, rlimit, .. } => {
+                    let Some(bucket) = self.buckets.get(bucket_id.0) else {
+                        send(&mut output, &Response::Error { message: "unknown bucket" })?;
+                        continue;
+                    };
+                    if bucket.queries.get(id.0).is_none() {
+                        send(&mut output, &Response::Error { message: "unknown query" })?;
+                        continue;
+                    }
+                    // Bounded as a ladder bounds a rung's budget, so a check
+                    // that tries the pin first is bounded even for a query
+                    // without an rlimit.
+                    if !(rlimit > 0.0 && rlimit <= MAX_RUNG_RLIMIT) {
+                        send(
+                            &mut output,
+                            &Response::Error { message: "rlimit must be above 0 and at most 1000" },
+                        )?;
+                        continue;
+                    }
+                    let pin = Pin { rung, alongside, rlimit };
+                    self.pins.insert((bucket_id.0, id.0), pin);
+                    send(
+                        &mut output,
+                        &Response::Pinned { session, bucket: bucket_id, query: id, pin },
+                    )?;
                 }
                 Request::Close { .. } => {
                     if let Err(error) = self.shutdown() {
@@ -6551,6 +6701,7 @@ mod tests {
                 instantiation_replay: false,
                 inst_graph: false,
                 strategy_ladder: false,
+                retain_only: false,
             },
         );
         let input = format!("{}\n{{\"command\":\"list\"}}\n", " ".repeat(65537));
@@ -6564,5 +6715,82 @@ mod tests {
         assert_eq!(output.lines().count(), 2, "{output}");
         assert!(!output.contains("\"queries\""), "{output}");
         assert!(output.lines().nth(1).unwrap().contains("64 KiB"), "{output}");
+    }
+
+    /// A retained query's fingerprint reads its AIR, not where it came from:
+    /// spans on the query's context and on its assertions leave it alone,
+    /// a declaration added below it changes its prefix and nothing else, and
+    /// an edit to the query changes its body and nothing else.
+    #[test]
+    fn fingerprints_ignore_spans_and_tell_the_prefix_from_the_body() {
+        use air::ast::{QueryX, StmtX};
+        use vir::messages::ToAny;
+        let span = |text: &str| vir::messages::Span {
+            raw_span: Arc::new(()),
+            id: 0,
+            data: Vec::new(),
+            as_string: text.to_owned(),
+        };
+        let fun = Arc::new(vir::ast::FunX {
+            path: Arc::new(vir::ast::PathX {
+                krate: vir::ast::CrateId::Internal,
+                segments: Arc::new(vec![Arc::new("f".to_owned())]),
+            }),
+        });
+        // A query over `x` whose one assertion, labelled at `at`, checks `text`.
+        let query = |at: &str, text: &str| {
+            let parsed = commands(&format!("(check-valid (declare-const x Int) (assert {text}))"));
+            let CommandX::CheckValid(parsed) = &*parsed[0] else { panic!("a query") };
+            let StmtX::Assert(_, _, _, expr) = &*parsed.assertion else { panic!("an assert") };
+            let assertion = Arc::new(StmtX::Assert(
+                None,
+                vir::messages::error(&span(at), "assertion failed").to_any(),
+                None,
+                expr.clone(),
+            ));
+            Arc::new(QueryX { local: parsed.local.clone(), assertion })
+        };
+        // The journal of one compilation: a base, a scope of declarations,
+        // then the query, and after it one more declaration.
+        let journal = |at: &str, extra_below: &str, text: &str| {
+            let mut air = Context::new(Arc::new(VirMessageInterface {}), SmtSolver::Cvc5);
+            let mut journal = QueryJournal::new();
+            let base = commands("(declare-fun g (Int) Bool)");
+            for command in base.iter() {
+                if let CommandX::Global(decl) = &**command {
+                    air.global(decl).unwrap();
+                }
+            }
+            journal.record_base(std::iter::once(base));
+            apply(&mut journal, &mut air, &commands(&format!("(axiom (g 1)) {extra_below}")));
+            journal
+                .record_query(
+                    vir::def::CommandsWithContextX::new(
+                        fun.clone(),
+                        span(at),
+                        "body".to_owned(),
+                        Arc::new(vec![Arc::new(CommandX::CheckValid(query(at, text)))]),
+                        vir::def::ProverChoice::DefaultProver,
+                        false,
+                    ),
+                    &QueryOp::Body(Style::Normal),
+                    1.0,
+                )
+                .unwrap();
+            apply(&mut journal, &mut air, &commands("(axiom (g 2))"));
+            journal.fingerprints()
+        };
+        let before = journal("a.rs:3:5", "", "(> x 0)");
+        assert_eq!(before.len(), 1);
+        // Moved to other lines: the same fingerprint.
+        assert_eq!(journal("a.rs:9:5", "", "(> x 0)"), before);
+        // A declaration added below the query: its prefix changed, its body did not.
+        let below = journal("a.rs:3:5", "(axiom (g 3))", "(> x 0)");
+        assert_ne!(below[0].prefix, before[0].prefix);
+        assert_eq!(below[0].body, before[0].body);
+        // The query itself edited: its body changed, its prefix did not.
+        let edited = journal("a.rs:3:5", "", "(>= x 0)");
+        assert_eq!(edited[0].prefix, before[0].prefix);
+        assert_ne!(edited[0].body, before[0].body);
     }
 }
