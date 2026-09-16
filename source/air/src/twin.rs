@@ -195,12 +195,8 @@ pub fn set_triggers(expr: &Expr, qid: &str, triggers: &Triggers) -> (Expr, usize
         ExprX::Bind(bind, body) => match &**bind {
             BindX::Quant(Quant::Forall, binders, _, Some(q)) if q.as_str() == qid => {
                 replaced += 1;
-                let bind = BindX::Quant(
-                    Quant::Forall,
-                    binders.clone(),
-                    triggers.clone(),
-                    Some(q.clone()),
-                );
+                let bind =
+                    BindX::Quant(Quant::Forall, binders.clone(), triggers.clone(), Some(q.clone()));
                 Arc::new(ExprX::Bind(Arc::new(bind), body.clone()))
             }
             _ => e.clone(),
@@ -259,10 +255,9 @@ pub fn rename_bound(expr: &Expr, renaming: &BTreeMap<Ident, Ident>) -> Expr {
                     binders
                         .iter()
                         .map(|b| match renaming.get(&b.name) {
-                            Some(to) => Arc::new(crate::ast::BinderX {
-                                name: to.clone(),
-                                a: b.a.clone(),
-                            }),
+                            Some(to) => {
+                                Arc::new(crate::ast::BinderX { name: to.clone(), a: b.a.clone() })
+                            }
                             None => b.clone(),
                         })
                         .collect(),
@@ -273,12 +268,9 @@ pub fn rename_bound(expr: &Expr, renaming: &BTreeMap<Ident, Ident>) -> Expr {
                 BindX::Lambda(binders, triggers, qid) => {
                     BindX::Lambda(rename(binders), triggers.clone(), qid.clone())
                 }
-                BindX::Choose(binders, triggers, qid, cond) => BindX::Choose(
-                    rename(binders),
-                    triggers.clone(),
-                    qid.clone(),
-                    cond.clone(),
-                ),
+                BindX::Choose(binders, triggers, qid, cond) => {
+                    BindX::Choose(rename(binders), triggers.clone(), qid.clone(), cond.clone())
+                }
             };
             Arc::new(ExprX::Bind(Arc::new(bind), body.clone()))
         }

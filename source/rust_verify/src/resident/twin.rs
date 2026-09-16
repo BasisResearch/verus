@@ -889,13 +889,29 @@ fn plan(
                     in_base.iter().map(|a| matched("base", &AxiomRef::of(a), fun, symbols)),
                 );
                 report.fuel = Some(fuel);
-                return Ok(Plan { query: twin, rlimit, rebuild: None, report, vacuity: false, qid: None, quantifier: None });
+                return Ok(Plan {
+                    query: twin,
+                    rlimit,
+                    rebuild: None,
+                    report,
+                    vacuity: false,
+                    qid: None,
+                    quantifier: None,
+                });
             }
             let rebuild = in_prefix.iter().map(|(scope, _)| *scope).min().map(|first| {
                 report.rebuilt_scopes = Some(prefix - first);
                 Rebuild { first, drop: Box::new(move |axiom| named_by(axiom, &names)) }
             });
-            Ok(Plan { query: twin, rlimit, rebuild, report, vacuity: false, qid: None, quantifier: None })
+            Ok(Plan {
+                query: twin,
+                rlimit,
+                rebuild,
+                report,
+                vacuity: false,
+                qid: None,
+                quantifier: None,
+            })
         }
         TwinEdit::AddAxiom(text) => {
             let mut report = empty_report("add_axiom");
@@ -904,7 +920,15 @@ fn plan(
                 report.expression = Some(text.clone());
                 let axiom = air::twin::parse_axiom(Arc::new(VirMessageInterface {}), text)?;
                 twin = air::twin::with_local_axiom(&twin, axiom);
-                return Ok(Plan { query: twin, rlimit, rebuild: None, report, vacuity: true, qid: None, quantifier: None });
+                return Ok(Plan {
+                    query: twin,
+                    rlimit,
+                    rebuild: None,
+                    report,
+                    vacuity: true,
+                    qid: None,
+                    quantifier: None,
+                });
             }
             let names = names_for(text, symbols)?;
             let in_base = base_axioms(journal).find(|a| named_by(a, &names)).map(|a| ("base", a));
@@ -973,7 +997,15 @@ fn plan(
                     air::twin::with_local_axiom(&twin, Axiom { named: None, tag, expr: revealed });
                 report.fuel_assumed = Some(fuel_path(c));
             }
-            Ok(Plan { query: twin, rlimit, rebuild: None, report, vacuity: true, qid: None, quantifier: None })
+            Ok(Plan {
+                query: twin,
+                rlimit,
+                rebuild: None,
+                report,
+                vacuity: true,
+                qid: None,
+                quantifier: None,
+            })
         }
         TwinEdit::BumpRlimit(twin_rlimit) => {
             if !rlimit.is_finite() {
@@ -1009,7 +1041,15 @@ fn plan(
             let twin = air::twin::reorder_asserts(query, &ids)?;
             let mut report = empty_report("reorder_asserts");
             report.order = ids.iter().map(air::twin::assert_id_text).collect();
-            Ok(Plan { query: twin, rlimit, rebuild: None, report, vacuity: false, qid: None, quantifier: None })
+            Ok(Plan {
+                query: twin,
+                rlimit,
+                rebuild: None,
+                report,
+                vacuity: false,
+                qid: None,
+                quantifier: None,
+            })
         }
         TwinEdit::FlipFuel { function, fuel } => {
             let scan = FuelScan::of(journal, prefix);
@@ -1028,7 +1068,15 @@ fn plan(
             let mut report = empty_report("flip_fuel");
             report.resolved_fn = target.resolved.clone();
             report.fuel = Some(fuel_report);
-            Ok(Plan { query: twin, rlimit, rebuild: None, report, vacuity: false, qid: None, quantifier: None })
+            Ok(Plan {
+                query: twin,
+                rlimit,
+                rebuild: None,
+                report,
+                vacuity: false,
+                qid: None,
+                quantifier: None,
+            })
         }
         // A trigger edit needs the solver's declarations to read its terms;
         // `trigger_plan` makes it.
@@ -1522,11 +1570,9 @@ fn as_local_axiom(axiom: &Axiom, declared: &HashSet<String>) -> Axiom {
         }
     }
     match renaming.is_empty() {
-        true => Axiom {
-            named: axiom.named.clone(),
-            tag: axiom.tag.clone(),
-            expr: axiom.expr.clone(),
-        },
+        true => {
+            Axiom { named: axiom.named.clone(), tag: axiom.tag.clone(), expr: axiom.expr.clone() }
+        }
         false => Axiom {
             named: axiom.named.clone(),
             tag: axiom.tag.clone(),
@@ -1556,8 +1602,7 @@ fn lower_trigger(
         let node = super::read_term(text, None, lowering, reader, readings)?;
         let smt = super::flat(&node);
         let names = atoms(&smt);
-        let here: Vec<&str> =
-            variables.iter().copied().filter(|v| names.contains(v)).collect();
+        let here: Vec<&str> = variables.iter().copied().filter(|v| names.contains(v)).collect();
         if here.is_empty() {
             return Err(format!(
                 "the trigger term `{text}` reads as `{smt}`, which mentions none of {}'s variables ({}); a trigger term must mention the variables it matches",
@@ -1648,7 +1693,12 @@ fn trigger_plan(
     let declared = |name: &str| air.declared(name);
     let lowering = super::Lowering::new(
         &quantifier.binders,
-        super::Declarations::of(&decls.iter().collect::<Vec<_>>(), query, live.clone(), &no_versions),
+        super::Declarations::of(
+            &decls.iter().collect::<Vec<_>>(),
+            query,
+            live.clone(),
+            &no_versions,
+        ),
         &[&names.shown, &names.plain],
         &declared,
     );
@@ -1661,9 +1711,7 @@ fn trigger_plan(
             bound: quantifier
                 .binders
                 .iter()
-                .map(|(smt, sort)| {
-                    (Arc::new(smt.clone()), super::typ_of_sort(&super::flat(sort)))
-                })
+                .map(|(smt, sort)| (Arc::new(smt.clone()), super::typ_of_sort(&super::flat(sort))))
                 .collect(),
             declared: &declared,
             occurrences: &occurrences,
@@ -1710,8 +1758,13 @@ fn trigger_plan(
             )
         }
         TwinEdit::AddTrigger { pattern, .. } => {
-            let added =
-                lower_trigger(&pattern.terms(), &quantifier, &lowering, reader.as_ref(), &mut readings)?;
+            let added = lower_trigger(
+                &pattern.terms(),
+                &quantifier,
+                &lowering,
+                reader.as_ref(),
+                &mut readings,
+            )?;
             let mut all = (*current).clone();
             all.push(added);
             Arc::new(all)
@@ -1798,10 +1851,8 @@ fn trigger_plan(
                     tag: retriggered.tag.clone(),
                     expr: body.clone(),
                 };
-                twin = air::twin::with_local_axiom(
-                    &twin,
-                    as_local_axiom(&unguarded, &declared_names),
-                );
+                twin =
+                    air::twin::with_local_axiom(&twin, as_local_axiom(&unguarded, &declared_names));
             }
             report.fuel = Some(fuel);
             (twin, None, "base")
@@ -2023,7 +2074,13 @@ pub(super) fn serve(
     let vacuity = if plan.vacuity {
         // Each query with every goal switched off: valid only by contradiction.
         let mut falsified = |query: &Query| -> io::Result<Result<&'static str, String>> {
-            match run_branch(air, &air::twin::goals_off(query), rlimit, set_rlimit, Observe::default()) {
+            match run_branch(
+                air,
+                &air::twin::goals_off(query),
+                rlimit,
+                set_rlimit,
+                Observe::default(),
+            ) {
                 Ok(branch) => Ok(Ok(branch.class())),
                 Err(BranchError::Refused(message)) => Ok(Err(message)),
                 Err(BranchError::Fatal(error)) => Err(error),
@@ -2697,10 +2754,7 @@ mod tests {
         let holder = base_axioms(&journal)
             .find(|a| air::twin::holds_quantifier(&a.expr, "user_h_1"))
             .expect("the axiom");
-        assert_eq!(
-            fuel_guard(&holder.expr).as_deref().map(String::as_str),
-            Some("fuel%crate!r.")
-        );
+        assert_eq!(fuel_guard(&holder.expr).as_deref().map(String::as_str), Some("fuel%crate!r."));
         assert!(current_quantifier(&journal, 0, &q, "user_missing").is_none());
     }
 
@@ -2717,9 +2771,10 @@ mod tests {
             in_query: true,
         };
         let mut declarations = super::super::Declarations::default();
-        declarations
-            .functions
-            .insert("f".to_owned(), (vec!["Poly".to_owned(), "Poly".to_owned()], "Poly".to_owned()));
+        declarations.functions.insert(
+            "f".to_owned(),
+            (vec!["Poly".to_owned(), "Poly".to_owned()], "Poly".to_owned()),
+        );
         declarations.constants.insert("a".to_owned(), "Poly".to_owned());
         let empty = SourceNames::new();
         let declared = |_: &str| None;
@@ -2778,9 +2833,10 @@ mod tests {
                 .unwrap();
         assert!(matches!(edit, TwinEdit::DropTrigger { index: 1, .. }));
         assert_eq!(edit.trigger_edit(), Some(("drop_trigger", Some("q"))));
-        let edit: TwinEdit =
-            serde_json::from_value(serde_json::json!({"add_trigger": {"qid": "q", "pattern": "(f x)"}}))
-                .unwrap();
+        let edit: TwinEdit = serde_json::from_value(
+            serde_json::json!({"add_trigger": {"qid": "q", "pattern": "(f x)"}}),
+        )
+        .unwrap();
         assert_eq!(edit.trigger_edit(), Some(("add_trigger", Some("q"))));
         assert!(TwinEdit::BumpRlimit(1.0).trigger_edit().is_none());
     }
