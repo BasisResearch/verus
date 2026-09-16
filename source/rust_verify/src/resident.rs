@@ -548,9 +548,10 @@ impl RetainedBucket {
 /// assertion's labels as their notes and never a span, so a query that only
 /// moved to other lines prints the same, and generated names carry
 /// per-function counters, not line numbers. A quantifier's triggers are
-/// hashed sorted and once each (see `sort_patterns`). Two queries with the
-/// same function, kind and description and the same fingerprint are, to the
-/// solver, the same query.
+/// hashed sorted and once each (see `sort_patterns`). The body hash also
+/// covers the query's rlimit, since the budget a query checks at can change
+/// its verdict. Two queries with the same function, kind and description and
+/// the same fingerprint are, to the solver, the same query.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize)]
 pub(crate) struct Fingerprint {
     prefix: u64,
@@ -5018,7 +5019,7 @@ impl QueryJournal {
 
     /// Every retained query's fingerprint, in journal order: the running
     /// hash of the base context and the scopes below the query's prefix,
-    /// and the hash of the query itself.
+    /// and the hash of the query itself and its rlimit.
     fn fingerprints(&self) -> Vec<Fingerprint> {
         let printer = air::printer::Printer::new(
             std::sync::Arc::new(VirMessageInterface {}),
@@ -5041,6 +5042,9 @@ impl QueryJournal {
             .map(|query| {
                 let mut body = Fnv::new();
                 body.node(&printer.query_to_node(&query.query));
+                // The budget a query checks at is part of what it is: raising
+                // or lowering it can change its verdict.
+                body.write(&query.rlimit.to_bits().to_le_bytes());
                 Fingerprint { prefix: prefixes[query.prefix], body: body.0 }
             })
             .collect()
@@ -6763,7 +6767,8 @@ mod tests {
     /// A retained query's fingerprint reads its AIR, not where it came from:
     /// spans on the query's context and on its assertions leave it alone,
     /// a declaration added below it changes its prefix and nothing else, and
-    /// an edit to the query changes its body and nothing else.
+    /// an edit to the query or to its rlimit changes its body and nothing
+    /// else.
     #[test]
     fn fingerprints_ignore_spans_and_tell_the_prefix_from_the_body() {
         use air::ast::{QueryX, StmtX};
@@ -6794,8 +6799,8 @@ mod tests {
             Arc::new(QueryX { local: parsed.local.clone(), assertion })
         };
         // The journal of one compilation: a base, a scope of declarations,
-        // then the query, and after it one more declaration.
-        let journal = |at: &str, extra_below: &str, text: &str| {
+        // then the query at `rlimit`, and after it one more declaration.
+        let journal_at = |at: &str, extra_below: &str, text: &str, rlimit: f32| {
             let mut air = Context::new(Arc::new(VirMessageInterface {}), SmtSolver::Cvc5);
             let mut journal = QueryJournal::new();
             let base = commands("(declare-fun g (Int) Bool)");
@@ -6817,12 +6822,14 @@ mod tests {
                         false,
                     ),
                     &QueryOp::Body(Style::Normal),
-                    1.0,
+                    rlimit,
                 )
                 .unwrap();
             apply(&mut journal, &mut air, &commands("(axiom (g 2))"));
             journal.fingerprints()
         };
+        let journal =
+            |at: &str, extra_below: &str, text: &str| journal_at(at, extra_below, text, 1.0);
         let before = journal("a.rs:3:5", "", "(> x 0)");
         assert_eq!(before.len(), 1);
         // Moved to other lines: the same fingerprint.
@@ -6835,6 +6842,10 @@ mod tests {
         let edited = journal("a.rs:3:5", "", "(>= x 0)");
         assert_eq!(edited[0].prefix, before[0].prefix);
         assert_ne!(edited[0].body, before[0].body);
+        // The same query at another rlimit: its body changed, its prefix did not.
+        let budget = journal_at("a.rs:3:5", "", "(> x 0)", 5.0);
+        assert_eq!(budget[0].prefix, before[0].prefix);
+        assert_ne!(budget[0].body, before[0].body);
         // Triggers listed in another order: the same query, so the same body.
         let quantified = |patterns: &str| {
             journal(
