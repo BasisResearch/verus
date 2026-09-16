@@ -547,8 +547,9 @@ impl RetainedBucket {
 /// over the query itself, each printed as AIR. The printer writes an
 /// assertion's labels as their notes and never a span, so a query that only
 /// moved to other lines prints the same, and generated names carry
-/// per-function counters, not line numbers. Two queries with the same
-/// function, kind and description and the same fingerprint are, to the
+/// per-function counters, not line numbers. A quantifier's triggers are
+/// hashed sorted and once each (see `sort_patterns`). Two queries with the
+/// same function, kind and description and the same fingerprint are, to the
 /// solver, the same query.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize)]
 pub(crate) struct Fingerprint {
@@ -572,7 +573,9 @@ impl Fnv {
     }
 
     fn node(&mut self, node: &TreeNode) {
-        self.write(air::printer::node_to_string(node).as_bytes());
+        let mut node = node.clone();
+        sort_patterns(&mut node);
+        self.write(air::printer::node_to_string(&node).as_bytes());
         self.write(b"\n");
     }
 
@@ -594,6 +597,46 @@ impl Fnv {
             }
         }
     }
+}
+
+/// Put every annotated term's `:pattern` groups in the order of their text,
+/// once each, in place: `(! e :pattern (p) :pattern (q) :qid ...)` keeps its
+/// other annotations where they are, and the patterns take the place of the
+/// first. Automatic trigger selection lists a quantifier's triggers in an
+/// order that varies from one compilation to the next, and sometimes lists
+/// one twice; neither changes the query.
+fn sort_patterns(node: &mut TreeNode) {
+    let TreeNode::List(items) = node else { return };
+    for item in items.iter_mut() {
+        sort_patterns(item);
+    }
+    if !matches!(items.first(), Some(TreeNode::Atom(bang)) if bang == "!") {
+        return;
+    }
+    let mut rest = Vec::with_capacity(items.len());
+    let mut patterns: Vec<(String, TreeNode)> = Vec::new();
+    let mut first = None;
+    let mut i = 0;
+    while i < items.len() {
+        if matches!(&items[i], TreeNode::Atom(key) if key == ":pattern") && i + 1 < items.len() {
+            first.get_or_insert(rest.len());
+            patterns.push((air::printer::node_to_string(&items[i + 1]), items[i + 1].clone()));
+            i += 2;
+        } else {
+            rest.push(items[i].clone());
+            i += 1;
+        }
+    }
+    let Some(first) = first else { return };
+    patterns.sort_by(|a, b| a.0.cmp(&b.0));
+    patterns.dedup_by(|a, b| a.0 == b.0);
+    let tail = rest.split_off(first);
+    for (_, pattern) in patterns {
+        rest.push(TreeNode::Atom(":pattern".to_owned()));
+        rest.push(pattern);
+    }
+    rest.extend(tail);
+    *items = rest;
 }
 
 /// The name a query's instantiation certificate goes by: FNV-1a over its
@@ -6792,5 +6835,20 @@ mod tests {
         let edited = journal("a.rs:3:5", "", "(>= x 0)");
         assert_eq!(edited[0].prefix, before[0].prefix);
         assert_ne!(edited[0].body, before[0].body);
+        // Triggers listed in another order: the same query, so the same body.
+        let quantified = |patterns: &str| {
+            journal(
+                "a.rs:3:5",
+                "",
+                &format!(
+                    "(forall ((y Int)) (! (=> (g y) (> x y)) {patterns} :qid q :skolemid skolem_q))"
+                ),
+            )
+        };
+        let one = quantified(":pattern ((g y)) :pattern ((> x y))");
+        assert_eq!(one, quantified(":pattern ((> x y)) :pattern ((g y))"));
+        // A trigger listed twice: the same query too.
+        assert_eq!(one, quantified(":pattern ((g y)) :pattern ((> x y)) :pattern ((g y))"));
+        assert_ne!(one[0].body, quantified(":pattern ((g y))")[0].body);
     }
 }
