@@ -7178,4 +7178,124 @@ mod tests {
             fingerprint(constants, &about_j, &about_h, "(and (h x) (h 1))").prefix
         );
     }
+
+    /// A module's transparent datatypes are one `declare-datatypes`, and a
+    /// prefix fingerprint reads the datatypes of it the query reaches, not
+    /// the block: a struct added beside another leaves the queries that use
+    /// the other alone, and so do the added struct's own declarations. What
+    /// a datatype the query reaches mentions is reached in turn, so a field's
+    /// sort is read.
+    #[test]
+    fn fingerprints_read_the_datatypes_a_query_reaches() {
+        use air::ast::{QueryX, StmtX};
+        use vir::messages::ToAny;
+        let span = |text: &str| vir::messages::Span {
+            raw_span: Arc::new(()),
+            id: 0,
+            data: Vec::new(),
+            as_string: text.to_owned(),
+        };
+        let fun = Arc::new(vir::ast::FunX {
+            path: Arc::new(vir::ast::PathX {
+                krate: vir::ast::CrateId::Internal,
+                segments: Arc::new(vec![Arc::new("f".to_owned())]),
+            }),
+        });
+        // A module's datatype batch, the shape `datatype_to_air` gives it:
+        // one `declare-datatypes` for every transparent datatype of the
+        // module, and then each datatype's own declarations and axioms.
+        let journal_of = |datatypes: &str, decls: &str, sort: &str, text: &str| {
+            let mut air = Context::new(Arc::new(VirMessageInterface {}), SmtSolver::Cvc5);
+            let mut journal = QueryJournal::new();
+            journal.record_prelude(commands("(declare-const SZ Int)"));
+            let base = commands("(declare-fun g (Int) Bool)");
+            for command in base.iter() {
+                if let CommandX::Global(decl) = &**command {
+                    air.global(decl).unwrap();
+                }
+            }
+            journal.record_base(std::iter::once((base, BatchOwner::Module)));
+            apply_owned(
+                &mut journal,
+                &mut air,
+                &commands(&format!("{datatypes} {decls}")),
+                BatchOwner::Datatypes,
+            );
+            let parsed =
+                commands(&format!("(check-valid (declare-const v {sort}) (assert {text}))"));
+            let CommandX::CheckValid(parsed) = &*parsed[0] else { panic!("a query") };
+            let StmtX::Assert(_, _, _, expr) = &*parsed.assertion else { panic!("an assert") };
+            let assertion = Arc::new(StmtX::Assert(
+                None,
+                vir::messages::error(&span("a.rs:3:5"), "assertion failed").to_any(),
+                None,
+                expr.clone(),
+            ));
+            journal
+                .record_query(
+                    vir::def::CommandsWithContextX::new(
+                        fun.clone(),
+                        span("a.rs:3:5"),
+                        "body".to_owned(),
+                        Arc::new(vec![Arc::new(CommandX::CheckValid(Arc::new(QueryX {
+                            local: parsed.local.clone(),
+                            assertion,
+                        })))]),
+                        vir::def::ProverChoice::DefaultProver,
+                        false,
+                    ),
+                    &QueryOp::Body(Style::Normal),
+                    1.0,
+                )
+                .unwrap();
+            journal.fingerprints(&mut relevance::Index::new())[0]
+        };
+        // Each datatype's own declarations, which name it and so are read by
+        // the queries that reach it, as `has_type` and `Poly` are.
+        let has = |name: &str| {
+            format!(
+                "(declare-fun has_{name} ({name}) Bool) \
+                 (axiom (forall ((u {name})) (! (has_{name} u) :pattern ((has_{name} u)) \
+                 :qid user_crate__{name}_1 :skolemid skolem_user_crate__{name}_1)))"
+            )
+        };
+        let a_and_b = |b_field: &str| {
+            format!("(declare-datatypes ((A 0) (B 0)) ((($A (a_x Int))) (($B (b_y {b_field})))))")
+        };
+        let ab_decls = format!("{} {}", has("A"), has("B"));
+        // The same module with a third datatype added to its block, and its
+        // own declarations after it.
+        let a_b_and_c = |b_field: &str| {
+            format!(
+                "(declare-datatypes ((A 0) (B 0) (C 0)) \
+                 ((($A (a_x Int))) (($B (b_y {b_field}))) (($C (c_z Int)))))"
+            )
+        };
+        let abc_decls = format!("{} {}", ab_decls, has("C"));
+        let reaches_a =
+            |datatypes: &str, decls: &str| journal_of(datatypes, decls, "A", "(has_A v)").prefix;
+        let reaches_b =
+            |datatypes: &str, decls: &str| journal_of(datatypes, decls, "B", "(has_B v)").prefix;
+        // A datatype added to the module, with its own declarations: the
+        // queries that reach neither it nor a datatype that names it are
+        // left alone.
+        assert_eq!(reaches_a(&a_b_and_c("Int"), &abc_decls), reaches_a(&a_and_b("Int"), &ab_decls));
+        assert_eq!(reaches_b(&a_b_and_c("Int"), &abc_decls), reaches_b(&a_and_b("Int"), &ab_decls));
+        // One datatype of the block edited: the queries that reach it read
+        // it, and the queries that do not are left alone.
+        let wider_b =
+            "(declare-datatypes ((A 0) (B 0)) ((($A (a_x Int))) (($B (b_y Int) (b_w Int)))))";
+        assert_eq!(reaches_a(wider_b, &ab_decls), reaches_a(&a_and_b("Int"), &ab_decls));
+        assert_ne!(reaches_b(wider_b, &ab_decls), reaches_b(&a_and_b("Int"), &ab_decls));
+        // A field's sort is reached through the datatype that has it: with
+        // `b_y` of sort `A`, a query over `B` reads `A` and is changed by an
+        // edit to it; with `b_y` an `Int` it is not.
+        let wider_a = |b_field: &str| {
+            format!(
+                "(declare-datatypes ((A 0) (B 0)) ((($A (a_x Int) (a_w Int))) (($B (b_y {b_field})))))"
+            )
+        };
+        assert_ne!(reaches_b(&wider_a("A"), &ab_decls), reaches_b(&a_and_b("A"), &ab_decls));
+        assert_eq!(reaches_b(&wider_a("Int"), &ab_decls), reaches_b(&a_and_b("Int"), &ab_decls));
+    }
 }

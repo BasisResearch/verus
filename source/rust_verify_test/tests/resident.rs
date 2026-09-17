@@ -3935,6 +3935,62 @@ verus! {{
     assert_ne!(reads_unread_broadcast, reads_unread);
 }
 
+/// A module declares its transparent datatypes in one `declare-datatypes`,
+/// and a query reads the ones it reaches: a struct added to a module whose
+/// proofs already use a struct leaves those proofs alone, while an edit to
+/// the struct they do use changes them.
+#[test]
+fn resident_fingerprints_ignore_a_datatype_a_query_does_not_reach() {
+    let source = |used: &str, extra: &str| {
+        format!(
+            r#"
+use vstd::prelude::*;
+verus! {{
+    pub struct Used {{
+        pub x: u8,
+        {used}
+    }}
+
+    {extra}
+
+    spec fn field(u: Used) -> u8 {{
+        u.x
+    }}
+
+    proof fn uses(u: Used)
+        ensures field(u) == u.x,
+    {{
+    }}
+}}
+"#
+        )
+    };
+    let open = |source: &str| {
+        let mut worker =
+            Worker::start_with_env(source, &[], &[("VERUS_RESIDENT_RETAIN_ONLY", "1")]);
+        let ready = worker.receive();
+        assert_eq!(ready["retain_only"], true, "{ready}");
+        let fingerprint = query_of(&ready, "::uses", "default")["fingerprint"].clone();
+        worker.finish(true);
+        fingerprint
+    };
+    let uses = open(&source("", ""));
+    // A struct added beside the one the proof uses, which the module declares
+    // in the same `declare-datatypes`: neither it nor the declarations beside
+    // it are reached.
+    assert_eq!(open(&source("", "pub struct Other { pub y: u8 }")), uses);
+    // The struct it does use, edited: its query reads it.
+    assert_ne!(open(&source("pub z: u8,", "")), uses);
+    // A struct whose field has the type the proof does use is not left alone,
+    // though: its constructor's `has_type` axiom is triggered on a term of
+    // the added struct, which no query here can build, but it names the used
+    // struct's `Poly` and `TYPE` constants, and a datatype batch attributes a
+    // declaration by the names of its own batch that it mentions. Attributing
+    // an axiom by the symbols its triggers are headed by would read it for
+    // what it is; until then this is what the batch is conservative about.
+    assert_ne!(open(&source("", "pub struct Wraps { pub u: Used }")), uses);
+}
+
 /// A `by(bit_vector)` query's solver gets neither the prelude nor the bucket
 /// context, so its prefix fingerprint covers neither: an edit to the spec
 /// function of its bucket leaves it alone, while the default prover's query

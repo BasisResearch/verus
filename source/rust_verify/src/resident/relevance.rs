@@ -77,7 +77,22 @@ enum Projection {
     /// `(declare-datatypes ...)`: every transparent datatype of the module in
     /// one declaration, hashed over the datatypes the query reaches, each by
     /// the names it declares and its own hash.
-    Datatypes(Vec<(Vec<Symbol>, u64)>),
+    Datatypes(Vec<DatatypePart>),
+}
+
+/// One datatype of a `declare-datatypes`, as a query reaches it: a projected
+/// declaration is reached part by part, so that mentioning one datatype of a
+/// module's block does not read the block.
+struct DatatypePart {
+    /// The names it declares: its sort, its variants and their fields, which
+    /// is what a query mentions to reach it.
+    names: Vec<Symbol>,
+    /// Every name it mentions printed alone, which is what reaching it brings
+    /// in: a field's sort reaches that datatype's own declarations, and two
+    /// mutually recursive datatypes reach each other.
+    mentions: Vec<Symbol>,
+    /// FNV over that one datatype, printed alone.
+    hash: u64,
 }
 
 /// One declaration of a batch, hashed and indexed once per bucket.
@@ -120,9 +135,9 @@ impl DeclFacts {
                 }
             }
             Projection::Datatypes(datatypes) => {
-                for (names, datatype) in datatypes {
-                    if names.iter().any(|name| reached.contains(name)) {
-                        hash.write(&datatype.to_le_bytes());
+                for datatype in datatypes {
+                    if datatype.names.iter().any(|name| reached.contains(name)) {
+                        hash.write(&datatype.hash.to_le_bytes());
                     }
                 }
             }
@@ -297,9 +312,17 @@ impl Index {
                         let names = self.datatype_names(datatype);
                         let one: Decl =
                             Arc::new(DeclX::Datatypes(Arc::new(vec![datatype.clone()])));
+                        let node = self.printer.decl_to_node(&one);
+                        let mut mentions = Vec::new();
+                        {
+                            let symbols = &mut self.symbols;
+                            atoms(&node, &mut |atom| mentions.push(symbols.intern(atom)));
+                        }
+                        mentions.sort_unstable();
+                        mentions.dedup();
                         let mut hash = Fnv::new();
-                        hash.node(&self.printer.decl_to_node(&one));
-                        (names, hash.0)
+                        hash.node(&node);
+                        DatatypePart { names, mentions, hash: hash.0 }
                     })
                     .collect(),
             ),
@@ -365,15 +388,28 @@ pub(crate) fn fingerprints(journal: &QueryJournal, index: &mut Index) -> Vec<Fin
         }
     }
 
-    // The declarations a batch attributes, by the names they are about.
-    let mut about_index: HashMap<Symbol, Vec<(usize, usize)>> = HashMap::new();
+    // The declarations a batch attributes, by the names they are about, each
+    // with the part of it a name reaches: a projected declaration is reached
+    // part by part, and brings in only what that part mentions. A module's
+    // datatypes are one declaration, so propagating all of it would read the
+    // whole block for a query that mentions one of its sorts, which is what
+    // the projection exists to avoid.
+    let mut about_index: HashMap<Symbol, Vec<(usize, usize, Option<usize>)>> = HashMap::new();
     for (at, batch) in batches.iter().enumerate() {
         if matches!(batch.owner, BatchOwner::Item(_)) {
             continue;
         }
         for (which, decl) in batch.decls.iter().enumerate() {
+            if let Projection::Datatypes(datatypes) = &decl.projection {
+                for (part, datatype) in datatypes.iter().enumerate() {
+                    for name in &datatype.names {
+                        about_index.entry(*name).or_default().push((at, which, Some(part)));
+                    }
+                }
+                continue;
+            }
             for name in &decl.about {
-                about_index.entry(*name).or_default().push((at, which));
+                about_index.entry(*name).or_default().push((at, which, None));
             }
         }
     }
@@ -418,7 +454,7 @@ pub(crate) fn fingerprints(journal: &QueryJournal, index: &mut Index) -> Vec<Fin
                 item_queue.push(item);
             }
         }
-        let mut decl_read: HashSet<(usize, usize)> = HashSet::new();
+        let mut decl_read: HashSet<(usize, usize, Option<usize>)> = HashSet::new();
         loop {
             // Reading an item brings in every name its declarations mention,
             // which reaches the items and the datatypes they are about.
@@ -441,11 +477,16 @@ pub(crate) fn fingerprints(journal: &QueryJournal, index: &mut Index) -> Vec<Fin
                     item_queue.push(*item);
                 }
             }
-            for (at, which) in about_index.get(&name).map(Vec::as_slice).unwrap_or(&[]) {
-                if *at >= end || !decl_read.insert((*at, *which)) {
+            for (at, which, part) in about_index.get(&name).map(Vec::as_slice).unwrap_or(&[]) {
+                if *at >= end || !decl_read.insert((*at, *which, *part)) {
                     continue;
                 }
-                for name in &batches[*at].decls[*which].mentions {
+                let decl = &batches[*at].decls[*which];
+                let mentions = match (&decl.projection, part) {
+                    (Projection::Datatypes(datatypes), Some(part)) => &datatypes[*part].mentions,
+                    _ => &decl.mentions,
+                };
+                for name in mentions {
                     if reached.insert(*name) {
                         frontier.push(*name);
                     }
