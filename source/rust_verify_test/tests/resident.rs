@@ -3742,6 +3742,106 @@ fn resident_retain_only_session_retains_what_any_checked_session_could() {
     );
 }
 
+/// The one body query of `name`'s function whose prover is `prover`, from a
+/// session's ready event.
+fn query_of<'a>(ready: &'a Value, name: &str, prover: &str) -> &'a Value {
+    let found: Vec<_> = ready["buckets"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{}", ready))
+        .iter()
+        .flat_map(|bucket| bucket["queries"].as_array().unwrap())
+        .filter(|query| {
+            query["function"].as_str().unwrap().ends_with(name)
+                && query["kind"] == "body"
+                && query["prover"] == prover
+        })
+        .collect();
+    assert_eq!(found.len(), 1, "{name} ({prover}): {ready}");
+    found[0]
+}
+
+/// A query's prefix fingerprint covers the prelude its solver starts from,
+/// which is no fixed text: it reads the crate's word size, which a
+/// `global size_of usize` line sets. With that line in another module, whose
+/// size_of lemma the checked module's bucket prunes away, a query's own AIR
+/// and bucket context are the same either way, but its verdict is not, so it
+/// must not fingerprint the same.
+#[test]
+fn resident_fingerprints_cover_the_word_size_in_the_prelude() {
+    let source = |layout: &str| {
+        format!(
+            r#"
+use vstd::prelude::*;
+verus! {{
+    mod layout {{
+        use super::*;
+        {layout}
+    }}
+    mod a {{
+        use super::*;
+        proof fn word() {{
+            assert(usize::MAX == 0xffff_ffff_ffff_ffff);
+        }}
+    }}
+}}
+"#
+        )
+    };
+    let open = |source: &str| {
+        let mut worker = Worker::start(source, &["--verify-module", "a"]);
+        let ready = worker.receive();
+        let word = query_of(&ready, "::word", "default").clone();
+        let checked = worker.send(json!({"command":"check", "session":ready["session"],
+            "bucket":0, "query":word["id"]}));
+        worker.finish(ready["invocation_succeeded"] == true);
+        (word["fingerprint"].clone(), checked["result"].clone())
+    };
+    let (either, either_result) = open(&source(""));
+    let (sixty_four, sixty_four_result) = open(&source("global size_of usize == 8;"));
+    // The word size decides the query.
+    assert_eq!(either_result, "invalid");
+    assert_eq!(sixty_four_result, "valid");
+    // Its body is the same AIR either way; its prefix is not.
+    assert_eq!(either["body"], sixty_four["body"]);
+    assert_ne!(either["prefix"], sixty_four["prefix"], "{either} {sixty_four}");
+}
+
+/// A `by(bit_vector)` query's solver gets neither the prelude nor the bucket
+/// context, so its prefix fingerprint covers neither: a declaration added to
+/// its bucket leaves it alone, while the default prover's queries in the same
+/// function, whose solver does get the declaration, fingerprint differently.
+#[test]
+fn resident_bit_vector_fingerprints_ignore_the_bucket_context() {
+    let source = |extra: &str| {
+        format!(
+            r#"
+use vstd::prelude::*;
+verus! {{
+    {extra}
+    proof fn bits(x: u32) {{
+        assert(x & 0 == 0) by(bit_vector);
+        assert(1int + 1 == 2);
+    }}
+}}
+"#
+        )
+    };
+    let open = |source: &str| {
+        let mut worker =
+            Worker::start_with_env(source, &[], &[("VERUS_RESIDENT_RETAIN_ONLY", "1")]);
+        let ready = worker.receive();
+        assert_eq!(ready["retain_only"], true, "{ready}");
+        worker.finish(true);
+        let fingerprint = |prover| query_of(&ready, "::bits", prover)["fingerprint"].clone();
+        (fingerprint("bit_vector"), fingerprint("default"))
+    };
+    let (bits, body) = open(&source(""));
+    let (bits_extra, body_extra) =
+        open(&source("spec fn extra(x: int) -> int { x }\n    pub struct Extra { pub x: u8 }"));
+    assert_ne!(body["prefix"], body_extra["prefix"], "the declarations reached the bucket");
+    assert_eq!(bits, bits_extra);
+}
+
 const UNBOUNDED_SOURCE: &str = r#"
 use vstd::prelude::*;
 verus! {
