@@ -851,6 +851,26 @@ pub(crate) struct Server {
     /// (bucket, query) -> the rung its checks try first, as its last ladder
     /// request found.
     pins: HashMap<(usize, usize), Pin>,
+    /// The instantiation strategies a solver of this session has a module
+    /// for, as the first probe of one of them found (`SessionRungs`).
+    rungs: SessionRungs,
+}
+
+/// What the solvers of a session can run one strategy of, which is a
+/// property of the cvc5 they were all launched from and of the options they
+/// were all launched with, not of one solver's state. The first probe
+/// records it for the rest: a caller refreshing a session carries a pin over
+/// for every query whose fingerprint is unchanged, which is every query it
+/// does not mean to check, and probing each one's solver would start it and
+/// send it the whole context it never needs.
+#[derive(PartialEq, Eq)]
+enum SessionRungs {
+    /// Nothing has probed a solver yet.
+    Unknown,
+    /// This cvc5 does not know `:quant-strategy`.
+    Unsupported,
+    /// The strategies a rung can name.
+    Available(Vec<String>),
 }
 
 /// What a session reports about the invocation behind it, and the settings a
@@ -4965,12 +4985,18 @@ fn below_one_resource_unit(
 /// a budget below one cvc5 resource unit would run the attempt with no limit
 /// at all. A ladder pins only a rung it ran, so it has made these checks
 /// already.
+///
+/// Which rungs a solver has is the session's (`SessionRungs`), so only the
+/// first pin of a session probes one; the budget is the query's own, so it
+/// is checked on the query's solver every time, which reaches a solver that
+/// has already been started or is about to be.
 /// `Ok(Err(_))` is a refusal to report; `Err` ends the session.
 fn check_pin(
     bucket: &RetainedBucket,
     id: QueryId,
     rung: Rung,
     rlimit: f32,
+    known: &mut SessionRungs,
     set_rlimit: &impl Fn(&mut Context, f32),
 ) -> io::Result<Result<(), &'static str>> {
     let mut state =
@@ -4984,19 +5010,29 @@ fn check_pin(
     if below_one_resource_unit(air, rlimit, query_rlimit, set_rlimit) {
         return Ok(Err("the pin's budget is below one cvc5 resource unit"));
     }
-    // The first probe of a solver that has not checked anything yet, as in a
-    // retain-only session, starts it, sends the context it was given and
-    // initializes it even when that context is empty, as a bit-vector
-    // query's is, so the modules it has are known by the time it answers.
-    let Some(probe) = air.probe_strategy_rung() else {
-        return Ok(Err(
-            "this cvc5 cannot run one instantiation strategy alone; it needs :quant-strategy",
-        ));
-    };
-    if !probe.available.iter().any(|name| name == rung.name()) {
-        return Ok(Err("the solver has no module for this rung"));
+    if *known == SessionRungs::Unknown {
+        // The first probe of a solver that has not checked anything yet, as
+        // in a retain-only session, starts it, sends the context it was
+        // given and initializes it even when that context is empty, as a
+        // bit-vector query's is, so the modules it has are known by the time
+        // it answers.
+        *known = match air.probe_strategy_rung() {
+            Some(probe) => SessionRungs::Available(probe.available),
+            None => SessionRungs::Unsupported,
+        };
     }
-    Ok(Ok(()))
+    match known {
+        SessionRungs::Unknown => unreachable!("probed above"),
+        SessionRungs::Unsupported => Ok(Err(
+            "this cvc5 cannot run one instantiation strategy alone; it needs :quant-strategy",
+        )),
+        SessionRungs::Available(available) => {
+            if !available.iter().any(|name| name == rung.name()) {
+                return Ok(Err("the solver has no module for this rung"));
+            }
+            Ok(Ok(()))
+        }
+    }
 }
 
 /// Serve a ladder request for one query of `bucket`, whose address the
@@ -5013,6 +5049,7 @@ fn serve_ladder(
     budgets: &HashMap<Rung, f32>,
     run_all: bool,
     alongside: bool,
+    known: &mut SessionRungs,
     set_rlimit: &impl Fn(&mut Context, f32),
 ) -> io::Result<Result<LadderReport, &'static str>> {
     let mut state =
@@ -5036,7 +5073,14 @@ fn serve_ladder(
     let restore_ms = restore_start.elapsed().as_millis();
     // Asked before any option is set: a cvc5 without `:quant-strategy`
     // would answer the set-option with an error the check cannot survive.
-    let Some(probe) = air.probe_strategy_rung() else {
+    // This solver is about to run checks either way, so the ladder asks it
+    // rather than the session, and tells the session what it found.
+    let probe = air.probe_strategy_rung();
+    *known = match &probe {
+        Some(probe) => SessionRungs::Available(probe.available.clone()),
+        None => SessionRungs::Unsupported,
+    };
+    let Some(probe) = probe else {
         return Ok(Err(
             "this cvc5 cannot run one instantiation strategy alone; it needs :quant-strategy",
         ));
@@ -5214,6 +5258,7 @@ impl Server {
             info,
             graphs: KeptGraphs::new(MAX_KEPT_INSTANTIATIONS),
             pins: HashMap::new(),
+            rungs: SessionRungs::Unknown,
         }
     }
 
@@ -5367,7 +5412,7 @@ impl Server {
                         )?;
                         continue;
                     }
-                    match check_pin(bucket, id, rung, rlimit, &set_rlimit) {
+                    match check_pin(bucket, id, rung, rlimit, &mut self.rungs, &set_rlimit) {
                         Ok(Ok(())) => {}
                         Ok(Err(message)) => {
                             send(&mut output, &Response::Error { message })?;
@@ -5726,6 +5771,7 @@ impl Server {
                         &budgets,
                         run_all,
                         alongside,
+                        &mut self.rungs,
                         &set_rlimit,
                     ) {
                         Ok(Ok(mut report)) => {
