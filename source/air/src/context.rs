@@ -1093,14 +1093,18 @@ impl Context {
     /// before. `None` when the solver does not know the key, as a cvc5
     /// without `:quant-strategy` would not: setting that option on one would
     /// fail the next check. Read-only. The `available` list is filled in once
-    /// the solver is initialized, which its first assertion or `push` does,
-    /// so it is empty only while the solver has been sent neither.
+    /// the solver is initialized, which its first assertion or `push` does;
+    /// a solver that has been sent neither, as a bit-vector query's is before
+    /// its first check, would report it empty, so an empty scope is pushed
+    /// and popped first.
     pub fn probe_strategy_rung(&mut self) -> Option<StrategyRung> {
         if !matches!(self.solver, SmtSolver::Cvc5) {
             return None;
         }
         self.ensure_started();
         self.get_smt_process();
+        self.smt_log.log_push();
+        self.smt_log.log_pop();
         self.smt_log.log_get_info("strategy-rung");
         let lines = self.flush_commands();
         let line = lines.iter().find(|line| line.starts_with("(:strategy-rung "))?;

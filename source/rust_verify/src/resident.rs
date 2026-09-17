@@ -4964,8 +4964,9 @@ fn check_pin(
         return Ok(Err("the pin's budget is below one cvc5 resource unit"));
     }
     // The first probe of a solver that has not checked anything yet, as in a
-    // retain-only session, starts it and sends the context it was given, so
-    // the modules it has are known by the time it answers.
+    // retain-only session, starts it, sends the context it was given and
+    // initializes it even when that context is empty, as a bit-vector
+    // query's is, so the modules it has are known by the time it answers.
     let Some(probe) = air.probe_strategy_rung() else {
         return Ok(Err(
             "this cvc5 cannot run one instantiation strategy alone; it needs :quant-strategy",
