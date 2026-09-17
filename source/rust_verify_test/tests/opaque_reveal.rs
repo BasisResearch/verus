@@ -243,6 +243,7 @@ test_verify_one_file! {
         }
 
         mod m2 {
+            use vstd::prelude::*;
             use crate::m1::*;
             fn aproof(a: A<u64>) {
                 reveal(A::afunction);
@@ -484,4 +485,32 @@ test_verify_one_file! {
             };
         }
     } => Err(err) => assert_vir_error_msg(err, "this function is not recursive (nor mutually recursive), so fuel cannot be set to more than 1")
+}
+
+test_verify_one_file! {
+    #[test] hide_unreachable_function_from_other_module verus_code! {
+        // hide(m1::f) in a query that cannot otherwise reach f: pruning removes
+        // f's fuel constant from the module context
+        mod m1 {
+            use vstd::prelude::*;
+            pub open spec fn f(x: int) -> int { x + 1 }
+            pub open spec fn g(x: int) -> int { x + 2 }
+        }
+
+        mod m2 {
+            use vstd::prelude::*;
+            use crate::m1::*;
+
+            proof fn p() {
+                hide(f);
+                assert(g(1) == 3);
+            }
+
+            proof fn q() {
+                hide(f);
+                hide(g);
+                assert(g(1) == 3); // FAILS
+            }
+        }
+    } => Err(err) => assert_one_fails(err)
 }
