@@ -104,6 +104,8 @@ pub struct ArgsX {
     pub time: bool,
     pub time_expanded: bool,
     pub output_json: bool,
+    /// `--report-json PATH`: also write the machine report to PATH.
+    pub report_json: Option<String>,
     pub rlimit: f32,
     pub smt_options: Vec<(String, String)>,
     pub multiple_errors: u32,
@@ -166,6 +168,7 @@ impl ArgsX {
             time: Default::default(),
             time_expanded: Default::default(),
             output_json: Default::default(),
+            report_json: Default::default(),
             rlimit: f32::INFINITY, // NOTE: default rlimit is infinity
             smt_options: Default::default(),
             multiple_errors: Default::default(),
@@ -352,6 +355,7 @@ pub fn parse_args_with_imports(
     const OPT_TIME: &str = "time";
     const OPT_TIME_EXPANDED: &str = "time-expanded";
     const OPT_OUTPUT_JSON: &str = "output-json";
+    const OPT_REPORT_JSON: &str = "report-json";
     const OPT_RESIDENT: &str = "resident";
     const OPT_RLIMIT: &str = "rlimit";
     const OPT_SMT_OPTION: &str = "smt-option";
@@ -556,6 +560,12 @@ pub fn parse_args_with_imports(
     opts.optflag("", OPT_TIME, "Measure and report time taken");
     opts.optflag("", OPT_TIME_EXPANDED, "Measure and report time taken with module breakdown");
     opts.optflag("", OPT_OUTPUT_JSON, "Emit verification results and timing as json");
+    opts.optopt(
+        "",
+        OPT_REPORT_JSON,
+        "Write the machine report (verification results, timing, and the diagnostics Verus raised, resolved to source spans and attributed to their functions) as json to FILE. Unlike --output-json this does not go to stdout, and the file says which schema and which crate it is for.",
+        "FILE",
+    );
     opts.optflag(
         "",
         OPT_RESIDENT,
@@ -773,6 +783,7 @@ pub fn parse_args_with_imports(
         time: matches.opt_present(OPT_TIME) || matches.opt_present(OPT_TIME_EXPANDED),
         time_expanded: matches.opt_present(OPT_TIME_EXPANDED),
         output_json: matches.opt_present(OPT_OUTPUT_JSON),
+        report_json: matches.opt_str(OPT_REPORT_JSON),
         rlimit: {
             let rlimit = matches
                 .opt_get::<f32>(OPT_RLIMIT)

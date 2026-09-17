@@ -76,6 +76,86 @@ impl<'tcx> Reporter<'tcx> {
             source_map: compiler.sess.source_map(),
         }
     }
+
+    /// Join a span to the source it points at, the same way the rendered
+    /// diagnostic does.
+    ///
+    /// `None` when this session's source map cannot place the span, which is
+    /// what happens for a span imported from another crate. A consumer is
+    /// told the span is missing rather than given a plausible wrong one.
+    pub(crate) fn resolve_span(
+        &self,
+        span: &vir::messages::Span,
+    ) -> Option<crate::report::SourceSpan> {
+        let span = self.spans.from_air_span(span, Some(self.source_map))?;
+        let lo = self.source_map.lookup_char_pos(span.lo());
+        let hi = self.source_map.lookup_char_pos(span.hi());
+        Some(crate::report::SourceSpan {
+            file: self.source_map.filename_for_diagnostics(&lo.file.name).to_string(),
+            line: lo.line,
+            // `CharPos` counts from zero; the report counts from one, as the
+            // rendered diagnostic does.
+            col: lo.col.0 + 1,
+            end_line: hi.line,
+            end_col: hi.col.0 + 1,
+            text: self.source_map.span_to_snippet(span).ok(),
+        })
+    }
+
+    /// One diagnostic as Verus raised it, with every span it carries joined
+    /// to the source.
+    pub(crate) fn resolve_diagnostic(
+        &self,
+        msg: &MessageX,
+        level: MessageLevel,
+        function: Option<String>,
+        assert_ids: Vec<String>,
+    ) -> crate::report::Diagnostic {
+        crate::report::Diagnostic {
+            level: message_level_name(level).to_owned(),
+            message: msg.note.clone(),
+            spans: msg.spans.iter().filter_map(|sp| self.resolve_span(sp)).collect(),
+            labels: msg
+                .labels
+                .iter()
+                .map(|label| crate::report::Label {
+                    span: self.resolve_span(&label.span),
+                    note: label.note.clone(),
+                    is_proof_note: label.is_proof_note,
+                    is_custom_err: label.is_custom_err,
+                })
+                .collect(),
+            help: msg.help.clone(),
+            function,
+            assert_ids,
+        }
+    }
+}
+
+/// The level as the report spells it. Kept next to the report rather than as
+/// a `Display` on air's enum, which air renders its own way.
+fn message_level_name(level: MessageLevel) -> &'static str {
+    match level {
+        MessageLevel::Error => "error",
+        MessageLevel::Warning => "warning",
+        MessageLevel::Note => "note",
+    }
+}
+
+/// A diagnostic as it was raised, before its spans were joined to the source.
+///
+/// Held until `resolve_raised_diagnostics` runs, because joining a span needs
+/// the compiler session's source map, and a worker thread verifying a bucket
+/// does not have one.
+struct RaisedDiagnostic {
+    /// The function whose obligation raised it.
+    fun: Fun,
+    message: Message,
+    /// The level it was *reported* at, which is not always the level it was
+    /// created with: a recommends check reports an error as a note.
+    level: MessageLevel,
+    /// The solver assertion ids the failing query named, if any.
+    assert_ids: Vec<String>,
 }
 
 /// N.B.: The compiler performs deduplication on diagnostic messages, so reporting an error twice,
@@ -348,6 +428,15 @@ pub struct Verifier {
     func_inst_pressure: HashMap<Fun, Vec<QueryInstPressure>>,
     /// Errors to report after verification has run
     deferred_errors: Vec<VirErr>,
+    /// Every diagnostic raised while verifying a function's obligations,
+    /// with the function that raised it, in the order they were raised.
+    /// Collected in every mode; `--report-json` resolves and publishes them,
+    /// and nothing else reads them, so the cost when unused is one push per
+    /// diagnostic.
+    raised_diagnostics: Vec<RaisedDiagnostic>,
+    /// `raised_diagnostics` after `resolve_raised_diagnostics` has joined
+    /// each one to its source coordinates.
+    pub reported_diagnostics: Vec<crate::report::Diagnostic>,
 
     pub via_cargo_args: Option<CargoVerusArgs>,
     // Some(DepTracker) if via_cargo_args.is_some(), None otherwise
@@ -362,6 +451,10 @@ pub struct Verifier {
     created_solver_log_dir: Arc<std::sync::Mutex<Option<std::path::PathBuf>>>,
     vir_crate: Option<Krate>,
     crate_id: Option<CrateId>,
+    /// The crate being verified, as rustc names it. Read straight off the
+    /// compiler rather than inferred, so `--report-json` can say which crate
+    /// its report is for.
+    pub crate_name: Option<String>,
     air_no_span: Option<vir::messages::Span>,
     current_crate_modules: Option<Vec<vir::ast::Module>>,
     crate_items: Option<Arc<crate::external::CrateItems>>,
@@ -592,6 +685,8 @@ impl Verifier {
             func_matching_loops: HashMap::new(),
             func_inst_pressure: HashMap::new(),
             deferred_errors: Vec::new(),
+            raised_diagnostics: Vec::new(),
+            reported_diagnostics: Vec::new(),
 
             dep_tracker: if via_cargo_args.is_some() { Some(dep_tracker) } else { None },
             via_cargo_args,
@@ -603,6 +698,7 @@ impl Verifier {
             created_solver_log_dir: Arc::new(std::sync::Mutex::new(None)),
             vir_crate: None,
             crate_id: None,
+            crate_name: None,
             air_no_span: None,
             current_crate_modules: None,
             crate_items: None,
@@ -650,6 +746,8 @@ impl Verifier {
             func_matching_loops: HashMap::new(),
             func_inst_pressure: HashMap::new(),
             deferred_errors: Vec::new(),
+            raised_diagnostics: Vec::new(),
+            reported_diagnostics: Vec::new(),
 
             via_cargo_args: self.via_cargo_args.clone(),
             dep_tracker: None,
@@ -661,6 +759,7 @@ impl Verifier {
             created_solver_log_dir: self.created_solver_log_dir.clone(),
             vir_crate: self.vir_crate.clone(),
             crate_id: self.crate_id.clone(),
+            crate_name: self.crate_name.clone(),
             air_no_span: self.air_no_span.clone(),
             current_crate_modules: self.current_crate_modules.clone(),
             crate_items: self.crate_items.clone(),
@@ -689,6 +788,10 @@ impl Verifier {
         for (fun, reasons) in other.func_unknown_reasons {
             self.func_unknown_reasons.entry(fun).or_default().extend(reasons);
         }
+        // Each worker's diagnostics keep their order; the workers themselves
+        // are concatenated in the order they finished, which is the only
+        // order a parallel run has.
+        self.raised_diagnostics.extend(other.raised_diagnostics);
         for (fun, queries) in other.func_nl_frontier {
             self.func_nl_frontier.entry(fun).or_default().extend(queries);
         }
@@ -1102,7 +1205,9 @@ impl Verifier {
                         msg.push_str("; consider rerunning with --profile for more details");
                     }
                     if let Some(level) = level {
-                        reporter.report(&message(level, msg, &context.span).to_any());
+                        let raised = message(level, msg, &context.span);
+                        self.raise_diagnostic(&context.fun, &raised, level, &None);
+                        reporter.report(&raised.to_any());
                     }
                     // need to report that we need to rerun from this function (into spinoff)
                     // so that we can run the profiler on an isolated file on the second pass
@@ -1112,7 +1217,8 @@ impl Verifier {
                 ValidityResult::Invalid(None, error, assert_id_opt)
                 | ValidityResult::Invalid(_, error @ None, assert_id_opt) => {
                     // no model, but the obligation may still be known
-                    if let Some(assert_id) = assert_id_opt {
+                    // Borrowed, not moved: the report reads the same id below.
+                    if let Some(assert_id) = &assert_id_opt {
                         if prover_choice == vir::def::ProverChoice::DefaultProver {
                             default_prover_failed_assert_ids.push(assert_id.clone());
                         }
@@ -1127,16 +1233,22 @@ impl Verifier {
                     if let Some(level) = level {
                         if let Some(error) = error {
                             // singular_invalid case
+                            if let Some(raised) = error.downcast_ref::<MessageX>() {
+                                self.raise_diagnostic(&context.fun, raised, level, &assert_id_opt);
+                            }
                             reporter.report_as(&error, level);
                         } else {
                             // bitvector case
-                            reporter.report(&message(level, &context.desc, &context.span).to_any());
+                            let raised = message(level, &context.desc, &context.span);
+                            self.raise_diagnostic(&context.fun, &raised, level, &assert_id_opt);
+                            reporter.report(&raised.to_any());
                         }
                     }
                     break;
                 }
                 ValidityResult::Invalid(Some(air_model), Some(error), assert_id_opt) => {
-                    if let Some(assert_id) = assert_id_opt {
+                    // Borrowed, not moved: the report reads the same id below.
+                    if let Some(assert_id) = &assert_id_opt {
                         if prover_choice == vir::def::ProverChoice::DefaultProver {
                             default_prover_failed_assert_ids.push(assert_id.clone());
                         }
@@ -1152,6 +1264,10 @@ impl Verifier {
                     }
                     let error: Message = error.downcast().unwrap();
                     if let Some(level) = level {
+                        // Recorded whether or not it is reported now: an
+                        // expanded-error rerun reports a refined message, but
+                        // this is the obligation that actually failed.
+                        self.raise_diagnostic(&context.fun, &error, level, &assert_id_opt);
                         if !self.expand_flag {
                             match &mut *diagnostics_to_report.borrow_mut() {
                                 Some(collected) => {
@@ -3017,6 +3133,8 @@ impl Verifier {
         }
         // Join why queries answered unknown back to source, in every mode
         self.resolve_unknown_reasons(&global_ctx);
+        // Join the diagnostics raised while verifying to their source spans.
+        self.resolve_raised_diagnostics(&reporter);
         // Join what cvc5 reported (matching loops, instantiation pressure,
         // difficulty, provenance, nonlinear frontiers) back to source, per
         // function. The joins read the same symbols.
@@ -3554,6 +3672,49 @@ impl Verifier {
         }
     }
 
+    /// Keep a diagnostic, and the function whose obligation raised it, for
+    /// `--report-json`.
+    ///
+    /// Called where the function is still in hand. A consumer that only sees
+    /// the rendered diagnostic has to work the function back out by matching
+    /// spans against its own index, which is a guess; this is not.
+    fn raise_diagnostic(
+        &mut self,
+        fun: &Fun,
+        message: &MessageX,
+        level: MessageLevel,
+        assert_id: &Option<AssertId>,
+    ) {
+        if self.args.report_json.is_none() {
+            return;
+        }
+        self.raised_diagnostics.push(RaisedDiagnostic {
+            fun: fun.clone(),
+            message: Arc::new(message.clone()),
+            level,
+            assert_ids: assert_id.iter().map(|id| air::def::assert_id_to_symbol(id)).collect(),
+        });
+    }
+
+    /// Join every raised diagnostic to its source coordinates.
+    ///
+    /// Runs on the main thread once the workers have been merged, because
+    /// joining a span needs the compiler session's source map.
+    fn resolve_raised_diagnostics(&mut self, reporter: &Reporter<'_>) {
+        if self.raised_diagnostics.is_empty() {
+            return;
+        }
+        let resolved = std::mem::take(&mut self.raised_diagnostics).into_iter().map(|raised| {
+            reporter.resolve_diagnostic(
+                &raised.message,
+                raised.level,
+                Some(fun_as_friendly_rust_name(&raised.fun)),
+                raised.assert_ids,
+            )
+        });
+        self.reported_diagnostics.extend(resolved);
+    }
+
     fn record_func_failed_proof_notes(&mut self, func: Fun, failed_proof_notes: HashSet<String>) {
         use std::collections::hash_map::Entry;
         match self.func_details.entry(func) {
@@ -3782,6 +3943,7 @@ impl rustc_driver::Callbacks for VerifierCallbacksEraseMacro {
 
         rustc_interface::passes::write_dep_info(tcx);
         self.verifier.crate_id = Some(mk_crate_id(tcx, LOCAL_CRATE));
+        self.verifier.crate_name = Some(tcx.crate_name(LOCAL_CRATE).to_string());
 
         let time_import0 = Instant::now();
         let imported =

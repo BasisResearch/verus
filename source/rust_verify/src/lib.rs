@@ -55,6 +55,7 @@ mod import_export;
 pub mod profiler;
 mod provenance;
 mod reach;
+pub mod report;
 mod resident;
 mod resolve_traits;
 pub mod reveal_hide;
