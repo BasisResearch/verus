@@ -3851,21 +3851,107 @@ verus! {{
     assert_ne!(either["prefix"], sixty_four["prefix"], "{either} {sixty_four}");
 }
 
-/// A `by(bit_vector)` query's solver gets neither the prelude nor the bucket
-/// context, so its prefix fingerprint covers neither: a declaration added to
-/// its bucket leaves it alone, while the default prover's queries in the same
-/// function, whose solver does get the declaration, fingerprint differently.
+/// A prefix fingerprint reads the declarations its query reaches, so what a
+/// proof run does beside a query -- a lemma added next to it, an unrelated
+/// spec function edited, a struct and its spec function added -- leaves the
+/// query alone, and only what it can reach changes it. A broadcast axiom can
+/// fire anywhere, so every query below it reads it.
 #[test]
-fn resident_bit_vector_fingerprints_ignore_the_bucket_context() {
-    let source = |extra: &str| {
+fn resident_fingerprints_ignore_what_a_query_does_not_reach() {
+    let source = |counted: &str, unread: &str, first: &str, last: &str| {
         format!(
             r#"
 use vstd::prelude::*;
 verus! {{
-    {extra}
+    {first}
+    spec fn counted(x: nat) -> nat {{
+        {counted}
+    }}
+
+    spec fn unread(x: nat) -> nat {{
+        {unread}
+    }}
+
+    proof fn keeps(x: nat)
+        ensures counted(x) > x,
+    {{
+        assert(counted(x) == x + 1);
+    }}
+
+    proof fn reads_unread(x: nat)
+        ensures unread(x) + 1 > unread(x),
+    {{
+    }}
+
+    {last}
+}}
+"#
+        )
+    };
+    let open = |source: &str| {
+        let mut worker =
+            Worker::start_with_env(source, &[], &[("VERUS_RESIDENT_RETAIN_ONLY", "1")]);
+        let ready = worker.receive();
+        assert_eq!(ready["retain_only"], true, "{ready}");
+        let of = |name: &str| query_of(&ready, name, "default")["fingerprint"].clone();
+        let fingerprints = (of("::keeps"), of("::reads_unread"));
+        worker.finish(true);
+        fingerprints
+    };
+    let (keeps, reads_unread) = open(&source("x + 1", "x", "", ""));
+    for last in [
+        // A lemma added beside them.
+        "proof fn helper(y: nat) {}",
+        // A spec function added, which adds a fuel constant to the module.
+        "spec fn added(y: nat) -> nat { y }",
+        // A datatype added, with a spec function over it.
+        "pub struct Added { pub x: u8 }\n    spec fn over_added(a: Added) -> u8 { a.x }",
+        // A broadcast lemma below them, whose axiom no query of theirs is under.
+        "broadcast proof fn bc(y: nat)\n        ensures #[trigger] counted(y) > y,\n    {\n        admit();\n    }",
+    ] {
+        assert_eq!(
+            open(&source("x + 1", "x", "", last)),
+            (keeps.clone(), reads_unread.clone()),
+            "{last}"
+        );
+    }
+    // The body of a spec function: read by the query that calls it, by no
+    // other.
+    let (keeps_edited, reads_unread_edited) = open(&source("x + 1", "x + 1", "", ""));
+    assert_eq!(keeps_edited, keeps);
+    assert_ne!(reads_unread_edited, reads_unread);
+    let (keeps_edited, reads_unread_edited) = open(&source("x + 2", "x", "", ""));
+    assert_ne!(keeps_edited, keeps);
+    assert_eq!(reads_unread_edited, reads_unread);
+    // A broadcast axiom above them: every query below it reads it, whatever
+    // it calls.
+    let (keeps_broadcast, reads_unread_broadcast) = open(&source(
+        "x + 1",
+        "x",
+        "broadcast proof fn bc(y: nat)\n        ensures #[trigger] counted(y) > y,\n    {\n        admit();\n    }",
+        "",
+    ));
+    assert_ne!(keeps_broadcast, keeps);
+    assert_ne!(reads_unread_broadcast, reads_unread);
+}
+
+/// A `by(bit_vector)` query's solver gets neither the prelude nor the bucket
+/// context, so its prefix fingerprint covers neither: an edit to the spec
+/// function of its bucket leaves it alone, while the default prover's query
+/// in the same function, which calls that function, fingerprints differently.
+#[test]
+fn resident_bit_vector_fingerprints_ignore_the_bucket_context() {
+    let source = |body: &str| {
+        format!(
+            r#"
+use vstd::prelude::*;
+verus! {{
+    spec fn extra(x: int) -> int {{
+        {body}
+    }}
     proof fn bits(x: u32) {{
         assert(x & 0 == 0) by(bit_vector);
-        assert(1int + 1 == 2);
+        assert(extra(1int) + 1 == extra(1int) + 1);
     }}
 }}
 "#
@@ -3880,11 +3966,10 @@ verus! {{
         let fingerprint = |prover| query_of(&ready, "::bits", prover)["fingerprint"].clone();
         (fingerprint("bit_vector"), fingerprint("default"))
     };
-    let (bits, body) = open(&source(""));
-    let (bits_extra, body_extra) =
-        open(&source("spec fn extra(x: int) -> int { x }\n    pub struct Extra { pub x: u8 }"));
-    assert_ne!(body["prefix"], body_extra["prefix"], "the declarations reached the bucket");
-    assert_eq!(bits, bits_extra);
+    let (bits, body) = open(&source("x"));
+    let (bits_edited, body_edited) = open(&source("x + 0"));
+    assert_ne!(body["prefix"], body_edited["prefix"], "the definition reached the bucket");
+    assert_eq!(bits, bits_edited);
 }
 
 const UNBOUNDED_SOURCE: &str = r#"

@@ -59,7 +59,10 @@
 //!
 //! The catalogue names each query's `fingerprint` (see `Fingerprint`): what
 //! a caller compares the query by across compilations of edited source, to
-//! tell the queries an edit left alone from those it changed. Under
+//! tell the queries an edit left alone from those it changed. Its prefix
+//! covers the declarations the query reads of those below it, not every
+//! declaration below it, so a lemma added beside a query or an edit to a
+//! spec function it never calls leaves it unchanged (see `relevance`). Under
 //! `VERUS_RESIDENT_RETAIN_ONLY` the invocation retains every selected query
 //! and checks none (`ready.retain_only`), which is what such a caller opens a
 //! session on the edited source with; it then carries what it knew about the
@@ -70,6 +73,7 @@
 //! as the batch run does), and none of the `--expand-errors` queries, which
 //! only a failed check can name.
 
+mod relevance;
 mod twin;
 
 use crate::buckets::BucketId;
@@ -176,12 +180,42 @@ pub(crate) struct QueryJournal {
     /// datatypes, function declarations, module-level broadcast groups).
     /// Never replayed: it lives below every scope. Kept so a twin or a
     /// speculative probe can find what it declares.
-    base: Vec<Commands>,
-    contexts: Vec<Vec<Commands>>,
+    base: Vec<Batch>,
+    contexts: Vec<Vec<Batch>>,
     queries: Vec<RetainedQuery>,
     applied: usize,
     /// Whether a query has been recorded since the open scope began.
     recorded_in_scope: bool,
+}
+
+/// One batch of declarations of a journal, with what it is about: a
+/// fingerprint reads the batches its query can reach (see `relevance`).
+pub(crate) struct Batch {
+    commands: Commands,
+    owner: BatchOwner,
+}
+
+/// What a batch of declarations is about, as the verifier generates it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum BatchOwner {
+    /// Read by every query: a module-wide declaration, a broadcast axiom, a
+    /// trait-impl axiom. Whatever it asserts can fire anywhere.
+    Module,
+    /// A module's datatypes, whose declarations say what they are about: the
+    /// names of the batch itself that each one mentions.
+    Datatypes,
+    /// One item's own declarations, read by the queries that reach a name it
+    /// declares. `key` is what groups an item's batches, whose axioms are
+    /// headed by the names the item declares (a function's declaration, its
+    /// `req`/`ens` axioms and its definition axioms).
+    Item(std::sync::Arc<String>),
+}
+
+impl BatchOwner {
+    /// The batches of one function.
+    pub(crate) fn function(fun: &vir::ast::Fun) -> Self {
+        BatchOwner::Item(std::sync::Arc::new(fun_as_friendly_rust_name(fun)))
+    }
 }
 
 /// The requests this worker serves, as `ready` reports them. A client reads
@@ -517,8 +551,12 @@ impl RetainedBucket {
         let mut addresses = Vec::new();
         let mut cert_keys = Vec::new();
         let mut repeats = std::collections::HashMap::new();
+        // One index for the bucket: its journals share the batches they were
+        // given, and hashing a batch again for every spinoff solver would
+        // print the whole base context once per query.
+        let mut index = relevance::Index::new();
         for (solver, state) in states.iter().enumerate() {
-            let fingerprints = state.journal.fingerprints();
+            let fingerprints = state.journal.fingerprints(&mut index);
             for (local, query) in state.journal.queries.iter().enumerate() {
                 let function = fun_as_friendly_rust_name(&query.context.fun);
                 let repeat = repeats
@@ -553,10 +591,12 @@ impl RetainedBucket {
 }
 
 /// What a caller compares a retained query by across compilations: FNV-1a
-/// over the AIR of the declarations asserted below it (its prefix: the
-/// prelude, which reads the crate's word size, the bucket's base context and
-/// the journal scopes up to the query's own, none of which a bit-vector
-/// query's solver gets) and
+/// over the AIR of the declarations it reads of the ones asserted below it
+/// (its prefix: the prelude, which reads the crate's word size, and the
+/// declarations of the bucket's base context and of the journal scopes up to
+/// the query's own that the query can reach, none of which a bit-vector
+/// query's solver gets -- see `relevance` for what reaching means and for
+/// what a prefix hash promises) and
 /// over the query itself, each printed as AIR. The printer writes an
 /// assertion's labels as their notes and never a span, so a query that only
 /// moved to other lines prints the same, and generated local names carry
@@ -596,25 +636,6 @@ impl Fnv {
         forget_quantifier_counters(&mut node);
         self.write(air::printer::node_to_string(&node).as_bytes());
         self.write(b"\n");
-    }
-
-    fn commands(&mut self, printer: &air::printer::Printer, commands: &Commands) {
-        for command in commands.iter() {
-            match &**command {
-                CommandX::Global(decl) => self.node(&printer.decl_to_node(decl)),
-                CommandX::CheckValid(query) => self.node(&printer.query_to_node(query)),
-                CommandX::Push => self.write(b"push\n"),
-                CommandX::Pop => self.write(b"pop\n"),
-                CommandX::SetOption(name, value) => {
-                    self.write(name.as_bytes());
-                    self.write(b"=");
-                    self.write(value.as_bytes());
-                    self.write(b"\n");
-                }
-                #[cfg(feature = "singular")]
-                CommandX::CheckSingular(_) => self.write(b"singular\n"),
-            }
-        }
     }
 }
 
@@ -3826,7 +3847,7 @@ fn serve_speculate(
         .base
         .iter()
         .chain(journal.contexts[..prefix].iter().flatten())
-        .flat_map(|batch| batch.iter())
+        .flat_map(|batch| batch.commands.iter())
         .filter_map(|command| match &**command {
             CommandX::Global(decl) => Some(decl),
             _ => None,
@@ -5071,9 +5092,9 @@ impl QueryJournal {
     }
 
     /// Keep the context the solver already holds below the journal's first
-    /// scope, for lookups only.
-    pub(crate) fn record_base(&mut self, batches: impl Iterator<Item = Commands>) {
-        self.base.extend(batches);
+    /// scope, for lookups and fingerprints only.
+    pub(crate) fn record_base(&mut self, batches: impl Iterator<Item = (Commands, BatchOwner)>) {
+        self.base.extend(batches.map(|(commands, owner)| Batch { commands, owner }));
     }
 
     /// Retain the next declaration batch, opening a scope when one is needed.
@@ -5081,6 +5102,7 @@ impl QueryJournal {
         &mut self,
         air: &mut Context,
         commands: Commands,
+        owner: BatchOwner,
     ) -> Result<(), &'static str> {
         if commands.iter().any(|command| !matches!(**command, CommandX::Global(_))) {
             return Err("resident context batches must contain only declarations");
@@ -5094,7 +5116,7 @@ impl QueryJournal {
             self.applied += 1;
             self.recorded_in_scope = false;
         }
-        self.contexts.last_mut().expect("scope opened above").push(commands);
+        self.contexts.last_mut().expect("scope opened above").push(Batch { commands, owner });
         Ok(())
     }
 
@@ -5127,38 +5149,10 @@ impl QueryJournal {
         Ok(())
     }
 
-    /// Every retained query's fingerprint, in journal order: the running
-    /// hash of the prelude, the base context and the scopes below the query's
-    /// prefix,
-    /// and the hash of the query itself and its rlimit.
-    fn fingerprints(&self) -> Vec<Fingerprint> {
-        let printer = air::printer::Printer::new(
-            std::sync::Arc::new(VirMessageInterface {}),
-            false,
-            SmtSolver::Cvc5,
-        );
-        let mut hash = Fnv::new();
-        for batch in self.prelude.iter().chain(&self.base) {
-            hash.commands(&printer, batch);
-        }
-        let mut prefixes = vec![hash.0];
-        for scope in &self.contexts {
-            for batch in scope {
-                hash.commands(&printer, batch);
-            }
-            prefixes.push(hash.0);
-        }
-        self.queries
-            .iter()
-            .map(|query| {
-                let mut body = Fnv::new();
-                body.node(&printer.query_to_node(&query.query));
-                // The budget a query checks at is part of what it is: raising
-                // or lowering it can change its verdict.
-                body.write(&query.rlimit.to_bits().to_le_bytes());
-                Fingerprint { prefix: prefixes[query.prefix], body: body.0 }
-            })
-            .collect()
+    /// Every retained query's fingerprint, in journal order, over the
+    /// declarations each query reads of the ones below it (see `relevance`).
+    fn fingerprints(&self, index: &mut relevance::Index) -> Vec<Fingerprint> {
+        relevance::fingerprints(self, index)
     }
 
     /// The declarations of the scopes below `prefix`, in the order they were
@@ -5167,7 +5161,7 @@ impl QueryJournal {
         self.contexts[..prefix]
             .iter()
             .flatten()
-            .flat_map(|batch| batch.iter())
+            .flat_map(|batch| batch.commands.iter())
             .filter_map(|command| match &**command {
                 CommandX::Global(decl) => Some(decl.clone()),
                 _ => None,
@@ -5187,7 +5181,7 @@ impl QueryJournal {
             let scope = self.applied;
             self.applied += 1;
             for batch in self.contexts[scope].iter() {
-                for command in batch.iter() {
+                for command in batch.commands.iter() {
                     if let CommandX::Global(decl) = &**command {
                         air.global(decl).map_err(|error| io::Error::other(error.to_string()))?;
                     }
@@ -6381,7 +6375,7 @@ mod tests {
                 air.global(decl).unwrap();
             }
         }
-        session.push_context(&mut air, later.clone()).unwrap();
+        session.push_context(&mut air, later.clone(), BatchOwner::Module).unwrap();
         for command in later.iter() {
             if let CommandX::Global(decl) = &**command {
                 air.global(decl).unwrap();
@@ -6409,7 +6403,16 @@ mod tests {
     /// Apply a declaration batch the way the verifier does: retain it, then
     /// let AIR assert it into the scope the journal just chose.
     fn apply(journal: &mut QueryJournal, air: &mut Context, batch: &Commands) {
-        journal.push_context(air, batch.clone()).unwrap();
+        apply_owned(journal, air, batch, BatchOwner::Module)
+    }
+
+    fn apply_owned(
+        journal: &mut QueryJournal,
+        air: &mut Context,
+        batch: &Commands,
+        owner: BatchOwner,
+    ) {
+        journal.push_context(air, batch.clone(), owner).unwrap();
         for command in batch.iter() {
             if let CommandX::Global(decl) = &**command {
                 air.global(decl).unwrap();
@@ -6930,7 +6933,7 @@ mod tests {
                     air.global(decl).unwrap();
                 }
             }
-            journal.record_base(std::iter::once(base));
+            journal.record_base(std::iter::once((base, BatchOwner::Module)));
             apply(&mut journal, &mut air, &commands(&format!("(axiom (g 1)) {extra_below}")));
             journal
                 .record_query(
@@ -6947,7 +6950,7 @@ mod tests {
                 )
                 .unwrap();
             apply(&mut journal, &mut air, &commands("(axiom (g 2))"));
-            journal.fingerprints()
+            journal.fingerprints(&mut relevance::Index::new())
         };
         let prelude = "(declare-const SZ Int)";
         let journal_at = |at: &str, extra_below: &str, text: &str, rlimit: f32| {
@@ -7005,5 +7008,128 @@ mod tests {
         let numbered = named("user_crate__f_3");
         assert_eq!(numbered, named("user_crate__f_17"));
         assert_ne!(numbered[0].body, named("user_crate__g_3")[0].body);
+    }
+
+    /// A prefix fingerprint reads the declarations the query reaches: an
+    /// item's own declarations and axioms are read by the queries that reach
+    /// a name it declares and by those that reach it through another item,
+    /// and by no others, so a lemma added beside a query leaves it alone. A
+    /// `distinct` over constants is read over the constants the query
+    /// reaches, as a module's fuel constants are.
+    #[test]
+    fn fingerprints_read_the_declarations_a_query_reaches() {
+        use air::ast::{QueryX, StmtX};
+        use vir::messages::ToAny;
+        let span = |text: &str| vir::messages::Span {
+            raw_span: Arc::new(()),
+            id: 0,
+            data: Vec::new(),
+            as_string: text.to_owned(),
+        };
+        let fun = Arc::new(vir::ast::FunX {
+            path: Arc::new(vir::ast::PathX {
+                krate: vir::ast::CrateId::Internal,
+                segments: Arc::new(vec![Arc::new("f".to_owned())]),
+            }),
+        });
+        let item = |name: &str| BatchOwner::Item(Arc::new(name.to_owned()));
+        // A module whose base declares `g`, whose constants are asserted
+        // distinct as a module's fuel constants are, and which has two items:
+        // `j`, an axiom about `g`, and `h`, an axiom about `j`.
+        let journal_of = |constants: &str, about_j: &str, about_h: &str, text: &str| {
+            let mut air = Context::new(Arc::new(VirMessageInterface {}), SmtSolver::Cvc5);
+            let mut journal = QueryJournal::new();
+            journal.record_prelude(commands("(declare-const SZ Int)"));
+            let base = commands("(declare-fun g (Int) Bool)");
+            for command in base.iter() {
+                if let CommandX::Global(decl) = &**command {
+                    air.global(decl).unwrap();
+                }
+            }
+            journal.record_base(std::iter::once((base, BatchOwner::Module)));
+            apply(&mut journal, &mut air, &commands(constants));
+            apply_owned(&mut journal, &mut air, &commands("(declare-fun j (Int) Bool)"), item("j"));
+            apply_owned(&mut journal, &mut air, &commands(about_j), item("j"));
+            apply_owned(&mut journal, &mut air, &commands("(declare-fun h (Int) Bool)"), item("h"));
+            apply_owned(&mut journal, &mut air, &commands(about_h), item("h"));
+            let parsed = commands(&format!("(check-valid (declare-const x Int) (assert {text}))"));
+            let CommandX::CheckValid(parsed) = &*parsed[0] else { panic!("a query") };
+            let StmtX::Assert(_, _, _, expr) = &*parsed.assertion else { panic!("an assert") };
+            let assertion = Arc::new(StmtX::Assert(
+                None,
+                vir::messages::error(&span("a.rs:3:5"), "assertion failed").to_any(),
+                None,
+                expr.clone(),
+            ));
+            journal
+                .record_query(
+                    vir::def::CommandsWithContextX::new(
+                        fun.clone(),
+                        span("a.rs:3:5"),
+                        "body".to_owned(),
+                        Arc::new(vec![Arc::new(CommandX::CheckValid(Arc::new(QueryX {
+                            local: parsed.local.clone(),
+                            assertion,
+                        })))]),
+                        vir::def::ProverChoice::DefaultProver,
+                        false,
+                    ),
+                    &QueryOp::Body(Style::Normal),
+                    1.0,
+                )
+                .unwrap();
+            journal.fingerprints(&mut relevance::Index::new())[0]
+        };
+        let constants = "(declare-const fa Int) (declare-const fb Int) (axiom (distinct fa fb))";
+        let one_more = "(declare-const fa Int) (declare-const fb Int) (declare-const fc Int) \
+             (axiom (distinct fa fb fc))";
+        let about = |head: &str, body: &str, qid: &str| {
+            format!(
+                "(axiom (forall ((y Int)) (! (=> ({head} y) {body}) \
+                 :pattern (({head} y)) :qid user_crate__{qid}_1 :skolemid skolem_user_crate__{qid}_1)))"
+            )
+        };
+        let about_j = about("j", "(g y)", "j");
+        let about_h = about("h", "(j y)", "h");
+        let fingerprint = |constants: &str, about_j: &str, about_h: &str, text: &str| {
+            journal_of(constants, about_j, about_h, text)
+        };
+        // A constant added to the module, distinct from the rest, leaves the
+        // queries alone, whether or not they reach the others.
+        for text in ["(> x 0)", "(and (> fa 0) (> fb 0))"] {
+            assert_eq!(
+                fingerprint(one_more, &about_j, &about_h, text),
+                fingerprint(constants, &about_j, &about_h, text),
+                "{text}"
+            );
+        }
+        // An item nothing reaches: its axiom is no part of any other query.
+        let other_h = about("h", "(g y)", "h");
+        for text in ["(> x 0)", "(j x)"] {
+            assert_eq!(
+                fingerprint(constants, &about_j, &other_h, text),
+                fingerprint(constants, &about_j, &about_h, text),
+                "{text}"
+            );
+        }
+        // The queries that reach it read it, and reading `h` reads `j`, which
+        // `h`'s axiom names.
+        let other_j = about("j", "(> y 0)", "j");
+        for text in ["(h x)", "(j x)"] {
+            assert_ne!(
+                fingerprint(constants, &other_j, &about_h, text).prefix,
+                fingerprint(constants, &about_j, &about_h, text).prefix,
+                "{text}"
+            );
+        }
+        assert_ne!(
+            fingerprint(constants, &about_j, &other_h, "(h x)").prefix,
+            fingerprint(constants, &about_j, &about_h, "(h x)").prefix
+        );
+        // The query itself is no part of the prefix either way.
+        assert_eq!(
+            fingerprint(constants, &about_j, &about_h, "(h x)").prefix,
+            fingerprint(constants, &about_j, &about_h, "(and (h x) (h 1))").prefix
+        );
     }
 }

@@ -696,7 +696,7 @@ fn prefix_axioms<'a>(
 ) -> impl Iterator<Item = (usize, &'a Axiom)> + 'a {
     scopes.flat_map(move |scope| {
         journal.contexts[scope].iter().flat_map(move |batch| {
-            batch.iter().filter_map(move |command| match &**command {
+            batch.commands.iter().filter_map(move |command| match &**command {
                 CommandX::Global(decl) => match &**decl {
                     DeclX::Axiom(axiom) => Some((scope, axiom)),
                     _ => None,
@@ -710,7 +710,7 @@ fn prefix_axioms<'a>(
 /// Every axiom of the bucket's base context, which lies below every scope.
 fn base_axioms(journal: &QueryJournal) -> impl Iterator<Item = &Axiom> {
     journal.base.iter().flat_map(|batch| {
-        batch.iter().filter_map(|command| match &**command {
+        batch.commands.iter().filter_map(|command| match &**command {
             CommandX::Global(decl) => match &**decl {
                 DeclX::Axiom(axiom) => Some(axiom),
                 _ => None,
@@ -1138,7 +1138,7 @@ impl FuelScan {
         let mut implied: Vec<(Ident, Vec<Ident>)> = Vec::new();
         // fuel constants are declared in the base context, below every scope
         for batch in journal.base.iter().chain(journal.contexts[..prefix].iter().flatten()) {
-            for command in batch.iter() {
+            for command in batch.commands.iter() {
                 let CommandX::Global(decl) = &**command else { continue };
                 match &**decl {
                     DeclX::Const(x, typ) => match &**typ {
@@ -1902,7 +1902,7 @@ fn with_rebuilt_prefix<T>(
             air.push();
             pushed += 1;
             for batch in journal.contexts[scope].iter() {
-                for command in batch.iter() {
+                for command in batch.commands.iter() {
                     let CommandX::Global(decl) = &**command else { continue };
                     if let DeclX::Axiom(axiom) = &**decl {
                         if drop(axiom) {
@@ -1968,7 +1968,7 @@ pub(super) fn serve(
             .base
             .iter()
             .chain(journal.contexts[..prefix].iter().flatten())
-            .flat_map(|batch| batch.iter())
+            .flat_map(|batch| batch.commands.iter())
             .filter_map(|command| match &**command {
                 CommandX::Global(decl) => Some(decl.clone()),
                 _ => None,
@@ -2526,7 +2526,7 @@ mod tests {
             .nodes_to_commands(&nodes)
             .unwrap();
         let mut journal = QueryJournal::new();
-        journal.record_base(std::iter::once(commands));
+        journal.record_base(std::iter::once((commands, crate::resident::BatchOwner::Module)));
         journal
     }
 
