@@ -3621,6 +3621,51 @@ fn resident_retain_only_session_pins_and_ladders_before_any_check() {
     worker.finish(true);
 }
 
+const BIT_VECTOR_PIN_SOURCE: &str = r#"
+use vstd::prelude::*;
+verus! {
+    proof fn bits_pin(x: u32) {
+        assert(x & 0 == 0) by(bit_vector);
+    }
+
+    proof fn bits_ladder(x: u32) {
+        assert(x | 0 == x) by(bit_vector);
+    }
+}
+"#;
+
+/// A `by(bit_vector)` query's solver gets no prelude, no bucket context and
+/// no journal scope, so in a retain-only session nothing at all has reached
+/// it when the first request arrives. A pin and a ladder, each the first
+/// request its solver sees, still find every rung.
+#[test]
+fn resident_retain_only_session_pins_and_ladders_bit_vector_queries() {
+    let mut worker = Worker::start_with_env(
+        BIT_VECTOR_PIN_SOURCE,
+        &[],
+        &[("VERUS_RESIDENT_STRATEGY_LADDER", "1"), ("VERUS_RESIDENT_RETAIN_ONLY", "1")],
+    );
+    let ready = worker.receive();
+    assert_eq!(ready["retain_only"], true, "{ready}");
+    let session = ready["session"].clone();
+    let pinned_query = query_of(&ready, "::bits_pin", "bit_vector")["id"].clone();
+    let pinned = worker.send(json!({"command":"pin", "session":session, "bucket":0,
+        "query":pinned_query, "rung":"ematch", "rlimit":10}));
+    assert_eq!(pinned["event"], "pinned", "{pinned}");
+    let checked = worker
+        .send(json!({"command":"check", "session":session, "bucket":0, "query":pinned_query}));
+    assert_eq!(checked["result"], "valid", "{checked}");
+    assert_eq!(checked["pinned"]["rung"], "ematch", "{checked}");
+
+    let laddered_query = query_of(&ready, "::bits_ladder", "bit_vector")["id"].clone();
+    let ladder = worker.send(json!({"command":"ladder", "session":session, "bucket":0,
+        "query":laddered_query}));
+    assert_eq!(ladder["event"], "laddered", "{ladder}");
+    assert_eq!(ladder["available"], json!(["ematch", "conflict", "pool", "enum", "mbqi"]));
+    assert_eq!(ladder["solved_by"], "ematch", "{ladder}");
+    worker.finish(true);
+}
+
 const RETAIN_ONLY_SOURCE: &str = r#"
 use vstd::prelude::*;
 verus! {
