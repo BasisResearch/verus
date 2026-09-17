@@ -140,7 +140,32 @@ impl Report {
     }
 }
 
+/// The file a report goes to, given what the caller asked for.
+///
+/// A path naming a directory — an existing one, or one written with a
+/// trailing separator — takes the crate's name inside it. Cargo invokes
+/// Verus once per target, so a fixed filename would have each invocation
+/// clobber the last one's report and leave the caller with whichever
+/// finished last. Naming the file after the crate keeps them apart.
+pub fn destination(path: &Path, crate_name: Option<&str>) -> std::path::PathBuf {
+    let names_a_directory =
+        path.is_dir() || path.as_os_str().to_string_lossy().ends_with(std::path::MAIN_SEPARATOR);
+    if !names_a_directory {
+        return path.to_path_buf();
+    }
+    // A crate whose name has a path separator in it cannot happen, but the
+    // name reaches a filesystem path, so it is not taken on trust.
+    let stem: String = crate_name
+        .unwrap_or("report")
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '-' })
+        .collect();
+    path.join(format!("{stem}.json"))
+}
+
 /// Write `report` to `path`, atomically.
+///
+/// `path` may name a file or a directory; see [`destination`].
 ///
 /// The report is written beside its destination and renamed onto it, so a
 /// reader polling the path sees either no file or a complete one — never a
@@ -148,6 +173,7 @@ impl Report {
 /// `rename` is atomic within a directory, which is why the temporary goes
 /// next to the destination rather than in the system temp directory.
 pub fn write(path: &Path, report: &Report) -> std::io::Result<()> {
+    let path = &destination(path, report.crate_name.as_deref());
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         std::fs::create_dir_all(parent)?;
     }

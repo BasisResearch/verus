@@ -231,6 +231,38 @@ fn the_report_is_written_whole_into_a_directory_it_creates() {
     assert!(beside.is_empty(), "the writer left a temporary behind: {:?}", beside);
 }
 
+/// A directory takes the crate's name inside it.
+///
+/// Cargo invokes Verus once per target. With a fixed filename each
+/// invocation would clobber the last one's report and the caller would be
+/// left with whichever finished last, silently.
+#[test]
+fn a_directory_destination_is_named_after_the_crate() {
+    let tempdir = TempDir::new().expect("temp dir");
+    let entry_file = tempdir.path().join("test.rs");
+    let source = format!("{}\n{}\n{}\n", FEATURE_PRELUDE, USE_PRELUDE, FAILING_PRECONDITION);
+    std::fs::write(&entry_file, source).expect("write source file");
+
+    // A trailing separator names a directory that does not exist yet.
+    let reports = tempdir.path().join("reports");
+    let asked_for = format!("{}{}", reports.display(), std::path::MAIN_SEPARATOR);
+
+    run_verus_raw(
+        &["--crate-type=lib", "--report-json", &asked_for, entry_file.to_str().unwrap()],
+        tempdir.path(),
+    );
+
+    let written = reports.join("test.json");
+    let text = std::fs::read_to_string(&written).unwrap_or_else(|err| {
+        let listing: Vec<_> = std::fs::read_dir(&reports)
+            .map(|d| d.filter_map(|e| e.ok()).map(|e| e.file_name()).collect())
+            .unwrap_or_default();
+        panic!("no report at {}: {err} (found {listing:?})", written.display())
+    });
+    let report: serde_json::Value = serde_json::from_str(&text).expect("valid json");
+    assert_eq!(report["crate_name"], serde_json::json!("test"));
+}
+
 /// `--report-json` is additive. Everything that reads `--output-json` today —
 /// `tools/verita`, `verus/src/record.rs`, the metrics scripts in verified
 /// projects — must see exactly what it saw before.
