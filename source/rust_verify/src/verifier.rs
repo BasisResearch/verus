@@ -1877,8 +1877,18 @@ impl Verifier {
         // The batches so far stay below every journal; context ops follow.
         let initial_batches = bucket_context.len();
 
+        // The prelude every solver but a bit-vector one starts from, which
+        // retained queries are fingerprinted over: it reads the crate's word
+        // size, so it is not the same for every source.
+        let resident_prelude = self.args.resident.then(|| {
+            ctx.prelude(PreludeConfig {
+                arch_word_bits: ctx.arch_word_bits,
+                solver: self.args.solver,
+            })
+        });
         let mut resident = self.args.resident.then(crate::resident::QueryJournal::new);
-        if let Some(journal) = &mut resident {
+        if let (Some(journal), Some(prelude)) = (&mut resident, &resident_prelude) {
+            journal.record_prelude(prelude.clone());
             journal.record_base(bucket_context.iter().map(|batch| batch.commands.clone()));
         }
         let mut resident_spinoffs = Vec::new();
@@ -2007,11 +2017,17 @@ impl Verifier {
 
                             let mut spinoff_journal = (retain_queries && do_spinoff)
                                 .then(crate::resident::QueryJournal::new);
-                            // A spinoff solver starts from the bucket's
-                            // initial batches, below its journal's scopes; the
-                            // context ops after them go into its journal
-                            // (`new_air_context_with_bucket_context`).
-                            if let Some(journal) = &mut spinoff_journal {
+                            // A spinoff solver starts from the prelude and the
+                            // bucket's initial batches, below its journal's
+                            // scopes; the context ops after them go into its
+                            // journal (`new_air_context_with_bucket_context`).
+                            // A bit-vector solver gets none of these.
+                            if let (Some(journal), Some(prelude), false) = (
+                                &mut spinoff_journal,
+                                &resident_prelude,
+                                cmds.prover_choice == vir::def::ProverChoice::BitVector,
+                            ) {
+                                journal.record_prelude(prelude.clone());
                                 journal.record_base(
                                     bucket_context[..initial_batches]
                                         .iter()

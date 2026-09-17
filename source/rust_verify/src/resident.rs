@@ -168,6 +168,10 @@ impl QueryKind {
 /// follow the number of retained queries rather than the number of declaration
 /// batches, which is roughly the size of the pruned call graph.
 pub(crate) struct QueryJournal {
+    /// The prelude the solver started from, which a bit-vector solver does
+    /// not get. Hashed into fingerprints only: it is not fixed text, since it
+    /// reads the crate's word size (`global size_of usize`).
+    prelude: Option<Commands>,
     /// The bucket's context from before the journal began (fuel constants,
     /// datatypes, function declarations, module-level broadcast groups).
     /// Never replayed: it lives below every scope. Kept so a twin or a
@@ -550,7 +554,9 @@ impl RetainedBucket {
 
 /// What a caller compares a retained query by across compilations: FNV-1a
 /// over the AIR of the declarations asserted below it (its prefix: the
-/// bucket's base context and the journal scopes up to the query's own) and
+/// prelude, which reads the crate's word size, the bucket's base context and
+/// the journal scopes up to the query's own, none of which a bit-vector
+/// query's solver gets) and
 /// over the query itself, each printed as AIR. The printer writes an
 /// assertion's labels as their notes and never a span, so a query that only
 /// moved to other lines prints the same, and generated local names carry
@@ -5049,12 +5055,18 @@ fn serve_ladder(
 impl QueryJournal {
     pub(crate) fn new() -> Self {
         Self {
+            prelude: None,
             base: Vec::new(),
             contexts: Vec::new(),
             queries: Vec::new(),
             applied: 0,
             recorded_in_scope: false,
         }
+    }
+
+    /// Keep the prelude the solver started from, for fingerprints only.
+    pub(crate) fn record_prelude(&mut self, prelude: Commands) {
+        self.prelude = Some(prelude);
     }
 
     /// Keep the context the solver already holds below the journal's first
@@ -5115,7 +5127,8 @@ impl QueryJournal {
     }
 
     /// Every retained query's fingerprint, in journal order: the running
-    /// hash of the base context and the scopes below the query's prefix,
+    /// hash of the prelude, the base context and the scopes below the query's
+    /// prefix,
     /// and the hash of the query itself and its rlimit.
     fn fingerprints(&self) -> Vec<Fingerprint> {
         let printer = air::printer::Printer::new(
@@ -5124,7 +5137,7 @@ impl QueryJournal {
             SmtSolver::Cvc5,
         );
         let mut hash = Fnv::new();
-        for batch in &self.base {
+        for batch in self.prelude.iter().chain(&self.base) {
             hash.commands(&printer, batch);
         }
         let mut prefixes = vec![hash.0];
@@ -6871,7 +6884,8 @@ mod tests {
 
     /// A retained query's fingerprint reads its AIR, not where it came from:
     /// spans on the query's context and on its assertions leave it alone,
-    /// a declaration added below it changes its prefix and nothing else, and
+    /// a declaration added below it or another prelude changes its prefix and
+    /// nothing else, and
     /// an edit to the query or to its rlimit changes its body and nothing
     /// else.
     #[test]
@@ -6905,9 +6919,10 @@ mod tests {
         };
         // The journal of one compilation: a base, a scope of declarations,
         // then the query at `rlimit`, and after it one more declaration.
-        let journal_at = |at: &str, extra_below: &str, text: &str, rlimit: f32| {
+        let journal_on = |prelude: &str, at: &str, extra_below: &str, text: &str, rlimit: f32| {
             let mut air = Context::new(Arc::new(VirMessageInterface {}), SmtSolver::Cvc5);
             let mut journal = QueryJournal::new();
+            journal.record_prelude(commands(prelude));
             let base = commands("(declare-fun g (Int) Bool)");
             for command in base.iter() {
                 if let CommandX::Global(decl) = &**command {
@@ -6933,6 +6948,10 @@ mod tests {
             apply(&mut journal, &mut air, &commands("(axiom (g 2))"));
             journal.fingerprints()
         };
+        let prelude = "(declare-const SZ Int)";
+        let journal_at = |at: &str, extra_below: &str, text: &str, rlimit: f32| {
+            journal_on(prelude, at, extra_below, text, rlimit)
+        };
         let journal =
             |at: &str, extra_below: &str, text: &str| journal_at(at, extra_below, text, 1.0);
         let before = journal("a.rs:3:5", "", "(> x 0)");
@@ -6943,6 +6962,11 @@ mod tests {
         let below = journal("a.rs:3:5", "(axiom (g 3))", "(> x 0)");
         assert_ne!(below[0].prefix, before[0].prefix);
         assert_eq!(below[0].body, before[0].body);
+        // Another prelude: its prefix changed, its body did not.
+        let word =
+            journal_on("(declare-const SZ Int) (axiom (= SZ 64))", "a.rs:3:5", "", "(> x 0)", 1.0);
+        assert_ne!(word[0].prefix, before[0].prefix);
+        assert_eq!(word[0].body, before[0].body);
         // The query itself edited: its body changed, its prefix did not.
         let edited = journal("a.rs:3:5", "", "(>= x 0)");
         assert_eq!(edited[0].prefix, before[0].prefix);
