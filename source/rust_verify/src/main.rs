@@ -542,6 +542,42 @@ pub fn main() {
         None
     };
 
+    // The machine report, written to a file of its own. Deliberately built
+    // before the `--output-json` block below, which consumes the timing data.
+    if let Some(path) = &verifier.args.report_json {
+        let entire_crate = rust_verify::driver::is_verifying_entire_crate(&verifier);
+        // Without a VIR the run never reached the point of counting, so the
+        // counts are absent rather than zero.
+        let counted = !verifier.encountered_vir_error;
+        let results = rust_verify::report::Results {
+            success: entire_crate.then(|| {
+                !status.is_err() && !verifier.encountered_vir_error && verifier.count_errors == 0
+            }),
+            verified: counted.then_some(verifier.count_verified),
+            errors: counted.then_some(verifier.count_errors),
+            encountered_error: status.is_err(),
+            encountered_vir_error: verifier.encountered_vir_error,
+            is_verifying_entire_crate: entire_crate,
+        };
+        let mut report = rust_verify::report::Report::new(
+            verifier.crate_name.clone(),
+            results,
+            build_info.to_json(),
+        );
+        report.diagnostics = verifier.reported_diagnostics.clone();
+        for (func, details) in &verifier.func_details {
+            report
+                .functions
+                .insert(vir::ast_util::fun_as_friendly_rust_name(func), details.to_json());
+        }
+        report.times_ms = times_ms_json_data.clone();
+        if let Err(err) = rust_verify::report::write(std::path::Path::new(path), &report) {
+            // Worth saying out loud, but it is not a verification result:
+            // the run's own status stands either way.
+            eprintln!("error: could not write --report-json {path}: {err}");
+        }
+    }
+
     if verifier.args.output_json {
         // Render function verification details as JSON.
         let mut func_details: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();

@@ -480,9 +480,30 @@ pub fn run_verus_raw(args: &[&str], dir: &std::path::Path) -> std::process::Outp
         });
     let z3 = path::absolute(z3).expect("Failed to find absolute path for Z3 executable");
 
-    std::process::Command::new(bin)
-        .current_dir(dir)
-        .env("VERUS_Z3_PATH", z3)
+    // This Verus runs cvc5 as well as z3, and `dir` is a temp directory, so
+    // the relative default that works for z3 in the workspace does not point
+    // anywhere useful here. Resolve it the same way, but only pass it on when
+    // it exists: a checkout that keeps cvc5 on PATH instead must keep working.
+    let cvc5 = std::env::var("VERUS_CVC5_PATH")
+        .map(|p| {
+            let p = std::path::PathBuf::from(p);
+            if p.is_relative() { std::path::PathBuf::from("..").join(p) } else { p }
+        })
+        .unwrap_or({
+            if cfg!(target_os = "windows") {
+                std::path::PathBuf::from("..\\cvc5.exe")
+            } else {
+                std::path::PathBuf::from("../cvc5")
+            }
+        });
+    let cvc5 = path::absolute(cvc5).ok().filter(|p| p.exists());
+
+    let mut command = std::process::Command::new(bin);
+    command.current_dir(dir).env("VERUS_Z3_PATH", z3);
+    if let Some(cvc5) = cvc5 {
+        command.env("VERUS_CVC5_PATH", cvc5);
+    }
+    command
         .arg("--mcp")
         .args(args)
         .stdout(std::process::Stdio::piped())
