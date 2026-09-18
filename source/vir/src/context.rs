@@ -965,6 +965,19 @@ impl Ctx {
         for group in &self.reveal_groups {
             names.push(group.x.name.clone());
         }
+        // The fuel hypothesis of a function body (sst_to_air::set_fuel) mentions fuel%f for
+        // every hide(f) in the body, but pruning does not follow `hidden`, so an f the body
+        // cannot otherwise reach is absent from the pruned context. Declare fuel%f anyway:
+        // with f's definition axioms pruned, it is a fresh distinct constant, so the query
+        // is the unpruned query minus the axioms pruning already removes.
+        let mut declared: HashSet<Fun> = names.iter().cloned().collect();
+        for function in &self.functions {
+            for hide in function.x.attrs.hidden.iter() {
+                if declared.insert(hide.clone()) {
+                    names.push(hide.clone());
+                }
+            }
+        }
         for name in names {
             let id = crate::def::prefix_fuel_id(&fun_to_air_ident(&self.name_ctxt, &name));
             ids.push(air::ast_util::ident_var(&id));
