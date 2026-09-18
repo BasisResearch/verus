@@ -4885,7 +4885,7 @@ fn resident_fingerprints_change_with_every_verdict() {
         let ready = worker.receive();
         let (bucket, uses) = ready["buckets"]
             .as_array()
-            .unwrap_or_else(|| panic!("{source}\n{ready}"))
+            .unwrap_or_else(|| panic!("{}\n{}", source, ready))
             .iter()
             .enumerate()
             .flat_map(|(at, bucket)| {
@@ -4896,7 +4896,7 @@ fn resident_fingerprints_change_with_every_verdict() {
                     && query["kind"] == "body"
                     && query["prover"] == "default"
             })
-            .unwrap_or_else(|| panic!("{ready}"));
+            .unwrap_or_else(|| panic!("{}", ready));
         let checked = worker.send(json!({"command":"check", "session":ready["session"],
             "bucket":bucket, "query":uses["id"]}));
         worker.finish(true);
@@ -4991,5 +4991,5 @@ fn resident_fingerprints_change_with_every_verdict() {
             missed.push(format!("{before} -> {after}"));
         }
     }
-    assert!(missed.is_empty(), "verdict changed, fingerprint did not: {missed:#?}");
+    assert!(missed.is_empty(), "verdict changed, fingerprint did not: {:#?}", missed);
 }
