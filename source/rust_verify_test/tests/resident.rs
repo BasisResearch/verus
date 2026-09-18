@@ -3241,7 +3241,8 @@ fn resident_ready_lists_the_requests_it_serves() {
             "inst_graph",
             "ladder",
             "twin",
-            "speculate"
+            "speculate",
+            "pin"
         ],
         "{ready}"
     );
@@ -3267,6 +3268,9 @@ fn resident_ready_lists_the_requests_it_serves() {
             }
             "scaffold" => {
                 json!({"command": command, "session": "stale", "bucket": 0, "query": 0, "assert": "true"})
+            }
+            "pin" => {
+                json!({"command": command, "session": "stale", "bucket": 0, "query": 0, "rung": "ematch", "rlimit": 1.0})
             }
             _ => panic!("no request for {}", command),
         };
@@ -3530,6 +3534,622 @@ fn resident_pinned_recheck_keeps_the_provenance_of_its_proof() {
         .count();
     assert!(requires > 0, "{}", checked);
     worker.finish(false);
+}
+
+/// A pin request is refused where the query's checks could not follow it,
+/// as a ladder would skip the rung, and the refusals leave the session
+/// working: a rung the solver has no module for, and budgets out of range or
+/// below one cvc5 resource unit (which would reach cvc5 as no limit at all).
+#[test]
+fn resident_pin_is_refused_where_checks_could_not_follow_it() {
+    let mut worker = Worker::start(LADDER_SOURCE, &[]);
+    let ready = worker.receive();
+    assert_eq!(ready["strategy_ladder"], false, "{ready}");
+    let session = ready["session"].clone();
+    let untriggered = query_id(&ready, "::untriggered");
+    let pin = |rung: &str, rlimit: Value| {
+        json!({"command":"pin", "session":session, "bucket":0, "query":untriggered,
+            "rung":rung, "rlimit":rlimit})
+    };
+    for (rung, rlimit) in [
+        ("enum", json!(10)),
+        ("mbqi", json!(10)),
+        ("conflict", json!(10)),
+        ("pool", json!(0)),
+        ("pool", json!(1001)),
+        ("pool", json!(0.000001)),
+    ] {
+        let reply = worker.send(pin(rung, rlimit.clone()));
+        assert_eq!(reply["event"], "error", "{rung} at {rlimit}: {reply}");
+    }
+    for (bucket, query) in [(json!(1), untriggered.clone()), (json!(0), json!(99))] {
+        let reply = worker.send(json!({"command":"pin", "session":session, "bucket":bucket,
+            "query":query, "rung":"pool", "rlimit":10}));
+        assert_eq!(reply["event"], "error", "{reply}");
+    }
+    let check = json!({"command":"check", "session":session, "bucket":0, "query":untriggered});
+    let checked = worker.send(check.clone());
+    assert_eq!(checked["result"], "invalid", "{checked}");
+    assert!(checked["pinned"].is_null(), "{}", checked);
+    // A rung the solver has is pinned, and the next check tries it first.
+    let pinned = worker.send(pin("pool", json!(5)));
+    assert_eq!(pinned["event"], "pinned", "{pinned}");
+    assert_eq!(pinned["pin"], json!({"rung": "pool", "alongside": false, "rlimit": 5.0}));
+    let checked = worker.send(check);
+    assert_eq!(checked["result"], "invalid", "{checked}");
+    assert_eq!(checked["pinned"]["rung"], "pool", "{checked}");
+    assert_eq!(checked["pinned"]["closed"], false, "{checked}");
+    worker.finish(false);
+}
+
+/// A valid requested budget can become unlimited after clamping to the
+/// query's budget. Explicit pins refuse it; ladders validate inherited
+/// budgets and do not pin a successful override that cannot be clamped.
+#[test]
+fn resident_pin_and_ladder_reject_effective_subunit_budgets() {
+    for budget in ["0", "0.000001"] {
+        let source = format!(
+            r#"
+use vstd::prelude::*;
+verus! {{
+    #[verifier::rlimit({budget})]
+    proof fn tiny() {{ assert(true); }}
+
+    #[verifier::rlimit(1)]
+    proof fn bounded() {{ assert(true); }}
+}}
+"#
+        );
+        let mut worker =
+            Worker::start_with_env(&source, &[], &[("VERUS_RESIDENT_RETAIN_ONLY", "1")]);
+        let ready = worker.receive();
+        let session = ready["session"].clone();
+        let tiny = query_id(&ready, "::tiny");
+        let refused = worker.send(json!({"command":"pin", "session":session, "bucket":0,
+            "query":tiny, "rung":"ematch", "rlimit":1}));
+        assert_eq!(refused["event"], "error", "{budget}: {refused}");
+        assert!(refused["message"].as_str().unwrap().contains("below one cvc5 resource unit"));
+
+        let refused = worker.send(json!({"command":"ladder", "session":session, "bucket":0,
+            "query":tiny, "rungs":["ematch"]}));
+        assert_eq!(refused["event"], "error", "{budget}: {refused}");
+        assert!(refused["message"].as_str().unwrap().contains("below one cvc5 resource unit"));
+
+        // An explicit ladder budget still checks, but cannot become a pin
+        // whose next attempt would clamp to an unlimited resource budget.
+        let ladder = worker.send(json!({"command":"ladder", "session":session, "bucket":0,
+            "query":tiny, "rungs":["ematch"], "budgets":{"ematch":1}}));
+        assert_eq!(ladder["event"], "laddered", "{budget}: {ladder}");
+        assert_eq!(ladder["solved_by"], "ematch", "{budget}: {ladder}");
+        assert!(rung(&ladder, "ematch")["resource_limit"].as_u64().unwrap() > 0);
+        assert!(ladder["pinned"].is_null(), "{}: {}", budget, ladder);
+
+        // Refusals leave the session usable; a positive clamped budget is
+        // accepted and the next check actually uses that smaller budget.
+        let bounded = query_id(&ready, "::bounded");
+        let pinned = worker.send(json!({"command":"pin", "session":session, "bucket":0,
+            "query":bounded, "rung":"ematch", "rlimit":5}));
+        assert_eq!(pinned["event"], "pinned", "{pinned}");
+        let checked = worker.send(json!({"command":"check", "session":session, "bucket":0,
+            "query":bounded}));
+        assert_eq!(checked["result"], "valid", "{checked}");
+        assert_eq!(checked["pinned"]["rlimit"], 1.0, "{checked}");
+        worker.finish(true);
+    }
+}
+
+/// A retain-only session has checked nothing when its first request arrives,
+/// and its solvers have not even started. A pin request for such a query
+/// still sees every rung the solver has and is followed by the check; a
+/// ladder request on another still runs its rungs and pins the one that
+/// proves it.
+#[test]
+fn resident_retain_only_session_pins_and_ladders_before_any_check() {
+    let mut worker = Worker::start_with_env(
+        LADDER_SOURCE,
+        &[],
+        &[("VERUS_RESIDENT_STRATEGY_LADDER", "1"), ("VERUS_RESIDENT_RETAIN_ONLY", "1")],
+    );
+    let ready = worker.receive();
+    assert_eq!(ready["retain_only"], true, "{ready}");
+    assert_eq!(ready["strategy_ladder"], true, "{ready}");
+    let session = ready["session"].clone();
+    let untriggered = query_id(&ready, "::untriggered");
+    let pinned = worker.send(json!({"command":"pin", "session":session, "bucket":0,
+        "query":untriggered, "rung":"enum", "alongside":true, "rlimit":10}));
+    assert_eq!(pinned["event"], "pinned", "{pinned}");
+    let checked =
+        worker.send(json!({"command":"check", "session":session, "bucket":0, "query":untriggered}));
+    assert_eq!(checked["result"], "valid", "{checked}");
+    assert_eq!(checked["pinned"]["closed"], true, "{checked}");
+
+    let triggered = query_id(&ready, "::triggered");
+    let ladder = worker.send(json!({"command":"ladder", "session":session, "bucket":0,
+        "query":triggered}));
+    assert_eq!(ladder["event"], "laddered", "{ladder}");
+    assert_eq!(ladder["available"], json!(["ematch", "conflict", "pool", "enum", "mbqi"]));
+    assert_eq!(ladder["solved_by"], "ematch", "{ladder}");
+    assert_eq!(ladder["pinned"]["rung"], "ematch", "{ladder}");
+    // The untriggered query's pin is its own.
+    let checked =
+        worker.send(json!({"command":"check", "session":session, "bucket":0, "query":untriggered}));
+    assert_eq!(checked["pinned"]["rung"], "enum", "{checked}");
+    worker.finish(true);
+}
+
+const BIT_VECTOR_PIN_SOURCE: &str = r#"
+use vstd::prelude::*;
+verus! {
+    proof fn bits_pin(x: u32) {
+        assert(x & 0 == 0) by(bit_vector);
+    }
+
+    proof fn bits_ladder(x: u32) {
+        assert(x | 0 == x) by(bit_vector);
+    }
+}
+"#;
+
+/// A `by(bit_vector)` query's solver gets no prelude, no bucket context and
+/// no journal scope, so in a retain-only session nothing at all has reached
+/// it when the first request arrives. A pin and a ladder, each the first
+/// request its solver sees, still find every rung.
+#[test]
+fn resident_retain_only_session_pins_and_ladders_bit_vector_queries() {
+    let mut worker = Worker::start_with_env(
+        BIT_VECTOR_PIN_SOURCE,
+        &[],
+        &[("VERUS_RESIDENT_STRATEGY_LADDER", "1"), ("VERUS_RESIDENT_RETAIN_ONLY", "1")],
+    );
+    let ready = worker.receive();
+    assert_eq!(ready["retain_only"], true, "{ready}");
+    let session = ready["session"].clone();
+    let pinned_query = query_of(&ready, "::bits_pin", "bit_vector")["id"].clone();
+    let pinned = worker.send(json!({"command":"pin", "session":session, "bucket":0,
+        "query":pinned_query, "rung":"ematch", "rlimit":10}));
+    assert_eq!(pinned["event"], "pinned", "{pinned}");
+    let checked = worker
+        .send(json!({"command":"check", "session":session, "bucket":0, "query":pinned_query}));
+    assert_eq!(checked["result"], "valid", "{checked}");
+    assert_eq!(checked["pinned"]["rung"], "ematch", "{checked}");
+
+    let laddered_query = query_of(&ready, "::bits_ladder", "bit_vector")["id"].clone();
+    let ladder = worker.send(json!({"command":"ladder", "session":session, "bucket":0,
+        "query":laddered_query}));
+    assert_eq!(ladder["event"], "laddered", "{ladder}");
+    assert_eq!(ladder["available"], json!(["ematch", "conflict", "pool", "enum", "mbqi"]));
+    assert_eq!(ladder["solved_by"], "ematch", "{ladder}");
+    worker.finish(true);
+}
+
+const RETAIN_ONLY_SOURCE: &str = r#"
+use vstd::prelude::*;
+verus! {
+    spec fn positive(x: int) -> int
+        recommends x > 0,
+    {
+        x
+    }
+
+    proof fn failing(x: int) {
+        assert(forall|y: int| y > 0 ==> #[trigger] positive(y) > 0);
+        assert(positive(x) > 0);
+    }
+
+    proof fn passing(x: int)
+        requires x > 0,
+    {
+        assert(forall|y: int| y > 0 ==> #[trigger] positive(y) > 0);
+        assert(positive(x) > 0);
+    }
+
+    spec(checked) fn checked_spec(x: int) -> int {
+        positive(x)
+    }
+
+    spec fn recursive(n: nat) -> nat
+        decreases n,
+    {
+        if n == 0 { 0 } else { recursive((n - 1) as nat) }
+    }
+
+    #[verifier::rlimit(20)]
+    proof fn bounded() {
+        assert(recursive(0) == 0);
+    }
+
+    proof fn later() {
+        passing(1);
+        bounded();
+        assert(forall|z: int| z > 0 ==> #[trigger] positive(z) == z);
+    }
+}
+"#;
+
+/// Every query of a function, by what a caller compares across sessions.
+fn catalogue(ready: &Value) -> Vec<(String, String, String, Value)> {
+    let mut queries: Vec<_> = ready["buckets"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{}", ready))
+        .iter()
+        .flat_map(|bucket| bucket["queries"].as_array().unwrap())
+        .map(|query| {
+            let text = |key: &str| query[key].as_str().unwrap().to_owned();
+            (text("function"), text("kind"), text("description"), query["fingerprint"].clone())
+        })
+        .collect();
+    queries.sort_by(|a, b| format!("{a:?}").cmp(&format!("{b:?}")));
+    queries
+}
+
+/// No check decides what a retain-only session retains, so it retains every
+/// recommends query a check could have added: a session that checked the same
+/// source retains a subset of it, with the same fingerprints, whichever of its
+/// checks failed. A follow-up that only a failed check adds is there, and so
+/// are both kinds for a `spec(checked)` function. The follow-ups a checked
+/// session skips have quantifiers, so a retain-only session numbers every
+/// quantifier lowered after them otherwise (`later`'s among them), and the
+/// fingerprints still agree.
+#[test]
+fn resident_retain_only_session_retains_what_any_checked_session_could() {
+    let mut checked = Worker::start(RETAIN_ONLY_SOURCE, &[]);
+    let checked_ready = checked.receive();
+    assert_eq!(checked_ready["retain_only"], false, "{checked_ready}");
+    assert_eq!(checked_ready["invocation_succeeded"], false, "{checked_ready}");
+    checked.finish(false);
+    let mut retained =
+        Worker::start_with_env(RETAIN_ONLY_SOURCE, &[], &[("VERUS_RESIDENT_RETAIN_ONLY", "1")]);
+    let retained_ready = retained.receive();
+    assert_eq!(retained_ready["retain_only"], true, "{retained_ready}");
+    retained.finish(true);
+
+    let checked = catalogue(&checked_ready);
+    let mut retained = catalogue(&retained_ready);
+    for query in &checked {
+        let Some(at) = retained.iter().position(|kept| kept == query) else {
+            panic!(
+                "the checked session retained {:?}, the retain-only one did not: {:?}",
+                query, retained
+            )
+        };
+        retained.remove(at);
+    }
+    let has = |queries: &[(String, String, String, Value)], function: &str, kind: &str| {
+        queries.iter().any(|query| query.0.ends_with(function) && query.1 == kind)
+    };
+    // The failed check added its follow-up, the passing spec(checked) check
+    // the checked kind.
+    assert!(has(&checked, "::failing", "recommends_followup"), "{:?}", checked);
+    assert!(has(&checked, "::checked_spec", "recommends"), "{:?}", checked);
+    // What is left is what checks that passed did not add: the follow-up of
+    // every other check that could have failed, a recursive spec function's
+    // termination check among them. `checked_spec` and `positive` have no
+    // termination check to fail.
+    let mut left: Vec<(&str, &str)> = retained
+        .iter()
+        .map(|query| (query.0.rsplit("::").next().unwrap(), query.1.as_str()))
+        .collect();
+    left.sort();
+    assert_eq!(
+        left,
+        [
+            ("bounded", "recommends_followup"),
+            ("later", "recommends_followup"),
+            ("passing", "recommends_followup"),
+            ("recursive", "recommends_followup")
+        ],
+        "{:?}",
+        retained
+    );
+}
+
+/// The one body query of `name`'s function whose prover is `prover`, from a
+/// session's ready event.
+fn query_of<'a>(ready: &'a Value, name: &str, prover: &str) -> &'a Value {
+    let found: Vec<_> = ready["buckets"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{}", ready))
+        .iter()
+        .flat_map(|bucket| bucket["queries"].as_array().unwrap())
+        .filter(|query| {
+            query["function"].as_str().unwrap().ends_with(name)
+                && query["kind"] == "body"
+                && query["prover"] == prover
+        })
+        .collect();
+    assert_eq!(found.len(), 1, "{name} ({prover}): {ready}");
+    found[0]
+}
+
+/// A query's prefix fingerprint covers the prelude its solver starts from,
+/// which is no fixed text: it reads the crate's word size, which a
+/// `global size_of usize` line sets. With that line in another module, whose
+/// size_of lemma the checked module's bucket prunes away, a query's own AIR
+/// and bucket context are the same either way, but its verdict is not, so it
+/// must not fingerprint the same.
+#[test]
+fn resident_fingerprints_cover_the_word_size_in_the_prelude() {
+    let source = |layout: &str| {
+        format!(
+            r#"
+use vstd::prelude::*;
+verus! {{
+    mod layout {{
+        use super::*;
+        {layout}
+    }}
+    mod a {{
+        use super::*;
+        proof fn word() {{
+            assert(usize::MAX == 0xffff_ffff_ffff_ffff);
+        }}
+    }}
+}}
+"#
+        )
+    };
+    let open = |source: &str| {
+        let mut worker = Worker::start(source, &["--verify-module", "a"]);
+        let ready = worker.receive();
+        let word = query_of(&ready, "::word", "default").clone();
+        let checked = worker.send(json!({"command":"check", "session":ready["session"],
+            "bucket":0, "query":word["id"]}));
+        worker.finish(ready["invocation_succeeded"] == true);
+        (word["fingerprint"].clone(), checked["result"].clone())
+    };
+    let (either, either_result) = open(&source(""));
+    let (sixty_four, sixty_four_result) = open(&source("global size_of usize == 8;"));
+    // The word size decides the query.
+    assert_eq!(either_result, "invalid");
+    assert_eq!(sixty_four_result, "valid");
+    // Its body is the same AIR either way; its prefix is not.
+    assert_eq!(either["body"], sixty_four["body"]);
+    assert_ne!(either["prefix"], sixty_four["prefix"], "{either} {sixty_four}");
+}
+
+/// A prefix fingerprint reads the declarations its query reaches, so what a
+/// proof run does beside a query -- a lemma added next to it, an unrelated
+/// spec function edited, a struct and its spec function added -- leaves the
+/// query alone, and only what it can reach changes it. A broadcast axiom can
+/// fire anywhere, so every query below it reads it.
+#[test]
+fn resident_fingerprints_ignore_what_a_query_does_not_reach() {
+    let source = |counted: &str, unread: &str, first: &str, last: &str| {
+        format!(
+            r#"
+use vstd::prelude::*;
+verus! {{
+    {first}
+    spec fn counted(x: nat) -> nat {{
+        {counted}
+    }}
+
+    spec fn unread(x: nat) -> nat {{
+        {unread}
+    }}
+
+    proof fn keeps(x: nat)
+        ensures counted(x) > x,
+    {{
+        assert(counted(x) == x + 1);
+    }}
+
+    proof fn reads_unread(x: nat)
+        ensures unread(x) + 1 > unread(x),
+    {{
+    }}
+
+    {last}
+}}
+"#
+        )
+    };
+    let open = |source: &str| {
+        let mut worker =
+            Worker::start_with_env(source, &[], &[("VERUS_RESIDENT_RETAIN_ONLY", "1")]);
+        let ready = worker.receive();
+        assert_eq!(ready["retain_only"], true, "{ready}");
+        let of = |name: &str| query_of(&ready, name, "default")["fingerprint"].clone();
+        let fingerprints = (of("::keeps"), of("::reads_unread"));
+        worker.finish(true);
+        fingerprints
+    };
+    let (keeps, reads_unread) = open(&source("x + 1", "x", "", ""));
+    for last in [
+        // A lemma added beside them.
+        "proof fn helper(y: nat) {}",
+        // A spec function added, which adds a fuel constant to the module.
+        "spec fn added(y: nat) -> nat { y }",
+        // A datatype added, with a spec function over it.
+        "pub struct Added { pub x: u8 }\n    spec fn over_added(a: Added) -> u8 { a.x }",
+        // A broadcast lemma below them, whose axiom no query of theirs is under.
+        "broadcast proof fn bc(y: nat)\n        ensures #[trigger] counted(y) > y,\n    {\n        admit();\n    }",
+    ] {
+        assert_eq!(
+            open(&source("x + 1", "x", "", last)),
+            (keeps.clone(), reads_unread.clone()),
+            "{last}"
+        );
+    }
+    // The body of a spec function: read by the query that calls it, by no
+    // other.
+    let (keeps_edited, reads_unread_edited) = open(&source("x + 1", "x + 1", "", ""));
+    assert_eq!(keeps_edited, keeps);
+    assert_ne!(reads_unread_edited, reads_unread);
+    let (keeps_edited, reads_unread_edited) = open(&source("x + 2", "x", "", ""));
+    assert_ne!(keeps_edited, keeps);
+    assert_eq!(reads_unread_edited, reads_unread);
+    // A broadcast axiom above them: every query below it reads it, whatever
+    // it calls.
+    let (keeps_broadcast, reads_unread_broadcast) = open(&source(
+        "x + 1",
+        "x",
+        "broadcast proof fn bc(y: nat)\n        ensures #[trigger] counted(y) > y,\n    {\n        admit();\n    }",
+        "",
+    ));
+    assert_ne!(keeps_broadcast, keeps);
+    assert_ne!(reads_unread_broadcast, reads_unread);
+}
+
+/// A module declares its transparent datatypes in one `declare-datatypes`,
+/// and a query reads the ones it reaches: a struct added to a module whose
+/// proofs already use a struct leaves those proofs alone, while an edit to
+/// the struct they do use changes them.
+#[test]
+fn resident_fingerprints_ignore_a_datatype_a_query_does_not_reach() {
+    let source = |used: &str, extra: &str| {
+        format!(
+            r#"
+use vstd::prelude::*;
+verus! {{
+    pub struct Used {{
+        pub x: u8,
+        {used}
+    }}
+
+    {extra}
+
+    spec fn field(u: Used) -> u8 {{
+        u.x
+    }}
+
+    proof fn uses(u: Used)
+        ensures field(u) == u.x,
+    {{
+    }}
+}}
+"#
+        )
+    };
+    let open = |source: &str| {
+        let mut worker =
+            Worker::start_with_env(source, &[], &[("VERUS_RESIDENT_RETAIN_ONLY", "1")]);
+        let ready = worker.receive();
+        assert_eq!(ready["retain_only"], true, "{ready}");
+        let fingerprint = query_of(&ready, "::uses", "default")["fingerprint"].clone();
+        worker.finish(true);
+        fingerprint
+    };
+    let uses = open(&source("", ""));
+    // A struct added beside the one the proof uses, which the module declares
+    // in the same `declare-datatypes`: neither it nor the declarations beside
+    // it are reached.
+    assert_eq!(open(&source("", "pub struct Other { pub y: u8 }")), uses);
+    // The struct it does use, edited: its query reads it.
+    assert_ne!(open(&source("pub z: u8,", "")), uses);
+    // Nor is a struct whose field has the type the proof uses: its axioms name
+    // the used struct's `Poly` and `TYPE` constants, but they are triggered on
+    // terms of the added struct, which no query here can build.
+    assert_eq!(open(&source("", "pub struct Wraps { pub u: Used }")), uses);
+}
+
+/// An item's axiom can be triggered on a name the item does not declare, and
+/// a query that reaches that name reads it: a recursive trait impl's spec
+/// definition is keyed on the trait method, and a function's `FnDef` axioms
+/// on its `FNDEF` type, which a query that calls the function through a value
+/// mentions instead of the function's own `ens%`. Each edit here changes the
+/// verdict of `uses`, so it must change its fingerprint.
+#[test]
+fn resident_fingerprints_read_an_item_axiom_by_its_triggers() {
+    let trait_impl = |base: &str| {
+        format!(
+            r#"
+use vstd::prelude::*;
+verus! {{
+    pub trait T {{
+        spec fn f(&self, n: nat) -> nat;
+    }}
+    pub struct S;
+    impl T for S {{
+        open spec fn f(&self, n: nat) -> nat
+            decreases n,
+        {{
+            if n == 0 {{ {base} }} else {{ self.f((n - 1) as nat) }}
+        }}
+    }}
+    proof fn uses(s: S) {{
+        assert(s.f(0) == 0);
+    }}
+}}
+"#
+        )
+    };
+    let fn_value = |ens: &str| {
+        format!(
+            r#"
+use vstd::prelude::*;
+verus! {{
+    fn id(x: u8) -> (r: u8)
+        ensures {ens},
+    {{
+        x
+    }}
+    fn uses() {{
+        let f = id;
+        let r = f(1);
+        assert(r == 1);
+    }}
+}}
+"#
+        )
+    };
+    let open = |source: &str| {
+        let mut worker =
+            Worker::start_with_env(source, &[], &[("VERUS_RESIDENT_RETAIN_ONLY", "1")]);
+        let ready = worker.receive();
+        assert_eq!(ready["retain_only"], true, "{ready}");
+        let uses = query_of(&ready, "::uses", "default").clone();
+        let checked = worker.send(json!({"command":"check", "session":ready["session"],
+            "bucket":0, "query":uses["id"]}));
+        worker.finish(true);
+        (uses["fingerprint"].clone(), checked["result"].clone())
+    };
+    for (before, after) in
+        [(trait_impl("0"), trait_impl("1")), (fn_value("r == x"), fn_value("r == x || r == 0"))]
+    {
+        let (fingerprint, result) = open(&before);
+        let (edited, edited_result) = open(&after);
+        assert_eq!((result, edited_result), (json!("valid"), json!("invalid")), "{after}");
+        assert_eq!(fingerprint["body"], edited["body"], "{after}");
+        assert_ne!(fingerprint["prefix"], edited["prefix"], "{after}");
+    }
+}
+
+/// A `by(bit_vector)` query's solver gets neither the prelude nor the bucket
+/// context, so its prefix fingerprint covers neither: an edit to the spec
+/// function of its bucket leaves it alone, while the default prover's query
+/// in the same function, which calls that function, fingerprints differently.
+#[test]
+fn resident_bit_vector_fingerprints_ignore_the_bucket_context() {
+    let source = |body: &str| {
+        format!(
+            r#"
+use vstd::prelude::*;
+verus! {{
+    spec fn extra(x: int) -> int {{
+        {body}
+    }}
+    proof fn bits(x: u32) {{
+        assert(x & 0 == 0) by(bit_vector);
+        assert(extra(1int) + 1 == extra(1int) + 1);
+    }}
+}}
+"#
+        )
+    };
+    let open = |source: &str| {
+        let mut worker =
+            Worker::start_with_env(source, &[], &[("VERUS_RESIDENT_RETAIN_ONLY", "1")]);
+        let ready = worker.receive();
+        assert_eq!(ready["retain_only"], true, "{ready}");
+        worker.finish(true);
+        let fingerprint = |prover| query_of(&ready, "::bits", prover)["fingerprint"].clone();
+        (fingerprint("bit_vector"), fingerprint("default"))
+    };
+    let (bits, body) = open(&source("x"));
+    let (bits_edited, body_edited) = open(&source("x + 0"));
+    assert_ne!(body["prefix"], body_edited["prefix"], "the definition reached the bucket");
+    assert_eq!(bits, bits_edited);
 }
 
 const UNBOUNDED_SOURCE: &str = r#"
@@ -4248,4 +4868,128 @@ fn resident_without_difficulty_reports_none() {
         "closed"
     );
     worker.finish(false);
+}
+
+/// Edits that each flip the verdict of `uses`, across the ways a query can
+/// reach a declaration: a function's fuel, visibility and definition, a
+/// constant, a datatype (directly, through a container, a tuple and
+/// structural equality), a type invariant, an associated type, a trait impl
+/// behind a bound, a closure and a module-level reveal. A refresh carries
+/// over the verdict of every query whose fingerprint is unchanged, so each
+/// of these must change it.
+#[test]
+fn resident_fingerprints_change_with_every_verdict() {
+    let open = |source: &str| {
+        let mut worker =
+            Worker::start_with_env(source, &[], &[("VERUS_RESIDENT_RETAIN_ONLY", "1")]);
+        let ready = worker.receive();
+        let (bucket, uses) = ready["buckets"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{}\n{}", source, ready))
+            .iter()
+            .enumerate()
+            .flat_map(|(at, bucket)| {
+                bucket["queries"].as_array().unwrap().iter().map(move |query| (at, query))
+            })
+            .find(|(_, query)| {
+                query["function"].as_str().unwrap().ends_with("::uses")
+                    && query["kind"] == "body"
+                    && query["prover"] == "default"
+            })
+            .unwrap_or_else(|| panic!("{}", ready));
+        let checked = worker.send(json!({"command":"check", "session":ready["session"],
+            "bucket":bucket, "query":uses["id"]}));
+        worker.finish(true);
+        (uses["fingerprint"].clone(), checked["result"].clone())
+    };
+    let source = |items: &str| format!("use vstd::prelude::*;\nverus! {{\n{items}\n}}\n");
+    let cases = [
+        (
+            "#[verifier::opaque] spec fn f(x: int) -> int { x }",
+            "spec fn f(x: int) -> int { x }",
+            "proof fn uses() { assert(f(1) == 1); }",
+        ),
+        (
+            "pub mod m { use vstd::prelude::*; pub closed spec fn f(x: int) -> int { x } }",
+            "pub mod m { use vstd::prelude::*; pub open spec fn f(x: int) -> int { x } }",
+            "proof fn uses() { assert(m::f(1) == 1); }",
+        ),
+        ("spec const C: int = 5;", "spec const C: int = 6;", "proof fn uses() { assert(C == 5); }"),
+        ("pub const C: u64 = 5;", "pub const C: u64 = 6;", "proof fn uses() { assert(C == 5); }"),
+        (
+            "pub enum E { A, B }",
+            "pub enum E { A, B, C }",
+            "proof fn uses(e: E) { assert(e is A || e is B); }",
+        ),
+        (
+            "pub struct S { pub x: u8 }",
+            "pub struct S { pub x: u16 }",
+            "proof fn uses(s: S) { assert(s.x < 256); }",
+        ),
+        (
+            "pub struct S { pub x: u8 }",
+            "pub struct S { pub x: u16 }",
+            "proof fn uses(s: Seq<S>) requires s.len() > 0 { assert(s[0].x < 256); }",
+        ),
+        (
+            "pub struct P { pub a: (u8, u8) }",
+            "pub struct P { pub a: (u16, u8) }",
+            "proof fn uses(p: P) { assert(p.a.0 < 256); }",
+        ),
+        (
+            "pub struct P { pub a: u8 }",
+            "pub struct P { pub a: u8, pub b: u8 }",
+            "proof fn uses(p: P, q: P) requires p.a == q.a { assert(p == q); }",
+        ),
+        (
+            "spec fn f() -> int { 1 }",
+            "uninterp spec fn f() -> int;",
+            "proof fn uses() { assert(f() == 1); }",
+        ),
+        (
+            "pub struct S { x: u8 }\nimpl S { #[verifier::type_invariant] spec fn inv(self) -> bool { self.x > 5 } }",
+            "pub struct S { x: u8 }\nimpl S { #[verifier::type_invariant] spec fn inv(self) -> bool { self.x > 4 } }",
+            "fn uses(s: &S) { proof { use_type_invariant(s); } assert(s.x > 5); }",
+        ),
+        (
+            "pub trait T { type X; }\npub struct S;\nimpl T for S { type X = u8; }",
+            "pub trait T { type X; }\npub struct S;\nimpl T for S { type X = u16; }",
+            "proof fn uses(v: <S as T>::X) { assert(v < 256); }",
+        ),
+        (
+            "pub trait T { spec fn k() -> int; }\npub struct S;\nimpl T for S { open spec fn k() -> int { 1 } }",
+            "pub trait T { spec fn k() -> int; }\npub struct S;\nimpl T for S { open spec fn k() -> int { 2 } }",
+            "proof fn g<A: T>() -> (r: int) ensures r == A::k() { A::k() }\nproof fn uses() { let r = g::<S>(); assert(r == 1); }",
+        ),
+        (
+            "spec fn f(x: int) -> int { x }",
+            "spec fn f(x: int) -> int { x + 1 }",
+            "proof fn uses() { let g = |x: int| f(x); assert(g(1) == 1); }",
+        ),
+        (
+            "spec fn r(n: nat) -> nat decreases n { if n == 0 { 0 } else { r((n - 1) as nat) } }",
+            "spec fn r(n: nat) -> nat decreases n { if n == 0 { 1 } else { r((n - 1) as nat) } }",
+            "proof fn uses() { assert(r(0) == 0); }",
+        ),
+        (
+            "pub mod m { use vstd::prelude::*; pub fn id(x: u8) -> (r: u8) ensures r == x { x } }",
+            "pub mod m { use vstd::prelude::*; pub fn id(x: u8) -> (r: u8) ensures r <= x { x } }",
+            "fn uses() { let r = m::id(1); assert(r == 1); }",
+        ),
+        (
+            "#[verifier::opaque] spec fn f(x: int) -> int { x }\nproof fn uses() { assert(f(1) == 1); }",
+            "#[verifier::opaque] spec fn f(x: int) -> int { x }\nproof fn uses() { reveal(f); assert(f(1) == 1); }",
+            "",
+        ),
+    ];
+    let mut missed = Vec::new();
+    for (before, after, uses) in cases {
+        let (fingerprint, result) = open(&source(&format!("{before}\n{uses}")));
+        let (edited, edited_result) = open(&source(&format!("{after}\n{uses}")));
+        assert_ne!(result, edited_result, "{before} -> {after}: the edit must flip the verdict");
+        if fingerprint == edited {
+            missed.push(format!("{before} -> {after}"));
+        }
+    }
+    assert!(missed.is_empty(), "verdict changed, fingerprint did not: {:#?}", missed);
 }

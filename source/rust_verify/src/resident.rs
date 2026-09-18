@@ -56,7 +56,24 @@
 //! ordinary way, with
 //! its removed axioms never asserted. Every scope is popped before the reply;
 //! the next request restores its own prefix.
+//!
+//! The catalogue names each query's `fingerprint` (see `Fingerprint`): what
+//! a caller compares the query by across compilations of edited source, to
+//! tell the queries an edit left alone from those it changed. Its prefix
+//! covers the declarations the query reads of those below it, not every
+//! declaration below it, so a lemma added beside a query or an edit to a
+//! spec function it never calls leaves it unchanged (see `relevance`). Under
+//! `VERUS_RESIDENT_RETAIN_ONLY` the invocation retains every selected query
+//! and checks none (`ready.retain_only`), which is what such a caller opens a
+//! session on the edited source with; it then carries what it knew about the
+//! unchanged queries over, a pinned rung with a `pin` request. Since no check
+//! decides which recommends follow-ups to retain, such a session retains
+//! every one a check could have added, including those for functions whose
+//! checks pass (a caller checks a follow-up when its function's body fails,
+//! as the batch run does), and none of the `--expand-errors` queries, which
+//! only a failed check can name.
 
+mod relevance;
 mod twin;
 
 use crate::buckets::BucketId;
@@ -155,16 +172,50 @@ impl QueryKind {
 /// follow the number of retained queries rather than the number of declaration
 /// batches, which is roughly the size of the pruned call graph.
 pub(crate) struct QueryJournal {
+    /// The prelude the solver started from, which a bit-vector solver does
+    /// not get. Hashed into fingerprints only: it is not fixed text, since it
+    /// reads the crate's word size (`global size_of usize`).
+    prelude: Option<Commands>,
     /// The bucket's context from before the journal began (fuel constants,
     /// datatypes, function declarations, module-level broadcast groups).
     /// Never replayed: it lives below every scope. Kept so a twin or a
     /// speculative probe can find what it declares.
-    base: Vec<Commands>,
-    contexts: Vec<Vec<Commands>>,
+    base: Vec<Batch>,
+    contexts: Vec<Vec<Batch>>,
     queries: Vec<RetainedQuery>,
     applied: usize,
     /// Whether a query has been recorded since the open scope began.
     recorded_in_scope: bool,
+}
+
+/// One batch of declarations of a journal, with what it is about: a
+/// fingerprint reads the batches its query can reach (see `relevance`).
+pub(crate) struct Batch {
+    commands: Commands,
+    owner: BatchOwner,
+}
+
+/// What a batch of declarations is about, as the verifier generates it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum BatchOwner {
+    /// Read by every query: a module-wide declaration, a broadcast axiom, a
+    /// trait-impl axiom. Whatever it asserts can fire anywhere.
+    Module,
+    /// A module's datatypes, whose declarations say what they are about: the
+    /// names of the batch itself that each one mentions.
+    Datatypes,
+    /// One item's own declarations, read by the queries that reach a name it
+    /// declares. `key` is what groups an item's batches, whose axioms are
+    /// headed by the names the item declares (a function's declaration, its
+    /// `req`/`ens` axioms and its definition axioms).
+    Item(std::sync::Arc<String>),
+}
+
+impl BatchOwner {
+    /// The batches of one function.
+    pub(crate) fn function(fun: &vir::ast::Fun) -> Self {
+        BatchOwner::Item(std::sync::Arc::new(fun_as_friendly_rust_name(fun)))
+    }
 }
 
 /// The requests this worker serves, as `ready` reports them. A client reads
@@ -185,6 +236,7 @@ const COMMANDS: &[&str] = &[
     "ladder",
     "twin",
     "speculate",
+    "pin",
 ];
 
 #[derive(Deserialize)]
@@ -345,9 +397,26 @@ enum Request {
         /// than alone.
         #[serde(default)]
         alongside: bool,
-        /// Pin the first rung that proved the query, or remove the pin when
-        /// none did. Default true; false leaves the pin as it was.
+        /// Pin the first rung that proved the query if its clamped budget is
+        /// at least one resource unit; otherwise remove the pin. Default
+        /// true; false leaves the pin as it was.
         pin: Option<bool>,
+    },
+    /// Give the query the rung its checks try first, as a ladder request
+    /// pins one: what a caller carries over from a session on the source
+    /// before an edit for a query the edit left unchanged. Refused, as a
+    /// ladder would skip it, when the solver cannot run the rung (see
+    /// `check_pin`).
+    Pin {
+        session: String,
+        bucket: BucketIndex,
+        query: QueryId,
+        rung: Rung,
+        #[serde(default)]
+        alongside: bool,
+        /// The pin's budget in `#[verifier::rlimit]` units, above 0, at
+        /// most `MAX_RUNG_RLIMIT`, and at least one cvc5 resource unit.
+        rlimit: f32,
     },
 }
 
@@ -419,6 +488,7 @@ struct QueryDescription {
     kind: QueryKind,
     prover: &'static str,
     span: String,
+    fingerprint: Fingerprint,
 }
 
 #[derive(Serialize)]
@@ -482,7 +552,12 @@ impl RetainedBucket {
         let mut addresses = Vec::new();
         let mut cert_keys = Vec::new();
         let mut repeats = std::collections::HashMap::new();
+        // One index for the bucket: its journals share the batches they were
+        // given, and hashing a batch again for every spinoff solver would
+        // print the whole base context once per query.
+        let mut index = relevance::Index::new();
         for (solver, state) in states.iter().enumerate() {
+            let fingerprints = state.journal.fingerprints(&mut index);
             for (local, query) in state.journal.queries.iter().enumerate() {
                 let function = fun_as_friendly_rust_name(&query.context.fun);
                 let repeat = repeats
@@ -507,11 +582,135 @@ impl RetainedBucket {
                         vir::def::ProverChoice::Singular => "singular",
                     },
                     span: query.context.span.as_string.clone(),
+                    fingerprint: fingerprints[local],
                 });
                 addresses.push((solver, local));
             }
         }
         Self { id, queries, addresses, cert_keys, state: Mutex::new(states), symbols, quantifiers }
+    }
+}
+
+/// What a caller compares a retained query by across compilations: FNV-1a
+/// over the AIR of the declarations it reads of the ones asserted below it
+/// (its prefix: the prelude, which reads the crate's word size, and the
+/// declarations of the bucket's base context and of the journal scopes up to
+/// the query's own that the query can reach, none of which a bit-vector
+/// query's solver gets -- see `relevance` for what reaching means and for
+/// what a prefix hash promises) and
+/// over the query itself, each printed as AIR. The printer writes an
+/// assertion's labels as their notes and never a span, so a query that only
+/// moved to other lines prints the same, and generated local names carry
+/// per-function counters, not line numbers. A quantifier's triggers are
+/// hashed sorted and once each (see `sort_patterns`), and its `:qid` and
+/// `:skolemid` without the counter they end in, which is the bucket's, not
+/// the function's (see `forget_quantifier_counters`). The body hash also
+/// covers the query's rlimit, since the budget a query checks at can change
+/// its verdict. Two queries with the same function, kind and description and
+/// the same fingerprint are the same query over the same declarations it can
+/// reach, up to the names of their quantifiers; a declaration neither can
+/// reach may differ between them (see `relevance`). What a caller carries
+/// over by fingerprint must not name a quantifier by its `:qid`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize)]
+pub(crate) struct Fingerprint {
+    prefix: u64,
+    body: u64,
+}
+
+/// FNV-1a over printed AIR.
+struct Fnv(u64);
+
+impl Fnv {
+    fn new() -> Self {
+        Self(0xcbf2_9ce4_8422_2325)
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for byte in bytes {
+            self.0 ^= u64::from(*byte);
+            self.0 = self.0.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+
+    fn node(&mut self, node: &TreeNode) {
+        let mut node = node.clone();
+        sort_patterns(&mut node);
+        forget_quantifier_counters(&mut node);
+        self.write(air::printer::node_to_string(&node).as_bytes());
+        self.write(b"\n");
+    }
+}
+
+/// Put every annotated term's `:pattern` groups in the order of their text,
+/// once each, in place: `(! e :pattern (p) :pattern (q) :qid ...)` keeps its
+/// other annotations where they are, and the patterns take the place of the
+/// first. Automatic trigger selection lists a quantifier's triggers in an
+/// order that varies from one compilation to the next, and sometimes lists
+/// one twice; neither changes the query.
+fn sort_patterns(node: &mut TreeNode) {
+    let TreeNode::List(items) = node else { return };
+    for item in items.iter_mut() {
+        sort_patterns(item);
+    }
+    if !matches!(items.first(), Some(TreeNode::Atom(bang)) if bang == "!") {
+        return;
+    }
+    let mut rest = Vec::with_capacity(items.len());
+    let mut patterns: Vec<(String, TreeNode)> = Vec::new();
+    let mut first = None;
+    let mut i = 0;
+    while i < items.len() {
+        if matches!(&items[i], TreeNode::Atom(key) if key == ":pattern") && i + 1 < items.len() {
+            first.get_or_insert(rest.len());
+            patterns.push((air::printer::node_to_string(&items[i + 1]), items[i + 1].clone()));
+            i += 2;
+        } else {
+            rest.push(items[i].clone());
+            i += 1;
+        }
+    }
+    let Some(first) = first else { return };
+    patterns.sort_by(|a, b| a.0.cmp(&b.0));
+    patterns.dedup_by(|a, b| a.0 == b.0);
+    let tail = rest.split_off(first);
+    for (_, pattern) in patterns {
+        rest.push(TreeNode::Atom(":pattern".to_owned()));
+        rest.push(pattern);
+    }
+    rest.extend(tail);
+    *items = rest;
+}
+
+/// Drop the counter from every user quantifier's `:qid` and `:skolemid`, in
+/// place: `user_f_12` becomes `user_f_`. The counter is kept per bucket, not
+/// per function (`new_user_qid`), so it moves with every quantifier lowered
+/// before this one in the bucket: one added to an earlier function, or a
+/// recommends query lowered for an earlier function, as a retain-only session
+/// lowers some a checked session does not and a check that starts or stops
+/// failing adds or drops one. None of those changes this quantifier, whose
+/// own text is hashed with its name.
+fn forget_quantifier_counters(node: &mut TreeNode) {
+    let TreeNode::List(items) = node else { return };
+    for item in items.iter_mut() {
+        forget_quantifier_counters(item);
+    }
+    if !matches!(items.first(), Some(TreeNode::Atom(bang)) if bang == "!") {
+        return;
+    }
+    let skolem_prefix = air::def::mk_skolem_id(air::profiler::USER_QUANT_PREFIX);
+    for i in 1..items.len() {
+        if !matches!(&items[i - 1], TreeNode::Atom(key) if key == ":qid" || key == ":skolemid") {
+            continue;
+        }
+        let TreeNode::Atom(name) = &mut items[i] else { continue };
+        if !name.starts_with(air::profiler::USER_QUANT_PREFIX) && !name.starts_with(&skolem_prefix)
+        {
+            continue;
+        }
+        let without = name.trim_end_matches(|c: char| c.is_ascii_digit()).len();
+        if without < name.len() && name[..without].ends_with('_') {
+            name.truncate(without);
+        }
     }
 }
 
@@ -654,6 +853,26 @@ pub(crate) struct Server {
     /// (bucket, query) -> the rung its checks try first, as its last ladder
     /// request found.
     pins: HashMap<(usize, usize), Pin>,
+    /// The instantiation strategies a solver of this session has a module
+    /// for, as the first probe of one of them found (`SessionRungs`).
+    rungs: SessionRungs,
+}
+
+/// What the solvers of a session can run one strategy of, which is a
+/// property of the cvc5 they were all launched from and of the options they
+/// were all launched with, not of one solver's state. The first probe
+/// records it for the rest: a caller refreshing a session carries a pin over
+/// for every query whose fingerprint is unchanged, which is every query it
+/// does not mean to check, and probing each one's solver would start it and
+/// send it the whole context it never needs.
+#[derive(PartialEq, Eq)]
+enum SessionRungs {
+    /// Nothing has probed a solver yet.
+    Unknown,
+    /// This cvc5 does not know `:quant-strategy`.
+    Unsupported,
+    /// The strategies a rung can name.
+    Available(Vec<String>),
 }
 
 /// What a session reports about the invocation behind it, and the settings a
@@ -685,6 +904,10 @@ pub(crate) struct SessionInfo {
     /// Whether cvc5 solvers were launched with every instantiation strategy a
     /// ladder request can run (`VERUS_RESIDENT_STRATEGY_LADDER`).
     pub(crate) strategy_ladder: bool,
+    /// Whether the invocation retained its queries without checking any of
+    /// them (`VERUS_RESIDENT_RETAIN_ONLY`): its `invocation_succeeded` says
+    /// nothing about them, and no verdict is on record.
+    pub(crate) retain_only: bool,
 }
 
 #[derive(Serialize)]
@@ -705,12 +928,19 @@ enum Response<'a> {
         instantiation_replay: bool,
         inst_graph: bool,
         strategy_ladder: bool,
+        retain_only: bool,
         input_files: &'a [String],
         buckets: &'a [BucketDescription],
     },
     Queries {
         session: &'a str,
         buckets: &'a [BucketDescription],
+    },
+    Pinned {
+        session: &'a str,
+        bucket: BucketIndex,
+        query: QueryId,
+        pin: Pin,
     },
     Checked {
         session: &'a str,
@@ -3639,7 +3869,7 @@ fn serve_speculate(
         .base
         .iter()
         .chain(journal.contexts[..prefix].iter().flatten())
-        .flat_map(|batch| batch.iter())
+        .flat_map(|batch| batch.commands.iter())
         .filter_map(|command| match &**command {
             CommandX::Global(decl) => Some(decl),
             _ => None,
@@ -4734,6 +4964,79 @@ fn ladder_rung(
     })
 }
 
+/// Whether `rlimit`, in `#[verifier::rlimit]` units, is too small for a
+/// single cvc5 resource unit: `set_rlimit` converts such a budget to 0, which
+/// cvc5 takes as no limit at all. Leaves the solver at `restore`.
+fn below_one_resource_unit(
+    air: &mut Context,
+    rlimit: f32,
+    restore: f32,
+    set_rlimit: &impl Fn(&mut Context, f32),
+) -> bool {
+    set_rlimit(air, rlimit);
+    let below = air.cvc5_query_budget() == 0;
+    set_rlimit(air, restore);
+    below
+}
+
+/// Refuse a pin request that the query's checks could not follow, for a
+/// query of `bucket` whose address the caller has checked. A check tries a
+/// pinned rung by setting `:quant-strategy` without asking first, so a pin on
+/// a cvc5 without that option would fail that check and end the session; a
+/// rung the solver has no module for would run nothing, at every check; and
+/// a budget below one cvc5 resource unit would run the attempt with no limit
+/// at all. Both explicit pins and ladder-generated pins pass this check:
+/// a ladder may have run at a larger budget than the query permits a pin.
+///
+/// Which rungs a solver has is the session's (`SessionRungs`), so only the
+/// first pin of a session probes one; the budget is the query's own, so it
+/// is checked on the query's solver every time, which reaches a solver that
+/// has already been started or is about to be.
+/// `Ok(Err(_))` is a refusal to report; `Err` ends the session.
+fn check_pin(
+    bucket: &RetainedBucket,
+    id: QueryId,
+    rung: Rung,
+    rlimit: f32,
+    known: &mut SessionRungs,
+    set_rlimit: &impl Fn(&mut Context, f32),
+) -> io::Result<Result<(), &'static str>> {
+    let mut state =
+        bucket.state.lock().map_err(|_| io::Error::other("resident bucket poisoned"))?;
+    let (solver, local) = bucket.addresses[id.0];
+    let SolverState { air, journal } = &mut state[solver];
+    if !matches!(air.get_solver(), SmtSolver::Cvc5) {
+        return Ok(Err("pin requests need cvc5"));
+    }
+    let query_rlimit = journal.queries[local].rlimit;
+    if below_one_resource_unit(air, rlimit.min(query_rlimit), query_rlimit, set_rlimit) {
+        return Ok(Err("the pin's budget is below one cvc5 resource unit"));
+    }
+    if *known == SessionRungs::Unknown {
+        // The first probe of a solver that has not checked anything yet, as
+        // in a retain-only session, starts it, sends the context it was
+        // given and initializes it even when that context is empty, as a
+        // bit-vector query's is, so the modules it has are known by the time
+        // it answers.
+        *known = match air.probe_strategy_rung() {
+            Some(probe) => SessionRungs::Available(probe.available),
+            None => SessionRungs::Unsupported,
+        };
+    }
+    match known {
+        SessionRungs::Unknown => unreachable!("probed above"),
+        SessionRungs::Unsupported => Ok(Err(
+            "this cvc5 cannot run one instantiation strategy alone; it needs :quant-strategy",
+        )),
+        SessionRungs::Available(available) => {
+            if !available.iter().any(|name| name == rung.name()) {
+                return Ok(Err("the solver has no module for this rung"));
+            }
+            Ok(Ok(()))
+        }
+    }
+}
+
 /// Serve a ladder request for one query of `bucket`, whose address the
 /// caller has checked. Each rung checks the query with its strategy alone or,
 /// with `alongside`, together with the default schedule, at its own budget,
@@ -4748,6 +5051,7 @@ fn serve_ladder(
     budgets: &HashMap<Rung, f32>,
     run_all: bool,
     alongside: bool,
+    known: &mut SessionRungs,
     set_rlimit: &impl Fn(&mut Context, f32),
 ) -> io::Result<Result<LadderReport, &'static str>> {
     let mut state =
@@ -4759,31 +5063,35 @@ fn serve_ladder(
     }
     let prefix = journal.queries[local].prefix;
     let query_rlimit = journal.queries[local].rlimit;
-    // A budget is in `#[verifier::rlimit]` units, converted to cvc5's by
-    // `set_rlimit`. One too small for a single cvc5 unit converts to 0, which
-    // cvc5 takes as no limit at all, so it is refused before any rung runs.
-    for &rlimit in budgets.values() {
-        set_rlimit(air, rlimit);
-        if air.cvc5_query_budget() == 0 {
-            set_rlimit(air, query_rlimit);
-            return Ok(Err("a rung's budget is below one cvc5 resource unit"));
-        }
+    // Validate the resolved budgets before any rung runs, including the
+    // query budget used by rungs without an explicit override.
+    let default_budget = if query_rlimit.is_finite() { query_rlimit } else { DEFAULT_RUNG_RLIMIT };
+    if budgets
+        .values()
+        .copied()
+        .chain(rungs.iter().map(|rung| budgets.get(rung).copied().unwrap_or(default_budget)))
+        .any(|rlimit| below_one_resource_unit(air, rlimit, query_rlimit, set_rlimit))
+    {
+        return Ok(Err("a rung's budget is below one cvc5 resource unit"));
     }
-    set_rlimit(air, query_rlimit);
     let restore_start = Instant::now();
     journal.restore_prefix(air, prefix)?;
     let restore_ms = restore_start.elapsed().as_millis();
     // Asked before any option is set: a cvc5 without `:quant-strategy`
     // would answer the set-option with an error the check cannot survive.
-    let Some(probe) = air.probe_strategy_rung() else {
+    // This solver is about to run checks either way, so the ladder asks it
+    // rather than the session, and tells the session what it found.
+    let probe = air.probe_strategy_rung();
+    *known = match &probe {
+        Some(probe) => SessionRungs::Available(probe.available.clone()),
+        None => SessionRungs::Unsupported,
+    };
+    let Some(probe) = probe else {
         return Ok(Err(
             "this cvc5 cannot run one instantiation strategy alone; it needs :quant-strategy",
         ));
     };
     let query = &journal.queries[local];
-    // A rung without a budget gets the query's own, or, for a query without
-    // one, `DEFAULT_RUNG_RLIMIT`: every rung runs bounded.
-    let default_budget = if query.rlimit.is_finite() { query.rlimit } else { DEFAULT_RUNG_RLIMIT };
     let start = Instant::now();
     let mut solved_by = None;
     let mut reports = Vec::new();
@@ -4816,6 +5124,7 @@ fn serve_ladder(
 impl QueryJournal {
     pub(crate) fn new() -> Self {
         Self {
+            prelude: None,
             base: Vec::new(),
             contexts: Vec::new(),
             queries: Vec::new(),
@@ -4824,10 +5133,15 @@ impl QueryJournal {
         }
     }
 
+    /// Keep the prelude the solver started from, for fingerprints only.
+    pub(crate) fn record_prelude(&mut self, prelude: Commands) {
+        self.prelude = Some(prelude);
+    }
+
     /// Keep the context the solver already holds below the journal's first
-    /// scope, for lookups only.
-    pub(crate) fn record_base(&mut self, batches: impl Iterator<Item = Commands>) {
-        self.base.extend(batches);
+    /// scope, for lookups and fingerprints only.
+    pub(crate) fn record_base(&mut self, batches: impl Iterator<Item = (Commands, BatchOwner)>) {
+        self.base.extend(batches.map(|(commands, owner)| Batch { commands, owner }));
     }
 
     /// Retain the next declaration batch, opening a scope when one is needed.
@@ -4835,6 +5149,7 @@ impl QueryJournal {
         &mut self,
         air: &mut Context,
         commands: Commands,
+        owner: BatchOwner,
     ) -> Result<(), &'static str> {
         if commands.iter().any(|command| !matches!(**command, CommandX::Global(_))) {
             return Err("resident context batches must contain only declarations");
@@ -4848,7 +5163,7 @@ impl QueryJournal {
             self.applied += 1;
             self.recorded_in_scope = false;
         }
-        self.contexts.last_mut().expect("scope opened above").push(commands);
+        self.contexts.last_mut().expect("scope opened above").push(Batch { commands, owner });
         Ok(())
     }
 
@@ -4881,13 +5196,19 @@ impl QueryJournal {
         Ok(())
     }
 
+    /// Every retained query's fingerprint, in journal order, over the
+    /// declarations each query reads of the ones below it (see `relevance`).
+    fn fingerprints(&self, index: &mut relevance::Index) -> Vec<Fingerprint> {
+        relevance::fingerprints(self, index)
+    }
+
     /// The declarations of the scopes below `prefix`, in the order they were
     /// asserted.
     fn prefix_decls(&self, prefix: usize) -> Vec<air::ast::Decl> {
         self.contexts[..prefix]
             .iter()
             .flatten()
-            .flat_map(|batch| batch.iter())
+            .flat_map(|batch| batch.commands.iter())
             .filter_map(|command| match &**command {
                 CommandX::Global(decl) => Some(decl.clone()),
                 _ => None,
@@ -4907,7 +5228,7 @@ impl QueryJournal {
             let scope = self.applied;
             self.applied += 1;
             for batch in self.contexts[scope].iter() {
-                for command in batch.iter() {
+                for command in batch.commands.iter() {
                     if let CommandX::Global(decl) = &**command {
                         air.global(decl).map_err(|error| io::Error::other(error.to_string()))?;
                     }
@@ -4940,6 +5261,7 @@ impl Server {
             info,
             graphs: KeptGraphs::new(MAX_KEPT_INSTANTIATIONS),
             pins: HashMap::new(),
+            rungs: SessionRungs::Unknown,
         }
     }
 
@@ -5014,6 +5336,7 @@ impl Server {
                 instantiation_replay: self.info.instantiation_replay,
                 inst_graph: self.info.inst_graph,
                 strategy_ladder: self.info.strategy_ladder,
+                retain_only: self.info.retain_only,
                 input_files: &self.info.input_files,
                 buckets: &buckets,
             },
@@ -5062,6 +5385,7 @@ impl Server {
                 | Request::InstGraph { session: requested, .. }
                 | Request::Twin { session: requested, .. }
                 | Request::Ladder { session: requested, .. }
+                | Request::Pin { session: requested, .. }
                     if requested != session =>
                 {
                     send(
@@ -5071,6 +5395,40 @@ impl Server {
                 }
                 Request::List { .. } => {
                     send(&mut output, &Response::Queries { session, buckets: &buckets })?
+                }
+                Request::Pin { bucket: bucket_id, query: id, rung, alongside, rlimit, .. } => {
+                    let Some(bucket) = self.buckets.get(bucket_id.0) else {
+                        send(&mut output, &Response::Error { message: "unknown bucket" })?;
+                        continue;
+                    };
+                    if bucket.queries.get(id.0).is_none() {
+                        send(&mut output, &Response::Error { message: "unknown query" })?;
+                        continue;
+                    }
+                    // Bounded as a ladder bounds a rung's budget, so a check
+                    // that tries the pin first is bounded even for a query
+                    // without an rlimit.
+                    if !(rlimit > 0.0 && rlimit <= MAX_RUNG_RLIMIT) {
+                        send(
+                            &mut output,
+                            &Response::Error { message: "rlimit must be above 0 and at most 1000" },
+                        )?;
+                        continue;
+                    }
+                    match check_pin(bucket, id, rung, rlimit, &mut self.rungs, &set_rlimit) {
+                        Ok(Ok(())) => {}
+                        Ok(Err(message)) => {
+                            send(&mut output, &Response::Error { message })?;
+                            continue;
+                        }
+                        Err(error) => return fatal(&mut output, error),
+                    }
+                    let pin = Pin { rung, alongside, rlimit };
+                    self.pins.insert((bucket_id.0, id.0), pin);
+                    send(
+                        &mut output,
+                        &Response::Pinned { session, bucket: bucket_id, query: id, pin },
+                    )?;
                 }
                 Request::Close { .. } => {
                     if let Err(error) = self.shutdown() {
@@ -5416,6 +5774,7 @@ impl Server {
                         &budgets,
                         run_all,
                         alongside,
+                        &mut self.rungs,
                         &set_rlimit,
                     ) {
                         Ok(Ok(mut report)) => {
@@ -5430,7 +5789,25 @@ impl Server {
                                             .find(|report| report.rung == rung)
                                             .and_then(|report| report.rlimit)
                                             .expect("the rung that proved the query ran");
-                                        self.pins.insert(key, Pin { rung, alongside, rlimit });
+                                        match check_pin(
+                                            bucket,
+                                            id,
+                                            rung,
+                                            rlimit,
+                                            &mut self.rungs,
+                                            &set_rlimit,
+                                        ) {
+                                            Ok(Ok(())) => {
+                                                self.pins
+                                                    .insert(key, Pin { rung, alongside, rlimit });
+                                            }
+                                            Ok(Err(_)) => {
+                                                // The rung proved it at its own budget, but
+                                                // clamping to the query's would be unlimited.
+                                                self.pins.remove(&key);
+                                            }
+                                            Err(error) => return fatal(&mut output, error),
+                                        }
                                     }
                                     None => {
                                         self.pins.remove(&key);
@@ -5551,10 +5928,10 @@ impl Server {
                             elapsed_ms: start.elapsed().as_millis(),
                         });
                     }
-                    // Then the pinned rung, when a ladder request pinned one:
-                    // its strategy, alone or alongside as the ladder ran it,
-                    // at the budget it proved the query at or the query's
-                    // own, whichever is smaller, so it is bounded even for a
+                    // Then the pinned rung, when a ladder or pin request set
+                    // one: its strategy, alone or alongside as pinned, at the
+                    // budget it was pinned at or the query's own, whichever
+                    // is smaller, so it is bounded even for a
                     // query without an rlimit. It changes which instances
                     // are tried, never what is asserted, so a valid answer
                     // is sound, and that answer's diagnostics (provenance,
@@ -6065,7 +6442,7 @@ mod tests {
                 air.global(decl).unwrap();
             }
         }
-        session.push_context(&mut air, later.clone()).unwrap();
+        session.push_context(&mut air, later.clone(), BatchOwner::Module).unwrap();
         for command in later.iter() {
             if let CommandX::Global(decl) = &**command {
                 air.global(decl).unwrap();
@@ -6093,7 +6470,16 @@ mod tests {
     /// Apply a declaration batch the way the verifier does: retain it, then
     /// let AIR assert it into the scope the journal just chose.
     fn apply(journal: &mut QueryJournal, air: &mut Context, batch: &Commands) {
-        journal.push_context(air, batch.clone()).unwrap();
+        apply_owned(journal, air, batch, BatchOwner::Module)
+    }
+
+    fn apply_owned(
+        journal: &mut QueryJournal,
+        air: &mut Context,
+        batch: &Commands,
+        owner: BatchOwner,
+    ) {
+        journal.push_context(air, batch.clone(), owner).unwrap();
         for command in batch.iter() {
             if let CommandX::Global(decl) = &**command {
                 air.global(decl).unwrap();
@@ -6551,6 +6937,7 @@ mod tests {
                 instantiation_replay: false,
                 inst_graph: false,
                 strategy_ladder: false,
+                retain_only: false,
             },
         );
         let input = format!("{}\n{{\"command\":\"list\"}}\n", " ".repeat(65537));
@@ -6564,5 +6951,485 @@ mod tests {
         assert_eq!(output.lines().count(), 2, "{output}");
         assert!(!output.contains("\"queries\""), "{output}");
         assert!(output.lines().nth(1).unwrap().contains("64 KiB"), "{output}");
+    }
+
+    /// A retained query's fingerprint reads its AIR, not where it came from:
+    /// spans on the query's context and on its assertions leave it alone,
+    /// a declaration added below it or another prelude changes its prefix and
+    /// nothing else, and
+    /// an edit to the query or to its rlimit changes its body and nothing
+    /// else.
+    #[test]
+    fn fingerprints_ignore_spans_and_tell_the_prefix_from_the_body() {
+        use air::ast::{QueryX, StmtX};
+        use vir::messages::ToAny;
+        let span = |text: &str| vir::messages::Span {
+            raw_span: Arc::new(()),
+            id: 0,
+            data: Vec::new(),
+            as_string: text.to_owned(),
+        };
+        let fun = Arc::new(vir::ast::FunX {
+            path: Arc::new(vir::ast::PathX {
+                krate: vir::ast::CrateId::Internal,
+                segments: Arc::new(vec![Arc::new("f".to_owned())]),
+            }),
+        });
+        // A query over `x` whose one assertion, labelled at `at`, checks `text`.
+        let query = |at: &str, text: &str| {
+            let parsed = commands(&format!("(check-valid (declare-const x Int) (assert {text}))"));
+            let CommandX::CheckValid(parsed) = &*parsed[0] else { panic!("a query") };
+            let StmtX::Assert(_, _, _, expr) = &*parsed.assertion else { panic!("an assert") };
+            let assertion = Arc::new(StmtX::Assert(
+                None,
+                vir::messages::error(&span(at), "assertion failed").to_any(),
+                None,
+                expr.clone(),
+            ));
+            Arc::new(QueryX { local: parsed.local.clone(), assertion })
+        };
+        // The journal of one compilation: a base, a scope of declarations,
+        // then the query at `rlimit`, and after it one more declaration.
+        let journal_on = |prelude: &str, at: &str, extra_below: &str, text: &str, rlimit: f32| {
+            let mut air = Context::new(Arc::new(VirMessageInterface {}), SmtSolver::Cvc5);
+            let mut journal = QueryJournal::new();
+            journal.record_prelude(commands(prelude));
+            let base = commands("(declare-fun g (Int) Bool)");
+            for command in base.iter() {
+                if let CommandX::Global(decl) = &**command {
+                    air.global(decl).unwrap();
+                }
+            }
+            journal.record_base(std::iter::once((base, BatchOwner::Module)));
+            apply(&mut journal, &mut air, &commands(&format!("(axiom (g 1)) {extra_below}")));
+            journal
+                .record_query(
+                    vir::def::CommandsWithContextX::new(
+                        fun.clone(),
+                        span(at),
+                        "body".to_owned(),
+                        Arc::new(vec![Arc::new(CommandX::CheckValid(query(at, text)))]),
+                        vir::def::ProverChoice::DefaultProver,
+                        false,
+                    ),
+                    &QueryOp::Body(Style::Normal),
+                    rlimit,
+                )
+                .unwrap();
+            apply(&mut journal, &mut air, &commands("(axiom (g 2))"));
+            journal.fingerprints(&mut relevance::Index::new())
+        };
+        let prelude = "(declare-const SZ Int)";
+        let journal_at = |at: &str, extra_below: &str, text: &str, rlimit: f32| {
+            journal_on(prelude, at, extra_below, text, rlimit)
+        };
+        let journal =
+            |at: &str, extra_below: &str, text: &str| journal_at(at, extra_below, text, 1.0);
+        let before = journal("a.rs:3:5", "", "(> x 0)");
+        assert_eq!(before.len(), 1);
+        // Moved to other lines: the same fingerprint.
+        assert_eq!(journal("a.rs:9:5", "", "(> x 0)"), before);
+        // A declaration added below the query: its prefix changed, its body did not.
+        let below = journal("a.rs:3:5", "(axiom (g 3))", "(> x 0)");
+        assert_ne!(below[0].prefix, before[0].prefix);
+        assert_eq!(below[0].body, before[0].body);
+        // Another prelude: its prefix changed, its body did not.
+        let word =
+            journal_on("(declare-const SZ Int) (axiom (= SZ 64))", "a.rs:3:5", "", "(> x 0)", 1.0);
+        assert_ne!(word[0].prefix, before[0].prefix);
+        assert_eq!(word[0].body, before[0].body);
+        // The query itself edited: its body changed, its prefix did not.
+        let edited = journal("a.rs:3:5", "", "(>= x 0)");
+        assert_eq!(edited[0].prefix, before[0].prefix);
+        assert_ne!(edited[0].body, before[0].body);
+        // The same query at another rlimit: its body changed, its prefix did not.
+        let budget = journal_at("a.rs:3:5", "", "(> x 0)", 5.0);
+        assert_eq!(budget[0].prefix, before[0].prefix);
+        assert_ne!(budget[0].body, before[0].body);
+        // Triggers listed in another order: the same query, so the same body.
+        let quantified = |patterns: &str| {
+            journal(
+                "a.rs:3:5",
+                "",
+                &format!(
+                    "(forall ((y Int)) (! (=> (g y) (> x y)) {patterns} :qid q :skolemid skolem_q))"
+                ),
+            )
+        };
+        let one = quantified(":pattern ((g y)) :pattern ((> x y))");
+        assert_eq!(one, quantified(":pattern ((> x y)) :pattern ((g y))"));
+        // A trigger listed twice: the same query too.
+        assert_eq!(one, quantified(":pattern ((g y)) :pattern ((> x y)) :pattern ((g y))"));
+        assert_ne!(one[0].body, quantified(":pattern ((g y))")[0].body);
+        // A user quantifier numbered otherwise by the bucket's counter: the
+        // same query. One named for another function is not.
+        let named = |qid: &str| {
+            journal(
+                "a.rs:3:5",
+                "",
+                &format!(
+                    "(forall ((y Int)) (! (=> (g y) (> x y)) :pattern ((g y)) :qid {qid} :skolemid skolem_{qid}))"
+                ),
+            )
+        };
+        let numbered = named("user_crate__f_3");
+        assert_eq!(numbered, named("user_crate__f_17"));
+        assert_ne!(numbered[0].body, named("user_crate__g_3")[0].body);
+    }
+
+    /// A prefix fingerprint reads the declarations the query reaches: an
+    /// item's own declarations and axioms are read by the queries that reach
+    /// a name it declares and by those that reach it through another item,
+    /// and by no others, so a lemma added beside a query leaves it alone. A
+    /// `distinct` over constants is read over the constants the query
+    /// reaches, as a module's fuel constants are.
+    #[test]
+    fn fingerprints_read_the_declarations_a_query_reaches() {
+        use air::ast::{QueryX, StmtX};
+        use vir::messages::ToAny;
+        let span = |text: &str| vir::messages::Span {
+            raw_span: Arc::new(()),
+            id: 0,
+            data: Vec::new(),
+            as_string: text.to_owned(),
+        };
+        let fun = Arc::new(vir::ast::FunX {
+            path: Arc::new(vir::ast::PathX {
+                krate: vir::ast::CrateId::Internal,
+                segments: Arc::new(vec![Arc::new("f".to_owned())]),
+            }),
+        });
+        let item = |name: &str| BatchOwner::Item(Arc::new(name.to_owned()));
+        // A module whose base declares `g`, whose constants are asserted
+        // distinct as a module's fuel constants are, and which has two items:
+        // `j`, an axiom about `g`, and `h`, an axiom about `j`.
+        let journal_of = |constants: &str, about_j: &str, about_h: &str, text: &str| {
+            let mut air = Context::new(Arc::new(VirMessageInterface {}), SmtSolver::Cvc5);
+            let mut journal = QueryJournal::new();
+            journal.record_prelude(commands("(declare-const SZ Int)"));
+            let base = commands("(declare-fun g (Int) Bool)");
+            for command in base.iter() {
+                if let CommandX::Global(decl) = &**command {
+                    air.global(decl).unwrap();
+                }
+            }
+            journal.record_base(std::iter::once((base, BatchOwner::Module)));
+            apply(&mut journal, &mut air, &commands(constants));
+            apply_owned(&mut journal, &mut air, &commands("(declare-fun j (Int) Bool)"), item("j"));
+            apply_owned(&mut journal, &mut air, &commands(about_j), item("j"));
+            apply_owned(&mut journal, &mut air, &commands("(declare-fun h (Int) Bool)"), item("h"));
+            apply_owned(&mut journal, &mut air, &commands(about_h), item("h"));
+            let parsed = commands(&format!("(check-valid (declare-const x Int) (assert {text}))"));
+            let CommandX::CheckValid(parsed) = &*parsed[0] else { panic!("a query") };
+            let StmtX::Assert(_, _, _, expr) = &*parsed.assertion else { panic!("an assert") };
+            let assertion = Arc::new(StmtX::Assert(
+                None,
+                vir::messages::error(&span("a.rs:3:5"), "assertion failed").to_any(),
+                None,
+                expr.clone(),
+            ));
+            journal
+                .record_query(
+                    vir::def::CommandsWithContextX::new(
+                        fun.clone(),
+                        span("a.rs:3:5"),
+                        "body".to_owned(),
+                        Arc::new(vec![Arc::new(CommandX::CheckValid(Arc::new(QueryX {
+                            local: parsed.local.clone(),
+                            assertion,
+                        })))]),
+                        vir::def::ProverChoice::DefaultProver,
+                        false,
+                    ),
+                    &QueryOp::Body(Style::Normal),
+                    1.0,
+                )
+                .unwrap();
+            journal.fingerprints(&mut relevance::Index::new())[0]
+        };
+        let constants = "(declare-const fa Int) (declare-const fb Int) (axiom (distinct fa fb))";
+        let one_more = "(declare-const fa Int) (declare-const fb Int) (declare-const fc Int) \
+             (axiom (distinct fa fb fc))";
+        let about = |head: &str, body: &str, qid: &str| {
+            format!(
+                "(axiom (forall ((y Int)) (! (=> ({head} y) {body}) \
+                 :pattern (({head} y)) :qid user_crate__{qid}_1 :skolemid skolem_user_crate__{qid}_1)))"
+            )
+        };
+        let about_j = about("j", "(g y)", "j");
+        let about_h = about("h", "(j y)", "h");
+        let fingerprint = |constants: &str, about_j: &str, about_h: &str, text: &str| {
+            journal_of(constants, about_j, about_h, text)
+        };
+        // A constant added to the module, distinct from the rest, leaves the
+        // queries alone, whether or not they reach the others.
+        for text in ["(> x 0)", "(and (> fa 0) (> fb 0))"] {
+            assert_eq!(
+                fingerprint(one_more, &about_j, &about_h, text),
+                fingerprint(constants, &about_j, &about_h, text),
+                "{text}"
+            );
+        }
+        // An item nothing reaches: its axiom is no part of any other query.
+        let other_h = about("h", "(g y)", "h");
+        for text in ["(> x 0)", "(j x)"] {
+            assert_eq!(
+                fingerprint(constants, &about_j, &other_h, text),
+                fingerprint(constants, &about_j, &about_h, text),
+                "{text}"
+            );
+        }
+        // The queries that reach it read it, and reading `h` reads `j`, which
+        // `h`'s axiom names.
+        let other_j = about("j", "(> y 0)", "j");
+        for text in ["(h x)", "(j x)"] {
+            assert_ne!(
+                fingerprint(constants, &other_j, &about_h, text).prefix,
+                fingerprint(constants, &about_j, &about_h, text).prefix,
+                "{text}"
+            );
+        }
+        assert_ne!(
+            fingerprint(constants, &about_j, &other_h, "(h x)").prefix,
+            fingerprint(constants, &about_j, &about_h, "(h x)").prefix
+        );
+        // The query itself is no part of the prefix either way.
+        assert_eq!(
+            fingerprint(constants, &about_j, &about_h, "(h x)").prefix,
+            fingerprint(constants, &about_j, &about_h, "(and (h x) (h 1))").prefix
+        );
+    }
+
+    /// An item's axiom is read by the queries that can trigger it, whether or
+    /// not the trigger names what the item declares: `imp`'s definition is
+    /// keyed on `m`, which item `m` declares, as a trait impl's spec
+    /// definition is keyed on the trait method; `id`'s axiom on `fndef_id`, a
+    /// module-wide constant, and `closure_ens`, which no batch declares, as a
+    /// function's `FnDef` axioms are. An axiom whose trigger names nothing of
+    /// the bucket is read by every query.
+    #[test]
+    fn fingerprints_read_an_item_axiom_by_its_triggers() {
+        use air::ast::{QueryX, StmtX};
+        use vir::messages::ToAny;
+        let span = |text: &str| vir::messages::Span {
+            raw_span: Arc::new(()),
+            id: 0,
+            data: Vec::new(),
+            as_string: text.to_owned(),
+        };
+        let fun = Arc::new(vir::ast::FunX {
+            path: Arc::new(vir::ast::PathX {
+                krate: vir::ast::CrateId::Internal,
+                segments: Arc::new(vec![Arc::new("f".to_owned())]),
+            }),
+        });
+        let item = |name: &str| BatchOwner::Item(Arc::new(name.to_owned()));
+        let forall = |pattern: &str, body: &str| {
+            format!("(axiom (forall ((y Int)) (! {body} :pattern ({pattern}))))")
+        };
+        let journal_of = |imp_body: &str, id_ens: &str, anywhere: &str, text: &str| {
+            let mut air = Context::new(Arc::new(VirMessageInterface {}), SmtSolver::Cvc5);
+            let mut journal = QueryJournal::new();
+            // Declared as the prelude declares it: below every batch.
+            for command in commands("(declare-fun closure_ens (Int Int) Bool)").iter() {
+                if let CommandX::Global(decl) = &**command {
+                    air.global(decl).unwrap();
+                }
+            }
+            journal.record_prelude(commands("(declare-const SZ Int)"));
+            let base = commands("(declare-const fndef_id Int)");
+            for command in base.iter() {
+                if let CommandX::Global(decl) = &**command {
+                    air.global(decl).unwrap();
+                }
+            }
+            journal.record_base(std::iter::once((base, BatchOwner::Module)));
+            apply_owned(&mut journal, &mut air, &commands("(declare-fun m (Int) Int)"), item("m"));
+            let imp = format!(
+                "(declare-fun rec_imp (Int) Int) {} {}",
+                forall("(m y)", "(= (m y) (rec_imp y))"),
+                forall("(rec_imp y)", &format!("(= (rec_imp y) {imp_body})")),
+            );
+            apply_owned(&mut journal, &mut air, &commands(&imp), item("imp"));
+            let id = format!(
+                "(declare-fun ens_id (Int) Bool) {} {}",
+                forall("(closure_ens fndef_id y)", "(= (closure_ens fndef_id y) (ens_id y))"),
+                forall("(ens_id y)", &format!("(= (ens_id y) {id_ens})")),
+            );
+            apply_owned(&mut journal, &mut air, &commands(&id), item("id"));
+            apply_owned(
+                &mut journal,
+                &mut air,
+                &commands(&forall("(closure_ens 0 y)", anywhere)),
+                item("anywhere"),
+            );
+            let parsed = commands(&format!("(check-valid (declare-const x Int) (assert {text}))"));
+            let CommandX::CheckValid(parsed) = &*parsed[0] else { panic!("a query") };
+            let StmtX::Assert(_, _, _, expr) = &*parsed.assertion else { panic!("an assert") };
+            let assertion = Arc::new(StmtX::Assert(
+                None,
+                vir::messages::error(&span("a.rs:3:5"), "assertion failed").to_any(),
+                None,
+                expr.clone(),
+            ));
+            journal
+                .record_query(
+                    vir::def::CommandsWithContextX::new(
+                        fun.clone(),
+                        span("a.rs:3:5"),
+                        "body".to_owned(),
+                        Arc::new(vec![Arc::new(CommandX::CheckValid(Arc::new(QueryX {
+                            local: parsed.local.clone(),
+                            assertion,
+                        })))]),
+                        vir::def::ProverChoice::DefaultProver,
+                        false,
+                    ),
+                    &QueryOp::Body(Style::Normal),
+                    1.0,
+                )
+                .unwrap();
+            journal.fingerprints(&mut relevance::Index::new())[0].prefix
+        };
+        let anywhere = "(=> (closure_ens 0 y) true)";
+        let prefix =
+            |imp_body: &str, id_ens: &str, text: &str| journal_of(imp_body, id_ens, anywhere, text);
+        let via_m = "(= (m x) 0)";
+        let via_value = "(closure_ens fndef_id x)";
+        let neither = "(> x 0)";
+        // `imp`'s definition edited: read through `m`, which `imp` does not
+        // declare, and by no query that reaches neither.
+        assert_ne!(prefix("1", "true", via_m), prefix("0", "true", via_m));
+        assert_eq!(prefix("1", "true", via_value), prefix("0", "true", via_value));
+        assert_eq!(prefix("1", "true", neither), prefix("0", "true", neither));
+        // `id`'s ensures edited: read through its `FnDef` axiom.
+        assert_ne!(prefix("0", "(> y 0)", via_value), prefix("0", "true", via_value));
+        assert_eq!(prefix("0", "(> y 0)", via_m), prefix("0", "true", via_m));
+        assert_eq!(prefix("0", "(> y 0)", neither), prefix("0", "true", neither));
+        // Triggered on a term every query can build.
+        assert_ne!(
+            journal_of("0", "true", "(=> (closure_ens 0 y) false)", neither),
+            journal_of("0", "true", anywhere, neither)
+        );
+    }
+
+    /// A module's transparent datatypes are one `declare-datatypes`, and a
+    /// prefix fingerprint reads the datatypes of it the query reaches, not
+    /// the block: a struct added beside another leaves the queries that use
+    /// the other alone, and so do the added struct's own declarations. What
+    /// a datatype the query reaches mentions is reached in turn, so a field's
+    /// sort is read.
+    #[test]
+    fn fingerprints_read_the_datatypes_a_query_reaches() {
+        use air::ast::{QueryX, StmtX};
+        use vir::messages::ToAny;
+        let span = |text: &str| vir::messages::Span {
+            raw_span: Arc::new(()),
+            id: 0,
+            data: Vec::new(),
+            as_string: text.to_owned(),
+        };
+        let fun = Arc::new(vir::ast::FunX {
+            path: Arc::new(vir::ast::PathX {
+                krate: vir::ast::CrateId::Internal,
+                segments: Arc::new(vec![Arc::new("f".to_owned())]),
+            }),
+        });
+        // A module's datatype batch, the shape `datatype_to_air` gives it:
+        // one `declare-datatypes` for every transparent datatype of the
+        // module, and then each datatype's own declarations and axioms.
+        let journal_of = |datatypes: &str, decls: &str, sort: &str, text: &str| {
+            let mut air = Context::new(Arc::new(VirMessageInterface {}), SmtSolver::Cvc5);
+            let mut journal = QueryJournal::new();
+            journal.record_prelude(commands("(declare-const SZ Int)"));
+            let base = commands("(declare-fun g (Int) Bool)");
+            for command in base.iter() {
+                if let CommandX::Global(decl) = &**command {
+                    air.global(decl).unwrap();
+                }
+            }
+            journal.record_base(std::iter::once((base, BatchOwner::Module)));
+            apply_owned(
+                &mut journal,
+                &mut air,
+                &commands(&format!("{datatypes} {decls}")),
+                BatchOwner::Datatypes,
+            );
+            let parsed =
+                commands(&format!("(check-valid (declare-const v {sort}) (assert {text}))"));
+            let CommandX::CheckValid(parsed) = &*parsed[0] else { panic!("a query") };
+            let StmtX::Assert(_, _, _, expr) = &*parsed.assertion else { panic!("an assert") };
+            let assertion = Arc::new(StmtX::Assert(
+                None,
+                vir::messages::error(&span("a.rs:3:5"), "assertion failed").to_any(),
+                None,
+                expr.clone(),
+            ));
+            journal
+                .record_query(
+                    vir::def::CommandsWithContextX::new(
+                        fun.clone(),
+                        span("a.rs:3:5"),
+                        "body".to_owned(),
+                        Arc::new(vec![Arc::new(CommandX::CheckValid(Arc::new(QueryX {
+                            local: parsed.local.clone(),
+                            assertion,
+                        })))]),
+                        vir::def::ProverChoice::DefaultProver,
+                        false,
+                    ),
+                    &QueryOp::Body(Style::Normal),
+                    1.0,
+                )
+                .unwrap();
+            journal.fingerprints(&mut relevance::Index::new())[0]
+        };
+        // Each datatype's own declarations, which name it and so are read by
+        // the queries that reach it, as `has_type` and `Poly` are.
+        let has = |name: &str| {
+            format!(
+                "(declare-fun has_{name} ({name}) Bool) \
+                 (axiom (forall ((u {name})) (! (has_{name} u) :pattern ((has_{name} u)) \
+                 :qid user_crate__{name}_1 :skolemid skolem_user_crate__{name}_1)))"
+            )
+        };
+        let a_and_b = |b_field: &str| {
+            format!("(declare-datatypes ((A 0) (B 0)) ((($A (a_x Int))) (($B (b_y {b_field})))))")
+        };
+        let ab_decls = format!("{} {}", has("A"), has("B"));
+        // The same module with a third datatype added to its block, and its
+        // own declarations after it.
+        let a_b_and_c = |b_field: &str| {
+            format!(
+                "(declare-datatypes ((A 0) (B 0) (C 0)) \
+                 ((($A (a_x Int))) (($B (b_y {b_field}))) (($C (c_z Int)))))"
+            )
+        };
+        let abc_decls = format!("{} {}", ab_decls, has("C"));
+        let reaches_a =
+            |datatypes: &str, decls: &str| journal_of(datatypes, decls, "A", "(has_A v)").prefix;
+        let reaches_b =
+            |datatypes: &str, decls: &str| journal_of(datatypes, decls, "B", "(has_B v)").prefix;
+        // A datatype added to the module, with its own declarations: the
+        // queries that reach neither it nor a datatype that names it are
+        // left alone.
+        assert_eq!(reaches_a(&a_b_and_c("Int"), &abc_decls), reaches_a(&a_and_b("Int"), &ab_decls));
+        assert_eq!(reaches_b(&a_b_and_c("Int"), &abc_decls), reaches_b(&a_and_b("Int"), &ab_decls));
+        // One datatype of the block edited: the queries that reach it read
+        // it, and the queries that do not are left alone.
+        let wider_b =
+            "(declare-datatypes ((A 0) (B 0)) ((($A (a_x Int))) (($B (b_y Int) (b_w Int)))))";
+        assert_eq!(reaches_a(wider_b, &ab_decls), reaches_a(&a_and_b("Int"), &ab_decls));
+        assert_ne!(reaches_b(wider_b, &ab_decls), reaches_b(&a_and_b("Int"), &ab_decls));
+        // A field's sort is reached through the datatype that has it: with
+        // `b_y` of sort `A`, a query over `B` reads `A` and is changed by an
+        // edit to it; with `b_y` an `Int` it is not.
+        let wider_a = |b_field: &str| {
+            format!(
+                "(declare-datatypes ((A 0) (B 0)) ((($A (a_x Int) (a_w Int))) (($B (b_y {b_field})))))"
+            )
+        };
+        assert_ne!(reaches_b(&wider_a("A"), &ab_decls), reaches_b(&a_and_b("A"), &ab_decls));
+        assert_eq!(reaches_b(&wider_a("Int"), &ab_decls), reaches_b(&a_and_b("Int"), &ab_decls));
     }
 }

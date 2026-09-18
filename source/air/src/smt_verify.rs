@@ -2077,7 +2077,8 @@ mod strategy_rung_tests {
         assert_eq!((rung.rounds, rung.resource_units), (2, 640));
         assert!(rung.instantiations.contains(&("enum".to_owned(), 34)));
         assert!(rung.instantiations.contains(&("other".to_owned(), 1)));
-        // Before any check: nothing available, the strategy as set.
+        // Before the solver is initialized: nothing available, the strategy
+        // as set.
         let idle = parse_strategy_rung(
             "(:strategy-rung (:strategy all :alone true :available () :rounds 0 \
              :resource-units 0 :instantiations (:ematch 0 :conflict 0 :pool 0 :enum 0 :mbqi 0 \

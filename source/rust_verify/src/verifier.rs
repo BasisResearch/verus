@@ -1,5 +1,5 @@
 use crate::boundary_suggestions::build_boundary_suggestion;
-use crate::commands::{OpGenerator, OpKind, QueryOp, Style};
+use crate::commands::{ContextOp, OpGenerator, OpKind, QueryOp, Style};
 use crate::config::{Args, CargoVerusArgs, ShowTriggers};
 use crate::context::{ContextX, ErasureInfo};
 use crate::debugger::Debugger;
@@ -294,6 +294,13 @@ pub struct Verifier {
     resident_buckets: Vec<crate::resident::RetainedBucket>,
     resident_prepared: bool,
     resident_inputs: Vec<String>,
+    /// Retain every selected query without checking any
+    /// (`VERUS_RESIDENT_RETAIN_ONLY`): a resident session opened on edited
+    /// source, whose caller carries over what it knew about the unchanged
+    /// queries and checks the changed ones itself (see resident.rs). With no
+    /// answers to go by, it retains every recommends query a check could
+    /// have added (`retain_unchecked_recommends`).
+    resident_retain_only: bool,
     /// this is the actual number of threads used for verification. This will be set to the
     /// minimum of the requested threads and the number of buckets to verify
     pub num_threads: usize,
@@ -543,11 +550,25 @@ impl From<VirErr> for VerifyErr {
 struct CommandBatch {
     title: String,
     commands: Commands,
+    /// What the batch is about, which decides the queries whose fingerprint
+    /// reads it (`resident::relevance`). Module-wide by default: what a batch
+    /// asserts can fire anywhere unless it is an item's own.
+    owner: crate::resident::BatchOwner,
 }
 
 impl CommandBatch {
     fn new(title: impl Into<String>, commands: Commands) -> Self {
-        CommandBatch { title: title.into(), commands }
+        CommandBatch { title: title.into(), commands, owner: crate::resident::BatchOwner::Module }
+    }
+
+    /// A batch of one item's own declarations, whose axioms are headed by the
+    /// names it declares.
+    fn owned(
+        title: impl Into<String>,
+        commands: Commands,
+        owner: crate::resident::BatchOwner,
+    ) -> Self {
+        CommandBatch { title: title.into(), commands, owner }
     }
 }
 
@@ -559,6 +580,8 @@ impl Verifier {
         dep_tracker: crate::cargo_verus_dep_tracker::DepTracker,
     ) -> Verifier {
         let compile = args.compile || via_cargo_compile;
+        let resident_retain_only =
+            args.resident && std::env::var_os("VERUS_RESIDENT_RETAIN_ONLY").is_some();
 
         Verifier {
             num_threads: 1,
@@ -566,6 +589,7 @@ impl Verifier {
             resident_buckets: Vec::new(),
             resident_prepared: false,
             resident_inputs: Vec::new(),
+            resident_retain_only,
             encountered_vir_error: false,
             count_verified: 0,
             count_errors: 0,
@@ -624,6 +648,7 @@ impl Verifier {
             resident_buckets: Vec::new(),
             resident_prepared: false,
             resident_inputs: Vec::new(),
+            resident_retain_only: self.resident_retain_only,
             encountered_vir_error: false,
             count_verified: 0,
             count_errors: 0,
@@ -733,6 +758,7 @@ impl Verifier {
                 instantiation_replay: self.instantiation_replay(),
                 inst_graph: self.inst_graph(),
                 strategy_ladder: self.strategy_ladder(),
+                retain_only: self.resident_retain_only,
                 input_files: std::mem::take(&mut self.resident_inputs),
             },
         )
@@ -1281,6 +1307,35 @@ impl Verifier {
         }
     }
 
+    /// The recommends queries a retain-only session retains after a body or
+    /// termination op it did not check: every one that checking it could
+    /// have added, whatever the checks would have answered. A failed check
+    /// adds the follow-up (unless `--no-auto-recommends-check`), and with
+    /// `check_recommends` a passing one adds the checked kind, so such a
+    /// function gets both. An op without commands (`could_fail` false, as
+    /// every proof and exec function's termination op is) never fails, and
+    /// adds only the checked kind. What is retained then depends on the
+    /// source alone, and a follow-up that a session on the source before an
+    /// edit retained because a check failed is still there to compare.
+    /// `--expand-errors` queries are the exception: they focus on the
+    /// assertion a check failed at, which only a check can name, so a
+    /// retain-only session has none.
+    fn retain_unchecked_recommends(
+        &self,
+        function_opgen: &mut crate::commands::FunctionOpGenerator,
+        op: &crate::commands::Op,
+        check_recommends: bool,
+        could_fail: bool,
+    ) -> Result<(), VirErr> {
+        if check_recommends {
+            function_opgen.retry_with_recommends(op, false)?;
+        }
+        if could_fail && (check_recommends || !self.args.no_auto_recommends_check) {
+            function_opgen.retry_with_recommends(op, true)?;
+        }
+        Ok(())
+    }
+
     /// Returns the status of running the provided queries
     /// invalidity: whether the command returned invalid or not
     /// timed_out: whether the command timed out or not
@@ -1303,7 +1358,8 @@ impl Verifier {
         default_prover_failed_assert_ids: &mut Vec<AssertId>,
         includes_function: bool,
     ) -> RunCommandQueriesResult {
-        if !includes_function {
+        // A retain-only session records the queries and checks none of them.
+        if !includes_function || self.resident_retain_only {
             return RunCommandQueriesResult {
                 invalidity: false,
                 timed_out: false,
@@ -1694,7 +1750,11 @@ impl Verifier {
                     self.run_command_batches(bucket_id, diagnostics, &mut air_context, initial);
                     for batch in ops {
                         journal
-                            .push_context(&mut air_context, batch.commands.clone())
+                            .push_context(
+                                &mut air_context,
+                                batch.commands.clone(),
+                                batch.owner.clone(),
+                            )
                             .map_err(vir::messages::error_bare)?;
                         self.run_command_batch(bucket_id, diagnostics, &mut air_context, batch);
                     }
@@ -1782,7 +1842,7 @@ impl Verifier {
                 "Associated-Type-Decls",
                 vir::assoc_types_to_air::assoc_type_decls_to_air(ctx, &krate.traits),
             ),
-            CommandBatch::new(
+            CommandBatch::owned(
                 "Datatypes",
                 vir::datatype_to_air::datatypes_and_primitives_to_air(
                     ctx,
@@ -1793,6 +1853,7 @@ impl Verifier {
                         .cloned()
                         .collect(),
                 ),
+                crate::resident::BatchOwner::Datatypes,
             ),
             CommandBatch::new("Trait-Bounds", vir::traits::trait_bound_axioms(ctx, &krate.traits)),
             CommandBatch::new(
@@ -1826,7 +1887,11 @@ impl Verifier {
             ctx.fun = vir::ast_to_sst_func::mk_fun_ctx(function, false);
             let commands = vir::sst_to_air_func::func_name_to_air(ctx, reporter, function)?;
             let title = "Function-Decl ".to_string() + &fun_as_friendly_rust_name(&function.x.name);
-            bucket_context.push(CommandBatch::new(title, commands));
+            bucket_context.push(CommandBatch::owned(
+                title,
+                commands,
+                crate::resident::BatchOwner::function(&function.x.name),
+            ));
         }
         ctx.fun = None;
 
@@ -1835,9 +1900,21 @@ impl Verifier {
         // The batches so far stay below every journal; context ops follow.
         let initial_batches = bucket_context.len();
 
+        // The prelude every solver but a bit-vector one starts from, which
+        // retained queries are fingerprinted over: it reads the crate's word
+        // size, so it is not the same for every source.
+        let resident_prelude = self.args.resident.then(|| {
+            ctx.prelude(PreludeConfig {
+                arch_word_bits: ctx.arch_word_bits,
+                solver: self.args.solver,
+            })
+        });
         let mut resident = self.args.resident.then(crate::resident::QueryJournal::new);
-        if let Some(journal) = &mut resident {
-            journal.record_base(bucket_context.iter().map(|batch| batch.commands.clone()));
+        if let (Some(journal), Some(prelude)) = (&mut resident, &resident_prelude) {
+            journal.record_prelude(prelude.clone());
+            journal.record_base(
+                bucket_context.iter().map(|batch| (batch.commands.clone(), batch.owner.clone())),
+            );
         }
         let mut resident_spinoffs = Vec::new();
 
@@ -1896,11 +1973,24 @@ impl Verifier {
                     break;
                 };
                 match &op.kind {
-                    OpKind::Context(_context_op, commands) => {
-                        let batch = CommandBatch::new(op.to_air_comment(), commands.clone());
+                    OpKind::Context(context_op, commands) => {
+                        // An item's own axioms are read by the queries that
+                        // reach what it declares; a broadcast axiom or a
+                        // trait-impl axiom can fire anywhere.
+                        let owner = match (context_op, &op.function) {
+                            (ContextOp::ReqEns | ContextOp::SpecDefinition, Some(function)) => {
+                                crate::resident::BatchOwner::function(&function.x.name)
+                            }
+                            _ => crate::resident::BatchOwner::Module,
+                        };
+                        let batch = CommandBatch::owned(
+                            op.to_air_comment(),
+                            commands.clone(),
+                            owner.clone(),
+                        );
                         if let Some(session) = &mut resident {
                             session
-                                .push_context(&mut air_context, commands.clone())
+                                .push_context(&mut air_context, commands.clone(), owner)
                                 .map_err(&resident_error)?;
                         }
                         self.run_command_batch(bucket_id, reporter, &mut air_context, &batch);
@@ -1965,15 +2055,21 @@ impl Verifier {
 
                             let mut spinoff_journal = (retain_queries && do_spinoff)
                                 .then(crate::resident::QueryJournal::new);
-                            // A spinoff solver starts from the bucket's
-                            // initial batches, below its journal's scopes; the
-                            // context ops after them go into its journal
-                            // (`new_air_context_with_bucket_context`).
-                            if let Some(journal) = &mut spinoff_journal {
+                            // A spinoff solver starts from the prelude and the
+                            // bucket's initial batches, below its journal's
+                            // scopes; the context ops after them go into its
+                            // journal (`new_air_context_with_bucket_context`).
+                            // A bit-vector solver gets none of these.
+                            if let (Some(journal), Some(prelude), false) = (
+                                &mut spinoff_journal,
+                                &resident_prelude,
+                                cmds.prover_choice == vir::def::ProverChoice::BitVector,
+                            ) {
+                                journal.record_prelude(prelude.clone());
                                 journal.record_base(
                                     bucket_context[..initial_batches]
                                         .iter()
-                                        .map(|batch| batch.commands.clone()),
+                                        .map(|batch| (batch.commands.clone(), batch.owner.clone())),
                                 );
                             }
 
@@ -2240,7 +2336,25 @@ impl Verifier {
                             }
                         }
 
-                        if matches!(query_op, QueryOp::Body(Style::Normal)) {
+                        // Nothing was checked, so no answer can decide which
+                        // follow-ups to retain (see `retain_unchecked_recommends`).
+                        // A function the filter leaves out retains nothing, so
+                        // its follow-ups are not even generated.
+                        if self.resident_retain_only
+                            && matches!(
+                                query_op,
+                                QueryOp::Body(Style::Normal) | QueryOp::SpecTermination
+                            )
+                        {
+                            if includes_function {
+                                self.retain_unchecked_recommends(
+                                    &mut function_opgen,
+                                    &op,
+                                    function.x.attrs.check_recommends,
+                                    !commands_with_context_list.is_empty(),
+                                )?;
+                            }
+                        } else if matches!(query_op, QueryOp::Body(Style::Normal)) {
                             if (any_invalid
                                 && !self.args.no_auto_recommends_check
                                 && !any_timed_out)
@@ -2272,7 +2386,9 @@ impl Verifier {
                             function_opgen.report_expand_error_result(res);
                         }
 
-                        if matches!(query_op, QueryOp::SpecTermination) {
+                        if matches!(query_op, QueryOp::SpecTermination)
+                            && !self.resident_retain_only
+                        {
                             if (any_invalid
                                 && !self.args.no_auto_recommends_check
                                 && !any_timed_out)
