@@ -3622,7 +3622,7 @@ verus! {{
         assert_eq!(ladder["event"], "laddered", "{budget}: {ladder}");
         assert_eq!(ladder["solved_by"], "ematch", "{budget}: {ladder}");
         assert!(rung(&ladder, "ematch")["resource_limit"].as_u64().unwrap() > 0);
-        assert!(ladder["pinned"].is_null(), "{budget}: {ladder}");
+        assert!(ladder["pinned"].is_null(), "{}: {}", budget, ladder);
 
         // Refusals leave the session usable; a positive clamped budget is
         // accepted and the next check actually uses that smaller budget.
