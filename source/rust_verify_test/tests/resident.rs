@@ -3981,14 +3981,82 @@ verus! {{
     assert_eq!(open(&source("", "pub struct Other { pub y: u8 }")), uses);
     // The struct it does use, edited: its query reads it.
     assert_ne!(open(&source("pub z: u8,", "")), uses);
-    // A struct whose field has the type the proof does use is not left alone,
-    // though: its constructor's `has_type` axiom is triggered on a term of
-    // the added struct, which no query here can build, but it names the used
-    // struct's `Poly` and `TYPE` constants, and a datatype batch attributes a
-    // declaration by the names of its own batch that it mentions. Attributing
-    // an axiom by the symbols its triggers are headed by would read it for
-    // what it is; until then this is what the batch is conservative about.
-    assert_ne!(open(&source("", "pub struct Wraps { pub u: Used }")), uses);
+    // Nor is a struct whose field has the type the proof uses: its axioms name
+    // the used struct's `Poly` and `TYPE` constants, but they are triggered on
+    // terms of the added struct, which no query here can build.
+    assert_eq!(open(&source("", "pub struct Wraps { pub u: Used }")), uses);
+}
+
+/// An item's axiom can be triggered on a name the item does not declare, and
+/// a query that reaches that name reads it: a recursive trait impl's spec
+/// definition is keyed on the trait method, and a function's `FnDef` axioms
+/// on its `FNDEF` type, which a query that calls the function through a value
+/// mentions instead of the function's own `ens%`. Each edit here changes the
+/// verdict of `uses`, so it must change its fingerprint.
+#[test]
+fn resident_fingerprints_read_an_item_axiom_by_its_triggers() {
+    let trait_impl = |base: &str| {
+        format!(
+            r#"
+use vstd::prelude::*;
+verus! {{
+    pub trait T {{
+        spec fn f(&self, n: nat) -> nat;
+    }}
+    pub struct S;
+    impl T for S {{
+        open spec fn f(&self, n: nat) -> nat
+            decreases n,
+        {{
+            if n == 0 {{ {base} }} else {{ self.f((n - 1) as nat) }}
+        }}
+    }}
+    proof fn uses(s: S) {{
+        assert(s.f(0) == 0);
+    }}
+}}
+"#
+        )
+    };
+    let fn_value = |ens: &str| {
+        format!(
+            r#"
+use vstd::prelude::*;
+verus! {{
+    fn id(x: u8) -> (r: u8)
+        ensures {ens},
+    {{
+        x
+    }}
+    fn uses() {{
+        let f = id;
+        let r = f(1);
+        assert(r == 1);
+    }}
+}}
+"#
+        )
+    };
+    let open = |source: &str| {
+        let mut worker =
+            Worker::start_with_env(source, &[], &[("VERUS_RESIDENT_RETAIN_ONLY", "1")]);
+        let ready = worker.receive();
+        assert_eq!(ready["retain_only"], true, "{ready}");
+        let uses = query_of(&ready, "::uses", "default").clone();
+        let checked = worker.send(json!({"command":"check", "session":ready["session"],
+            "bucket":0, "query":uses["id"]}));
+        worker.finish(true);
+        (uses["fingerprint"].clone(), checked["result"].clone())
+    };
+    for (before, after) in
+        [(trait_impl("0"), trait_impl("1")), (fn_value("r == x"), fn_value("r == x || r == 0"))]
+    {
+        let (fingerprint, result) = open(&before);
+        let (edited, edited_result) = open(&after);
+        assert_eq!((result, edited_result), (json!("valid"), json!("invalid")), "{after}");
+        assert_eq!(fingerprint["body"], edited["body"], "{after}");
+        assert_ne!(fingerprint["prefix"], edited["prefix"], "{after}");
+    }
 }
 
 /// A `by(bit_vector)` query's solver gets neither the prelude nor the bucket

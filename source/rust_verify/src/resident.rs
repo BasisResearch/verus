@@ -7179,6 +7179,119 @@ mod tests {
         );
     }
 
+    /// An item's axiom is read by the queries that can trigger it, whether or
+    /// not the trigger names what the item declares: `imp`'s definition is
+    /// keyed on `m`, which item `m` declares, as a trait impl's spec
+    /// definition is keyed on the trait method; `id`'s axiom on `fndef_id`, a
+    /// module-wide constant, and `closure_ens`, which no batch declares, as a
+    /// function's `FnDef` axioms are. An axiom whose trigger names nothing of
+    /// the bucket is read by every query.
+    #[test]
+    fn fingerprints_read_an_item_axiom_by_its_triggers() {
+        use air::ast::{QueryX, StmtX};
+        use vir::messages::ToAny;
+        let span = |text: &str| vir::messages::Span {
+            raw_span: Arc::new(()),
+            id: 0,
+            data: Vec::new(),
+            as_string: text.to_owned(),
+        };
+        let fun = Arc::new(vir::ast::FunX {
+            path: Arc::new(vir::ast::PathX {
+                krate: vir::ast::CrateId::Internal,
+                segments: Arc::new(vec![Arc::new("f".to_owned())]),
+            }),
+        });
+        let item = |name: &str| BatchOwner::Item(Arc::new(name.to_owned()));
+        let forall = |pattern: &str, body: &str| {
+            format!("(axiom (forall ((y Int)) (! {body} :pattern ({pattern}))))")
+        };
+        let journal_of = |imp_body: &str, id_ens: &str, anywhere: &str, text: &str| {
+            let mut air = Context::new(Arc::new(VirMessageInterface {}), SmtSolver::Cvc5);
+            let mut journal = QueryJournal::new();
+            // Declared as the prelude declares it: below every batch.
+            for command in commands("(declare-fun closure_ens (Int Int) Bool)").iter() {
+                if let CommandX::Global(decl) = &**command {
+                    air.global(decl).unwrap();
+                }
+            }
+            journal.record_prelude(commands("(declare-const SZ Int)"));
+            let base = commands("(declare-const fndef_id Int)");
+            for command in base.iter() {
+                if let CommandX::Global(decl) = &**command {
+                    air.global(decl).unwrap();
+                }
+            }
+            journal.record_base(std::iter::once((base, BatchOwner::Module)));
+            apply_owned(&mut journal, &mut air, &commands("(declare-fun m (Int) Int)"), item("m"));
+            let imp = format!(
+                "(declare-fun rec_imp (Int) Int) {} {}",
+                forall("(m y)", "(= (m y) (rec_imp y))"),
+                forall("(rec_imp y)", &format!("(= (rec_imp y) {imp_body})")),
+            );
+            apply_owned(&mut journal, &mut air, &commands(&imp), item("imp"));
+            let id = format!(
+                "(declare-fun ens_id (Int) Bool) {} {}",
+                forall("(closure_ens fndef_id y)", "(= (closure_ens fndef_id y) (ens_id y))"),
+                forall("(ens_id y)", &format!("(= (ens_id y) {id_ens})")),
+            );
+            apply_owned(&mut journal, &mut air, &commands(&id), item("id"));
+            apply_owned(
+                &mut journal,
+                &mut air,
+                &commands(&forall("(closure_ens 0 y)", anywhere)),
+                item("anywhere"),
+            );
+            let parsed = commands(&format!("(check-valid (declare-const x Int) (assert {text}))"));
+            let CommandX::CheckValid(parsed) = &*parsed[0] else { panic!("a query") };
+            let StmtX::Assert(_, _, _, expr) = &*parsed.assertion else { panic!("an assert") };
+            let assertion = Arc::new(StmtX::Assert(
+                None,
+                vir::messages::error(&span("a.rs:3:5"), "assertion failed").to_any(),
+                None,
+                expr.clone(),
+            ));
+            journal
+                .record_query(
+                    vir::def::CommandsWithContextX::new(
+                        fun.clone(),
+                        span("a.rs:3:5"),
+                        "body".to_owned(),
+                        Arc::new(vec![Arc::new(CommandX::CheckValid(Arc::new(QueryX {
+                            local: parsed.local.clone(),
+                            assertion,
+                        })))]),
+                        vir::def::ProverChoice::DefaultProver,
+                        false,
+                    ),
+                    &QueryOp::Body(Style::Normal),
+                    1.0,
+                )
+                .unwrap();
+            journal.fingerprints(&mut relevance::Index::new())[0].prefix
+        };
+        let anywhere = "(=> (closure_ens 0 y) true)";
+        let prefix =
+            |imp_body: &str, id_ens: &str, text: &str| journal_of(imp_body, id_ens, anywhere, text);
+        let via_m = "(= (m x) 0)";
+        let via_value = "(closure_ens fndef_id x)";
+        let neither = "(> x 0)";
+        // `imp`'s definition edited: read through `m`, which `imp` does not
+        // declare, and by no query that reaches neither.
+        assert_ne!(prefix("1", "true", via_m), prefix("0", "true", via_m));
+        assert_eq!(prefix("1", "true", via_value), prefix("0", "true", via_value));
+        assert_eq!(prefix("1", "true", neither), prefix("0", "true", neither));
+        // `id`'s ensures edited: read through its `FnDef` axiom.
+        assert_ne!(prefix("0", "(> y 0)", via_value), prefix("0", "true", via_value));
+        assert_eq!(prefix("0", "(> y 0)", via_m), prefix("0", "true", via_m));
+        assert_eq!(prefix("0", "(> y 0)", neither), prefix("0", "true", neither));
+        // Triggered on a term every query can build.
+        assert_ne!(
+            journal_of("0", "true", "(=> (closure_ens 0 y) false)", neither),
+            journal_of("0", "true", anywhere, neither)
+        );
+    }
+
     /// A module's transparent datatypes are one `declare-datatypes`, and a
     /// prefix fingerprint reads the datatypes of it the query reaches, not
     /// the block: a struct added beside another leaves the queries that use
