@@ -287,6 +287,17 @@ enum Request {
         /// candidates. Lets a caller search past a witness the absence
         /// check disowned.
         exclude: Option<Vec<usize>>,
+        /// Resource limit for each probe, in `#[verifier::rlimit]` units,
+        /// above 0 and at most `MAX_RUNG_RLIMIT`. Default: the query's own.
+        /// A diagnostic budget for the probes alone: the absence check, an
+        /// ordinary check of the witness, keeps the query's own limit, as
+        /// does every other request.
+        rlimit: Option<f32>,
+        /// Wall-clock cap per probe, in milliseconds. A probe that reaches
+        /// it is cancelled by the solver (it answers `unknown`, reason
+        /// `timeout`, and the search takes it as not valid), is listed in
+        /// `skipped_probes`, and the reply is marked `partial`.
+        probe_timeout_ms: Option<u64>,
     },
     Egraph {
         session: String,
@@ -1604,6 +1615,13 @@ struct AblateReport {
     probes: Vec<BisectProbe>,
     elapsed_ms: u128,
     restore_ms: u128,
+    /// Some probe was cancelled at the request's `probe_timeout_ms`, so the
+    /// witness is what the other probes established: possibly not minimal,
+    /// and confirmed only as far as `skipped_probes` allows.
+    partial: bool,
+    /// The probes cancelled at the wall-clock cap, by what they asked.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    skipped_probes: Vec<String>,
 }
 
 struct AblateRequest {
@@ -1611,6 +1629,10 @@ struct AblateRequest {
     budget: usize,
     hypotheses: bool,
     exclude: Vec<usize>,
+    /// The probes' own resource limit; `None` keeps the query's.
+    rlimit: Option<f32>,
+    /// Wall-clock cap per probe.
+    probe_timeout_ms: Option<u64>,
 }
 
 /// A goal the vacuity probes name.
@@ -1651,6 +1673,8 @@ fn scan_vacuity(
     goals: &[usize],
     removed: &[usize],
     checks: &mut usize,
+    skipped: &mut Vec<String>,
+    label: &str,
 ) -> Result<VacuityScan, String> {
     use air::bisect::Answer;
     let count = prober.units().len();
@@ -1664,6 +1688,9 @@ fn scan_vacuity(
     if goals.is_empty() {
         let answer = prober.probe_vacuity(&mask(removed))?;
         *checks += 1;
+        if answer.timed_out() {
+            skipped.push(format!("{label} vacuity probe"));
+        }
         return Ok(VacuityScan { answer, goal: None, unchecked: 0 });
     }
     let mut unknown = None;
@@ -1678,6 +1705,9 @@ fn scan_vacuity(
         off.extend(goals.iter().copied().filter(|&g| g != goal));
         let answer = prober.probe_vacuity(&mask(&off))?;
         *checks += 1;
+        if answer.timed_out() {
+            skipped.push(format!("{label} vacuity probe of goal {goal}"));
+        }
         if answer == Answer::Valid {
             return Ok(VacuityScan { answer, goal: Some(goal), unchecked: 0 });
         }
@@ -1706,14 +1736,21 @@ fn ablate(
     query: &RetainedQuery,
     symbols: Option<&crate::provenance::Symbols>,
     request: AblateRequest,
+    set_rlimit: &impl Fn(&mut Context, f32),
 ) -> io::Result<AblateReport> {
     use air::bisect::{Answer, Mode, ProbeDetail, Status, Target, UnitKind};
     let group_of = |axiom: &air::ast::Axiom| -> Option<String> {
         symbols.and_then(|symbols| symbols.axiom_group(axiom)).map(str::to_owned)
     };
+    // The probes' budget: their own rlimit when the request gives one, and
+    // a wall-clock cap each. The absence check below runs at the query's.
+    set_rlimit(air, request.rlimit.unwrap_or(query.rlimit));
     let mut prober = air
         .ablate_query(prefix, &mut |axiom| group_of(axiom), &query.query)
         .map_err(|error| io::Error::other(error.to_string()))?;
+    prober.set_probe_timeout(request.probe_timeout_ms);
+    // Probes the solver cancelled at the cap, by what they asked.
+    let mut skipped: Vec<String> = Vec::new();
     let units = prober.units().to_vec();
     let count = units.len();
     let no_candidate = |&&i: &&usize| {
@@ -1744,6 +1781,9 @@ fn ablate(
     };
     let mut details: HashMap<Vec<usize>, ProbeDetail> = HashMap::new();
     let (before, detail) = prober.probe_detailed(&mask(&[])).map_err(io::Error::other)?;
+    if before.timed_out() {
+        skipped.push("probe with nothing removed".to_owned());
+    }
     details.insert(Vec::new(), detail);
     let mode = match request.mode {
         AblateMode::Auto if before == Answer::Valid => AblateMode::LoadBearing,
@@ -1791,7 +1831,11 @@ fn ablate(
         Some(before),
         &mut |disabled| -> Result<Answer, String> {
             let (answer, detail) = prober.probe_detailed(disabled)?;
-            details.insert(switched_off(disabled), detail);
+            let removed = switched_off(disabled);
+            if answer.timed_out() {
+                skipped.push(format!("search probe with {removed:?} removed"));
+            }
+            details.insert(removed, detail);
             Ok(answer)
         },
     )
@@ -1808,13 +1852,15 @@ fn ablate(
     let goals: Vec<usize> = (0..count).filter(|&i| units[i].kind == UnitKind::Goal).rev().collect();
     let mut extra_checks = 0;
     let vacuity_before =
-        scan_vacuity(&mut prober, &goals, &[], &mut extra_checks).map_err(io::Error::other)?;
+        scan_vacuity(&mut prober, &goals, &[], &mut extra_checks, &mut skipped, "before")
+            .map_err(io::Error::other)?;
     let mut vacuity_witness = None;
     let mut participated = Vec::new();
     let mut participation_unchecked = 0;
     if let Some(removed) = &witness_removed {
-        let scan = scan_vacuity(&mut prober, &goals, removed, &mut extra_checks)
-            .map_err(io::Error::other)?;
+        let scan =
+            scan_vacuity(&mut prober, &goals, removed, &mut extra_checks, &mut skipped, "witness")
+                .map_err(io::Error::other)?;
         // A removal leaves its members out of the contradiction by
         // definition; only kept members can take part in it. Each is tried
         // at the goal the scan found contradictory.
@@ -1831,6 +1877,9 @@ fn ablate(
                 without.push(member);
                 let answer = prober.probe_vacuity(&mask(&without)).map_err(io::Error::other)?;
                 extra_checks += 1;
+                if answer.timed_out() {
+                    skipped.push(format!("participation probe of unit {member}"));
+                }
                 if answer != Answer::Valid {
                     participated.push(member);
                 }
@@ -1852,18 +1901,35 @@ fn ablate(
         Some(removed) => {
             let answer = prober.probe_vacuity(&mask(&removed)).map_err(io::Error::other)?;
             extra_checks += 1;
+            if answer.timed_out() {
+                skipped.push("every-goal vacuity probe".to_owned());
+            }
             Some(answer)
         }
         None => None,
     };
     drop(prober);
 
+    // The absence check is an ordinary check of the witness: the query's
+    // own rlimit, which every later request expects to find, under the
+    // same wall-clock cap.
+    set_rlimit(air, query.rlimit);
     let absence_check = match &witness_removed {
         Some(removed) => {
             let probed_valid = outcome.after == Some(Answer::Valid);
-            let check =
-                absence_check(air, prefix, query, &group_of, &units, removed, probed_valid)?;
+            air.set_check_timeout(request.probe_timeout_ms);
+            let checked =
+                absence_check(air, prefix, query, &group_of, &units, removed, probed_valid);
+            if request.probe_timeout_ms.is_some() {
+                air.set_check_timeout(None);
+            }
+            let check = checked?;
             extra_checks += 1;
+            if check.result == QueryResult::ResourceLimit
+                && request.probe_timeout_ms.is_some_and(|ms| check.elapsed_ms >= ms as u128)
+            {
+                skipped.push("absence check".to_owned());
+            }
             Some(check)
         }
         None => None,
@@ -2019,6 +2085,8 @@ fn ablate(
             .collect(),
         elapsed_ms: 0,
         restore_ms: 0,
+        partial: !skipped.is_empty(),
+        skipped_probes: skipped,
     })
 }
 
@@ -5511,6 +5579,8 @@ impl Server {
                     budget_checks,
                     hypotheses,
                     exclude,
+                    rlimit,
+                    probe_timeout_ms,
                     ..
                 } => {
                     let Some(bucket) = self.buckets.get(bucket_id.0) else {
@@ -5526,6 +5596,20 @@ impl Server {
                         send(
                             &mut output,
                             &Response::Error { message: "budget_checks must be between 1 and 256" },
+                        )?;
+                        continue;
+                    }
+                    if rlimit.is_some_and(|r| !(r.is_finite() && r > 0.0 && r <= MAX_RUNG_RLIMIT)) {
+                        send(
+                            &mut output,
+                            &Response::Error { message: "rlimit must be above 0 and at most 1000" },
+                        )?;
+                        continue;
+                    }
+                    if probe_timeout_ms == Some(0) {
+                        send(
+                            &mut output,
+                            &Response::Error { message: "probe_timeout_ms must be positive" },
                         )?;
                         continue;
                     }
@@ -5550,16 +5634,39 @@ impl Server {
                     let restore_ms = restore_start.elapsed().as_millis();
                     let query = &journal.queries[local];
                     let prefix = journal.prefix_decls(query.prefix);
-                    set_rlimit(air, query.rlimit);
+                    // A probe budget too small for one cvc5 unit converts to
+                    // 0, which cvc5 takes as no limit, as the ladder refuses.
+                    if let Some(probe_rlimit) = rlimit {
+                        set_rlimit(air, probe_rlimit);
+                        let empty = air.cvc5_query_budget() == 0;
+                        set_rlimit(air, query.rlimit);
+                        if empty {
+                            send(
+                                &mut output,
+                                &Response::Error {
+                                    message: "rlimit is below one cvc5 resource unit",
+                                },
+                            )?;
+                            continue;
+                        }
+                    }
                     let request = AblateRequest {
                         mode,
                         budget,
                         hypotheses: hypotheses.unwrap_or(true),
                         exclude: exclude.unwrap_or_default(),
+                        rlimit,
+                        probe_timeout_ms,
                     };
                     let start = Instant::now();
-                    let report = match ablate(air, &prefix, query, bucket.symbols.as_ref(), request)
-                    {
+                    let report = match ablate(
+                        air,
+                        &prefix,
+                        query,
+                        bucket.symbols.as_ref(),
+                        request,
+                        &set_rlimit,
+                    ) {
                         Ok(mut report) => {
                             report.elapsed_ms = start.elapsed().as_millis();
                             report.restore_ms = restore_ms;
