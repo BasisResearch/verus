@@ -607,9 +607,10 @@ impl RetainedBucket {
 /// the function's (see `forget_quantifier_counters`). The body hash also
 /// covers the query's rlimit, since the budget a query checks at can change
 /// its verdict. Two queries with the same function, kind and description and
-/// the same fingerprint are, to the solver, the same query up to the names of
-/// their quantifiers: what a caller carries over by fingerprint must not name
-/// a quantifier by its `:qid`.
+/// the same fingerprint are the same query over the same declarations it can
+/// reach, up to the names of their quantifiers; a declaration neither can
+/// reach may differ between them (see `relevance`). What a caller carries
+/// over by fingerprint must not name a quantifier by its `:qid`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize)]
 pub(crate) struct Fingerprint {
     prefix: u64,

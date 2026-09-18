@@ -4869,3 +4869,127 @@ fn resident_without_difficulty_reports_none() {
     );
     worker.finish(false);
 }
+
+/// Edits that each flip the verdict of `uses`, across the ways a query can
+/// reach a declaration: a function's fuel, visibility and definition, a
+/// constant, a datatype (directly, through a container, a tuple and
+/// structural equality), a type invariant, an associated type, a trait impl
+/// behind a bound, a closure and a module-level reveal. A refresh carries
+/// over the verdict of every query whose fingerprint is unchanged, so each
+/// of these must change it.
+#[test]
+fn resident_fingerprints_change_with_every_verdict() {
+    let open = |source: &str| {
+        let mut worker =
+            Worker::start_with_env(source, &[], &[("VERUS_RESIDENT_RETAIN_ONLY", "1")]);
+        let ready = worker.receive();
+        let (bucket, uses) = ready["buckets"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{source}\n{ready}"))
+            .iter()
+            .enumerate()
+            .flat_map(|(at, bucket)| {
+                bucket["queries"].as_array().unwrap().iter().map(move |query| (at, query))
+            })
+            .find(|(_, query)| {
+                query["function"].as_str().unwrap().ends_with("::uses")
+                    && query["kind"] == "body"
+                    && query["prover"] == "default"
+            })
+            .unwrap_or_else(|| panic!("{ready}"));
+        let checked = worker.send(json!({"command":"check", "session":ready["session"],
+            "bucket":bucket, "query":uses["id"]}));
+        worker.finish(true);
+        (uses["fingerprint"].clone(), checked["result"].clone())
+    };
+    let source = |items: &str| format!("use vstd::prelude::*;\nverus! {{\n{items}\n}}\n");
+    let cases = [
+        (
+            "#[verifier::opaque] spec fn f(x: int) -> int { x }",
+            "spec fn f(x: int) -> int { x }",
+            "proof fn uses() { assert(f(1) == 1); }",
+        ),
+        (
+            "pub mod m { use vstd::prelude::*; pub closed spec fn f(x: int) -> int { x } }",
+            "pub mod m { use vstd::prelude::*; pub open spec fn f(x: int) -> int { x } }",
+            "proof fn uses() { assert(m::f(1) == 1); }",
+        ),
+        ("spec const C: int = 5;", "spec const C: int = 6;", "proof fn uses() { assert(C == 5); }"),
+        ("pub const C: u64 = 5;", "pub const C: u64 = 6;", "proof fn uses() { assert(C == 5); }"),
+        (
+            "pub enum E { A, B }",
+            "pub enum E { A, B, C }",
+            "proof fn uses(e: E) { assert(e is A || e is B); }",
+        ),
+        (
+            "pub struct S { pub x: u8 }",
+            "pub struct S { pub x: u16 }",
+            "proof fn uses(s: S) { assert(s.x < 256); }",
+        ),
+        (
+            "pub struct S { pub x: u8 }",
+            "pub struct S { pub x: u16 }",
+            "proof fn uses(s: Seq<S>) requires s.len() > 0 { assert(s[0].x < 256); }",
+        ),
+        (
+            "pub struct P { pub a: (u8, u8) }",
+            "pub struct P { pub a: (u16, u8) }",
+            "proof fn uses(p: P) { assert(p.a.0 < 256); }",
+        ),
+        (
+            "pub struct P { pub a: u8 }",
+            "pub struct P { pub a: u8, pub b: u8 }",
+            "proof fn uses(p: P, q: P) requires p.a == q.a { assert(p == q); }",
+        ),
+        (
+            "spec fn f() -> int { 1 }",
+            "uninterp spec fn f() -> int;",
+            "proof fn uses() { assert(f() == 1); }",
+        ),
+        (
+            "pub struct S { x: u8 }\nimpl S { #[verifier::type_invariant] spec fn inv(self) -> bool { self.x > 5 } }",
+            "pub struct S { x: u8 }\nimpl S { #[verifier::type_invariant] spec fn inv(self) -> bool { self.x > 4 } }",
+            "fn uses(s: &S) { proof { use_type_invariant(s); } assert(s.x > 5); }",
+        ),
+        (
+            "pub trait T { type X; }\npub struct S;\nimpl T for S { type X = u8; }",
+            "pub trait T { type X; }\npub struct S;\nimpl T for S { type X = u16; }",
+            "proof fn uses(v: <S as T>::X) { assert(v < 256); }",
+        ),
+        (
+            "pub trait T { spec fn k() -> int; }\npub struct S;\nimpl T for S { open spec fn k() -> int { 1 } }",
+            "pub trait T { spec fn k() -> int; }\npub struct S;\nimpl T for S { open spec fn k() -> int { 2 } }",
+            "proof fn g<A: T>() -> (r: int) ensures r == A::k() { A::k() }\nproof fn uses() { let r = g::<S>(); assert(r == 1); }",
+        ),
+        (
+            "spec fn f(x: int) -> int { x }",
+            "spec fn f(x: int) -> int { x + 1 }",
+            "proof fn uses() { let g = |x: int| f(x); assert(g(1) == 1); }",
+        ),
+        (
+            "spec fn r(n: nat) -> nat decreases n { if n == 0 { 0 } else { r((n - 1) as nat) } }",
+            "spec fn r(n: nat) -> nat decreases n { if n == 0 { 1 } else { r((n - 1) as nat) } }",
+            "proof fn uses() { assert(r(0) == 0); }",
+        ),
+        (
+            "pub mod m { use vstd::prelude::*; pub fn id(x: u8) -> (r: u8) ensures r == x { x } }",
+            "pub mod m { use vstd::prelude::*; pub fn id(x: u8) -> (r: u8) ensures r <= x { x } }",
+            "fn uses() { let r = m::id(1); assert(r == 1); }",
+        ),
+        (
+            "#[verifier::opaque] spec fn f(x: int) -> int { x }\nproof fn uses() { assert(f(1) == 1); }",
+            "#[verifier::opaque] spec fn f(x: int) -> int { x }\nproof fn uses() { reveal(f); assert(f(1) == 1); }",
+            "",
+        ),
+    ];
+    let mut missed = Vec::new();
+    for (before, after, uses) in cases {
+        let (fingerprint, result) = open(&source(&format!("{before}\n{uses}")));
+        let (edited, edited_result) = open(&source(&format!("{after}\n{uses}")));
+        assert_ne!(result, edited_result, "{before} -> {after}: the edit must flip the verdict");
+        if fingerprint == edited {
+            missed.push(format!("{before} -> {after}"));
+        }
+    }
+    assert!(missed.is_empty(), "verdict changed, fingerprint did not: {missed:#?}");
+}
