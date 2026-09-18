@@ -186,12 +186,12 @@ pub fn write(path: &Path, report: &Report) -> std::io::Result<()> {
     temp.push(format!(".tmp.{}", std::process::id()));
     let temp = std::path::PathBuf::from(temp);
 
-    std::fs::write(&temp, &json)?;
-    match std::fs::rename(&temp, path) {
-        Ok(()) => Ok(()),
-        Err(err) => {
-            let _ = std::fs::remove_file(&temp);
-            Err(err)
-        }
+    // Whichever step fails, the temporary does not outlive the attempt: a
+    // full disk that stops the write half-way would otherwise leave a
+    // `.tmp.<pid>` beside every report until someone noticed.
+    let written = std::fs::write(&temp, &json).and_then(|()| std::fs::rename(&temp, path));
+    if written.is_err() {
+        let _ = std::fs::remove_file(&temp);
     }
+    written
 }
