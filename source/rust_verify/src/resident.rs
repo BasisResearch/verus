@@ -397,8 +397,9 @@ enum Request {
         /// than alone.
         #[serde(default)]
         alongside: bool,
-        /// Pin the first rung that proved the query, or remove the pin when
-        /// none did. Default true; false leaves the pin as it was.
+        /// Pin the first rung that proved the query if its clamped budget is
+        /// at least one resource unit; otherwise remove the pin. Default
+        /// true; false leaves the pin as it was.
         pin: Option<bool>,
     },
     /// Give the query the rung its checks try first, as a ladder request
@@ -4983,8 +4984,8 @@ fn below_one_resource_unit(
 /// a cvc5 without that option would fail that check and end the session; a
 /// rung the solver has no module for would run nothing, at every check; and
 /// a budget below one cvc5 resource unit would run the attempt with no limit
-/// at all. A ladder pins only a rung it ran, so it has made these checks
-/// already.
+/// at all. Both explicit pins and ladder-generated pins pass this check:
+/// a ladder may have run at a larger budget than the query permits a pin.
 ///
 /// Which rungs a solver has is the session's (`SessionRungs`), so only the
 /// first pin of a session probes one; the budget is the query's own, so it
@@ -5007,7 +5008,7 @@ fn check_pin(
         return Ok(Err("pin requests need cvc5"));
     }
     let query_rlimit = journal.queries[local].rlimit;
-    if below_one_resource_unit(air, rlimit, query_rlimit, set_rlimit) {
+    if below_one_resource_unit(air, rlimit.min(query_rlimit), query_rlimit, set_rlimit) {
         return Ok(Err("the pin's budget is below one cvc5 resource unit"));
     }
     if *known == SessionRungs::Unknown {
@@ -5061,10 +5062,14 @@ fn serve_ladder(
     }
     let prefix = journal.queries[local].prefix;
     let query_rlimit = journal.queries[local].rlimit;
-    // Refused before any rung runs.
+    // Validate the resolved budgets before any rung runs, including the
+    // query budget used by rungs without an explicit override.
+    let default_budget = if query_rlimit.is_finite() { query_rlimit } else { DEFAULT_RUNG_RLIMIT };
     if budgets
         .values()
-        .any(|&rlimit| below_one_resource_unit(air, rlimit, query_rlimit, set_rlimit))
+        .copied()
+        .chain(rungs.iter().map(|rung| budgets.get(rung).copied().unwrap_or(default_budget)))
+        .any(|rlimit| below_one_resource_unit(air, rlimit, query_rlimit, set_rlimit))
     {
         return Ok(Err("a rung's budget is below one cvc5 resource unit"));
     }
@@ -5086,9 +5091,6 @@ fn serve_ladder(
         ));
     };
     let query = &journal.queries[local];
-    // A rung without a budget gets the query's own, or, for a query without
-    // one, `DEFAULT_RUNG_RLIMIT`: every rung runs bounded.
-    let default_budget = if query.rlimit.is_finite() { query.rlimit } else { DEFAULT_RUNG_RLIMIT };
     let start = Instant::now();
     let mut solved_by = None;
     let mut reports = Vec::new();
@@ -5786,7 +5788,25 @@ impl Server {
                                             .find(|report| report.rung == rung)
                                             .and_then(|report| report.rlimit)
                                             .expect("the rung that proved the query ran");
-                                        self.pins.insert(key, Pin { rung, alongside, rlimit });
+                                        match check_pin(
+                                            bucket,
+                                            id,
+                                            rung,
+                                            rlimit,
+                                            &mut self.rungs,
+                                            &set_rlimit,
+                                        ) {
+                                            Ok(Ok(())) => {
+                                                self.pins
+                                                    .insert(key, Pin { rung, alongside, rlimit });
+                                            }
+                                            Ok(Err(_)) => {
+                                                // The rung proved it at its own budget, but
+                                                // clamping to the query's would be unlimited.
+                                                self.pins.remove(&key);
+                                            }
+                                            Err(error) => return fatal(&mut output, error),
+                                        }
                                     }
                                     None => {
                                         self.pins.remove(&key);

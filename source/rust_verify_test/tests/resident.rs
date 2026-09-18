@@ -3582,6 +3582,62 @@ fn resident_pin_is_refused_where_checks_could_not_follow_it() {
     worker.finish(false);
 }
 
+/// A valid requested budget can become unlimited after clamping to the
+/// query's budget. Explicit pins refuse it; ladders validate inherited
+/// budgets and do not pin a successful override that cannot be clamped.
+#[test]
+fn resident_pin_and_ladder_reject_effective_subunit_budgets() {
+    for budget in ["0", "0.000001"] {
+        let source = format!(
+            r#"
+use vstd::prelude::*;
+verus! {{
+    #[verifier::rlimit({budget})]
+    proof fn tiny() {{ assert(true); }}
+
+    #[verifier::rlimit(1)]
+    proof fn bounded() {{ assert(true); }}
+}}
+"#
+        );
+        let mut worker =
+            Worker::start_with_env(&source, &[], &[("VERUS_RESIDENT_RETAIN_ONLY", "1")]);
+        let ready = worker.receive();
+        let session = ready["session"].clone();
+        let tiny = query_id(&ready, "::tiny");
+        let refused = worker.send(json!({"command":"pin", "session":session, "bucket":0,
+            "query":tiny, "rung":"ematch", "rlimit":1}));
+        assert_eq!(refused["event"], "error", "{budget}: {refused}");
+        assert!(refused["message"].as_str().unwrap().contains("below one cvc5 resource unit"));
+
+        let refused = worker.send(json!({"command":"ladder", "session":session, "bucket":0,
+            "query":tiny, "rungs":["ematch"]}));
+        assert_eq!(refused["event"], "error", "{budget}: {refused}");
+        assert!(refused["message"].as_str().unwrap().contains("below one cvc5 resource unit"));
+
+        // An explicit ladder budget still checks, but cannot become a pin
+        // whose next attempt would clamp to an unlimited resource budget.
+        let ladder = worker.send(json!({"command":"ladder", "session":session, "bucket":0,
+            "query":tiny, "rungs":["ematch"], "budgets":{"ematch":1}}));
+        assert_eq!(ladder["event"], "laddered", "{budget}: {ladder}");
+        assert_eq!(ladder["solved_by"], "ematch", "{budget}: {ladder}");
+        assert!(rung(&ladder, "ematch")["resource_limit"].as_u64().unwrap() > 0);
+        assert!(ladder["pinned"].is_null(), "{budget}: {ladder}");
+
+        // Refusals leave the session usable; a positive clamped budget is
+        // accepted and the next check actually uses that smaller budget.
+        let bounded = query_id(&ready, "::bounded");
+        let pinned = worker.send(json!({"command":"pin", "session":session, "bucket":0,
+            "query":bounded, "rung":"ematch", "rlimit":5}));
+        assert_eq!(pinned["event"], "pinned", "{pinned}");
+        let checked = worker.send(json!({"command":"check", "session":session, "bucket":0,
+            "query":bounded}));
+        assert_eq!(checked["result"], "valid", "{checked}");
+        assert_eq!(checked["pinned"]["rlimit"], 1.0, "{checked}");
+        worker.finish(true);
+    }
+}
+
 /// A retain-only session has checked nothing when its first request arrives,
 /// and its solvers have not even started. A pin request for such a query
 /// still sees every rung the solver has and is followed by the check; a
