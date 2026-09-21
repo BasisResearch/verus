@@ -119,7 +119,7 @@ fn update_breaks_to_versions(
     }
 }
 
-struct LowerStmtState {
+struct LowerStmtState<'a> {
     decls: Vec<Decl>,
     break_versions: HashMap<Ident, Vec<IndexMap<Ident, u32>>>,
     version_decls: HashSet<Ident>,
@@ -129,6 +129,7 @@ struct LowerStmtState {
     /// When kept, each assert reached, with the versions and snapshots in
     /// force there.
     goal_scopes: Option<Vec<(Option<AssertId>, GoalScope)>>,
+    observer: Option<&'a mut dyn crate::air_observer::AirObserver>,
 }
 
 /// The variable versions and snapshots in force at one assert of a query:
@@ -145,7 +146,7 @@ impl GoalScope {
     /// occurrence; without a `goal`, or when no assert has it, the query's
     /// last assert; before any statement when it has none.
     pub fn of(query: &Query, goal: Option<&AssertId>) -> Self {
-        let (_, _, _, _, entry, scopes) = lower_query_with(query, false, true);
+        let (_, _, _, _, entry, scopes) = lower_query_with(query, false, true, None);
         let scopes = scopes.unwrap_or_default();
         let wanted = goal.and_then(|goal| {
             scopes.iter().find(|(id, _)| id.as_ref().is_some_and(|id| **id == **goal))
@@ -168,8 +169,20 @@ impl GoalScope {
     }
 }
 
+impl LowerStmtState<'_> {
+    fn notify_version_created(
+        &mut self,
+        versioned: &Ident,
+        kind: crate::air_observer::VersionOrigin,
+    ) {
+        if let Some(obs) = &mut self.observer {
+            obs.on_wp_version_created(versioned, kind);
+        }
+    }
+}
+
 fn lower_stmt(
-    state: &mut LowerStmtState,
+    state: &mut LowerStmtState<'_>,
     versions: &mut IndexMap<Ident, u32>,
     snapshots: &mut Snapshots,
     types: &HashMap<Ident, Typ>,
@@ -188,6 +201,7 @@ fn lower_stmt(
             stmt
         }
         StmtX::Havoc(x) | StmtX::Assign(x, _) => {
+            let is_havoc = matches!(&*stmt, StmtX::Havoc(_));
             let n = find_version(&versions, x);
             let typ = types[x].clone();
             versions.insert(x.clone(), n + 1);
@@ -200,6 +214,12 @@ fn lower_stmt(
                 state.decls.push(decl);
                 state.version_decls.insert(x.clone());
             }
+            let kind = if is_havoc {
+                crate::air_observer::VersionOrigin::Havoc
+            } else {
+                crate::air_observer::VersionOrigin::Assign
+            };
+            state.notify_version_created(&x, kind);
             match &*stmt {
                 StmtX::Assign(_, e) => {
                     let expr1 = Arc::new(ExprX::Var(x));
@@ -235,6 +255,18 @@ fn lower_stmt(
                 state.break_versions.remove(label).expect("break_versions");
             all_versions.insert(0, versions.clone());
             update_versions_from_all_branches(&all_versions, versions);
+            // Notify observer of phantom versions created by break merge reconciliation
+            for x in versions.keys() {
+                let merged_version = versions[x];
+                let had_explicit = all_versions.iter().any(|v| v[x] == merged_version);
+                if !had_explicit {
+                    let renamed = Arc::new(rename_var(x, merged_version));
+                    state.notify_version_created(
+                        &renamed,
+                        crate::air_observer::VersionOrigin::BreakMerge,
+                    );
+                }
+            }
             let mut break_i: usize = 1;
             let s = update_breaks_to_versions(label, &all_versions, versions, &mut break_i, &s);
             assert!(break_i == all_versions.len());
@@ -264,6 +296,18 @@ fn lower_stmt(
                 state.all_snapshots.extend(snapshots_i);
             }
             update_versions_from_all_branches(&all_versions, versions);
+            // Notify observer of phantom versions created by merge reconciliation
+            for x in versions.keys() {
+                let merged_version = versions[x];
+                let had_explicit = all_versions.iter().any(|v| v[x] == merged_version);
+                if !had_explicit {
+                    let renamed = Arc::new(rename_var(x, merged_version));
+                    state.notify_version_created(
+                        &renamed,
+                        crate::air_observer::VersionOrigin::BranchMerge,
+                    );
+                }
+            }
             for i in 0..ss.len() {
                 stmts[i] = update_branch_to_versions(&all_versions[i], versions, &stmts[i], false);
             }
@@ -275,9 +319,10 @@ fn lower_stmt(
 pub(crate) fn lower_query(
     query: &Query,
     record_versions: bool,
+    observer: Option<&mut dyn crate::air_observer::AirObserver>,
 ) -> (Query, Snapshots, Vec<Decl>, crate::context::VariableVersions) {
     let (query, snapshots, local_vars, versions, _, _) =
-        lower_query_with(query, record_versions, false);
+        lower_query_with(query, record_versions, false, observer);
     (query, snapshots, local_vars, versions)
 }
 
@@ -287,6 +332,7 @@ fn lower_query_with(
     query: &Query,
     record_versions: bool,
     record_goal_scopes: bool,
+    observer: Option<&mut dyn crate::air_observer::AirObserver>,
 ) -> (
     Query,
     Snapshots,
@@ -339,6 +385,7 @@ fn lower_query_with(
         variable_versions,
         record_versions,
         goal_scopes: record_goal_scopes.then(Vec::new),
+        observer,
     };
     let entry = GoalScope { versions: versions.clone(), snapshots: snapshots.clone() };
     let assertion = lower_stmt(&mut state, &mut versions, &mut snapshots, &types, assertion);
@@ -370,14 +417,14 @@ mod tests {
             })
         };
         let (_, _, _, versions) =
-            lower_query(&query(vec![Arc::new(StmtX::Havoc(name.clone()))]), true);
+            lower_query(&query(vec![Arc::new(StmtX::Havoc(name.clone()))]), true, None);
         assert_eq!(versions.get("balance@0"), Some(&("balance@".into(), 0)));
         assert_eq!(versions.get("balance@1"), Some(&("balance@".into(), 1)));
-        let (_, _, _, versions) = lower_query(&query(vec![]), true);
+        let (_, _, _, versions) = lower_query(&query(vec![]), true, None);
         assert_eq!(versions.len(), 1);
         assert!(!versions.contains_key("balance@1"));
         let (_, _, _, versions) =
-            lower_query(&query(vec![Arc::new(StmtX::Havoc(name.clone()))]), false);
+            lower_query(&query(vec![Arc::new(StmtX::Havoc(name.clone()))]), false, None);
         assert!(versions.is_empty());
     }
 

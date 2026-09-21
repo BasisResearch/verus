@@ -73,6 +73,7 @@ mod scaffold;
 #[cfg(feature = "singular")]
 pub mod singular;
 mod spans;
+pub mod test_observer;
 pub mod trait_check;
 mod trait_check_ast;
 mod trait_check_emit;

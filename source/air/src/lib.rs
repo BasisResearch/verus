@@ -1,3 +1,4 @@
+pub mod air_observer;
 pub mod ast;
 pub mod ast_util;
 pub mod bisect;
@@ -10,6 +11,7 @@ pub mod messages;
 pub mod model;
 pub mod parser;
 pub mod profiler;
+pub mod query_result_observer;
 pub mod remove_asserts;
 pub mod scope_map;
 pub mod smt_process;
@@ -21,6 +23,7 @@ pub mod printer;
 pub mod scaffold;
 
 mod block_to_assert;
+pub use block_to_assert::lower_query;
 mod closure;
 pub mod def;
 mod smt_verify;
