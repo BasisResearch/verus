@@ -72,6 +72,7 @@ mod sst_elaborate;
 mod sst_to_air;
 pub mod sst_to_air_func;
 pub mod sst_util;
+pub mod tla;
 mod sst_vars;
 mod sst_visitor;
 pub mod traits;

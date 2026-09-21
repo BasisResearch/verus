@@ -892,6 +892,31 @@ impl Verifier {
         })
     }
 
+    /// `-V tla-export=<module>`: write the module's transition system as
+    /// TLA+ (`<Module>.tla`, a `.cfg` skeleton, a `.tla.json` report) under
+    /// the log directory, before simplification so `match` and constructor
+    /// updates are still visible.
+    fn export_tla(&mut self, krate: &Krate, module: &str) -> Result<(), VirErr> {
+        use std::io::Write;
+        let export = vir::tla::export_module(krate, module).map_err(|e| {
+            crate::util::error(format!("tla-export: {e}"))
+        })?;
+        let stem = format!("{}", export.report.state_type.rsplit("::").next().unwrap_or("Model"));
+        let mut tla = self.create_log_file(None, &format!("-{stem}.tla"))?;
+        tla.write_all(export.tla.as_bytes()).map_err(|e| crate::util::error(format!("tla-export: {e}")))?;
+        let mut cfg = self.create_log_file(None, &format!("-{stem}.cfg"))?;
+        cfg.write_all(export.cfg.as_bytes()).map_err(|e| crate::util::error(format!("tla-export: {e}")))?;
+        let mut json = self.create_log_file(None, &format!("-{stem}.tla.json"))?;
+        let text = serde_json::to_string_pretty(&export.report).unwrap_or_else(|_| "{}".into());
+        json.write_all(text.as_bytes()).map_err(|e| crate::util::error(format!("tla-export: {e}")))?;
+        eprintln!(
+            "tla-export: {} ({}), {} operators, {} holes, {} refusals",
+            export.report.state_type, export.report.shape, export.report.operators,
+            export.report.holes.len(), export.report.refusals.len()
+        );
+        Ok(())
+    }
+
     fn create_log_file(
         &mut self,
         bucket_id_opt: Option<&BucketId>,
@@ -2756,6 +2781,9 @@ impl Verifier {
             self.args.report_long_running,
         )?;
         vir::recursive_types::check_traits(&krate, &global_ctx)?;
+        if let Some(module) = self.args.tla_export.clone() {
+            self.export_tla(&krate, &module)?;
+        }
         let krate = vir::ast_simplify::simplify_krate(&mut global_ctx, &krate)?;
 
         if self.args.log_all || self.args.log_args.log_vir_simple {
