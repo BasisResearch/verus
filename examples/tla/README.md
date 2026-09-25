@@ -85,7 +85,12 @@ A recursive spec fn (one with `decreases`) that reads the state takes it
 explicitly, as a record: `sum(s, i)` called on the post state is `sum([v |->
 v', n |-> n'], i)`. A primed copy of a RECURSIVE operator would give every
 recursive operator an action's level in SANY, so an invariant calling the
-unprimed one would no longer be a state predicate.
+unprimed one would no longer be a state predicate. A spec fn given such a
+record, or any state value other than the pre or post state (`k_le(State {
+k: 0, ..s }, 0)`), is called in its record variant (`ok_at_rec(s, i)`),
+which takes every parameter explicitly, so a recursive walk can call a
+per-index predicate. A call that swaps the pre and post states is a
+refusal as a whole.
 
 A closure bound by `let` (or a closure parameter) is only ever applied; passed
 to a function, compared or returned, it is a refusal.
@@ -99,7 +104,9 @@ cannot build the successor and stops with "successor state not completely
 specified". Likewise an `init` that constrains only some fields: TLC cannot
 compute the initial states ("current state is not a legal state"). The
 report's `init_unassigned` lists the variables `Init` never assigns (`x = e`
-or `e = x` at conjunct level, followed through calls passing the state) and
+or `e = x` at conjunct level, followed through calls passing the state; `s.o
+is None` and `s.o.is_none()` are printed `o = [tag |-> "None"]` and assign
+`o`, as does the same check on `post` in a transition) and
 the `.cfg` names them. The report's `transitions` lists each transition `Next` reaches
 with the variables it never assigns (`unassigned`), and the `.cfg` names any
 that leaves one unassigned. A transition is `Next` itself or an operator

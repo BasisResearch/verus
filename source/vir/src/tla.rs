@@ -30,7 +30,10 @@
 //! the shape TLC needs to assign a primed variable.
 //! A recursive function other than a root takes its state parameters
 //! explicitly, as records, rather than as a primed variant (SANY gives every
-//! RECURSIVE operator the highest level among them). A closure-valued
+//! RECURSIVE operator the highest level among them). A function given a
+//! state value rather than the pre or post state (such a record, or a
+//! constructed state) is called in its record variant (`f_rec`), which takes
+//! every parameter explicitly. A closure-valued
 //! variable is kept only symbolically; used other than in an application it
 //! is refused.
 
@@ -151,10 +154,23 @@ struct Call {
     context: BTreeSet<String>,
 }
 
-/// An operator: a function, and whether it is the variant whose single
-/// state parameter is read as the primed variables (a callee given `post`
-/// where it declares one state parameter).
-type OpKey = (Fun, bool);
+/// An operator: a function, and which of its variants (see [`Variant`]).
+type OpKey = (Fun, Variant);
+
+/// How an operator reads its state parameters.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+enum Variant {
+    /// As the unprimed (pre) and primed (post) variables, dropped from the
+    /// parameter list.
+    Plain,
+    /// Its single state parameter as the primed variables (a callee given
+    /// `post` where it declares one state parameter).
+    Primed,
+    /// Every state parameter explicitly, as a record: a callee given a state
+    /// value rather than the pre or post state, as a recursive function
+    /// holds it (`ok_at(s, i)` called from a recursive walk over `s`).
+    Record,
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Role {
@@ -636,15 +652,17 @@ impl Exporter {
         if let Some(n) = self.op_names.get(key) {
             return n.clone();
         }
-        let (fun, primed) = key;
+        let (fun, variant) = key;
         let friendly = fun_as_friendly_rust_name(fun);
         let segs: Vec<&str> = friendly.split("::").collect();
         let mut candidate = ident_name(&VarIdent(
             Arc::new(segs.last().unwrap_or(&"f").to_string()),
             VarIdentDisambiguate::AirLocal,
         ));
-        if *primed {
-            candidate = format!("{candidate}_post");
+        match variant {
+            Variant::Plain => {}
+            Variant::Primed => candidate = format!("{candidate}_post"),
+            Variant::Record => candidate = format!("{candidate}_rec"),
         }
         let taken = |this: &Self, c: &str| {
             this.used_names.contains(c)
@@ -852,7 +870,7 @@ impl Exporter {
             }
             ExprX::VarAt(..) => self.refuse("old(...) reference", &e.span),
             ExprX::ConstVar(fun, _) | ExprX::StaticVar(fun) => {
-                self.ensure_function(&(fun.clone(), false))
+                self.ensure_function(&(fun.clone(), Variant::Plain))
             }
             ExprX::ReadPlace(place, _) => self.place(place, env),
             ExprX::Call { target, args, .. } => self.call(e, target, args, env),
@@ -900,10 +918,12 @@ impl Exporter {
                 UnaryOpr::Box(_) | UnaryOpr::Unbox(_) => self.expr(inner, env),
                 UnaryOpr::HasType(_) => "TRUE".into(),
                 UnaryOpr::IsVariant { datatype, variant } => {
-                    let inner_s = self.expr(inner, env);
                     if self.single_variant(datatype) {
                         "TRUE".into()
+                    } else if self.fieldless_variant(datatype, variant) {
+                        self.is_fieldless(inner, variant, self.conj_level, env)
                     } else {
+                        let inner_s = self.quiet(|x| x.expr(inner, env));
                         format!("({inner_s}.tag = \"{variant}\")")
                     }
                 }
@@ -1138,6 +1158,35 @@ impl Exporter {
                 .collect::<Vec<_>>()
                 .join(" /\\ ")
         ))
+    }
+
+    /// Whether `variant` of the enum `dt` has no fields, so its value is
+    /// the record `[tag |-> "variant"]` alone.
+    fn fieldless_variant(&self, dt: &Dt, variant: &Ident) -> bool {
+        match dt {
+            Dt::Path(p) => self
+                .datatypes
+                .get(p)
+                .and_then(|d| d.x.variants.iter().find(|v| &v.name == variant))
+                .is_some_and(|v| v.fields.is_empty()),
+            Dt::Tuple(_) => false,
+        }
+    }
+
+    /// `inner is variant` for a variant without fields (`s.o is None`,
+    /// `s.o.is_none()`), printed as the equality `inner = [tag |->
+    /// "variant"]`, which says the same. At conjunct level (`at_conj`) on a
+    /// field of the post state it assigns the field (`o' = [tag |->
+    /// "None"]`), and in Init it assigns the unprimed one, so TLC can
+    /// compute the state.
+    fn is_fieldless(&mut self, inner: &Expr, variant: &str, at_conj: bool, env: &Env) -> String {
+        if at_conj {
+            if let Some(v) = self.post_field(inner, env) {
+                self.current_assigned.insert(v);
+            }
+        }
+        let inner_s = self.quiet(|x| x.expr(inner, env));
+        format!("({inner_s} = [tag |-> \"{variant}\"])")
     }
 
     fn single_variant(&self, dt: &Dt) -> bool {
@@ -1412,19 +1461,13 @@ impl Exporter {
                 }
                 // Option's spec helpers, recognised by the receiver's type so
                 // a crate function of the same name is left alone.
-                let on_option = args
-                    .first()
-                    .and_then(|a| typ_datatype(&a.typ))
-                    .map(|p| path_as_friendly_rust_name(&p) == "core::option::Option")
-                    .unwrap_or(false);
-                let method = friendly.rsplit("::").next().unwrap_or("");
-                if on_option {
-                    match method {
+                if let Some(method) = option_method(fun, args) {
+                    match method.as_str() {
                         "is_some" | "is_Some" => {
                             return format!("({}.tag = \"Some\")", self.expr(&args[0], env));
                         }
                         "is_none" | "is_None" => {
-                            return format!("({}.tag = \"None\")", self.expr(&args[0], env));
+                            return self.is_fieldless(&args[0], "None", level, env);
                         }
                         // `.unwrap()` in spec code is vstd's `spec_unwrap`,
                         // whose body is the uninterpreted trait method
@@ -1455,38 +1498,50 @@ impl Exporter {
                 // variables and leaves the other arguments as they are.
                 let roles = self.param_roles(&callee);
                 let single_state = roles.iter().filter(|r| r.is_some()).count() == 1;
+                let arg_role = |a: &Expr| read_var(a).and_then(|v| env.roles.get(&v).copied());
+                // A state value that is neither the pre nor the post state
+                // (a record, as a recursive function holds the state, or a
+                // constructed state) goes to the record variant, which takes
+                // every parameter explicitly; a pre or post state among the
+                // arguments is passed as its record.
+                if roles.iter().zip(args.iter()).any(|(r, a)| r.is_some() && arg_role(a).is_none())
+                {
+                    let printed: Vec<String> = args.iter().map(|a| self.expr(a, env)).collect();
+                    self.conj_level = level;
+                    let name = self.ensure_function(&(fun.clone(), Variant::Record));
+                    return format!("{name}({})", printed.join(", "));
+                }
                 let mut printed = Vec::new();
-                let mut primed = false;
+                let mut variant = Variant::Plain;
+                // A pre and a post state swapped: the call as a whole is the
+                // refusal, since the operator declares no parameter for the
+                // state.
+                let mut refused = None;
                 for (i, a) in args.iter().enumerate() {
-                    let arg_role = read_var(a).and_then(|v| env.roles.get(&v).copied());
-                    match roles.get(i).copied().flatten() {
-                        Some(Role::Pre) => match arg_role {
-                            Some(Role::Pre) => {}
-                            Some(Role::Post) if single_state => primed = true,
-                            Some(Role::Post) => {
-                                let r = self.refuse(
-                                    "post state passed where the callee expects its pre state",
-                                    &a.span,
-                                );
-                                printed.push(r);
-                            }
-                            None => {
-                                let r = self
-                                    .refuse("a computed state passed to a state operator", &a.span);
-                                printed.push(r);
-                            }
-                        },
-                        Some(Role::Post) => {
-                            if arg_role != Some(Role::Post) {
-                                let r = self.refuse("something other than the post state passed as a callee's post state", &a.span);
-                                printed.push(r);
-                            }
+                    match (roles.get(i).copied().flatten(), arg_role(a)) {
+                        (Some(Role::Pre), Some(Role::Pre))
+                        | (Some(Role::Post), Some(Role::Post)) => {}
+                        (Some(Role::Pre), Some(Role::Post)) if single_state => {
+                            variant = Variant::Primed
                         }
-                        None => printed.push(self.expr(a, env)),
+                        (Some(Role::Pre), _) => {
+                            let what = "post state passed where the callee expects its pre state";
+                            refused = Some(self.refuse(what, &a.span));
+                            break;
+                        }
+                        (Some(Role::Post), _) => {
+                            let what = "pre state passed where the callee expects its post state";
+                            refused = Some(self.refuse(what, &a.span));
+                            break;
+                        }
+                        (None, _) => printed.push(self.expr(a, env)),
                     }
                 }
                 self.conj_level = level;
-                let name = self.ensure_function(&(fun.clone(), primed));
+                if let Some(r) = refused {
+                    return r;
+                }
+                let name = self.ensure_function(&(fun.clone(), variant));
                 if printed.is_empty() { name } else { format!("{name}({})", printed.join(", ")) }
             }
             CallTarget::FnSpec(f) => {
@@ -2356,7 +2411,7 @@ impl Exporter {
             self.assign_through_call(key, reach);
             return name;
         }
-        let (fun, primed) = key;
+        let (fun, variant) = key;
         let Some(f) = self.functions.get(fun).cloned() else { return name };
         self.emitting.insert(key.clone());
         let previous = std::mem::replace(&mut self.current, fun_as_friendly_rust_name(fun));
@@ -2368,12 +2423,15 @@ impl Exporter {
         let previous_enclosing = std::mem::take(&mut self.enclosing_assigned);
         let previous_level = std::mem::replace(&mut self.conj_level, true);
         let mut env = Env::new();
-        let roles = self.param_roles(&f);
+        let roles = match variant {
+            Variant::Record => vec![None; f.x.params.len()],
+            Variant::Plain | Variant::Primed => self.param_roles(&f),
+        };
         let mut params = Vec::new();
         for (p, role) in f.x.params.iter().zip(roles.iter()) {
             match role {
                 // The primed variant reads its one state parameter as post.
-                Some(Role::Pre) if *primed => {
+                Some(Role::Pre) if *variant == Variant::Primed => {
                     env.roles.insert(p.x.name.clone(), Role::Post);
                 }
                 Some(r) => {
@@ -2395,7 +2453,11 @@ impl Exporter {
         def.push_str(&format!(
             "\\* {}{}, {}\n",
             fun_as_friendly_rust_name(fun),
-            if *primed { " (read in the post state)" } else { "" },
+            match variant {
+                Variant::Plain => "",
+                Variant::Primed => " (read in the post state)",
+                Variant::Record => " (the state passed as a record)",
+            },
             span_string(&f.span)
         ));
         if f.x.decrease.len() > 0 {
@@ -2514,6 +2576,19 @@ impl Exporter {
                     _ => BTreeSet::new(),
                 }
             }
+            // `s.o is None`, `s.o.is_none()`: printed `o = [tag |-> "None"]`
+            // (see [`Exporter::is_fieldless`]).
+            ExprX::UnaryOpr(UnaryOpr::IsVariant { datatype, variant }, inner)
+                if !self.single_variant(datatype) && self.fieldless_variant(datatype, variant) =>
+            {
+                field(inner).into_iter().collect()
+            }
+            ExprX::Call { target: CallTarget::Fun(_, fun, ..), args, .. }
+                if option_method(fun, args)
+                    .is_some_and(|m| matches!(m.as_str(), "is_none" | "is_None")) =>
+            {
+                field(&args[0]).into_iter().collect()
+            }
             ExprX::Call { target: CallTarget::Fun(kind, fun, ..), args, .. } if depth < 16 => {
                 let fun = self.resolved_fun(kind, fun);
                 let Some(callee) = self.functions.get(&fun) else { return BTreeSet::new() };
@@ -2557,7 +2632,11 @@ fn conjunctive(e: &Expr) -> bool {
         | ExprX::WithTriggers { .. }
         | ExprX::ReadPlace(..)
         | ExprX::UnaryOpr(
-            UnaryOpr::Box(_) | UnaryOpr::Unbox(_) | UnaryOpr::ProofNote(_) | UnaryOpr::CustomErr(_),
+            UnaryOpr::Box(_)
+            | UnaryOpr::Unbox(_)
+            | UnaryOpr::ProofNote(_)
+            | UnaryOpr::CustomErr(_)
+            | UnaryOpr::IsVariant { .. },
             _,
         )
         | ExprX::Unary(UnaryOp::Trigger(_) | UnaryOp::CoerceMode { .. }, _) => true,
@@ -2654,6 +2733,18 @@ fn field_name(f: &Ident) -> String {
     } else {
         s
     }
+}
+
+/// The method a call runs on an `Option` receiver (`is_none`, `unwrap`,
+/// ...): Option's spec helpers are recognised by the receiver's type, so a
+/// crate function of the same name is left alone.
+fn option_method(fun: &Fun, args: &Exprs) -> Option<String> {
+    let on_option = args
+        .first()
+        .and_then(|a| typ_datatype(&a.typ))
+        .is_some_and(|p| path_as_friendly_rust_name(&p) == "core::option::Option");
+    let friendly = fun_as_friendly_rust_name(fun);
+    on_option.then(|| friendly.rsplit("::").next().unwrap_or("").to_string())
 }
 
 /// Whether `e` is the literal `false`.
@@ -3020,7 +3111,7 @@ pub fn export_module(krate: &Krate, arg: &str) -> Result<Export, String> {
     if verus_tla {
         for (i, r) in roots.iter().enumerate() {
             let f = ex.functions.get(r).cloned().ok_or("root missing")?;
-            let key = (r.clone(), false);
+            let key = (r.clone(), Variant::Plain);
             let name = ex.op_name(&key);
             ex.current = fun_as_friendly_rust_name(r);
             ex.bound.clear();
@@ -3063,16 +3154,19 @@ pub fn export_module(krate: &Krate, arg: &str) -> Result<Export, String> {
             }
         }
     } else {
-        init_name = ex.ensure_function(&(triple.init.clone(), false));
-        next_name = ex.ensure_function(&(triple.next.clone(), false));
+        init_name = ex.ensure_function(&(triple.init.clone(), Variant::Plain));
+        next_name = ex.ensure_function(&(triple.next.clone(), Variant::Plain));
         // A predicate init or next reads, unprimed or primed, is a guard or helper of
         // the transition, not an invariant, unless the command line names
         // it; it is reported as excluded, never dropped silently.
         let transitions: HashSet<OpKey> = ex.emitted.clone();
         for r in &selected {
-            let key = (r.clone(), false);
-            // Read primed (`p(post)` in next) is a guard too.
-            let reached = transitions.contains(&key) || transitions.contains(&(r.clone(), true));
+            let key = (r.clone(), Variant::Plain);
+            // Read primed (`p(post)` in next), or given a state value, is a
+            // guard too.
+            let reached = [Variant::Plain, Variant::Primed, Variant::Record]
+                .iter()
+                .any(|v| transitions.contains(&(r.clone(), *v)));
             if !triple.explicit && reached {
                 outcome.insert(
                     r.clone(),
@@ -3097,7 +3191,7 @@ pub fn export_module(krate: &Krate, arg: &str) -> Result<Export, String> {
             );
         }
     }
-    let transitions = ex.transitions(&(triple.next.clone(), false));
+    let transitions = ex.transitions(&(triple.next.clone(), Variant::Plain));
     let init_unassigned = match ex.functions.get(&triple.init).and_then(|f| f.x.body.clone()) {
         // verus-tla: the initial predicate is the body of the closure `init()`
         // returns, over its one parameter.
@@ -3136,7 +3230,7 @@ pub fn export_module(krate: &Krate, arg: &str) -> Result<Export, String> {
                 outcome.get(f).cloned().unwrap_or_else(|| (*selected, reason.clone()));
             Candidate {
                 function: fun_as_friendly_rust_name(f),
-                operator: ex.op_names.get(&(f.clone(), false)).cloned(),
+                operator: ex.op_names.get(&(f.clone(), Variant::Plain)).cloned(),
                 included,
                 reason,
             }

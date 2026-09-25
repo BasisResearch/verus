@@ -1581,3 +1581,123 @@ fn tla_export_counts_updates_under_a_verussync_assert() {
     // n from 0 to 3.
     assert_eq!(run.distinct, 4, "{run:?}");
 }
+
+/// `moved(post, pre)` swaps the callee's pre and post states: the call as a
+/// whole is the refusal. Printed as an extra argument, the Assert gave
+/// `moved` more arguments than its definition, and SANY rejected the module.
+const SWAPPED_STATES: &str = r#"
+verus! {
+pub struct State { pub x: int }
+
+pub open spec fn moved(a: State, b: State) -> bool { b.x == a.x + 1 }
+
+pub open spec fn init(s: State) -> bool { s.x == 0 }
+
+pub open spec fn next(pre: State, post: State) -> bool {
+    pre.x < 2 && post.x == pre.x + 1 && moved(post, pre)
+}
+
+pub open spec fn small(s: State) -> bool { s.x <= 2 }
+}
+"#;
+
+#[test]
+fn tla_export_refuses_a_swapped_state_as_the_whole_call() {
+    let ex = export_code(SWAPPED_STATES, "test_crate");
+    let refusals: Vec<String> = ex.report["refusals"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["what"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(refusals.len(), 1, "{refusals:?}");
+    assert!(refusals[0].contains("post state passed where the callee expects its pre"));
+    assert!(!ex.tla.contains("moved("), "{}", ex.tla);
+    // Only Next reaches the refusal; the invariant is still checked.
+    assert_eq!(names(&ex.report["invariants"]), ["small"]);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    // TLC stops where the refused call is evaluated, with its reason.
+    let out = tlc_output(&jar, &ex.spec(), &ex.cfg);
+    assert!(out.contains("tla-export refused: post state passed"), "TLC output:\n{}", out);
+}
+
+/// A recursive walk holds the state as a record, so the per-index predicate
+/// it calls, and a helper given a constructed state, take theirs as a
+/// record too (the `_rec` variant) rather than being refused.
+const RECORD_STATE: &str = r#"
+use vstd::prelude::*;
+verus! {
+pub struct State { pub a: Seq<u8>, pub k: nat }
+
+pub open spec fn ok_at(s: State, i: int) -> bool { s.a[i] <= 3 }
+
+pub open spec fn all_le(s: State, i: nat) -> bool decreases i {
+    if i == 0 { true } else { s.a.len() >= i ==> ok_at(s, i - 1) && all_le(s, (i - 1) as nat) }
+}
+
+pub open spec fn k_le(s: State, n: nat) -> bool { s.k <= n }
+
+pub open spec fn init(s: State) -> bool { s.a == Seq::<u8>::empty() && s.k == 0 }
+
+pub open spec fn next(pre: State, post: State) -> bool {
+    &&& pre.k < 3
+    &&& post.k == pre.k + 1
+    &&& post.a == pre.a.push(pre.k as u8)
+}
+
+pub open spec fn good(s: State) -> bool { all_le(s, s.a.len()) }
+
+pub open spec fn reset_ok(s: State) -> bool { k_le(State { k: 0, ..s }, 0) }
+}
+"#;
+
+#[test]
+fn tla_export_passes_a_record_state_to_a_state_helper() {
+    let ex = export_code(RECORD_STATE, "test_crate");
+    assert_eq!(ex.report["refusals"], serde_json::json!([]), "{}", ex.tla);
+    assert_eq!(names(&ex.report["invariants"]), ["good", "reset_ok"]);
+    assert!(ex.tla.contains("ok_at_rec(s, (i - 1))"), "{}", ex.tla);
+    assert!(ex.tla.contains("k_le_rec("), "{}", ex.tla);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let run = tlc(&jar, &ex.spec(), &ex.cfg);
+    assert_eq!(run.violated, Vec::<String>::new(), "{}", ex.tla);
+    // k in 0..3, `a` the pushes so far.
+    assert_eq!(run.distinct, 4, "{run:?}\n{}", ex.tla);
+}
+
+/// `s.o.is_none()` and `s.p is None` in Init, and `post.p is None` in Next,
+/// say the field is the `None` record: printed as that equality, they
+/// assign it, so TLC can compute the states.
+const NONE_INIT: &str = r#"
+verus! {
+pub struct State { pub o: Option<int>, pub p: Option<int>, pub x: int }
+
+pub open spec fn init(s: State) -> bool { s.o.is_none() && s.p is None && s.x == 0 }
+
+pub open spec fn next(pre: State, post: State) -> bool {
+    &&& pre.x < 2
+    &&& post.x == pre.x + 1
+    &&& post.o == Some(pre.x)
+    &&& post.p is None
+}
+
+pub open spec fn inv(s: State) -> bool { s.p is None && (s.o is None || s.o.unwrap() < 2) }
+}
+"#;
+
+#[test]
+fn tla_export_assigns_a_none_check() {
+    let ex = export_code(NONE_INIT, "test_crate");
+    assert_eq!(ex.report["init_unassigned"], serde_json::json!([]), "{}", ex.tla);
+    assert!(!ex.cfg.contains("never assigns"), "{}", ex.cfg);
+    assert!(ex.tla.contains("(o = [tag |-> \"None\"])"), "{}", ex.tla);
+    assert!(ex.tla.contains("(p = [tag |-> \"None\"])"), "{}", ex.tla);
+    assert!(ex.tla.contains("(p' = [tag |-> \"None\"])"), "{}", ex.tla);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let run = tlc(&jar, &ex.spec(), &ex.cfg);
+    assert_eq!(run.violated, Vec::<String>::new(), "{}", ex.tla);
+    assert_eq!(run.distinct, 3, "{run:?}\n{}", ex.tla);
+}
