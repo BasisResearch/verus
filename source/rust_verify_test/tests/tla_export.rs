@@ -1035,7 +1035,7 @@ fn tla_export_says_when_no_invariant_is_checked() {
     assert_eq!(names(&ex.report["invariants"]), Vec::<String>::new());
     assert!(!ex.cfg.contains("INVARIANTS"), "{}", ex.cfg);
     assert!(
-        ex.cfg.contains("\\* No invariant is checked. The candidates (see the .tla.json report):\n\\*   test_crate::can_step: reached from init/next unprimed"),
+        ex.cfg.contains("\\* No invariant is checked. The candidates (see the .tla.json report):\n\\*   test_crate::can_step: reached from init/next, unprimed or primed"),
         "{}",
         ex.cfg
     );
@@ -1326,4 +1326,178 @@ fn tla_export_keeps_a_field_named_tag_apart_from_the_variant() {
     assert_eq!(run.violated, Vec::<String>::new(), "{}", ex.tla);
     // tag 1..3.
     assert_eq!(run.distinct, 3, "{run:?}");
+}
+
+/// Quantifiers over bounded integer types: a domain read off the guard is
+/// intersected with the type's range (`x < 300` over `u8` was `0..299`, so
+/// TLC found `all_small` FALSE and `no_witness`'s 256), a guard's open side
+/// is closed by the type (`i8`), an unguarded binder of at most 16 bits takes
+/// its whole range, and a wider one is a hole named after its type
+/// (`Dom_u32`, once `Dom_int` like every integer binder).
+const INT_BINDERS: &str = r#"
+verus! {
+pub struct State { pub n: nat }
+
+pub open spec fn init(s: State) -> bool { s.n == 0 }
+
+pub open spec fn next(pre: State, post: State) -> bool { pre.n < 1 && post.n == pre.n + 1 }
+
+pub open spec fn f(x: u8) -> int { x as int }
+
+pub open spec fn g(x: i8) -> int { x as int }
+
+pub open spec fn h(x: u32) -> int { x as int }
+
+pub open spec fn all_small(s: State) -> bool { forall|x: u8| x < 300 ==> #[trigger] f(x) <= 255 }
+
+pub open spec fn no_witness(s: State) -> bool {
+    !(exists|x: u8| x < 300 && #[trigger] f(x) == 256)
+}
+
+pub open spec fn i8_low(s: State) -> bool { forall|x: i8| x < 5 ==> #[trigger] g(x) >= -128 }
+
+pub open spec fn u8_top(s: State) -> bool { exists|x: u8| #[trigger] f(x) == 255 }
+
+pub open spec fn u32_nonneg(s: State) -> bool { forall|x: u32| #[trigger] h(x) >= 0 }
+
+proof fn truths(s: State)
+    ensures all_small(s), no_witness(s), i8_low(s), u8_top(s), u32_nonneg(s)
+{
+    assert(f(255u8) == 255);
+}
+}
+"#;
+
+#[test]
+fn tla_export_bounds_integer_binders_by_their_type() {
+    let ex = export_code(INT_BINDERS, "test_crate");
+    assert_eq!(ex.report["refusals"], serde_json::json!([]), "{}", ex.tla);
+    assert!(
+        ex.tla.contains("\\A x \\in 0..(IF ((300) - 1) < 255 THEN ((300) - 1) ELSE 255) :"),
+        "{}",
+        ex.tla
+    );
+    assert!(
+        ex.tla.contains("\\A x \\in -128..(IF ((5) - 1) < 127 THEN ((5) - 1) ELSE 127) :"),
+        "{}",
+        ex.tla
+    );
+    assert!(ex.tla.contains("\\E x \\in 0..255 :"), "{}", ex.tla);
+    let holes = ex.report["holes"].as_array().unwrap();
+    assert_eq!(holes.len(), 1, "{holes:?}");
+    assert_eq!(holes[0]["constant"], "Dom_u32");
+    assert_eq!(holes[0]["typ"], "u32");
+    assert_eq!(
+        names(&ex.report["invariants"]),
+        ["all_small", "no_witness", "i8_low", "u8_top", "u32_nonneg"]
+    );
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let cfg = format!("{}CONSTANTS Dom_u32 = {{0, 1}}\n", ex.cfg);
+    let run = tlc(&jar, &ex.spec(), &cfg);
+    assert_eq!(run.violated, Vec::<String>::new(), "{}", ex.tla);
+    assert_eq!(run.distinct, 2, "{run:?}");
+}
+
+/// A chained guard bounds a binder through a later one: `0 <= a < b < len`
+/// gives `a` the domain `0..len - 2` (it was a `Dom_int` hole).
+const CHAINED: &str = r#"
+use vstd::prelude::*;
+verus! {
+pub struct State { pub s: Seq<u8> }
+
+pub open spec fn init(s: State) -> bool { s.s == Seq::<u8>::empty() }
+
+pub open spec fn next(pre: State, post: State) -> bool {
+    pre.s.len() < 3 && post.s == pre.s.push(pre.s.len() as u8)
+}
+
+pub open spec fn sorted(s: State) -> bool {
+    forall|a: int, b: int| 0 <= a < b < s.s.len() ==> s.s[a] <= s.s[b]
+}
+
+pub open spec fn descending(s: State) -> bool {
+    forall|a: int, b: int| s.s.len() > b > a >= 0 ==> s.s[a] < s.s[b]
+}
+}
+"#;
+
+#[test]
+fn tla_export_bounds_a_binder_through_a_chained_guard() {
+    let ex = export_code(CHAINED, "test_crate");
+    assert_eq!(ex.report["holes"], serde_json::json!([]), "{}", ex.tla);
+    assert!(ex.tla.contains("\\A a \\in 0..(Len(s)) - 2 :"), "{}", ex.tla);
+    assert!(ex.tla.contains("\\A b \\in (a) + 1..(Len(s)) - 1 :"), "{}", ex.tla);
+    assert_eq!(names(&ex.report["invariants"]), ["sorted", "descending"]);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let run = tlc(&jar, &ex.spec(), &ex.cfg);
+    assert_eq!(run.violated, Vec::<String>::new(), "{}", ex.tla);
+    // The sequence grows from << >> to <<0, 1, 2>>.
+    assert_eq!(run.distinct, 4, "{run:?}");
+}
+
+/// A predicate next reads only on the post state (`lit(post)`) is a guard,
+/// not an invariant, as one read on the pre state is: it was checked, and
+/// failed at Init.
+const PRIMED_GUARD: &str = r#"
+verus! {
+pub struct State { pub on: bool, pub n: nat }
+
+pub open spec fn init(s: State) -> bool { s.on == false && s.n == 0 }
+
+pub open spec fn lit(s: State) -> bool { s.on }
+
+pub open spec fn next(pre: State, post: State) -> bool {
+    &&& pre.n < 2
+    &&& post.n == pre.n + 1
+    &&& post.on == false
+    &&& !lit(post)
+}
+
+pub open spec fn small(s: State) -> bool { s.n <= 2 }
+}
+"#;
+
+#[test]
+fn tla_export_leaves_out_a_guard_read_on_the_post_state() {
+    let ex = export_code(PRIMED_GUARD, "test_crate");
+    assert_eq!(names(&ex.report["invariants"]), ["small"]);
+    let c = candidates(&ex.report);
+    assert!(c.contains(&("lit".into(), false)), "{:?}", c);
+    let lit = ex.report["candidates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["function"] == "test_crate::lit")
+        .unwrap();
+    assert!(lit["reason"].as_str().unwrap().starts_with("reached from init/next"), "{}", lit);
+    assert!(ex.cfg.contains("\\* test_crate::lit is not checked"), "{}", ex.cfg);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let run = tlc(&jar, &ex.spec(), &ex.cfg);
+    assert_eq!(run.violated, Vec::<String>::new(), "{}", ex.tla);
+    assert_eq!(run.distinct, 3, "{run:?}");
+}
+
+/// VerusSync lowers `assert` to `tmp_assert => (update ...)`: the updates
+/// count as assigning (the transition was reported leaving `n` and `s`
+/// unassigned, though TLC checks it).
+#[test]
+fn tla_export_counts_updates_under_a_verussync_assert() {
+    let ex = export(&fixture("assert_sync.rs"), "test_crate::Guarded");
+    assert_eq!(ex.report["shape"], "verussync");
+    assert!(ex.tla.contains("tmp_assert_2 => (n' = update_tmp_n)"), "{}", ex.tla);
+    assert_eq!(
+        ex.report["transitions"],
+        serde_json::json!([{"operator": "bump", "unassigned": []}])
+    );
+    assert!(!ex.cfg.contains("never assigns"), "{}", ex.cfg);
+    assert_eq!(names(&ex.report["invariants"]), ["n_small"]);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let run = tlc(&jar, &ex.spec(), &ex.cfg);
+    assert_eq!(run.violated, Vec::<String>::new(), "{}", ex.tla);
+    // n from 0 to 3.
+    assert_eq!(run.distinct, 4, "{run:?}");
 }

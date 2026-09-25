@@ -20,6 +20,11 @@ what was recognised, refused and left unbounded.
   `reset_enabled(pre)`, which have an invariant's signature; the invariants
   are the conjuncts of the generated `State::invariant`, so only `n_nonneg`
   is checked, and the report lists the others as excluded candidates.
+- `assert_sync.rs`, VerusSync with an `assert` in a transition. Module
+  `assert_sync::Guarded`. The macro lowers the assert to `tmp_assert =>
+  (update ...)`; Verus proves the assertion wherever the transition is
+  taken, so the updates count as assigning and the transition is not
+  reported. TLC checks it as written: 4 distinct states, `n_small` holds.
 - `mutex_tla.rs`, verus-tla: `init()`/`next()` return closures and actions are
   `Action { precondition, transition }` records built by spec fns, reduced
   symbolically. Module `mutex_tla`. The export has no hole and no refusal and
@@ -28,8 +33,8 @@ what was recognised, refused and left unbounded.
 The invariants are, by default, the `#[invariant]` methods for VerusSync,
 every closure `() -> spec_fn(State) -> bool` for verus-tla, and every
 `(State) -> bool` spec fn in the module for a hand-rolled model (one named
-`invariant` included), except one that `init`/`next` read unprimed (a guard,
-not an invariant). The report's `candidates` lists every candidate with
+`invariant` included), except one that `init`/`next` read, unprimed or
+primed (a guard such as `busy(post) == false`, not an invariant). The report's `candidates` lists every candidate with
 whether it was included and why. `-V tla-export=<module>:inv1,inv2` checks
 exactly the named ones instead. When no invariant is checked, the `.cfg`
 says so and lists the candidates with their reasons, since TLC with no
@@ -48,6 +53,16 @@ Whatever the export cannot express is printed as `Assert(FALSE, "...")`, so
 TLC stops with the reason wherever it is evaluated. An invariant that reaches
 one is left out of the `.cfg` and listed in the report's
 `skipped_invariants`.
+
+A quantifier's binder is bounded from its guard: membership in a set, a
+map's domain or a sequence, or integer comparisons, chained ones included
+and through binders bound later (`0 <= a < b < s.len()` bounds `a` by
+`s.len() - 2`). An integer binder's domain is intersected with its type's
+range (`x < 300` over a `u8` is `0..255`), and the type closes a side the
+guard leaves open (`x < 5` over an `i8` starts at -128). An unguarded
+binder of a type of at most 16 bits takes its whole range (`0..255`); an
+unbounded one is a hole, a `CONSTANT Dom_<type>` named after its type
+(`Dom_u32`, `Dom_int`, `Dom_Option_int_Some_v0`).
 
 A cast to a bounded type (`as u8`, `as nat`, ...) that widens (the operand's
 own type lies in the target's, as `u8` in `u16` or `nat`) is the identity. A
@@ -99,9 +114,9 @@ conjunct order, so a `v'` read before the conjunct that assigns it (which
 stops TLC) is not reported; and it does not count `v' \in S`, so a
 transition assigning that way is reported although TLC can enumerate it.
 
-`rust_verify_test/tests/tla_export.rs` exports the four fixtures (as crate
+`rust_verify_test/tests/tla_export.rs` exports the five fixtures (as crate
 `test_crate`, so the modules are `test_crate`, `test_crate::Adder`,
-`test_crate::Toggle` and `test_crate`) and checks the reports. With `TLA2TOOLS_JAR` naming a
+`test_crate::Toggle`, `test_crate::Guarded` and `test_crate`) and checks the reports. With `TLA2TOOLS_JAR` naming a
 `tla2tools.jar` it also parses every export with SANY and model-checks the
 counter against `Counter.tla`:
 
