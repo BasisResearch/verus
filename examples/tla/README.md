@@ -37,7 +37,10 @@ every closure `() -> spec_fn(State) -> bool` over the state type for
 verus-tla (a `() -> spec_fn(int) -> bool` helper is not one), and every
 `(State) -> bool` spec fn in the module for a hand-rolled model (one named
 `invariant` included), except one that `init`/`next` read, unprimed or
-primed (a guard such as `busy(post) == false`, not an invariant). The report's `candidates` lists every candidate with
+primed (a guard such as `busy(post) == false`, not an invariant), and
+except one another selected invariant calls (`big` and `marked` in `inv(s)
+= big(s) ==> !marked(s)` are checked inside `inv`; alone, `big` need not
+hold). The report's `candidates` lists every candidate with
 whether it was included and why. `-V tla-export=<module>:inv1,inv2` checks
 exactly the named ones instead. When no invariant is checked, the `.cfg`
 says so and lists the candidates with their reasons, since TLC with no
@@ -114,6 +117,10 @@ a refusal as a whole.
 A sequence literal `seq![a, b]` (an array literal viewed as a `Seq`) is the
 tuple `<<a, b>>`.
 
+A literal match pattern is an equality with the scrutinee (`0 => ...` is
+`IF m = 0 THEN ...`) and a range pattern its comparisons (`1..=3` is `1 <=
+m /\ m <= 3`).
+
 A closure bound by `let` (or a closure parameter) is only ever applied; passed
 to a function, compared or returned, it is a refusal.
 
@@ -126,9 +133,13 @@ cannot build the successor and stops with "successor state not completely
 specified". Likewise an `init` that constrains only some fields: TLC cannot
 compute the initial states ("current state is not a legal state"). The
 report's `init_unassigned` lists the variables `Init` never assigns (`x = e`
-or `e = x` at conjunct level, followed through calls passing the state; `s.o
-is None` and `s.o.is_none()` are printed `o = [tag |-> "None"]` and assign
-`o`, as does the same check on `post` in a transition) and
+or `e = x` at conjunct level, followed through calls passing the state; `s.x
+== s.y` assigns whichever of the two an earlier conjunct left unassigned,
+and is printed with that one on the left; `s.o is None` and
+`s.o.is_none()` are printed `o = [tag |-> "None"]` and assign `o`, and a
+bare or negated bool field `s.done`, `!s.done` is printed `done = TRUE`,
+`done = FALSE` and assigns `done`, as do the same on `post` in a
+transition) and
 the `.cfg` names them. The report's `transitions` lists each transition `Next` reaches
 with the variables it never assigns (`unassigned`), and the `.cfg` names any
 that leaves one unassigned. A transition is `Next` itself or an operator

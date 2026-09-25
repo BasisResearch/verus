@@ -2195,3 +2195,178 @@ fn tla_export_bounds_tuple_binders_by_their_element_types() {
     assert_eq!(run.violated, Vec::<String>::new(), "{}", ex.tla);
     assert_eq!(run.distinct, 3, "{run:?}");
 }
+
+/// Helpers an invariant calls (`big`, `marked`, under an implication) are
+/// checked inside it, not on their own: alone, `big` fails in the initial
+/// state. Named on the command line, they are checked as asked.
+const INVARIANT_HELPERS: &str = r#"
+verus! {
+pub struct State { pub x: nat, pub y: nat }
+
+pub open spec fn init(s: State) -> bool { s.x == 0 && s.y == 0 }
+
+pub open spec fn next(pre: State, post: State) -> bool {
+    pre.x < 3 && post.x == pre.x + 1 && post.y == pre.y
+}
+
+pub open spec fn big(s: State) -> bool { s.x >= 2 }
+
+pub open spec fn marked(s: State) -> bool { s.y == 7 }
+
+pub open spec fn inv(s: State) -> bool { big(s) ==> !marked(s) }
+
+pub open spec fn small(s: State) -> bool { s.x <= 3 }
+}
+"#;
+
+#[test]
+fn tla_export_leaves_out_a_helper_another_invariant_calls() {
+    let ex = export_code(INVARIANT_HELPERS, "test_crate");
+    assert_eq!(names(&ex.report["invariants"]), ["inv", "small"]);
+    assert_eq!(
+        candidates(&ex.report),
+        [
+            ("big".to_string(), false),
+            ("marked".to_string(), false),
+            ("inv".to_string(), true),
+            ("small".to_string(), true)
+        ]
+    );
+    let reason = ex.report["candidates"][0]["reason"].as_str().unwrap();
+    assert!(reason.starts_with("called by the invariant test_crate::inv"), "{}", reason);
+    assert!(ex.cfg.contains("test_crate::big is not checked on its own"), "{}", ex.cfg);
+    let named = export_code(INVARIANT_HELPERS, "test_crate:inv,big");
+    assert_eq!(names(&named.report["invariants"]), ["big", "inv"]);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let run = tlc(&jar, &ex.spec(), &ex.cfg);
+    assert_eq!(run.violated, Vec::<String>::new(), "{}", ex.tla);
+    assert_eq!(run.distinct, 4, "{run:?}");
+    // Alone, `big` fails where x < 2: at x = 0 and x = 1.
+    let run = tlc(&jar, &named.spec(), &named.cfg);
+    assert_eq!(run.violated, ["big", "big"], "{run:?}");
+}
+
+/// `s.x == s.y` in Init assigns whichever field an earlier conjunct left
+/// unassigned, and is printed with that one on the left (TLC assigns only
+/// from the left): `y = x` once `x` is assigned, `x = y` once `y` is.
+const INIT_FIELD_EQUALITY: &str = r#"
+verus! {
+pub struct State { pub x: nat, pub y: nat, pub z: nat }
+
+pub open spec fn init(s: State) -> bool {
+    &&& s.x == 1
+    &&& s.x == s.y
+    &&& s.z == s.y
+}
+
+pub open spec fn next(pre: State, post: State) -> bool {
+    pre.x < 3 && post.x == pre.x + 1 && post.y == pre.y && post.z == pre.z
+}
+
+pub open spec fn same(s: State) -> bool { s.y == s.z && s.y == 1 }
+}
+"#;
+
+#[test]
+fn tla_export_assigns_an_init_equality_of_two_fields() {
+    let ex = export_code(INIT_FIELD_EQUALITY, "test_crate");
+    assert_eq!(ex.report["init_unassigned"], serde_json::json!([]), "{}", ex.tla);
+    assert!(!ex.cfg.contains("Init never assigns"), "{}", ex.cfg);
+    assert!(ex.tla.contains("(y = x)"), "{}", ex.tla);
+    assert!(ex.tla.contains("(z = y)"), "{}", ex.tla);
+    // With nothing assigned before it, the equality assigns neither.
+    let gap = export_code(&INIT_FIELD_EQUALITY.replace("s.x == 1", "true"), "test_crate");
+    assert_eq!(gap.report["init_unassigned"], serde_json::json!(["x", "y", "z"]), "{}", gap.tla);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let run = tlc(&jar, &ex.spec(), &ex.cfg);
+    assert_eq!(run.violated, Vec::<String>::new(), "{}", ex.tla);
+    assert_eq!(run.distinct, 3, "{run:?}");
+}
+
+/// Literal and range patterns are comparisons of the scrutinee.
+const LITERAL_PATTERNS: &str = r#"
+verus! {
+pub struct State { pub k: u8, pub phase: int }
+
+pub open spec fn init(s: State) -> bool { s.k == 0 && s.phase == 0 }
+
+pub open spec fn next(pre: State, post: State) -> bool {
+    &&& match pre.k {
+        0 => post.k == 1,
+        1..=3 => post.k == pre.k + 2,
+        _ => post.k == 0,
+    }
+    &&& post.phase == match post.k {
+        0 => 0int,
+        1..5 => 1,
+        _ => 2,
+    }
+}
+
+pub open spec fn k_small(s: State) -> bool { s.k <= 5 }
+
+pub open spec fn phase_ok(s: State) -> bool {
+    (s.k == 0 ==> s.phase == 0) && (1 <= s.k < 5 ==> s.phase == 1) && (s.k >= 5 ==> s.phase == 2)
+}
+}
+"#;
+
+#[test]
+fn tla_export_compares_literal_and_range_patterns() {
+    let ex = export_code(LITERAL_PATTERNS, "test_crate");
+    assert_eq!(ex.report["refusals"], serde_json::json!([]), "{}", ex.tla);
+    assert!(ex.tla.contains("IF (m__ = 0) THEN"), "{}", ex.tla);
+    assert!(ex.tla.contains("((1 <= m__) /\\ (m__ <= 3))"), "{}", ex.tla);
+    assert!(ex.tla.contains("((1 <= m__2) /\\ (m__2 < 5))"), "{}", ex.tla);
+    assert_eq!(names(&ex.report["invariants"]), ["k_small", "phase_ok"]);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let run = tlc(&jar, &ex.spec(), &ex.cfg);
+    assert_eq!(run.violated, Vec::<String>::new(), "{}", ex.tla);
+    // k: 0 -> 1 -> 3 -> 5 -> 0.
+    assert_eq!(run.distinct, 4, "{run:?}");
+}
+
+/// A bare or negated bool field at conjunct level is an assignment: `!s.done`
+/// in Init is `done = FALSE`, `post.done` and `!post.done` in Next are
+/// `done' = TRUE` and `done' = FALSE`. Printed as a bare read, TLC stopped
+/// on the unassigned variable.
+const BOOL_FIELDS: &str = r#"
+verus! {
+pub struct State { pub n: nat, pub done: bool, pub busy: bool }
+
+pub open spec fn init(s: State) -> bool { s.n == 0 && !s.done && s.busy }
+
+pub open spec fn finished(s: State) -> bool { s.done }
+
+pub open spec fn next(pre: State, post: State) -> bool {
+    &&& pre.n < 3
+    &&& post.n == pre.n + 1
+    &&& if post.n == 3 { post.done } else { !post.done }
+    &&& !post.busy || pre.busy
+    &&& post.busy == pre.busy
+}
+
+pub open spec fn done_at_three(s: State) -> bool { s.done <==> s.n == 3 }
+}
+"#;
+
+#[test]
+fn tla_export_assigns_a_bare_bool_field() {
+    let ex = export_code(BOOL_FIELDS, "test_crate");
+    assert_eq!(ex.report["init_unassigned"], serde_json::json!([]), "{}", ex.tla);
+    assert!(!ex.cfg.contains("never assigns"), "{}", ex.cfg);
+    assert!(ex.tla.contains("(done = FALSE)"), "{}", ex.tla);
+    assert!(ex.tla.contains("(busy = TRUE)"), "{}", ex.tla);
+    assert!(ex.tla.contains("(done' = TRUE)"), "{}", ex.tla);
+    assert!(ex.tla.contains("(done' = FALSE)"), "{}", ex.tla);
+    assert_eq!(names(&ex.report["invariants"]), ["finished", "done_at_three"]);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let run = tlc(&jar, &ex.spec(), &ex.cfg);
+    // `finished` fails wherever n < 3.
+    assert_eq!(run.violated, ["finished", "finished", "finished"], "{run:?}\n{}", ex.tla);
+    assert_eq!(run.distinct, 4, "{run:?}");
+}
