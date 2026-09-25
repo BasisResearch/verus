@@ -143,7 +143,8 @@ pub struct ArgsX {
     /// after every unknown, bounding instantiation rounds when given.
     pub matching_loops: bool,
     pub matching_loop_rounds: Option<u32>,
-    /// `-V tla-export=<module>`: write the module's transition system as TLA+.
+    /// `-V tla-export=<module>[:<inv>,...]`: write the module's transition
+    /// system as TLA+, checking the named invariants (or the default ones).
     pub tla_export: Option<String>,
     /// Record cvc5's per-quantifier instantiation pressure for every query.
     pub inst_pressure: bool,
@@ -502,7 +503,7 @@ pub fn parse_args_with_imports(
         ),
         (
             EXTENDED_TLA_EXPORT,
-            "Export the transition system in the named module (-V tla-export=crate::a::b) to TLA+ under the log directory: <State>_tla.tla (named after its module, as TLC requires), a .cfg skeleton and a .tla.json report of what was recognised, refused and left unbounded; the export runs before verification",
+            "Export the transition system in the named module (-V tla-export=crate::a::b) to TLA+ under the log directory: <State>_tla.tla (named after its module, as TLC requires), a .cfg skeleton and a .tla.json report of what was recognised, refused and left unbounded, and of every candidate invariant; -V tla-export=crate::a::b:inv1,inv2 checks exactly the named invariants. The export runs before verification",
         ),
         (EXTENDED_ALLOW_INLINE_AIR, "Allow the POTENTIALLY UNSOUND use of inline_air_stmt"),
         (
@@ -948,9 +949,12 @@ pub fn parse_args_with_imports(
         nl_frontier: extended.contains_key(EXTENDED_NL_FRONTIER),
         matching_loops: extended.contains_key(EXTENDED_MATCHING_LOOPS),
         tla_export: match extended.get(EXTENDED_TLA_EXPORT) {
-            Some(Some(module)) if !module.is_empty() => Some(module.clone()),
+            Some(Some(module)) if !module.is_empty() => match vir::tla::parse_export_arg(module) {
+                Ok(_) => Some(module.clone()),
+                Err(e) => error(format!("-V {EXTENDED_TLA_EXPORT}: {e}")),
+            },
             Some(_) => error(format!(
-                "-V {EXTENDED_TLA_EXPORT} needs a module path: -V {EXTENDED_TLA_EXPORT}=crate::a::b"
+                "-V {EXTENDED_TLA_EXPORT} needs a module path: -V {EXTENDED_TLA_EXPORT}=crate::a::b, or crate::a::b:inv1,inv2 to name the invariants"
             )),
             None => None,
         },

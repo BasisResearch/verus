@@ -892,13 +892,13 @@ impl Verifier {
         })
     }
 
-    /// `-V tla-export=<module>`: write the module's transition system as
-    /// TLA+ under the log directory, before simplification so `match` and
+    /// `-V tla-export=<module>[:<inv>,...]`: write the module's transition
+    /// system as TLA+ under the log directory, before simplification so `match` and
     /// constructor updates are still visible. The files are named after the
     /// TLA+ module (`<State>_tla.tla`, `.cfg`, `.tla.json`), since TLC only
     /// loads a module from a file of the same name.
-    fn export_tla(&mut self, krate: &Krate, module: &str) -> Result<(), VirErr> {
-        let export = vir::tla::export_module(krate, module)
+    fn export_tla(&mut self, krate: &Krate, arg: &str) -> Result<(), VirErr> {
+        let export = vir::tla::export_module(krate, arg)
             .map_err(|e| crate::util::error(format!("tla-export: {e}")))?;
         let dir = self.log_dir()?;
         let json = serde_json::to_string_pretty(&export.report).unwrap_or_else(|_| "{}".into());
@@ -2786,8 +2786,8 @@ impl Verifier {
             self.args.report_long_running,
         )?;
         vir::recursive_types::check_traits(&krate, &global_ctx)?;
-        if let Some(module) = self.args.tla_export.clone() {
-            self.export_tla(&krate, &module)?;
+        if let Some(arg) = self.args.tla_export.clone() {
+            self.export_tla(&krate, &arg)?;
         }
         let krate = vir::ast_simplify::simplify_krate(&mut global_ctx, &krate)?;
 

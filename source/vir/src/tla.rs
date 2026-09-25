@@ -55,6 +55,18 @@ pub struct Hole {
     pub in_function: String,
 }
 
+/// A candidate invariant (a predicate over one state in the model's module)
+/// and what became of it.
+#[derive(Debug, Clone, Serialize)]
+pub struct Candidate {
+    pub function: String,
+    /// The operator it is printed as, when it is printed.
+    pub operator: Option<String>,
+    /// Whether it is an invariant in the `.cfg`.
+    pub included: bool,
+    pub reason: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct Report {
     pub module: String,
@@ -66,6 +78,8 @@ pub struct Report {
     pub invariants: Vec<String>,
     /// Invariants left out of the `.cfg` because they reach a refusal.
     pub skipped_invariants: Vec<String>,
+    /// Every candidate invariant, included or not, and why.
+    pub candidates: Vec<Candidate>,
     pub operators: usize,
     pub holes: Vec<Hole>,
     pub refusals: Vec<Refusal>,
@@ -78,6 +92,16 @@ pub struct Export {
     pub cfg: String,
     pub report: Report,
 }
+
+/// Verus's Euclidean division and remainder (the remainder is never
+/// negative), for divisors other than a positive literal. Reserved at module
+/// level, so no operator or local takes these names.
+const EUCLID_DIV: &str = "EuclidDiv";
+const EUCLID_MOD: &str = "EuclidMod";
+
+/// The module-level names the export generates beside the operators.
+const GENERATED_NAMES: [&str; 8] =
+    ["Init", "Next", "Spec", "vars", "Inv", "TypeOK", EUCLID_DIV, EUCLID_MOD];
 
 /// An operator: a function, and whether it is the variant whose single
 /// state parameter is read as the primed variables (a callee given `post`
@@ -114,7 +138,14 @@ struct Exporter {
     datatypes: HashMap<Path, Datatype>,
     functions: HashMap<Fun, Function>,
     state_path: Path,
+    /// The state datatype's fields: the record labels, and the TLA+ variable
+    /// each is held in (the label, renamed where it would clash with a
+    /// generated module-level name or a TLA+ reserved word).
     state_fields: Vec<String>,
+    state_vars: Vec<String>,
+    /// Whether an operator divides by something other than a positive
+    /// literal, so the Euclidean division operators must be emitted.
+    uses_euclid: bool,
     /// Operator definitions in dependency order.
     defs: Vec<String>,
     /// Operators already emitted or being emitted (for recursion), keyed by
@@ -468,8 +499,18 @@ impl Exporter {
         n
     }
 
-    fn state_field_names(&self) -> Vec<String> {
-        self.state_fields.clone()
+    /// The state's `(label, variable)` pairs.
+    fn state_pairs(&self) -> Vec<(String, String)> {
+        self.state_fields.iter().cloned().zip(self.state_vars.iter().cloned()).collect()
+    }
+
+    /// The TLA+ variable holding the state field `label`.
+    fn state_var(&self, label: &str) -> String {
+        self.state_pairs()
+            .into_iter()
+            .find(|(l, _)| l == label)
+            .map(|(_, v)| v)
+            .unwrap_or_else(|| label.to_string())
     }
 
     fn is_state_typ(&self, typ: &Typ) -> bool {
@@ -516,9 +557,9 @@ impl Exporter {
         let prime = if role == Role::Post { "'" } else { "" };
         format!(
             "[{}]",
-            self.state_fields
+            self.state_pairs()
                 .iter()
-                .map(|f| format!("{f} |-> {f}{prime}"))
+                .map(|(l, v)| format!("{l} |-> {v}{prime}"))
                 .collect::<Vec<_>>()
                 .join(", ")
         )
@@ -584,7 +625,7 @@ impl Exporter {
                         if let Some(role) = env.roles.get(&v) {
                             if matches!(datatype, Dt::Path(p) if *p == self.state_path) {
                                 let prime = if *role == Role::Post { "'" } else { "" };
-                                return format!("{}{prime}", field_name(field));
+                                return format!("{}{prime}", self.state_var(&field_name(field)));
                             }
                         }
                     }
@@ -680,8 +721,24 @@ impl Exporter {
                     ArithOp::Add(_) => "+",
                     ArithOp::Sub(_) => "-",
                     ArithOp::Mul(_) => "*",
-                    ArithOp::EuclideanDiv(_) => "\\div",
-                    ArithOp::EuclideanMod(_) => "%",
+                    ArithOp::EuclideanDiv(_) | ArithOp::EuclideanMod(_) => {
+                        // TLA+'s `\div` rounds down and TLC's `%` wants a
+                        // positive divisor; both agree with Verus's
+                        // Euclidean operators only when the divisor is
+                        // positive, so any other divisor goes through
+                        // `EDiv`/`EMod`.
+                        let div = matches!(ar, ArithOp::EuclideanDiv(_));
+                        let (sa, sb) = (self.expr(a, env), self.expr(b, env));
+                        let positive = matches!(&peel(b).x,
+                            ExprX::Const(Constant::Int(i)) if i > &num_bigint::BigInt::from(0));
+                        if positive {
+                            let sym = if div { "\\div" } else { "%" };
+                            return format!("({sa} {sym} {sb})");
+                        }
+                        self.uses_euclid = true;
+                        let op = if div { EUCLID_DIV } else { EUCLID_MOD };
+                        return format!("{op}({sa}, {sb})");
+                    }
                 };
                 format!("({} {sym} {})", self.expr(a, env), self.expr(b, env))
             }
@@ -705,23 +762,23 @@ impl Exporter {
             (Some(r), None) => (r, b),
             (None, Some(r)) => (r, a),
             (Some(Role::Post), Some(Role::Pre)) | (Some(Role::Pre), Some(Role::Post)) => {
-                let fields = self.state_field_names();
+                let vars = self.state_vars.clone();
                 return Some(format!(
                     "({})",
-                    fields.iter().map(|f| format!("{f}' = {f}")).collect::<Vec<_>>().join(" /\\ ")
+                    vars.iter().map(|v| format!("{v}' = {v}")).collect::<Vec<_>>().join(" /\\ ")
                 ));
             }
             _ => return None,
         };
         let prime = if role == Role::Post { "'" } else { "" };
-        let fields = self.state_field_names();
+        let fields = self.state_pairs();
         // A constructor of the state type assigns field by field; anything
         // else is projected.
         if let ExprX::Ctor(Dt::Path(p), _variant, binders, tail) = &other.x {
             if *p == self.state_path {
                 let mut parts = Vec::new();
-                for f in &fields {
-                    let given = binders.iter().find(|b| b.name.to_string() == *f);
+                for (f, var) in &fields {
+                    let given = binders.iter().find(|b| field_name(&b.name) == *f);
                     let value = match given {
                         Some(b) => self.expr(&b.a, env),
                         None => match tail {
@@ -732,7 +789,7 @@ impl Exporter {
                             None => self.refuse("state constructor without the field", &other.span),
                         },
                     };
-                    parts.push(format!("{f}{prime} = {value}"));
+                    parts.push(format!("{var}{prime} = {value}"));
                 }
                 return Some(format!("({})", parts.join(" /\\ ")));
             }
@@ -743,7 +800,7 @@ impl Exporter {
             "(LET {s} == {so} IN {})",
             fields
                 .iter()
-                .map(|f| format!("{f}{prime} = {s}.{f}"))
+                .map(|(f, var)| format!("{var}{prime} = {s}.{f}"))
                 .collect::<Vec<_>>()
                 .join(" /\\ ")
         ))
@@ -841,7 +898,7 @@ impl Exporter {
                     if let Some(role) = env.roles.get(&v) {
                         if matches!(datatype, Dt::Path(p) if *p == self.state_path) {
                             let prime = if *role == Role::Post { "'" } else { "" };
-                            return format!("{}{prime}", field_name(field));
+                            return format!("{}{prime}", self.state_var(&field_name(field)));
                         }
                     }
                 }
@@ -1009,18 +1066,38 @@ impl Exporter {
                 if let Some(op) = vstd_op(&friendly) {
                     return self.vstd_call(e, op, args, env);
                 }
-                // Option and other core datatypes' spec helpers.
-                if friendly.ends_with("::is_some") || friendly.ends_with("::is_Some") {
-                    return format!("({}.tag = \"Some\")", self.expr(&args[0], env));
-                }
-                if friendly.ends_with("::is_none") || friendly.ends_with("::is_None") {
-                    return format!("({}.tag = \"None\")", self.expr(&args[0], env));
-                }
-                if friendly.ends_with("::unwrap")
-                    || friendly.ends_with("::get_Some_0")
-                    || friendly.ends_with("::arrow_Some_0")
-                {
-                    return format!("{}.v0", self.expr(&args[0], env));
+                // Option's spec helpers, recognised by the receiver's type so
+                // a crate function of the same name is left alone.
+                let on_option = args
+                    .first()
+                    .and_then(|a| typ_datatype(&a.typ))
+                    .map(|p| path_as_friendly_rust_name(&p) == "core::option::Option")
+                    .unwrap_or(false);
+                let method = friendly.rsplit("::").next().unwrap_or("");
+                if on_option {
+                    match method {
+                        "is_some" | "is_Some" => {
+                            return format!("({}.tag = \"Some\")", self.expr(&args[0], env));
+                        }
+                        "is_none" | "is_None" => {
+                            return format!("({}.tag = \"None\")", self.expr(&args[0], env));
+                        }
+                        // `.unwrap()` in spec code is vstd's `spec_unwrap`,
+                        // whose body is the uninterpreted trait method
+                        // `arrow_0`.
+                        "unwrap" | "get_Some_0" | "arrow_Some_0" | "arrow_0" | "spec_unwrap"
+                        | "spec_expect" => {
+                            return format!("{}.v0", self.expr(&args[0], env));
+                        }
+                        "spec_unwrap_or" if args.len() == 2 => {
+                            let (o, d) = (self.expr(&args[0], env), self.expr(&args[1], env));
+                            let m = self.bind("o__");
+                            return format!(
+                                "(LET {m} == {o} IN IF {m}.tag = \"Some\" THEN {m}.v0 ELSE {d})"
+                            );
+                        }
+                        _ => {}
+                    }
                 }
                 let Some(callee) = self.functions.get(fun).cloned() else {
                     let what = format!("call to {friendly} (no definition in the crate)");
@@ -1719,14 +1796,80 @@ struct Triple {
     state: Path,
     init: Fun,
     next: Fun,
-    invariants: Vec<Fun>,
+    /// Every candidate invariant: whether it is selected, and why.
+    candidates: Vec<(Fun, bool, String)>,
+    /// Whether the invariants were named on the command line.
+    explicit: bool,
 }
 
 fn module_of(f: &Function) -> Option<Path> {
     f.x.owning_module.clone()
 }
 
-fn recognise(krate: &Krate, module: &str) -> Result<Triple, String> {
+/// Split `-V tla-export`'s argument, `crate::a::b` or `crate::a::b:inv1,inv2`,
+/// into the module and the invariants named after its single `:`.
+pub fn parse_export_arg(arg: &str) -> Result<(String, Option<Vec<String>>), String> {
+    let b = arg.as_bytes();
+    let colon = (0..b.len()).find(|&i| {
+        b[i] == b':' && (i == 0 || b[i - 1] != b':') && (i + 1 == b.len() || b[i + 1] != b':')
+    });
+    let Some(i) = colon else { return Ok((arg.to_string(), None)) };
+    let module = arg[..i].to_string();
+    let names: Vec<String> =
+        arg[i + 1..].split(',').map(|n| n.trim().to_string()).filter(|n| !n.is_empty()).collect();
+    if module.is_empty() || names.is_empty() {
+        return Err(format!("`{arg}` is not `<module>` or `<module>:<invariant>,<invariant>,...`"));
+    }
+    let mut unique = Vec::new();
+    for n in names {
+        if !unique.contains(&n) {
+            unique.push(n);
+        }
+    }
+    Ok((module, Some(unique)))
+}
+
+/// Pick the invariants among `pool`: those named on the command line, or
+/// else those `default` selects (with its reason for each).
+fn select_invariants(
+    pool: &[Function],
+    named: Option<&[String]>,
+    module: &str,
+    default: impl Fn(&Function) -> (bool, String),
+) -> Result<Vec<(Fun, bool, String)>, String> {
+    let short = |f: &Function| last_segment(&f.x.name.path);
+    let Some(named) = named else {
+        return Ok(pool
+            .iter()
+            .map(|f| {
+                let (selected, reason) = default(f);
+                (f.x.name.clone(), selected, reason)
+            })
+            .collect());
+    };
+    for n in named {
+        let found =
+            pool.iter().any(|f| short(f) == *n || fun_as_friendly_rust_name(&f.x.name) == *n);
+        if !found {
+            return Err(format!(
+                "no invariant `{n}` in `{module}`; the candidates are: {}",
+                pool.iter().map(short).collect::<Vec<_>>().join(", ")
+            ));
+        }
+    }
+    Ok(pool
+        .iter()
+        .map(|f| {
+            let chosen =
+                named.iter().any(|n| short(f) == *n || fun_as_friendly_rust_name(&f.x.name) == *n);
+            let reason =
+                if chosen { "named on the command line" } else { "not named on the command line" };
+            (f.x.name.clone(), chosen, reason.to_string())
+        })
+        .collect())
+}
+
+fn recognise(krate: &Krate, module: &str, named: Option<&[String]>) -> Result<Triple, String> {
     let in_module: Vec<Function> = krate
         .functions
         .iter()
@@ -1774,7 +1917,8 @@ fn recognise(krate: &Krate, module: &str) -> Result<Triple, String> {
         } else {
             "hand-rolled"
         };
-        let invariants: Vec<Fun> = in_module
+        // Every `(State) -> bool` spec fn with a body, other than `init`.
+        let pool: Vec<Function> = in_module
             .iter()
             .filter(|f| {
                 f.x.params.len() == 1
@@ -1783,16 +1927,68 @@ fn recognise(krate: &Krate, module: &str) -> Result<Triple, String> {
                     && short(f) != "init"
                     && f.x.mode == Mode::Spec
                     && f.x.body.is_some()
-                    && !matches!(short(f).as_str(), "next" | "next_by" | "init_by" | "invariant")
             })
-            .map(|f| f.x.name.clone())
+            .cloned()
             .collect();
+        let candidates = if shape == "verussync" {
+            // `state_machine!` generates `State::invariant(&self)` as the
+            // conjunction `self.a() && self.b() && ...` of the `#[invariant]`
+            // methods (or `true` when there are none); those are the
+            // invariants. The generated `<transition>_enabled` predicates and
+            // any helper are not.
+            let conj = pool.iter().find(|f| short(f) == "invariant");
+            let mut invs: Vec<Fun> = Vec::new();
+            let mut whole = false;
+            if let Some(conj) = conj {
+                let param = conj.x.params[0].x.name.clone();
+                for c in conjuncts(conj.x.body.as_ref().unwrap()) {
+                    match &c.x {
+                        ExprX::Const(Constant::Bool(true)) => {}
+                        ExprX::Call { target: CallTarget::Fun(_, fun, ..), args, .. }
+                            if args.len() == 1
+                                && read_var(&args[0]).as_ref() == Some(&param)
+                                && pool.iter().any(|f| f.x.name == *fun) =>
+                        {
+                            invs.push(fun.clone())
+                        }
+                        // Not the generated shape: check the conjunction whole.
+                        _ => whole = true,
+                    }
+                }
+            }
+            select_invariants(&pool, named, module, |f| {
+                if short(f) == "invariant" {
+                    if whole {
+                        (true, "State::invariant, checked whole: a conjunct is not a call to an #[invariant] method".into())
+                    } else {
+                        (false, "the conjunction of the #[invariant] methods, which are checked one by one".into())
+                    }
+                } else if !whole && invs.contains(&f.x.name) {
+                    (
+                        true,
+                        "an #[invariant] of the state machine (a conjunct of State::invariant)"
+                            .into(),
+                    )
+                } else {
+                    (false, "not an #[invariant] of the state machine (a generated or helper predicate)".into())
+                }
+            })?
+        } else {
+            select_invariants(&pool, named, module, |f| {
+                if short(f) == "invariant" {
+                    (false, "named `invariant`; name it on the command line to check it".into())
+                } else {
+                    (true, "a (State) -> bool spec fn in the module".into())
+                }
+            })?
+        };
         return Ok(Triple {
             shape,
             state,
             init: init.x.name.clone(),
             next: next.x.name.clone(),
-            invariants,
+            candidates,
+            explicit: named.is_some(),
         });
     }
     // verus-tla: `next()` returning a spec_fn over (S, S).
@@ -1812,17 +2008,21 @@ fn recognise(krate: &Krate, module: &str) -> Result<Triple, String> {
                     && matches!(&*f.x.ret.x.typ, TypX::SpecFn(ps, _) if ps.len() == 1)
             })
             .ok_or("found verus-tla `next()` but no `init()`")?;
-        let invariants: Vec<Fun> = in_module
+        let pool: Vec<Function> = in_module
             .iter()
             .filter(|f| f.x.params.is_empty() && matches!(&*f.x.ret.x.typ, TypX::SpecFn(ps, r) if ps.len() == 1 && matches!(&**r, TypX::Bool)) && short(f) != "init")
-            .map(|f| f.x.name.clone())
+            .cloned()
             .collect();
+        let candidates = select_invariants(&pool, named, module, |_| {
+            (true, "a verus-tla closure over the state returning bool".into())
+        })?;
         return Ok(Triple {
             shape: "verus-tla",
             state,
             init: init.x.name.clone(),
             next: next.x.name.clone(),
-            invariants,
+            candidates,
+            explicit: named.is_some(),
         });
     }
     Err(format!(
@@ -1830,10 +2030,13 @@ fn recognise(krate: &Krate, module: &str) -> Result<Triple, String> {
     ))
 }
 
-/// Export the transition system in `module` (a `crate::a::b` path as Verus
-/// prints it) to TLA+.
-pub fn export_module(krate: &Krate, module: &str) -> Result<Export, String> {
-    let triple = recognise(krate, module)?;
+/// Export the transition system named by `arg`, `-V tla-export`'s argument:
+/// a module (a `crate::a::b` path as Verus prints it), optionally followed by
+/// `:inv1,inv2` naming the invariants to check.
+pub fn export_module(krate: &Krate, arg: &str) -> Result<Export, String> {
+    let (module, named) = parse_export_arg(arg)?;
+    let module = module.as_str();
+    let triple = recognise(krate, module, named.as_deref())?;
     let datatypes: HashMap<Path, Datatype> = krate
         .datatypes
         .iter()
@@ -1854,11 +2057,35 @@ pub fn export_module(krate: &Krate, module: &str) -> Result<Export, String> {
     if state_dt.x.variants.len() != 1 {
         return Err("the state type must be a struct".into());
     }
+    let module_name = format!("{}_tla", sanitize(&last_segment(&triple.state)));
+    // Each field is held in a variable of its own name, unless that name is
+    // one the module generates (`vars`, `Init`, ...), the module's own name,
+    // or reserved by TLA+: then the variable is renamed and the record label
+    // kept.
+    let mut state_vars: Vec<String> = Vec::new();
+    for f in &state_fields {
+        let clashes = |c: &str, taken: &[String]| {
+            GENERATED_NAMES.contains(&c)
+                || c == module_name
+                || is_tla_reserved(c)
+                || taken.iter().any(|t| t == c)
+                || state_fields.iter().any(|g| g == c && g != f)
+        };
+        let mut v = f.clone();
+        let mut n = 1;
+        while clashes(&v, &state_vars) {
+            v = if n == 1 { format!("{f}_v") } else { format!("{f}_v{n}") };
+            n += 1;
+        }
+        state_vars.push(v);
+    }
     let mut ex = Exporter {
         datatypes,
         functions,
         state_path: triple.state.clone(),
         state_fields: state_fields.clone(),
+        state_vars: state_vars.clone(),
+        uses_euclid: false,
         defs: Vec::new(),
         emitted: HashSet::new(),
         emitting: HashSet::new(),
@@ -1874,22 +2101,25 @@ pub fn export_module(krate: &Krate, module: &str) -> Result<Export, String> {
         constants: BTreeSet::new(),
         current: String::new(),
     };
-    let module_name = format!("{}_tla", sanitize(&last_segment(&triple.state)));
-    for f in &state_fields {
-        ex.used_names.insert(f.clone());
+    for v in &state_vars {
+        ex.used_names.insert(v.clone());
     }
-    for reserved in ["Init", "Next", "Spec", "vars", "Inv", "TypeOK", module_name.as_str()] {
+    for reserved in GENERATED_NAMES.iter().copied().chain([module_name.as_str()]) {
         ex.used_names.insert(reserved.into());
     }
+    let selected: Vec<Fun> =
+        triple.candidates.iter().filter(|(_, s, _)| *s).map(|(f, _, _)| f.clone()).collect();
+    // What became of each candidate, when not what recognition decided.
+    let mut outcome: HashMap<Fun, (bool, String)> = HashMap::new();
     let mut roots = vec![triple.init.clone(), triple.next.clone()];
-    roots.extend(triple.invariants.iter().cloned());
+    roots.extend(selected.iter().cloned());
     // verus-tla: the closures are the bodies; emit as state operators by
     // treating `init()`/`next()` specially.
     let verus_tla = triple.shape == "verus-tla";
     let mut init_name = String::new();
     let mut next_name = String::new();
     // Each invariant, and whether it reaches a refusal.
-    let mut invs: Vec<(String, bool)> = Vec::new();
+    let mut invs: Vec<(Fun, String, bool)> = Vec::new();
     if verus_tla {
         for (i, r) in roots.iter().enumerate() {
             let f = ex.functions.get(r).cloned().ok_or("root missing")?;
@@ -1926,28 +2156,60 @@ pub fn export_module(krate: &Krate, module: &str) -> Result<Export, String> {
             match i {
                 0 => init_name = name,
                 1 => next_name = name,
-                _ => invs.push((name, ex.current_tainted)),
+                _ => invs.push((r.clone(), name, ex.current_tainted)),
             }
         }
     } else {
         init_name = ex.ensure_function(&(triple.init.clone(), false));
         next_name = ex.ensure_function(&(triple.next.clone(), false));
-        // Everything reached from init and next is a transition or a helper,
-        // not an invariant, whatever its signature.
+        // A predicate init or next reads unprimed is a guard or helper of
+        // the transition, not an invariant, unless the command line names
+        // it; it is reported as excluded, never dropped silently.
         let transitions: HashSet<OpKey> = ex.emitted.clone();
-        for r in &triple.invariants {
+        for r in &selected {
             let key = (r.clone(), false);
-            if transitions.contains(&key) {
+            if !triple.explicit && transitions.contains(&key) {
+                outcome.insert(
+                    r.clone(),
+                    (
+                        false,
+                        format!(
+                            "reached from init/next unprimed (a guard or helper of the transition), so not taken as an invariant; name it in -V tla-export={module}:<invariants> to check it"
+                        ),
+                    ),
+                );
                 continue;
             }
             let name = ex.ensure_function(&key);
-            invs.push((name, ex.tainted.contains(&key)));
+            invs.push((r.clone(), name, ex.tainted.contains(&key)));
+        }
+    }
+    for (f, _, tainted) in &invs {
+        if *tainted {
+            outcome.insert(
+                f.clone(),
+                (false, "reaches a refusal, so it is left out of the .cfg (see refusals)".into()),
+            );
         }
     }
     let inv_names: Vec<String> =
-        invs.iter().filter(|(_, tainted)| !tainted).map(|(n, _)| n.clone()).collect();
+        invs.iter().filter(|(_, _, tainted)| !tainted).map(|(_, n, _)| n.clone()).collect();
     let skipped: Vec<String> =
-        invs.iter().filter(|(_, tainted)| *tainted).map(|(n, _)| n.clone()).collect();
+        invs.iter().filter(|(_, _, tainted)| *tainted).map(|(_, n, _)| n.clone()).collect();
+    let candidates: Vec<Candidate> = triple
+        .candidates
+        .iter()
+        .map(|(f, selected, reason)| {
+            let (included, reason) =
+                outcome.get(f).cloned().unwrap_or_else(|| (*selected, reason.clone()));
+            Candidate {
+                function: fun_as_friendly_rust_name(f),
+                operator: ex.op_names.get(&(f.clone(), false)).cloned(),
+                included,
+                reason,
+            }
+        })
+        .collect();
     let mut tla = String::new();
     tla.push_str(&format!("---- MODULE {module_name} ----\n"));
     tla.push_str("\\* Exported by verus -V tla-export from the Verus model in `");
@@ -1974,8 +2236,26 @@ pub fn export_module(krate: &Krate, module: &str) -> Result<Export, String> {
             ex.constants.iter().cloned().collect::<Vec<_>>().join(", ")
         ));
     }
-    tla.push_str(&format!("VARIABLES {}\n", state_fields.join(", ")));
-    tla.push_str(&format!("vars == <<{}>>\n\n", state_fields.join(", ")));
+    tla.push_str(&format!("VARIABLES {}\n", state_vars.join(", ")));
+    tla.push_str(&format!("vars == <<{}>>\n\n", state_vars.join(", ")));
+    let renamed: Vec<String> = state_fields
+        .iter()
+        .zip(state_vars.iter())
+        .filter(|(f, v)| f != v)
+        .map(|(f, v)| format!("{f} in {v}"))
+        .collect();
+    if !renamed.is_empty() {
+        tla.push_str(&format!(
+            "\\* Fields held in a renamed variable (the name is taken): {}\n\n",
+            renamed.join(", ")
+        ));
+    }
+    if ex.uses_euclid {
+        // Verus's `/` and `%` are Euclidean: the remainder is never negative.
+        tla.push_str(&format!(
+            "{EUCLID_MOD}(a, b) == a % (IF b < 0 THEN -b ELSE b)\n{EUCLID_DIV}(a, b) == (a - {EUCLID_MOD}(a, b)) \\div b\n\n"
+        ));
+    }
     if !ex.recursive.is_empty() {
         for (r, arity) in &ex.recursive {
             if *arity == 0 {
@@ -2014,6 +2294,12 @@ pub fn export_module(krate: &Krate, module: &str) -> Result<Export, String> {
             "\\* INVARIANT {n} is left out: it reaches a refusal (see the .tla.json report)\n"
         ));
     }
+    for c in candidates.iter().filter(|c| !c.included && c.reason.starts_with("reached from")) {
+        cfg.push_str(&format!(
+            "\\* {} is not checked: init/next read it unprimed (see the .tla.json candidates)\n",
+            c.function
+        ));
+    }
     if !ex.constants.is_empty() {
         // Left unassigned on purpose: TLC stops until each is given a finite
         // set, rather than quantifying over an empty one.
@@ -2029,11 +2315,12 @@ pub fn export_module(krate: &Krate, module: &str) -> Result<Export, String> {
         module: module.to_string(),
         shape: triple.shape.to_string(),
         state_type: path_as_friendly_rust_name(&triple.state),
-        variables: state_fields,
+        variables: state_vars,
         init: init_name,
         next: next_name,
         invariants: inv_names,
         skipped_invariants: skipped,
+        candidates,
         operators: ex.defs.len(),
         holes: ex.holes,
         refusals: ex.refusals,

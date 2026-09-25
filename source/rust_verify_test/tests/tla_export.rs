@@ -336,3 +336,148 @@ fn tla_export_refusals_stop_tlc_and_leave_the_invariant_out() {
     let Some(jar) = tla_tools() else { return };
     sany(&jar, &ex.spec());
 }
+
+/// The candidates the report lists, as (function's last segment, included).
+fn candidates(report: &serde_json::Value) -> Vec<(String, bool)> {
+    report["candidates"]
+        .as_array()
+        .expect("candidates")
+        .iter()
+        .map(|c| {
+            let f = c["function"].as_str().unwrap();
+            (f.rsplit("::").next().unwrap().to_string(), c["included"].as_bool().unwrap())
+        })
+        .collect()
+}
+
+/// Add `Bound == <pred>` to an export and constrain the model with it.
+fn bounded(ex: &Exported, pred: &str) -> String {
+    let end = ex.tla.trim_end().rfind('\n').unwrap();
+    std::fs::write(ex.spec(), format!("{}\nBound == {pred}{}", &ex.tla[..end], &ex.tla[end..]))
+        .unwrap();
+    format!("{}CONSTRAINT Bound\n", ex.cfg)
+}
+
+#[test]
+fn tla_export_verussync_takes_the_invariants_from_state_invariant() {
+    let ex = export(&fixture("toggle_sync.rs"), "test_crate::Toggle");
+    assert_eq!(ex.report["shape"], "verussync");
+    // `flip_enabled`/`reset_enabled` have an invariant's signature but are
+    // not `#[invariant]`s: checking them would report spurious violations.
+    assert_eq!(names(&ex.report["invariants"]), ["n_nonneg"]);
+    let c = candidates(&ex.report);
+    assert!(c.contains(&("n_nonneg".into(), true)), "{:?}", c);
+    assert!(c.contains(&("flip_enabled".into(), false)), "{:?}", c);
+    assert!(c.contains(&("reset_enabled".into(), false)), "{:?}", c);
+    assert!(c.contains(&("invariant".into(), false)), "{:?}", c);
+    assert!(!ex.cfg.contains("_enabled"), "{}", ex.cfg);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let run = tlc(&jar, &ex.spec(), &bounded(&ex, "n < 3"));
+    assert_eq!(run.violated, Vec::<String>::new());
+}
+
+/// A crate function named `unwrap` (Option's is still `.v0`), Euclidean
+/// division and remainder by a negative divisor, a state field named like
+/// the generated `vars`, and a predicate `next` reads as a guard.
+const NAMES: &str = r#"
+verus! {
+pub struct Pair { pub a: int, pub b: int }
+
+impl Pair {
+    pub open spec fn unwrap(self) -> int { self.a + self.b }
+}
+
+pub struct State { pub x: int, pub vars: int, pub p: Pair, pub o: Option<int> }
+
+pub open spec fn init(s: State) -> bool {
+    s == State { x: 0, vars: 0, p: Pair { a: 1, b: 2 }, o: Some(5int) }
+}
+
+pub open spec fn safe(s: State) -> bool { s.x <= 3 }
+
+pub open spec fn next(pre: State, post: State) -> bool {
+    &&& safe(pre)
+    &&& pre.x < 3
+    &&& pre.o is Some
+    &&& post == State { x: pre.x + 1, vars: pre.vars + pre.p.unwrap() + pre.o.unwrap(), ..pre }
+}
+
+pub open spec fn vars_value(s: State) -> bool { s.vars == 8 * s.x }
+
+pub open spec fn euclid(s: State) -> bool {
+    &&& (s.x - 7) / -2int == (if s.x == 0 { 4int } else if s.x == 1 { 3 } else if s.x == 2 { 3 } else { 2 })
+    &&& (s.x - 7) % -2int == (if s.x == 0 || s.x == 2 { 1int } else { 0 })
+    &&& (s.x - 7) / 2 == (if s.x == 0 { -4int } else if s.x == 1 { -3 } else if s.x == 2 { -3 } else { -2 })
+    &&& (s.x - 7) % 2 == (if s.x == 0 || s.x == 2 { 1int } else { 0 })
+}
+
+pub open spec fn x_small(s: State) -> bool { s.x <= 2 }
+}
+"#;
+
+#[test]
+fn tla_export_names_and_euclidean_arithmetic() {
+    let ex = export_code(NAMES, "test_crate");
+    assert_eq!(ex.report["refusals"], serde_json::json!([]), "{}", ex.tla);
+    // The generated `vars` keeps its name; the field's variable is renamed.
+    assert_eq!(names(&ex.report["variables"]), ["x", "vars_v", "p", "o"]);
+    assert!(
+        ex.tla.contains("VARIABLES x, vars_v, p, o\nvars == <<x, vars_v, p, o>>"),
+        "{}",
+        ex.tla
+    );
+    // `Pair::unwrap` is the crate's function, not Option's `.v0`.
+    assert!(ex.tla.contains("unwrap(p)"), "{}", ex.tla);
+    assert!(ex.tla.contains("o.v0"), "{}", ex.tla);
+    assert!(!ex.tla.contains("arrow_0"), "{}", ex.tla);
+    // A positive literal divisor keeps `\div` and `%`; a negative one does not.
+    assert!(ex.tla.contains("EuclidDiv("), "{}", ex.tla);
+    assert!(ex.tla.contains("\\div 2)"), "{}", ex.tla);
+    // `safe` is a guard of `next`: excluded, and said so, not dropped.
+    assert_eq!(names(&ex.report["invariants"]), ["vars_value", "euclid", "x_small"]);
+    let c = candidates(&ex.report);
+    assert!(c.contains(&("safe".into(), false)), "{:?}", c);
+    let safe = ex.report["candidates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["function"] == "test_crate::safe")
+        .unwrap();
+    assert!(safe["reason"].as_str().unwrap().starts_with("reached from init/next"), "{}", safe);
+    assert!(ex.cfg.contains("test_crate::safe is not checked"), "{}", ex.cfg);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let run = tlc(&jar, &ex.spec(), &ex.cfg);
+    // x reaches 3; everything but x_small holds (with Verus's `/` and `%`).
+    assert_eq!(run.violated, ["x_small"], "{}", ex.tla);
+    assert_eq!(run.distinct, 4, "{run:?}");
+}
+
+#[test]
+fn tla_export_checks_exactly_the_named_invariants() {
+    let ex = export_code(NAMES, "test_crate:safe,euclid");
+    assert_eq!(names(&ex.report["invariants"]), ["safe", "euclid"]);
+    let c = candidates(&ex.report);
+    assert!(c.contains(&("safe".into(), true)), "{:?}", c);
+    assert!(c.contains(&("x_small".into(), false)), "{:?}", c);
+    assert!(ex.cfg.contains("INVARIANTS\n  safe\n  euclid\n"), "{}", ex.cfg);
+    let Some(jar) = tla_tools() else { return };
+    let run = tlc(&jar, &ex.spec(), &ex.cfg);
+    assert_eq!(run.violated, Vec::<String>::new(), "{}", ex.tla);
+}
+
+#[test]
+fn tla_export_rejects_an_unknown_invariant() {
+    let src = TempDir::new().expect("temp dir");
+    let entry = src.path().join("test.rs");
+    std::fs::write(&entry, format!("{}\n{}\n{}\n", FEATURE_PRELUDE, USE_PRELUDE, NAMES)).unwrap();
+    let log = src.path().join("log");
+    let options =
+        ["-V tla-export=test_crate:nope".to_string(), format!("--log-dir {}", log.display())];
+    let options: Vec<&str> = options.iter().map(|s| s.as_str()).collect();
+    let output = run_verus(&options, src.path(), &entry, true, true);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{}", stderr);
+    assert!(stderr.contains("no invariant `nope` in `test_crate`"), "{}", stderr);
+}
