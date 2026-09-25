@@ -294,11 +294,36 @@ fn ident_name(v: &VarIdent) -> String {
     if is_tla_reserved(&s) { format!("{s}_") } else { s }
 }
 
-/// TLA+ keywords and the operators of the modules the export extends.
+/// TLA+ keywords (the proof language's included) and the operators of the
+/// modules the export extends.
 fn is_tla_reserved(s: &str) -> bool {
     matches!(
         s,
-        "ASSUME"
+        "ACTION"
+            | "BY"
+            | "COROLLARY"
+            | "DEF"
+            | "DEFINE"
+            | "DEFS"
+            | "HAVE"
+            | "HIDE"
+            | "LEMMA"
+            | "NEW"
+            | "OBVIOUS"
+            | "OMITTED"
+            | "ONLY"
+            | "PICK"
+            | "PROOF"
+            | "PROPOSITION"
+            | "PROVE"
+            | "QED"
+            | "STATE"
+            | "SUFFICES"
+            | "TAKE"
+            | "TEMPORAL"
+            | "USE"
+            | "WITNESS"
+            | "ASSUME"
             | "ELSE"
             | "LOCAL"
             | "UNION"
@@ -405,6 +430,7 @@ fn read_var(e: &Expr) -> Option<VarIdent> {
         ExprX::Var(v) => Some(v.clone()),
         ExprX::ReadPlace(p, _) => place_var(p),
         ExprX::UnaryOpr(UnaryOpr::Box(_) | UnaryOpr::Unbox(_), inner) => read_var(inner),
+        ExprX::Unary(UnaryOp::Trigger(_) | UnaryOp::CoerceMode { .. }, inner) => read_var(inner),
         ExprX::Block(stmts, Some(tail)) if stmts.is_empty() => read_var(tail),
         _ => None,
     }
@@ -420,11 +446,13 @@ fn place_var(p: &Place) -> Option<VarIdent> {
 }
 
 /// Strip wrappers that carry no meaning here (empty blocks, boxing, place
-/// temporaries) to reach the expression underneath.
+/// temporaries, `#[trigger]` annotations and mode coercions) to reach the
+/// expression underneath, so `#[trigger] s.contains(x)` reads as a guard.
 fn peel(e: &Expr) -> Expr {
     match &e.x {
         ExprX::Block(stmts, Some(tail)) if stmts.is_empty() => peel(tail),
         ExprX::UnaryOpr(UnaryOpr::Box(_) | UnaryOpr::Unbox(_), inner) => peel(inner),
+        ExprX::Unary(UnaryOp::Trigger(_) | UnaryOp::CoerceMode { .. }, inner) => peel(inner),
         ExprX::ReadPlace(p, _) => match &p.x {
             PlaceX::Temporary(inner) | PlaceX::WithExpr(inner, _) => peel(inner),
             _ => e.clone(),
@@ -1939,12 +1967,12 @@ impl Exporter {
             self.bind_var(&mut env2, &b.name);
         }
         // The guard: the antecedent of an implication (forall) or the
-        // conjuncts (exists).
+        // conjuncts of the body, a single one included (exists).
         // Explicit triggers wrap the body; the guard is underneath.
         let inner = peel(body);
         let guard_exprs: Vec<Expr> = match (&inner.x, forall) {
             (ExprX::Logical(LogicalOp::Implies, g, _), true) => conjuncts(g),
-            (ExprX::Logical(LogicalOp::And, _, _), false) => conjuncts(&inner),
+            (_, false) => conjuncts(&inner),
             _ => vec![],
         };
         let mut bounds = Vec::new();

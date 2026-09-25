@@ -1860,3 +1860,70 @@ fn tla_export_translates_a_seq_literal() {
     // x in 0..2, y 1 then 5.
     assert_eq!(run.distinct, 3, "{run:?}\n{}", ex.tla);
 }
+
+/// Guards the export once left unbounded: a membership guard annotated
+/// `#[trigger]` (on a map's domain and on a set), and the body of an
+/// `exists` that is a single guard (membership, and a chained range). Each
+/// binder was a `Dom_int` hole. A spec const named like a TLA+ keyword
+/// (`STATE`) is renamed.
+const GUARD_SHAPES: &str = r#"
+use vstd::prelude::*;
+verus! {
+pub struct State { pub m: Map<int, int>, pub s: Set<int>, pub v: Seq<int>, pub x: int }
+
+pub spec const STATE: int = 3;
+
+pub open spec fn init(s: State) -> bool {
+    &&& s.m == Map::<int, int>::empty().insert(1, 1)
+    &&& s.s == Set::<int>::empty().insert(2)
+    &&& s.v == seq![4int, 5int]
+    &&& s.x == 0
+}
+
+pub open spec fn next(pre: State, post: State) -> bool {
+    &&& pre.x < STATE
+    &&& post.x == pre.x + 1
+    &&& post.m == pre.m
+    &&& post.s == pre.s
+    &&& post.v == pre.v
+}
+
+pub open spec fn m_pos(s: State) -> bool {
+    forall|k: int| #[trigger] s.m.dom().contains(k) ==> s.m[k] > 0
+}
+
+pub open spec fn s_small(s: State) -> bool { forall|e: int| #[trigger] s.s.contains(e) ==> e < 10 }
+
+pub open spec fn m_nonempty(s: State) -> bool { exists|k: int| s.m.dom().contains(k) }
+
+pub open spec fn v_nonempty(s: State) -> bool {
+    exists|i: int| #![trigger s.v[i]] 0 <= i < s.v.len()
+}
+
+pub open spec fn x_bounded(s: State) -> bool { s.x <= STATE }
+}
+"#;
+
+#[test]
+fn tla_export_bounds_trigger_and_single_exists_guards() {
+    let ex = export_code(GUARD_SHAPES, "test_crate");
+    assert_eq!(ex.report["holes"], serde_json::json!([]), "{}", ex.tla);
+    assert_eq!(ex.report["refusals"], serde_json::json!([]), "{}", ex.tla);
+    assert_eq!(
+        names(&ex.report["invariants"]),
+        ["m_pos", "s_small", "m_nonempty", "v_nonempty", "x_bounded"]
+    );
+    assert!(!ex.tla.contains("CONSTANTS"), "{}", ex.tla);
+    assert!(ex.tla.contains("\\A k \\in DOMAIN m :"), "{}", ex.tla);
+    assert!(ex.tla.contains("\\A e \\in s :"), "{}", ex.tla);
+    assert!(ex.tla.contains("\\E k \\in DOMAIN m :"), "{}", ex.tla);
+    assert!(ex.tla.contains("\\E i \\in 0..(Len(v)) - 1 :"), "{}", ex.tla);
+    assert!(ex.tla.contains("STATE_ ==\n"), "{}", ex.tla);
+    assert!(!ex.tla.contains("STATE ==\n"), "{}", ex.tla);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let run = tlc(&jar, &ex.spec(), &ex.cfg);
+    assert_eq!(run.violated, Vec::<String>::new(), "{}", ex.tla);
+    // x in 0..3, the rest fixed.
+    assert_eq!(run.distinct, 4, "{run:?}\n{}", ex.tla);
+}

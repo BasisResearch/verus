@@ -57,7 +57,9 @@ one is left out of the `.cfg` and listed in the report's
 A quantifier's binder is bounded from its guard: membership in a set, a
 map's domain or a sequence, or integer comparisons, chained ones included
 and through binders bound later (`0 <= a < b < s.len()` bounds `a` by
-`s.len() - 2`). An integer binder's domain is intersected with its type's
+`s.len() - 2`); a `#[trigger]` on a guard is looked through, and an
+`exists` body that is a single guard (`exists|k| m.dom().contains(k)`) is
+read as one. An integer binder's domain is intersected with its type's
 range (`x < 300` over a `u8` is `0..255`), and the type closes a side the
 guard leaves open (`x < 5` over an `i8` starts at -128). An unguarded
 binder of a type of at most 16 bits takes its whole range (`0..255`); an
