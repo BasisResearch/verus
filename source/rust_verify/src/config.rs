@@ -949,7 +949,9 @@ pub fn parse_args_with_imports(
         matching_loops: extended.contains_key(EXTENDED_MATCHING_LOOPS),
         tla_export: match extended.get(EXTENDED_TLA_EXPORT) {
             Some(Some(module)) if !module.is_empty() => Some(module.clone()),
-            Some(_) => error(format!("-V {EXTENDED_TLA_EXPORT} needs a module path: -V {EXTENDED_TLA_EXPORT}=crate::a::b")),
+            Some(_) => error(format!(
+                "-V {EXTENDED_TLA_EXPORT} needs a module path: -V {EXTENDED_TLA_EXPORT}=crate::a::b"
+            )),
             None => None,
         },
         matching_loop_rounds: match extended.get(EXTENDED_MATCHING_LOOPS) {

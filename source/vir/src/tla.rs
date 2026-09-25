@@ -97,8 +97,7 @@ impl Env {
     }
 }
 
-struct Exporter<'a> {
-    krate: &'a Krate,
+struct Exporter {
     datatypes: HashMap<Path, Datatype>,
     functions: HashMap<Fun, Function>,
     state_path: Path,
@@ -120,17 +119,23 @@ struct Exporter<'a> {
 
 fn ident_name(v: &VarIdent) -> String {
     let s = v.0.to_string();
-    let s: String = s.chars().map(|c| if c.is_alphanumeric() || c == '_' { c } else { '_' }).collect();
+    let s: String =
+        s.chars().map(|c| if c.is_alphanumeric() || c == '_' { c } else { '_' }).collect();
     let s = s.trim_end_matches('_').to_string();
     let s = if s.is_empty() { "v".to_string() } else { s };
     // TLA+ identifiers cannot start with a digit; a few words are reserved.
-    let s = if s.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false) { format!("v{s}") } else { s };
+    let s = if s.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false) {
+        format!("v{s}")
+    } else {
+        s
+    };
     match s.as_str() {
-        "ASSUME" | "ELSE" | "LOCAL" | "UNION" | "ASSUMPTION" | "ENABLED" | "MODULE" | "VARIABLE"
-        | "AXIOM" | "EXCEPT" | "OTHER" | "VARIABLES" | "CASE" | "EXTENDS" | "SF_" | "WF_"
-        | "CHOOSE" | "IF" | "SUBSET" | "WITH" | "CONSTANT" | "IN" | "THEN" | "CONSTANTS"
-        | "INSTANCE" | "THEOREM" | "DOMAIN" | "LET" | "UNCHANGED" | "STRING" | "BOOLEAN"
-        | "TRUE" | "FALSE" | "Nat" | "Int" | "Seq" | "Len" | "Append" | "Head" | "Tail" => {
+        "ASSUME" | "ELSE" | "LOCAL" | "UNION" | "ASSUMPTION" | "ENABLED" | "MODULE"
+        | "VARIABLE" | "AXIOM" | "EXCEPT" | "OTHER" | "VARIABLES" | "CASE" | "EXTENDS" | "SF_"
+        | "WF_" | "CHOOSE" | "IF" | "SUBSET" | "WITH" | "CONSTANT" | "IN" | "THEN"
+        | "CONSTANTS" | "INSTANCE" | "THEOREM" | "DOMAIN" | "LET" | "UNCHANGED" | "STRING"
+        | "BOOLEAN" | "TRUE" | "FALSE" | "Nat" | "Int" | "Seq" | "Len" | "Append" | "Head"
+        | "Tail" => {
             format!("{s}_")
         }
         _ => s,
@@ -294,7 +299,11 @@ fn vstd_op(name: &str) -> Option<&'static str> {
 
 /// Whether a type carries a spec_fn anywhere: such values are reduced
 /// symbolically and never printed.
-fn typ_has_specfn(typ: &Typ, datatypes: &HashMap<Path, Datatype>, seen: &mut HashSet<Path>) -> bool {
+fn typ_has_specfn(
+    typ: &Typ,
+    datatypes: &HashMap<Path, Datatype>,
+    seen: &mut HashSet<Path>,
+) -> bool {
     match &**typ {
         TypX::SpecFn(..) | TypX::AnonymousClosure(..) | TypX::FnDef(..) => true,
         TypX::Datatype(Dt::Path(p), args, _) => {
@@ -306,16 +315,22 @@ fn typ_has_specfn(typ: &Typ, datatypes: &HashMap<Path, Datatype>, seen: &mut Has
             }
             datatypes
                 .get(p)
-                .map(|d| d.x.variants.iter().any(|v| v.fields.iter().any(|f| typ_has_specfn(&f.a.0, datatypes, seen))))
+                .map(|d| {
+                    d.x.variants
+                        .iter()
+                        .any(|v| v.fields.iter().any(|f| typ_has_specfn(&f.a.0, datatypes, seen)))
+                })
                 .unwrap_or(false)
         }
-        TypX::Datatype(Dt::Tuple(_), args, _) => args.iter().any(|a| typ_has_specfn(a, datatypes, seen)),
+        TypX::Datatype(Dt::Tuple(_), args, _) => {
+            args.iter().any(|a| typ_has_specfn(a, datatypes, seen))
+        }
         TypX::Decorate(_, _, t) | TypX::Boxed(t) => typ_has_specfn(t, datatypes, seen),
         _ => false,
     }
 }
 
-impl<'a> Exporter<'a> {
+impl Exporter {
     fn refuse(&mut self, what: impl Into<String>, span: &crate::messages::Span) -> String {
         let what = what.into();
         self.refusals.push(Refusal {
@@ -341,7 +356,10 @@ impl<'a> Exporter<'a> {
         }
         let friendly = fun_as_friendly_rust_name(fun);
         let segs: Vec<&str> = friendly.split("::").collect();
-        let mut candidate = ident_name(&VarIdent(Arc::new(segs.last().unwrap_or(&"f").to_string()), VarIdentDisambiguate::AirLocal));
+        let mut candidate = ident_name(&VarIdent(
+            Arc::new(segs.last().unwrap_or(&"f").to_string()),
+            VarIdentDisambiguate::AirLocal,
+        ));
         if self.used_names.contains(&candidate) && segs.len() >= 2 {
             candidate = format!("{}_{}", sanitize(segs[segs.len() - 2]), candidate);
         }
@@ -361,7 +379,11 @@ impl<'a> Exporter<'a> {
         let prime = if role == Role::Post { "'" } else { "" };
         format!(
             "[{}]",
-            self.state_fields.iter().map(|f| format!("{f} |-> {f}{prime}")).collect::<Vec<_>>().join(", ")
+            self.state_fields
+                .iter()
+                .map(|f| format!("{f} |-> {f}{prime}"))
+                .collect::<Vec<_>>()
+                .join(", ")
         )
     }
 
@@ -377,7 +399,9 @@ impl<'a> Exporter<'a> {
                 Constant::Real(r) => r.clone(),
                 Constant::ByteStr(_) => self.refuse("byte string literal", &e.span),
                 Constant::Char(c) => format!("\"{}\"", c),
-                Constant::Float32(_) | Constant::Float64(_) => self.refuse("float literal", &e.span),
+                Constant::Float32(_) | Constant::Float64(_) => {
+                    self.refuse("float literal", &e.span)
+                }
             },
             ExprX::Var(v) => {
                 if let Some(role) = env.roles.get(v) {
@@ -394,7 +418,9 @@ impl<'a> Exporter<'a> {
             }
             ExprX::ReadPlace(place, _) => self.place(place, env),
             ExprX::Call { target, args, .. } => self.call(e, target, args, env),
-            ExprX::Ctor(dt, variant, binders, tail) => self.ctor(e, dt, variant, binders, tail, env),
+            ExprX::Ctor(dt, variant, binders, tail) => {
+                self.ctor(e, dt, variant, binders, tail, env)
+            }
             ExprX::NullaryOpr(_) => self.refuse("nullary operator", &e.span),
             ExprX::Unary(op, inner) => match op {
                 UnaryOp::Not => format!("~({})", self.expr(inner, env)),
@@ -448,15 +474,9 @@ impl<'a> Exporter<'a> {
                 format!("({sa} {sym} {sb})")
             }
             ExprX::Binary(op, a, b) => self.binary(e, op, a, b, env),
-            ExprX::BinaryOpr(op, a, b) => match op {
-                BinaryOpr::ExtEq(..) => {
-                    format!("({} = {})", self.expr(a, env), self.expr(b, env))
-                }
-                _ => {
-                    let what = format!("binary operator {:?}", op);
-                    self.refuse(what, &e.span)
-                }
-            },
+            ExprX::BinaryOpr(BinaryOpr::ExtEq(..), a, b) => {
+                format!("({} = {})", self.expr(a, env), self.expr(b, env))
+            }
             ExprX::Multi(MultiOp::Chained(ops), args) => {
                 let mut parts = Vec::new();
                 for (i, op) in ops.iter().enumerate() {
@@ -487,9 +507,10 @@ impl<'a> Exporter<'a> {
             }
             ExprX::Match(place, arms, _) => self.matches(e, place, arms, env),
             ExprX::Block(stmts, tail) => self.block(e, stmts, tail, env),
-            ExprX::Header(_) | ExprX::Fuel(..) | ExprX::RevealString(_) | ExprX::RevealByteString(_) => {
-                "TRUE".into()
-            }
+            ExprX::Header(_)
+            | ExprX::Fuel(..)
+            | ExprX::RevealString(_)
+            | ExprX::RevealByteString(_) => "TRUE".into(),
             ExprX::AssertAssume { .. } | ExprX::AssertBy { .. } | ExprX::AssertQuery { .. } => {
                 "TRUE".into()
             }
@@ -585,7 +606,11 @@ impl<'a> Exporter<'a> {
         let so = self.expr(other, env);
         Some(format!(
             "(LET s__ == {so} IN {})",
-            fields.iter().map(|f| format!("{f}{prime} = s__.{f}")).collect::<Vec<_>>().join(" /\\ ")
+            fields
+                .iter()
+                .map(|f| format!("{f}{prime} = s__.{f}"))
+                .collect::<Vec<_>>()
+                .join(" /\\ ")
         ))
     }
 
@@ -645,7 +670,12 @@ impl<'a> Exporter<'a> {
                 let declared: Vec<Ident> = self
                     .datatypes
                     .get(p)
-                    .and_then(|d| d.x.variants.iter().find(|v| &v.name == variant).map(|v| v.fields.iter().map(|f| f.name.clone()).collect()))
+                    .and_then(|d| {
+                        d.x.variants
+                            .iter()
+                            .find(|v| &v.name == variant)
+                            .map(|v| v.fields.iter().map(|f| f.name.clone()).collect())
+                    })
                     .unwrap_or_else(|| binders.iter().map(|b| b.name.clone()).collect());
                 for name in declared {
                     if let Some(b) = binders.iter().find(|b| b.name == name) {
@@ -725,11 +755,7 @@ impl<'a> Exporter<'a> {
             None => "TRUE".into(),
         };
         let _ = e;
-        if lets.is_empty() {
-            body
-        } else {
-            format!("(LET {} IN {body})", lets.join("\n         "))
-        }
+        if lets.is_empty() { body } else { format!("(LET {} IN {body})", lets.join("\n         ")) }
     }
 
     fn matches(&mut self, e: &Expr, place: &Place, arms: &Arms, env: &Env) -> String {
@@ -747,7 +773,8 @@ impl<'a> Exporter<'a> {
                 Some(self.expr(&arm.x.guard, &env2))
             };
             let body = self.expr(&arm.x.body, &env2);
-            let body = if lets.is_empty() { body } else { format!("(LET {} IN {body})", lets.join(" ")) };
+            let body =
+                if lets.is_empty() { body } else { format!("(LET {} IN {body})", lets.join(" ")) };
             let cond = match (cond, guard) {
                 (None, None) => None,
                 (Some(c), None) => Some(c),
@@ -773,7 +800,12 @@ impl<'a> Exporter<'a> {
 
     /// The condition a pattern imposes on `subject`, and the LET bindings it
     /// introduces (added to `env`).
-    fn pattern(&mut self, subject: &str, p: &Pattern, env: &mut Env) -> (Option<String>, Vec<String>) {
+    fn pattern(
+        &mut self,
+        subject: &str,
+        p: &Pattern,
+        env: &mut Env,
+    ) -> (Option<String>, Vec<String>) {
         match &p.x {
             PatternX::Wildcard(_) => (None, vec![]),
             PatternX::Var(PatternBinding { name, .. }) => {
@@ -831,7 +863,10 @@ impl<'a> Exporter<'a> {
                 if friendly.ends_with("::is_none") || friendly.ends_with("::is_None") {
                     return format!("({}.tag = \"None\")", self.expr(&args[0], env));
                 }
-                if friendly.ends_with("::unwrap") || friendly.ends_with("::get_Some_0") || friendly.ends_with("::arrow_Some_0") {
+                if friendly.ends_with("::unwrap")
+                    || friendly.ends_with("::get_Some_0")
+                    || friendly.ends_with("::arrow_Some_0")
+                {
                     return format!("{}.v0", self.expr(&args[0], env));
                 }
                 let Some(callee) = self.functions.get(fun).cloned() else {
@@ -854,12 +889,16 @@ impl<'a> Exporter<'a> {
                                 if roles.iter().filter(|r| r.is_some()).count() == 1 {
                                     prime = true;
                                 } else {
-                                    let r = self.refuse("post state passed where the callee expects its pre state", &a.span);
+                                    let r = self.refuse(
+                                        "post state passed where the callee expects its pre state",
+                                        &a.span,
+                                    );
                                     printed.push(r);
                                 }
                             }
                             None => {
-                                let r = self.refuse("a computed state passed to a state operator", &a.span);
+                                let r = self
+                                    .refuse("a computed state passed to a state operator", &a.span);
                                 printed.push(r);
                             }
                         },
@@ -875,7 +914,11 @@ impl<'a> Exporter<'a> {
                 let _ = pre_given;
                 let name = self.op_name(fun);
                 self.ensure_function(fun);
-                let app = if printed.is_empty() { name } else { format!("{name}({})", printed.join(", ")) };
+                let app = if printed.is_empty() {
+                    name
+                } else {
+                    format!("{name}({})", printed.join(", "))
+                };
                 if prime { format!("({app})'") } else { app }
             }
             CallTarget::FnSpec(f) => {
@@ -888,7 +931,8 @@ impl<'a> Exporter<'a> {
                             _ => {
                                 let n = ident_name(&p.name);
                                 env2.names.insert(p.name.clone(), n.clone());
-                                env2.values.insert(p.name.clone(), (peel(a), Box::new(env.clone())));
+                                env2.values
+                                    .insert(p.name.clone(), (peel(a), Box::new(env.clone())));
                                 if !typ_has_specfn(&p.a, &self.datatypes, &mut HashSet::new()) {
                                     lets.push(format!("{n} == {}", self.expr(a, env)));
                                 }
@@ -896,9 +940,16 @@ impl<'a> Exporter<'a> {
                         }
                     }
                     let b = self.expr(&body, &env2);
-                    return if lets.is_empty() { b } else { format!("(LET {} IN {b})", lets.join(" ")) };
+                    return if lets.is_empty() {
+                        b
+                    } else {
+                        format!("(LET {} IN {b})", lets.join(" "))
+                    };
                 }
-                self.refuse("application of a spec_fn value that does not reduce to a closure", &e.span)
+                self.refuse(
+                    "application of a spec_fn value that does not reduce to a closure",
+                    &e.span,
+                )
             }
             CallTarget::BuiltinSpecFun(..) => self.refuse("call_requires/call_ensures", &e.span),
             CallTarget::AssumeExternal => self.refuse("external call", &e.span),
@@ -910,13 +961,20 @@ impl<'a> Exporter<'a> {
     /// one (its parameters become LET bindings or symbolic values). Returns
     /// the closure's parameters and body with the environment to print the
     /// body in, plus the LET bindings that environment relies on.
-    fn resolve_closure(&mut self, f: &Expr, env: &Env, depth: usize) -> Option<(VarBinders<Typ>, Expr, Env, Vec<String>)> {
+    fn resolve_closure(
+        &mut self,
+        f: &Expr,
+        env: &Env,
+        depth: usize,
+    ) -> Option<(VarBinders<Typ>, Expr, Env, Vec<String>)> {
         if depth > 16 {
             return None;
         }
         let f = peel(f);
         match &f.x {
-            ExprX::Closure(params, body) => Some((params.clone(), body.clone(), env.clone(), vec![])),
+            ExprX::Closure(params, body) => {
+                Some((params.clone(), body.clone(), env.clone(), vec![]))
+            }
             ExprX::Var(v) => {
                 let (value, venv) = env.values.get(v)?.clone();
                 self.resolve_closure(&value, &venv, depth + 1)
@@ -953,7 +1011,8 @@ impl<'a> Exporter<'a> {
                         }
                     }
                 }
-                let (params, cbody, cenv, mut clets) = self.resolve_closure(&body, &env2, depth + 1)?;
+                let (params, cbody, cenv, mut clets) =
+                    self.resolve_closure(&body, &env2, depth + 1)?;
                 lets.append(&mut clets);
                 Some((params, cbody, cenv, lets))
             }
@@ -961,7 +1020,12 @@ impl<'a> Exporter<'a> {
         }
     }
 
-    fn resolve_place_closure(&mut self, p: &Place, env: &Env, depth: usize) -> Option<(VarBinders<Typ>, Expr, Env, Vec<String>)> {
+    fn resolve_place_closure(
+        &mut self,
+        p: &Place,
+        env: &Env,
+        depth: usize,
+    ) -> Option<(VarBinders<Typ>, Expr, Env, Vec<String>)> {
         match &p.x {
             PlaceX::Local(v) => {
                 let (value, venv) = env.values.get(v)?.clone();
@@ -975,8 +1039,12 @@ impl<'a> Exporter<'a> {
                 }
                 None
             }
-            PlaceX::Temporary(e) | PlaceX::WithExpr(e, _) => self.resolve_closure(e, env, depth + 1),
-            PlaceX::DerefMut(inner) | PlaceX::ModeUnwrap(inner, _) => self.resolve_place_closure(inner, env, depth + 1),
+            PlaceX::Temporary(e) | PlaceX::WithExpr(e, _) => {
+                self.resolve_closure(e, env, depth + 1)
+            }
+            PlaceX::DerefMut(inner) | PlaceX::ModeUnwrap(inner, _) => {
+                self.resolve_place_closure(inner, env, depth + 1)
+            }
             _ => None,
         }
     }
@@ -1016,7 +1084,9 @@ impl<'a> Exporter<'a> {
                 self.resolve_record(&value, &venv, depth + 1)
             }
             PlaceX::Temporary(e) | PlaceX::WithExpr(e, _) => self.resolve_record(e, env, depth + 1),
-            PlaceX::DerefMut(inner) | PlaceX::ModeUnwrap(inner, _) => self.resolve_record_place(inner, env, depth + 1),
+            PlaceX::DerefMut(inner) | PlaceX::ModeUnwrap(inner, _) => {
+                self.resolve_record_place(inner, env, depth + 1)
+            }
             _ => None,
         }
     }
@@ -1038,7 +1108,9 @@ impl<'a> Exporter<'a> {
             "seq_drop_last" => format!("(LET s__ == {} IN SubSeq(s__, 1, Len(s__) - 1))", g(0)),
             "seq_take" => format!("SubSeq({}, 1, {})", g(0), g(1)),
             "seq_skip" => format!("(LET s__ == {} IN SubSeq(s__, ({}) + 1, Len(s__)))", g(0), g(1)),
-            "seq_contains" => format!("(LET s__ == {} IN \\E i__ \\in 1..Len(s__) : s__[i__] = {})", g(0), g(1)),
+            "seq_contains" => {
+                format!("(LET s__ == {} IN \\E i__ \\in 1..Len(s__) : s__[i__] = {})", g(0), g(1))
+            }
             "seq_new" => {
                 if let ExprX::Closure(params, body) = &args[1].x {
                     let mut env2 = env.clone();
@@ -1066,7 +1138,11 @@ impl<'a> Exporter<'a> {
             "map_dom" => format!("DOMAIN {}", g(0)),
             "map_index" => format!("{}[{}]", g(0), g(1)),
             "map_insert" => format!("(({} :> {}) @@ {})", g(1), g(2), g(0)),
-            "map_remove" => format!("(LET m__ == {} IN [k__ \\in (DOMAIN m__) \\ {{{}}} |-> m__[k__]])", g(0), g(1)),
+            "map_remove" => format!(
+                "(LET m__ == {} IN [k__ \\in (DOMAIN m__) \\ {{{}}} |-> m__[k__]])",
+                g(0),
+                g(1)
+            ),
             "map_empty" => "[k__ \\in {} |-> k__]".into(),
             "map_contains_key" => format!("({} \\in DOMAIN {})", g(1), g(0)),
             "map_len" => format!("Cardinality(DOMAIN {})", g(0)),
@@ -1077,7 +1153,14 @@ impl<'a> Exporter<'a> {
 
     // ─── quantifiers ────────────────────────────────────────────────────
 
-    fn quant(&mut self, e: &Expr, q: &Quant, binders: &VarBinders<Typ>, body: &Expr, env: &Env) -> String {
+    fn quant(
+        &mut self,
+        e: &Expr,
+        q: &Quant,
+        binders: &VarBinders<Typ>,
+        body: &Expr,
+        env: &Env,
+    ) -> String {
         let forall = matches!(q.quant, air::ast::Quant::Forall);
         let mut env2 = env.clone();
         for b in binders.iter() {
@@ -1145,7 +1228,12 @@ impl<'a> Exporter<'a> {
                         let domain = match self.bound_from_type(&f.a.0, span) {
                             Some(dom) => dom,
                             None => {
-                                let constant = format!("Dom_{}_{}_{}", sanitize(&last_segment(p)), sanitize(&v.name), fname);
+                                let constant = format!(
+                                    "Dom_{}_{}_{}",
+                                    sanitize(&last_segment(p)),
+                                    sanitize(&v.name),
+                                    fname
+                                );
                                 self.constants.insert(constant.clone());
                                 self.holes.push(Hole {
                                     variable: format!("{}.{}", v.name, fname),
@@ -1167,11 +1255,7 @@ impl<'a> Exporter<'a> {
                         parts.push(format!("{{{record} : {}}}", binds.join(", ")));
                     }
                 }
-                if parts.is_empty() {
-                    None
-                } else {
-                    Some(format!("({})", parts.join(" \\cup ")))
-                }
+                if parts.is_empty() { None } else { Some(format!("({})", parts.join(" \\cup "))) }
             }
             TypX::Decorate(_, _, t) | TypX::Boxed(t) => self.bound_from_type(t, span),
             _ => None,
@@ -1180,7 +1264,13 @@ impl<'a> Exporter<'a> {
 
     /// A finite domain for `v` read off the guard's conjuncts: membership in
     /// a set, a map's domain, or an integer range from inequalities.
-    fn bound_from_guard(&mut self, v: &VarIdent, typ: &Typ, guard: &[Expr], env: &Env) -> Option<String> {
+    fn bound_from_guard(
+        &mut self,
+        v: &VarIdent,
+        typ: &Typ,
+        guard: &[Expr],
+        env: &Env,
+    ) -> Option<String> {
         let is_v = |x: &Expr| matches!(&x.x, ExprX::Var(u) if u == v);
         let _ = typ;
         // Membership.
@@ -1188,13 +1278,19 @@ impl<'a> Exporter<'a> {
             if let ExprX::Call { target: CallTarget::Fun(_, fun, ..), args, .. } = &g.x {
                 let name = fun_as_friendly_rust_name(fun);
                 match vstd_op(&name) {
-                    Some("set_contains") if args.len() == 2 && is_v(&args[1]) && !mentions(&args[0], v) => {
+                    Some("set_contains")
+                        if args.len() == 2 && is_v(&args[1]) && !mentions(&args[0], v) =>
+                    {
                         return Some(self.expr(&args[0], env));
                     }
-                    Some("map_contains_key") if args.len() == 2 && is_v(&args[1]) && !mentions(&args[0], v) => {
+                    Some("map_contains_key")
+                        if args.len() == 2 && is_v(&args[1]) && !mentions(&args[0], v) =>
+                    {
                         return Some(format!("DOMAIN {}", self.expr(&args[0], env)));
                     }
-                    Some("seq_contains") if args.len() == 2 && is_v(&args[1]) && !mentions(&args[0], v) => {
+                    Some("seq_contains")
+                        if args.len() == 2 && is_v(&args[1]) && !mentions(&args[0], v) =>
+                    {
                         let s = self.expr(&args[0], env);
                         return Some(format!("{{{s}[i__] : i__ \\in 1..Len({s})}}"));
                     }
@@ -1205,7 +1301,12 @@ impl<'a> Exporter<'a> {
         // Integer range from inequalities and chained comparisons.
         let mut lower: Option<String> = None;
         let mut upper: Option<String> = None;
-        let mut note = |side: &Expr, op: InequalityOp, other: &Expr, this: &mut Self, lower: &mut Option<String>, upper: &mut Option<String>| {
+        let note = |side: &Expr,
+                    op: InequalityOp,
+                    other: &Expr,
+                    this: &mut Self,
+                    lower: &mut Option<String>,
+                    upper: &mut Option<String>| {
             // side is v; the comparison is `v op other`.
             let _ = side;
             if mentions(other, v) {
@@ -1304,9 +1405,14 @@ impl<'a> Exporter<'a> {
                 r
             }
         };
-        let head = if params.is_empty() { name.clone() } else { format!("{name}({})", params.join(", ")) };
+        let head =
+            if params.is_empty() { name.clone() } else { format!("{name}({})", params.join(", ")) };
         let mut def = String::new();
-        def.push_str(&format!("\\* {}, {}\n", fun_as_friendly_rust_name(fun), span_string(&f.span)));
+        def.push_str(&format!(
+            "\\* {}, {}\n",
+            fun_as_friendly_rust_name(fun),
+            span_string(&f.span)
+        ));
         if f.x.decrease.len() > 0 || self.recursive.contains(&name) {
             self.recursive.insert(name.clone());
         }
@@ -1320,11 +1426,7 @@ impl<'a> Exporter<'a> {
 
 fn field_name(f: &Ident) -> String {
     let s = f.to_string();
-    if s.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false) {
-        format!("v{s}")
-    } else {
-        s
-    }
+    if s.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false) { format!("v{s}") } else { s }
 }
 
 fn expr_kind(x: &ExprX) -> &'static str {
@@ -1363,8 +1465,12 @@ fn recognise(krate: &Krate, module: &str) -> Result<Triple, String> {
         .cloned()
         .collect();
     if in_module.is_empty() {
-        let known: BTreeSet<String> =
-            krate.functions.iter().filter_map(module_of).map(|m| path_as_friendly_rust_name(&m)).collect();
+        let known: BTreeSet<String> = krate
+            .functions
+            .iter()
+            .filter_map(module_of)
+            .map(|m| path_as_friendly_rust_name(&m))
+            .collect();
         return Err(format!(
             "no functions in module `{module}`; modules with functions: {}",
             known.into_iter().collect::<Vec<_>>().join(", ")
@@ -1374,14 +1480,31 @@ fn recognise(krate: &Krate, module: &str) -> Result<Triple, String> {
     let state_of = |f: &Function| f.x.params.first().and_then(|p| typ_datatype(&p.x.typ));
     let is_bool = |f: &Function| matches!(&*f.x.ret.x.typ, TypX::Bool);
     // Hand-rolled or VerusSync: `next(pre, post)` with two params of one datatype.
-    let next = in_module.iter().find(|f| short(f) == "next" && f.x.params.len() == 2 && is_bool(f) && state_of(f).is_some() && state_of(f) == f.x.params.get(1).and_then(|p| typ_datatype(&p.x.typ)));
+    let next = in_module.iter().find(|f| {
+        short(f) == "next"
+            && f.x.params.len() == 2
+            && is_bool(f)
+            && state_of(f).is_some()
+            && state_of(f) == f.x.params.get(1).and_then(|p| typ_datatype(&p.x.typ))
+    });
     if let Some(next) = next {
         let state = state_of(next).unwrap();
         let init = in_module
             .iter()
-            .find(|f| short(f) == "init" && f.x.params.len() == 1 && is_bool(f) && state_of(f).as_ref() == Some(&state))
-            .ok_or_else(|| format!("found `next` in `{module}` but no `init(s: State) -> bool` beside it"))?;
-        let shape = if in_module.iter().any(|f| short(f) == "next_by") { "verussync" } else { "hand-rolled" };
+            .find(|f| {
+                short(f) == "init"
+                    && f.x.params.len() == 1
+                    && is_bool(f)
+                    && state_of(f).as_ref() == Some(&state)
+            })
+            .ok_or_else(|| {
+                format!("found `next` in `{module}` but no `init(s: State) -> bool` beside it")
+            })?;
+        let shape = if in_module.iter().any(|f| short(f) == "next_by") {
+            "verussync"
+        } else {
+            "hand-rolled"
+        };
         let invariants: Vec<Fun> = in_module
             .iter()
             .filter(|f| {
@@ -1395,27 +1518,47 @@ fn recognise(krate: &Krate, module: &str) -> Result<Triple, String> {
             })
             .map(|f| f.x.name.clone())
             .collect();
-        return Ok(Triple { shape, state, init: init.x.name.clone(), next: next.x.name.clone(), invariants });
+        return Ok(Triple {
+            shape,
+            state,
+            init: init.x.name.clone(),
+            next: next.x.name.clone(),
+            invariants,
+        });
     }
     // verus-tla: `next()` returning a spec_fn over (S, S).
     let next = in_module.iter().find(|f| short(f) == "next" && f.x.params.is_empty() && matches!(&*f.x.ret.x.typ, TypX::SpecFn(ps, r) if ps.len() == 2 && matches!(&**r, TypX::Bool)));
     if let Some(next) = next {
         let state = match &*next.x.ret.x.typ {
-            TypX::SpecFn(ps, _) => typ_datatype(&ps[0]).ok_or("state type of `next()` is not a datatype")?,
+            TypX::SpecFn(ps, _) => {
+                typ_datatype(&ps[0]).ok_or("state type of `next()` is not a datatype")?
+            }
             _ => unreachable!(),
         };
         let init = in_module
             .iter()
-            .find(|f| short(f) == "init" && f.x.params.is_empty() && matches!(&*f.x.ret.x.typ, TypX::SpecFn(ps, _) if ps.len() == 1))
+            .find(|f| {
+                short(f) == "init"
+                    && f.x.params.is_empty()
+                    && matches!(&*f.x.ret.x.typ, TypX::SpecFn(ps, _) if ps.len() == 1)
+            })
             .ok_or("found verus-tla `next()` but no `init()`")?;
         let invariants: Vec<Fun> = in_module
             .iter()
             .filter(|f| f.x.params.is_empty() && matches!(&*f.x.ret.x.typ, TypX::SpecFn(ps, r) if ps.len() == 1 && matches!(&**r, TypX::Bool)) && short(f) != "init")
             .map(|f| f.x.name.clone())
             .collect();
-        return Ok(Triple { shape: "verus-tla", state, init: init.x.name.clone(), next: next.x.name.clone(), invariants });
+        return Ok(Triple {
+            shape: "verus-tla",
+            state,
+            init: init.x.name.clone(),
+            next: next.x.name.clone(),
+            invariants,
+        });
     }
-    Err(format!("no transition system found in `{module}`: expected `next(pre, post) -> bool` and `init(s) -> bool`, or verus-tla's `next()`/`init()` closures"))
+    Err(format!(
+        "no transition system found in `{module}`: expected `next(pre, post) -> bool` and `init(s) -> bool`, or verus-tla's `next()`/`init()` closures"
+    ))
 }
 
 /// Export the transition system in `module` (a `crate::a::b` path as Verus
@@ -1430,15 +1573,19 @@ pub fn export_module(krate: &Krate, module: &str) -> Result<Export, String> {
             Dt::Tuple(_) => None,
         })
         .collect();
-    let functions: HashMap<Fun, Function> = krate.functions.iter().map(|f| (f.x.name.clone(), f.clone())).collect();
+    let functions: HashMap<Fun, Function> =
+        krate.functions.iter().map(|f| (f.x.name.clone(), f.clone())).collect();
     let state_dt = datatypes.get(&triple.state).ok_or("state datatype not found")?.clone();
-    let state_fields: Vec<String> =
-        state_dt.x.variants.first().map(|v| v.fields.iter().map(|f| field_name(&f.name)).collect()).unwrap_or_default();
+    let state_fields: Vec<String> = state_dt
+        .x
+        .variants
+        .first()
+        .map(|v| v.fields.iter().map(|f| field_name(&f.name)).collect())
+        .unwrap_or_default();
     if state_dt.x.variants.len() != 1 {
         return Err("the state type must be a struct".into());
     }
     let mut ex = Exporter {
-        krate,
         datatypes,
         functions,
         state_path: triple.state.clone(),
@@ -1479,7 +1626,10 @@ pub fn export_module(krate: &Krate, module: &str) -> Result<Export, String> {
                     ExprX::Closure(params, body) => {
                         let mut env = Env::new();
                         for (k, p) in params.iter().enumerate() {
-                            env.roles.insert(p.name.clone(), if k == 0 { Role::Pre } else { Role::Post });
+                            env.roles.insert(
+                                p.name.clone(),
+                                if k == 0 { Role::Pre } else { Role::Post },
+                            );
                         }
                         ex.expr(body, &env)
                     }
@@ -1487,7 +1637,11 @@ pub fn export_module(krate: &Krate, module: &str) -> Result<Export, String> {
                 },
                 None => ex.refuse("root without a body", &f.span),
             };
-            ex.defs.push(format!("\\* {}, {}\n{name} ==\n    {body}\n", fun_as_friendly_rust_name(r), span_string(&f.span)));
+            ex.defs.push(format!(
+                "\\* {}, {}\n{name} ==\n    {body}\n",
+                fun_as_friendly_rust_name(r),
+                span_string(&f.span)
+            ));
             ex.emitted.insert(r.clone());
             match i {
                 0 => init_name = name,
@@ -1518,13 +1672,22 @@ pub fn export_module(krate: &Krate, module: &str) -> Result<Export, String> {
     tla.push_str(module);
     tla.push_str("`.\n\\* Mapping: structs are records; enum values are records with a `tag`;\n");
     tla.push_str("\\* Seq is a 1-based sequence (every index shifted once); Set is a set;\n");
-    tla.push_str("\\* Map is a function (dom = DOMAIN, insert = :> @@); Option is a record tagged\n");
-    tla.push_str("\\* None/Some with field v0; nat/int/uN are Int; a spec fn is an operator, its\n");
-    tla.push_str("\\* pre/post state parameters dropped and read as the unprimed/primed variables;\n");
+    tla.push_str(
+        "\\* Map is a function (dom = DOMAIN, insert = :> @@); Option is a record tagged\n",
+    );
+    tla.push_str(
+        "\\* None/Some with field v0; nat/int/uN are Int; a spec fn is an operator, its\n",
+    );
+    tla.push_str(
+        "\\* pre/post state parameters dropped and read as the unprimed/primed variables;\n",
+    );
     tla.push_str("\\* a quantifier is bounded from its guard, or from a CONSTANT Dom_<Type>.\n");
     tla.push_str("EXTENDS Integers, Sequences, FiniteSets, TLC\n\n");
     if !ex.constants.is_empty() {
-        tla.push_str(&format!("CONSTANTS {}\n\n", ex.constants.iter().cloned().collect::<Vec<_>>().join(", ")));
+        tla.push_str(&format!(
+            "CONSTANTS {}\n\n",
+            ex.constants.iter().cloned().collect::<Vec<_>>().join(", ")
+        ));
     }
     tla.push_str(&format!("VARIABLES {}\n", state_fields.join(", ")));
     tla.push_str(&format!("vars == <<{}>>\n\n", state_fields.join(", ")));
@@ -1542,7 +1705,10 @@ pub fn export_module(krate: &Krate, module: &str) -> Result<Export, String> {
     tla.push_str(&format!("Next == {next_name}\n"));
     tla.push_str("Spec == Init /\\ [][Next]_vars\n");
     if !inv_names.is_empty() {
-        tla.push_str(&format!("Inv == {}\n", inv_names.iter().map(|n| format!("({n})")).collect::<Vec<_>>().join(" /\\ ")));
+        tla.push_str(&format!(
+            "Inv == {}\n",
+            inv_names.iter().map(|n| format!("({n})")).collect::<Vec<_>>().join(" /\\ ")
+        ));
     }
     tla.push_str(&format!("{}\n", "=".repeat(module_name.len() + 20)));
 
@@ -1555,7 +1721,9 @@ pub fn export_module(krate: &Krate, module: &str) -> Result<Export, String> {
         }
     }
     if !ex.constants.is_empty() {
-        cfg.push_str("\\* Domains the export could not bound; give each a finite set.\nCONSTANTS\n");
+        cfg.push_str(
+            "\\* Domains the export could not bound; give each a finite set.\nCONSTANTS\n",
+        );
         for c in &ex.constants {
             cfg.push_str(&format!("  {c} = {{}}\n"));
         }
