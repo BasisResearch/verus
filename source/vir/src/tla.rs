@@ -35,7 +35,8 @@
 //! highest level among them, so no RECURSIVE operator may read `v'`); a
 //! recursive root is a wrapper applying it to the state. A function given a
 //! state value rather than the pre or post state (such a record, or a
-//! constructed state) is called in its record variant too. Only operators in
+//! constructed state), or the pre and post states other than in its roles
+//! (swapped, or one twice), is called in its record variant too. Only operators in
 //! a call cycle are declared RECURSIVE. A closure-valued
 //! variable is kept only symbolically; used other than in an application it
 //! is refused.
@@ -176,7 +177,9 @@ enum Variant {
     Primed,
     /// Every state parameter explicitly, as a record: a callee given a state
     /// value rather than the pre or post state, as a recursive function
-    /// holds it (`ok_at(s, i)` called from a recursive walk over `s`).
+    /// holds it (`ok_at(s, i)` called from a recursive walk over `s`), or
+    /// given the pre and post states other than in its roles (swapped, or
+    /// one of them twice: `frame(post, post)`).
     Record,
 }
 
@@ -1662,56 +1665,47 @@ impl Exporter {
                 let roles = self.param_roles(&callee);
                 let single_state = roles.iter().filter(|r| r.is_some()).count() == 1;
                 let arg_role = |a: &Expr| read_var(a).and_then(|v| env.roles.get(&v).copied());
+                // Whether the argument `a` fills the state parameter of role
+                // `r` as the plain or primed variant reads it: the pre state
+                // for the pre role, the post state for the post role, or the
+                // post state for a single state parameter (primed variant).
+                let fits = |r: Role, a: &Expr| match (r, arg_role(a)) {
+                    (Role::Pre, Some(Role::Pre)) | (Role::Post, Some(Role::Post)) => true,
+                    (Role::Pre, Some(Role::Post)) => single_state,
+                    _ => false,
+                };
                 // A recursive function (one with `decreases`), or a function
-                // given a state value that is neither the pre nor the post
-                // state (a record, as a recursive function holds the state,
-                // or a constructed state), is called in its record variant,
-                // which takes every parameter explicitly; a pre or post state
-                // among the arguments is passed as its record. A recursive
-                // function has no other variant: SANY gives every operator in
-                // a RECURSIVE group the highest level among them, so one
+                // whose state arguments do not fit its roles (a state value
+                // that is neither the pre nor the post state, as a recursive
+                // function holds the state, or a constructed state; the pre
+                // and post states swapped; one state given twice, as in
+                // `frame(post, post)`), is called in its record variant, which
+                // takes every parameter explicitly; a pre or post state among
+                // the arguments is passed as its record. A recursive function
+                // has no other variant: SANY gives every operator in a
+                // RECURSIVE group the highest level among them, so one
                 // reading `v'` would make the rest actions.
                 if !callee.x.decrease.is_empty()
-                    || roles
-                        .iter()
-                        .zip(args.iter())
-                        .any(|(r, a)| r.is_some() && arg_role(a).is_none())
+                    || roles.iter().zip(args.iter()).any(|(r, a)| r.is_some_and(|r| !fits(r, a)))
                 {
                     let printed: Vec<String> = args.iter().map(|a| self.expr(a, env)).collect();
                     self.conj_level = level;
                     let name = self.ensure_function(&(fun.clone(), Variant::Record));
                     return format!("{name}({})", printed.join(", "));
                 }
+                // Every state argument fits its role (checked above): it is
+                // dropped, and `post` given to a single pre-role parameter
+                // selects the primed variant.
                 let mut printed = Vec::new();
                 let mut variant = Variant::Plain;
-                // A pre and a post state swapped: the call as a whole is the
-                // refusal, since the operator declares no parameter for the
-                // state.
-                let mut refused = None;
                 for (i, a) in args.iter().enumerate() {
                     match (roles.get(i).copied().flatten(), arg_role(a)) {
-                        (Some(Role::Pre), Some(Role::Pre))
-                        | (Some(Role::Post), Some(Role::Post)) => {}
-                        (Some(Role::Pre), Some(Role::Post)) if single_state => {
-                            variant = Variant::Primed
-                        }
-                        (Some(Role::Pre), _) => {
-                            let what = "post state passed where the callee expects its pre state";
-                            refused = Some(self.refuse(what, &a.span));
-                            break;
-                        }
-                        (Some(Role::Post), _) => {
-                            let what = "pre state passed where the callee expects its post state";
-                            refused = Some(self.refuse(what, &a.span));
-                            break;
-                        }
+                        (Some(Role::Pre), Some(Role::Post)) => variant = Variant::Primed,
+                        (Some(_), _) => {}
                         (None, _) => printed.push(self.expr(a, env)),
                     }
                 }
                 self.conj_level = level;
-                if let Some(r) = refused {
-                    return r;
-                }
                 let name = self.ensure_function(&(fun.clone(), variant));
                 if printed.is_empty() { name } else { format!("{name}({})", printed.join(", ")) }
             }

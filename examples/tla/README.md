@@ -111,8 +111,10 @@ a wrapper `cnt == cnt_rec([n |-> n, m |-> m])`, and only operators in a call
 cycle are declared RECURSIVE. A spec fn given such a record, or any state
 value other than the pre or post state (`k_le(State { k: 0, ..s }, 0)`), is
 called in its record variant too (`ok_at_rec(s, i)`), so a recursive walk
-can call a per-index predicate. A call that swaps the pre and post states is
-a refusal as a whole.
+can call a per-index predicate. So is a call whose pre and post states do
+not fit the callee's parameters, swapped (`moved(post, pre)`) or one given
+twice (`frame(post, post)`, `same(pre, pre)`): `frame_rec([a |-> a', b |->
+b'], [a |-> a', b |-> b'])`.
 
 A sequence literal `seq![a, b]` (an array literal viewed as a `Seq`) is the
 tuple `<<a, b>>`.

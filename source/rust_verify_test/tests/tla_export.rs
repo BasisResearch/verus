@@ -84,7 +84,9 @@ fn tla_tools() -> Option<String> {
     }
 }
 
-fn java(jar: &str, dir: &Path, args: &[&str]) -> String {
+/// Run a class from the TLA+ tools: whether java exited successfully, and
+/// its stdout and stderr.
+fn java(jar: &str, dir: &Path, args: &[&str]) -> (bool, String) {
     let out = std::process::Command::new("java")
         .arg(format!("-Djava.io.tmpdir={}", dir.display()))
         .args(["-cp", jar])
@@ -92,15 +94,24 @@ fn java(jar: &str, dir: &Path, args: &[&str]) -> String {
         .current_dir(dir)
         .output()
         .expect("could not run java");
-    format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr))
+    let text =
+        format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    (out.status.success(), text)
 }
 
-/// SANY's verdict on a spec: panics with its output on any error.
+/// SANY's verdict on a spec: panics with its output unless java ran SANY to
+/// the end of semantic processing of the module with no error. The positive
+/// marker catches a SANY that never ran (a jar without it prints "Error:
+/// Could not find or load main class", which no error pattern matched).
 fn sany(jar: &str, spec: &Path) {
-    let out = java(jar, spec.parent().unwrap(), &["tla2sany.SANY", spec.to_str().unwrap()]);
+    let (ok, out) = java(jar, spec.parent().unwrap(), &["tla2sany.SANY", spec.to_str().unwrap()]);
+    let module = spec.file_stem().unwrap().to_str().unwrap();
     assert!(
-        !out.contains("*** Errors") && !out.contains("Fatal errors") && !out.contains("error"),
-        "SANY rejected {}:\n{out}",
+        ok && out.contains(&format!("Semantic processing of module {module}"))
+            && !out.contains("*** Errors")
+            && !out.contains("Fatal errors")
+            && !out.contains("error"),
+        "SANY rejected {} (or did not run):\n{out}",
         spec.display()
     );
 }
@@ -136,6 +147,8 @@ fn tlc_output(jar: &str, spec: &Path, cfg: &str) -> String {
             spec.to_str().unwrap(),
         ],
     )
+    // TLC exits non-zero on a violation too; callers read the output.
+    .1
 }
 
 /// Run TLC to completion on `spec` with `cfg`, counting every violation;
@@ -1589,9 +1602,11 @@ fn tla_export_counts_updates_under_a_verussync_assert() {
     assert_eq!(run.distinct, 4, "{run:?}");
 }
 
-/// `moved(post, pre)` swaps the callee's pre and post states: the call as a
-/// whole is the refusal. Printed as an extra argument, the Assert gave
-/// `moved` more arguments than its definition, and SANY rejected the module.
+/// `moved(post, pre)` swaps the callee's pre and post states: it is called
+/// in its record variant, each state passed as its record, rather than
+/// refused. `moved(post, pre)` says `pre.x == post.x + 1`, against `post.x ==
+/// pre.x + 1`, so Next never holds, as in Verus: TLC finds the initial state
+/// alone.
 const SWAPPED_STATES: &str = r#"
 verus! {
 pub struct State { pub x: int }
@@ -1609,24 +1624,55 @@ pub open spec fn small(s: State) -> bool { s.x <= 2 }
 "#;
 
 #[test]
-fn tla_export_refuses_a_swapped_state_as_the_whole_call() {
+fn tla_export_passes_swapped_states_as_records() {
     let ex = export_code(SWAPPED_STATES, "test_crate");
-    let refusals: Vec<String> = ex.report["refusals"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|r| r["what"].as_str().unwrap().to_string())
-        .collect();
-    assert_eq!(refusals.len(), 1, "{refusals:?}");
-    assert!(refusals[0].contains("post state passed where the callee expects its pre"));
-    assert!(!ex.tla.contains("moved("), "{}", ex.tla);
-    // Only Next reaches the refusal; the invariant is still checked.
+    assert_eq!(ex.report["refusals"], serde_json::json!([]), "{}", ex.tla);
+    assert!(ex.tla.contains("moved_rec([x |-> x'], [x |-> x])"), "{}", ex.tla);
     assert_eq!(names(&ex.report["invariants"]), ["small"]);
     let Some(jar) = tla_tools() else { return };
     sany(&jar, &ex.spec());
-    // TLC stops where the refused call is evaluated, with its reason.
-    let out = tlc_output(&jar, &ex.spec(), &ex.cfg);
-    assert!(out.contains("tla-export refused: post state passed"), "TLC output:\n{}", out);
+    let run = tlc(&jar, &ex.spec(), &ex.cfg);
+    assert_eq!(run.violated, Vec::<String>::new(), "{}", ex.tla);
+    assert_eq!(run.distinct, 1, "{run:?}\n{}", ex.tla);
+}
+
+/// A two-state helper given one state twice (`frame(post, post)`,
+/// `same(pre, pre)`) fits neither its plain nor its primed variant: it is
+/// called in its record variant, rather than refused (which stopped TLC on
+/// every step).
+const SAME_STATE_TWICE: &str = r#"
+verus! {
+pub struct State { pub a: u8, pub b: u8 }
+
+pub open spec fn frame(x: State, y: State) -> bool { x.b == y.b }
+
+pub open spec fn init(s: State) -> bool { s.a == 0 && s.b == 0 }
+
+pub open spec fn next(pre: State, post: State) -> bool {
+    &&& pre.a < 2
+    &&& frame(pre, pre)
+    &&& post.a == pre.a + 1
+    &&& post.b == pre.b
+    &&& frame(post, post)
+}
+
+pub open spec fn ok(s: State) -> bool { s.a <= 2 }
+}
+"#;
+
+#[test]
+fn tla_export_passes_one_state_given_twice_as_records() {
+    let ex = export_code(SAME_STATE_TWICE, "test_crate");
+    assert_eq!(ex.report["refusals"], serde_json::json!([]), "{}", ex.tla);
+    assert!(ex.tla.contains("frame_rec([a |-> a, b |-> b], [a |-> a, b |-> b])"), "{}", ex.tla);
+    assert!(ex.tla.contains("frame_rec([a |-> a', b |-> b'], [a |-> a', b |-> b'])"), "{}", ex.tla);
+    assert_eq!(names(&ex.report["invariants"]), ["ok"]);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let run = tlc(&jar, &ex.spec(), &ex.cfg);
+    assert_eq!(run.violated, Vec::<String>::new(), "{}", ex.tla);
+    // a runs 0..2 with b fixed at 0.
+    assert_eq!(run.distinct, 3, "{run:?}\n{}", ex.tla);
 }
 
 /// A recursive walk holds the state as a record, so the per-index predicate
