@@ -2416,3 +2416,111 @@ fn tla_export_assigns_a_bare_bool_field() {
     assert_eq!(run.violated, ["finished", "finished", "finished"], "{run:?}\n{}", ex.tla);
     assert_eq!(run.distinct, 4, "{run:?}");
 }
+
+/// A helper Init calls is printed once, orienting `s.x == s.y` by its own
+/// conjuncts alone (`x = y`), so it does not assign `y` after the caller
+/// assigned `x`: TLC stops on `x = y` with `y` unassigned. The report says so.
+const INIT_HELPER_EQUALITY: &str = r#"
+verus! {
+pub struct State { pub x: u8, pub y: u8 }
+
+pub open spec fn same(s: State) -> bool { s.x == s.y }
+
+pub open spec fn init(s: State) -> bool { s.x == 0 && same(s) }
+
+pub open spec fn next(pre: State, post: State) -> bool {
+    pre.x < 3 && post.x == pre.x + 1 && post.y == pre.y
+}
+
+pub open spec fn small(s: State) -> bool { s.x < 9 }
+}
+"#;
+
+#[test]
+fn tla_export_reads_an_init_helper_as_it_is_printed() {
+    let ex = export_code(INIT_HELPER_EQUALITY, "test_crate");
+    assert!(ex.tla.contains("same ==\n    (x = y)"), "{}", ex.tla);
+    assert_eq!(ex.report["init_unassigned"], serde_json::json!(["y"]), "{}", ex.tla);
+    assert!(ex.cfg.contains("\\* Init never assigns y"), "{}", ex.cfg);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    // TLC cannot compute the initial state, as the report says.
+    let out = tlc_output(&jar, &ex.spec(), &ex.cfg);
+    assert!(out.contains("0 distinct states found"), "{}", out);
+}
+
+/// A helper is checked inside its caller only when that caller is in the
+/// .cfg: `inv` reaches a refusal (`choose`) and is left out, so `small`,
+/// which it calls, is checked on its own (and fails at x = 3, 4, 5).
+const HELPER_OF_A_REFUSED_INVARIANT: &str = r#"
+verus! {
+pub struct State { pub x: u8 }
+
+pub open spec fn init(s: State) -> bool { s.x == 0 }
+
+pub open spec fn next(pre: State, post: State) -> bool { pre.x < 5 && post.x == pre.x + 1 }
+
+pub open spec fn small(s: State) -> bool { s.x < 3 }
+
+pub open spec fn id(y: u8) -> u8 { y }
+
+pub open spec fn weird(s: State) -> bool { s.x == choose|y: u8| #[trigger] id(y) == s.x }
+
+pub open spec fn inv(s: State) -> bool { small(s) && weird(s) }
+}
+"#;
+
+#[test]
+fn tla_export_checks_a_helper_whose_caller_is_left_out() {
+    let ex = export_code(HELPER_OF_A_REFUSED_INVARIANT, "test_crate");
+    // `weird` reaches the refusal too; `small` is checked.
+    assert_eq!(names(&ex.report["skipped_invariants"]), ["weird", "inv"]);
+    assert_eq!(names(&ex.report["invariants"]), ["small"]);
+    assert_eq!(
+        candidates(&ex.report),
+        [("small".to_string(), true), ("weird".to_string(), false), ("inv".to_string(), false)]
+    );
+    assert!(!ex.cfg.contains("not checked on its own"), "{}", ex.cfg);
+    assert!(ex.cfg.contains("INVARIANTS\n  small\n"), "{}", ex.cfg);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let run = tlc(&jar, &ex.spec(), &ex.cfg);
+    assert_eq!(run.violated, ["small", "small", "small"], "{run:?}");
+}
+
+/// A datatype of one variant without fields has one value, the record the
+/// export prints for it (`[tag |-> "unit"]`), so a binder over it is
+/// enumerated rather than a hole.
+const ONE_VALUE_STEP: &str = r#"
+verus! {
+pub struct State { pub x: u8 }
+
+pub enum Step { Tick }
+
+pub open spec fn init(s: State) -> bool { s.x == 0 }
+
+pub open spec fn step(pre: State, post: State, st: Step) -> bool {
+    match st { Step::Tick => pre.x < 5 && post.x == pre.x + 1 }
+}
+
+pub open spec fn next(pre: State, post: State) -> bool {
+    exists|st: Step| step(pre, post, st) && st == Step::Tick
+}
+
+pub open spec fn small(s: State) -> bool { s.x < 9 }
+}
+"#;
+
+#[test]
+fn tla_export_enumerates_a_datatype_of_one_value() {
+    let ex = export_code(ONE_VALUE_STEP, "test_crate");
+    assert_eq!(ex.report["holes"], serde_json::json!([]), "{}", ex.tla);
+    assert!(!ex.tla.contains("CONSTANTS"), "{}", ex.tla);
+    assert!(ex.tla.contains("\\E st \\in {[tag |-> \"unit\"]}"), "{}", ex.tla);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let run = tlc(&jar, &ex.spec(), &ex.cfg);
+    assert_eq!(run.violated, Vec::<String>::new(), "{}", ex.tla);
+    // x in 0..5.
+    assert_eq!(run.distinct, 6, "{run:?}");
+}

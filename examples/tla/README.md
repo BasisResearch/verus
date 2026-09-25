@@ -40,7 +40,9 @@ verus-tla (a `() -> spec_fn(int) -> bool` helper is not one), and every
 primed (a guard such as `busy(post) == false`, not an invariant), and
 except one another selected invariant calls (`big` and `marked` in `inv(s)
 = big(s) ==> !marked(s)` are checked inside `inv`; alone, `big` need not
-hold). The report's `candidates` lists every candidate with
+hold), when that invariant is itself checked: a helper whose every caller
+reaches a refusal and is left out is checked on its own. The report's
+`candidates` lists every candidate with
 whether it was included and why. `-V tla-export=<module>:inv1,inv2` checks
 exactly the named ones instead. When no invariant is checked, the `.cfg`
 says so and lists the candidates with their reasons, since TLC with no
@@ -70,7 +72,8 @@ range (`x < 300` over a `u8` is `0..255`), and the type closes a side the
 guard leaves open (`x < 5` over an `i8` starts at -128). An unguarded
 binder is bounded by its type alone only when that domain has at most 2^10
 values: a `bool` or a `u8`/`i8` takes its whole range (`0..255`), a
-datatype the union of its variants, and a tuple the tuples of its
+datatype the union of its variants (one variant without fields, `enum
+Step { Tick }`, its one value `{[tag |-> "unit"]}`), and a tuple the tuples of its
 elements' domains. A larger or unbounded one is a hole, a
 `CONSTANT Dom_<type>` named after its type (`Dom_u16`, `Dom_u32`,
 `Dom_int`, `Dom_Option_int_Some_v0`, a tuple's after its element types,
@@ -137,7 +140,9 @@ compute the initial states ("current state is not a legal state"). The
 report's `init_unassigned` lists the variables `Init` never assigns (`x = e`
 or `e = x` at conjunct level, followed through calls passing the state; `s.x
 == s.y` assigns whichever of the two an earlier conjunct left unassigned,
-and is printed with that one on the left; `s.o is None` and
+and is printed with that one on the left, where an earlier conjunct of the
+same operator counts: a helper is printed once, so in `same(s) = s.x ==
+s.y` called after `s.x == 0` it is `x = y` and assigns nothing; `s.o is None` and
 `s.o.is_none()` are printed `o = [tag |-> "None"]` and assign `o`, and a
 bare or negated bool field `s.done`, `!s.done` is printed `done = TRUE`,
 `done = FALSE` and assigns `done`, as do the same on `post` in a

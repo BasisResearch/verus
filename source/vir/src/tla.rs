@@ -2128,7 +2128,12 @@ impl Exporter {
                 if d.x.typ_params.len() != args.len() {
                     return None;
                 }
-                if d.x.variants.len() < 2 && d.x.variants.iter().all(|v| v.fields.is_empty()) {
+                // One variant without fields has one value, printed (see
+                // [`Exporter::ctor`]) as `[tag |-> "unit"]`.
+                if d.x.variants.len() == 1 && d.x.variants[0].fields.is_empty() {
+                    return Some(("{[tag |-> \"unit\"]}".into(), 1));
+                }
+                if d.x.variants.is_empty() {
                     return None;
                 }
                 let tagged = d.x.variants.len() > 1;
@@ -2963,7 +2968,10 @@ impl Exporter {
                 if inner.is_empty() {
                     return BTreeSet::new();
                 }
-                self.init_assigns(body, &inner, before, depth + 1)
+                // The callee is printed once, orienting `s.x == s.y` by what
+                // its own conjuncts assign (see [`Exporter::orient`]), so
+                // what the caller assigned before the call is not seen.
+                self.init_assigns(body, &inner, &BTreeSet::new(), depth + 1)
             }
             ExprX::Call { target: CallTarget::FnSpec(_), .. } => all(),
             _ => BTreeSet::new(),
@@ -3594,40 +3602,10 @@ pub fn export_module(krate: &Krate, arg: &str) -> Result<Export, String> {
     for reserved in GENERATED_NAMES.iter().copied().chain([module_name.as_str()]) {
         ex.used_names.insert(reserved.into());
     }
-    let mut selected: Vec<Fun> =
+    let selected: Vec<Fun> =
         triple.candidates.iter().filter(|(_, s, _)| *s).map(|(f, _, _)| f.clone()).collect();
     // What became of each candidate, when not what recognition decided.
     let mut outcome: HashMap<Fun, (bool, String)> = HashMap::new();
-    // A candidate another selected invariant calls is a helper of that
-    // invariant (`inv(s) = big(s) ==> !marked(s)`), checked where it is
-    // called, not an invariant of its own: alone it may well not hold.
-    // Two that call each other are both kept.
-    if !triple.explicit {
-        let reach: HashMap<Fun, HashSet<Fun>> =
-            selected.iter().map(|f| (f.clone(), reached_functions(&ex.functions, f))).collect();
-        let callers: Vec<(Fun, Fun)> = selected
-            .iter()
-            .filter_map(|g| {
-                let caller = selected
-                    .iter()
-                    .find(|f| *f != g && reach[*f].contains(g) && !reach[g].contains(*f))?;
-                Some((g.clone(), caller.clone()))
-            })
-            .collect();
-        for (g, caller) in callers {
-            selected.retain(|f| *f != g);
-            outcome.insert(
-                g,
-                (
-                    false,
-                    format!(
-                        "called by the invariant {}, so checked there rather than on its own; name it in -V tla-export={module}:<invariants> to check it",
-                        fun_as_friendly_rust_name(&caller)
-                    ),
-                ),
-            );
-        }
-    }
     let mut roots = vec![triple.init.clone(), triple.next.clone()];
     roots.extend(selected.iter().cloned());
     // verus-tla: the closures are the bodies; emit as state operators by
@@ -3721,6 +3699,45 @@ pub fn export_module(krate: &Krate, arg: &str) -> Result<Export, String> {
                 (false, "reaches a refusal, so it is left out of the .cfg (see refusals)".into()),
             );
         }
+    }
+    // An invariant another checked invariant calls is a helper of that
+    // invariant (`inv(s) = big(s) ==> !marked(s)`), checked where it is
+    // called, not an invariant of its own: alone it may well not hold. Only
+    // a caller in the .cfg covers it: when every caller reaches a refusal,
+    // the helper is checked on its own. Two that call each other are both
+    // kept.
+    if !triple.explicit {
+        let checked: Vec<Fun> =
+            invs.iter().filter(|(_, _, tainted)| !tainted).map(|(f, _, _)| f.clone()).collect();
+        let reach: HashMap<Fun, HashSet<Fun>> =
+            checked.iter().map(|f| (f.clone(), reached_functions(&ex.functions, f))).collect();
+        let covers = |f: &Fun, g: &Fun| f != g && reach[f].contains(g) && !reach[g].contains(f);
+        let helpers: HashSet<Fun> =
+            checked.iter().filter(|g| checked.iter().any(|f| covers(f, g))).cloned().collect();
+        for g in &checked {
+            if !helpers.contains(g) {
+                continue;
+            }
+            // Name a caller that is itself checked on its own when there is
+            // one (a caller's callers reach the helper too).
+            let caller = checked
+                .iter()
+                .filter(|f| covers(f, g))
+                .find(|f| !helpers.contains(*f))
+                .or_else(|| checked.iter().find(|f| covers(f, g)))
+                .expect("a helper has a caller");
+            outcome.insert(
+                g.clone(),
+                (
+                    false,
+                    format!(
+                        "called by the invariant {}, so checked there rather than on its own; name it in -V tla-export={module}:<invariants> to check it",
+                        fun_as_friendly_rust_name(caller)
+                    ),
+                ),
+            );
+        }
+        invs.retain(|(f, _, _)| !helpers.contains(f));
     }
     let transitions = ex.transitions(&(triple.next.clone(), Variant::Plain));
     let init_unassigned = match ex.functions.get(&triple.init).and_then(|f| f.x.body.clone()) {
