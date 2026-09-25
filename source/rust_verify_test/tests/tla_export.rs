@@ -153,6 +153,15 @@ fn tla_export_counter_matches_the_hand_written_spec() {
     assert_eq!(ex.report["shape"], "hand-rolled");
     assert_eq!(names(&ex.report["variables"]), ["x", "y"]);
     assert_eq!(names(&ex.report["invariants"]), ["bounded", "sum_small"]);
+    // Each step is a transition (`next` and `next_step` only branch), and
+    // each primes both variables.
+    assert_eq!(
+        ex.report["transitions"],
+        serde_json::json!([
+            {"operator": "t_dbl", "unassigned": []},
+            {"operator": "t_inc", "unassigned": []},
+        ])
+    );
     assert_eq!(ex.report["holes"], serde_json::json!([]));
     assert_eq!(ex.report["refusals"], serde_json::json!([]));
     assert!(ex.cfg.contains("INVARIANTS\n  bounded\n  sum_small\n"), "{}", ex.cfg);
@@ -248,8 +257,8 @@ pub open spec fn drop_key(o: Option<int>, m: Map<int, int>) -> Map<int, int> {
 
 pub open spec fn twice(a: int) -> int { let a2 = a + 1; let a2 = a2 * 2; a2 }
 
-pub open spec fn sumto(n: nat, acc: int) -> int decreases n {
-    if n == 0 { acc } else { sumto((n - 1) as nat, acc + 1) }
+pub open spec fn sumto(n: int, acc: int) -> int decreases n {
+    if n <= 0 { acc } else { sumto(n - 1, acc + 1) }
 }
 
 pub open spec fn is_val(s: State, v: int) -> bool { s.count == v }
@@ -480,4 +489,146 @@ fn tla_export_rejects_an_unknown_invariant() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(!output.status.success(), "{}", stderr);
     assert!(stderr.contains("no invariant `nope` in `test_crate`"), "{}", stderr);
+}
+
+/// State fields named like the Euclidean operators' parameters would once
+/// have been (`a`, `b`): TLA+ forbids a parameter that redefines a variable.
+const EUCLID_FIELDS: &str = r#"
+verus! {
+pub struct State { pub a: int, pub b: int }
+
+pub open spec fn init(s: State) -> bool { s.a == 7 && s.b == -2 }
+
+pub open spec fn next(pre: State, post: State) -> bool {
+    pre.b < 0 && post.a == pre.a / pre.b && post.b == -pre.b
+}
+
+pub open spec fn rem_nonneg(s: State) -> bool { s.a % s.b >= 0 }
+
+pub open spec fn quotient(s: State) -> bool { s.b < 0 || s.a == -3 }
+}
+"#;
+
+#[test]
+fn tla_export_euclid_parameters_do_not_clash_with_fields() {
+    let ex = export_code(EUCLID_FIELDS, "test_crate");
+    assert_eq!(names(&ex.report["variables"]), ["a", "b"]);
+    assert!(ex.tla.contains("EuclidDiv(a, b)"), "{}", ex.tla);
+    assert!(!ex.tla.contains("EuclidMod(a, b) =="), "{}", ex.tla);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let run = tlc(&jar, &ex.spec(), &ex.cfg);
+    // 7 / -2 is -3 in Verus (remainder 1), and -3 % 2 is 1.
+    assert_eq!(run.violated, Vec::<String>::new(), "{}", ex.tla);
+    assert_eq!(run.distinct, 2, "{run:?}");
+}
+
+/// A cast to a bounded type is only known, by proof, to land in range: it is
+/// refused rather than printed as the identity (which let TLC reach x = 256
+/// and report `in_range` violated). A literal already in range is kept.
+const CLIP: &str = r#"
+verus! {
+pub struct State { pub x: u8 }
+
+pub open spec fn init(s: State) -> bool { s.x == 254int as u8 }
+
+pub open spec fn next(pre: State, post: State) -> bool { post.x == (pre.x + 1) as u8 }
+
+pub open spec fn in_range(s: State) -> bool { s.x <= 255 }
+
+pub open spec fn wide(s: State) -> bool { s.x != 300int as u8 }
+}
+"#;
+
+#[test]
+fn tla_export_refuses_a_cast_to_a_bounded_type() {
+    let ex = export_code(CLIP, "test_crate");
+    let refusals = ex.report["refusals"].as_array().unwrap();
+    assert_eq!(refusals.len(), 2, "{refusals:?}");
+    assert!(refusals.iter().all(|r| r["what"].as_str().unwrap().starts_with("cast to u8")));
+    assert_eq!(refusals[0]["in_function"], "test_crate::next");
+    // The in-range literal is kept; the out-of-range one taints `wide`.
+    assert!(ex.tla.contains("(x = 254)"), "{}", ex.tla);
+    assert_eq!(names(&ex.report["invariants"]), ["in_range"]);
+    assert_eq!(names(&ex.report["skipped_invariants"]), ["wide"]);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+}
+
+/// A quantifier over a generic datatype is bounded per instantiation:
+/// `Option<bool>` from BOOLEAN, `Option<int>` by a constant of its own.
+const OPTIONS: &str = r#"
+verus! {
+pub struct State { pub x: int }
+
+pub open spec fn init(s: State) -> bool { s.x == 0 }
+
+pub open spec fn next(pre: State, post: State) -> bool { pre.x < 2 && post.x == pre.x + 1 }
+
+pub open spec fn id_bool(o: Option<bool>) -> Option<bool> { o }
+
+pub open spec fn id_int(o: Option<int>) -> Option<int> { o }
+
+pub open spec fn some_bool(s: State) -> bool {
+    exists|o: Option<bool>| #[trigger] id_bool(o) == Some(s.x > 0)
+}
+
+pub open spec fn some_int(s: State) -> bool {
+    exists|o: Option<int>| #[trigger] id_int(o) == Some(s.x)
+}
+}
+"#;
+
+#[test]
+fn tla_export_bounds_a_generic_datatype_per_instantiation() {
+    let ex = export_code(OPTIONS, "test_crate");
+    assert_eq!(ex.report["refusals"], serde_json::json!([]), "{}", ex.tla);
+    let holes = ex.report["holes"].as_array().unwrap();
+    assert_eq!(holes.len(), 1, "{holes:?}");
+    assert_eq!(holes[0]["constant"], "Dom_Option_int_Some_v0");
+    assert_eq!(holes[0]["typ"], "int");
+    assert!(ex.tla.contains("v0__ \\in BOOLEAN"), "{}", ex.tla);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let cfg = format!("{}CONSTANTS Dom_Option_int_Some_v0 = {{0, 1, 2}}\n", ex.cfg);
+    let run = tlc(&jar, &ex.spec(), &cfg);
+    assert_eq!(run.violated, Vec::<String>::new(), "{}", ex.tla);
+    assert_eq!(run.distinct, 3, "{run:?}");
+}
+
+/// A transition that primes only some variables: TLC cannot complete the
+/// successor, so the report and the .cfg name what it leaves unassigned. A
+/// helper a transition conjoins (`keep_y`) is part of it, not a transition.
+const UNASSIGNED: &str = r#"
+verus! {
+pub struct State { pub x: int, pub y: int }
+
+pub open spec fn init(s: State) -> bool { s.x == 0 && s.y == 0 }
+
+pub open spec fn keep_y(pre: State, post: State) -> bool { post.y == pre.y }
+
+pub open spec fn step_x(pre: State, post: State) -> bool {
+    post.x == pre.x + 1 && keep_y(pre, post)
+}
+
+pub open spec fn step_y(pre: State, post: State) -> bool { post.y == pre.y + 1 }
+
+pub open spec fn next(pre: State, post: State) -> bool { step_x(pre, post) || step_y(pre, post) }
+}
+"#;
+
+#[test]
+fn tla_export_reports_unassigned_variables_per_transition() {
+    let ex = export_code(UNASSIGNED, "test_crate");
+    assert_eq!(
+        ex.report["transitions"],
+        serde_json::json!([
+            {"operator": "step_x", "unassigned": []},
+            {"operator": "step_y", "unassigned": ["x"]},
+        ])
+    );
+    assert!(ex.cfg.contains("\\* Transition step_y never primes x:"), "{}", ex.cfg);
+    assert!(!ex.cfg.contains("step_x never"), "{}", ex.cfg);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
 }

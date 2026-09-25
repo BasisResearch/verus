@@ -67,6 +67,17 @@ pub struct Candidate {
     pub reason: String,
 }
 
+/// A transition: an operator Next reaches through a disjunction, an `IF` or
+/// `match` branch, or an `exists`, together with the operators it conjoins,
+/// and the variables none of them primes. TLC stops on such a step with
+/// "successor state not completely specified"; in Verus the variable is
+/// unconstrained.
+#[derive(Debug, Clone, Serialize)]
+pub struct Transition {
+    pub operator: String,
+    pub unassigned: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct Report {
     pub module: String,
@@ -76,6 +87,8 @@ pub struct Report {
     pub init: String,
     pub next: String,
     pub invariants: Vec<String>,
+    /// Every transition Next reaches, with the variables it leaves unprimed.
+    pub transitions: Vec<Transition>,
     /// Invariants left out of the `.cfg` because they reach a refusal.
     pub skipped_invariants: Vec<String>,
     /// Every candidate invariant, included or not, and why.
@@ -98,10 +111,15 @@ pub struct Export {
 /// level, so no operator or local takes these names.
 const EUCLID_DIV: &str = "EuclidDiv";
 const EUCLID_MOD: &str = "EuclidMod";
+/// The Euclidean operators' parameters. TLA+ forbids a parameter that
+/// redefines a variable or operator, so these are reserved too, and a state
+/// field of the same name is held in a renamed variable.
+const EUCLID_A: &str = "euclid_a";
+const EUCLID_B: &str = "euclid_b";
 
 /// The module-level names the export generates beside the operators.
-const GENERATED_NAMES: [&str; 8] =
-    ["Init", "Next", "Spec", "vars", "Inv", "TypeOK", EUCLID_DIV, EUCLID_MOD];
+const GENERATED_NAMES: [&str; 10] =
+    ["Init", "Next", "Spec", "vars", "Inv", "TypeOK", EUCLID_DIV, EUCLID_MOD, EUCLID_A, EUCLID_B];
 
 /// An operator: a function, and whether it is the variant whose single
 /// state parameter is read as the primed variables (a callee given `post`
@@ -168,6 +186,16 @@ struct Exporter {
     tainted: HashSet<OpKey>,
     /// Whether the operator being printed has reached a refusal so far.
     current_tainted: bool,
+    /// How many branches (a disjunct, an `IF` or `match` arm, an `exists`
+    /// body, an implication's consequent) enclose the expression being
+    /// printed, within its operator.
+    branch_depth: usize,
+    /// The operators each operator calls, and whether the call sits in a
+    /// branch; the calls of the operator being printed.
+    calls: HashMap<OpKey, Vec<(OpKey, bool)>>,
+    current_calls: Vec<(OpKey, bool)>,
+    /// The state variables each operator's own body primes.
+    primes: HashMap<OpKey, BTreeSet<String>>,
     holes: Vec<Hole>,
     refusals: Vec<Refusal>,
     constants: BTreeSet<String>,
@@ -600,9 +628,24 @@ impl Exporter {
             ExprX::NullaryOpr(_) => self.refuse("nullary operator", &e.span),
             ExprX::Unary(op, inner) => match op {
                 UnaryOp::Not => format!("~({})", self.expr(inner, env)),
-                UnaryOp::Trigger(_) | UnaryOp::Clip { .. } | UnaryOp::CoerceMode { .. } => {
-                    self.expr(inner, env)
-                }
+                UnaryOp::Trigger(_) | UnaryOp::CoerceMode { .. } => self.expr(inner, env),
+                // A clip to `int` is the identity. Any other clip (`as u8`,
+                // `as nat`, ...) is only known to land in its range, a fact
+                // Verus proves and TLC cannot see: printed as the identity it
+                // would give values outside the type, and a check that
+                // stopped there would turn the proof-time fact into a
+                // runtime failure. Only a literal already in range is kept.
+                UnaryOp::Clip { range: IntRange::Int, .. } => self.expr(inner, env),
+                UnaryOp::Clip { range, .. } => match &peel(inner).x {
+                    ExprX::Const(Constant::Int(i)) if int_in_range(i, range) => i.to_string(),
+                    _ => {
+                        let what = format!(
+                            "cast to {} (TLC cannot keep the value in range)",
+                            crate::ast_util::int_range_to_type_string(range)
+                        );
+                        self.refuse(what, &e.span)
+                    }
+                },
                 UnaryOp::IntToReal | UnaryOp::RealToInt => self.expr(inner, env),
                 _ => {
                     let what = format!("unary operator {:?}", op);
@@ -640,7 +683,11 @@ impl Exporter {
                 }
             },
             ExprX::Logical(op, a, b) => {
-                let (sa, sb) = (self.expr(a, env), self.expr(b, env));
+                let (sa, sb) = match op {
+                    LogicalOp::And => (self.expr(a, env), self.expr(b, env)),
+                    LogicalOp::Or => (self.in_branch(a, env), self.in_branch(b, env)),
+                    LogicalOp::Implies => (self.expr(a, env), self.in_branch(b, env)),
+                };
                 let sym = match op {
                     LogicalOp::And => "/\\",
                     LogicalOp::Or => "\\/",
@@ -673,9 +720,9 @@ impl Exporter {
             ExprX::Choose { .. } => self.refuse("choose (TLC cannot evaluate it)", &e.span),
             ExprX::WithTriggers { body, .. } => self.expr(body, env),
             ExprX::If(c, t, f) => {
-                let (sc, st) = (self.expr(c, env), self.expr(t, env));
+                let (sc, st) = (self.expr(c, env), self.in_branch(t, env));
                 let sf = match f {
-                    Some(f) => self.expr(f, env),
+                    Some(f) => self.in_branch(f, env),
                     None => "TRUE".into(),
                 };
                 format!("(IF {sc} THEN {st} ELSE {sf})")
@@ -726,7 +773,7 @@ impl Exporter {
                         // positive divisor; both agree with Verus's
                         // Euclidean operators only when the divisor is
                         // positive, so any other divisor goes through
-                        // `EDiv`/`EMod`.
+                        // `EuclidDiv`/`EuclidMod`.
                         let div = matches!(ar, ArithOp::EuclideanDiv(_));
                         let (sa, sb) = (self.expr(a, env), self.expr(b, env));
                         let positive = matches!(&peel(b).x,
@@ -984,7 +1031,7 @@ impl Exporter {
             } else {
                 Some(in_lets(self.expr(&arm.x.guard, &env2)))
             };
-            let body = in_lets(self.expr(&arm.x.body, &env2));
+            let body = in_lets(self.in_branch(&arm.x.body, &env2));
             let cond = match (cond, guard) {
                 (None, None) => None,
                 (Some(c), None) => Some(c),
@@ -1495,7 +1542,7 @@ impl Exporter {
             };
             bounds.push(format!("{name} \\in {domain}"));
         }
-        let sb = self.expr(body, &env2);
+        let sb = if forall { self.expr(body, &env2) } else { self.in_branch(body, &env2) };
         let q = if forall { "\\A" } else { "\\E" };
         let mut out = sb;
         for bound in bounds.into_iter().rev() {
@@ -1517,11 +1564,18 @@ impl Exporter {
     ) -> Option<String> {
         match &**typ {
             TypX::Bool => Some("BOOLEAN".into()),
-            TypX::Datatype(Dt::Path(p), _, _) => {
+            TypX::Datatype(Dt::Path(p), args, _) => {
                 if seen.contains(p) {
                     return None;
                 }
                 let d = self.datatypes.get(p)?.clone();
+                if d.x.typ_params.len() != args.len() {
+                    return None;
+                }
+                // The constant for an unbounded field is named after the
+                // instantiation (`Option_bool`, `Option_int`), since each
+                // needs its own set.
+                let instance = sanitize(&typ_name(typ));
                 if d.x.variants.len() < 2 && d.x.variants.iter().all(|v| v.fields.is_empty()) {
                     return None;
                 }
@@ -1538,22 +1592,20 @@ impl Exporter {
                     let mut binds = Vec::new();
                     for f in v.fields.iter() {
                         let fname = field_name(&f.name);
+                        let ftyp =
+                            crate::sst_util::subst_typ_for_datatype(&d.x.typ_params, args, &f.a.0);
                         seen.push(p.clone());
-                        let bounded = self.bound_from_type(&f.a.0, span, seen);
+                        let bounded = self.bound_from_type(&ftyp, span, seen);
                         seen.pop();
                         let domain = match bounded {
                             Some(dom) => dom,
                             None => {
-                                let constant = format!(
-                                    "Dom_{}_{}_{}",
-                                    sanitize(&last_segment(p)),
-                                    sanitize(&v.name),
-                                    fname
-                                );
+                                let constant =
+                                    format!("Dom_{instance}_{}_{}", sanitize(&v.name), fname);
                                 self.constants.insert(constant.clone());
                                 self.holes.push(Hole {
                                     variable: format!("{}.{}", v.name, fname),
-                                    typ: typ_name(&f.a.0),
+                                    typ: typ_name(&ftyp),
                                     constant: constant.clone(),
                                     location: span_string(span),
                                     in_function: self.current.clone(),
@@ -1688,6 +1740,69 @@ impl Exporter {
 
     // ─── functions ──────────────────────────────────────────────────────
 
+    /// Print `e` as a branch: a transition it calls is one of its own.
+    fn in_branch(&mut self, e: &Expr, env: &Env) -> String {
+        self.branch_depth += 1;
+        let s = self.expr(e, env);
+        self.branch_depth -= 1;
+        s
+    }
+
+    /// Keep what an operator's printed body primes and calls, for
+    /// [`Exporter::transitions`].
+    fn record_body(&mut self, key: &OpKey, body: &str) {
+        let primed = primed_vars(body, &self.state_vars);
+        self.primes.insert(key.clone(), primed);
+        self.calls.insert(key.clone(), std::mem::take(&mut self.current_calls));
+    }
+
+    /// The transitions Next reaches, each with the variables it leaves
+    /// unprimed. A transition is Next itself, or an operator called in a
+    /// branch of a transition or of an operator a transition conjoins. It
+    /// assigns what it and the operators it conjoins prime. One that only
+    /// branches further and primes nothing itself is not reported, since
+    /// its branches are.
+    fn transitions(&self, next: &OpKey) -> Vec<Transition> {
+        let mut out = Vec::new();
+        let mut seen: HashSet<OpKey> = HashSet::new();
+        let mut queue = vec![next.clone()];
+        while let Some(t) = queue.pop() {
+            if !seen.insert(t.clone()) {
+                continue;
+            }
+            // The operators `t` conjoins, `t` included.
+            let mut conj: Vec<OpKey> = vec![t.clone()];
+            let mut conj_seen: HashSet<OpKey> = HashSet::from([t.clone()]);
+            let mut i = 0;
+            let mut branches = false;
+            while i < conj.len() {
+                for (callee, branch) in self.calls.get(&conj[i]).into_iter().flatten() {
+                    if *branch {
+                        branches = true;
+                        queue.push(callee.clone());
+                    } else if conj_seen.insert(callee.clone()) {
+                        conj.push(callee.clone());
+                    }
+                }
+                i += 1;
+            }
+            let primed: BTreeSet<String> = conj
+                .iter()
+                .flat_map(|k| self.primes.get(k).into_iter().flatten())
+                .cloned()
+                .collect();
+            if branches && primed.is_empty() {
+                continue;
+            }
+            let unassigned =
+                self.state_vars.iter().filter(|v| !primed.contains(*v)).cloned().collect();
+            let operator = self.op_names.get(&t).cloned().unwrap_or_default();
+            out.push(Transition { operator, unassigned });
+        }
+        out.sort_by(|a, b| a.operator.cmp(&b.operator));
+        out
+    }
+
     /// The role of each parameter: a state-typed parameter is pre or post
     /// (the first one pre, a second one post), any other is None.
     fn param_roles(&self, f: &Function) -> Vec<Option<Role>> {
@@ -1710,6 +1825,7 @@ impl Exporter {
     /// taints the operator being printed.
     fn ensure_function(&mut self, key: &OpKey) -> String {
         let name = self.op_name(key);
+        self.current_calls.push((key.clone(), self.branch_depth > 0));
         if self.emitted.contains(key) || self.emitting.contains(key) {
             if self.tainted.contains(key) {
                 self.current_tainted = true;
@@ -1722,6 +1838,8 @@ impl Exporter {
         let previous = std::mem::replace(&mut self.current, fun_as_friendly_rust_name(fun));
         let previous_bound = std::mem::take(&mut self.bound);
         let previous_tainted = std::mem::replace(&mut self.current_tainted, false);
+        let previous_depth = std::mem::replace(&mut self.branch_depth, 0);
+        let previous_calls = std::mem::take(&mut self.current_calls);
         let mut env = Env::new();
         let roles = self.param_roles(&f);
         let mut params = Vec::new();
@@ -1758,6 +1876,9 @@ impl Exporter {
         }
         def.push_str(&format!("{head} ==\n    {body}\n"));
         self.defs.push(def);
+        self.record_body(key, &body);
+        self.current_calls = previous_calls;
+        self.branch_depth = previous_depth;
         if self.current_tainted {
             self.tainted.insert(key.clone());
         }
@@ -1767,6 +1888,41 @@ impl Exporter {
         self.emitting.remove(key);
         self.emitted.insert(key.clone());
         name
+    }
+}
+
+/// The variables among `vars` that `body` primes: `v'` with `v` a whole
+/// identifier.
+fn primed_vars(body: &str, vars: &[String]) -> BTreeSet<String> {
+    let ident = |c: char| c.is_alphanumeric() || c == '_';
+    vars.iter()
+        .filter(|v| {
+            let pat = format!("{v}'");
+            body.match_indices(&pat)
+                .any(|(i, _)| !body[..i].chars().next_back().map(ident).unwrap_or(false))
+        })
+        .cloned()
+        .collect()
+}
+
+/// Whether the literal `i` lies in `range`. `usize`/`isize` are taken at 32
+/// bits, the narrowest width Verus allows, so a literal counted in range is
+/// in range on every architecture; `char` is never.
+fn int_in_range(i: &num_bigint::BigInt, range: &IntRange) -> bool {
+    use num_bigint::BigInt;
+    let signed = |bits: u32| {
+        let half = BigInt::from(1) << (bits - 1);
+        -half.clone() <= *i && *i < half
+    };
+    let unsigned = |bits: u32| BigInt::from(0) <= *i && *i < (BigInt::from(1) << bits);
+    match range {
+        IntRange::Int => true,
+        IntRange::Nat => *i >= BigInt::from(0),
+        IntRange::U(bits) => unsigned(*bits),
+        IntRange::I(bits) => signed(*bits),
+        IntRange::USize => unsigned(32),
+        IntRange::ISize => signed(32),
+        IntRange::Char => false,
     }
 }
 
@@ -2096,6 +2252,10 @@ pub fn export_module(krate: &Krate, arg: &str) -> Result<Export, String> {
         bound: HashSet::new(),
         tainted: HashSet::new(),
         current_tainted: false,
+        branch_depth: 0,
+        calls: HashMap::new(),
+        current_calls: Vec::new(),
+        primes: HashMap::new(),
         holes: Vec::new(),
         refusals: Vec::new(),
         constants: BTreeSet::new(),
@@ -2128,6 +2288,8 @@ pub fn export_module(krate: &Krate, arg: &str) -> Result<Export, String> {
             ex.current = fun_as_friendly_rust_name(r);
             ex.bound.clear();
             ex.current_tainted = false;
+            ex.branch_depth = 0;
+            ex.current_calls.clear();
             let body = match &f.x.body {
                 Some(b) => match &peel(b).x {
                     ExprX::Closure(params, body) => {
@@ -2149,6 +2311,7 @@ pub fn export_module(krate: &Krate, arg: &str) -> Result<Export, String> {
                 fun_as_friendly_rust_name(r),
                 span_string(&f.span)
             ));
+            ex.record_body(&key, &body);
             ex.emitted.insert(key.clone());
             if ex.current_tainted {
                 ex.tainted.insert(key);
@@ -2192,6 +2355,7 @@ pub fn export_module(krate: &Krate, arg: &str) -> Result<Export, String> {
             );
         }
     }
+    let transitions = ex.transitions(&(triple.next.clone(), false));
     let inv_names: Vec<String> =
         invs.iter().filter(|(_, _, tainted)| !tainted).map(|(_, n, _)| n.clone()).collect();
     let skipped: Vec<String> =
@@ -2252,8 +2416,9 @@ pub fn export_module(krate: &Krate, arg: &str) -> Result<Export, String> {
     }
     if ex.uses_euclid {
         // Verus's `/` and `%` are Euclidean: the remainder is never negative.
+        let (a, b) = (EUCLID_A, EUCLID_B);
         tla.push_str(&format!(
-            "{EUCLID_MOD}(a, b) == a % (IF b < 0 THEN -b ELSE b)\n{EUCLID_DIV}(a, b) == (a - {EUCLID_MOD}(a, b)) \\div b\n\n"
+            "{EUCLID_MOD}({a}, {b}) == {a} % (IF {b} < 0 THEN -{b} ELSE {b})\n{EUCLID_DIV}({a}, {b}) == ({a} - {EUCLID_MOD}({a}, {b})) \\div {b}\n\n"
         ));
     }
     if !ex.recursive.is_empty() {
@@ -2310,6 +2475,13 @@ pub fn export_module(krate: &Krate, arg: &str) -> Result<Export, String> {
             cfg.push_str(&format!("\\*   {c} = {{ ... }}\n"));
         }
     }
+    for t in transitions.iter().filter(|t| !t.unassigned.is_empty()) {
+        cfg.push_str(&format!(
+            "\\* Transition {} never primes {}: TLC stops there with \"successor state not\n\\* completely specified\" (see the .tla.json transitions)\n",
+            t.operator,
+            t.unassigned.join(", ")
+        ));
+    }
     cfg.push_str("\\* CONSTRAINT <a state predicate bounding the model>\n");
     let report = Report {
         module: module.to_string(),
@@ -2319,6 +2491,7 @@ pub fn export_module(krate: &Krate, arg: &str) -> Result<Export, String> {
         init: init_name,
         next: next_name,
         invariants: inv_names,
+        transitions,
         skipped_invariants: skipped,
         candidates,
         operators: ex.defs.len(),

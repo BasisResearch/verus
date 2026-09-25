@@ -35,7 +35,20 @@ that `init`/`next` read unprimed (a guard, not an invariant). The report's
 Whatever the export cannot express is printed as `Assert(FALSE, "...")`, so
 TLC stops with the reason wherever it is evaluated. An invariant that reaches
 one is left out of the `.cfg` and listed in the report's
-`skipped_invariants`.
+`skipped_invariants`. A cast to a bounded type (`as u8`, `as nat`, ...) is
+one of these, unless it casts a literal already in range: Verus proves the
+value lands in the type's range, TLC cannot, and printing the cast as the
+identity would let the model leave the type.
+
+A transition that constrains only some of the fields (`post.x == pre.x + 1`
+and nothing about `y`) leaves the others unconstrained in Verus, but TLC
+cannot build the successor and stops with "successor state not completely
+specified". The report's `transitions` lists each transition `Next` reaches
+with the variables it never primes (`unassigned`), and the `.cfg` names any
+that leaves one unassigned. A transition is `Next` itself or an operator
+called in a branch (a disjunct, an `IF` or `match` arm, an `exists` body),
+together with the operators it conjoins; a variable primed in one branch of
+a transition's own body but not in another is not caught.
 
 `rust_verify_test/tests/tla_export.rs` exports the four fixtures (as crate
 `test_crate`, so the modules are `test_crate`, `test_crate::Adder`,

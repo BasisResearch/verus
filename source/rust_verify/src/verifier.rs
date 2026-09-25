@@ -909,12 +909,13 @@ impl Verifier {
             })?;
         }
         eprintln!(
-            "tla-export: {} ({}), {} operators, {} holes, {} refusals; wrote {}",
+            "tla-export: {} ({}), {} operators, {} holes, {} refusals, {} transitions leaving a variable unassigned; wrote {}",
             export.report.state_type,
             export.report.shape,
             export.report.operators,
             export.report.holes.len(),
             export.report.refusals.len(),
+            export.report.transitions.iter().filter(|t| !t.unassigned.is_empty()).count(),
             dir.join(format!("{}.tla", export.module_name)).display()
         );
         Ok(())
