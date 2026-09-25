@@ -33,7 +33,8 @@ is verified.
   checks under TLC as written: 10 distinct states, both invariants hold.
 
 The invariants are, by default, the `#[invariant]` methods for VerusSync,
-every closure `() -> spec_fn(State) -> bool` for verus-tla, and every
+every closure `() -> spec_fn(State) -> bool` over the state type for
+verus-tla (a `() -> spec_fn(int) -> bool` helper is not one), and every
 `(State) -> bool` spec fn in the module for a hand-rolled model (one named
 `invariant` included), except one that `init`/`next` read, unprimed or
 primed (a guard such as `busy(post) == false`, not an invariant). The report's `candidates` lists every candidate with
@@ -65,15 +66,20 @@ read as one. An integer binder's domain is intersected with its type's
 range (`x < 300` over a `u8` is `0..255`), and the type closes a side the
 guard leaves open (`x < 5` over an `i8` starts at -128). An unguarded
 binder is bounded by its type alone only when that domain has at most 2^10
-values: a `bool` or a `u8`/`i8` takes its whole range (`0..255`), and a
-datatype the union of its variants. A larger or unbounded one is a hole, a
+values: a `bool` or a `u8`/`i8` takes its whole range (`0..255`), a
+datatype the union of its variants, and a tuple the tuples of its
+elements' domains. A larger or unbounded one is a hole, a
 `CONSTANT Dom_<type>` named after its type (`Dom_u16`, `Dom_u32`,
-`Dom_int`, `Dom_Option_int_Some_v0`), so TLC never tries to enumerate
+`Dom_int`, `Dom_Option_int_Some_v0`, a tuple's after its element types,
+`Dom_tuple2_u8_u8_v0`), so TLC never tries to enumerate
 65536 values per state. In a datatype, a variant whose fields together
 take more than 2^10 values (`Step::Put(u16, u16)`, or `Step::Pair(u8, u8)`
 with its 65536) has a hole for each field of more than one value
 (`Dom_Step_Pair_v0`, `Dom_Step_Pair_v1`), which the `.cfg` supplies as
 small sets; a small variant (`Step::Nudge(u8)`) is still enumerated whole.
+The cap holds for the variants together too: when their union would take
+more (five variants `A(u8, bool)` ... `E(u8, bool)`, 2560 values), every
+variant of more than one value has a hole per field.
 
 A cast to a bounded type (`as u8`, `as nat`, ...) that widens (the operand's
 own type lies in the target's, as `u8` in `u16` or `nat`) is the identity. A

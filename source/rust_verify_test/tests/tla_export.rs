@@ -2017,7 +2017,7 @@ fn tla_export_caps_a_domain_read_off_a_type() {
     assert!(!ex.tla.contains("0..65535 :"), "{}", ex.tla);
     assert!(!ex.tla.contains("Dom_Option"), "{}", ex.tla);
     assert!(
-        ex.tla.contains("[tag |-> \"Nudge\", v0 |-> v0__3] : v0__3 \\in 0..255}"),
+        ex.tla.contains("[tag |-> \"Nudge\", v0 |-> v0__4] : v0__4 \\in 0..255}"),
         "{}",
         ex.tla
     );
@@ -2047,4 +2047,151 @@ fn tla_export_caps_a_domain_read_off_a_type() {
     assert_eq!(run.violated, Vec::<String>::new(), "{}", ex.tla);
     // n reaches 0..20 (Put, Mixed, then Nudge) and 25 (Pair).
     assert_eq!(run.distinct, 22, "{run:?}\n{}", ex.tla);
+}
+
+/// verus-tla's invariants are closures over the state: a `() ->
+/// spec_fn(int) -> bool` helper beside them is not one (it was printed with
+/// the state record as its argument, `[count |-> count] > 0`).
+const VERUS_TLA_HELPER: &str = r#"
+verus! {
+pub struct State { pub count: nat }
+
+pub open spec fn init() -> spec_fn(State) -> bool { |s: State| s.count == 0 }
+
+pub open spec fn next() -> spec_fn(State, State) -> bool {
+    |pre: State, post: State| pre.count < 3 && post.count == pre.count + 1
+}
+
+pub open spec fn positive() -> spec_fn(int) -> bool { |i: int| i > 0 }
+
+pub open spec fn small() -> spec_fn(State) -> bool { |s: State| s.count <= 3 }
+}
+"#;
+
+#[test]
+fn tla_export_verus_tla_takes_only_closures_over_the_state() {
+    let ex = export_code(VERUS_TLA_HELPER, "test_crate");
+    assert_eq!(ex.report["shape"], "verus-tla");
+    assert_eq!(names(&ex.report["invariants"]), ["small"]);
+    assert_eq!(candidates(&ex.report), [("small".to_string(), true)]);
+    assert!(!ex.tla.contains("positive"), "{}", ex.tla);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let run = tlc(&jar, &ex.spec(), &ex.cfg);
+    assert_eq!(run.violated, Vec::<String>::new(), "{}", ex.tla);
+    assert_eq!(run.distinct, 4, "{run:?}");
+}
+
+/// The 2^10 cap holds for a datatype's variants together too: five
+/// variants of 512 values each (2560 in all) have a hole per field, while
+/// `Small` (3 values) is still enumerated whole.
+const WIDE_UNION: &str = r#"
+verus! {
+pub enum Cmd { A(u8, bool), B(u8, bool), C(u8, bool), D(u8, bool), E(u8, bool) }
+
+pub enum Small { On(bool), Off }
+
+pub struct State { pub x: u8 }
+
+pub open spec fn off(k: Small) -> bool { k is Off }
+
+pub open spec fn init(s: State) -> bool { s.x == 0 }
+
+pub open spec fn next(pre: State, post: State) -> bool {
+    ||| exists|c: Cmd| c is A && c->A_1 && pre.x < 5 && post.x == c->A_0
+    ||| exists|k: Small| #[trigger] off(k) && post.x == 0
+}
+
+pub open spec fn x_small(s: State) -> bool { s.x < 5 }
+}
+"#;
+
+#[test]
+fn tla_export_caps_the_union_of_a_datatypes_variants() {
+    let ex = export_code(WIDE_UNION, "test_crate");
+    assert_eq!(ex.report["refusals"], serde_json::json!([]), "{}", ex.tla);
+    let mut constants: Vec<String> = ex.report["holes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|h| h["constant"].as_str().unwrap().to_string())
+        .collect();
+    constants.sort();
+    let expected: Vec<String> = ["A", "B", "C", "D", "E"]
+        .iter()
+        .flat_map(|v| [format!("Dom_Cmd_{v}_v0"), format!("Dom_Cmd_{v}_v1")])
+        .collect();
+    assert_eq!(constants, expected, "{}", ex.tla);
+    assert!(!ex.tla.contains("0..255"), "{}", ex.tla);
+    assert!(
+        ex.tla.contains(
+            "({[tag |-> \"On\", v0 |-> v0__6] : v0__6 \\in BOOLEAN} \\cup {[tag |-> \"Off\"]})"
+        ),
+        "{}",
+        ex.tla
+    );
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let mut cfg = format!("{}CONSTANTS\n", ex.cfg);
+    for v in ["A", "B", "C", "D", "E"] {
+        cfg.push_str(&format!("  Dom_Cmd_{v}_v0 = {{1, 4, 9}}\n  Dom_Cmd_{v}_v1 = {{TRUE}}\n"));
+    }
+    let run = tlc(&jar, &ex.spec(), &cfg);
+    // x takes 0, 1 and 4; 9 is reached and violates x_small.
+    assert_eq!(run.violated, ["x_small"], "{}", ex.tla);
+}
+
+/// A tuple binder is bounded as a datatype of one variant, its values TLA+
+/// tuples: `(bool, u8)` whole (512 values), `(u8, u8)` (65536) a hole per
+/// element; and a hole is named after the tuple's element types, so
+/// `(u8, u8)` and `(int, bool)` never share one.
+const TUPLE_BINDERS: &str = r#"
+verus! {
+pub struct State { pub x: u8 }
+
+pub open spec fn init(s: State) -> bool { s.x == 0 }
+
+pub open spec fn next(pre: State, post: State) -> bool {
+    ||| exists|p: (u8, u8)| p.0 == p.1 && pre.x < 3 && post.x == p.0
+    ||| exists|q: (bool, u8)| q.0 && q.1 == 2 && pre.x == 1 && post.x == q.1
+}
+
+pub open spec fn x_small(s: State) -> bool { forall|t: (int, bool)| t.1 ==> s.x < 3 + t.0 }
+}
+"#;
+
+#[test]
+fn tla_export_bounds_tuple_binders_by_their_element_types() {
+    let ex = export_code(TUPLE_BINDERS, "test_crate");
+    assert_eq!(ex.report["refusals"], serde_json::json!([]), "{}", ex.tla);
+    let mut constants: Vec<String> = ex.report["holes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|h| h["constant"].as_str().unwrap().to_string())
+        .collect();
+    constants.sort();
+    assert_eq!(
+        constants,
+        ["Dom_tuple2_int_bool_v0", "Dom_tuple2_u8_u8_v0", "Dom_tuple2_u8_u8_v1"],
+        "{}",
+        ex.tla
+    );
+    assert!(
+        ex.tla
+            .contains("\\E q \\in ({<<v0__2, v1__2>> : v0__2 \\in BOOLEAN, v1__2 \\in 0..255}) :"),
+        "{}",
+        ex.tla
+    );
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let cfg = format!(
+        "{}CONSTANTS\n  Dom_tuple2_u8_u8_v0 = {{0, 1}}\n  Dom_tuple2_u8_u8_v1 = {{1, 2}}\n  \
+         Dom_tuple2_int_bool_v0 = {{0, 1}}\n",
+        ex.cfg
+    );
+    let run = tlc(&jar, &ex.spec(), &cfg);
+    // x takes 0, 1 (the pair (1, 1)) and 2 (the pair (true, 2)).
+    assert_eq!(run.violated, Vec::<String>::new(), "{}", ex.tla);
+    assert_eq!(run.distinct, 3, "{run:?}");
 }

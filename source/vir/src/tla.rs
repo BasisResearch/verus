@@ -408,8 +408,9 @@ fn typ_datatype(typ: &Typ) -> Option<Path> {
 }
 
 /// The friendly name of a type, for holes and constants. An integer type is
-/// named after its range (`u8`, `nat`, `int`), so binders of different
-/// integer types never share a hole constant.
+/// named after its range (`u8`, `nat`, `int`) and a tuple after its element
+/// types (`tuple2_u8_bool`), so binders of different types never share a
+/// hole constant.
 fn typ_name(typ: &Typ) -> String {
     match &**typ {
         TypX::Bool => "bool".into(),
@@ -422,7 +423,16 @@ fn typ_name(typ: &Typ) -> String {
                 format!("{base}_{}", args.iter().map(typ_name).collect::<Vec<_>>().join("_"))
             }
         }
-        TypX::Datatype(Dt::Tuple(n), _, _) => format!("tuple{n}"),
+        // Named after its element types too, so binders of different tuple
+        // types never share a hole constant.
+        TypX::Datatype(Dt::Tuple(n), args, _) => {
+            let mut name = format!("tuple{n}");
+            for a in args.iter() {
+                name.push('_');
+                name.push_str(&typ_name(a));
+            }
+            name
+        }
         TypX::Decorate(_, _, t) | TypX::Boxed(t) => typ_name(t),
         TypX::TypParam(x) => x.to_string(),
         _ => "T".into(),
@@ -2019,11 +2029,13 @@ impl Exporter {
 
     /// A finite domain from the type alone, with its number of elements:
     /// booleans, integer types of at most [`MAX_TYPE_DOMAIN`] values (`u8`,
-    /// `i8`), and datatypes whose fields are themselves bounded. A field of
-    /// an unbounded type becomes a hole constant of its own, and so does
-    /// every field of more than one value in a variant whose fields together
-    /// would take more than [`MAX_TYPE_DOMAIN`] values (a `Step::Upd(u8, u8)`
-    /// has 65536), so TLC never enumerates a domain it cannot get through.
+    /// `i8`), and datatypes and tuples whose fields are themselves bounded.
+    /// A field of an unbounded type becomes a hole constant of its own, and
+    /// so does every field of more than one value in a variant whose fields
+    /// together would take more than [`MAX_TYPE_DOMAIN`] values (a
+    /// `Step::Upd(u8, u8)` has 65536), or in every variant when the variants
+    /// together would (see [`Exporter::bound_variants`]), so TLC never
+    /// enumerates a domain it cannot get through.
     /// `seen` holds the datatypes being bounded, so a recursive datatype is
     /// a hole rather than an endless recursion.
     fn bound_from_type(
@@ -2049,97 +2061,167 @@ impl Exporter {
                 if d.x.typ_params.len() != args.len() {
                     return None;
                 }
-                // The constant for an unbounded field is named after the
-                // instantiation (`Option_bool`, `Option_int`), since each
-                // needs its own set.
-                let instance = sanitize(&typ_name(typ));
                 if d.x.variants.len() < 2 && d.x.variants.iter().all(|v| v.fields.is_empty()) {
                     return None;
                 }
                 let tagged = d.x.variants.len() > 1;
-                let mut parts = Vec::new();
-                let mut total: u128 = 0;
-                for v in d.x.variants.iter() {
-                    if v.name.to_string() == "dummy_to_use_type_params" {
-                        continue;
-                    }
-                    // Each field's domain, and the holes bounding it added.
-                    let mut bounded = Vec::new();
-                    for f in v.fields.iter() {
-                        let ftyp =
-                            crate::sst_util::subst_typ_for_datatype(&d.x.typ_params, args, &f.a.0);
-                        let first_hole = self.holes.len();
-                        seen.push(p.clone());
-                        let b = self.bound_from_type(&ftyp, span, seen);
-                        seen.pop();
-                        bounded.push((field_name(&f.name), ftyp, b, first_hole..self.holes.len()));
-                    }
-                    let product = bounded
+                let variants: Vec<(Option<String>, Vec<(String, Typ)>)> =
+                    d.x.variants
                         .iter()
-                        .map(|(_, _, b, _)| b.as_ref().map_or(1, |(_, n)| *n))
-                        .fold(1u128, |acc, n| acc.saturating_mul(n));
-                    let oversize = product > MAX_TYPE_DOMAIN;
-                    // A field about to be a hole drops the holes bounding it
-                    // (latest first, so the earlier ranges stay valid).
-                    if oversize {
-                        for (_, _, b, holes) in bounded.iter().rev() {
-                            if b.as_ref().is_some_and(|(_, n)| *n > 1) {
-                                let dropped: Vec<Hole> = self.holes.drain(holes.clone()).collect();
-                                for h in dropped {
-                                    if !self.holes.iter().any(|k| k.constant == h.constant) {
-                                        self.constants.remove(&h.constant);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    let mut fields = Vec::new();
-                    if tagged {
-                        fields.push(format!("tag |-> \"{}\"", v.name));
-                    }
-                    let mut binds = Vec::new();
-                    let mut size: u128 = 1;
-                    for (fname, ftyp, b, _) in bounded {
-                        let domain = match b {
-                            Some((dom, n)) if !oversize || n <= 1 => {
-                                size = size.saturating_mul(n);
-                                dom
-                            }
-                            _ => {
-                                let constant =
-                                    format!("Dom_{instance}_{}_{}", sanitize(&v.name), fname);
-                                self.constants.insert(constant.clone());
-                                self.holes.push(Hole {
-                                    variable: format!("{}.{}", v.name, fname),
-                                    typ: typ_name(&ftyp),
-                                    constant: constant.clone(),
-                                    location: span_string(span),
-                                    in_function: self.current.clone(),
-                                });
-                                constant
-                            }
-                        };
-                        let x = self.bind(&format!("{fname}__"));
-                        fields.push(format!("{fname} |-> {x}"));
-                        binds.push(format!("{x} \\in {domain}"));
-                    }
-                    total = total.saturating_add(size);
-                    let record = format!("[{}]", fields.join(", "));
-                    if binds.is_empty() {
-                        parts.push(format!("{{{record}}}"));
-                    } else {
-                        parts.push(format!("{{{record} : {}}}", binds.join(", ")));
-                    }
-                }
-                if parts.is_empty() {
-                    None
-                } else {
-                    Some((format!("({})", parts.join(" \\cup ")), total))
-                }
+                        .filter(|v| v.name.to_string() != "dummy_to_use_type_params")
+                        .map(|v| {
+                            let fields = v
+                                .fields
+                                .iter()
+                                .map(|f| {
+                                    let ftyp = crate::sst_util::subst_typ_for_datatype(
+                                        &d.x.typ_params,
+                                        args,
+                                        &f.a.0,
+                                    );
+                                    (field_name(&f.name), ftyp)
+                                })
+                                .collect();
+                            (Some(v.name.to_string()), fields)
+                        })
+                        .collect();
+                seen.push(p.clone());
+                let r = self.bound_variants(typ, tagged, false, &variants, span, seen);
+                seen.pop();
+                r
+            }
+            // A tuple is bounded as a datatype of one variant, its values
+            // TLA+ tuples.
+            TypX::Datatype(Dt::Tuple(_), args, _) => {
+                let fields =
+                    args.iter().enumerate().map(|(i, a)| (format!("v{i}"), a.clone())).collect();
+                self.bound_variants(typ, false, true, &[(None, fields)], span, seen)
             }
             TypX::Decorate(_, _, t) | TypX::Boxed(t) => self.bound_from_type(t, span, seen),
             _ => None,
         }
+    }
+
+    /// The domain of a datatype of type `typ` given as its variants (a name,
+    /// or `None` for a tuple's one variant, and the fields' labels and
+    /// types), with its number of elements: the union over the variants of
+    /// the records (`tagged` with the variant's name) or, for a `tuple`, the
+    /// TLA+ tuples of their fields' domains. A variant whose fields together
+    /// take more than [`MAX_TYPE_DOMAIN`] values has a hole constant for
+    /// each field of more than one value; and when the variants together
+    /// still take more (`Cmd::A(u8, bool)` beside four more like it), so has
+    /// every variant of more than one value, so the domain as a whole never
+    /// exceeds the cap either.
+    fn bound_variants(
+        &mut self,
+        typ: &Typ,
+        tagged: bool,
+        tuple: bool,
+        variants: &[(Option<String>, Vec<(String, Typ)>)],
+        span: &crate::messages::Span,
+        seen: &mut Vec<Path>,
+    ) -> Option<(String, u128)> {
+        type Bounded = Vec<(Option<(String, u128)>, std::ops::Range<usize>)>;
+        // The constant for an unbounded field is named after the
+        // instantiation (`Option_bool`, `Option_int`, `tuple2_u8_u8`), since
+        // each needs its own set.
+        let instance = sanitize(&typ_name(typ));
+        // Each field's domain, and the holes bounding it added.
+        let mut all: Vec<Bounded> = Vec::new();
+        for (_, fields) in variants {
+            let mut bounded = Vec::new();
+            for (_, ftyp) in fields {
+                let first_hole = self.holes.len();
+                let b = self.bound_from_type(ftyp, span, seen);
+                bounded.push((b, first_hole..self.holes.len()));
+            }
+            all.push(bounded);
+        }
+        // A variant's size: every field's, or, once it is split into holes,
+        // only those of at most one value (each hole counts once).
+        let size = |bounded: &Bounded, split: bool| {
+            bounded
+                .iter()
+                .map(|(b, _)| b.as_ref().map_or(1, |(_, n)| *n))
+                .filter(|n| !split || *n <= 1)
+                .fold(1u128, |acc, n| acc.saturating_mul(n))
+        };
+        let mut split: Vec<bool> = all.iter().map(|b| size(b, false) > MAX_TYPE_DOMAIN).collect();
+        let union =
+            all.iter().zip(&split).fold(0u128, |acc, (b, s)| acc.saturating_add(size(b, *s)));
+        if union > MAX_TYPE_DOMAIN {
+            for (b, s) in all.iter().zip(split.iter_mut()) {
+                *s = *s || size(b, false) > 1;
+            }
+        }
+        // A field about to be a hole drops the holes bounding it (latest
+        // first, so the earlier ranges stay valid).
+        for (bounded, s) in all.iter().zip(&split).rev() {
+            if !*s {
+                continue;
+            }
+            for (b, holes) in bounded.iter().rev() {
+                if b.as_ref().is_some_and(|(_, n)| *n > 1) {
+                    let dropped: Vec<Hole> = self.holes.drain(holes.clone()).collect();
+                    for h in dropped {
+                        if !self.holes.iter().any(|k| k.constant == h.constant) {
+                            self.constants.remove(&h.constant);
+                        }
+                    }
+                }
+            }
+        }
+        let mut parts = Vec::new();
+        let mut total: u128 = 0;
+        for (((vname, fields), bounded), s) in variants.iter().zip(all).zip(split) {
+            let mut items = Vec::new();
+            if let (true, Some(v)) = (tagged, vname) {
+                items.push(format!("tag |-> \"{v}\""));
+            }
+            let mut binds = Vec::new();
+            let mut size: u128 = 1;
+            for ((fname, ftyp), (b, _)) in fields.iter().zip(bounded) {
+                let domain = match b {
+                    Some((dom, n)) if !s || n <= 1 => {
+                        size = size.saturating_mul(n);
+                        dom
+                    }
+                    _ => {
+                        let (constant, variable) = match vname {
+                            Some(v) => (
+                                format!("Dom_{instance}_{}_{fname}", sanitize(v)),
+                                format!("{v}.{fname}"),
+                            ),
+                            None => (format!("Dom_{instance}_{fname}"), fname.clone()),
+                        };
+                        self.constants.insert(constant.clone());
+                        self.holes.push(Hole {
+                            variable,
+                            typ: typ_name(ftyp),
+                            constant: constant.clone(),
+                            location: span_string(span),
+                            in_function: self.current.clone(),
+                        });
+                        constant
+                    }
+                };
+                let x = self.bind(&format!("{fname}__"));
+                items.push(if tuple { x.clone() } else { format!("{fname} |-> {x}") });
+                binds.push(format!("{x} \\in {domain}"));
+            }
+            total = total.saturating_add(size);
+            let value = if tuple {
+                format!("<<{}>>", items.join(", "))
+            } else {
+                format!("[{}]", items.join(", "))
+            };
+            if binds.is_empty() {
+                parts.push(format!("{{{value}}}"));
+            } else {
+                parts.push(format!("{{{value} : {}}}", binds.join(", ")));
+            }
+        }
+        if parts.is_empty() { None } else { Some((format!("({})", parts.join(" \\cup ")), total)) }
     }
 
     /// A finite domain for `v` read off the guard's conjuncts: membership in
@@ -3246,27 +3328,31 @@ fn recognise(krate: &Krate, module: &str, named: Option<&[String]>) -> Result<Tr
         });
     }
     // verus-tla: `next()` returning a spec_fn over (S, S).
-    let next = in_module.iter().find(|f| short(f) == "next" && f.x.params.is_empty() && matches!(&*f.x.ret.x.typ, TypX::SpecFn(ps, r) if ps.len() == 2 && matches!(&**r, TypX::Bool)));
+    // A function of no parameters returning a `spec_fn` over `arity`
+    // values of one datatype, to bool: that datatype.
+    let closure_state = |f: &Function, arity: usize| -> Option<Path> {
+        if !f.x.params.is_empty() {
+            return None;
+        }
+        let TypX::SpecFn(ps, r) = &*f.x.ret.x.typ else { return None };
+        if ps.len() != arity || !matches!(&**r, TypX::Bool) {
+            return None;
+        }
+        let state = typ_datatype(&ps[0])?;
+        ps.iter().all(|p| typ_datatype(p).as_ref() == Some(&state)).then_some(state)
+    };
+    let next = in_module.iter().find(|f| short(f) == "next" && closure_state(f, 2).is_some());
     if let Some(next) = next {
-        let state = match &*next.x.ret.x.typ {
-            TypX::SpecFn(ps, _) => {
-                typ_datatype(&ps[0]).ok_or("state type of `next()` is not a datatype")?
-            }
-            _ => unreachable!(),
-        };
+        let state = closure_state(next, 2).expect("checked above");
+        // `init()` and the invariants are closures over the state itself: a
+        // `() -> spec_fn(int) -> bool` beside them is a helper.
+        let over_state = |f: &Function| closure_state(f, 1).as_ref() == Some(&state);
         let init = in_module
             .iter()
-            .find(|f| {
-                short(f) == "init"
-                    && f.x.params.is_empty()
-                    && matches!(&*f.x.ret.x.typ, TypX::SpecFn(ps, _) if ps.len() == 1)
-            })
-            .ok_or("found verus-tla `next()` but no `init()`")?;
-        let pool: Vec<Function> = in_module
-            .iter()
-            .filter(|f| f.x.params.is_empty() && matches!(&*f.x.ret.x.typ, TypX::SpecFn(ps, r) if ps.len() == 1 && matches!(&**r, TypX::Bool)) && short(f) != "init")
-            .cloned()
-            .collect();
+            .find(|f| short(f) == "init" && over_state(f))
+            .ok_or("found verus-tla `next()` but no `init()` returning a closure over its state")?;
+        let pool: Vec<Function> =
+            in_module.iter().filter(|f| over_state(f) && short(f) != "init").cloned().collect();
         let candidates = select_invariants(&pool, named, module, |_| {
             (true, "a verus-tla closure over the state returning bool".into())
         })?;
