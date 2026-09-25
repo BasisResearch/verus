@@ -89,6 +89,8 @@ pub struct Report {
     pub typed_variables: Vec<String>,
     pub init: String,
     pub next: String,
+    /// The variables Init never assigns; TLC cannot compute an initial state.
+    pub init_unassigned: Vec<String>,
     pub invariants: Vec<String>,
     /// Every transition Next reaches, with the variables it leaves unassigned.
     pub transitions: Vec<Transition>,
@@ -693,6 +695,16 @@ impl Exporter {
         (r, assigned)
     }
 
+    /// Print `e` as one branch of an `IF`, `match` or disjunction, with what
+    /// it assigns. A branch that is the literal `false` never holds, so it
+    /// needs to assign nothing and counts as assigning every variable
+    /// (VerusSync's `dummy_to_use_type_params => false` arm, `if c { false }
+    /// else { ... }`).
+    fn branch_expr(&mut self, e: &Expr, env: &Env) -> (String, BTreeSet<String>) {
+        let (s, assigned) = self.branch(|x| x.in_branch(e, env));
+        if is_false(e) { (s, self.state_vars.iter().cloned().collect()) } else { (s, assigned) }
+    }
+
     /// Whether the operator being printed has assigned `v` so far, in the
     /// branch being printed or before it.
     fn assigned_so_far(&self, v: &str) -> bool {
@@ -710,8 +722,13 @@ impl Exporter {
 
     /// The variable `e` reads as a primed field of the state (`post.f`).
     fn post_field(&self, e: &Expr, env: &Env) -> Option<String> {
+        self.role_field(e, env, Role::Post)
+    }
+
+    /// The variable `e` reads as a field of the state in `role`.
+    fn role_field(&self, e: &Expr, env: &Env, role: Role) -> Option<String> {
         let is_post =
-            |v: Option<VarIdent>| v.and_then(|v| env.roles.get(&v).copied()) == Some(Role::Post);
+            |v: Option<VarIdent>| v.and_then(|v| env.roles.get(&v).copied()) == Some(role);
         let is_state = |dt: &Dt| matches!(dt, Dt::Path(p) if *p == self.state_path);
         let e = peel(e);
         match &e.x {
@@ -737,13 +754,20 @@ impl Exporter {
     /// field on the right alone (`pre.y == post.y`) is printed on the left
     /// (`swap`). With a primed field on both sides, the one already assigned
     /// goes on the right and the other is assigned; when neither is, the
-    /// equality assigns nothing (TLC cannot evaluate it).
+    /// equality assigns nothing (TLC cannot evaluate it). With no primed
+    /// field, an unprimed one on the right alone (`0 == s.x` in `init`) goes
+    /// on the left too, since TLC computes an initial state only from `x =
+    /// e`; `=` is symmetric, so the swap changes nothing else.
     fn orient(&self, a: &Expr, b: &Expr, env: &Env) -> (bool, Option<String>) {
         match (self.post_field(a, env), self.post_field(b, env)) {
             (Some(x), None) => (false, Some(x)),
             (None, Some(y)) => (true, Some(y)),
             (Some(x), Some(y)) if self.assigned_so_far(&y) => (false, Some(x)),
             (Some(x), Some(y)) if self.assigned_so_far(&x) => (true, Some(y)),
+            (None, None) => {
+                let pre = |x: &Expr| self.role_field(x, env, Role::Pre).is_some();
+                (!pre(a) && pre(b), None)
+            }
             _ => (false, None),
         }
     }
@@ -800,28 +824,33 @@ impl Exporter {
             ExprX::Unary(op, inner) => match op {
                 UnaryOp::Not => format!("~({})", self.expr(inner, env)),
                 UnaryOp::Trigger(_) | UnaryOp::CoerceMode { .. } => self.expr(inner, env),
-                // A clip to `int` is the identity. Any other clip (`as u8`,
-                // `as nat`, ...) is only known to land in its range, a fact
-                // Verus proves and TLC cannot see: printed as the identity it
-                // would give values outside the type, and a check that
-                // stopped there would turn the proof-time fact into a
-                // runtime failure. Only a literal already in range, or an
-                // operand whose own type lies within the range (a widening
-                // cast, `u8` to `u16`), is kept.
+                // A clip to `int`, or of an operand whose own type lies
+                // within the range (a widening cast, `u8` to `u16`), is the
+                // identity. Any other clip (`as u8`, `as nat`, ...) gives an
+                // out-of-range value some unspecified value of the type,
+                // which TLC cannot express: it is printed as a value check,
+                // the value when it is in range and an `Assert` otherwise,
+                // so TLC stops only in a reached state whose value leaves
+                // the type (`(pre.x - 1) as nat` behind `pre.x > 0` never
+                // does). It is not a refusal and taints nothing. A literal
+                // is decided here: kept in range, refused out of it.
                 UnaryOp::Clip { range: IntRange::Int, .. } => self.expr(inner, env),
                 UnaryOp::Clip { range, .. } if int_typ_within(&inner.typ, range) => {
                     self.expr(inner, env)
                 }
-                UnaryOp::Clip { range, .. } => match &peel(inner).x {
-                    ExprX::Const(Constant::Int(i)) if int_in_range(i, range) => i.to_string(),
-                    _ => {
-                        let what = format!(
-                            "cast to {} (TLC cannot keep the value in range)",
-                            crate::ast_util::int_range_to_type_string(range)
-                        );
-                        self.refuse(what, &e.span)
+                UnaryOp::Clip { range, .. } => {
+                    let ty = crate::ast_util::int_range_to_type_string(range);
+                    match &peel(inner).x {
+                        ExprX::Const(Constant::Int(i)) if int_in_range(i, range) => i.to_string(),
+                        ExprX::Const(Constant::Int(_)) => {
+                            self.refuse(format!("cast to {ty} of a literal out of range"), &e.span)
+                        }
+                        _ if matches!(range, IntRange::Char) => {
+                            self.refuse(format!("cast to {ty}"), &e.span)
+                        }
+                        _ => self.checked_cast(e, inner, range, env),
                     }
-                },
+                }
                 UnaryOp::IntToReal | UnaryOp::RealToInt => self.expr(inner, env),
                 _ => {
                     let what = format!("unary operator {:?}", op);
@@ -862,8 +891,8 @@ impl Exporter {
                 let (sa, sb) = match op {
                     LogicalOp::And => (self.expr(a, env), self.expr(b, env)),
                     LogicalOp::Or => {
-                        let (sa, aa) = self.branch(|x| x.in_branch(a, env));
-                        let (sb, ab) = self.branch(|x| x.in_branch(b, env));
+                        let (sa, aa) = self.branch_expr(a, env);
+                        let (sb, ab) = self.branch_expr(b, env);
                         self.meet(vec![aa, ab]);
                         (sa, sb)
                     }
@@ -909,9 +938,9 @@ impl Exporter {
             ExprX::WithTriggers { body, .. } => self.expr(body, env),
             ExprX::If(c, t, f) => {
                 let sc = self.quiet(|x| x.expr(c, env));
-                let (st, at) = self.branch(|x| x.in_branch(t, env));
+                let (st, at) = self.branch_expr(t, env);
                 let (sf, af) = match f {
-                    Some(f) => self.branch(|x| x.in_branch(f, env)),
+                    Some(f) => self.branch_expr(f, env),
                     None => ("TRUE".into(), BTreeSet::new()),
                 };
                 self.meet(vec![at, af]);
@@ -931,6 +960,25 @@ impl Exporter {
                 self.refuse(what, &e.span)
             }
         }
+    }
+
+    /// `inner as <range>`, checked: the value when it lies in the range,
+    /// else an `Assert` naming the cast, so TLC stops in exactly the reached
+    /// states where Verus would pick an unspecified value. A bound beyond
+    /// TLC's 32-bit integers is left out (see [`int_range_pred`]).
+    fn checked_cast(&mut self, e: &Expr, inner: &Expr, range: &IntRange, env: &Env) -> String {
+        let value = self.expr(inner, env);
+        let c = self.bind("c__");
+        let Some(in_range) = int_range_pred(&c, range) else { return value };
+        let msg = format!(
+            "tla-export: value out of range of {} in a cast at {}",
+            crate::ast_util::int_range_to_type_string(range),
+            span_string(&e.span)
+        );
+        format!(
+            "(LET {c} == {value} IN IF {in_range} THEN {c} ELSE Assert(FALSE, {}))",
+            tla_string(&msg)
+        )
     }
 
     fn binary(&mut self, e: &Expr, op: &BinaryOp, a: &Expr, b: &Expr, env: &Env) -> String {
@@ -1229,7 +1277,7 @@ impl Exporter {
             } else {
                 Some(in_lets(self.quiet(|x| x.expr(&arm.x.guard, &env2))))
             };
-            let (body, assigned) = self.branch(|x| x.in_branch(&arm.x.body, &env2));
+            let (body, assigned) = self.branch_expr(&arm.x.body, &env2);
             arm_assigned.push(assigned);
             let body = in_lets(body);
             let cond = match (cond, guard) {
@@ -2285,6 +2333,110 @@ impl Exporter {
             self.current_assigned.extend(assigned.iter().cloned());
         }
     }
+
+    /// The state variables Init leaves unassigned: `body` is the initial
+    /// predicate and `states` its state parameter. TLC computes an initial
+    /// state only when every variable is assigned (`x = e`), else it stops
+    /// ("current state is not a legal state").
+    fn init_unassigned(&self, body: &Expr, states: &HashSet<VarIdent>) -> Vec<String> {
+        let assigned = self.init_assigns(body, states, 0);
+        self.state_vars.iter().filter(|v| !assigned.contains(*v)).cloned().collect()
+    }
+
+    /// The state variables `e` assigns on every path, `states` holding the
+    /// state being assigned. Kept apart from the printing's own tracking,
+    /// which records what an operator assigns in the primed state: an
+    /// operator both `init` and `next` call (`init(s) = is_zero(s)`, `next`
+    /// guarded by `is_zero(pre)`) assigns in Init but only reads in Next.
+    /// Counted: a conjunct-level `s.f == e` or `e == s.f` (`s == e` or `s =~=
+    /// e` for every field), through conjunctions, `LET`s, `exists` bodies,
+    /// calls passing the state to a crate function, and an `IF`, `match` or
+    /// disjunction every branch of which assigns (a `false` branch assigns
+    /// everything). A closure application is not followed and counts as
+    /// assigning everything, so nothing is reported for it.
+    fn init_assigns(&self, e: &Expr, states: &HashSet<VarIdent>, depth: usize) -> BTreeSet<String> {
+        let all = || self.state_vars.iter().cloned().collect::<BTreeSet<_>>();
+        let meet = |sets: Vec<BTreeSet<String>>| {
+            let mut it = sets.into_iter();
+            let first = it.next().unwrap_or_else(all);
+            it.fold(first, |acc, b| acc.intersection(&b).cloned().collect())
+        };
+        let is_state = |x: &Expr| read_var(x).is_some_and(|v| states.contains(&v));
+        let field = |x: &Expr| -> Option<String> {
+            let x = peel(x);
+            let (dt, field, base) = match &x.x {
+                ExprX::UnaryOpr(UnaryOpr::Field(FieldOpr { datatype, field, .. }), inner) => {
+                    (datatype, field, read_var(inner))
+                }
+                ExprX::ReadPlace(p, _) => match &p.x {
+                    PlaceX::Field(FieldOpr { datatype, field, .. }, inner) => {
+                        (datatype, field, place_var(inner))
+                    }
+                    _ => return None,
+                },
+                _ => return None,
+            };
+            let ours = matches!(dt, Dt::Path(p) if *p == self.state_path)
+                && base.is_some_and(|v| states.contains(&v));
+            ours.then(|| self.state_var(&field_name(field)))
+        };
+        let e = peel(e);
+        match &e.x {
+            ExprX::Const(Constant::Bool(false)) => all(),
+            ExprX::Logical(LogicalOp::And, a, b) => {
+                let mut s = self.init_assigns(a, states, depth);
+                s.extend(self.init_assigns(b, states, depth));
+                s
+            }
+            ExprX::Logical(LogicalOp::Or, a, b) => {
+                meet(vec![self.init_assigns(a, states, depth), self.init_assigns(b, states, depth)])
+            }
+            ExprX::If(_, t, Some(f)) => {
+                meet(vec![self.init_assigns(t, states, depth), self.init_assigns(f, states, depth)])
+            }
+            ExprX::Match(_, arms, _) => {
+                meet(arms.iter().map(|a| self.init_assigns(&a.x.body, states, depth)).collect())
+            }
+            ExprX::Block(_, Some(tail)) => self.init_assigns(tail, states, depth),
+            // Wrappers that print as their operand (VerusSync labels each
+            // `init` with a ProofNote).
+            ExprX::UnaryOpr(UnaryOpr::ProofNote(_) | UnaryOpr::CustomErr(_), inner)
+            | ExprX::Unary(UnaryOp::Trigger(_) | UnaryOp::CoerceMode { .. }, inner) => {
+                self.init_assigns(inner, states, depth)
+            }
+            ExprX::Quant(q, _, body) if matches!(q.quant, air::ast::Quant::Exists) => {
+                self.init_assigns(body, states, depth)
+            }
+            ExprX::Binary(BinaryOp::Eq(_), a, b) | ExprX::BinaryOpr(BinaryOpr::ExtEq(..), a, b) => {
+                if is_state(a) || is_state(b) {
+                    return all();
+                }
+                match (field(a), field(b)) {
+                    (Some(x), None) | (None, Some(x)) => BTreeSet::from([x]),
+                    _ => BTreeSet::new(),
+                }
+            }
+            ExprX::Call { target: CallTarget::Fun(kind, fun, ..), args, .. } if depth < 16 => {
+                let fun = self.resolved_fun(kind, fun);
+                let Some(callee) = self.functions.get(&fun) else { return BTreeSet::new() };
+                let Some(body) = &callee.x.body else { return BTreeSet::new() };
+                let inner: HashSet<VarIdent> = callee
+                    .x
+                    .params
+                    .iter()
+                    .zip(args.iter())
+                    .filter(|(p, a)| self.is_state_typ(&p.x.typ) && is_state(a))
+                    .map(|(p, _)| p.x.name.clone())
+                    .collect();
+                if inner.is_empty() {
+                    return BTreeSet::new();
+                }
+                self.init_assigns(body, &inner, depth + 1)
+            }
+            ExprX::Call { target: CallTarget::FnSpec(_), .. } => all(),
+            _ => BTreeSet::new(),
+        }
+    }
 }
 
 /// Whether a conjunct-level `e` keeps its conjunct-level children there: a
@@ -2379,9 +2531,24 @@ fn int_typ_within(typ: &Typ, range: &IntRange) -> bool {
     }
 }
 
+/// A field's record label. A positional field `0` is `v0`. An enum value's
+/// record carries its variant in the label `tag`, so a field named `tag`, or
+/// `tag` followed by underscores, takes one more underscore: labels stay
+/// distinct and the mapping stays one to one.
 fn field_name(f: &Ident) -> String {
     let s = f.to_string();
-    if s.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false) { format!("v{s}") } else { s }
+    if s.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false) {
+        format!("v{s}")
+    } else if s.strip_prefix("tag").is_some_and(|rest| rest.chars().all(|c| c == '_')) {
+        format!("{s}_")
+    } else {
+        s
+    }
+}
+
+/// Whether `e` is the literal `false`.
+fn is_false(e: &Expr) -> bool {
+    matches!(peel(e).x, ExprX::Const(Constant::Bool(false)))
 }
 
 fn expr_kind(x: &ExprX) -> &'static str {
@@ -2816,6 +2983,28 @@ pub fn export_module(krate: &Krate, arg: &str) -> Result<Export, String> {
         }
     }
     let transitions = ex.transitions(&(triple.next.clone(), false));
+    let init_unassigned = match ex.functions.get(&triple.init).and_then(|f| f.x.body.clone()) {
+        // verus-tla: the initial predicate is the body of the closure `init()`
+        // returns, over its one parameter.
+        Some(body) if verus_tla => match &peel(&body).x {
+            ExprX::Closure(params, cbody) => {
+                let states = params.iter().take(1).map(|p| p.name.clone()).collect();
+                ex.init_unassigned(cbody, &states)
+            }
+            _ => Vec::new(),
+        },
+        Some(body) => {
+            let f = &ex.functions[&triple.init];
+            let states =
+                f.x.params
+                    .iter()
+                    .filter(|p| ex.is_state_typ(&p.x.typ))
+                    .map(|p| p.x.name.clone())
+                    .collect();
+            ex.init_unassigned(&body, &states)
+        }
+        None => Vec::new(),
+    };
     // Verus's state is always within its fields' types, so a step that
     // would leave them is disabled: TypeOK holds initially and after each
     // step.
@@ -2966,6 +3155,12 @@ pub fn export_module(krate: &Krate, arg: &str) -> Result<Export, String> {
             cfg.push_str(&format!("\\*   {c} = {{ ... }}\n"));
         }
     }
+    if !init_unassigned.is_empty() {
+        cfg.push_str(&format!(
+            "\\* Init never assigns {}: TLC cannot compute the initial states (\"current state\n\\* is not a legal state\"; see the .tla.json init_unassigned)\n",
+            init_unassigned.join(", ")
+        ));
+    }
     for t in transitions.iter().filter(|t| !t.unassigned.is_empty()) {
         cfg.push_str(&format!(
             "\\* Transition {} never assigns {}: TLC stops there with \"successor state not\n\\* completely specified\" (see the .tla.json transitions)\n",
@@ -2974,7 +3169,7 @@ pub fn export_module(krate: &Krate, arg: &str) -> Result<Export, String> {
         ));
     }
     cfg.push_str(
-        "\\* The unassigned check counts a conjunct-level v' = e (an IF, match or disjunction\n\\* when every branch assigns v). It can miss a v' read before the conjunct that\n\\* assigns it (TLC evaluates conjuncts in order) and does not count v' \\in S.\n",
+        "\\* The unassigned check counts a conjunct-level v' = e, and v = e in Init (an IF,\n\\* match or disjunction when every branch assigns v; a FALSE branch assigns all).\n\\* It can miss a v' read before the conjunct that assigns it (TLC evaluates\n\\* conjuncts in order), and it does not count v' \\in S.\n",
     );
     cfg.push_str("\\* CONSTRAINT <a state predicate bounding the model>\n");
     let report = Report {
@@ -2985,6 +3180,7 @@ pub fn export_module(krate: &Krate, arg: &str) -> Result<Export, String> {
         typed_variables: type_ok.iter().map(|(v, _)| v.clone()).collect(),
         init: init_name,
         next: next_name,
+        init_unassigned,
         invariants: inv_names,
         transitions,
         skipped_invariants: skipped,

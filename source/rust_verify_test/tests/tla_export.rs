@@ -107,14 +107,14 @@ struct Tlc {
     violated: Vec<String>,
 }
 
-/// Run TLC to completion on `spec` with `cfg` (deadlock is not an error,
-/// and every violation is counted).
-fn tlc(jar: &str, spec: &Path, cfg: &str) -> Tlc {
+/// TLC's output on `spec` with `cfg` (deadlock is not an error, and it
+/// continues past a violation).
+fn tlc_output(jar: &str, spec: &Path, cfg: &str) -> String {
     let dir = spec.parent().unwrap();
     let cfg_path = spec.with_extension("cfg");
     std::fs::write(&cfg_path, cfg).unwrap();
     let meta = dir.join("states");
-    let out = java(
+    java(
         jar,
         dir,
         &[
@@ -129,7 +129,13 @@ fn tlc(jar: &str, spec: &Path, cfg: &str) -> Tlc {
             cfg_path.to_str().unwrap(),
             spec.to_str().unwrap(),
         ],
-    );
+    )
+}
+
+/// Run TLC to completion on `spec` with `cfg`, counting every violation;
+/// panics on any other error.
+fn tlc(jar: &str, spec: &Path, cfg: &str) -> Tlc {
+    let out = tlc_output(jar, spec, cfg);
     let re = regex::Regex::new(r"(\d+) states generated, (\d+) distinct states found").unwrap();
     let caps =
         re.captures_iter(&out).last().unwrap_or_else(|| panic!("TLC did not finish:\n{}", out));
@@ -194,6 +200,14 @@ fn tla_export_verussync_leaves_the_step_parameter_as_a_hole() {
     let holes = ex.report["holes"].as_array().unwrap();
     assert_eq!(holes.len(), 1, "{holes:?}");
     assert_eq!(holes[0]["constant"], "Dom_Step_add_v0");
+    // `next_by`'s `dummy_to_use_type_params => false` arm never holds, so
+    // it assigns nothing and leaves nothing unassigned (in Next or Init).
+    assert_eq!(
+        ex.report["transitions"],
+        serde_json::json!([{"operator": "add", "unassigned": []}])
+    );
+    assert_eq!(ex.report["init_unassigned"], serde_json::json!([]));
+    assert!(!ex.cfg.contains("never assigns"), "{}", ex.cfg);
     // The hole is left unassigned, so TLC stops until it is given a domain
     // rather than quantifying over an empty set.
     assert!(ex.cfg.contains("\\*   Dom_Step_add_v0 = { ... }"), "{}", ex.cfg);
@@ -380,6 +394,15 @@ fn tla_export_verussync_takes_the_invariants_from_state_invariant() {
     assert!(c.contains(&("reset_enabled".into(), false)), "{:?}", c);
     assert!(c.contains(&("invariant".into(), false)), "{:?}", c);
     assert!(!ex.cfg.contains("_enabled"), "{}", ex.cfg);
+    assert_eq!(
+        ex.report["transitions"],
+        serde_json::json!([
+            {"operator": "flip", "unassigned": []},
+            {"operator": "reset", "unassigned": []},
+        ])
+    );
+    assert_eq!(ex.report["init_unassigned"], serde_json::json!([]));
+    assert!(!ex.cfg.contains("never assigns"), "{}", ex.cfg);
     let Some(jar) = tla_tools() else { return };
     sany(&jar, &ex.spec());
     let run = tlc(&jar, &ex.spec(), &bounded(&ex, "n < 3"));
@@ -523,10 +546,10 @@ fn tla_export_euclid_parameters_do_not_clash_with_fields() {
     assert_eq!(run.distinct, 2, "{run:?}");
 }
 
-/// A cast to a bounded type is only known, by proof, to land in range: an
-/// out-of-range value becomes some unspecified value of the type. Printed as
-/// the identity it would leave the type (or, under TypeOK, disable the step),
-/// so it is refused. A literal already in range is kept.
+/// A narrowing cast gives an out-of-range value some unspecified value of the
+/// type. It is printed as a value check: TLC stops, naming the cast, in the
+/// reached state where `(pre.x + 1) as u8` leaves `u8` (x = 255). A literal
+/// is decided statically: kept in range, refused (tainting `wide`) out of it.
 const CLIP: &str = r#"
 verus! {
 pub struct State { pub x: u8 }
@@ -542,18 +565,61 @@ pub open spec fn wide(s: State) -> bool { s.x != 300int as u8 }
 "#;
 
 #[test]
-fn tla_export_refuses_a_cast_to_a_bounded_type() {
+fn tla_export_checks_a_narrowing_cast_where_it_is_evaluated() {
     let ex = export_code(CLIP, "test_crate");
     let refusals = ex.report["refusals"].as_array().unwrap();
-    assert_eq!(refusals.len(), 2, "{refusals:?}");
-    assert!(refusals.iter().all(|r| r["what"].as_str().unwrap().starts_with("cast to u8")));
-    assert_eq!(refusals[0]["in_function"], "test_crate::next");
+    assert_eq!(refusals.len(), 1, "{refusals:?}");
+    assert_eq!(refusals[0]["what"], "cast to u8 of a literal out of range");
+    assert_eq!(refusals[0]["in_function"], "test_crate::wide");
     // The in-range literal is kept; the out-of-range one taints `wide`.
     assert!(ex.tla.contains("(x = 254)"), "{}", ex.tla);
+    assert!(
+        ex.tla.contains("IF (0 <= c__ /\\ c__ <= 255) THEN c__ ELSE Assert(FALSE, \"tla-export: value out of range of u8 in a cast at "),
+        "{}",
+        ex.tla
+    );
     assert_eq!(names(&ex.report["invariants"]), ["in_range"]);
     assert_eq!(names(&ex.report["skipped_invariants"]), ["wide"]);
     let Some(jar) = tla_tools() else { return };
     sany(&jar, &ex.spec());
+    // 254 and 255 are reached; the step from 255 stops TLC at the cast.
+    let out = tlc_output(&jar, &ex.spec(), &ex.cfg);
+    assert!(out.contains("tla-export: value out of range of u8 in a cast at"), "{}", out);
+    assert!(out.contains("x = 255"), "{}", out);
+}
+
+/// A narrowing cast behind the guard that keeps it in range, the usual
+/// shape of a decrement: the value check never fails, nothing is refused,
+/// and the invariant is checked (the cast was a refusal that made the only
+/// transition fail).
+const GUARDED_CAST: &str = r#"
+verus! {
+pub struct State { pub x: nat, pub y: u8 }
+
+pub open spec fn init(s: State) -> bool { s.x == 2 && s.y == 3 }
+
+pub open spec fn dec(pre: State, post: State) -> bool {
+    pre.x > 0 && post.x == (pre.x - 1) as nat && post.y == (pre.y - 1) as u8
+}
+
+pub open spec fn next(pre: State, post: State) -> bool { dec(pre, post) }
+
+pub open spec fn small(s: State) -> bool { s.x <= 2 && s.y >= 1 && (s.y - 1) as nat <= 2 }
+}
+"#;
+
+#[test]
+fn tla_export_keeps_a_guarded_narrowing_cast() {
+    let ex = export_code(GUARDED_CAST, "test_crate");
+    assert_eq!(ex.report["refusals"], serde_json::json!([]), "{}", ex.tla);
+    assert_eq!(names(&ex.report["invariants"]), ["small"]);
+    assert_eq!(names(&ex.report["skipped_invariants"]), Vec::<String>::new());
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let run = tlc(&jar, &ex.spec(), &ex.cfg);
+    assert_eq!(run.violated, Vec::<String>::new(), "{}", ex.tla);
+    // x from 2 down to 0 (y from 3 down to 1).
+    assert_eq!(run.distinct, 3, "{run:?}");
 }
 
 /// A quantifier over a generic datatype is bounded per instantiation:
@@ -1089,8 +1155,8 @@ fn tla_export_counts_a_frame_condition_around_a_disjunction() {
     assert_eq!(run.distinct, 9, "{run:?}");
 }
 
-/// A widening cast (`u8` to `u16`, `i16`, `nat`) is the identity and is
-/// kept; a narrowing one is still refused.
+/// A widening cast (`u8` to `u16`, `i16`, `nat`) is the identity; a
+/// narrowing one is a value check, which holds in every reached state here.
 const WIDENING: &str = r#"
 verus! {
 pub struct State { pub b: u8 }
@@ -1111,14 +1177,153 @@ pub open spec fn narrow(s: State) -> bool { (s.b as i8) >= 0 }
 fn tla_export_keeps_a_widening_cast() {
     let ex = export_code(WIDENING, "test_crate");
     assert!(ex.tla.contains("(b <= 3)"), "{}", ex.tla);
-    assert_eq!(names(&ex.report["invariants"]), ["wide"]);
-    assert_eq!(names(&ex.report["skipped_invariants"]), ["narrow"]);
-    let refusals = ex.report["refusals"].as_array().unwrap();
-    assert_eq!(refusals.len(), 1, "{}", ex.report["refusals"]);
-    assert!(refusals[0]["what"].as_str().unwrap().contains("cast to i8"), "{:?}", refusals);
+    assert!(ex.tla.contains("value out of range of i8"), "{}", ex.tla);
+    assert_eq!(names(&ex.report["invariants"]), ["wide", "narrow"]);
+    assert_eq!(names(&ex.report["skipped_invariants"]), Vec::<String>::new());
+    assert_eq!(ex.report["refusals"], serde_json::json!([]), "{}", ex.tla);
     let Some(jar) = tla_tools() else { return };
     sany(&jar, &ex.spec());
     let run = tlc(&jar, &ex.spec(), &ex.cfg);
     assert_eq!(run.violated, Vec::<String>::new(), "{}", ex.tla);
     assert_eq!(run.distinct, 4, "{run:?}");
+}
+
+/// A branch that is `false` never holds, so it needs to assign nothing:
+/// `cond` assigns both variables on the branch that can hold (it was
+/// reported as assigning neither, though TLC checks the model).
+const FALSE_BRANCH: &str = r#"
+verus! {
+pub struct State { pub x: int, pub y: int }
+
+pub open spec fn init(s: State) -> bool { s.x == 0 && s.y == 0 }
+
+pub open spec fn step(pre: State, post: State) -> bool {
+    pre.x < 3 && post == State { x: pre.x + 1, ..pre }
+}
+
+pub open spec fn cond(pre: State, post: State) -> bool {
+    if pre.x > 10 { false } else { post.x == pre.x && post.y == pre.y + 1 && pre.y < 2 }
+}
+
+pub open spec fn next(pre: State, post: State) -> bool { step(pre, post) || cond(pre, post) }
+
+pub open spec fn small(s: State) -> bool { s.x <= 3 && s.y <= 2 }
+}
+"#;
+
+#[test]
+fn tla_export_counts_a_false_branch_as_assigning_everything() {
+    let ex = export_code(FALSE_BRANCH, "test_crate");
+    assert_eq!(
+        ex.report["transitions"],
+        serde_json::json!([
+            {"operator": "cond", "unassigned": []},
+            {"operator": "step", "unassigned": []},
+        ])
+    );
+    assert!(!ex.cfg.contains("never assigns"), "{}", ex.cfg);
+    // A branch that is not `false` and assigns nothing is still counted.
+    let gap = export_code(&FALSE_BRANCH.replace("{ false }", "{ pre.y > 0 }"), "test_crate");
+    assert_eq!(
+        gap.report["transitions"],
+        serde_json::json!([
+            {"operator": "cond", "unassigned": ["x", "y"]},
+            {"operator": "step", "unassigned": []},
+        ])
+    );
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let run = tlc(&jar, &ex.spec(), &ex.cfg);
+    assert_eq!(run.violated, Vec::<String>::new(), "{}", ex.tla);
+    // x in 0..3, y in 0..2.
+    assert_eq!(run.distinct, 12, "{run:?}");
+}
+
+/// An `init` that says nothing of `y`: TLC cannot compute the initial states
+/// ("current state is not a legal state"), so the report and the .cfg name
+/// it. `0 == s.x` counts, and is printed `x = 0` (TLC assigns only from the
+/// left). A helper `init` calls with the state is followed, and one `next`
+/// also calls as a guard (`is_zero`) assigns in Init only.
+const INIT_GAP: &str = r#"
+verus! {
+pub struct State { pub x: nat, pub y: int }
+
+pub open spec fn is_zero(s: State) -> bool { 0 == s.x }
+
+pub open spec fn init(s: State) -> bool { is_zero(s) }
+
+pub open spec fn next(pre: State, post: State) -> bool {
+    &&& is_zero(pre) || pre.x < 2
+    &&& post.x == pre.x + 1
+    &&& post.y == pre.y
+}
+
+pub open spec fn small(s: State) -> bool { s.x <= 2 }
+}
+"#;
+
+#[test]
+fn tla_export_reports_what_init_leaves_unassigned() {
+    let ex = export_code(INIT_GAP, "test_crate");
+    assert_eq!(ex.report["init_unassigned"], serde_json::json!(["y"]));
+    assert!(ex.cfg.contains("\\* Init never assigns y: TLC cannot compute"), "{}", ex.cfg);
+    assert!(ex.tla.contains("(x = 0)"), "{}", ex.tla);
+    // `is_zero(pre)` in next is a guard: Next assigns both variables.
+    assert!(!ex.cfg.contains("Transition next never assigns"), "{}", ex.cfg);
+    let fixed = export_code(
+        &INIT_GAP
+            .replace("{ is_zero(s) }", "{ is_zero(s) && if s.x == 0 { s.y == 5 } else { false } }"),
+        "test_crate",
+    );
+    assert_eq!(fixed.report["init_unassigned"], serde_json::json!([]));
+    assert!(!fixed.cfg.contains("Init never assigns"), "{}", fixed.cfg);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    sany(&jar, &fixed.spec());
+    let run = tlc(&jar, &fixed.spec(), &fixed.cfg);
+    assert_eq!(run.violated, Vec::<String>::new(), "{}", fixed.tla);
+    // x in 0..2, y = 5.
+    assert_eq!(run.distinct, 3, "{run:?}");
+}
+
+/// An enum value carries its variant in the record label `tag`, so a field
+/// named `tag` (in a variant, or in the state) is labelled `tag_`: the
+/// record `[tag |-> "A", tag |-> 1]` was rejected by SANY.
+const TAG_FIELD: &str = r#"
+verus! {
+pub enum Mode { A { tag: int }, B }
+
+pub struct State { pub m: Mode, pub tag: int }
+
+pub open spec fn init(s: State) -> bool { s.m == Mode::A { tag: 1 } && s.tag == 0 }
+
+pub open spec fn next(pre: State, post: State) -> bool {
+    match pre.m {
+        Mode::A { tag } => tag < 3 && post.m == Mode::A { tag: tag + 1 } && post.tag == pre.tag,
+        Mode::B => false,
+    }
+}
+
+pub open spec fn small(s: State) -> bool {
+    match s.m { Mode::A { tag } => tag <= 3 && s.tag == 0, Mode::B => false }
+}
+}
+"#;
+
+#[test]
+fn tla_export_keeps_a_field_named_tag_apart_from_the_variant() {
+    let ex = export_code(TAG_FIELD, "test_crate");
+    assert_eq!(ex.report["refusals"], serde_json::json!([]), "{}", ex.tla);
+    assert!(ex.tla.contains("[tag |-> \"A\", tag_ |-> 1]"), "{}", ex.tla);
+    assert_eq!(names(&ex.report["variables"]), ["m", "tag_"]);
+    assert_eq!(
+        ex.report["transitions"],
+        serde_json::json!([{"operator": "next", "unassigned": []}])
+    );
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let run = tlc(&jar, &ex.spec(), &ex.cfg);
+    assert_eq!(run.violated, Vec::<String>::new(), "{}", ex.tla);
+    // tag 1..3.
+    assert_eq!(run.distinct, 3, "{run:?}");
 }

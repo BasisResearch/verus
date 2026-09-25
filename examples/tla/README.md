@@ -47,12 +47,24 @@ overflow before reaching it.
 Whatever the export cannot express is printed as `Assert(FALSE, "...")`, so
 TLC stops with the reason wherever it is evaluated. An invariant that reaches
 one is left out of the `.cfg` and listed in the report's
-`skipped_invariants`. A cast to a bounded type (`as u8`, `as nat`, ...) is
-one of these, unless it casts a literal already in range or widens (the
-operand's own type lies in the target's, as `u8` in `u16` or `nat`): Verus
-gives an out-of-range value some unspecified value of the type, which the
-identity cannot express (it would leave the type, or under `TypeOK` disable
-the step).
+`skipped_invariants`.
+
+A cast to a bounded type (`as u8`, `as nat`, ...) that widens (the operand's
+own type lies in the target's, as `u8` in `u16` or `nat`) is the identity. A
+narrowing one gives an out-of-range value some unspecified value of the
+type in Verus, which TLC cannot express, so it is printed as a value check:
+`LET c == e IN IF <c in range> THEN c ELSE Assert(FALSE, "... value out of
+range of u8 in a cast at <location>")`. TLC stops only in a reached state
+where the value leaves the type; `(pre.x - 1) as nat` behind `pre.x > 0`
+never does. It is not a refusal and taints nothing. The check sits where the
+cast is evaluated, so a guard written after the cast (TLC evaluates conjuncts
+in order) does not protect it. A literal is decided at export: kept when in
+range, refused when not.
+
+An enum value's record carries its variant in the label `tag`, so a field
+named `tag` (or `tag` followed by underscores) is labelled with one more
+underscore (`tag_`), in a variant as in the state (whose variable is then
+`tag_`).
 
 A trait method call that Verus resolved to an impl (`s.view()` with `impl
 View for State`) is exported as the impl's function.
@@ -60,14 +72,20 @@ View for State`) is exported as the impl's function.
 A transition that constrains only some of the fields (`post.x == pre.x + 1`
 and nothing about `y`) leaves the others unconstrained in Verus, but TLC
 cannot build the successor and stops with "successor state not completely
-specified". The report's `transitions` lists each transition `Next` reaches
+specified". Likewise an `init` that constrains only some fields: TLC cannot
+compute the initial states ("current state is not a legal state"). The
+report's `init_unassigned` lists the variables `Init` never assigns (`x = e`
+or `e = x` at conjunct level, followed through calls passing the state) and
+the `.cfg` names them. The report's `transitions` lists each transition `Next` reaches
 with the variables it never assigns (`unassigned`), and the `.cfg` names any
 that leaves one unassigned. A transition is `Next` itself or an operator
 called at conjunct level in a branch (a disjunct, an `IF` or `match` arm, an
 `exists` body), together with the operators it conjoins. A variable counts as
 assigned only by a conjunct-level `v' = e` (or `post == e` or `post =~= e`
 for all of them), by a conjunct-level call to an operator that assigns it, or
-by an `IF`, `match` or disjunction every branch of which assigns it; a guard
+by an `IF`, `match` or disjunction every branch of which assigns it (a
+branch that is the literal `false` never holds and counts as assigning
+everything, as VerusSync's `dummy_to_use_type_params => false` arm); a guard
 reading `v'`, a predicate applied to the post state, or a negated equality
 does not assign. A transition also counts what its callers assign around it,
 so a frame condition factored out of a disjunction (`(a || b) && post.z ==
