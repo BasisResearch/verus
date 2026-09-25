@@ -502,7 +502,7 @@ pub fn parse_args_with_imports(
         ),
         (
             EXTENDED_TLA_EXPORT,
-            "Export the transition system in the named module (-V tla-export=crate::a::b) to TLA+ under the log directory: <Module>.tla, a .cfg skeleton and a .tla.json report of what was recognised, refused and left unbounded; no verification is needed",
+            "Export the transition system in the named module (-V tla-export=crate::a::b) to TLA+ under the log directory: <State>_tla.tla (named after its module, as TLC requires), a .cfg skeleton and a .tla.json report of what was recognised, refused and left unbounded; the export runs before verification",
         ),
         (EXTENDED_ALLOW_INLINE_AIR, "Allow the POTENTIALLY UNSOUND use of inline_air_stmt"),
         (

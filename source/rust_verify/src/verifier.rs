@@ -893,33 +893,51 @@ impl Verifier {
     }
 
     /// `-V tla-export=<module>`: write the module's transition system as
-    /// TLA+ (`<Module>.tla`, a `.cfg` skeleton, a `.tla.json` report) under
-    /// the log directory, before simplification so `match` and constructor
-    /// updates are still visible.
+    /// TLA+ under the log directory, before simplification so `match` and
+    /// constructor updates are still visible. The files are named after the
+    /// TLA+ module (`<State>_tla.tla`, `.cfg`, `.tla.json`), since TLC only
+    /// loads a module from a file of the same name.
     fn export_tla(&mut self, krate: &Krate, module: &str) -> Result<(), VirErr> {
-        use std::io::Write;
         let export = vir::tla::export_module(krate, module)
             .map_err(|e| crate::util::error(format!("tla-export: {e}")))?;
-        let stem = format!("{}", export.report.state_type.rsplit("::").next().unwrap_or("Model"));
-        let mut tla = self.create_log_file(None, &format!("-{stem}.tla"))?;
-        tla.write_all(export.tla.as_bytes())
-            .map_err(|e| crate::util::error(format!("tla-export: {e}")))?;
-        let mut cfg = self.create_log_file(None, &format!("-{stem}.cfg"))?;
-        cfg.write_all(export.cfg.as_bytes())
-            .map_err(|e| crate::util::error(format!("tla-export: {e}")))?;
-        let mut json = self.create_log_file(None, &format!("-{stem}.tla.json"))?;
-        let text = serde_json::to_string_pretty(&export.report).unwrap_or_else(|_| "{}".into());
-        json.write_all(text.as_bytes())
-            .map_err(|e| crate::util::error(format!("tla-export: {e}")))?;
+        let dir = self.log_dir()?;
+        let json = serde_json::to_string_pretty(&export.report).unwrap_or_else(|_| "{}".into());
+        for (ext, text) in [("tla", &export.tla), ("cfg", &export.cfg), ("tla.json", &json)] {
+            let path = dir.join(format!("{}.{ext}", export.module_name));
+            std::fs::write(&path, text.as_bytes()).map_err(|err| {
+                io_vir_err(format!("tla-export: could not write {}", path.display()), err)
+            })?;
+        }
         eprintln!(
-            "tla-export: {} ({}), {} operators, {} holes, {} refusals",
+            "tla-export: {} ({}), {} operators, {} holes, {} refusals; wrote {}",
             export.report.state_type,
             export.report.shape,
             export.report.operators,
             export.report.holes.len(),
-            export.report.refusals.len()
+            export.report.refusals.len(),
+            dir.join(format!("{}.tla", export.module_name)).display()
         );
         Ok(())
+    }
+
+    /// The log directory, created (and emptied) on first use.
+    fn log_dir(&self) -> Result<std::path::PathBuf, VirErr> {
+        let mut created_log_dir =
+            self.created_log_dir.lock().expect("failed to lock created_log_dir");
+        if let Some(dir_path) = &*created_log_dir {
+            return Ok(dir_path.clone());
+        }
+        let dir = std::path::PathBuf::from(if let Some(dir) = &self.args.log_dir {
+            dir.clone()
+        } else {
+            crate::config::LOG_DIR.to_string()
+        });
+        delete_dir_if_exists_and_is_dir(&dir)?;
+        std::fs::create_dir_all(&dir).map_err(|err| {
+            io_vir_err(format!("could not create directory {}", dir.display()), err)
+        })?;
+        *created_log_dir = Some(dir.clone());
+        Ok(dir)
     }
 
     fn create_log_file(
@@ -927,25 +945,7 @@ impl Verifier {
         bucket_id_opt: Option<&BucketId>,
         suffix: &str,
     ) -> Result<File, VirErr> {
-        let dir_path = {
-            let mut created_log_dir =
-                self.created_log_dir.lock().expect("failed to lock created_log_dir");
-            if let Some(dir_path) = &*created_log_dir {
-                dir_path.clone()
-            } else {
-                let dir = std::path::PathBuf::from(if let Some(dir) = &self.args.log_dir {
-                    dir.clone()
-                } else {
-                    crate::config::LOG_DIR.to_string()
-                });
-                delete_dir_if_exists_and_is_dir(&dir)?;
-                std::fs::create_dir_all(&dir).map_err(|err| {
-                    io_vir_err(format!("could not create directory {}", dir.display()), err)
-                })?;
-                *created_log_dir = Some(dir.clone());
-                dir
-            }
-        };
+        let dir_path = self.log_dir()?;
         let log_file_name = self.log_file_name(&dir_path, bucket_id_opt, suffix);
         match File::create(&log_file_name) {
             Ok(file) => Ok(file),

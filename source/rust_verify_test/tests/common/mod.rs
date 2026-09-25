@@ -340,6 +340,10 @@ pub fn run_verus(
             verus_args.push("2024".to_string());
         } else if let Some(dir) = option.strip_prefix("--reach ") {
             verus_args.extend(["--reach".to_string(), dir.to_string()]);
+        } else if let Some(module) = option.strip_prefix("-V tla-export=") {
+            verus_args.extend(["-V".to_string(), format!("tla-export={module}")]);
+        } else if let Some(dir) = option.strip_prefix("--log-dir ") {
+            verus_args.extend(["--log-dir".to_string(), dir.to_string()]);
         } else {
             panic!("option '{}' not recognized by test harness", option);
         }
