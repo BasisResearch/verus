@@ -523,9 +523,10 @@ fn tla_export_euclid_parameters_do_not_clash_with_fields() {
     assert_eq!(run.distinct, 2, "{run:?}");
 }
 
-/// A cast to a bounded type is only known, by proof, to land in range: it is
-/// refused rather than printed as the identity (which let TLC reach x = 256
-/// and report `in_range` violated). A literal already in range is kept.
+/// A cast to a bounded type is only known, by proof, to land in range: an
+/// out-of-range value becomes some unspecified value of the type. Printed as
+/// the identity it would leave the type (or, under TypeOK, disable the step),
+/// so it is refused. A literal already in range is kept.
 const CLIP: &str = r#"
 verus! {
 pub struct State { pub x: u8 }
@@ -627,8 +628,184 @@ fn tla_export_reports_unassigned_variables_per_transition() {
             {"operator": "step_y", "unassigned": ["x"]},
         ])
     );
-    assert!(ex.cfg.contains("\\* Transition step_y never primes x:"), "{}", ex.cfg);
+    assert!(ex.cfg.contains("\\* Transition step_y never assigns x:"), "{}", ex.cfg);
     assert!(!ex.cfg.contains("step_x never"), "{}", ex.cfg);
     let Some(jar) = tla_tools() else { return };
     sany(&jar, &ex.spec());
+}
+
+/// Fields of bounded integer types, directly and inside a record, an enum
+/// payload, an Option and a Seq. In Verus the state is always within its
+/// types, so `dec` is disabled at x = 0 and `inc` at b = 255; without TypeOK
+/// TLC ran x below 0 and b up to 256, and reported `sum_in_range` (which
+/// Verus proves) violated.
+const TYPED: &str = r#"
+use vstd::prelude::*;
+verus! {
+pub struct Inner { pub c: u8, pub n: int }
+
+pub enum Tag { A, B(i8) }
+
+pub struct State { pub x: nat, pub b: u8, pub i: Inner, pub o: Option<u16>, pub t: Tag, pub s: Seq<u8> }
+
+pub open spec fn init(s: State) -> bool {
+    &&& s.x == 2
+    &&& s.b == 254
+    &&& s.i == Inner { c: 1, n: 0 }
+    &&& s.o == None::<u16>
+    &&& s.t == Tag::A
+    &&& s.s == Seq::<u8>::empty()
+}
+
+pub open spec fn dec(pre: State, post: State) -> bool {
+    post.x == pre.x - 1 && post.b == pre.b && post.i == pre.i && post.o == pre.o && post.t == pre.t
+        && post.s == pre.s
+}
+
+pub open spec fn inc(pre: State, post: State) -> bool {
+    post.b == pre.b + 1 && post.x == pre.x && post.i == pre.i && post.o == pre.o && post.t == pre.t
+        && post.s == pre.s
+}
+
+pub open spec fn next(pre: State, post: State) -> bool { dec(pre, post) || inc(pre, post) }
+
+pub open spec fn sum_in_range(s: State) -> bool { s.x + s.b <= 257 }
+}
+"#;
+
+#[test]
+fn tla_export_keeps_bounded_integers_in_their_types() {
+    let ex = export_code(TYPED, "test_crate");
+    assert_eq!(ex.report["refusals"], serde_json::json!([]), "{}", ex.tla);
+    assert_eq!(names(&ex.report["typed_variables"]), ["x", "b", "i", "o", "t", "s"]);
+    for pred in [
+        "/\\ (x >= 0)\n",
+        "/\\ (0 <= b /\\ b <= 255)\n",
+        "/\\ (0 <= i.c /\\ i.c <= 255)\n",
+        "/\\ (o.tag = \"Some\" => (0 <= o.v0 /\\ o.v0 <= 65535))\n",
+        "/\\ (t.tag = \"B\" => (-128 <= t.v0 /\\ t.v0 <= 127))\n",
+        "/\\ (\\A i__ \\in 1..Len(s) : (0 <= s[i__] /\\ s[i__] <= 255))\n",
+        "Init == init /\\ TypeOK\n",
+        "Next == next /\\ TypeOK'\n",
+    ] {
+        assert!(ex.tla.contains(pred), "{pred}\n{}", ex.tla);
+    }
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    // The bound only keeps a regression from running forever.
+    let run = tlc(&jar, &ex.spec(), &bounded(&ex, "x > -3 /\\ b < 258"));
+    assert_eq!(run.violated, Vec::<String>::new(), "{}", ex.tla);
+    // x in 0..2, b in 254..255.
+    assert_eq!(run.distinct, 6, "{run:?}");
+}
+
+/// A trait method call resolved to an impl runs the impl's body, which the
+/// trait's declaration lacks.
+const TRAIT_IMPL: &str = r#"
+verus! {
+pub trait Measure { spec fn measure(&self) -> int; }
+
+pub struct State { pub x: int }
+
+impl Measure for State {
+    open spec fn measure(&self) -> int { self.x * 2 }
+}
+
+pub open spec fn init(s: State) -> bool { s.x == 0 }
+
+pub open spec fn next(pre: State, post: State) -> bool { pre.x < 3 && post.x == pre.x + 1 }
+
+pub open spec fn measured(s: State) -> bool { s.measure() <= 6 }
+}
+"#;
+
+#[test]
+fn tla_export_calls_the_impl_of_a_trait_method() {
+    let ex = export_code(TRAIT_IMPL, "test_crate");
+    assert_eq!(ex.report["refusals"], serde_json::json!([]), "{}", ex.tla);
+    assert_eq!(names(&ex.report["invariants"]), ["measured"]);
+    assert!(ex.tla.contains("(x * 2)"), "{}", ex.tla);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let run = tlc(&jar, &ex.spec(), &ex.cfg);
+    assert_eq!(run.violated, Vec::<String>::new(), "{}", ex.tla);
+    assert_eq!(run.distinct, 4, "{run:?}");
+}
+
+/// Only a conjunct-level `v' = e` assigns `v`: not a guard reading `v'`, not
+/// a predicate conjoined on the post state, not a negated equality, and an
+/// `IF` only when both arms assign.
+const GUARDS: &str = r#"
+verus! {
+pub struct State { pub x: int, pub y: int }
+
+pub open spec fn init(s: State) -> bool { s.x == 0 && s.y == 0 }
+
+pub open spec fn pos(s: State) -> bool { s.y >= 0 }
+
+pub open spec fn guard_only(pre: State, post: State) -> bool { post.x == pre.x + 1 && post.y >= 0 }
+
+pub open spec fn via_primed(pre: State, post: State) -> bool { post.x == pre.x + 1 && pos(post) }
+
+pub open spec fn negated(pre: State, post: State) -> bool { post.x == pre.x + 1 && post.y != pre.y }
+
+pub open spec fn both_arms(pre: State, post: State) -> bool {
+    post.x == pre.x + 1 && (if pre.x < 3 { post.y == 1 } else { post.y == 2 })
+}
+
+pub open spec fn one_arm(pre: State, post: State) -> bool {
+    post.x == pre.x + 1 && (if pre.x < 3 { post.y == 1 } else { true })
+}
+
+pub open spec fn next(pre: State, post: State) -> bool {
+    guard_only(pre, post) || via_primed(pre, post) || negated(pre, post) || both_arms(pre, post)
+        || one_arm(pre, post)
+}
+}
+"#;
+
+#[test]
+fn tla_export_counts_only_conjunct_level_assignments() {
+    let ex = export_code(GUARDS, "test_crate");
+    assert_eq!(
+        ex.report["transitions"],
+        serde_json::json!([
+            {"operator": "both_arms", "unassigned": []},
+            {"operator": "guard_only", "unassigned": ["y"]},
+            {"operator": "negated", "unassigned": ["y"]},
+            {"operator": "one_arm", "unassigned": ["y"]},
+            {"operator": "via_primed", "unassigned": ["y"]},
+        ])
+    );
+    assert!(ex.cfg.contains("\\* Transition guard_only never assigns y:"), "{}", ex.cfg);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+}
+
+/// Backslashes and quotes in character (and string) literals are escaped.
+const ESCAPES: &str = r#"
+verus! {
+pub struct State { pub c: char }
+
+pub open spec fn init(s: State) -> bool { s.c == '\\' }
+
+pub open spec fn next(pre: State, post: State) -> bool {
+    post.c == (if pre.c == '\\' { '"' } else { '\\' })
+}
+
+pub open spec fn alternates(s: State) -> bool { s.c == '\\' || s.c == '"' }
+}
+"#;
+
+#[test]
+fn tla_export_escapes_string_literals() {
+    let ex = export_code(ESCAPES, "test_crate");
+    assert_eq!(ex.report["refusals"], serde_json::json!([]), "{}", ex.tla);
+    assert!(ex.tla.contains("(c = \"\\\\\")"), "{}", ex.tla);
+    assert!(ex.tla.contains("\"\\\"\""), "{}", ex.tla);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let run = tlc(&jar, &ex.spec(), &ex.cfg);
+    assert_eq!(run.violated, Vec::<String>::new(), "{}", ex.tla);
+    assert_eq!(run.distinct, 2, "{run:?}");
 }

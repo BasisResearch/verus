@@ -69,9 +69,9 @@ pub struct Candidate {
 
 /// A transition: an operator Next reaches through a disjunction, an `IF` or
 /// `match` branch, or an `exists`, together with the operators it conjoins,
-/// and the variables none of them primes. TLC stops on such a step with
-/// "successor state not completely specified"; in Verus the variable is
-/// unconstrained.
+/// and the variables none of them assigns (a conjunct-level `v' = e`). TLC
+/// stops on such a step with "successor state not completely specified"; in
+/// Verus the variable is unconstrained.
 #[derive(Debug, Clone, Serialize)]
 pub struct Transition {
     pub operator: String,
@@ -84,10 +84,12 @@ pub struct Report {
     pub shape: String,
     pub state_type: String,
     pub variables: Vec<String>,
+    /// The variables TypeOK keeps in their types' ranges.
+    pub typed_variables: Vec<String>,
     pub init: String,
     pub next: String,
     pub invariants: Vec<String>,
-    /// Every transition Next reaches, with the variables it leaves unprimed.
+    /// Every transition Next reaches, with the variables it leaves unassigned.
     pub transitions: Vec<Transition>,
     /// Invariants left out of the `.cfg` because they reach a refusal.
     pub skipped_invariants: Vec<String>,
@@ -120,6 +122,17 @@ const EUCLID_B: &str = "euclid_b";
 /// The module-level names the export generates beside the operators.
 const GENERATED_NAMES: [&str; 10] =
     ["Init", "Next", "Spec", "vars", "Inv", "TypeOK", EUCLID_DIV, EUCLID_MOD, EUCLID_A, EUCLID_B];
+
+/// How an operator is called, for [`Exporter::transitions`]: at conjunct
+/// level inside a branch (a transition of its own), at conjunct level
+/// outside any branch (part of its caller's transition), or elsewhere (a
+/// guard, an operand: it assigns nothing).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Reach {
+    Branch,
+    Conjoined,
+    Other,
+}
 
 /// An operator: a function, and whether it is the variant whose single
 /// state parameter is read as the primed variables (a callee given `post`
@@ -190,12 +203,22 @@ struct Exporter {
     /// body, an implication's consequent) enclose the expression being
     /// printed, within its operator.
     branch_depth: usize,
-    /// The operators each operator calls, and whether the call sits in a
-    /// branch; the calls of the operator being printed.
-    calls: HashMap<OpKey, Vec<(OpKey, bool)>>,
-    current_calls: Vec<(OpKey, bool)>,
-    /// The state variables each operator's own body primes.
-    primes: HashMap<OpKey, BTreeSet<String>>,
+    /// Whether the expression being printed sits at conjunct level of its
+    /// operator: reached from the body through conjunctions, `LET`s, the
+    /// arms of an `IF`, `match` or disjunction, and `exists` bodies only, so
+    /// `v' = e` there assigns `v`.
+    conj_level: bool,
+    /// The operators each operator calls, and how; the calls of the
+    /// operator being printed.
+    calls: HashMap<OpKey, Vec<(OpKey, Reach)>>,
+    current_calls: Vec<(OpKey, Reach)>,
+    /// The state variables each operator's own body assigns (a conjunct-level
+    /// `v' = e`, or one every branch of a conjunct-level `IF`, `match` or
+    /// disjunction makes); those the operator being printed assigns so far.
+    assigned: HashMap<OpKey, BTreeSet<String>>,
+    current_assigned: BTreeSet<String>,
+    /// The state datatype's field types, in the order of `state_fields`.
+    state_types: Vec<Typ>,
     holes: Vec<Hole>,
     refusals: Vec<Refusal>,
     constants: BTreeSet<String>,
@@ -354,6 +377,24 @@ fn peel(e: &Expr) -> Expr {
     }
 }
 
+/// A TLA+ string literal holding `s`.
+fn tla_string(s: &str) -> String {
+    let mut out = String::from("\"");
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            '\r' => out.push_str("\\r"),
+            '\x0c' => out.push_str("\\f"),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
 fn sanitize(s: &str) -> String {
     s.chars().map(|c| if c.is_alphanumeric() || c == '_' { c } else { '_' }).collect()
 }
@@ -494,7 +535,7 @@ impl Exporter {
         // TLC's `Assert` stops the check with the message wherever the
         // refused expression is evaluated, so a refusal never passes as TRUE.
         let msg = format!("tla-export refused: {what} at {}", span_string(span));
-        format!("Assert(FALSE, \"{}\")", msg.replace('\\', "\\\\").replace('"', "\\\""))
+        format!("Assert(FALSE, {})", tla_string(&msg))
     }
 
     /// Whether a name is taken at module level or reserved by TLA+.
@@ -595,16 +636,98 @@ impl Exporter {
 
     // ─── expressions ────────────────────────────────────────────────────
 
+    /// Print `e`. Below a node that is not conjunctive (see
+    /// [`conjunctive`]) nothing is at conjunct level, so nothing assigns.
     fn expr(&mut self, e: &Expr, env: &Env) -> String {
+        let level = self.conj_level;
+        if !conjunctive(e) {
+            self.conj_level = false;
+        }
+        let s = self.expr_at(e, env);
+        self.conj_level = level;
+        s
+    }
+
+    /// Run `f` off conjunct level: for a condition, a guard, an operand or
+    /// a bound, where `v' = e` does not assign `v`.
+    fn quiet<T>(&mut self, f: impl FnOnce(&mut Self) -> T) -> T {
+        let level = std::mem::replace(&mut self.conj_level, false);
+        let r = f(self);
+        self.conj_level = level;
+        r
+    }
+
+    /// Run `f` for one branch of an `IF`, `match` or disjunction, returning
+    /// what it assigns on its own; [`Exporter::meet`] keeps what every branch
+    /// assigns.
+    fn branch<T>(&mut self, f: impl FnOnce(&mut Self) -> T) -> (T, BTreeSet<String>) {
+        let outer = std::mem::take(&mut self.current_assigned);
+        let r = f(self);
+        (r, std::mem::replace(&mut self.current_assigned, outer))
+    }
+
+    /// A variable is assigned by a branching conjunct when every branch
+    /// assigns it.
+    fn meet(&mut self, branches: Vec<BTreeSet<String>>) {
+        let mut it = branches.into_iter();
+        let Some(first) = it.next() else { return };
+        let all = it.fold(first, |acc, b| acc.intersection(&b).cloned().collect());
+        self.current_assigned.extend(all);
+    }
+
+    /// The variable `e` reads as a primed field of the state (`post.f`).
+    fn post_field(&self, e: &Expr, env: &Env) -> Option<String> {
+        let is_post =
+            |v: Option<VarIdent>| v.and_then(|v| env.roles.get(&v).copied()) == Some(Role::Post);
+        let is_state = |dt: &Dt| matches!(dt, Dt::Path(p) if *p == self.state_path);
+        let e = peel(e);
+        match &e.x {
+            ExprX::UnaryOpr(UnaryOpr::Field(FieldOpr { datatype, field, .. }), inner)
+                if is_state(datatype) && is_post(read_var(inner)) =>
+            {
+                Some(self.state_var(&field_name(field)))
+            }
+            ExprX::ReadPlace(p, _) => match &p.x {
+                PlaceX::Field(FieldOpr { datatype, field, .. }, inner)
+                    if is_state(datatype) && is_post(place_var(inner)) =>
+                {
+                    Some(self.state_var(&field_name(field)))
+                }
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// At conjunct level, the variables `a = b` assigns: every variable when
+    /// one side is the whole post state, else a primed field on either side.
+    fn note_assignment(&mut self, a: &Expr, b: &Expr, env: &Env) {
+        if !self.conj_level {
+            return;
+        }
+        let whole =
+            |x: &Expr| read_var(x).and_then(|v| env.roles.get(&v).copied()) == Some(Role::Post);
+        if whole(a) || whole(b) {
+            self.current_assigned.extend(self.state_vars.iter().cloned());
+            return;
+        }
+        for side in [a, b] {
+            if let Some(v) = self.post_field(side, env) {
+                self.current_assigned.insert(v);
+            }
+        }
+    }
+
+    fn expr_at(&mut self, e: &Expr, env: &Env) -> String {
         match &e.x {
             ExprX::Const(c) => match c {
                 Constant::Bool(true) => "TRUE".into(),
                 Constant::Bool(false) => "FALSE".into(),
                 Constant::Int(i) => i.to_string(),
-                Constant::StrSlice(s) => format!("\"{}\"", s.replace('"', "\\\"")),
+                Constant::StrSlice(s) => tla_string(s),
                 Constant::Real(r) => r.clone(),
                 Constant::ByteStr(_) => self.refuse("byte string literal", &e.span),
-                Constant::Char(c) => format!("\"{}\"", c),
+                Constant::Char(c) => tla_string(&c.to_string()),
                 Constant::Float32(_) | Constant::Float64(_) => {
                     self.refuse("float literal", &e.span)
                 }
@@ -685,7 +808,12 @@ impl Exporter {
             ExprX::Logical(op, a, b) => {
                 let (sa, sb) = match op {
                     LogicalOp::And => (self.expr(a, env), self.expr(b, env)),
-                    LogicalOp::Or => (self.in_branch(a, env), self.in_branch(b, env)),
+                    LogicalOp::Or => {
+                        let (sa, aa) = self.branch(|x| x.in_branch(a, env));
+                        let (sb, ab) = self.branch(|x| x.in_branch(b, env));
+                        self.meet(vec![aa, ab]);
+                        (sa, sb)
+                    }
                     LogicalOp::Implies => (self.expr(a, env), self.in_branch(b, env)),
                 };
                 let sym = match op {
@@ -697,7 +825,8 @@ impl Exporter {
             }
             ExprX::Binary(op, a, b) => self.binary(e, op, a, b, env),
             ExprX::BinaryOpr(BinaryOpr::ExtEq(..), a, b) => {
-                format!("({} = {})", self.expr(a, env), self.expr(b, env))
+                self.note_assignment(a, b, env);
+                self.quiet(|x| format!("({} = {})", x.expr(a, env), x.expr(b, env)))
             }
             ExprX::Multi(MultiOp::Chained(ops), args) => {
                 let mut parts = Vec::new();
@@ -720,11 +849,13 @@ impl Exporter {
             ExprX::Choose { .. } => self.refuse("choose (TLC cannot evaluate it)", &e.span),
             ExprX::WithTriggers { body, .. } => self.expr(body, env),
             ExprX::If(c, t, f) => {
-                let (sc, st) = (self.expr(c, env), self.in_branch(t, env));
-                let sf = match f {
-                    Some(f) => self.in_branch(f, env),
-                    None => "TRUE".into(),
+                let sc = self.quiet(|x| x.expr(c, env));
+                let (st, at) = self.branch(|x| x.in_branch(t, env));
+                let (sf, af) = match f {
+                    Some(f) => self.branch(|x| x.in_branch(f, env)),
+                    None => ("TRUE".into(), BTreeSet::new()),
                 };
+                self.meet(vec![at, af]);
                 format!("(IF {sc} THEN {st} ELSE {sf})")
             }
             ExprX::Match(place, arms, _) => self.matches(e, place, arms, env),
@@ -747,12 +878,17 @@ impl Exporter {
         match op {
             BinaryOp::Eq(_) | BinaryOp::Ne => {
                 let sym = if matches!(op, BinaryOp::Eq(_)) { "=" } else { "#" };
-                // Whole-state equality with the post state on one side:
-                // one primed assignment per field, so TLC can enumerate.
-                if let Some(assign) = self.state_assignment(a, b, env) {
-                    return if sym == "=" { assign } else { format!("~({assign})") };
+                if sym == "=" {
+                    self.note_assignment(a, b, env);
                 }
-                format!("({} {sym} {})", self.expr(a, env), self.expr(b, env))
+                self.quiet(|x| {
+                    // Whole-state equality with the post state on one side:
+                    // one primed assignment per field, so TLC can enumerate.
+                    if let Some(assign) = x.state_assignment(a, b, env) {
+                        return if sym == "=" { assign } else { format!("~({assign})") };
+                    }
+                    format!("({} {sym} {})", x.expr(a, env), x.expr(b, env))
+                })
             }
             BinaryOp::Inequality(iq) => {
                 let sym = match iq {
@@ -984,7 +1120,7 @@ impl Exporter {
                         }
                         // The value is read in the scope before the binding,
                         // so `let x = x + 1` reads the outer `x`.
-                        let value = self.place(init, &env2);
+                        let value = self.quiet(|x| x.place(init, &env2));
                         let before = env2.clone();
                         let n = self.bind_var(&mut env2, name);
                         if let Some(v) = symbolic {
@@ -1013,11 +1149,12 @@ impl Exporter {
     }
 
     fn matches(&mut self, e: &Expr, place: &Place, arms: &Arms, env: &Env) -> String {
-        let scrutinee = self.place(place, env);
+        let scrutinee = self.quiet(|x| x.place(place, env));
         // Bind the scrutinee once, under a name fresh in this operator.
         let m = self.bind("m__");
         let mut chain: Vec<(String, String)> = Vec::new();
         let mut otherwise: Option<String> = None;
+        let mut arm_assigned = Vec::new();
         for arm in arms.iter() {
             let mut env2 = env.clone();
             let (cond, lets) = self.pattern(&m, &arm.x.pattern, &mut env2);
@@ -1029,9 +1166,11 @@ impl Exporter {
             let guard = if matches!(arm.x.guard.x, ExprX::Const(Constant::Bool(true))) {
                 None
             } else {
-                Some(in_lets(self.expr(&arm.x.guard, &env2)))
+                Some(in_lets(self.quiet(|x| x.expr(&arm.x.guard, &env2))))
             };
-            let body = in_lets(self.in_branch(&arm.x.body, &env2));
+            let (body, assigned) = self.branch(|x| x.in_branch(&arm.x.body, &env2));
+            arm_assigned.push(assigned);
+            let body = in_lets(body);
             let cond = match (cond, guard) {
                 (None, None) => None,
                 (Some(c), None) => Some(c),
@@ -1046,6 +1185,7 @@ impl Exporter {
                 }
             }
         }
+        self.meet(arm_assigned);
         // Verus checks that a match is exhaustive, so this branch is never
         // taken; it is not a refusal.
         let mut tail = otherwise
@@ -1108,7 +1248,10 @@ impl Exporter {
 
     fn call(&mut self, e: &Expr, target: &CallTarget, args: &Exprs, env: &Env) -> String {
         match target {
-            CallTarget::Fun(_, fun, _typs, _, _) => {
+            CallTarget::Fun(kind, fun, _typs, _, _) => {
+                // The arguments are operands; only the call itself is at the
+                // caller's level (restored for `ensure_function` below).
+                let level = std::mem::replace(&mut self.conj_level, false);
                 let friendly = fun_as_friendly_rust_name(fun);
                 if let Some(op) = vstd_op(&friendly) {
                     return self.vstd_call(e, op, args, env);
@@ -1146,6 +1289,7 @@ impl Exporter {
                         _ => {}
                     }
                 }
+                let fun = &self.resolved_fun(kind, fun);
                 let Some(callee) = self.functions.get(fun).cloned() else {
                     let what = format!("call to {friendly} (no definition in the crate)");
                     return self.refuse(what, &e.span);
@@ -1187,13 +1331,20 @@ impl Exporter {
                         None => printed.push(self.expr(a, env)),
                     }
                 }
+                self.conj_level = level;
                 let name = self.ensure_function(&(fun.clone(), primed));
                 if printed.is_empty() { name } else { format!("{name}({})", printed.join(", ")) }
             }
             CallTarget::FnSpec(f) => {
-                if let Some((params, body, mut env2, mut lets)) = self.resolve_closure(f, env, 0) {
+                // The application is reduced: the closure's body sits where
+                // the application does, and the arguments are operands.
+                let closure = self.quiet(|x| {
+                    let (params, body, mut env2, mut lets) = x.resolve_closure(f, env, 0)?;
                     let bindings = params.iter().map(|p| (p.name.clone(), p.a.clone()));
-                    self.bind_args(bindings, args, env, &mut env2, &mut lets);
+                    x.bind_args(bindings, args, env, &mut env2, &mut lets);
+                    Some((body, env2, lets))
+                });
+                if let Some((body, env2, lets)) = closure {
                     let b = self.expr(&body, &env2);
                     return if lets.is_empty() {
                         b
@@ -1209,6 +1360,18 @@ impl Exporter {
             CallTarget::BuiltinSpecFun(..) => self.refuse("call_requires/call_ensures", &e.span),
             CallTarget::AssumeExternal => self.refuse("external call", &e.span),
         }
+    }
+
+    /// The function a call runs: a trait method call that Verus resolved to
+    /// an impl (or a default method) runs that function, which has the body
+    /// the trait's declaration lacks.
+    fn resolved_fun(&self, kind: &CallTargetKind, fun: &Fun) -> Fun {
+        if let CallTargetKind::DynamicResolved { resolved, .. } = kind {
+            if self.functions.get(resolved).is_some_and(|f| f.x.body.is_some()) {
+                return resolved.clone();
+            }
+        }
+        fun.clone()
     }
 
     /// Bind parameters to the arguments of an application that is reduced
@@ -1268,7 +1431,8 @@ impl Exporter {
                 let (record, renv, mut lets) = self.resolve_record(inner, env, depth + 1)?;
                 self.closure_of_field(&record, field, renv, &mut lets, depth)
             }
-            ExprX::Call { target: CallTarget::Fun(_, fun, ..), args, .. } => {
+            ExprX::Call { target: CallTarget::Fun(kind, fun, ..), args, .. } => {
+                let fun = &self.resolved_fun(kind, fun);
                 let (body, env2, mut lets) = self.inline_call(fun, args, env)?;
                 let (params, cbody, cenv, mut clets) =
                     self.resolve_closure(&body, &env2, depth + 1)?;
@@ -1360,7 +1524,8 @@ impl Exporter {
                 self.resolve_record(&value, &venv, depth + 1)
             }
             ExprX::ReadPlace(p, _) => self.resolve_record_place(p, env, depth + 1),
-            ExprX::Call { target: CallTarget::Fun(_, fun, ..), args, .. } => {
+            ExprX::Call { target: CallTarget::Fun(kind, fun, ..), args, .. } => {
+                let fun = &self.resolved_fun(kind, fun);
                 let (body, env2, mut lets) = self.inline_call(fun, args, env)?;
                 let (record, renv, mut rlets) = self.resolve_record(&body, &env2, depth + 1)?;
                 lets.append(&mut rlets);
@@ -1522,7 +1687,9 @@ impl Exporter {
             // A binder's domain may read the binders before it (the
             // quantifiers nest) but not itself or the ones after it.
             let unbound: Vec<VarIdent> = binders[i..].iter().map(|b| b.name.clone()).collect();
-            let domain = match self.bound_from_guard(&b.name, &b.a, &unbound, &guard_exprs, &env2) {
+            let domain = match self
+                .quiet(|x| x.bound_from_guard(&b.name, &b.a, &unbound, &guard_exprs, &env2))
+            {
                 Some(d) => d,
                 None => match self.bound_from_type(&b.a, &e.span, &mut Vec::new()) {
                     Some(d) => d,
@@ -1748,19 +1915,115 @@ impl Exporter {
         s
     }
 
-    /// Keep what an operator's printed body primes and calls, for
+    /// Keep what an operator's body assigns and calls, for
     /// [`Exporter::transitions`].
-    fn record_body(&mut self, key: &OpKey, body: &str) {
-        let primed = primed_vars(body, &self.state_vars);
-        self.primes.insert(key.clone(), primed);
+    fn record_body(&mut self, key: &OpKey) {
+        let assigned = std::mem::take(&mut self.current_assigned);
+        self.assigned.insert(key.clone(), assigned);
         self.calls.insert(key.clone(), std::mem::take(&mut self.current_calls));
     }
 
+    /// `TypeOK`'s conjuncts: for each state variable whose type bounds its
+    /// integers, the predicate keeping it in range, with its variable.
+    fn type_ok(&mut self) -> Vec<(String, String)> {
+        self.bound.clear();
+        self.current = "TypeOK".into();
+        let mut out = Vec::new();
+        for (var, typ) in self.state_vars.clone().iter().zip(self.state_types.clone().iter()) {
+            let mut seen = vec![self.state_path.clone()];
+            if let Some(p) = self.type_pred(var, typ, &mut seen) {
+                out.push((var.clone(), p));
+            }
+        }
+        out
+    }
+
+    /// The predicate keeping `subject`, of type `typ`, in the type's range:
+    /// every integer it holds, through records, enum payloads, tuples and
+    /// `Seq`/`Set`/`Map` elements, within its integer type's bounds. `None`
+    /// when the type bounds nothing. `seen` holds the datatypes being
+    /// descended into, so a recursive datatype stops.
+    fn type_pred(&mut self, subject: &str, typ: &Typ, seen: &mut Vec<Path>) -> Option<String> {
+        let conj = |parts: Vec<String>| match parts.len() {
+            0 => None,
+            1 => parts.into_iter().next(),
+            _ => Some(format!("({})", parts.join(" /\\ "))),
+        };
+        match &**typ {
+            TypX::Int(range) => int_range_pred(subject, range),
+            TypX::Decorate(_, _, t) | TypX::Boxed(t) => self.type_pred(subject, t, seen),
+            TypX::Datatype(Dt::Tuple(_), args, _) => {
+                let mut parts = Vec::new();
+                for (i, a) in args.iter().enumerate() {
+                    parts.extend(self.type_pred(&format!("{subject}[{}]", i + 1), a, seen));
+                }
+                conj(parts)
+            }
+            TypX::Datatype(Dt::Path(p), args, _) => match path_as_friendly_rust_name(p).as_str() {
+                "vstd::seq::Seq" => {
+                    let i = self.bind("i__");
+                    let inner = self.type_pred(&format!("{subject}[{i}]"), args.first()?, seen)?;
+                    Some(format!("(\\A {i} \\in 1..Len({subject}) : {inner})"))
+                }
+                "vstd::set::Set" => {
+                    let x = self.bind("e__");
+                    let inner = self.type_pred(&x, args.first()?, seen)?;
+                    Some(format!("(\\A {x} \\in {subject} : {inner})"))
+                }
+                "vstd::map::Map" => {
+                    let k = self.bind("k__");
+                    let key = self.type_pred(&k, args.first()?, seen);
+                    let value = self.type_pred(&format!("{subject}[{k}]"), args.get(1)?, seen);
+                    let inner = conj(key.into_iter().chain(value).collect())?;
+                    Some(format!("(\\A {k} \\in DOMAIN {subject} : {inner})"))
+                }
+                _ => {
+                    if seen.contains(p) {
+                        return None;
+                    }
+                    let d = self.datatypes.get(p)?.clone();
+                    if d.x.typ_params.len() != args.len() {
+                        return None;
+                    }
+                    let tagged = d.x.variants.len() > 1;
+                    seen.push(p.clone());
+                    let mut parts = Vec::new();
+                    for v in d.x.variants.iter() {
+                        if v.name.to_string() == "dummy_to_use_type_params" {
+                            continue;
+                        }
+                        let mut fields = Vec::new();
+                        for f in v.fields.iter() {
+                            let ftyp = crate::sst_util::subst_typ_for_datatype(
+                                &d.x.typ_params,
+                                args,
+                                &f.a.0,
+                            );
+                            let sub = format!("{subject}.{}", field_name(&f.name));
+                            fields.extend(self.type_pred(&sub, &ftyp, seen));
+                        }
+                        match conj(fields) {
+                            Some(c) if tagged => {
+                                parts.push(format!("({subject}.tag = \"{}\" => {c})", v.name))
+                            }
+                            Some(c) => parts.push(c),
+                            None => {}
+                        }
+                    }
+                    seen.pop();
+                    conj(parts)
+                }
+            },
+            _ => None,
+        }
+    }
+
     /// The transitions Next reaches, each with the variables it leaves
-    /// unprimed. A transition is Next itself, or an operator called in a
-    /// branch of a transition or of an operator a transition conjoins. It
-    /// assigns what it and the operators it conjoins prime. One that only
-    /// branches further and primes nothing itself is not reported, since
+    /// unassigned. A transition is Next itself, or an operator called at
+    /// conjunct level in a branch of a transition or of an operator a
+    /// transition conjoins. It assigns what it and the operators it conjoins
+    /// (calls at conjunct level outside a branch) assign. One that only
+    /// branches further and assigns nothing itself is not reported, since
     /// its branches are.
     fn transitions(&self, next: &OpKey) -> Vec<Transition> {
         let mut out = Vec::new();
@@ -1776,26 +2039,32 @@ impl Exporter {
             let mut i = 0;
             let mut branches = false;
             while i < conj.len() {
-                for (callee, branch) in self.calls.get(&conj[i]).into_iter().flatten() {
-                    if *branch {
-                        branches = true;
-                        queue.push(callee.clone());
-                    } else if conj_seen.insert(callee.clone()) {
-                        conj.push(callee.clone());
+                for (callee, reach) in self.calls.get(&conj[i]).into_iter().flatten() {
+                    match reach {
+                        Reach::Branch => {
+                            branches = true;
+                            queue.push(callee.clone());
+                        }
+                        Reach::Conjoined => {
+                            if conj_seen.insert(callee.clone()) {
+                                conj.push(callee.clone());
+                            }
+                        }
+                        Reach::Other => {}
                     }
                 }
                 i += 1;
             }
-            let primed: BTreeSet<String> = conj
+            let assigned: BTreeSet<String> = conj
                 .iter()
-                .flat_map(|k| self.primes.get(k).into_iter().flatten())
+                .flat_map(|k| self.assigned.get(k).into_iter().flatten())
                 .cloned()
                 .collect();
-            if branches && primed.is_empty() {
+            if branches && assigned.is_empty() {
                 continue;
             }
             let unassigned =
-                self.state_vars.iter().filter(|v| !primed.contains(*v)).cloned().collect();
+                self.state_vars.iter().filter(|v| !assigned.contains(*v)).cloned().collect();
             let operator = self.op_names.get(&t).cloned().unwrap_or_default();
             out.push(Transition { operator, unassigned });
         }
@@ -1825,7 +2094,12 @@ impl Exporter {
     /// taints the operator being printed.
     fn ensure_function(&mut self, key: &OpKey) -> String {
         let name = self.op_name(key);
-        self.current_calls.push((key.clone(), self.branch_depth > 0));
+        let reach = match (self.conj_level, self.branch_depth > 0) {
+            (false, _) => Reach::Other,
+            (true, true) => Reach::Branch,
+            (true, false) => Reach::Conjoined,
+        };
+        self.current_calls.push((key.clone(), reach));
         if self.emitted.contains(key) || self.emitting.contains(key) {
             if self.tainted.contains(key) {
                 self.current_tainted = true;
@@ -1840,6 +2114,8 @@ impl Exporter {
         let previous_tainted = std::mem::replace(&mut self.current_tainted, false);
         let previous_depth = std::mem::replace(&mut self.branch_depth, 0);
         let previous_calls = std::mem::take(&mut self.current_calls);
+        let previous_assigned = std::mem::take(&mut self.current_assigned);
+        let previous_level = std::mem::replace(&mut self.conj_level, true);
         let mut env = Env::new();
         let roles = self.param_roles(&f);
         let mut params = Vec::new();
@@ -1876,8 +2152,10 @@ impl Exporter {
         }
         def.push_str(&format!("{head} ==\n    {body}\n"));
         self.defs.push(def);
-        self.record_body(key, &body);
+        self.record_body(key);
         self.current_calls = previous_calls;
+        self.current_assigned = previous_assigned;
+        self.conj_level = previous_level;
         self.branch_depth = previous_depth;
         if self.current_tainted {
             self.tainted.insert(key.clone());
@@ -1891,18 +2169,51 @@ impl Exporter {
     }
 }
 
-/// The variables among `vars` that `body` primes: `v'` with `v` a whole
-/// identifier.
-fn primed_vars(body: &str, vars: &[String]) -> BTreeSet<String> {
-    let ident = |c: char| c.is_alphanumeric() || c == '_';
-    vars.iter()
-        .filter(|v| {
-            let pat = format!("{v}'");
-            body.match_indices(&pat)
-                .any(|(i, _)| !body[..i].chars().next_back().map(ident).unwrap_or(false))
-        })
-        .cloned()
-        .collect()
+/// Whether a conjunct-level `e` keeps its conjunct-level children there: a
+/// conjunction, a `LET` block, an `IF`, `match` or disjunction (whose arms
+/// are, their conditions not), an equality (which assigns; its operands are
+/// not at conjunct level), a reduced closure application, an `exists`, and
+/// wrappers that print as their operand. Anything else (a negation, an
+/// implication, a `forall`, a call's arguments, arithmetic) is not. A call
+/// is conjunctive so its operator is recorded as called at conjunct level;
+/// its arguments are not.
+fn conjunctive(e: &Expr) -> bool {
+    match &e.x {
+        ExprX::Logical(LogicalOp::And | LogicalOp::Or, ..)
+        | ExprX::Block(..)
+        | ExprX::If(..)
+        | ExprX::Match(..)
+        | ExprX::Binary(BinaryOp::Eq(_), ..)
+        | ExprX::BinaryOpr(BinaryOpr::ExtEq(..), ..)
+        | ExprX::Call { target: CallTarget::FnSpec(_) | CallTarget::Fun(..), .. }
+        | ExprX::WithTriggers { .. }
+        | ExprX::ReadPlace(..)
+        | ExprX::UnaryOpr(
+            UnaryOpr::Box(_) | UnaryOpr::Unbox(_) | UnaryOpr::ProofNote(_) | UnaryOpr::CustomErr(_),
+            _,
+        )
+        | ExprX::Unary(UnaryOp::Trigger(_) | UnaryOp::CoerceMode { .. }, _) => true,
+        ExprX::Quant(q, ..) => matches!(q.quant, air::ast::Quant::Exists),
+        _ => false,
+    }
+}
+
+/// The predicate keeping the integer `s` in `range`, if the range bounds
+/// it. TLC's integers are 32-bit, so a bound beyond them (`u32`'s upper,
+/// `i32`'s and wider) is left out: TLC cannot reach it anyway, and
+/// stops with an overflow first. A `char` is a string here.
+fn int_range_pred(s: &str, range: &IntRange) -> Option<String> {
+    match range {
+        IntRange::Int | IntRange::Char | IntRange::ISize => None,
+        IntRange::I(bits) if *bits >= 32 => None,
+        IntRange::Nat | IntRange::USize => Some(format!("({s} >= 0)")),
+        IntRange::U(bits) if *bits >= 31 => Some(format!("({s} >= 0)")),
+        IntRange::U(bits) => Some(format!("(0 <= {s} /\\ {s} <= {})", (1u64 << bits) - 1)),
+        IntRange::I(bits) => {
+            let half = 1i64 << (bits - 1);
+            Some(format!("({} <= {s} /\\ {s} <= {})", -half, half - 1))
+        }
+    }
 }
 
 /// Whether the literal `i` lies in `range`. `usize`/`isize` are taken at 32
@@ -2213,6 +2524,8 @@ pub fn export_module(krate: &Krate, arg: &str) -> Result<Export, String> {
     if state_dt.x.variants.len() != 1 {
         return Err("the state type must be a struct".into());
     }
+    let state_types: Vec<Typ> =
+        state_dt.x.variants[0].fields.iter().map(|f| f.a.0.clone()).collect();
     let module_name = format!("{}_tla", sanitize(&last_segment(&triple.state)));
     // Each field is held in a variable of its own name, unless that name is
     // one the module generates (`vars`, `Init`, ...), the module's own name,
@@ -2253,9 +2566,12 @@ pub fn export_module(krate: &Krate, arg: &str) -> Result<Export, String> {
         tainted: HashSet::new(),
         current_tainted: false,
         branch_depth: 0,
+        conj_level: false,
         calls: HashMap::new(),
         current_calls: Vec::new(),
-        primes: HashMap::new(),
+        assigned: HashMap::new(),
+        current_assigned: BTreeSet::new(),
+        state_types,
         holes: Vec::new(),
         refusals: Vec::new(),
         constants: BTreeSet::new(),
@@ -2290,6 +2606,8 @@ pub fn export_module(krate: &Krate, arg: &str) -> Result<Export, String> {
             ex.current_tainted = false;
             ex.branch_depth = 0;
             ex.current_calls.clear();
+            ex.current_assigned.clear();
+            ex.conj_level = true;
             let body = match &f.x.body {
                 Some(b) => match &peel(b).x {
                     ExprX::Closure(params, body) => {
@@ -2311,7 +2629,7 @@ pub fn export_module(krate: &Krate, arg: &str) -> Result<Export, String> {
                 fun_as_friendly_rust_name(r),
                 span_string(&f.span)
             ));
-            ex.record_body(&key, &body);
+            ex.record_body(&key);
             ex.emitted.insert(key.clone());
             if ex.current_tainted {
                 ex.tainted.insert(key);
@@ -2356,6 +2674,10 @@ pub fn export_module(krate: &Krate, arg: &str) -> Result<Export, String> {
         }
     }
     let transitions = ex.transitions(&(triple.next.clone(), false));
+    // Verus's state is always within its fields' types, so a step that
+    // would leave them is disabled: TypeOK holds initially and after each
+    // step.
+    let type_ok = ex.type_ok();
     let inv_names: Vec<String> =
         invs.iter().filter(|(_, _, tainted)| !tainted).map(|(_, n, _)| n.clone()).collect();
     let skipped: Vec<String> =
@@ -2384,7 +2706,10 @@ pub fn export_module(krate: &Krate, arg: &str) -> Result<Export, String> {
         "\\* Map is a function (dom = DOMAIN, insert = :> @@); Option is a record tagged\n",
     );
     tla.push_str(
-        "\\* None/Some with field v0; nat/int/uN are Int; a spec fn is an operator, its\n",
+        "\\* None/Some with field v0; nat/int/uN are Int, and TypeOK keeps each variable\n",
+    );
+    tla.push_str(
+        "\\* in its type's range (conjoined to Init, primed to Next); a spec fn is an operator, its\n",
     );
     tla.push_str(
         "\\* pre/post state parameters dropped and read as the unprimed/primed variables;\n",
@@ -2435,8 +2760,19 @@ pub fn export_module(krate: &Krate, arg: &str) -> Result<Export, String> {
         tla.push_str(d);
         tla.push('\n');
     }
-    tla.push_str(&format!("Init == {init_name}\n"));
-    tla.push_str(&format!("Next == {next_name}\n"));
+    if type_ok.is_empty() {
+        tla.push_str(&format!("Init == {init_name}\n"));
+        tla.push_str(&format!("Next == {next_name}\n"));
+    } else {
+        tla.push_str(
+            "\\* The state's integer fields stay within their types, as in Verus.\nTypeOK ==\n",
+        );
+        for (_, p) in &type_ok {
+            tla.push_str(&format!("    /\\ {p}\n"));
+        }
+        tla.push_str(&format!("Init == {init_name} /\\ TypeOK\n"));
+        tla.push_str(&format!("Next == {next_name} /\\ TypeOK'\n"));
+    }
     tla.push_str("Spec == Init /\\ [][Next]_vars\n");
     if !inv_names.is_empty() {
         tla.push_str(&format!(
@@ -2477,17 +2813,21 @@ pub fn export_module(krate: &Krate, arg: &str) -> Result<Export, String> {
     }
     for t in transitions.iter().filter(|t| !t.unassigned.is_empty()) {
         cfg.push_str(&format!(
-            "\\* Transition {} never primes {}: TLC stops there with \"successor state not\n\\* completely specified\" (see the .tla.json transitions)\n",
+            "\\* Transition {} never assigns {}: TLC stops there with \"successor state not\n\\* completely specified\" (see the .tla.json transitions)\n",
             t.operator,
             t.unassigned.join(", ")
         ));
     }
+    cfg.push_str(
+        "\\* The unassigned check counts a conjunct-level v' = e (an IF, match or disjunction\n\\* when every branch assigns v). It can miss a v' read before the conjunct that\n\\* assigns it (TLC evaluates conjuncts in order) and does not count v' \\in S.\n",
+    );
     cfg.push_str("\\* CONSTRAINT <a state predicate bounding the model>\n");
     let report = Report {
         module: module.to_string(),
         shape: triple.shape.to_string(),
         state_type: path_as_friendly_rust_name(&triple.state),
         variables: state_vars,
+        typed_variables: type_ok.iter().map(|(v, _)| v.clone()).collect(),
         init: init_name,
         next: next_name,
         invariants: inv_names,

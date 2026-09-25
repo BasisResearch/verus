@@ -32,23 +32,41 @@ that `init`/`next` read unprimed (a guard, not an invariant). The report's
 `candidates` lists every candidate with whether it was included and why.
 `-V tla-export=<module>:inv1,inv2` checks exactly the named ones instead.
 
+A Verus state is always within its fields' types, so a step that would take
+a `nat` below 0 or a `u8` past 255 is not a step at all. The export keeps
+this with `TypeOK`: a range for every bounded integer the state holds,
+directly or inside a record, an enum payload, a tuple or a `Seq`/`Set`/`Map`,
+conjoined to `Init` and, primed, to `Next`. The report's `typed_variables`
+lists the variables it constrains. TLC's integers are 32-bit, so a bound
+beyond them (`u32`'s upper, `i32`'s, `u64`'s) is left out; TLC stops with an
+overflow before reaching it.
+
 Whatever the export cannot express is printed as `Assert(FALSE, "...")`, so
 TLC stops with the reason wherever it is evaluated. An invariant that reaches
 one is left out of the `.cfg` and listed in the report's
 `skipped_invariants`. A cast to a bounded type (`as u8`, `as nat`, ...) is
-one of these, unless it casts a literal already in range: Verus proves the
-value lands in the type's range, TLC cannot, and printing the cast as the
-identity would let the model leave the type.
+one of these, unless it casts a literal already in range: Verus gives an
+out-of-range value some unspecified value of the type, which the identity
+cannot express (it would leave the type, or under `TypeOK` disable the step).
+
+A trait method call that Verus resolved to an impl (`s.view()` with `impl
+View for State`) is exported as the impl's function.
 
 A transition that constrains only some of the fields (`post.x == pre.x + 1`
 and nothing about `y`) leaves the others unconstrained in Verus, but TLC
 cannot build the successor and stops with "successor state not completely
 specified". The report's `transitions` lists each transition `Next` reaches
-with the variables it never primes (`unassigned`), and the `.cfg` names any
+with the variables it never assigns (`unassigned`), and the `.cfg` names any
 that leaves one unassigned. A transition is `Next` itself or an operator
-called in a branch (a disjunct, an `IF` or `match` arm, an `exists` body),
-together with the operators it conjoins; a variable primed in one branch of
-a transition's own body but not in another is not caught.
+called at conjunct level in a branch (a disjunct, an `IF` or `match` arm, an
+`exists` body), together with the operators it conjoins. A variable counts as
+assigned only by a conjunct-level `v' = e` (or `post == e` for all of them),
+or by an `IF`, `match` or disjunction every branch of which assigns it; a
+guard reading `v'`, a predicate applied to the post state, or a negated
+equality does not assign. What the check can miss: it does not look at
+conjunct order, so a `v'` read before the conjunct that assigns it (which
+stops TLC) is not reported; and it does not count `v' \in S`, so a
+transition assigning that way is reported although TLC can enumerate it.
 
 `rust_verify_test/tests/tla_export.rs` exports the four fixtures (as crate
 `test_crate`, so the modules are `test_crate`, `test_crate::Adder`,
