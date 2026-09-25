@@ -48,9 +48,11 @@ Whatever the export cannot express is printed as `Assert(FALSE, "...")`, so
 TLC stops with the reason wherever it is evaluated. An invariant that reaches
 one is left out of the `.cfg` and listed in the report's
 `skipped_invariants`. A cast to a bounded type (`as u8`, `as nat`, ...) is
-one of these, unless it casts a literal already in range: Verus gives an
-out-of-range value some unspecified value of the type, which the identity
-cannot express (it would leave the type, or under `TypeOK` disable the step).
+one of these, unless it casts a literal already in range or widens (the
+operand's own type lies in the target's, as `u8` in `u16` or `nat`): Verus
+gives an out-of-range value some unspecified value of the type, which the
+identity cannot express (it would leave the type, or under `TypeOK` disable
+the step).
 
 A trait method call that Verus resolved to an impl (`s.view()` with `impl
 View for State`) is exported as the impl's function.
@@ -63,10 +65,14 @@ with the variables it never assigns (`unassigned`), and the `.cfg` names any
 that leaves one unassigned. A transition is `Next` itself or an operator
 called at conjunct level in a branch (a disjunct, an `IF` or `match` arm, an
 `exists` body), together with the operators it conjoins. A variable counts as
-assigned only by a conjunct-level `v' = e` (or `post == e` for all of them),
-or by an `IF`, `match` or disjunction every branch of which assigns it; a
-guard reading `v'`, a predicate applied to the post state, or a negated
-equality does not assign. TLC assigns only a primed variable on the left, so
+assigned only by a conjunct-level `v' = e` (or `post == e` or `post =~= e`
+for all of them), by a conjunct-level call to an operator that assigns it, or
+by an `IF`, `match` or disjunction every branch of which assigns it; a guard
+reading `v'`, a predicate applied to the post state, or a negated equality
+does not assign. A transition also counts what its callers assign around it,
+so a frame condition factored out of a disjunction (`(a || b) && post.z ==
+pre.z`) assigns `z` in both `a` and `b`. An operator that branches is
+reported only for a variable none of its called branches is reported for. TLC assigns only a primed variable on the left, so
 `pre.y == post.y` is printed as `y' = y`. With a primed field on both sides
 (`post.x == post.y`), the one assigned earlier in the operator goes on the
 right and the other is assigned; when neither is, nothing is, and the

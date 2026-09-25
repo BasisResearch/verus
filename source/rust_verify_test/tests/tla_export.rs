@@ -989,3 +989,136 @@ fn tla_export_says_when_no_invariant_is_checked() {
     sany(&jar, &ex.spec());
     sany(&jar, &none.spec());
 }
+
+/// `=~=` on the whole state assigns field by field, as `==` does (printed as
+/// a record equality, TLC stopped at once: "the identifier x is either
+/// undefined or not an operator").
+const WHOLE_EXT_EQ: &str = r#"
+verus! {
+pub struct State { pub x: int, pub y: int }
+
+pub open spec fn init(s: State) -> bool { s =~= State { x: 0, y: 0 } }
+
+pub open spec fn next(pre: State, post: State) -> bool {
+    pre.x < 2 && post =~= State { x: pre.x + 1, ..pre }
+}
+
+pub open spec fn small(s: State) -> bool { s.x <= 2 && s.y == 0 }
+}
+"#;
+
+#[test]
+fn tla_export_assigns_a_whole_state_ext_equality() {
+    let ex = export_code(WHOLE_EXT_EQ, "test_crate");
+    assert!(ex.tla.contains("(x = 0 /\\ y = 0)"), "{}", ex.tla);
+    assert!(ex.tla.contains("x' = (x + 1) /\\ y' = "), "{}", ex.tla);
+    assert_eq!(
+        ex.report["transitions"],
+        serde_json::json!([{"operator": "next", "unassigned": []}])
+    );
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let run = tlc(&jar, &ex.spec(), &ex.cfg);
+    assert_eq!(run.violated, Vec::<String>::new(), "{}", ex.tla);
+    assert_eq!(run.distinct, 3, "{run:?}");
+}
+
+/// A frame condition factored out of a disjunction: every step assigns `z`
+/// through the caller, and `next` assigns `x` and `y` through its branches,
+/// so nothing is unassigned (all three used to be reported, though TLC
+/// checks the model).
+const FRAME: &str = r#"
+verus! {
+pub struct State { pub x: int, pub y: int, pub z: int }
+
+pub open spec fn init(s: State) -> bool { s.x == 0 && s.y == 0 && s.z == 0 }
+
+pub open spec fn step_x(pre: State, post: State) -> bool {
+    pre.x < 2 && post.x == pre.x + 1 && post.y == pre.y
+}
+
+pub open spec fn step_y(pre: State, post: State) -> bool {
+    pre.y < 2 && post.y == pre.y + 1 && post.x == pre.x
+}
+
+pub open spec fn next(pre: State, post: State) -> bool {
+    (step_x(pre, post) || step_y(pre, post)) && post.z == pre.z
+}
+
+pub open spec fn small(s: State) -> bool { s.x + s.y <= 4 && s.z == 0 }
+}
+"#;
+
+#[test]
+fn tla_export_counts_a_frame_condition_around_a_disjunction() {
+    let ex = export_code(FRAME, "test_crate");
+    assert_eq!(
+        ex.report["transitions"],
+        serde_json::json!([
+            {"operator": "step_x", "unassigned": []},
+            {"operator": "step_y", "unassigned": []},
+        ])
+    );
+    assert!(!ex.cfg.contains("never assigns"), "{}", ex.cfg);
+    // A step that really leaves `x` out is still reported, and only it.
+    let gap = export_code(&FRAME.replace(" && post.x == pre.x\n", "\n"), "test_crate");
+    assert_eq!(
+        gap.report["transitions"],
+        serde_json::json!([
+            {"operator": "step_x", "unassigned": []},
+            {"operator": "step_y", "unassigned": ["x"]},
+        ])
+    );
+    // So is an inline branch that leaves it out: `next` is.
+    let inline = export_code(
+        &FRAME.replace("step_y(pre, post))", "(pre.y < 2 && post.y == pre.y + 1))"),
+        "test_crate",
+    );
+    assert_eq!(
+        inline.report["transitions"],
+        serde_json::json!([
+            {"operator": "next", "unassigned": ["x"]},
+            {"operator": "step_x", "unassigned": []},
+        ])
+    );
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let run = tlc(&jar, &ex.spec(), &ex.cfg);
+    assert_eq!(run.violated, Vec::<String>::new(), "{}", ex.tla);
+    // x, y in 0..2.
+    assert_eq!(run.distinct, 9, "{run:?}");
+}
+
+/// A widening cast (`u8` to `u16`, `i16`, `nat`) is the identity and is
+/// kept; a narrowing one is still refused.
+const WIDENING: &str = r#"
+verus! {
+pub struct State { pub b: u8 }
+
+pub open spec fn init(s: State) -> bool { s.b == 0 }
+
+pub open spec fn next(pre: State, post: State) -> bool { pre.b < 3 && post.b == pre.b + 1 }
+
+pub open spec fn wide(s: State) -> bool {
+    (s.b as u16) <= 3 && (s.b as i16) >= 0 && (s.b as nat) < 4 && (s.b as u32) != 5
+}
+
+pub open spec fn narrow(s: State) -> bool { (s.b as i8) >= 0 }
+}
+"#;
+
+#[test]
+fn tla_export_keeps_a_widening_cast() {
+    let ex = export_code(WIDENING, "test_crate");
+    assert!(ex.tla.contains("(b <= 3)"), "{}", ex.tla);
+    assert_eq!(names(&ex.report["invariants"]), ["wide"]);
+    assert_eq!(names(&ex.report["skipped_invariants"]), ["narrow"]);
+    let refusals = ex.report["refusals"].as_array().unwrap();
+    assert_eq!(refusals.len(), 1, "{}", ex.report["refusals"]);
+    assert!(refusals[0]["what"].as_str().unwrap().contains("cast to i8"), "{:?}", refusals);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let run = tlc(&jar, &ex.spec(), &ex.cfg);
+    assert_eq!(run.violated, Vec::<String>::new(), "{}", ex.tla);
+    assert_eq!(run.distinct, 4, "{run:?}");
+}

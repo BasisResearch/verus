@@ -135,6 +135,15 @@ enum Reach {
     Other,
 }
 
+/// A call recorded for [`Exporter::transitions`]: the callee, how it is
+/// reached, and what the branches enclosing the call (within the caller)
+/// assign, which TLC has assigned too on any step through the call.
+struct Call {
+    callee: OpKey,
+    reach: Reach,
+    context: BTreeSet<String>,
+}
+
 /// An operator: a function, and whether it is the variant whose single
 /// state parameter is read as the primed variables (a callee given `post`
 /// where it declares one state parameter).
@@ -209,13 +218,15 @@ struct Exporter {
     /// arms of an `IF`, `match` or disjunction, and `exists` bodies only, so
     /// `v' = e` there assigns `v`.
     conj_level: bool,
-    /// The operators each operator calls, and how; the calls of the
+    /// The operators each operator calls, how, and (for a call in a branch)
+    /// what the branches enclosing the call assign; the calls of the
     /// operator being printed.
-    calls: HashMap<OpKey, Vec<(OpKey, Reach)>>,
-    current_calls: Vec<(OpKey, Reach)>,
-    /// The state variables each operator's own body assigns (a conjunct-level
-    /// `v' = e`, or one every branch of a conjunct-level `IF`, `match` or
-    /// disjunction makes); those the operator being printed assigns so far.
+    calls: HashMap<OpKey, Vec<Call>>,
+    current_calls: Vec<Call>,
+    /// The state variables each operator assigns on every path through it (a
+    /// conjunct-level `v' = e`, what an operator it calls at conjunct level
+    /// assigns, or what every branch of a conjunct-level `IF`, `match` or
+    /// disjunction assigns); those the operator being printed assigns so far.
     assigned: HashMap<OpKey, BTreeSet<String>>,
     current_assigned: BTreeSet<String>,
     /// What the branches enclosing the one being printed had assigned when
@@ -665,12 +676,21 @@ impl Exporter {
     /// Run `f` for one branch of an `IF`, `match` or disjunction, returning
     /// what it assigns on its own; [`Exporter::meet`] keeps what every branch
     /// assigns.
+    /// What the branch assigns is also the context of every transition it
+    /// calls.
     fn branch<T>(&mut self, f: impl FnOnce(&mut Self) -> T) -> (T, BTreeSet<String>) {
         let outer = std::mem::take(&mut self.current_assigned);
         self.enclosing_assigned.push(outer);
+        let first_call = self.current_calls.len();
         let r = f(self);
         let outer = self.enclosing_assigned.pop().expect("pushed above");
-        (r, std::mem::replace(&mut self.current_assigned, outer))
+        let assigned = std::mem::replace(&mut self.current_assigned, outer);
+        for call in &mut self.current_calls[first_call..] {
+            if call.reach == Reach::Branch {
+                call.context.extend(assigned.iter().cloned());
+            }
+        }
+        (r, assigned)
     }
 
     /// Whether the operator being printed has assigned `v` so far, in the
@@ -785,8 +805,13 @@ impl Exporter {
                 // Verus proves and TLC cannot see: printed as the identity it
                 // would give values outside the type, and a check that
                 // stopped there would turn the proof-time fact into a
-                // runtime failure. Only a literal already in range is kept.
+                // runtime failure. Only a literal already in range, or an
+                // operand whose own type lies within the range (a widening
+                // cast, `u8` to `u16`), is kept.
                 UnaryOp::Clip { range: IntRange::Int, .. } => self.expr(inner, env),
+                UnaryOp::Clip { range, .. } if int_typ_within(&inner.typ, range) => {
+                    self.expr(inner, env)
+                }
                 UnaryOp::Clip { range, .. } => match &peel(inner).x {
                     ExprX::Const(Constant::Int(i)) if int_in_range(i, range) => i.to_string(),
                     _ => {
@@ -855,7 +880,12 @@ impl Exporter {
             ExprX::BinaryOpr(BinaryOpr::ExtEq(..), a, b) => {
                 let (a, b) = if self.orient(a, b, env).0 { (b, a) } else { (a, b) };
                 self.note_assignment(a, b, env);
-                self.quiet(|x| format!("({} = {})", x.expr(a, env), x.expr(b, env)))
+                // TLA+ values are extensional, so `=~=` is `=`; on the whole
+                // state it assigns field by field, as `==` does.
+                self.quiet(|x| match x.state_assignment(a, b, env) {
+                    Some(assign) => assign,
+                    None => format!("({} = {})", x.expr(a, env), x.expr(b, env)),
+                })
             }
             ExprX::Multi(MultiOp::Chained(ops), args) => {
                 let mut parts = Vec::new();
@@ -2052,33 +2082,47 @@ impl Exporter {
     /// The transitions Next reaches, each with the variables it leaves
     /// unassigned. A transition is Next itself, or an operator called at
     /// conjunct level in a branch of a transition or of an operator a
-    /// transition conjoins. It assigns what it and the operators it conjoins
-    /// (calls at conjunct level outside a branch) assign. One that only
-    /// branches further and assigns nothing itself is not reported, since
-    /// its branches are.
+    /// transition conjoins. A step through it assigns what it and the
+    /// operators it conjoins assign (on every path through them), and what
+    /// its callers assign around the call: outside the branch it sits in,
+    /// or inside that branch. An operator that branches is reported only for
+    /// a variable no transition in its branches is reported for (one its own
+    /// inline branches leave unassigned), since its branches are reported;
+    /// an operator reached from several places is reported for every
+    /// variable some place leaves unassigned.
     fn transitions(&self, next: &OpKey) -> Vec<Transition> {
-        let mut out = Vec::new();
-        let mut seen: HashSet<OpKey> = HashSet::new();
-        let mut queue = vec![next.clone()];
-        while let Some(t) = queue.pop() {
-            if !seen.insert(t.clone()) {
+        struct Node {
+            op: OpKey,
+            unassigned: BTreeSet<String>,
+            children: Vec<usize>,
+        }
+        let mut nodes: Vec<Node> = Vec::new();
+        let mut index: HashMap<(OpKey, BTreeSet<String>), usize> = HashMap::new();
+        // An operator, what its callers have assigned around it, and the
+        // node it was reached from.
+        let mut queue: Vec<(OpKey, BTreeSet<String>, Option<usize>)> =
+            vec![(next.clone(), BTreeSet::new(), None)];
+        while let Some((t, context, parent)) = queue.pop() {
+            let key = (t.clone(), context.clone());
+            if let Some(&id) = index.get(&key) {
+                if let Some(p) = parent {
+                    nodes[p].children.push(id);
+                }
                 continue;
             }
-            // The operators `t` conjoins, `t` included.
+            // The operators `t` conjoins, `t` included, and the calls in
+            // their branches.
             let mut conj: Vec<OpKey> = vec![t.clone()];
             let mut conj_seen: HashSet<OpKey> = HashSet::from([t.clone()]);
+            let mut branch_calls: Vec<(OpKey, &BTreeSet<String>)> = Vec::new();
             let mut i = 0;
-            let mut branches = false;
             while i < conj.len() {
-                for (callee, reach) in self.calls.get(&conj[i]).into_iter().flatten() {
-                    match reach {
-                        Reach::Branch => {
-                            branches = true;
-                            queue.push(callee.clone());
-                        }
+                for call in self.calls.get(&conj[i]).into_iter().flatten() {
+                    match call.reach {
+                        Reach::Branch => branch_calls.push((call.callee.clone(), &call.context)),
                         Reach::Conjoined => {
-                            if conj_seen.insert(callee.clone()) {
-                                conj.push(callee.clone());
+                            if conj_seen.insert(call.callee.clone()) {
+                                conj.push(call.callee.clone());
                             }
                         }
                         Reach::Other => {}
@@ -2086,21 +2130,49 @@ impl Exporter {
                 }
                 i += 1;
             }
-            let assigned: BTreeSet<String> = conj
-                .iter()
-                .flat_map(|k| self.assigned.get(k).into_iter().flatten())
-                .cloned()
-                .collect();
-            if branches && assigned.is_empty() {
-                continue;
+            let mut assigned = context;
+            for k in &conj {
+                assigned.extend(self.assigned.get(k).into_iter().flatten().cloned());
             }
             let unassigned =
                 self.state_vars.iter().filter(|v| !assigned.contains(*v)).cloned().collect();
-            let operator = self.op_names.get(&t).cloned().unwrap_or_default();
-            out.push(Transition { operator, unassigned });
+            let id = nodes.len();
+            nodes.push(Node { op: t, unassigned, children: Vec::new() });
+            index.insert(key, id);
+            if let Some(p) = parent {
+                nodes[p].children.push(id);
+            }
+            for (callee, around) in branch_calls {
+                let mut inner = assigned.clone();
+                inner.extend(around.iter().cloned());
+                queue.push((callee, inner, Some(id)));
+            }
         }
-        out.sort_by(|a, b| a.operator.cmp(&b.operator));
-        out
+        let mut per_op: BTreeMap<String, Option<BTreeSet<String>>> = BTreeMap::new();
+        for n in &nodes {
+            let operator = self.op_names.get(&n.op).cloned().unwrap_or_default();
+            let covered: BTreeSet<&String> =
+                n.children.iter().flat_map(|c| nodes[*c].unassigned.iter()).collect();
+            if !n.children.is_empty() && n.unassigned.iter().all(|v| covered.contains(v)) {
+                // Leave it to its branches, unless it is reported elsewhere.
+                per_op.entry(operator).or_default();
+                continue;
+            }
+            per_op
+                .entry(operator)
+                .or_default()
+                .get_or_insert_with(BTreeSet::new)
+                .extend(n.unassigned.iter().cloned());
+        }
+        per_op
+            .into_iter()
+            .filter_map(|(operator, unassigned)| {
+                let unassigned = unassigned?;
+                let unassigned =
+                    self.state_vars.iter().filter(|v| unassigned.contains(*v)).cloned().collect();
+                Some(Transition { operator, unassigned })
+            })
+            .collect()
     }
 
     /// The role of each parameter: a state-typed parameter is pre or post
@@ -2130,11 +2202,12 @@ impl Exporter {
             (true, true) => Reach::Branch,
             (true, false) => Reach::Conjoined,
         };
-        self.current_calls.push((key.clone(), reach));
+        self.current_calls.push(Call { callee: key.clone(), reach, context: BTreeSet::new() });
         if self.emitted.contains(key) || self.emitting.contains(key) {
             if self.tainted.contains(key) {
                 self.current_tainted = true;
             }
+            self.assign_through_call(key, reach);
             return name;
         }
         let (fun, primed) = key;
@@ -2198,7 +2271,19 @@ impl Exporter {
         self.current_tainted = previous_tainted || self.tainted.contains(key);
         self.emitting.remove(key);
         self.emitted.insert(key.clone());
+        self.assign_through_call(key, reach);
         name
+    }
+
+    /// A call at conjunct level assigns what its operator assigns on every
+    /// path (nothing yet known for a recursive call still being printed).
+    fn assign_through_call(&mut self, key: &OpKey, reach: Reach) {
+        if reach == Reach::Other {
+            return;
+        }
+        if let Some(assigned) = self.assigned.get(key) {
+            self.current_assigned.extend(assigned.iter().cloned());
+        }
     }
 }
 
@@ -2267,6 +2352,30 @@ fn int_in_range(i: &num_bigint::BigInt, range: &IntRange) -> bool {
         IntRange::USize => unsigned(32),
         IntRange::ISize => signed(32),
         IntRange::Char => false,
+    }
+}
+
+/// Whether every value of the integer type `typ` lies in `range`, so a cast
+/// to `range` is the identity. `usize`/`isize` are taken at 32 or 64 bits,
+/// whichever makes the answer hold on both.
+fn int_typ_within(typ: &Typ, range: &IntRange) -> bool {
+    let TypX::Int(from) = &*crate::ast_util::undecorate_typ(typ) else { return false };
+    match (from, range) {
+        (_, IntRange::Int) => true,
+        (IntRange::Nat | IntRange::U(_) | IntRange::USize, IntRange::Nat) => true,
+        (IntRange::U(a), IntRange::U(b)) => a <= b,
+        (IntRange::U(a), IntRange::I(b)) => a < b,
+        (IntRange::U(a), IntRange::USize) => *a <= 32,
+        (IntRange::U(a), IntRange::ISize) => *a < 32,
+        (IntRange::I(a), IntRange::I(b)) => a <= b,
+        (IntRange::I(a), IntRange::ISize) => *a <= 32,
+        (IntRange::USize, IntRange::U(b)) => *b >= 64,
+        (IntRange::USize, IntRange::I(b)) => *b > 64,
+        (IntRange::ISize, IntRange::I(b)) => *b >= 64,
+        (IntRange::USize, IntRange::USize)
+        | (IntRange::ISize, IntRange::ISize)
+        | (IntRange::Char, IntRange::Char) => true,
+        _ => false,
     }
 }
 
