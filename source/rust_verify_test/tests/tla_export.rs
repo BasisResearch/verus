@@ -809,3 +809,183 @@ fn tla_export_escapes_string_literals() {
     assert_eq!(run.violated, Vec::<String>::new(), "{}", ex.tla);
     assert_eq!(run.distinct, 2, "{run:?}");
 }
+
+/// A frame condition with the post state on the right: TLC assigns only a
+/// primed variable on the left, so `pre.y == post.y` must print as
+/// `y' = y` (as `(y = y')` TLC stopped: "the identifier y is either undefined
+/// or not an operator"), and likewise for `=~=`.
+const REVERSED: &str = r#"
+use vstd::prelude::*;
+verus! {
+pub struct State { pub x: nat, pub y: nat, pub s: Seq<int> }
+
+pub open spec fn init(s: State) -> bool { s.x == 0 && s.y == 5 && s.s == Seq::<int>::empty() }
+
+pub open spec fn next(pre: State, post: State) -> bool {
+    &&& pre.x < 3
+    &&& post.x == pre.x + 1
+    &&& pre.y == post.y
+    &&& pre.s =~= post.s
+}
+
+pub open spec fn y_fixed(s: State) -> bool { s.y == 5 && s.s.len() == 0 }
+}
+"#;
+
+#[test]
+fn tla_export_puts_the_assigned_variable_on_the_left() {
+    let ex = export_code(REVERSED, "test_crate");
+    assert_eq!(ex.report["refusals"], serde_json::json!([]), "{}", ex.tla);
+    assert!(ex.tla.contains("(y' = y)"), "{}", ex.tla);
+    assert!(ex.tla.contains("(s' = s)"), "{}", ex.tla);
+    assert_eq!(
+        ex.report["transitions"],
+        serde_json::json!([{"operator": "next", "unassigned": []}])
+    );
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let run = tlc(&jar, &ex.spec(), &ex.cfg);
+    assert_eq!(run.violated, Vec::<String>::new(), "{}", ex.tla);
+    assert_eq!(run.distinct, 4, "{run:?}");
+}
+
+/// A primed field on both sides: the one assigned earlier (in the operator,
+/// or before an enclosing branch) goes on the right and the other is
+/// assigned.
+const BOTH_PRIMED: &str = r#"
+verus! {
+pub struct State { pub x: int, pub y: int }
+
+pub open spec fn init(s: State) -> bool { s.x == 0 && s.y == 0 }
+
+pub open spec fn copy_after(pre: State, post: State) -> bool {
+    pre.x < 2 && post.x == pre.x + 1 && post.x == post.y
+}
+
+pub open spec fn copy_in_branch(pre: State, post: State) -> bool {
+    &&& pre.x < 2
+    &&& post.x == pre.x + 2
+    &&& if pre.x == 0 { post.y == post.x } else { post.x == post.y }
+}
+
+pub open spec fn next(pre: State, post: State) -> bool {
+    copy_after(pre, post) || copy_in_branch(pre, post)
+}
+
+pub open spec fn same(s: State) -> bool { s.x == s.y }
+}
+"#;
+
+#[test]
+fn tla_export_orients_an_equality_of_two_primed_fields() {
+    let ex = export_code(BOTH_PRIMED, "test_crate");
+    assert_eq!(
+        ex.report["transitions"],
+        serde_json::json!([
+            {"operator": "copy_after", "unassigned": []},
+            {"operator": "copy_in_branch", "unassigned": []},
+        ])
+    );
+    assert!(ex.tla.contains("(y' = x')"), "{}", ex.tla);
+    assert!(!ex.tla.contains("(x' = y')"), "{}", ex.tla);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let run = tlc(&jar, &ex.spec(), &ex.cfg);
+    assert_eq!(run.violated, Vec::<String>::new(), "{}", ex.tla);
+    // (0,0), (1,1), (2,2), (3,3).
+    assert_eq!(run.distinct, 4, "{run:?}");
+}
+
+/// Neither primed field assigned yet: the equality assigns nothing, and the
+/// transition is reported (TLC cannot evaluate `y' = x'` there).
+const BOTH_PRIMED_FIRST: &str = r#"
+verus! {
+pub struct State { pub x: int, pub y: int }
+
+pub open spec fn init(s: State) -> bool { s.x == 0 && s.y == 0 }
+
+pub open spec fn next(pre: State, post: State) -> bool {
+    pre.x < 2 && post.y == post.x && post.x == pre.x + 1
+}
+}
+"#;
+
+#[test]
+fn tla_export_reports_an_equality_of_two_unassigned_primed_fields() {
+    let ex = export_code(BOTH_PRIMED_FIRST, "test_crate");
+    assert_eq!(
+        ex.report["transitions"],
+        serde_json::json!([{"operator": "next", "unassigned": ["y"]}])
+    );
+    assert!(ex.cfg.contains("\\* Transition next never assigns y:"), "{}", ex.cfg);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+}
+
+/// A hand-rolled invariant named `invariant` is checked by default.
+const NAMED_INVARIANT: &str = r#"
+verus! {
+pub struct State { pub x: int }
+
+pub open spec fn init(s: State) -> bool { s.x == 0 }
+
+pub open spec fn next(pre: State, post: State) -> bool { pre.x < 3 && post.x == pre.x + 1 }
+
+// Violated: x reaches 3.
+pub open spec fn invariant(s: State) -> bool { s.x < 3 }
+}
+"#;
+
+#[test]
+fn tla_export_checks_a_hand_rolled_invariant_named_invariant() {
+    let ex = export_code(NAMED_INVARIANT, "test_crate");
+    assert_eq!(names(&ex.report["invariants"]), ["invariant"]);
+    assert!(ex.cfg.contains("INVARIANTS\n  invariant\n"), "{}", ex.cfg);
+    assert!(!ex.cfg.contains("No invariant is checked"), "{}", ex.cfg);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let run = tlc(&jar, &ex.spec(), &ex.cfg);
+    assert_eq!(run.violated, ["invariant"], "{}", ex.tla);
+}
+
+/// No invariant checked: the .cfg says so rather than let TLC report "No
+/// error has been found" silently, with no candidate at all or with the
+/// candidates and why none is included.
+const NO_INVARIANT: &str = r#"
+verus! {
+pub struct State { pub x: int }
+
+pub open spec fn init(s: State) -> bool { s.x == 0 }
+
+pub open spec fn can_step(s: State) -> bool { s.x < 3 }
+
+pub open spec fn next(pre: State, post: State) -> bool { can_step(pre) && post.x == pre.x + 1 }
+}
+"#;
+
+#[test]
+fn tla_export_says_when_no_invariant_is_checked() {
+    let ex = export_code(NO_INVARIANT, "test_crate");
+    assert_eq!(names(&ex.report["invariants"]), Vec::<String>::new());
+    assert!(!ex.cfg.contains("INVARIANTS"), "{}", ex.cfg);
+    assert!(
+        ex.cfg.contains("\\* No invariant is checked. The candidates (see the .tla.json report):\n\\*   test_crate::can_step: reached from init/next unprimed"),
+        "{}",
+        ex.cfg
+    );
+    let none = export_code(
+        &NO_INVARIANT.replace("can_step(pre)", "pre.x < 3").replace(
+            "pub open spec fn can_step(s: State) -> bool { s.x < 3 }",
+            "pub open spec fn bump(x: int) -> int { x + 1 }",
+        ),
+        "test_crate",
+    );
+    assert!(
+        none.cfg.contains("\\* No invariant is checked: the module has no candidate invariant.\n"),
+        "{}",
+        none.cfg
+    );
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    sany(&jar, &none.spec());
+}

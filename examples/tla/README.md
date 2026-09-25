@@ -27,10 +27,13 @@ what was recognised, refused and left unbounded.
 
 The invariants are, by default, the `#[invariant]` methods for VerusSync,
 every closure `() -> spec_fn(State) -> bool` for verus-tla, and every
-`(State) -> bool` spec fn in the module for a hand-rolled model, except one
-that `init`/`next` read unprimed (a guard, not an invariant). The report's
-`candidates` lists every candidate with whether it was included and why.
-`-V tla-export=<module>:inv1,inv2` checks exactly the named ones instead.
+`(State) -> bool` spec fn in the module for a hand-rolled model (one named
+`invariant` included), except one that `init`/`next` read unprimed (a guard,
+not an invariant). The report's `candidates` lists every candidate with
+whether it was included and why. `-V tla-export=<module>:inv1,inv2` checks
+exactly the named ones instead. When no invariant is checked, the `.cfg`
+says so and lists the candidates with their reasons, since TLC with no
+invariant reports "No error has been found".
 
 A Verus state is always within its fields' types, so a step that would take
 a `nat` below 0 or a `u8` past 255 is not a step at all. The export keeps
@@ -63,7 +66,11 @@ called at conjunct level in a branch (a disjunct, an `IF` or `match` arm, an
 assigned only by a conjunct-level `v' = e` (or `post == e` for all of them),
 or by an `IF`, `match` or disjunction every branch of which assigns it; a
 guard reading `v'`, a predicate applied to the post state, or a negated
-equality does not assign. What the check can miss: it does not look at
+equality does not assign. TLC assigns only a primed variable on the left, so
+`pre.y == post.y` is printed as `y' = y`. With a primed field on both sides
+(`post.x == post.y`), the one assigned earlier in the operator goes on the
+right and the other is assigned; when neither is, nothing is, and the
+transition is reported. What the check can miss: it does not look at
 conjunct order, so a `v'` read before the conjunct that assigns it (which
 stops TLC) is not reported; and it does not count `v' \in S`, so a
 transition assigning that way is reported although TLC can enumerate it.
