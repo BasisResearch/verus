@@ -132,6 +132,11 @@ const EUCLID_MOD: &str = "EuclidMod";
 const EUCLID_A: &str = "euclid_a";
 const EUCLID_B: &str = "euclid_b";
 
+/// The most values a quantifier's domain read off its type alone may take
+/// (a `u8` or `i8` whole, a record of a few small fields); a larger type, or
+/// a larger variant of a datatype, is a hole constant the .cfg supplies.
+const MAX_TYPE_DOMAIN: u128 = 1 << 10;
+
 /// The module-level names the export generates beside the operators.
 const GENERATED_NAMES: [&str; 10] =
     ["Init", "Next", "Spec", "vars", "Inv", "TypeOK", EUCLID_DIV, EUCLID_MOD, EUCLID_A, EUCLID_B];
@@ -1986,7 +1991,7 @@ impl Exporter {
             {
                 Some(d) => d,
                 None => match self.bound_from_type(&b.a, &e.span, &mut Vec::new()) {
-                    Some(d) => d,
+                    Some((d, _)) => d,
                     None => {
                         let constant = format!("Dom_{}", sanitize(&typ_name(&b.a)));
                         self.constants.insert(constant.clone());
@@ -2012,9 +2017,13 @@ impl Exporter {
         out
     }
 
-    /// A finite domain from the type alone: booleans, and enums whose
-    /// variants' fields are themselves bounded (a variant's field of an
-    /// unbounded type becomes a hole constant of its own).
+    /// A finite domain from the type alone, with its number of elements:
+    /// booleans, integer types of at most [`MAX_TYPE_DOMAIN`] values (`u8`,
+    /// `i8`), and datatypes whose fields are themselves bounded. A field of
+    /// an unbounded type becomes a hole constant of its own, and so does
+    /// every field of more than one value in a variant whose fields together
+    /// would take more than [`MAX_TYPE_DOMAIN`] values (a `Step::Upd(u8, u8)`
+    /// has 65536), so TLC never enumerates a domain it cannot get through.
     /// `seen` holds the datatypes being bounded, so a recursive datatype is
     /// a hole rather than an endless recursion.
     fn bound_from_type(
@@ -2022,14 +2031,13 @@ impl Exporter {
         typ: &Typ,
         span: &crate::messages::Span,
         seen: &mut Vec<Path>,
-    ) -> Option<String> {
+    ) -> Option<(String, u128)> {
         match &**typ {
-            TypX::Bool => Some("BOOLEAN".into()),
-            // An integer type of at most 16 bits is small enough to
-            // enumerate whole.
-            TypX::Int(range) => match (int_type_bounds(range), range) {
-                ((Some(lo), Some(hi)), IntRange::U(bits) | IntRange::I(bits)) if *bits <= 16 => {
-                    Some(format!("{lo}..{hi}"))
+            TypX::Bool => Some(("BOOLEAN".into(), 2)),
+            TypX::Int(range @ (IntRange::U(_) | IntRange::I(_))) => match int_type_bounds(range) {
+                (Some(lo), Some(hi)) => {
+                    let size = (hi - lo + 1) as u128;
+                    (size <= MAX_TYPE_DOMAIN).then(|| (format!("{lo}..{hi}"), size))
                 }
                 _ => None,
             },
@@ -2050,25 +2058,54 @@ impl Exporter {
                 }
                 let tagged = d.x.variants.len() > 1;
                 let mut parts = Vec::new();
+                let mut total: u128 = 0;
                 for v in d.x.variants.iter() {
                     if v.name.to_string() == "dummy_to_use_type_params" {
                         continue;
+                    }
+                    // Each field's domain, and the holes bounding it added.
+                    let mut bounded = Vec::new();
+                    for f in v.fields.iter() {
+                        let ftyp =
+                            crate::sst_util::subst_typ_for_datatype(&d.x.typ_params, args, &f.a.0);
+                        let first_hole = self.holes.len();
+                        seen.push(p.clone());
+                        let b = self.bound_from_type(&ftyp, span, seen);
+                        seen.pop();
+                        bounded.push((field_name(&f.name), ftyp, b, first_hole..self.holes.len()));
+                    }
+                    let product = bounded
+                        .iter()
+                        .map(|(_, _, b, _)| b.as_ref().map_or(1, |(_, n)| *n))
+                        .fold(1u128, |acc, n| acc.saturating_mul(n));
+                    let oversize = product > MAX_TYPE_DOMAIN;
+                    // A field about to be a hole drops the holes bounding it
+                    // (latest first, so the earlier ranges stay valid).
+                    if oversize {
+                        for (_, _, b, holes) in bounded.iter().rev() {
+                            if b.as_ref().is_some_and(|(_, n)| *n > 1) {
+                                let dropped: Vec<Hole> = self.holes.drain(holes.clone()).collect();
+                                for h in dropped {
+                                    if !self.holes.iter().any(|k| k.constant == h.constant) {
+                                        self.constants.remove(&h.constant);
+                                    }
+                                }
+                            }
+                        }
                     }
                     let mut fields = Vec::new();
                     if tagged {
                         fields.push(format!("tag |-> \"{}\"", v.name));
                     }
                     let mut binds = Vec::new();
-                    for f in v.fields.iter() {
-                        let fname = field_name(&f.name);
-                        let ftyp =
-                            crate::sst_util::subst_typ_for_datatype(&d.x.typ_params, args, &f.a.0);
-                        seen.push(p.clone());
-                        let bounded = self.bound_from_type(&ftyp, span, seen);
-                        seen.pop();
-                        let domain = match bounded {
-                            Some(dom) => dom,
-                            None => {
+                    let mut size: u128 = 1;
+                    for (fname, ftyp, b, _) in bounded {
+                        let domain = match b {
+                            Some((dom, n)) if !oversize || n <= 1 => {
+                                size = size.saturating_mul(n);
+                                dom
+                            }
+                            _ => {
                                 let constant =
                                     format!("Dom_{instance}_{}_{}", sanitize(&v.name), fname);
                                 self.constants.insert(constant.clone());
@@ -2086,6 +2123,7 @@ impl Exporter {
                         fields.push(format!("{fname} |-> {x}"));
                         binds.push(format!("{x} \\in {domain}"));
                     }
+                    total = total.saturating_add(size);
                     let record = format!("[{}]", fields.join(", "));
                     if binds.is_empty() {
                         parts.push(format!("{{{record}}}"));
@@ -2093,7 +2131,11 @@ impl Exporter {
                         parts.push(format!("{{{record} : {}}}", binds.join(", ")));
                     }
                 }
-                if parts.is_empty() { None } else { Some(format!("({})", parts.join(" \\cup "))) }
+                if parts.is_empty() {
+                    None
+                } else {
+                    Some((format!("({})", parts.join(" \\cup ")), total))
+                }
             }
             TypX::Decorate(_, _, t) | TypX::Boxed(t) => self.bound_from_type(t, span, seen),
             _ => None,

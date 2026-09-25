@@ -24,10 +24,16 @@ impl Exported {
 /// Export `module` of the file at `entry` and read back what was written.
 /// The crate is `test_crate`, so its root module is `test_crate`.
 fn export(entry: &Path, module: &str) -> Exported {
+    export_with(entry, module, &[])
+}
+
+/// [`export`], with further options for Verus (`--no-verify`).
+fn export_with(entry: &Path, module: &str, extra: &[&str]) -> Exported {
     let dir = TempDir::new().expect("temp dir");
     let log = dir.path().join("log");
     let options = [format!("-V tla-export={module}"), format!("--log-dir {}", log.display())];
-    let options: Vec<&str> = options.iter().map(|s| s.as_str()).collect();
+    let mut options: Vec<&str> = options.iter().map(|s| s.as_str()).collect();
+    options.extend_from_slice(extra);
     let output = run_verus(&options, dir.path(), &entry.to_path_buf(), true, true);
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
     assert!(output.status.success(), "verus failed:\n{}", stderr);
@@ -1412,8 +1418,8 @@ fn tla_export_keeps_a_field_named_tag_apart_from_the_variant() {
 /// Quantifiers over bounded integer types: a domain read off the guard is
 /// intersected with the type's range (`x < 300` over `u8` was `0..299`, so
 /// TLC found `all_small` FALSE and `no_witness`'s 256), a guard's open side
-/// is closed by the type (`i8`), an unguarded binder of at most 16 bits takes
-/// its whole range, and a wider one is a hole named after its type
+/// is closed by the type (`i8`), an unguarded binder of at most 2^10 values
+/// (`u8`) takes its whole range, and a wider one is a hole named after its type
 /// (`Dom_u32`, once `Dom_int` like every integer binder).
 const INT_BINDERS: &str = r#"
 verus! {
@@ -1926,4 +1932,119 @@ fn tla_export_bounds_trigger_and_single_exists_guards() {
     assert_eq!(run.violated, Vec::<String>::new(), "{}", ex.tla);
     // x in 0..3, the rest fixed.
     assert_eq!(run.distinct, 4, "{run:?}\n{}", ex.tla);
+}
+
+/// The export reads the VIR crate before verification, so `--no-verify`
+/// still writes it (it once wrote nothing and exited 0). The crate holds a
+/// proof that does not verify, so the run succeeds only if nothing is
+/// verified.
+#[test]
+fn tla_export_runs_under_no_verify() {
+    let counter = std::fs::read_to_string(fixture("counter.rs")).unwrap();
+    let broken = counter
+        .replace("fn main() {\n}", "proof fn unprovable() ensures false {}\n\nfn main() {\n}");
+    assert_ne!(broken, counter, "the fixture's main moved");
+    let src = TempDir::new().expect("temp dir");
+    let entry = src.path().join("counter.rs");
+    std::fs::write(&entry, broken).unwrap();
+    let ex = export_with(&entry, "test_crate", &["--no-verify"]);
+    assert_eq!(ex.report["shape"], "hand-rolled");
+    assert_eq!(names(&ex.report["invariants"]), ["bounded", "sum_small"]);
+    assert!(ex.tla.contains("Next == next /\\ TypeOK'"), "{}", ex.tla);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let run = tlc(&jar, &ex.spec(), &ex.cfg);
+    assert_eq!((run.generated, run.distinct), (28, 18), "{run:?}");
+}
+
+/// A domain read off a type alone takes at most 2^10 values. A `u16`
+/// binder is a `Dom_u16` hole rather than 65536 values, and a step variant
+/// whose fields together take more (`Put(u16, u16)`, `Pair(u8, u8)`,
+/// `Mixed(Option<int>, u8, u8)`) has a hole for each field of more than one
+/// value; a hole bounding a field that became one (`Option<int>`'s payload)
+/// is dropped. A small variant (`Nudge(u8)`, 256 values) is still whole.
+const WIDE_STEPS: &str = r#"
+verus! {
+pub struct State { pub n: u16 }
+
+pub enum Step { Put(u16, u16), Pair(u8, u8), Nudge(u8), Mixed(Option<int>, u8, u8) }
+
+pub open spec fn init(s: State) -> bool { s.n == 0 }
+
+pub open spec fn step(pre: State, post: State, st: Step) -> bool {
+    match st {
+        Step::Put(a, b) => a + b < 10 && post.n == a + b,
+        Step::Pair(a, b) => a < b && post.n == b as u16,
+        Step::Nudge(a) => a == 1 && pre.n < 20 && post.n == pre.n + a,
+        Step::Mixed(o, a, b) => o is Some && b == 0 && post.n == a as u16,
+    }
+}
+
+pub open spec fn next(pre: State, post: State) -> bool { exists|st: Step| step(pre, post, st) }
+
+pub open spec fn f(x: u16) -> int { x as int }
+
+pub open spec fn n_small(s: State) -> bool { forall|x: u16| #[trigger] f(x) == s.n ==> x < 30 }
+}
+"#;
+
+#[test]
+fn tla_export_caps_a_domain_read_off_a_type() {
+    let ex = export_code(WIDE_STEPS, "test_crate");
+    assert_eq!(ex.report["refusals"], serde_json::json!([]), "{}", ex.tla);
+    let mut constants: Vec<String> = ex.report["holes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|h| h["constant"].as_str().unwrap().to_string())
+        .collect();
+    constants.sort();
+    assert_eq!(
+        constants,
+        [
+            "Dom_Step_Mixed_v0",
+            "Dom_Step_Mixed_v1",
+            "Dom_Step_Mixed_v2",
+            "Dom_Step_Pair_v0",
+            "Dom_Step_Pair_v1",
+            "Dom_Step_Put_v0",
+            "Dom_Step_Put_v1",
+            "Dom_u16",
+        ],
+        "{}",
+        ex.tla
+    );
+    assert!(!ex.tla.contains("0..65535 :"), "{}", ex.tla);
+    assert!(!ex.tla.contains("Dom_Option"), "{}", ex.tla);
+    assert!(
+        ex.tla.contains("[tag |-> \"Nudge\", v0 |-> v0__3] : v0__3 \\in 0..255}"),
+        "{}",
+        ex.tla
+    );
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    // A record set or a range is not a .cfg value: an MC module extending
+    // the export defines the domains and the .cfg substitutes them.
+    let mc = ex.spec().with_file_name("MC.tla");
+    std::fs::write(
+        &mc,
+        format!(
+            "---- MODULE MC ----\nEXTENDS {}\n\
+             MC_mixed == {{[tag |-> \"None\"], [tag |-> \"Some\", v0 |-> 1]}}\n\
+             MC_u16 == 0..40\n====\n",
+            ex.module
+        ),
+    )
+    .unwrap();
+    let cfg = format!(
+        "{}CONSTANTS\n  Dom_Step_Put_v0 = {{0, 1, 2}}\n  Dom_Step_Put_v1 = {{0, 3}}\n  \
+         Dom_Step_Pair_v0 = {{0, 1}}\n  Dom_Step_Pair_v1 = {{1, 25}}\n  \
+         Dom_Step_Mixed_v0 <- MC_mixed\n  Dom_Step_Mixed_v1 = {{2}}\n  \
+         Dom_Step_Mixed_v2 = {{0}}\n  Dom_u16 <- MC_u16\n",
+        ex.cfg
+    );
+    let run = tlc(&jar, &mc, &cfg);
+    assert_eq!(run.violated, Vec::<String>::new(), "{}", ex.tla);
+    // n reaches 0..20 (Put, Mixed, then Nudge) and 25 (Pair).
+    assert_eq!(run.distinct, 22, "{run:?}\n{}", ex.tla);
 }

@@ -2788,9 +2788,6 @@ impl Verifier {
             self.args.report_long_running,
         )?;
         vir::recursive_types::check_traits(&krate, &global_ctx)?;
-        if let Some(arg) = self.args.tla_export.clone() {
-            self.export_tla(&krate, &arg)?;
-        }
         let krate = vir::ast_simplify::simplify_krate(&mut global_ctx, &krate)?;
 
         if self.args.log_all || self.args.log_args.log_vir_simple {
@@ -3458,6 +3455,13 @@ impl Verifier {
     ) -> Result<(), VerifyErr> {
         // Verify crate
         let time_verify_crate_start = Instant::now();
+
+        // The export reads the VIR crate before simplification, so it runs
+        // under --no-verify too.
+        if let Some(arg) = self.args.tla_export.clone() {
+            let krate = self.vir_crate.clone().expect("vir_crate should be initialized");
+            self.export_tla(&krate, &arg)?;
+        }
 
         let result =
             if !self.args.no_verify { self.verify_crate_inner(&compiler, spans) } else { Ok(()) };

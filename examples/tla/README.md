@@ -3,7 +3,9 @@ Three ways of writing a transition system in Verus, each exported to TLA+ by
 fork's; see `vir/src/tla.rs`). The export is written under the log directory
 as `<State>_tla.tla`, named after the module it declares so TLC can load it,
 beside a `<State>_tla.cfg` skeleton and a `<State>_tla.tla.json` report of
-what was recognised, refused and left unbounded.
+what was recognised, refused and left unbounded. The export reads the
+crate before verification, so with `--no-verify` it is written and nothing
+is verified.
 
 - `counter.rs`, hand-rolled: `init(s)`, `next(pre, post)` as an `exists` over
   a step enum, one relational spec fn per step, invariants as `(State) ->
@@ -62,9 +64,16 @@ and through binders bound later (`0 <= a < b < s.len()` bounds `a` by
 read as one. An integer binder's domain is intersected with its type's
 range (`x < 300` over a `u8` is `0..255`), and the type closes a side the
 guard leaves open (`x < 5` over an `i8` starts at -128). An unguarded
-binder of a type of at most 16 bits takes its whole range (`0..255`); an
-unbounded one is a hole, a `CONSTANT Dom_<type>` named after its type
-(`Dom_u32`, `Dom_int`, `Dom_Option_int_Some_v0`).
+binder is bounded by its type alone only when that domain has at most 2^10
+values: a `bool` or a `u8`/`i8` takes its whole range (`0..255`), and a
+datatype the union of its variants. A larger or unbounded one is a hole, a
+`CONSTANT Dom_<type>` named after its type (`Dom_u16`, `Dom_u32`,
+`Dom_int`, `Dom_Option_int_Some_v0`), so TLC never tries to enumerate
+65536 values per state. In a datatype, a variant whose fields together
+take more than 2^10 values (`Step::Put(u16, u16)`, or `Step::Pair(u8, u8)`
+with its 65536) has a hole for each field of more than one value
+(`Dom_Step_Pair_v0`, `Dom_Step_Pair_v1`), which the `.cfg` supplies as
+small sets; a small variant (`Step::Nudge(u8)`) is still enumerated whole.
 
 A cast to a bounded type (`as u8`, `as nat`, ...) that widens (the operand's
 own type lies in the target's, as `u8` in `u16` or `nat`) is the identity. A
