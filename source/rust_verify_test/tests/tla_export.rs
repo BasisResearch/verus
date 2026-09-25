@@ -317,6 +317,86 @@ fn tla_export_probes_parse_and_check() {
     assert_eq!(run.distinct, 4, "{run:?}\n{}", ex.tla);
 }
 
+const RECURSIVE_STATE: &str = r#"
+use vstd::prelude::*;
+verus! {
+pub struct State { pub v: Seq<int>, pub n: nat }
+
+pub open spec fn sum(s: State, i: nat) -> int decreases i {
+    if i == 0 || i > s.v.len() { 0 } else { s.v[i - 1] + sum(s, (i - 1) as nat) }
+}
+
+pub open spec fn init(s: State) -> bool { s.v == Seq::<int>::empty() && s.n == 0 }
+
+pub open spec fn next(pre: State, post: State) -> bool {
+    &&& pre.n < 3
+    &&& post.v == pre.v.push(1)
+    &&& post.n == pre.n + 1
+    &&& sum(post, post.v.len()) == sum(pre, pre.v.len()) + 1
+}
+
+pub open spec fn sum_is_n(s: State) -> bool { sum(s, s.v.len()) == s.n }
+}
+"#;
+
+#[test]
+fn tla_export_passes_the_state_to_a_recursive_function() {
+    // A primed variant of a RECURSIVE operator would raise the level of
+    // every recursive operator to an action's (SANY), so `sum_is_n` would
+    // not be a state predicate: the state is passed as a record instead.
+    let ex = export_code(RECURSIVE_STATE, "test_crate");
+    assert_eq!(ex.report["refusals"], serde_json::json!([]), "{}", ex.tla);
+    assert_eq!(names(&ex.report["invariants"]), ["sum_is_n"]);
+    assert!(ex.tla.contains("RECURSIVE sum(_, _)"), "{}", ex.tla);
+    assert!(!ex.tla.contains("sum_post"), "{}", ex.tla);
+    assert!(ex.tla.contains("sum([v |-> v', n |-> n'], Len(v'))"), "{}", ex.tla);
+    assert!(ex.tla.contains("sum([v |-> v, n |-> n], Len(v))"), "{}", ex.tla);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let run = tlc(&jar, &ex.spec(), &ex.cfg);
+    assert_eq!(run.violated, Vec::<String>::new(), "{}", ex.tla);
+    assert_eq!(run.distinct, 4, "{run:?}\n{}", ex.tla);
+}
+
+const SYMBOLIC_ARGUMENT: &str = r#"
+use vstd::prelude::*;
+verus! {
+pub struct State { pub x: int }
+
+pub open spec fn apply(f: spec_fn(int) -> int, v: int) -> int { f(v) }
+
+pub open spec fn init(s: State) -> bool { s.x == 0 }
+
+pub open spec fn next(pre: State, post: State) -> bool {
+    let f = |v: int| v + 1;
+    pre.x < 3 && post.x == apply(f, pre.x)
+}
+
+pub open spec fn small(s: State) -> bool { s.x <= 3 }
+}
+"#;
+
+#[test]
+fn tla_export_refuses_a_closure_passed_as_a_value() {
+    // `f` is held only symbolically; passing it on is a refusal (an
+    // Assert), never its bare name, which SANY would reject.
+    let ex = export_code(SYMBOLIC_ARGUMENT, "test_crate");
+    let refusals: Vec<String> = ex.report["refusals"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["what"].as_str().unwrap().to_string())
+        .collect();
+    assert!(
+        refusals.iter().any(|w| w.contains("closure value `f` used other than in an application")),
+        "{:?}",
+        refusals
+    );
+    assert!(!ex.tla.contains("apply(f, x)"), "{}", ex.tla);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+}
+
 const REFUSED: &str = r#"
 verus! {
 pub enum List { Nil, Cons(int, Box<List>) }

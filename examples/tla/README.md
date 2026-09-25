@@ -81,6 +81,15 @@ named `tag` (or `tag` followed by underscores) is labelled with one more
 underscore (`tag_`), in a variant as in the state (whose variable is then
 `tag_`).
 
+A recursive spec fn (one with `decreases`) that reads the state takes it
+explicitly, as a record: `sum(s, i)` called on the post state is `sum([v |->
+v', n |-> n'], i)`. A primed copy of a RECURSIVE operator would give every
+recursive operator an action's level in SANY, so an invariant calling the
+unprimed one would no longer be a state predicate.
+
+A closure bound by `let` (or a closure parameter) is only ever applied; passed
+to a function, compared or returned, it is a refusal.
+
 A trait method call that Verus resolved to an impl (`s.view()` with `impl
 View for State`) is exported as the impl's function.
 

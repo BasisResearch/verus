@@ -28,6 +28,11 @@
 //! state type in the pre role prints as the unprimed variables, one in the
 //! post role as the primed ones, so `post.f == e` becomes `f' = e`, which is
 //! the shape TLC needs to assign a primed variable.
+//! A recursive function other than a root takes its state parameters
+//! explicitly, as records, rather than as a primed variant (SANY gives every
+//! RECURSIVE operator the highest level among them). A closure-valued
+//! variable is kept only symbolically; used other than in an application it
+//! is refused.
 
 use crate::ast::*;
 use crate::ast_util::{fun_as_friendly_rust_name, path_as_friendly_rust_name};
@@ -175,6 +180,12 @@ impl Env {
     fn name(&self, v: &VarIdent) -> String {
         self.names.get(v).cloned().unwrap_or_else(|| ident_name(v))
     }
+    /// Whether `v` is held only symbolically (a closure, or a record of
+    /// closures): it has no TLA+ name, so it can only be applied or have a
+    /// field selected and applied, never printed.
+    fn symbolic_only(&self, v: &VarIdent) -> bool {
+        self.values.contains_key(v) && !self.names.contains_key(v) && !self.roles.contains_key(v)
+    }
 }
 
 struct Exporter {
@@ -240,6 +251,9 @@ struct Exporter {
     enclosing_assigned: Vec<BTreeSet<String>>,
     /// The state datatype's field types, in the order of `state_fields`.
     state_types: Vec<Typ>,
+    /// Init, Next and the invariants: operators called with no arguments,
+    /// whose state parameters always take a role.
+    roots: HashSet<Fun>,
     holes: Vec<Hole>,
     refusals: Vec<Refusal>,
     constants: BTreeSet<String>,
@@ -561,6 +575,14 @@ impl Exporter {
         format!("Assert(FALSE, {})", tla_string(&msg))
     }
 
+    /// A closure-valued variable used other than in an application (passed
+    /// to a function, compared, returned): the export keeps it only
+    /// symbolically, so it has nothing to print.
+    fn refuse_symbolic(&mut self, v: &VarIdent, span: &crate::messages::Span) -> String {
+        let what = format!("closure value `{}` used other than in an application", v.0);
+        self.refuse(what, span)
+    }
+
     /// Whether a name is taken at module level or reserved by TLA+.
     fn name_taken(&self, n: &str) -> bool {
         self.used_names.contains(n)
@@ -822,6 +844,8 @@ impl Exporter {
             ExprX::Var(v) => {
                 if let Some(role) = env.roles.get(v) {
                     self.state_record(*role)
+                } else if env.symbolic_only(v) {
+                    self.refuse_symbolic(v, &e.span)
                 } else {
                     env.name(v)
                 }
@@ -1199,6 +1223,8 @@ impl Exporter {
             PlaceX::Local(v) => {
                 if let Some(role) = env.roles.get(v) {
                     self.state_record(*role)
+                } else if env.symbolic_only(v) {
+                    self.refuse_symbolic(v, &p.span)
                 } else {
                     env.name(v)
                 }
@@ -1241,6 +1267,7 @@ impl Exporter {
                             typ_has_specfn(&pattern.typ, &self.datatypes, &mut HashSet::new());
                         if closure_valued {
                             if let Some(v) = symbolic {
+                                env2.names.remove(name);
                                 env2.values.insert(name.clone(), (v, Box::new(env2.clone())));
                                 continue;
                             }
@@ -1521,6 +1548,7 @@ impl Exporter {
                 continue;
             }
             env2.roles.remove(&name);
+            env2.names.remove(&name);
             env2.values.insert(name.clone(), (peel(a), Box::new(env.clone())));
             if !typ_has_specfn(&typ, &self.datatypes, &mut HashSet::new()) {
                 let value = self.expr(a, env);
@@ -2285,7 +2313,17 @@ impl Exporter {
 
     /// The role of each parameter: a state-typed parameter is pre or post
     /// (the first one pre, a second one post), any other is None.
+    ///
+    /// A recursive function (other than a root) takes its state parameters
+    /// explicitly, as records: SANY gives every RECURSIVE operator the
+    /// highest level of any of them, so a primed variant reading `v'` would
+    /// make the unprimed one (and an invariant calling it) an action. Called
+    /// with the pre or post state, it is passed `[f |-> v, ...]` or `[f |->
+    /// v', ...]`, and its level stays that of its arguments.
     fn param_roles(&self, f: &Function) -> Vec<Option<Role>> {
+        if !f.x.decrease.is_empty() && !self.roots.contains(&f.x.name) {
+            return vec![None; f.x.params.len()];
+        }
         let mut seen = 0;
         f.x.params
             .iter()
@@ -2953,6 +2991,7 @@ pub fn export_module(krate: &Krate, arg: &str) -> Result<Export, String> {
         current_assigned: BTreeSet::new(),
         enclosing_assigned: Vec::new(),
         state_types,
+        roots: HashSet::new(),
         holes: Vec::new(),
         refusals: Vec::new(),
         constants: BTreeSet::new(),
@@ -2970,6 +3009,7 @@ pub fn export_module(krate: &Krate, arg: &str) -> Result<Export, String> {
     let mut outcome: HashMap<Fun, (bool, String)> = HashMap::new();
     let mut roots = vec![triple.init.clone(), triple.next.clone()];
     roots.extend(selected.iter().cloned());
+    ex.roots = roots.iter().cloned().collect();
     // verus-tla: the closures are the bodies; emit as state operators by
     // treating `init()`/`next()` specially.
     let verus_tla = triple.shape == "verus-tla";
