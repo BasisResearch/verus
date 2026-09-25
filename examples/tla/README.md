@@ -81,16 +81,21 @@ named `tag` (or `tag` followed by underscores) is labelled with one more
 underscore (`tag_`), in a variant as in the state (whose variable is then
 `tag_`).
 
-A recursive spec fn (one with `decreases`) that reads the state takes it
-explicitly, as a record: `sum(s, i)` called on the post state is `sum([v |->
-v', n |-> n'], i)`. A primed copy of a RECURSIVE operator would give every
-recursive operator an action's level in SANY, so an invariant calling the
-unprimed one would no longer be a state predicate. A spec fn given such a
-record, or any state value other than the pre or post state (`k_le(State {
-k: 0, ..s }, 0)`), is called in its record variant (`ok_at_rec(s, i)`),
-which takes every parameter explicitly, so a recursive walk can call a
-per-index predicate. A call that swaps the pre and post states is a
-refusal as a whole.
+A recursive spec fn (one with `decreases`) has one operator only, its record
+variant, which takes every parameter explicitly and the state as a record:
+`sum(s, i)` called on the post state is `sum_rec([v |-> v', n |-> n'], i)`.
+SANY gives every operator of a RECURSIVE group the highest level among them,
+so an operator reading `v'` declared RECURSIVE makes the rest actions (and
+the module is rejected). A recursive root, such as an invariant `cnt(s)`, is
+a wrapper `cnt == cnt_rec([n |-> n, m |-> m])`, and only operators in a call
+cycle are declared RECURSIVE. A spec fn given such a record, or any state
+value other than the pre or post state (`k_le(State { k: 0, ..s }, 0)`), is
+called in its record variant too (`ok_at_rec(s, i)`), so a recursive walk
+can call a per-index predicate. A call that swaps the pre and post states is
+a refusal as a whole.
+
+A sequence literal `seq![a, b]` (an array literal viewed as a `Seq`) is the
+tuple `<<a, b>>`.
 
 A closure bound by `let` (or a closure parameter) is only ever applied; passed
 to a function, compared or returned, it is a refusal.
@@ -116,7 +121,12 @@ assigned only by a conjunct-level `v' = e` (or `post == e` or `post =~= e`
 for all of them), by a conjunct-level call to an operator that assigns it, or
 by an `IF`, `match` or disjunction every branch of which assigns it (a
 branch that is the literal `false` never holds and counts as assigning
-everything, as VerusSync's `dummy_to_use_type_params => false` arm); a guard
+everything, as VerusSync's `dummy_to_use_type_params => false` arm), or by
+two conjunct-level implications of complementary guards whose consequents
+both assign it (`pre.f ==> post.x == 1` beside `!pre.f ==> post.x == 2`, or
+`x < 1`/`x >= 1`, `x == y`/`x != y`; TLC assigns in a consequent when its
+guard holds, so one implication alone leaves the variable unassigned when
+the guard fails), in Init as in Next; a guard
 reading `v'`, a predicate applied to the post state, or a negated equality
 does not assign. A transition also counts what its callers assign around it,
 so a frame condition factored out of a disjunction (`(a || b) && post.z ==

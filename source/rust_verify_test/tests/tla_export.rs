@@ -307,7 +307,7 @@ fn tla_export_probes_parse_and_check() {
     let ex = export_code(PROBES, "test_crate");
     assert_eq!(ex.report["refusals"], serde_json::json!([]), "{}", ex.tla);
     assert_eq!(ex.report["holes"], serde_json::json!([]), "{}", ex.tla);
-    assert!(ex.tla.contains("RECURSIVE sumto(_, _)"), "{}", ex.tla);
+    assert!(ex.tla.contains("RECURSIVE sumto_rec(_, _)"), "{}", ex.tla);
     let Some(jar) = tla_tools() else { return };
     sany(&jar, &ex.spec());
     let run = tlc(&jar, &ex.spec(), &ex.cfg);
@@ -343,14 +343,15 @@ pub open spec fn sum_is_n(s: State) -> bool { sum(s, s.v.len()) == s.n }
 fn tla_export_passes_the_state_to_a_recursive_function() {
     // A primed variant of a RECURSIVE operator would raise the level of
     // every recursive operator to an action's (SANY), so `sum_is_n` would
-    // not be a state predicate: the state is passed as a record instead.
+    // not be a state predicate: the state is passed as a record to the one
+    // operator a recursive function has, its record variant.
     let ex = export_code(RECURSIVE_STATE, "test_crate");
     assert_eq!(ex.report["refusals"], serde_json::json!([]), "{}", ex.tla);
     assert_eq!(names(&ex.report["invariants"]), ["sum_is_n"]);
-    assert!(ex.tla.contains("RECURSIVE sum(_, _)"), "{}", ex.tla);
+    assert!(ex.tla.contains("RECURSIVE sum_rec(_, _)"), "{}", ex.tla);
     assert!(!ex.tla.contains("sum_post"), "{}", ex.tla);
-    assert!(ex.tla.contains("sum([v |-> v', n |-> n'], Len(v'))"), "{}", ex.tla);
-    assert!(ex.tla.contains("sum([v |-> v, n |-> n], Len(v))"), "{}", ex.tla);
+    assert!(ex.tla.contains("sum_rec([v |-> v', n |-> n'], Len(v'))"), "{}", ex.tla);
+    assert!(ex.tla.contains("sum_rec([v |-> v, n |-> n], Len(v))"), "{}", ex.tla);
     let Some(jar) = tla_tools() else { return };
     sany(&jar, &ex.spec());
     let run = tlc(&jar, &ex.spec(), &ex.cfg);
@@ -1699,5 +1700,163 @@ fn tla_export_assigns_a_none_check() {
     sany(&jar, &ex.spec());
     let run = tlc(&jar, &ex.spec(), &ex.cfg);
     assert_eq!(run.violated, Vec::<String>::new(), "{}", ex.tla);
+    assert_eq!(run.distinct, 3, "{run:?}\n{}", ex.tla);
+}
+
+/// A recursive `(State) -> bool` spec fn `next` reads on the post state
+/// (`cnt`), another the invariant (`other`), and a mutual recursion
+/// (`is_even`/`is_odd`). A recursive function has only its record variant:
+/// a primed copy declared RECURSIVE made SANY reject the module ("\land has
+/// both temporal formula and action"). A recursive root is a wrapper
+/// applying the record variant, and only the operators in a call cycle are
+/// declared RECURSIVE.
+const RECURSIVE_ROOT: &str = r#"
+verus! {
+pub struct State { pub n: nat, pub m: nat }
+
+pub open spec fn init(s: State) -> bool { s.n == 0 && s.m == 0 }
+
+pub open spec fn cnt(s: State) -> bool decreases s.n {
+    if s.n == 0 { s.m <= 10 } else { cnt(State { n: (s.n - 1) as nat, ..s }) }
+}
+
+pub open spec fn other(s: State) -> bool decreases s.m {
+    if s.m == 0 { s.n <= 3 } else { other(State { m: (s.m - 1) as nat, ..s }) }
+}
+
+pub open spec fn is_even(k: nat) -> bool decreases k {
+    if k == 0 { true } else { is_odd((k - 1) as nat) }
+}
+
+pub open spec fn is_odd(k: nat) -> bool decreases k {
+    if k == 0 { false } else { is_even((k - 1) as nat) }
+}
+
+pub open spec fn next(pre: State, post: State) -> bool {
+    pre.n < 3 && post.n == pre.n + 1 && post.m == pre.m && cnt(post)
+}
+
+pub open spec fn parity(s: State) -> bool { is_even(s.n) != is_odd(s.n) }
+}
+"#;
+
+#[test]
+fn tla_export_gives_a_recursive_function_only_its_record_variant() {
+    let ex = export_code(RECURSIVE_ROOT, "test_crate");
+    assert_eq!(ex.report["refusals"], serde_json::json!([]), "{}", ex.tla);
+    assert_eq!(names(&ex.report["invariants"]), ["other", "parity"]);
+    assert!(!ex.tla.contains("cnt_post"), "{}", ex.tla);
+    assert!(ex.tla.contains("cnt_rec([n |-> n', m |-> m'])"), "{}", ex.tla);
+    assert!(ex.tla.contains("other ==\n    other_rec([n |-> n, m |-> m])"), "{}", ex.tla);
+    let recursive: Vec<&str> = ex.tla.lines().filter(|l| l.starts_with("RECURSIVE")).collect();
+    assert_eq!(
+        recursive,
+        [
+            "RECURSIVE cnt_rec(_)",
+            "RECURSIVE is_even_rec(_)",
+            "RECURSIVE is_odd_rec(_)",
+            "RECURSIVE other_rec(_)"
+        ],
+        "{}",
+        ex.tla
+    );
+    // Named, `cnt` is checked too, through its wrapper.
+    let named = export_code(RECURSIVE_ROOT, "test_crate:cnt,other");
+    assert_eq!(names(&named.report["invariants"]), ["cnt", "other"]);
+    assert!(named.tla.contains("cnt ==\n    cnt_rec([n |-> n, m |-> m])"), "{}", named.tla);
+    assert!(!named.tla.contains("RECURSIVE cnt\n"), "{}", named.tla);
+    let Some(jar) = tla_tools() else { return };
+    for ex in [&ex, &named] {
+        sany(&jar, &ex.spec());
+        let run = tlc(&jar, &ex.spec(), &ex.cfg);
+        assert_eq!(run.violated, Vec::<String>::new(), "{}", ex.tla);
+        // n in 0..3, m = 0.
+        assert_eq!(run.distinct, 4, "{run:?}\n{}", ex.tla);
+    }
+}
+
+/// Implications at conjunct level: TLC assigns in the consequent when the
+/// guard holds, so one alone leaves the variable unassigned when it fails,
+/// but two with complementary guards (`g`/`!g`, `y < 1`/`y >= 1`) assign
+/// what both consequents do, in Next as in Init.
+const IMPLICATIONS: &str = r#"
+verus! {
+pub struct State { pub f: bool, pub x: int, pub y: int }
+
+pub open spec fn init(s: State) -> bool {
+    s.f == false && (s.f ==> s.x == 1) && (!s.f ==> s.x == 0) && s.y == 0
+}
+
+pub open spec fn next(pre: State, post: State) -> bool {
+    &&& post.f == !pre.f
+    &&& pre.f ==> post.x == 1
+    &&& !pre.f ==> post.x == 2
+    &&& pre.y < 1 ==> post.y == pre.y + 1
+    &&& pre.y >= 1 ==> post.y == pre.y
+}
+
+pub open spec fn small(s: State) -> bool { s.x <= 2 && s.y <= 1 }
+}
+"#;
+
+#[test]
+fn tla_export_pairs_implications_of_complementary_guards() {
+    let ex = export_code(IMPLICATIONS, "test_crate");
+    assert_eq!(ex.report["init_unassigned"], serde_json::json!([]), "{}", ex.tla);
+    assert!(!ex.cfg.contains("never assigns"), "{}", ex.cfg);
+    // A guard that is not the complement leaves `x` unassigned when neither
+    // holds.
+    let gap = export_code(
+        &IMPLICATIONS.replace("!pre.f ==> post.x == 2", "pre.y < 5 ==> post.x == 2"),
+        "test_crate",
+    );
+    assert_eq!(
+        gap.report["transitions"],
+        serde_json::json!([{ "operator": "next", "unassigned": ["x"] }]),
+        "{}",
+        gap.tla
+    );
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let run = tlc(&jar, &ex.spec(), &ex.cfg);
+    assert_eq!(run.violated, Vec::<String>::new(), "{}", ex.tla);
+    // (f, x, y): (F, 0, 0), (T, 2, 1), (F, 1, 1).
+    assert_eq!(run.distinct, 3, "{run:?}\n{}", ex.tla);
+}
+
+/// `seq![a, b, c]` is `<_ as View>::view(&[a, b, c])`: the array literal is
+/// a sequence and the array's view the identity (it was refused, and an
+/// invariant using it left out).
+const SEQ_LITERAL: &str = r#"
+use vstd::prelude::*;
+verus! {
+pub struct State { pub x: int, pub y: int }
+
+pub open spec fn init(s: State) -> bool { s.x == 0 && s.y == 1 }
+
+pub open spec fn next(pre: State, post: State) -> bool {
+    pre.x < 2 && post.x == pre.x + 1 && post.y == seq![pre.y, 5int, 7int][1]
+}
+
+pub open spec fn first_is_x(s: State) -> bool {
+    seq![s.x, s.y][0] == s.x && seq![s.x, s.y].len() == 2
+}
+
+pub open spec fn y_in(s: State) -> bool { seq![1int, 5int].contains(s.y) }
+}
+"#;
+
+#[test]
+fn tla_export_translates_a_seq_literal() {
+    let ex = export_code(SEQ_LITERAL, "test_crate");
+    assert_eq!(ex.report["refusals"], serde_json::json!([]), "{}", ex.tla);
+    assert_eq!(names(&ex.report["invariants"]), ["first_is_x", "y_in"]);
+    assert!(ex.tla.contains("(y' = <<y, 5, 7>>[(1) + 1])"), "{}", ex.tla);
+    assert!(ex.tla.contains("Len(<<x, y>>)"), "{}", ex.tla);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let run = tlc(&jar, &ex.spec(), &ex.cfg);
+    assert_eq!(run.violated, Vec::<String>::new(), "{}", ex.tla);
+    // x in 0..2, y 1 then 5.
     assert_eq!(run.distinct, 3, "{run:?}\n{}", ex.tla);
 }

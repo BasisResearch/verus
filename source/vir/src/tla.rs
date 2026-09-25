@@ -28,12 +28,14 @@
 //! state type in the pre role prints as the unprimed variables, one in the
 //! post role as the primed ones, so `post.f == e` becomes `f' = e`, which is
 //! the shape TLC needs to assign a primed variable.
-//! A recursive function other than a root takes its state parameters
-//! explicitly, as records, rather than as a primed variant (SANY gives every
-//! RECURSIVE operator the highest level among them). A function given a
+//! A recursive function (one with `decreases`) is only ever printed in its
+//! record variant (`f_rec`), which takes every parameter explicitly, the
+//! state as a record (SANY gives every operator of a RECURSIVE group the
+//! highest level among them, so no RECURSIVE operator may read `v'`); a
+//! recursive root is a wrapper applying it to the state. A function given a
 //! state value rather than the pre or post state (such a record, or a
-//! constructed state) is called in its record variant (`f_rec`), which takes
-//! every parameter explicitly. A closure-valued
+//! constructed state) is called in its record variant too. Only operators in
+//! a call cycle are declared RECURSIVE. A closure-valued
 //! variable is kept only symbolically; used other than in an application it
 //! is refused.
 
@@ -225,8 +227,9 @@ struct Exporter {
     /// function and whether it is the primed variant (see [`OpKey`]).
     emitted: HashSet<OpKey>,
     emitting: HashSet<OpKey>,
-    /// Recursive operators and their arity, for the `RECURSIVE` declarations.
-    recursive: BTreeMap<String, usize>,
+    /// Every emitted operator's arity, for the `RECURSIVE` declarations of
+    /// those in a call cycle (see [`Exporter::recursive`]).
+    arity: HashMap<String, usize>,
     /// Operator name per function, unique.
     op_names: HashMap<OpKey, String>,
     /// Module-level names: operators, state variables, constants.
@@ -265,11 +268,12 @@ struct Exporter {
     /// it began, innermost last: TLC has assigned those by the time it
     /// evaluates the branch.
     enclosing_assigned: Vec<BTreeSet<String>>,
+    /// The conjunct-level implications `g ==> b` of the branch being
+    /// printed, each guard with what its consequent assigns: two with
+    /// complementary guards (`g`, `!g`) assign what both consequents do.
+    implications: Vec<(Expr, BTreeSet<String>)>,
     /// The state datatype's field types, in the order of `state_fields`.
     state_types: Vec<Typ>,
-    /// Init, Next and the invariants: operators called with no arguments,
-    /// whose state parameters always take a role.
-    roots: HashSet<Fun>,
     holes: Vec<Hole>,
     refusals: Vec<Refusal>,
     constants: BTreeSet<String>,
@@ -539,6 +543,10 @@ fn vstd_op(name: &str) -> Option<&'static str> {
         ("map", "len") => "map_len",
         ("map", "values") => "map_values",
         ("map", "ext_equal") => "ext_equal",
+        // An array is a sequence here (`seq![a, b]` is `[a, b].view()`), so
+        // its view is the identity.
+        ("array", "array_view") | ("array", "view") => "array_view",
+        ("array", "array_index") => "seq_index",
         _ => return None,
     })
 }
@@ -738,8 +746,10 @@ impl Exporter {
     fn branch<T>(&mut self, f: impl FnOnce(&mut Self) -> T) -> (T, BTreeSet<String>) {
         let outer = std::mem::take(&mut self.current_assigned);
         self.enclosing_assigned.push(outer);
+        let outer_implications = std::mem::take(&mut self.implications);
         let first_call = self.current_calls.len();
         let r = f(self);
+        self.implications = outer_implications;
         let outer = self.enclosing_assigned.pop().expect("pushed above");
         let assigned = std::mem::replace(&mut self.current_assigned, outer);
         for call in &mut self.current_calls[first_call..] {
@@ -773,6 +783,20 @@ impl Exporter {
         let Some(first) = it.next() else { return };
         let all = it.fold(first, |acc, b| acc.intersection(&b).cloned().collect());
         self.current_assigned.extend(all);
+    }
+
+    /// A conjunct-level `guard ==> ...` whose consequent assigns
+    /// `assigned`: with an earlier one of complementary guard in the same
+    /// branch, what both consequents assign is assigned.
+    fn note_implication(&mut self, guard: &Expr, assigned: BTreeSet<String>) {
+        let both: Vec<String> = self
+            .implications
+            .iter()
+            .filter(|(g, _)| complementary(g, guard))
+            .flat_map(|(_, a)| a.intersection(&assigned).cloned().collect::<Vec<_>>())
+            .collect();
+        self.current_assigned.extend(both);
+        self.implications.push((guard.clone(), assigned));
     }
 
     /// The variable `e` reads as a primed field of the state (`post.f`).
@@ -958,7 +982,20 @@ impl Exporter {
                     LogicalOp::Implies if self.assert_implication(e) => {
                         (self.quiet(|x| x.expr(a, env)), self.expr(b, env))
                     }
-                    LogicalOp::Implies => (self.expr(a, env), self.in_branch(b, env)),
+                    // At conjunct level, TLC assigns in the consequent when
+                    // the guard holds and nothing when it does not: the
+                    // consequent is a branch beside an empty one, so alone
+                    // it assigns nothing, but with a complementary guard
+                    // (`g ==> b1`, `!g ==> b2`) what both consequents assign
+                    // is assigned on every path.
+                    LogicalOp::Implies => {
+                        let sa = self.quiet(|x| x.expr(a, env));
+                        let (sb, assigned) = self.branch_expr(b, env);
+                        if self.conj_level {
+                            self.note_implication(a, assigned);
+                        }
+                        (sa, sb)
+                    }
                 };
                 let sym = match op {
                     LogicalOp::And => "/\\",
@@ -995,6 +1032,11 @@ impl Exporter {
                 format!("({})", parts.join(" /\\ "))
             }
             ExprX::Quant(q, binders, body) => self.quant(e, q, binders, body, env),
+            // An array literal is a sequence, 1-based like every sequence here.
+            ExprX::ArrayLiteral(items) => {
+                let items: Vec<String> = items.iter().map(|i| self.expr(i, env)).collect();
+                format!("<<{}>>", items.join(", "))
+            }
             ExprX::Closure(..) => self.refuse("closure outside a known call", &e.span),
             ExprX::Choose { .. } => self.refuse("choose (TLC cannot evaluate it)", &e.span),
             ExprX::WithTriggers { body, .. } => self.expr(body, env),
@@ -1487,6 +1529,11 @@ impl Exporter {
                     }
                 }
                 let fun = &self.resolved_fun(kind, fun);
+                // `<_ as View>::view(&[a, b])` (`seq![a, b]`) resolves to the
+                // array's `View` impl.
+                if vstd_op(&fun_as_friendly_rust_name(fun)) == Some("array_view") {
+                    return self.vstd_call(e, "array_view", args, env);
+                }
                 let Some(callee) = self.functions.get(fun).cloned() else {
                     let what = format!("call to {friendly} (no definition in the crate)");
                     return self.refuse(what, &e.span);
@@ -1499,12 +1546,20 @@ impl Exporter {
                 let roles = self.param_roles(&callee);
                 let single_state = roles.iter().filter(|r| r.is_some()).count() == 1;
                 let arg_role = |a: &Expr| read_var(a).and_then(|v| env.roles.get(&v).copied());
-                // A state value that is neither the pre nor the post state
-                // (a record, as a recursive function holds the state, or a
-                // constructed state) goes to the record variant, which takes
-                // every parameter explicitly; a pre or post state among the
-                // arguments is passed as its record.
-                if roles.iter().zip(args.iter()).any(|(r, a)| r.is_some() && arg_role(a).is_none())
+                // A recursive function (one with `decreases`), or a function
+                // given a state value that is neither the pre nor the post
+                // state (a record, as a recursive function holds the state,
+                // or a constructed state), is called in its record variant,
+                // which takes every parameter explicitly; a pre or post state
+                // among the arguments is passed as its record. A recursive
+                // function has no other variant: SANY gives every operator in
+                // a RECURSIVE group the highest level among them, so one
+                // reading `v'` would make the rest actions.
+                if !callee.x.decrease.is_empty()
+                    || roles
+                        .iter()
+                        .zip(args.iter())
+                        .any(|(r, a)| r.is_some() && arg_role(a).is_none())
                 {
                     let printed: Vec<String> = args.iter().map(|a| self.expr(a, env)).collect();
                     self.conj_level = level;
@@ -1788,6 +1843,7 @@ impl Exporter {
             "seq_subrange" => format!("SubSeq({}, ({}) + 1, {})", g!(0), g!(1), g!(2)),
             "seq_add" => format!("({} \\o {})", g!(0), g!(1)),
             "seq_empty" => "<< >>".into(),
+            "array_view" => g!(0),
             "seq_last" => {
                 let (v, s) = (g!(0), self.bind("s__"));
                 format!("(LET {s} == {v} IN {s}[Len({s})])")
@@ -2369,16 +2425,10 @@ impl Exporter {
     /// The role of each parameter: a state-typed parameter is pre or post
     /// (the first one pre, a second one post), any other is None.
     ///
-    /// A recursive function (other than a root) takes its state parameters
-    /// explicitly, as records: SANY gives every RECURSIVE operator the
-    /// highest level of any of them, so a primed variant reading `v'` would
-    /// make the unprimed one (and an invariant calling it) an action. Called
-    /// with the pre or post state, it is passed `[f |-> v, ...]` or `[f |->
-    /// v', ...]`, and its level stays that of its arguments.
+    /// A recursive function is only ever called in its record variant (see
+    /// [`Exporter::call`]); these roles serve the plain wrapper a recursive
+    /// root gets (see [`Exporter::ensure_function`]).
     fn param_roles(&self, f: &Function) -> Vec<Option<Role>> {
-        if !f.x.decrease.is_empty() && !self.roots.contains(&f.x.name) {
-            return vec![None; f.x.params.len()];
-        }
         let mut seen = 0;
         f.x.params
             .iter()
@@ -2421,6 +2471,7 @@ impl Exporter {
         let previous_calls = std::mem::take(&mut self.current_calls);
         let previous_assigned = std::mem::take(&mut self.current_assigned);
         let previous_enclosing = std::mem::take(&mut self.enclosing_assigned);
+        let previous_implications = std::mem::take(&mut self.implications);
         let previous_level = std::mem::replace(&mut self.conj_level, true);
         let mut env = Env::new();
         let roles = match variant {
@@ -2443,9 +2494,25 @@ impl Exporter {
                 }
             }
         }
-        let body = match &f.x.body {
-            Some(b) => self.expr(b, &env),
-            None => self.refuse("uninterpreted function", &f.span),
+        let body = if !f.x.decrease.is_empty() && *variant != Variant::Record {
+            // A recursive root (Init, Next, an invariant: called with no
+            // arguments) is a wrapper applying the record variant to the
+            // state, so no operator reading the variables is RECURSIVE.
+            let args: Vec<String> =
+                f.x.params
+                    .iter()
+                    .map(|p| match env.roles.get(&p.x.name) {
+                        Some(role) => self.state_record(*role),
+                        None => env.name(&p.x.name),
+                    })
+                    .collect();
+            let rec = self.ensure_function(&(fun.clone(), Variant::Record));
+            format!("{rec}({})", args.join(", "))
+        } else {
+            match &f.x.body {
+                Some(b) => self.expr(b, &env),
+                None => self.refuse("uninterpreted function", &f.span),
+            }
         };
         let head =
             if params.is_empty() { name.clone() } else { format!("{name}({})", params.join(", ")) };
@@ -2454,21 +2521,21 @@ impl Exporter {
             "\\* {}{}, {}\n",
             fun_as_friendly_rust_name(fun),
             match variant {
+                Variant::Plain if !f.x.decrease.is_empty() => " (applies the record variant)",
                 Variant::Plain => "",
                 Variant::Primed => " (read in the post state)",
                 Variant::Record => " (the state passed as a record)",
             },
             span_string(&f.span)
         ));
-        if f.x.decrease.len() > 0 {
-            self.recursive.insert(name.clone(), params.len());
-        }
+        self.arity.insert(name.clone(), params.len());
         def.push_str(&format!("{head} ==\n    {body}\n"));
         self.defs.push(def);
         self.record_body(key);
         self.current_calls = previous_calls;
         self.current_assigned = previous_assigned;
         self.enclosing_assigned = previous_enclosing;
+        self.implications = previous_implications;
         self.conj_level = previous_level;
         self.branch_depth = previous_depth;
         if self.current_tainted {
@@ -2481,6 +2548,38 @@ impl Exporter {
         self.emitted.insert(key.clone());
         self.assign_through_call(key, reach);
         name
+    }
+
+    /// The operators in a call cycle (one calling itself, directly or
+    /// through others), with their arity: exactly those TLA+ needs declared
+    /// `RECURSIVE`. A function with `decreases` that no cycle reaches back
+    /// to (the wrapper of a recursive root) is not among them.
+    fn recursive(&self) -> BTreeMap<String, usize> {
+        let callees = |k: &OpKey| -> Vec<OpKey> {
+            self.calls.get(k).into_iter().flatten().map(|c| c.callee.clone()).collect()
+        };
+        let mut out = BTreeMap::new();
+        for start in &self.emitted {
+            // Whether `start` reaches itself.
+            let mut seen: HashSet<OpKey> = HashSet::new();
+            let mut stack = callees(start);
+            let mut cyclic = false;
+            while let Some(k) = stack.pop() {
+                if k == *start {
+                    cyclic = true;
+                    break;
+                }
+                if seen.insert(k.clone()) {
+                    stack.extend(callees(&k));
+                }
+            }
+            if cyclic {
+                if let Some(name) = self.op_names.get(start) {
+                    out.insert(name.clone(), self.arity.get(name).copied().unwrap_or(0));
+                }
+            }
+        }
+        out
     }
 
     /// A call at conjunct level assigns what its operator assigns on every
@@ -2510,9 +2609,10 @@ impl Exporter {
     /// guarded by `is_zero(pre)`) assigns in Init but only reads in Next.
     /// Counted: a conjunct-level `s.f == e` or `e == s.f` (`s == e` or `s =~=
     /// e` for every field), through conjunctions, `LET`s, `exists` bodies,
-    /// calls passing the state to a crate function, and an `IF`, `match` or
+    /// calls passing the state to a crate function, an `IF`, `match` or
     /// disjunction every branch of which assigns (a `false` branch assigns
-    /// everything). A closure application is not followed and counts as
+    /// everything), and two conjoined implications of complementary guards
+    /// (`g ==> b1`, `!g ==> b2`) for what both consequents assign. A closure application is not followed and counts as
     /// assigning everything, so nothing is reported for it.
     fn init_assigns(&self, e: &Expr, states: &HashSet<VarIdent>, depth: usize) -> BTreeSet<String> {
         let all = || self.state_vars.iter().cloned().collect::<BTreeSet<_>>();
@@ -2543,9 +2643,25 @@ impl Exporter {
         let e = peel(e);
         match &e.x {
             ExprX::Const(Constant::Bool(false)) => all(),
-            ExprX::Logical(LogicalOp::And, a, b) => {
-                let mut s = self.init_assigns(a, states, depth);
-                s.extend(self.init_assigns(b, states, depth));
+            // An implication assigns nothing alone (its guard may fail), but
+            // two with complementary guards assign what both consequents do.
+            ExprX::Logical(LogicalOp::And, ..) => {
+                let mut s = BTreeSet::new();
+                let mut implications: Vec<(Expr, BTreeSet<String>)> = Vec::new();
+                for c in conjuncts(&e) {
+                    match &c.x {
+                        ExprX::Logical(LogicalOp::Implies, g, b) => {
+                            let a = self.init_assigns(b, states, depth);
+                            for (g2, a2) in &implications {
+                                if complementary(g, g2) {
+                                    s.extend(a.intersection(a2).cloned());
+                                }
+                            }
+                            implications.push((g.clone(), a));
+                        }
+                        _ => s.extend(self.init_assigns(&c, states, depth)),
+                    }
+                }
                 s
             }
             ExprX::Logical(LogicalOp::Or, a, b) => {
@@ -2614,15 +2730,16 @@ impl Exporter {
 
 /// Whether a conjunct-level `e` keeps its conjunct-level children there: a
 /// conjunction, a `LET` block, an `IF`, `match` or disjunction (whose arms
-/// are, their conditions not), an equality (which assigns; its operands are
-/// not at conjunct level), a reduced closure application, an `exists`, and
-/// wrappers that print as their operand. Anything else (a negation, an
-/// implication, a `forall`, a call's arguments, arithmetic) is not. A call
+/// are, their conditions not), an implication (whose consequent is, its
+/// guard not), an equality (which assigns; its operands are not at conjunct
+/// level), a reduced closure application, an `exists`, and wrappers that
+/// print as their operand. Anything else (a negation, a `forall`, a call's
+/// arguments, arithmetic) is not. A call
 /// is conjunctive so its operator is recorded as called at conjunct level;
 /// its arguments are not.
 fn conjunctive(e: &Expr) -> bool {
     match &e.x {
-        ExprX::Logical(LogicalOp::And | LogicalOp::Or, ..)
+        ExprX::Logical(LogicalOp::And | LogicalOp::Or | LogicalOp::Implies, ..)
         | ExprX::Block(..)
         | ExprX::If(..)
         | ExprX::Match(..)
@@ -2752,12 +2869,104 @@ fn is_false(e: &Expr) -> bool {
     matches!(peel(e).x, ExprX::Const(Constant::Bool(false)))
 }
 
+/// The variable and field path `e` reads (`pre.a.b`), through place reads
+/// and boxing, so a field read written as an expression and one written as
+/// a place compare equal.
+fn access_path(e: &Expr) -> Option<(VarIdent, Vec<Ident>)> {
+    fn place_path(p: &Place) -> Option<(VarIdent, Vec<Ident>)> {
+        match &p.x {
+            PlaceX::Local(v) => Some((v.clone(), vec![])),
+            PlaceX::Field(FieldOpr { field, .. }, inner) => {
+                let (v, mut fields) = place_path(inner)?;
+                fields.push(field.clone());
+                Some((v, fields))
+            }
+            PlaceX::DerefMut(inner) | PlaceX::ModeUnwrap(inner, _) => place_path(inner),
+            PlaceX::Temporary(e) | PlaceX::WithExpr(e, _) => access_path(e),
+            _ => None,
+        }
+    }
+    let e = peel(e);
+    match &e.x {
+        ExprX::Var(v) => Some((v.clone(), vec![])),
+        ExprX::ReadPlace(p, _) => place_path(p),
+        ExprX::UnaryOpr(UnaryOpr::Field(FieldOpr { field, .. }), inner) => {
+            let (v, mut fields) = access_path(inner)?;
+            fields.push(field.clone());
+            Some((v, fields))
+        }
+        _ => None,
+    }
+}
+
+/// Whether `a` and `b` are the same expression, for the common shapes of a
+/// guard (reads, literals, operators, calls); anything else is not, so the
+/// answer is never a wrong yes.
+fn same_expr(a: &Expr, b: &Expr) -> bool {
+    if let (Some(x), Some(y)) = (access_path(a), access_path(b)) {
+        return x == y;
+    }
+    let (a, b) = (peel(a), peel(b));
+    let all = |xs: &Exprs, ys: &Exprs| {
+        xs.len() == ys.len() && xs.iter().zip(ys.iter()).all(|(x, y)| same_expr(x, y))
+    };
+    match (&a.x, &b.x) {
+        (ExprX::Const(x), ExprX::Const(y)) => x == y,
+        (ExprX::Unary(o1, x), ExprX::Unary(o2, y)) => o1 == o2 && same_expr(x, y),
+        (
+            ExprX::UnaryOpr(UnaryOpr::IsVariant { datatype: d1, variant: v1 }, x),
+            ExprX::UnaryOpr(UnaryOpr::IsVariant { datatype: d2, variant: v2 }, y),
+        ) => d1 == d2 && v1 == v2 && same_expr(x, y),
+        (ExprX::UnaryOpr(UnaryOpr::Field(f1), x), ExprX::UnaryOpr(UnaryOpr::Field(f2), y)) => {
+            f1.datatype == f2.datatype && f1.field == f2.field && same_expr(x, y)
+        }
+        (ExprX::Binary(o1, x1, y1), ExprX::Binary(o2, x2, y2)) => {
+            o1 == o2 && same_expr(x1, x2) && same_expr(y1, y2)
+        }
+        (ExprX::Logical(o1, x1, y1), ExprX::Logical(o2, x2, y2)) => {
+            o1 == o2 && same_expr(x1, x2) && same_expr(y1, y2)
+        }
+        (
+            ExprX::Call { target: CallTarget::Fun(_, f1, ..), args: a1, .. },
+            ExprX::Call { target: CallTarget::Fun(_, f2, ..), args: a2, .. },
+        ) => f1 == f2 && all(a1, a2),
+        _ => false,
+    }
+}
+
+/// Whether exactly one of the guards `a` and `b` holds in every state: one
+/// is the negation of the other (`g`, `!g`), or they are opposite
+/// comparisons of the same operands (`x == y`, `x != y`; `x < y`, `x >= y`).
+fn complementary(a: &Expr, b: &Expr) -> bool {
+    let (a, b) = (peel(a), peel(b));
+    let negates =
+        |n: &Expr, g: &Expr| matches!(&n.x, ExprX::Unary(UnaryOp::Not, x) if same_expr(x, g));
+    if negates(&a, &b) || negates(&b, &a) {
+        return true;
+    }
+    let opposite = |o1: &BinaryOp, o2: &BinaryOp| {
+        use InequalityOp::*;
+        match (o1, o2) {
+            (BinaryOp::Eq(_), BinaryOp::Ne) | (BinaryOp::Ne, BinaryOp::Eq(_)) => true,
+            (BinaryOp::Inequality(i1), BinaryOp::Inequality(i2)) => {
+                matches!((i1, i2), (Lt, Ge) | (Ge, Lt) | (Le, Gt) | (Gt, Le))
+            }
+            _ => false,
+        }
+    };
+    match (&a.x, &b.x) {
+        (ExprX::Binary(o1, x1, y1), ExprX::Binary(o2, x2, y2)) => {
+            opposite(o1, o2) && same_expr(x1, x2) && same_expr(y1, y2)
+        }
+        _ => false,
+    }
+}
+
 fn expr_kind(x: &ExprX) -> &'static str {
     match x {
         ExprX::Loop { .. } => "loop",
         ExprX::Assign { .. } => "assignment",
         ExprX::NonSpecClosure { .. } => "exec closure",
-        ExprX::ArrayLiteral(_) => "array literal",
         ExprX::ExecFnByName(_) => "function by name",
         ExprX::OpenInvariant(..) => "open invariant",
         ExprX::Return(_) => "return",
@@ -3067,7 +3276,7 @@ pub fn export_module(krate: &Krate, arg: &str) -> Result<Export, String> {
         defs: Vec::new(),
         emitted: HashSet::new(),
         emitting: HashSet::new(),
-        recursive: BTreeMap::new(),
+        arity: HashMap::new(),
         op_names: HashMap::new(),
         used_names: HashSet::new(),
         locals_ever: HashSet::new(),
@@ -3081,8 +3290,8 @@ pub fn export_module(krate: &Krate, arg: &str) -> Result<Export, String> {
         assigned: HashMap::new(),
         current_assigned: BTreeSet::new(),
         enclosing_assigned: Vec::new(),
+        implications: Vec::new(),
         state_types,
-        roots: HashSet::new(),
         holes: Vec::new(),
         refusals: Vec::new(),
         constants: BTreeSet::new(),
@@ -3100,7 +3309,6 @@ pub fn export_module(krate: &Krate, arg: &str) -> Result<Export, String> {
     let mut outcome: HashMap<Fun, (bool, String)> = HashMap::new();
     let mut roots = vec![triple.init.clone(), triple.next.clone()];
     roots.extend(selected.iter().cloned());
-    ex.roots = roots.iter().cloned().collect();
     // verus-tla: the closures are the bodies; emit as state operators by
     // treating `init()`/`next()` specially.
     let verus_tla = triple.shape == "verus-tla";
@@ -3120,6 +3328,7 @@ pub fn export_module(krate: &Krate, arg: &str) -> Result<Export, String> {
             ex.current_calls.clear();
             ex.current_assigned.clear();
             ex.enclosing_assigned.clear();
+            ex.implications.clear();
             ex.conj_level = true;
             let body = match &f.x.body {
                 Some(b) => match &peel(b).x {
@@ -3286,8 +3495,9 @@ pub fn export_module(krate: &Krate, arg: &str) -> Result<Export, String> {
             "{EUCLID_MOD}({a}, {b}) == {a} % (IF {b} < 0 THEN -{b} ELSE {b})\n{EUCLID_DIV}({a}, {b}) == ({a} - {EUCLID_MOD}({a}, {b})) \\div {b}\n\n"
         ));
     }
-    if !ex.recursive.is_empty() {
-        for (r, arity) in &ex.recursive {
+    let recursive = ex.recursive();
+    if !recursive.is_empty() {
+        for (r, arity) in &recursive {
             if *arity == 0 {
                 tla.push_str(&format!("RECURSIVE {r}\n"));
             } else {
@@ -3378,7 +3588,7 @@ pub fn export_module(krate: &Krate, arg: &str) -> Result<Export, String> {
         ));
     }
     cfg.push_str(
-        "\\* The unassigned check counts a conjunct-level v' = e, and v = e in Init (an IF,\n\\* match or disjunction when every branch assigns v; a FALSE branch assigns all).\n\\* It can miss a v' read before the conjunct that assigns it (TLC evaluates\n\\* conjuncts in order), and it does not count v' \\in S.\n",
+        "\\* The unassigned check counts a conjunct-level v' = e, and v = e in Init (an IF,\n\\* match or disjunction when every branch assigns v; a FALSE branch assigns all;\n\\* g => b1 beside ~g => b2 when b1 and b2 both assign v).\n\\* It can miss a v' read before the conjunct that assigns it (TLC evaluates\n\\* conjuncts in order), and it does not count v' \\in S.\n",
     );
     cfg.push_str("\\* CONSTRAINT <a state predicate bounding the model>\n");
     let report = Report {
