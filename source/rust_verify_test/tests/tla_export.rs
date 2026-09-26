@@ -2703,3 +2703,77 @@ fn tla_export_prints_an_or_pattern_as_a_disjunction() {
     // n in 0..3 and k in 0..2.
     assert_eq!(run.distinct, 12, "{run:?}\n{}", ex.tla);
 }
+
+/// An Init equality of two fields after a helper that assigns one of them:
+/// the helper's assignment counts, so the other field goes on the left and
+/// the print agrees with the report (it was printed `x = y`, which TLC
+/// cannot evaluate, while the report said everything was assigned).
+const INIT_HELPER_THEN_EQUALITY: &str = r#"
+verus! {
+pub struct State { pub x: int, pub y: int, pub done: bool }
+
+pub open spec fn x_zero(s: State) -> bool { s.x == 0 && !s.done }
+
+pub open spec fn init(s: State) -> bool { x_zero(s) && s.x == s.y }
+
+pub open spec fn next(pre: State, post: State) -> bool {
+    &&& pre.x < 2
+    &&& post.x == pre.x + 1
+    &&& post.y == pre.y
+    &&& post.done == pre.done
+}
+
+pub open spec fn y_zero(s: State) -> bool { s.y == 0 }
+}
+"#;
+
+#[test]
+fn tla_export_counts_what_an_init_helper_assigns() {
+    let ex = export_code(INIT_HELPER_THEN_EQUALITY, "test_crate");
+    assert_eq!(ex.report["init_unassigned"], serde_json::json!([]), "{}", ex.tla);
+    assert!(ex.tla.contains("(x_zero /\\ (y = x))"), "{}", ex.tla);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let run = tlc(&jar, &ex.spec(), &ex.cfg);
+    assert_eq!(run.violated, Vec::<String>::new(), "{}", ex.tla);
+    // x in 0..2, y and done fixed.
+    assert_eq!(run.distinct, 3, "{run:?}\n{}", ex.tla);
+}
+
+/// TLC has no reals and rejects a module holding one outright, so a real
+/// literal and a conversion between int and real are refused where they
+/// occur (they were printed as a decimal and the identity).
+const REALS: &str = r#"
+verus! {
+pub struct State { pub x: int }
+
+pub open spec fn init(s: State) -> bool { s.x == 0 }
+
+pub open spec fn next(pre: State, post: State) -> bool { pre.x < 2 && post.x == pre.x + 1 }
+
+pub open spec fn small(s: State) -> bool { s.x <= 2 }
+
+pub open spec fn real_small(s: State) -> bool { (s.x as real) < 2.5real }
+}
+"#;
+
+#[test]
+fn tla_export_refuses_reals() {
+    let ex = export_code(REALS, "test_crate");
+    let whats: Vec<String> = ex.report["refusals"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["what"].as_str().unwrap().to_string())
+        .collect();
+    assert!(whats.iter().any(|w| w == "real literal"), "{:?}", whats);
+    assert!(whats.iter().any(|w| w == "conversion between int and real"), "{:?}", whats);
+    assert_eq!(names(&ex.report["skipped_invariants"]), ["real_small"]);
+    assert_eq!(names(&ex.report["invariants"]), ["small"]);
+    assert!(!ex.tla.contains("2.5"), "{}", ex.tla);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let run = tlc(&jar, &ex.spec(), &ex.cfg);
+    assert_eq!(run.violated, Vec::<String>::new(), "{}", ex.tla);
+    assert_eq!(run.distinct, 3, "{run:?}\n{}", ex.tla);
+}

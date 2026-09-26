@@ -279,6 +279,11 @@ struct Exporter {
     /// unassigned, so an equality of two unprimed fields puts the one not
     /// yet assigned on the left.
     pre_assigned: BTreeSet<String>,
+    /// The unprimed state variables each operator assigns at conjunct
+    /// level outside any branch (its `pre_assigned` when printed): a
+    /// conjunct-level call adds them to the caller's, so in `init(s) =
+    /// x_zero(s) && s.x == s.y` the equality is printed `y = x`.
+    pre_assigned_by: HashMap<OpKey, BTreeSet<String>>,
     /// What the branches enclosing the one being printed had assigned when
     /// it began, innermost last: TLC has assigned those by the time it
     /// evaluates the branch.
@@ -1005,7 +1010,9 @@ impl Exporter {
                 Constant::Bool(false) => "FALSE".into(),
                 Constant::Int(i) => i.to_string(),
                 Constant::StrSlice(s) => tla_string(s),
-                Constant::Real(r) => r.clone(),
+                // TLC has no reals: it rejects the whole module, so a real
+                // is refused where it occurs, as a float is.
+                Constant::Real(_) => self.refuse("real literal", &e.span),
                 Constant::ByteStr(_) => self.refuse("byte string literal", &e.span),
                 Constant::Char(c) => tla_string(&c.to_string()),
                 Constant::Float32(_) | Constant::Float64(_) => {
@@ -1061,7 +1068,9 @@ impl Exporter {
                         _ => self.checked_cast(e, inner, range, env),
                     }
                 }
-                UnaryOp::IntToReal | UnaryOp::RealToInt => self.expr(inner, env),
+                UnaryOp::IntToReal | UnaryOp::RealToInt => {
+                    self.refuse("conversion between int and real", &e.span)
+                }
                 _ => {
                     let what = format!("unary operator {:?}", op);
                     self.refuse(what, &e.span)
@@ -2548,6 +2557,7 @@ impl Exporter {
     fn record_body(&mut self, key: &OpKey) {
         let assigned = std::mem::take(&mut self.current_assigned);
         self.assigned.insert(key.clone(), assigned);
+        self.pre_assigned_by.insert(key.clone(), self.pre_assigned.clone());
         self.calls.insert(key.clone(), std::mem::take(&mut self.current_calls));
     }
 
@@ -2905,13 +2915,17 @@ impl Exporter {
     }
 
     /// A call at conjunct level assigns what its operator assigns on every
-    /// path (nothing yet known for a recursive call still being printed).
+    /// path (nothing yet known for a recursive call still being printed),
+    /// in the primed state and, for Init, in the unprimed one.
     fn assign_through_call(&mut self, key: &OpKey, reach: Reach) {
         if reach == Reach::Other {
             return;
         }
         if let Some(assigned) = self.assigned.get(key) {
             self.current_assigned.extend(assigned.iter().cloned());
+        }
+        if let Some(assigned) = self.pre_assigned_by.get(key) {
+            self.pre_assigned.extend(assigned.iter().cloned());
         }
     }
 
@@ -3725,6 +3739,7 @@ pub fn export_module(krate: &Krate, arg: &str) -> Result<Export, String> {
         assigned: HashMap::new(),
         current_assigned: BTreeSet::new(),
         pre_assigned: BTreeSet::new(),
+        pre_assigned_by: HashMap::new(),
         enclosing_assigned: Vec::new(),
         implications: Vec::new(),
         state_types,

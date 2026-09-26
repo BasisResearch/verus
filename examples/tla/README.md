@@ -69,7 +69,9 @@ overflow before reaching it.
 Whatever the export cannot express is printed as `Assert(FALSE, "...")`, so
 TLC stops with the reason wherever it is evaluated. An invariant that reaches
 one is left out of the `.cfg` and listed in the report's
-`skipped_invariants`.
+`skipped_invariants`. A real literal or a conversion between `int` and
+`real` is refused too, as a float literal is: TLC has no reals and would
+reject the whole module.
 
 A quantifier's binder is bounded from its guard: membership in a set, a
 map's domain or a sequence, or integer comparisons, chained ones included
@@ -157,7 +159,9 @@ report's `init_unassigned` lists the variables `Init` never assigns (`x = e`
 or `e = x` at conjunct level, followed through calls passing the state; `s.x
 == s.y` assigns whichever of the two an earlier conjunct left unassigned,
 and is printed with that one on the left, where an earlier conjunct of the
-same operator counts: a helper is printed once, so in `same(s) = s.x ==
+same operator counts, and so does what a helper called at conjunct level
+before it assigns (`x_zero(s) && s.x == s.y` is `x_zero /\ y = x`); a
+helper is printed once, so in `same(s) = s.x ==
 s.y` called after `s.x == 0` it is `x = y` and assigns nothing; `s.o is None` and
 `s.o.is_none()` are printed `o = [tag |-> "None"]` and assign `o`, and a
 bare or negated bool field `s.done`, `!s.done` is printed `done = TRUE`,
