@@ -71,7 +71,10 @@ TLC stops with the reason wherever it is evaluated. An invariant that reaches
 one is left out of the `.cfg` and listed in the report's
 `skipped_invariants`. A real literal or a conversion between `int` and
 `real` is refused too, as a float literal is: TLC has no reals and would
-reject the whole module.
+reject the whole module. A `char` is a TLA+ string, so a cast from one
+(`c as u32`) and an ordering comparison of chars (`'a' <= c`) are refused
+rather than left for TLC to stop at with a type error; a `char` binder's
+guard gives no range, and its domain is a hole (`Dom_char`).
 
 A quantifier's binder is bounded from its guard: membership in a set, a
 map's domain or a sequence, or integer comparisons, chained ones included
@@ -88,7 +91,9 @@ Step { Tick }`, its one value `{[tag |-> "unit"]}`), and a tuple the tuples of i
 elements' domains. A larger or unbounded one is a hole, a
 `CONSTANT Dom_<type>` named after its type (`Dom_u16`, `Dom_u32`,
 `Dom_int`, `Dom_Option_int_Some_v0`, a tuple's after its element types,
-`Dom_tuple2_u8_u8_v0`), so TLC never tries to enumerate
+`Dom_tuple2_u8_u8_v0`; of two datatypes of one name in different modules,
+the second takes a suffix, `a::Id` in `Dom_Id_Id_v` and `b::Id` in
+`Dom_Id_2_Id_v`), so TLC never tries to enumerate
 65536 values per state. In a datatype, a variant whose fields together
 take more than 2^10 values (`Step::Put(u16, u16)`, or `Step::Pair(u8, u8)`
 with its 65536) has a hole for each field of more than one value

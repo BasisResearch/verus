@@ -297,6 +297,12 @@ struct Exporter {
     holes: Vec<Hole>,
     refusals: Vec<Refusal>,
     constants: BTreeSet<String>,
+    /// The name each datatype takes in hole constants: its last segment,
+    /// with a suffix when a datatype of another path took it first
+    /// (`a::Id` is `Id`, `b::Id` then `Id_2`), so two types never share a
+    /// constant; and the names taken.
+    datatype_names: HashMap<Path, String>,
+    datatype_names_taken: HashSet<String>,
     current: String,
 }
 
@@ -422,20 +428,27 @@ fn typ_datatype(typ: &Typ) -> Option<Path> {
     }
 }
 
-/// The friendly name of a type, for holes and constants. An integer type is
-/// named after its range (`u8`, `nat`, `int`) and a tuple after its element
-/// types (`tuple2_u8_bool`), so binders of different types never share a
-/// hole constant.
+/// The friendly name of a type, for the report (a datatype by its last
+/// segment). An integer type is named after its range (`u8`, `nat`, `int`)
+/// and a tuple after its element types (`tuple2_u8_bool`). Hole constants
+/// are named by [`Exporter::constant_typ_name`], which keeps datatypes of
+/// one name in different modules apart.
 fn typ_name(typ: &Typ) -> String {
+    typ_name_with(typ, &mut |p: &Path| last_segment(p))
+}
+
+/// [`typ_name`], with `datatype` naming each datatype.
+fn typ_name_with(typ: &Typ, datatype: &mut dyn FnMut(&Path) -> String) -> String {
     match &**typ {
         TypX::Bool => "bool".into(),
         TypX::Int(range) => crate::ast_util::int_range_to_type_string(range),
         TypX::Datatype(Dt::Path(p), args, _) => {
-            let base = last_segment(p);
+            let base = datatype(p);
             if args.is_empty() {
                 base
             } else {
-                format!("{base}_{}", args.iter().map(typ_name).collect::<Vec<_>>().join("_"))
+                let args: Vec<String> = args.iter().map(|a| typ_name_with(a, datatype)).collect();
+                format!("{base}_{}", args.join("_"))
             }
         }
         // Named after its element types too, so binders of different tuple
@@ -444,11 +457,11 @@ fn typ_name(typ: &Typ) -> String {
             let mut name = format!("tuple{n}");
             for a in args.iter() {
                 name.push('_');
-                name.push_str(&typ_name(a));
+                name.push_str(&typ_name_with(a, datatype));
             }
             name
         }
-        TypX::Decorate(_, _, t) | TypX::Boxed(t) => typ_name(t),
+        TypX::Decorate(_, _, t) | TypX::Boxed(t) => typ_name_with(t, datatype),
         TypX::TypParam(x) => x.to_string(),
         _ => "T".into(),
     }
@@ -663,6 +676,27 @@ impl Exporter {
     fn refuse_symbolic(&mut self, v: &VarIdent, span: &crate::messages::Span) -> String {
         let what = format!("closure value `{}` used other than in an application", v.0);
         self.refuse(what, span)
+    }
+
+    /// The name of a type in a hole constant: [`typ_name`], with each
+    /// datatype named uniquely (see [`Exporter::datatype_names`]).
+    fn constant_typ_name(&mut self, typ: &Typ) -> String {
+        let (names, taken) = (&mut self.datatype_names, &mut self.datatype_names_taken);
+        sanitize(&typ_name_with(typ, &mut |p: &Path| {
+            if let Some(n) = names.get(p) {
+                return n.clone();
+            }
+            let base = sanitize(&last_segment(p));
+            let mut candidate = base.clone();
+            let mut n = 2;
+            while taken.contains(&candidate) {
+                candidate = format!("{base}_{n}");
+                n += 1;
+            }
+            taken.insert(candidate.clone());
+            names.insert(p.clone(), candidate.clone());
+            candidate
+        }))
     }
 
     /// Whether a name is taken at module level or reserved by TLA+.
@@ -1051,6 +1085,12 @@ impl Exporter {
                 // the type (`(pre.x - 1) as nat` behind `pre.x > 0` never
                 // does). It is not a refusal and taints nothing. A literal
                 // is decided here: kept in range, refused out of it.
+                // A `char` is a string here (see `Constant::Char`), so a
+                // cast from one has no integer to give: refused, as a cast
+                // to one is.
+                UnaryOp::Clip { .. } if is_char_typ(&inner.typ) => {
+                    self.refuse("cast from char", &e.span)
+                }
                 UnaryOp::Clip { range: IntRange::Int, .. } => self.expr(inner, env),
                 UnaryOp::Clip { range, .. } if int_typ_within(&inner.typ, range) => {
                     self.expr(inner, env)
@@ -1160,6 +1200,12 @@ impl Exporter {
                     None => format!("({} = {})", x.expr(a, env), x.expr(b, env)),
                 })
             }
+            ExprX::Multi(MultiOp::Chained(ops), args)
+                if ops.iter().any(|op| matches!(op, ChainedOp::Inequality(_)))
+                    && args.iter().any(|a| is_char_typ(&a.typ)) =>
+            {
+                self.refuse("ordering comparison of chars", &e.span)
+            }
             ExprX::Multi(MultiOp::Chained(ops), args) => {
                 let mut parts = Vec::new();
                 for (i, op) in ops.iter().enumerate() {
@@ -1247,6 +1293,10 @@ impl Exporter {
                     }
                     format!("({} {sym} {})", x.expr(a, env), x.expr(b, env))
                 })
+            }
+            // A `char` is a string here, and TLC orders only integers.
+            BinaryOp::Inequality(_) if is_char_typ(&a.typ) || is_char_typ(&b.typ) => {
+                self.refuse("ordering comparison of chars", &e.span)
             }
             BinaryOp::Inequality(iq) => {
                 let sym = match iq {
@@ -2138,7 +2188,7 @@ impl Exporter {
                 None => match self.bound_from_type(&b.a, &e.span, &mut Vec::new()) {
                     Some((d, _)) => d,
                     None => {
-                        let constant = format!("Dom_{}", sanitize(&typ_name(&b.a)));
+                        let constant = format!("Dom_{}", self.constant_typ_name(&b.a));
                         self.constants.insert(constant.clone());
                         self.holes.push(Hole {
                             variable: name.clone(),
@@ -2292,7 +2342,7 @@ impl Exporter {
         // The constant for an unbounded field is named after the
         // instantiation (`Option_bool`, `Option_int`, `tuple2_u8_u8`), since
         // each needs its own set.
-        let instance = sanitize(&typ_name(typ));
+        let instance = self.constant_typ_name(typ);
         // Each field's domain, and the holes bounding it added.
         let mut all: Vec<Bounded> = Vec::new();
         for (_, fields) in variants {
@@ -2449,7 +2499,11 @@ impl Exporter {
                 });
             }
         }
-        // Integer range from inequalities and chained comparisons.
+        // Integer range from inequalities and chained comparisons; a `char`
+        // is a string here, with no range.
+        if matches!(range, Some(IntRange::Char)) {
+            return None;
+        }
         let mut lower: Option<String> = None;
         let mut upper: Option<String> = None;
         // `v op other`, with `strict` strict comparisons on the way (each one
@@ -3198,6 +3252,11 @@ fn int_typ_within(typ: &Typ, range: &IntRange) -> bool {
     }
 }
 
+/// Whether `typ` is `char`, printed as a TLA+ string rather than an integer.
+fn is_char_typ(typ: &Typ) -> bool {
+    matches!(&*crate::ast_util::undecorate_typ(typ), TypX::Int(IntRange::Char))
+}
+
 /// A field's record label. A positional field `0` is `v0`. An enum value's
 /// record carries its variant in the label `tag`, so a field named `tag`, or
 /// `tag` followed by underscores, takes one more underscore: labels stay
@@ -3746,6 +3805,8 @@ pub fn export_module(krate: &Krate, arg: &str) -> Result<Export, String> {
         holes: Vec::new(),
         refusals: Vec::new(),
         constants: BTreeSet::new(),
+        datatype_names: HashMap::new(),
+        datatype_names_taken: HashSet::new(),
         current: String::new(),
     };
     for v in &state_vars {

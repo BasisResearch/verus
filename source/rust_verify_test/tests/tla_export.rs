@@ -464,6 +464,124 @@ fn tla_export_refusals_stop_tlc_and_leave_the_invariant_out() {
     sany(&jar, &ex.spec());
 }
 
+/// A `char` is a TLA+ string, so a cast from one and an ordering comparison
+/// of two have no TLA+ meaning: each is refused where it occurs rather than
+/// left for TLC to stop at with a type error, and a `char` binder's guard
+/// gives no range (its domain is a hole).
+const CHARS: &str = r#"
+verus! {
+pub struct State { pub x: u32, pub c: char }
+
+pub open spec fn init(s: State) -> bool { s.x == 0 && s.c == 'a' }
+
+pub open spec fn next(pre: State, post: State) -> bool {
+    pre.x < 2 && post.x == pre.x + 1 && post.c == pre.c
+}
+
+pub open spec fn small(s: State) -> bool { s.x <= 2 && s.c == 'a' }
+
+pub open spec fn code(s: State) -> bool { (s.c as u32) < 128 }
+
+pub open spec fn wide(s: State) -> bool { s.c as int >= 0 }
+
+pub open spec fn ordered(s: State) -> bool { 'a' <= s.c }
+
+pub open spec fn chained(s: State) -> bool { 'a' <= s.c <= 'z' }
+
+pub open spec fn is_c(d: char, s: State) -> bool { d == s.c }
+
+pub open spec fn spread(s: State) -> bool {
+    forall|d: char| #![trigger is_c(d, s)] 'b' <= d ==> !is_c(d, s)
+}
+}
+"#;
+
+#[test]
+fn tla_export_refuses_char_casts_and_orderings() {
+    let ex = export_code(CHARS, "test_crate");
+    let whats: Vec<String> = ex.report["refusals"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["what"].as_str().unwrap().to_string())
+        .collect();
+    // `s.c as u32` is a cast; `s.c as int` reaches VIR with the char type,
+    // so its comparison with `0` is the one refused.
+    assert_eq!(whats.iter().filter(|w| *w == "cast from char").count(), 1, "{whats:?}");
+    assert_eq!(
+        whats.iter().filter(|w| *w == "ordering comparison of chars").count(),
+        4,
+        "{whats:?}"
+    );
+    assert_eq!(names(&ex.report["invariants"]), ["small"]);
+    assert_eq!(
+        names(&ex.report["skipped_invariants"]),
+        ["code", "wide", "ordered", "chained", "spread"]
+    );
+    // No range of strings: the char binder is a hole.
+    let holes = ex.report["holes"].as_array().unwrap();
+    assert_eq!(holes.len(), 1, "{holes:?}");
+    assert_eq!(holes[0]["constant"], "Dom_char");
+    assert!(!ex.tla.contains("\"..") && !ex.tla.contains("..\""), "{}", ex.tla);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let cfg = format!("{}CONSTANTS Dom_char = {{\"a\", \"b\"}}\n", ex.cfg);
+    let run = tlc(&jar, &ex.spec(), &cfg);
+    assert_eq!(run.violated, Vec::<String>::new(), "{}", ex.tla);
+    assert_eq!(run.distinct, 3, "{run:?}");
+}
+
+/// Two datatypes of one name in different modules never share a hole
+/// constant: the first takes the name, the second a suffix.
+const SAME_NAMED: &str = r#"
+verus! {
+pub mod a { pub struct Id { pub v: u16 } }
+
+pub mod b {
+    use vstd::prelude::*;
+    pub struct Id { pub v: int }
+}
+
+pub struct State { pub x: int }
+
+pub open spec fn init(s: State) -> bool { s.x == 0 }
+
+pub open spec fn next(pre: State, post: State) -> bool { pre.x < 2 && post.x == pre.x + 1 }
+
+pub open spec fn ia(s: State) -> bool { forall|i: a::Id| i.v < 3 ==> s.x != 7 }
+
+pub open spec fn ib(s: State) -> bool { forall|i: b::Id| i.v == s.x ==> s.x >= 0 }
+}
+"#;
+
+#[test]
+fn tla_export_names_same_named_datatypes_apart() {
+    let ex = export_code(SAME_NAMED, "test_crate");
+    assert_eq!(ex.report["refusals"], serde_json::json!([]), "{}", ex.tla);
+    let holes: Vec<(String, String)> = ex.report["holes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|h| {
+            (h["constant"].as_str().unwrap().to_string(), h["typ"].as_str().unwrap().to_string())
+        })
+        .collect();
+    assert_eq!(
+        holes,
+        [("Dom_Id_Id_v".to_string(), "u16".to_string()), ("Dom_Id_2_Id_v".into(), "int".into())]
+    );
+    assert_eq!(names(&ex.report["invariants"]), ["ia", "ib"]);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let cfg = format!(
+        "{}CONSTANTS Dom_Id_Id_v = {{0, 1}}\nCONSTANTS Dom_Id_2_Id_v = {{0, 1, 2}}\n",
+        ex.cfg
+    );
+    let run = tlc(&jar, &ex.spec(), &cfg);
+    assert_eq!(run.violated, Vec::<String>::new(), "{}", ex.tla);
+    assert_eq!(run.distinct, 3, "{run:?}");
+}
+
 /// The candidates the report lists, as (function's last segment, included).
 fn candidates(report: &serde_json::Value) -> Vec<(String, bool)> {
     report["candidates"]
