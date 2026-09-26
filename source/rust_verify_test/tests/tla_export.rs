@@ -2524,3 +2524,141 @@ fn tla_export_enumerates_a_datatype_of_one_value() {
     // x in 0..5.
     assert_eq!(run.distinct, 6, "{run:?}");
 }
+
+/// A collection's values are TLA+ sequences, sets and functions, so a
+/// domain read off its type is never built from its Rust representation (a
+/// `Seq` was nested `SeqInner` records, a `Set` or `Map`, opaque in VIR,
+/// the one value `[tag |-> "unit"]`): a `Seq` or `Map` is a hole named after
+/// its type (per field in a step variant), a `Set` of a small element domain
+/// its subsets (`SUBSET BOOLEAN`), and a larger `Set` a hole.
+const COLLECTION_DOMAINS: &str = r#"
+use vstd::prelude::*;
+verus! {
+pub struct State { pub log: Seq<u8>, pub u: Set<u8>, pub m: Map<int, bool>, pub b: Set<bool> }
+
+pub enum Step { Put(Seq<u8>), Add(Set<u8>), Store(Map<int, bool>), Flags(Set<bool>) }
+
+pub open spec fn init(s: State) -> bool {
+    &&& s.log == Seq::<u8>::empty()
+    &&& s.u == Set::<u8>::empty()
+    &&& s.m == Map::<int, bool>::empty()
+    &&& s.b == Set::<bool>::empty()
+}
+
+pub open spec fn step(pre: State, post: State, st: Step) -> bool {
+    match st {
+        Step::Put(x) => x.len() == 1 && pre.log.len() < 2 && post.log == pre.log + x
+            && post.u == pre.u && post.m == pre.m && post.b == pre.b,
+        Step::Add(x) => post.u == pre.u.union(x)
+            && post.log == pre.log && post.m == pre.m && post.b == pre.b,
+        Step::Store(x) => post.m == x && post.log == pre.log && post.u == pre.u && post.b == pre.b,
+        Step::Flags(x) => post.b == x && post.log == pre.log && post.u == pre.u && post.m == pre.m,
+    }
+}
+
+pub open spec fn next(pre: State, post: State) -> bool { exists|st: Step| step(pre, post, st) }
+
+// Violated: Add can insert 3.
+pub open spec fn no3(s: State) -> bool { !s.u.contains(3u8) }
+
+pub open spec fn m_ok(s: State) -> bool { s.m.dom().contains(1) ==> s.m[1] }
+
+pub open spec fn log_short(s: State) -> bool { s.log.len() <= 2 }
+
+pub open spec fn b_small(s: State) -> bool {
+    forall|t: Set<bool>| #[trigger] t.subset_of(s.b) ==> t.len() <= 2
+}
+
+pub open spec fn log_other(s: State) -> bool {
+    forall|q: Seq<u8>| #[trigger] q.len() > 5 ==> q != s.log
+}
+}
+"#;
+
+#[test]
+fn tla_export_bounds_collections_by_holes_or_subsets() {
+    let ex = export_code(COLLECTION_DOMAINS, "test_crate");
+    assert_eq!(ex.report["refusals"], serde_json::json!([]), "{}", ex.tla);
+    let mut holes: Vec<(String, String)> = ex.report["holes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|h| (h["constant"].as_str().unwrap().into(), h["typ"].as_str().unwrap().into()))
+        .collect();
+    holes.sort();
+    let expected = [
+        ("Dom_Seq_u8", "Seq_u8"),
+        ("Dom_Step_Add_v0", "Set_u8"),
+        ("Dom_Step_Put_v0", "Seq_u8"),
+        ("Dom_Step_Store_v0", "Map_int_bool"),
+    ];
+    let expected: Vec<(String, String)> =
+        expected.iter().map(|(c, t)| (c.to_string(), t.to_string())).collect();
+    assert_eq!(holes, expected, "{}", ex.tla);
+    assert!(!ex.tla.contains("tag |-> \"unit\""), "{}", ex.tla);
+    assert!(!ex.tla.contains("SeqInner"), "{}", ex.tla);
+    assert!(ex.tla.contains("(SUBSET BOOLEAN)"), "{}", ex.tla);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let mc = ex.spec().with_file_name("MC.tla");
+    std::fs::write(
+        &mc,
+        format!(
+            "---- MODULE MC ----\nEXTENDS {}\n\
+             MC_put == {{<<1>>, <<2>>}}\n\
+             MC_add == {{{{}}, {{3}}}}\n\
+             MC_store == {{[k \\in {{}} |-> k], 1 :> TRUE}}\n\
+             MC_seq == {{<< >>, <<7>>}}\n====\n",
+            ex.module
+        ),
+    )
+    .unwrap();
+    let cfg = format!(
+        "{}CONSTANTS\n  Dom_Step_Put_v0 <- MC_put\n  Dom_Step_Add_v0 <- MC_add\n  \
+         Dom_Step_Store_v0 <- MC_store\n  Dom_Seq_u8 <- MC_seq\n",
+        ex.cfg
+    );
+    let run = tlc(&jar, &mc, &cfg);
+    assert!(!run.violated.is_empty(), "{run:?}\n{}", ex.tla);
+    assert!(run.violated.iter().all(|v| v == "no3"), "{run:?}\n{}", ex.tla);
+    // 7 logs (length at most 2 over {1, 2}) x 2 sets u x 2 maps x 4 sets b.
+    assert_eq!(run.distinct, 112, "{run:?}\n{}", ex.tla);
+}
+
+/// An or-pattern that binds nothing is the disjunction of its
+/// alternatives' conditions (it was refused, which stopped TLC at the
+/// first step of a `match` on the step).
+const OR_PATTERNS: &str = r#"
+use vstd::prelude::*;
+verus! {
+pub struct State { pub n: nat, pub k: nat }
+
+pub enum Step { A, B, C(u8), D }
+
+pub open spec fn init(s: State) -> bool { s.n == 0 && s.k == 0 }
+
+pub open spec fn next(pre: State, post: State) -> bool {
+    exists|st: Step| match st {
+        Step::A | Step::B => pre.n < 3 && post.n == pre.n + 1 && post.k == pre.k,
+        Step::C(1) | Step::C(2) => pre.k < 2 && post.k == pre.k + 1 && post.n == pre.n,
+        _ => post == pre,
+    }
+}
+
+pub open spec fn bounded(s: State) -> bool { s.n <= 3 && s.k <= 2 }
+}
+"#;
+
+#[test]
+fn tla_export_prints_an_or_pattern_as_a_disjunction() {
+    let ex = export_code(OR_PATTERNS, "test_crate");
+    assert_eq!(ex.report["refusals"], serde_json::json!([]), "{}", ex.tla);
+    assert_eq!(ex.report["holes"], serde_json::json!([]), "{}", ex.tla);
+    assert!(ex.tla.contains("((m__.tag = \"A\") \\/ (m__.tag = \"B\"))"), "{}", ex.tla);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let run = tlc(&jar, &ex.spec(), &ex.cfg);
+    assert_eq!(run.violated, Vec::<String>::new(), "{}", ex.tla);
+    // n in 0..3 and k in 0..2.
+    assert_eq!(run.distinct, 12, "{run:?}\n{}", ex.tla);
+}

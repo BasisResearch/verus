@@ -86,6 +86,12 @@ small sets; a small variant (`Step::Nudge(u8)`) is still enumerated whole.
 The cap holds for the variants together too: when their union would take
 more (five variants `A(u8, bool)` ... `E(u8, bool)`, 2560 values), every
 variant of more than one value has a hole per field.
+A collection is never enumerated from its Rust representation: a `Seq` or
+`Map` is a hole named after its type (`Dom_Seq_u8`, `Dom_Map_int_bool`, or
+per field in a variant, `Dom_Step_Put_v0`), as is an opaque
+(`external_body`) datatype, and a `Set` is the subsets of its elements'
+domain when there are at most 2^10 of them (`Set<bool>` is `SUBSET
+BOOLEAN`), else a hole (`Dom_Set_u8`).
 
 A cast to a bounded type (`as u8`, `as nat`, ...) that widens (the operand's
 own type lies in the target's, as `u8` in `u16` or `nat`) is the identity. A
@@ -124,7 +130,8 @@ tuple `<<a, b>>`.
 
 A literal match pattern is an equality with the scrutinee (`0 => ...` is
 `IF m = 0 THEN ...`) and a range pattern its comparisons (`1..=3` is `1 <=
-m /\ m <= 3`).
+m /\ m <= 3`). An or-pattern binding nothing is the disjunction of its
+alternatives (`Step::A | Step::B`); one that binds a name is refused.
 
 A closure bound by `let` (or a closure parameter) is only ever applied; passed
 to a function, compared or returned, it is a refusal.

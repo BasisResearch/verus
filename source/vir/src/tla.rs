@@ -1571,7 +1571,13 @@ impl Exporter {
                     }
                     lets.extend(l);
                 }
-                (if conds.is_empty() { None } else { Some(conds.join(" /\\ ")) }, lets)
+                // Parenthesised, so it stands alone in an or-pattern's `\/`.
+                let cond = match conds.len() {
+                    0 => None,
+                    1 => conds.pop(),
+                    _ => Some(format!("({})", conds.join(" /\\ "))),
+                };
+                (cond, lets)
             }
             // A literal (`0 => ...`) or a constant is an equality, and a
             // range (`1..=3`, `..5`) its comparisons; neither binds a name.
@@ -1596,6 +1602,16 @@ impl Exporter {
                     _ => Some(format!("({})", conds.join(" /\\ "))),
                 };
                 (cond, vec![])
+            }
+            // `A | B` binding nothing: either alternative's condition (an
+            // alternative that always matches makes the whole one match).
+            PatternX::Or(a, b) if !pattern_binds(a) && !pattern_binds(b) => {
+                let (ca, _) = self.pattern(subject, a, env);
+                let (cb, _) = self.pattern(subject, b, env);
+                match (ca, cb) {
+                    (Some(x), Some(y)) => (Some(format!("({x} \\/ {y})")), vec![]),
+                    _ => (None, vec![]),
+                }
             }
             PatternX::Or(..) => {
                 let r = self.refuse("or-pattern", &p.span);
@@ -2121,11 +2137,38 @@ impl Exporter {
                 _ => None,
             },
             TypX::Datatype(Dt::Path(p), args, _) => {
+                // A collection's values are TLA+ sequences, sets and
+                // functions, never records of its Rust representation: a
+                // `Seq` or `Map` is a hole named after its type
+                // (`Dom_Seq_u8`), and a `Set` the subsets of its elements'
+                // domain when that is small and has no hole (`SUBSET
+                // BOOLEAN`), else a hole too.
+                match path_as_friendly_rust_name(p).as_str() {
+                    "vstd::seq::Seq" | "vstd::map::Map" => return None,
+                    "vstd::set::Set" => {
+                        let first_hole = self.holes.len();
+                        let elem = self.bound_from_type(args.first()?, span, seen);
+                        if self.holes.len() > first_hole {
+                            self.drop_holes(first_hole);
+                            return None;
+                        }
+                        let (dom, n) = elem?;
+                        let size = 1u128.checked_shl(u32::try_from(n).ok()?)?;
+                        return (size <= MAX_TYPE_DOMAIN)
+                            .then(|| (format!("(SUBSET {dom})"), size));
+                    }
+                    _ => {}
+                }
                 if seen.contains(p) {
                     return None;
                 }
                 let d = self.datatypes.get(p)?.clone();
                 if d.x.typ_params.len() != args.len() {
+                    return None;
+                }
+                // An opaque (`external_body`) datatype has one variant
+                // without fields in VIR whatever it holds: never enumerated.
+                if matches!(d.x.transparency, DatatypeTransparency::Never) {
                     return None;
                 }
                 // One variant without fields has one value, printed (see
@@ -2234,12 +2277,7 @@ impl Exporter {
             }
             for (b, holes) in bounded.iter().rev() {
                 if b.as_ref().is_some_and(|(_, n)| *n > 1) {
-                    let dropped: Vec<Hole> = self.holes.drain(holes.clone()).collect();
-                    for h in dropped {
-                        if !self.holes.iter().any(|k| k.constant == h.constant) {
-                            self.constants.remove(&h.constant);
-                        }
-                    }
+                    self.drop_hole_range(holes.clone());
                 }
             }
         }
@@ -2294,6 +2332,21 @@ impl Exporter {
             }
         }
         if parts.is_empty() { None } else { Some((format!("({})", parts.join(" \\cup ")), total)) }
+    }
+
+    /// Drop the holes added from `first` on (a domain that became a hole
+    /// itself), with their constants unless another hole still uses one.
+    fn drop_holes(&mut self, first: usize) {
+        self.drop_hole_range(first..self.holes.len());
+    }
+
+    fn drop_hole_range(&mut self, range: std::ops::Range<usize>) {
+        let dropped: Vec<Hole> = self.holes.drain(range).collect();
+        for h in dropped {
+            if !self.holes.iter().any(|k| k.constant == h.constant) {
+                self.constants.remove(&h.constant);
+            }
+        }
     }
 
     /// A finite domain for `v` read off the guard's conjuncts: membership in
@@ -3156,6 +3209,17 @@ fn reached_functions(functions: &HashMap<Fun, Function>, root: &Fun) -> HashSet<
         });
     }
     seen
+}
+
+/// Whether a pattern binds a name anywhere in it.
+fn pattern_binds(p: &Pattern) -> bool {
+    match &p.x {
+        PatternX::Var(_) | PatternX::Binding { .. } => true,
+        PatternX::Wildcard(_) | PatternX::Expr(_) | PatternX::Range(..) => false,
+        PatternX::Constructor(_, _, binders) => binders.iter().any(|b| pattern_binds(&b.a)),
+        PatternX::Or(a, b) => pattern_binds(a) || pattern_binds(b),
+        PatternX::MutRef(inner) | PatternX::ImmutRef(inner) => pattern_binds(inner),
+    }
 }
 
 /// Whether `e` is the literal `false`.
