@@ -794,13 +794,49 @@ impl Exporter {
     }
 
     /// Whether `e` is VerusSync's lowering of an `assert` in a transition,
-    /// `tmp_assert => rest`. The assertion is proved to hold wherever the
-    /// transition is taken, so `rest` stays at conjunct level and what it
-    /// assigns counts (TLC assigns it whenever the assertion holds).
+    /// `tmp_assert => rest`, printed as `IF tmp_assert THEN rest ELSE
+    /// Assert(...)`: `rest` stays at conjunct level and what it assigns
+    /// counts, since a step either assigns it or stops TLC at the failed
+    /// assertion (see [`Exporter::assert_message`]).
     fn assert_implication(&self, e: &Expr) -> bool {
         self.verussync
             && matches!(&e.x, ExprX::Logical(LogicalOp::Implies, a, _)
                 if read_var(a).is_some_and(|v| v.0.starts_with("tmp_assert")))
+    }
+
+    /// The message of a failed VerusSync assert whose guard is `guard`, a
+    /// TLA+ string expression. The macro binds each `tmp_assert` to the
+    /// previous one and its assertion (`tmp_assert_3 == tmp_assert_2 /\
+    /// c3`), so the guard fails when any assertion so far does; the message
+    /// names the first that fails (`IF tmp_assert_2 THEN <c3's> ELSE
+    /// <earlier>`), each by its location and transition.
+    fn assert_message(&self, guard: &Expr, env: &Env, depth: usize) -> String {
+        let at = |span: String| {
+            let msg = format!("tla-export: VerusSync assert in {} fails at {span}", self.current);
+            tla_string(&msg)
+        };
+        let fallback = || at(span_string(&guard.span));
+        let Some((init, venv)) = read_var(guard).and_then(|v| env.values.get(&v)) else {
+            return fallback();
+        };
+        let init = peel(init);
+        let ExprX::Logical(LogicalOp::And, prev, cond) = &init.x else { return fallback() };
+        let here = match assertion_span(&init, cond) {
+            Some(span) => at(span),
+            None => fallback(),
+        };
+        let chained = |v: &VarIdent| {
+            venv.values
+                .get(v)
+                .is_some_and(|(i, _)| matches!(peel(i).x, ExprX::Logical(LogicalOp::And, ..)))
+        };
+        match read_var(prev) {
+            Some(pv) if depth < 64 && chained(&pv) => {
+                let earlier = self.assert_message(prev, venv, depth + 1);
+                format!("(IF {} THEN {here} ELSE {earlier})", venv.name(&pv))
+            }
+            _ => here,
+        }
     }
 
     /// Run `f` off conjunct level: for a condition, a guard, an operand or
@@ -1063,6 +1099,16 @@ impl Exporter {
                     self.refuse(what, &e.span)
                 }
             },
+            // VerusSync's `assert`, `tmp_assert => rest`: `rest` when the
+            // assertion holds, else an `Assert` naming it, so TLC reports a
+            // failed assertion (unproved under --no-verify) rather than a
+            // step it cannot complete. `rest` stays at conjunct level.
+            ExprX::Logical(LogicalOp::Implies, a, b) if self.assert_implication(e) => {
+                let sa = self.quiet(|x| x.expr(a, env));
+                let sb = self.expr(b, env);
+                let msg = self.assert_message(a, env, 0);
+                format!("(IF {sa} THEN {sb} ELSE Assert(FALSE, {msg}))")
+            }
             ExprX::Logical(op, a, b) => {
                 let (sa, sb) = match op {
                     LogicalOp::And => (self.expr(a, env), self.expr(b, env)),
@@ -1071,9 +1117,6 @@ impl Exporter {
                         let (sb, ab) = self.branch_expr(b, env);
                         self.meet(vec![aa, ab]);
                         (sa, sb)
-                    }
-                    LogicalOp::Implies if self.assert_implication(e) => {
-                        (self.quiet(|x| x.expr(a, env)), self.expr(b, env))
                     }
                     // At conjunct level, TLC assigns in the consequent when
                     // the guard holds and nothing when it does not: the
@@ -3222,6 +3265,36 @@ fn pattern_binds(p: &Pattern) -> bool {
     }
 }
 
+/// Where the assertion `cond` of VerusSync's `tmp_assert && cond` (`init`)
+/// is written. The `&&` and the assertion carry the macro's span (whatever
+/// its expansion mark), but the assertion's operands their own: the range
+/// they cover, when there is one.
+fn assertion_span(init: &Expr, cond: &Expr) -> Option<String> {
+    let macro_span = parse_span(&init.span.as_string);
+    let mut spans: Vec<(String, (u32, u32), (u32, u32))> = Vec::new();
+    crate::ast_visitor::expr_visitor_walk(cond, &mut |x: &Expr| {
+        spans.extend(parse_span(&x.span.as_string).filter(|s| Some(s) != macro_span.as_ref()));
+        crate::visitor::VisitorControlFlow::Recurse
+    });
+    let (file, _, _) = spans.first().cloned()?;
+    spans.retain(|(f, _, _)| *f == file);
+    let lo = spans.iter().map(|(_, lo, _)| *lo).min()?;
+    let hi = spans.iter().map(|(_, _, hi)| *hi).max()?;
+    Some(format!("{file}:{}:{}: {}:{}", lo.0, lo.1, hi.0, hi.1))
+}
+
+/// A span printed as `file:l1:c1: l2:c2 (#n)`: the file, and the start and
+/// end as (line, column).
+fn parse_span(s: &str) -> Option<(String, (u32, u32), (u32, u32))> {
+    let s = s.rsplit_once(" (").map_or(s, |(a, _)| a);
+    let (start, end) = s.rsplit_once(": ")?;
+    let (file_line, c1) = start.rsplit_once(':')?;
+    let (file, l1) = file_line.rsplit_once(':')?;
+    let (l2, c2) = end.split_once(':')?;
+    let n = |x: &str| x.trim().parse::<u32>().ok();
+    Some((file.to_string(), (n(l1)?, n(c1)?), (n(l2)?, n(c2)?)))
+}
+
 /// Whether `e` is the literal `false`.
 fn is_false(e: &Expr) -> bool {
     matches!(peel(e).x, ExprX::Const(Constant::Bool(false)))
@@ -3937,6 +4010,9 @@ pub fn export_module(krate: &Krate, arg: &str) -> Result<Export, String> {
 
     let mut cfg = String::new();
     cfg.push_str("SPECIFICATION Spec\n");
+    // Verus has no notion of deadlock: a state with no enabled step is not
+    // an error, so TLC must not report one.
+    cfg.push_str("CHECK_DEADLOCK FALSE\n");
     if !inv_names.is_empty() {
         cfg.push_str("INVARIANTS\n");
         for n in &inv_names {

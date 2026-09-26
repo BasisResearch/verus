@@ -127,28 +127,26 @@ struct Tlc {
 /// TLC's output on `spec` with `cfg` (deadlock is not an error, and it
 /// continues past a violation).
 fn tlc_output(jar: &str, spec: &Path, cfg: &str) -> String {
+    tlc_output_with(jar, spec, cfg, &["-deadlock", "-continue"])
+}
+
+/// TLC's output on `spec` with `cfg`, with `flags` before the spec.
+fn tlc_output_with(jar: &str, spec: &Path, cfg: &str, flags: &[&str]) -> String {
     let dir = spec.parent().unwrap();
     let cfg_path = spec.with_extension("cfg");
     std::fs::write(&cfg_path, cfg).unwrap();
     let meta = dir.join("states");
-    java(
-        jar,
-        dir,
-        &[
-            "tlc2.TLC",
-            "-workers",
-            "1",
-            "-deadlock",
-            "-continue",
-            "-metadir",
-            meta.to_str().unwrap(),
-            "-config",
-            cfg_path.to_str().unwrap(),
-            spec.to_str().unwrap(),
-        ],
-    )
+    let mut args = vec!["tlc2.TLC", "-workers", "1"];
+    args.extend_from_slice(flags);
+    args.extend([
+        "-metadir",
+        meta.to_str().unwrap(),
+        "-config",
+        cfg_path.to_str().unwrap(),
+        spec.to_str().unwrap(),
+    ]);
     // TLC exits non-zero on a violation too; callers read the output.
-    .1
+    java(jar, dir, &args).1
 }
 
 /// Run TLC to completion on `spec` with `cfg`, counting every violation;
@@ -259,6 +257,12 @@ fn tla_export_verus_tla_reduces_the_action_records() {
     assert_eq!(run.violated, Vec::<String>::new());
     // holder None at every count 0..3, and Some(0) or Some(1) at 1..3.
     assert_eq!(run.distinct, 10, "{run:?}");
+    // As written, with no flag: count stops at 3, which Verus does not
+    // count as an error, and the .cfg tells TLC so.
+    assert!(ex.cfg.contains("SPECIFICATION Spec\nCHECK_DEADLOCK FALSE\n"), "{}", ex.cfg);
+    let out = tlc_output_with(&jar, &ex.spec(), &ex.cfg, &[]);
+    assert!(out.contains("No error has been found"), "{}", out);
+    assert!(!out.contains("Deadlock"), "{}", out);
 }
 
 /// Shapes the export once printed as TLA+ that SANY rejects or that meant
@@ -1580,14 +1584,19 @@ fn tla_export_leaves_out_a_guard_read_on_the_post_state() {
     assert_eq!(run.distinct, 3, "{run:?}");
 }
 
-/// VerusSync lowers `assert` to `tmp_assert => (update ...)`: the updates
+/// VerusSync lowers `assert` to `tmp_assert => (update ...)`, printed as
+/// `IF tmp_assert THEN (update ...) ELSE Assert(FALSE, ...)`: the updates
 /// count as assigning (the transition was reported leaving `n` and `s`
 /// unassigned, though TLC checks it).
 #[test]
 fn tla_export_counts_updates_under_a_verussync_assert() {
     let ex = export(&fixture("assert_sync.rs"), "test_crate::Guarded");
     assert_eq!(ex.report["shape"], "verussync");
-    assert!(ex.tla.contains("tmp_assert_2 => (n' = update_tmp_n)"), "{}", ex.tla);
+    assert!(
+        ex.tla.contains("(IF tmp_assert_2 THEN (n' = update_tmp_n) ELSE Assert(FALSE, "),
+        "{}",
+        ex.tla
+    );
     assert_eq!(
         ex.report["transitions"],
         serde_json::json!([{"operator": "bump", "unassigned": []}])
@@ -1600,6 +1609,38 @@ fn tla_export_counts_updates_under_a_verussync_assert() {
     assert_eq!(run.violated, Vec::<String>::new(), "{}", ex.tla);
     // n from 0 to 3.
     assert_eq!(run.distinct, 4, "{run:?}");
+}
+
+/// Under --no-verify a VerusSync `assert` is not proved. When one fails in
+/// a reached state, TLC stops with the assertion's location and
+/// transition, not "successor state not completely specified" or an
+/// evaluation error. Of two asserts, the message names the one that fails
+/// first: `n <= 1` fails at n = 2 while `n <= 3` still holds.
+#[test]
+fn tla_export_reports_a_failing_verussync_assert() {
+    let fixture_code = std::fs::read_to_string(fixture("assert_sync.rs")).unwrap();
+    let broken = fixture_code
+        .replace("assert(pre.n <= 3);", "assert(pre.n <= 3);\n            assert(pre.n <= 1);");
+    assert_ne!(broken, fixture_code, "the fixture's assert moved");
+    let line = broken.lines().position(|l| l.contains("assert(pre.n <= 1);")).unwrap() + 1;
+    let src = TempDir::new().expect("temp dir");
+    let entry = src.path().join("assert_sync.rs");
+    std::fs::write(&entry, broken).unwrap();
+    let ex = export_with(&entry, "test_crate::Guarded", &["--no-verify"]);
+    assert_eq!(ex.report["refusals"], serde_json::json!([]), "{}", ex.tla);
+    assert_eq!(
+        ex.report["transitions"],
+        serde_json::json!([{"operator": "bump", "unassigned": []}])
+    );
+    let second = "VerusSync assert in test_crate::Guarded::State::bump fails at ";
+    assert!(ex.tla.contains(&format!("{second}{}:{line}:", entry.display())), "{}", ex.tla);
+    assert!(ex.tla.contains(&format!("{}:{}:", entry.display(), line - 1)), "{}", ex.tla);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let out = tlc_output_with(&jar, &ex.spec(), &ex.cfg, &[]);
+    assert!(out.contains("The first argument of Assert evaluated to FALSE"), "{}", out);
+    assert!(out.contains(&format!("{second}{}:{line}:", entry.display())), "{}", out);
+    assert!(!out.contains("not completely specified"), "{}", out);
 }
 
 /// `moved(post, pre)` swaps the callee's pre and post states: it is called

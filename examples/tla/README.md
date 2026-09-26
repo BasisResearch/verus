@@ -24,13 +24,22 @@ is verified.
   is checked, and the report lists the others as excluded candidates.
 - `assert_sync.rs`, VerusSync with an `assert` in a transition. Module
   `assert_sync::Guarded`. The macro lowers the assert to `tmp_assert =>
-  (update ...)`; Verus proves the assertion wherever the transition is
-  taken, so the updates count as assigning and the transition is not
-  reported. TLC checks it as written: 4 distinct states, `n_small` holds.
+  (update ...)`, printed as `IF tmp_assert THEN (update ...) ELSE
+  Assert(FALSE, "... VerusSync assert in <transition> fails at
+  <location>")`: the updates count as assigning, so the transition is not
+  reported, and under `--no-verify`, where nothing proves the assertion, TLC
+  stops at a reached state where it fails and names it (of several asserts,
+  the first that fails) rather than reporting a successor state it cannot
+  complete. TLC checks it as written: 4 distinct states, `n_small` holds.
 - `mutex_tla.rs`, verus-tla: `init()`/`next()` return closures and actions are
   `Action { precondition, transition }` records built by spec fns, reduced
   symbolically. Module `mutex_tla`. The export has no hole and no refusal and
   checks under TLC as written: 10 distinct states, both invariants hold.
+
+The `.cfg` sets `CHECK_DEADLOCK FALSE`: Verus has no notion of deadlock,
+so a state where no step is enabled (a counter at its bound) is not an
+error, and TLC run on the export as written, with no `-deadlock` flag,
+must not report one.
 
 The invariants are, by default, the `#[invariant]` methods for VerusSync,
 every closure `() -> spec_fn(State) -> bool` over the state type for
