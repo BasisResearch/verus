@@ -143,6 +143,9 @@ pub struct ArgsX {
     /// after every unknown, bounding instantiation rounds when given.
     pub matching_loops: bool,
     pub matching_loop_rounds: Option<u32>,
+    /// `-V tla-export=<module>[:<inv>,...]`: write the module's transition
+    /// system as TLA+, checking the named invariants (or the default ones).
+    pub tla_export: Option<String>,
     /// Record cvc5's per-quantifier instantiation pressure for every query.
     pub inst_pressure: bool,
     pub reach: Option<String>,
@@ -201,6 +204,7 @@ impl ArgsX {
             difficulty: Default::default(),
             nl_frontier: Default::default(),
             matching_loops: Default::default(),
+            tla_export: None,
             matching_loop_rounds: Default::default(),
             inst_pressure: Default::default(),
             reach: Default::default(),
@@ -459,6 +463,7 @@ pub fn parse_args_with_imports(
     const EXTENDED_MATCHING_LOOPS: &str = "matching-loops";
     const EXTENDED_INST_PRESSURE: &str = "inst-pressure";
     const EXTENDED_DIFFICULTY: &str = "difficulty";
+    const EXTENDED_TLA_EXPORT: &str = "tla-export";
     const EXTENDED_KEYS: &[(&str, &str)] = &[
         (
             EXTENDED_INST_PRESSURE,
@@ -495,6 +500,10 @@ pub fn parse_args_with_imports(
         (
             EXTENDED_MATCHING_LOOPS,
             "Matching-loop mode: after every unknown, ask cvc5 which quantifiers fed their own triggers, and on what growing terms (diagnostic). -V matching-loops=N also stops quantifier instantiation after N rounds, which can turn a resource-limit failure into an incomplete one",
+        ),
+        (
+            EXTENDED_TLA_EXPORT,
+            "Export the transition system in the named module (-V tla-export=crate::a::b) to TLA+ under the log directory: <State>_tla.tla (named after its module, as TLC requires), a .cfg skeleton and a .tla.json report of what was recognised, refused and left unbounded, and of every candidate invariant; -V tla-export=crate::a::b:inv1,inv2 checks exactly the named invariants. The export runs before verification, and under --no-verify too",
         ),
         (EXTENDED_ALLOW_INLINE_AIR, "Allow the POTENTIALLY UNSOUND use of inline_air_stmt"),
         (
@@ -939,6 +948,16 @@ pub fn parse_args_with_imports(
         difficulty: extended.contains_key(EXTENDED_DIFFICULTY),
         nl_frontier: extended.contains_key(EXTENDED_NL_FRONTIER),
         matching_loops: extended.contains_key(EXTENDED_MATCHING_LOOPS),
+        tla_export: match extended.get(EXTENDED_TLA_EXPORT) {
+            Some(Some(module)) if !module.is_empty() => match vir::tla::parse_export_arg(module) {
+                Ok(_) => Some(module.clone()),
+                Err(e) => error(format!("-V {EXTENDED_TLA_EXPORT}: {e}")),
+            },
+            Some(_) => error(format!(
+                "-V {EXTENDED_TLA_EXPORT} needs a module path: -V {EXTENDED_TLA_EXPORT}=crate::a::b, or crate::a::b:inv1,inv2 to name the invariants"
+            )),
+            None => None,
+        },
         matching_loop_rounds: match extended.get(EXTENDED_MATCHING_LOOPS) {
             // zero rounds would instantiate nothing and fail every quantified check
             Some(Some(rounds)) => Some(match rounds.parse::<u32>() {

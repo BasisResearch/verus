@@ -892,30 +892,62 @@ impl Verifier {
         })
     }
 
+    /// `-V tla-export=<module>[:<inv>,...]`: write the module's transition
+    /// system as TLA+ under the log directory, before simplification so `match` and
+    /// constructor updates are still visible. The files are named after the
+    /// TLA+ module (`<State>_tla.tla`, `.cfg`, `.tla.json`), since TLC only
+    /// loads a module from a file of the same name.
+    fn export_tla(&mut self, krate: &Krate, arg: &str) -> Result<(), VirErr> {
+        let export = vir::tla::export_module(krate, arg)
+            .map_err(|e| crate::util::error(format!("tla-export: {e}")))?;
+        let dir = self.log_dir()?;
+        let json = serde_json::to_string_pretty(&export.report).unwrap_or_else(|_| "{}".into());
+        for (ext, text) in [("tla", &export.tla), ("cfg", &export.cfg), ("tla.json", &json)] {
+            let path = dir.join(format!("{}.{ext}", export.module_name));
+            std::fs::write(&path, text.as_bytes()).map_err(|err| {
+                io_vir_err(format!("tla-export: could not write {}", path.display()), err)
+            })?;
+        }
+        eprintln!(
+            "tla-export: {} ({}), {} operators, {} holes, {} refusals, {} transitions leaving a variable unassigned, {} variables Init leaves unassigned; wrote {}",
+            export.report.state_type,
+            export.report.shape,
+            export.report.operators,
+            export.report.holes.len(),
+            export.report.refusals.len(),
+            export.report.transitions.iter().filter(|t| !t.unassigned.is_empty()).count(),
+            export.report.init_unassigned.len(),
+            dir.join(format!("{}.tla", export.module_name)).display()
+        );
+        Ok(())
+    }
+
+    /// The log directory, created (and emptied) on first use.
+    fn log_dir(&self) -> Result<std::path::PathBuf, VirErr> {
+        let mut created_log_dir =
+            self.created_log_dir.lock().expect("failed to lock created_log_dir");
+        if let Some(dir_path) = &*created_log_dir {
+            return Ok(dir_path.clone());
+        }
+        let dir = std::path::PathBuf::from(if let Some(dir) = &self.args.log_dir {
+            dir.clone()
+        } else {
+            crate::config::LOG_DIR.to_string()
+        });
+        delete_dir_if_exists_and_is_dir(&dir)?;
+        std::fs::create_dir_all(&dir).map_err(|err| {
+            io_vir_err(format!("could not create directory {}", dir.display()), err)
+        })?;
+        *created_log_dir = Some(dir.clone());
+        Ok(dir)
+    }
+
     fn create_log_file(
         &mut self,
         bucket_id_opt: Option<&BucketId>,
         suffix: &str,
     ) -> Result<File, VirErr> {
-        let dir_path = {
-            let mut created_log_dir =
-                self.created_log_dir.lock().expect("failed to lock created_log_dir");
-            if let Some(dir_path) = &*created_log_dir {
-                dir_path.clone()
-            } else {
-                let dir = std::path::PathBuf::from(if let Some(dir) = &self.args.log_dir {
-                    dir.clone()
-                } else {
-                    crate::config::LOG_DIR.to_string()
-                });
-                delete_dir_if_exists_and_is_dir(&dir)?;
-                std::fs::create_dir_all(&dir).map_err(|err| {
-                    io_vir_err(format!("could not create directory {}", dir.display()), err)
-                })?;
-                *created_log_dir = Some(dir.clone());
-                dir
-            }
-        };
+        let dir_path = self.log_dir()?;
         let log_file_name = self.log_file_name(&dir_path, bucket_id_opt, suffix);
         match File::create(&log_file_name) {
             Ok(file) => Ok(file),
@@ -3423,6 +3455,13 @@ impl Verifier {
     ) -> Result<(), VerifyErr> {
         // Verify crate
         let time_verify_crate_start = Instant::now();
+
+        // The export reads the VIR crate before simplification, so it runs
+        // under --no-verify too.
+        if let Some(arg) = self.args.tla_export.clone() {
+            let krate = self.vir_crate.clone().expect("vir_crate should be initialized");
+            self.export_tla(&krate, &arg)?;
+        }
 
         let result =
             if !self.args.no_verify { self.verify_crate_inner(&compiler, spans) } else { Ok(()) };
