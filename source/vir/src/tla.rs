@@ -107,15 +107,17 @@ pub struct Property {
     pub function: String,
     pub location: String,
     pub formula: String,
-    /// The fairness conjuncts of its spec, as exported (`WF_vars(...)`).
+    /// The fairness conjuncts of its spec, as exported: `WF_vars(...)`,
+    /// under `\A` and `/\` (only these can go into `Spec`).
     pub fairness: Vec<String>,
     /// Its spec's other conjuncts (neither `lift_state(init())`, `always(
-    /// lift_action(next()))` nor fairness), assumed as written.
+    /// lift_action(next()))` nor fairness), premises of the property as
+    /// written (`assumptions => formula`), never in `Spec`.
     pub assumptions: Vec<String>,
     /// Where its spec came from.
     pub spec: String,
-    /// Its spec states no fairness, so TLC checks it without any: a
-    /// behaviour may stop (stutter) anywhere.
+    /// Its spec states no fairness (in `fairness` or an assumption), so TLC
+    /// checks it without any: a behaviour may stop (stutter) anywhere.
     pub without_fairness: bool,
     /// In the `.cfg`: false when it reaches a refusal.
     pub included: bool,
@@ -158,9 +160,10 @@ pub struct Report {
     pub refusals: Vec<Refusal>,
     /// The temporal properties, checked as `PROPERTY`s.
     pub properties: Vec<Property>,
-    /// Whether the properties' fairness is in `Spec` (they share one spec);
-    /// otherwise each property is `fairness => formula` under a `Spec`
-    /// without fairness.
+    /// Whether the properties' fairness is in `Spec`: they take it from the
+    /// same conjuncts (the same source); otherwise each property is
+    /// `fairness => formula` under a `Spec` without fairness. The other
+    /// assumptions are premises either way.
     pub fairness_in_spec: bool,
     /// Where the TLA+ reading of a temporal formula differs from verus-tla's,
     /// and what was passed over.
@@ -3625,6 +3628,21 @@ struct TemporalSource {
     spec: Vec<Expr>,
     /// Where the spec came from, for the report.
     spec_from: String,
+    /// How the spec was read, for the property's report.
+    notes: Vec<String>,
+}
+
+/// Whether two `.entails` receivers are the same spec: the same variable,
+/// or a call to the same function of no arguments (`spec()`).
+fn same_receiver(a: &Expr, b: &Expr) -> bool {
+    let (a, b) = (peel(a), peel(b));
+    if let (Some(x), Some(y)) = (read_var(&a), read_var(&b)) {
+        return x == y;
+    }
+    match (called(&a), called(&b)) {
+        (Some((_, f, fa)), Some((_, g, ga))) => f == g && fa.is_empty() && ga.is_empty(),
+        _ => false,
+    }
 }
 
 /// The temporal properties stated in the module's functions:
@@ -3632,11 +3650,14 @@ struct TemporalSource {
 /// * a proof fn whose `ensures` has `m.entails(p)`, `m` a `TempPred`
 ///   parameter: `p` under the conjuncts `c` of its `requires` of the form
 ///   `m.entails(c)` (verus-tla's `mutex_example.rs`); or `spec().entails(p)`
-///   for a spec expression: `p` under that expression. Every parameter must
-///   be a `TempPred`, since nothing else can be printed at module level.
+///   for a spec expression: `p` under that expression and the `c` of its
+///   `requires` of the form `spec().entails(c)`. Every parameter must be the
+///   receiver of an `ensures`: nothing else can be printed at module level,
+///   and a lemma generic over other `TempPred`s is a proof rule. A requires
+///   clause left out of the spec is noted.
 /// * else, beside a spec fn `spec()` returning a `TempPred`, every other
 ///   spec fn of no parameters in the module returning one that neither
-///   `spec` nor a proof fn's property reaches: under `spec()`.
+///   `spec` nor a proof fn's requires or ensures reaches: under `spec()`.
 ///
 /// Returns them with what was passed over and why.
 fn temporal_sources(
@@ -3664,12 +3685,24 @@ fn temporal_sources(
             ));
             continue;
         }
+        // A rule lemma generic over temporal formulas (`p: TempPred<S>`
+        // beside the spec's `m`) states nothing about this module's model.
+        let models: Vec<VarIdent> =
+            ensured.iter().filter_map(|(m, _)| read_var(&peel(m))).collect();
+        if let Some(p) = f.x.params.iter().find(|p| !models.contains(&p.x.name)) {
+            notes.push(format!(
+                "{name}: not exported, it is generic over the TempPred `{}`, which is not the receiver of its ensures (a rule lemma, not a property of the model)",
+                p.x.name.0
+            ));
+            continue;
+        }
         let many = ensured.len() > 1;
         for (i, (model, formula)) in ensured.into_iter().enumerate() {
             let base = if many { format!("{}_{}", short(f), i + 1) } else { short(f) };
-            let (spec, spec_from) = match read_var(&peel(&model)) {
+            let mut spec = Vec::new();
+            let mut src_notes = Vec::new();
+            let spec_from = match read_var(&peel(&model)) {
                 Some(m) => {
-                    let mut spec = Vec::new();
                     for r in f.x.require.iter() {
                         match entails(r) {
                             Some((m2, c)) if read_var(&peel(&m2)).as_ref() == Some(&m) => {
@@ -3682,9 +3715,30 @@ fn temporal_sources(
                             )),
                         }
                     }
-                    (spec, format!("the requires of {name} ({}.entails(...))", m.0))
+                    format!("the requires of {name} ({}.entails(...))", m.0)
                 }
-                None => (vec![model.clone()], format!("{name}'s `.entails` receiver")),
+                None => {
+                    // `s.entails(p)` under `requires s.entails(c)`: the
+                    // lemma proves `s |= p` given `s |= c`; TLC checks
+                    // `s /\ c => p`, which implies it.
+                    spec.push(model.clone());
+                    for r in f.x.require.iter() {
+                        match entails(r) {
+                            Some((r2, c)) if same_receiver(&r2, &model) => {
+                                src_notes.push(format!(
+                                    "its requires at {} (the receiver's .entails(c)) is read as a conjunct of its spec: TLC checks spec /\\ c => property, which implies what the lemma proves",
+                                    span_string(&r.span)
+                                ));
+                                spec.push(c)
+                            }
+                            _ => notes.push(format!(
+                                "{name}: a requires clause at {} is not `.entails(...)` on the receiver of its ensures, so it is not part of the spec",
+                                span_string(&r.span)
+                            )),
+                        }
+                    }
+                    format!("{name}'s `.entails` receiver")
+                }
             };
             out.push(TemporalSource {
                 function: f.x.name.clone(),
@@ -3693,6 +3747,7 @@ fn temporal_sources(
                 formula,
                 spec,
                 spec_from,
+                notes: src_notes,
             });
         }
     }
@@ -3704,19 +3759,26 @@ fn temporal_sources(
             && f.x.body.is_some()
     });
     if let Some(spec_fn) = spec_fn {
+        // What `spec` reads, and what any proof fn states or assumes (its
+        // ensures and requires, exported or not): a building block such as
+        // `fairness()` that a lemma's requires use is not a property.
         let mut reached = reached_functions(functions, &spec_fn.x.name);
-        for s in &out {
-            let mut roots = Vec::new();
-            crate::ast_visitor::expr_visitor_walk(&s.formula, &mut |x: &Expr| {
+        let mut roots = Vec::new();
+        let stated = in_module
+            .iter()
+            .filter(|f| f.x.mode == Mode::Proof)
+            .flat_map(|f| f.x.require.iter().chain(f.x.ensure.0.iter()));
+        for e in stated {
+            crate::ast_visitor::expr_visitor_walk(e, &mut |x: &Expr| {
                 if let ExprX::Call { target: CallTarget::Fun(_, fun, ..), .. } = &x.x {
                     roots.push(fun.clone());
                 }
                 crate::visitor::VisitorControlFlow::Recurse
             });
-            for r in roots {
-                reached.extend(reached_functions(functions, &r));
-                reached.insert(r);
-            }
+        }
+        for r in roots {
+            reached.extend(reached_functions(functions, &r));
+            reached.insert(r);
         }
         let spec_call = SpannedTyped::new(
             &spec_fn.span,
@@ -3755,6 +3817,7 @@ fn temporal_sources(
                 formula: f.x.body.clone().expect("checked above"),
                 spec: vec![spec_call.clone()],
                 spec_from: fun_as_friendly_rust_name(&spec_fn.x.name),
+                notes: Vec::new(),
             });
         }
     }
@@ -4156,6 +4219,36 @@ impl Exporter {
             }
         }
         vec![e]
+    }
+
+    /// Whether the spec conjunct `e` is fairness TLC takes in a `Spec`:
+    /// `weak_fairness` (`WF_vars`), under `tla_forall` and `and`; nothing
+    /// else (`always`, a disjunction of fairness, ...) goes into `Spec`.
+    fn is_fairness(&self, e: &Expr, depth: usize) -> bool {
+        if depth > 16 {
+            return false;
+        }
+        let e = peel(e);
+        let Some((kind, fun, args)) = called(&e).filter(|_| is_temp_pred(&e.typ)) else {
+            return false;
+        };
+        let fun = self.resolved_fun(&kind, &fun);
+        match (last_segment(&fun.path).as_str(), args.len()) {
+            ("weak_fairness", 1 | 2) => true,
+            ("and", 2) => args.iter().all(|a| self.is_fairness(a, depth + 1)),
+            ("tla_forall", 1) => match &peel(&args[0]).x {
+                ExprX::Closure(params, body) => {
+                    params.len() == 1 && self.is_fairness(body, depth + 1)
+                }
+                _ => false,
+            },
+            (name, 0) if !TEMPORAL_PRIMITIVES.contains(&name) => self
+                .functions
+                .get(&fun)
+                .and_then(|f| f.x.body.clone())
+                .is_some_and(|b| self.is_fairness(&b, depth + 1)),
+            _ => false,
+        }
     }
 
     /// Whether `e` states fairness: it calls `weak_fairness`, directly or
@@ -4766,6 +4859,8 @@ pub fn export_module(krate: &Krate, arg: &str) -> Result<Export, String> {
     // The temporal properties, each an operator; the fairness of their spec
     // goes into `Spec` when they share one.
     let mut properties: Vec<Property> = Vec::new();
+    // The source spans of each property's fairness conjuncts.
+    let mut fairness_sources: Vec<Vec<String>> = Vec::new();
     for src in &sources {
         let base = sanitize(&src.base);
         let mut op = base.clone();
@@ -4779,27 +4874,39 @@ pub fn export_module(krate: &Krate, arg: &str) -> Result<Export, String> {
             n += 1;
         }
         ex.used_names.insert(op.clone());
-        ex.bound.clear();
         ex.current = fun_as_friendly_rust_name(&src.function);
         ex.current_tainted = false;
         ex.conj_level = false;
         ex.branch_depth = 0;
-        let formula = ex.temporal(&src.formula, &Env::new(), 0);
+        // The spec first, each conjunct with no binder in scope, so the same
+        // conjunct prints the same under every property.
         let (mut fairness, mut assumptions) = (Vec::new(), Vec::new());
+        let mut fairness_from = Vec::new();
         let (mut has_init, mut has_next) = (false, false);
         let conjuncts: Vec<Expr> = src.spec.iter().flat_map(|c| ex.spec_conjuncts(c, 0)).collect();
+        let mut states_fairness = false;
         for c in conjuncts {
             if ex.names_root(&c, &triple.init, true) {
                 has_init = true;
-            } else if ex.names_root(&c, &triple.next, false) {
+                continue;
+            }
+            if ex.names_root(&c, &triple.next, false) {
                 has_next = true;
-            } else if ex.states_fairness(&c) {
-                fairness.push(ex.temporal(&c, &Env::new(), 0));
+                continue;
+            }
+            states_fairness |= ex.states_fairness(&c);
+            ex.bound.clear();
+            let printed = ex.temporal(&c, &Env::new(), 0);
+            if ex.is_fairness(&c, 0) {
+                fairness.push(printed);
+                fairness_from.push(span_string(&c.span));
             } else {
-                assumptions.push(ex.temporal(&c, &Env::new(), 0));
+                assumptions.push(printed);
             }
         }
-        let mut notes = Vec::new();
+        ex.bound.clear();
+        let formula = ex.temporal(&src.formula, &Env::new(), 0);
+        let mut notes = src.notes.clone();
         if !has_init {
             notes.push(format!(
                 "its spec has no lift_state({}()) conjunct; TLC checks it from Init all the same",
@@ -4812,7 +4919,10 @@ pub fn export_module(krate: &Krate, arg: &str) -> Result<Export, String> {
                 last_segment(&triple.next.path)
             ));
         }
-        let without_fairness = fairness.is_empty();
+        // Fairness a conjunct states other than as WF_vars (under
+        // quantifiers and conjunctions) is a premise, not in Spec.
+        let without_fairness = !states_fairness;
+        fairness_sources.push(fairness_from);
         properties.push(Property {
             operator: op,
             function: fun_as_friendly_rust_name(&src.function),
@@ -4826,10 +4936,11 @@ pub fn export_module(krate: &Krate, arg: &str) -> Result<Export, String> {
             notes,
         });
     }
-    let fairness_in_spec = !properties.is_empty()
-        && properties
-            .windows(2)
-            .all(|w| w[0].fairness == w[1].fairness && w[0].assumptions == w[1].assumptions);
+    // The properties share their fairness when it comes from the same
+    // conjuncts (the same source spans, as when every spec is `spec()`),
+    // however it prints; their other assumptions are premises either way.
+    let fairness_in_spec =
+        !properties.is_empty() && fairness_sources.windows(2).all(|w| w[0] == w[1]);
     let mut temporal_notes: Vec<String> = source_notes;
     if !properties.is_empty() {
         temporal_notes.push(
@@ -4884,7 +4995,7 @@ pub fn export_module(krate: &Krate, arg: &str) -> Result<Export, String> {
     );
     if !properties.is_empty() {
         tla.push_str(
-            "\\* Temporal (verus-tla): always is [], eventually <>, leads_to ~>, lift_state(p)\n\\* the state formula p, always(lift_action(a)) [][A]_vars, weak_fairness WF_vars(A)\n\\* of the action's forward step, tla_forall/tla_exists bounded quantifiers. The\n\\* fairness of the properties' spec is in Spec, each property is a PROPERTY.\n",
+            "\\* Temporal (verus-tla): always is [], eventually <>, leads_to ~>, lift_state(p)\n\\* the state formula p, always(lift_action(a)) [][A]_vars, weak_fairness WF_vars(A)\n\\* of the action's forward step, tla_forall/tla_exists bounded quantifiers. Shared\n\\* WF_vars fairness is in Spec; other spec assumptions are a property's premises.\n",
         );
     }
     tla.push_str("EXTENDS Integers, Sequences, FiniteSets, TLC\n\n");
@@ -4956,9 +5067,6 @@ pub fn export_module(krate: &Krate, arg: &str) -> Result<Export, String> {
             }
             spec_line.push_str(" /\\ Fairness");
         }
-        for a in &p.assumptions {
-            spec_line.push_str(&format!(" /\\ {a}"));
-        }
     }
     tla.push_str(&format!("{spec_line}\n"));
     if !inv_names.is_empty() {
@@ -4969,8 +5077,10 @@ pub fn export_module(krate: &Krate, arg: &str) -> Result<Export, String> {
     }
     for p in &properties {
         tla.push_str(&format!("\\* {}, {}; spec: {}\n", p.function, p.location, p.spec));
+        // Only WF_vars goes into Spec: every other assumption of the spec
+        // is a premise (TLC cannot take `[]P` in a Spec).
         let premises: Vec<&String> = if fairness_in_spec {
-            vec![]
+            p.assumptions.iter().collect()
         } else {
             p.fairness.iter().chain(p.assumptions.iter()).collect()
         };

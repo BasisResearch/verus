@@ -2941,7 +2941,7 @@ fn tla_export_verus_tla_liveness_under_weak_fairness() {
         p["fairness"],
         serde_json::json!([
             "(\\A tid \\in ({[tag |-> \"A\"]} \\cup {[tag |-> \"B\"]}) : WF_vars(thread_acquires_lock(tid)))",
-            "(\\A tid_2 \\in ({[tag |-> \"A\"]} \\cup {[tag |-> \"B\"]}) : WF_vars(thread_releases_lock(tid_2)))",
+            "(\\A tid \\in ({[tag |-> \"A\"]} \\cup {[tag |-> \"B\"]}) : WF_vars(thread_releases_lock(tid)))",
         ])
     );
     assert_eq!(p["assumptions"], serde_json::json!([]));
@@ -3055,4 +3055,192 @@ fn tla_export_verus_tla_liveness_per_property_spec() {
     let out = tlc_output_with(&jar, &ex.spec(), &only("stops_short"), &[]);
     assert!(out.contains("Error: Temporal property stops_short was violated"), "{}", out);
     assert!(out.contains("Stuttering"), "{}", out);
+}
+
+/// A verus-tla counter that `inc()` and `bump(b)` (enabled only for `true`)
+/// count to 3, with `spec` as the body of `spec()` and `rest` after it.
+fn liveness_counter_with(spec: &str, rest: &str) -> String {
+    format!(
+        r#"
+verus! {{
+{defs}
+use action::*;
+use defs::*;
+
+pub struct S {{ pub x: u8 }}
+
+pub open spec fn init() -> StatePred<S> {{ |s: S| s.x == 0 }}
+
+pub open spec fn inc() -> Action<S, (), ()> {{
+    Action {{
+        precondition: |input: (), s: S| s.x < 3,
+        transition: |input: (), s: S| (S {{ x: (s.x + 1) as u8 }}, ()),
+    }}
+}}
+
+pub open spec fn bump() -> Action<S, bool, ()> {{
+    Action {{
+        precondition: |b: bool, s: S| s.x < 3 && b,
+        transition: |b: bool, s: S| (S {{ x: (s.x + 1) as u8 }}, ()),
+    }}
+}}
+
+pub open spec fn next() -> ActionPred<S> {{
+    |s: S, s_prime: S| inc().forward(())(s, s_prime) || bump().forward(true)(s, s_prime) || s_prime == s
+}}
+
+pub open spec fn spec() -> TempPred<S> {{ {spec} }}
+
+{rest}
+}}
+"#,
+        defs = verus_tla_defs()
+    )
+}
+
+/// Only WF_vars goes into Spec: a spec's `always(lift_state(p))` is the
+/// property's premise (TLC cannot take `[]P` in a Spec).
+#[test]
+fn tla_export_verus_tla_spec_assumption_is_a_premise() {
+    let ex = export_code(
+        &liveness_counter_with(
+            "lift_state(init()).and(always(lift_action(next()))).and(inc().weak_fairness(())).and(always(lift_state(|s: S| s.x <= 3)))",
+            "pub open spec fn reaches_three() -> TempPred<S> { eventually(lift_state(|s: S| s.x == 3)) }",
+        ),
+        "test_crate",
+    );
+    assert_eq!(ex.report["refusals"], serde_json::json!([]));
+    let p = &ex.report["properties"][0];
+    assert_eq!(p["fairness"], serde_json::json!(["WF_vars(inc)"]));
+    assert_eq!(p["assumptions"], serde_json::json!(["[]((x <= 3))"]));
+    assert_eq!(ex.report["fairness_in_spec"], true);
+    assert!(ex.tla.contains("Spec == Init /\\ [][Next]_vars /\\ Fairness\n"), "{}", ex.tla);
+    assert!(
+        ex.tla.contains("reaches_three ==\n    (([]((x <= 3)))) => (<>((x = 3)))\n"),
+        "{}",
+        ex.tla
+    );
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let out = tlc_output_with(&jar, &ex.spec(), &ex.cfg, &[]);
+    assert!(out.contains("No error has been found"), "{}", out);
+}
+
+/// Properties share their fairness when it comes from the same spec, even
+/// where a property's own binder would rename the fairness's (`b`).
+#[test]
+fn tla_export_verus_tla_fairness_shared_by_source() {
+    let ex = export_code(
+        &liveness_counter_with(
+            "lift_state(init()).and(always(lift_action(next()))).and(tla_forall(|b: bool| bump().weak_fairness(b)))",
+            r#"
+pub open spec fn a_first() -> TempPred<S> {
+    tla_exists(|b: bool| eventually(lift_state(|s: S| s.x == 2 || b)))
+}
+
+pub open spec fn reaches_three() -> TempPred<S> { eventually(lift_state(|s: S| s.x == 3)) }
+"#,
+        ),
+        "test_crate",
+    );
+    assert_eq!(ex.report["refusals"], serde_json::json!([]));
+    let props = ex.report["properties"].as_array().unwrap();
+    assert_eq!(props.len(), 2, "{:?}", props);
+    for p in props {
+        assert_eq!(
+            p["fairness"],
+            serde_json::json!(["(\\A b \\in BOOLEAN : WF_vars(bump(b)))"]),
+            "{}",
+            ex.tla
+        );
+    }
+    assert_eq!(ex.report["fairness_in_spec"], true);
+    assert!(ex.tla.contains("Spec == Init /\\ [][Next]_vars /\\ Fairness\n"), "{}", ex.tla);
+    assert!(ex.tla.contains("reaches_three ==\n    <>((x = 3))\n"), "{}", ex.tla);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let out = tlc_output_with(&jar, &ex.spec(), &ex.cfg, &[]);
+    assert!(out.contains("No error has been found"), "{}", out);
+}
+
+/// What a lemma's requires assume is its spec, not a property: `fair_inc()`
+/// used only there is not a PROPERTY. A `spec().entails(p)` lemma's
+/// `requires spec().entails(c)` is a conjunct of its spec, and a requires
+/// that is neither is noted. A rule lemma generic over TempPreds, and one
+/// with a non-TempPred parameter, are skipped with a note.
+#[test]
+fn tla_export_verus_tla_lemma_requires_are_the_spec() {
+    let ex = export_code(
+        &liveness_counter_with(
+            "lift_state(init()).and(always(lift_action(next())))",
+            r#"
+pub open spec fn fair_inc() -> TempPred<S> { inc().weak_fairness(()) }
+
+pub proof fn reaches(m: TempPred<S>)
+    requires
+        m.entails(spec()),
+        m.entails(fair_inc()),
+    ensures
+        m.entails(eventually(lift_state(|s: S| s.x == 3))),
+{
+    admit();
+}
+
+pub proof fn reaches_given_fairness()
+    requires
+        spec().entails(fair_inc()),
+        1u8 + 1u8 == 2u8,
+    ensures
+        spec().entails(eventually(lift_state(|s: S| s.x >= 2))),
+{
+    admit();
+}
+
+pub proof fn trans(m: TempPred<S>, p: TempPred<S>, q: TempPred<S>)
+    requires
+        m.entails(p),
+        m.entails(p.implies(q)),
+    ensures
+        m.entails(q),
+{
+    admit();
+}
+
+pub proof fn indexed(i: int)
+    ensures
+        spec().entails(eventually(lift_state(|s: S| s.x == 3))),
+{
+    admit();
+}
+"#,
+        ),
+        "test_crate",
+    );
+    assert_eq!(ex.report["refusals"], serde_json::json!([]));
+    let props = ex.report["properties"].as_array().unwrap();
+    let ops: Vec<&str> = props.iter().map(|p| p["operator"].as_str().unwrap()).collect();
+    assert_eq!(ops, ["reaches", "reaches_given_fairness"], "{}", ex.tla);
+    for p in props {
+        assert_eq!(p["fairness"], serde_json::json!(["WF_vars(inc)"]), "{}", ex.tla);
+        assert_eq!(p["without_fairness"], false);
+    }
+    let notes = props[1]["notes"].as_array().unwrap();
+    assert!(notes.iter().any(|n| n.as_str().unwrap().contains("read as a conjunct of its spec")));
+    // Both take their fairness from fair_inc's body: it is shared.
+    assert_eq!(ex.report["fairness_in_spec"], true);
+    assert!(ex.tla.contains("Spec == Init /\\ [][Next]_vars /\\ Fairness\n"), "{}", ex.tla);
+    let temporal: Vec<&str> = ex.report["temporal_notes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| n.as_str().unwrap())
+        .collect();
+    let has = |s: &str| temporal.iter().any(|n| n.contains(s));
+    assert!(has("reaches_given_fairness: a requires clause at"), "{:?}", temporal);
+    assert!(has("trans: not exported, it is generic over the TempPred `p`"), "{:?}", temporal);
+    assert!(has("indexed: not exported, its parameter `i` is not a TempPred"), "{:?}", temporal);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let out = tlc_output_with(&jar, &ex.spec(), &ex.cfg, &[]);
+    assert!(out.contains("No error has been found"), "{}", out);
 }
