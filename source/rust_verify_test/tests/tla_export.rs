@@ -3207,6 +3207,45 @@ fn tla_export_keeps_a_disjunction_over_the_post_state() {
     assert_eq!(run.distinct, 9, "{run:?}\n{}", ex.tla);
 }
 
+/// A closure, or a record of closures, that captures the post state reads
+/// it: a disjunction of its applications keeps its `\/`, whose branches
+/// assign `x'`. From `y = 0` the steps take `x` to `y` or `y + 10`.
+const CLOSURE_OR: &str = r#"
+use vstd::prelude::*;
+verus! {
+pub struct State { pub x: int, pub y: int }
+
+pub struct Pair { pub f: spec_fn(int) -> bool }
+
+pub open spec fn init(s: State) -> bool { s.x == 0 && s.y == 0 }
+
+pub open spec fn next(pre: State, post: State) -> bool {
+    let f = |v: int| post.x == v;
+    let p = Pair { f: |v: int| post.x == v };
+    &&& pre.y < 3
+    &&& post.y == pre.y + 1
+    &&& (f(pre.y) || f(pre.y + 10))
+    &&& ((p.f)(pre.y) || (p.f)(pre.y + 10))
+}
+
+pub open spec fn small(s: State) -> bool { s.y <= 3 }
+}
+"#;
+
+#[test]
+fn tla_export_keeps_a_disjunction_over_a_closure_reading_the_post_state() {
+    let ex = export_code(CLOSURE_OR, "test_crate");
+    assert_eq!(ex.report["refusals"], serde_json::json!([]), "{}", ex.tla);
+    assert_eq!(ex.report["holes"], serde_json::json!([]), "{}", ex.tla);
+    assert!(!ex.tla.contains("IF (LET"), "{}", ex.tla);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let run = tlc(&jar, &ex.spec(), &ex.cfg);
+    assert_eq!(run.violated, Vec::<String>::new(), "{}", ex.tla);
+    // (0,0); then x in {y, y+10} for y = 1..3 after each step: 1 + 2 + 2 + 2.
+    assert_eq!(run.distinct, 7, "{run:?}\n{}", ex.tla);
+}
+
 /// A step field whose guard reads the step value itself (`b < size(step)`)
 /// is not bounded from it: the domain sits outside the `LET` binding the
 /// step. It is bounded by its type (`u8`) instead, in the callee's match and

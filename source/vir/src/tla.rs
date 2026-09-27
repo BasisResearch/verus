@@ -231,10 +231,14 @@ impl Env {
     fn symbolic_only(&self, v: &VarIdent) -> bool {
         self.values.contains_key(v) && !self.names.contains_key(v) && !self.roles.contains_key(v)
     }
-    /// Whether `v` reads the post state: the post-role parameter, or a local
-    /// bound to something that reads it.
+    /// Whether `v` reads the post state: the post-role parameter, a local
+    /// bound to something that reads it, or one kept symbolically (a closure
+    /// or record of closures) whose value reads it in the scope it was bound
+    /// in (`let f = |v| post.x == v`).
     fn post_var(&self, v: &VarIdent) -> bool {
-        self.roles.get(v) == Some(&Role::Post) || self.primed.contains(v)
+        self.roles.get(v) == Some(&Role::Post)
+            || self.primed.contains(v)
+            || self.values.get(v).is_some_and(|(e, scope)| scope.reads_post(e))
     }
     /// Whether `e` reads the post state (primed variables), directly or
     /// through a call it passes the post state to.
