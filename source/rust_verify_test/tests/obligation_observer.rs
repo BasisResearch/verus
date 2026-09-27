@@ -140,6 +140,27 @@ fn a_query_that_stops_early_leaves_obligations_unchecked() {
     );
 }
 
+/// When the `--multiple-errors` budget runs out, the last round disables every
+/// assertion after the first failure. Whichever failure the solver finds first,
+/// `b + 0 == b` between the two is never proved, so it is unchecked.
+#[test]
+fn a_truncated_query_leaves_obligations_after_the_first_failure_unchecked() {
+    let code = r#"
+verus!{
+fn tricky(a: u32, b: u32) {
+    assert(b == b);
+    assert(a != 123456);
+    assert(b + 0 == b);
+    assert(a != 0);
+}
+}
+"#;
+    let functions = functions_for(code, &["-V", "observers=coverage", "--multiple-errors", "2"]);
+    let st: Vec<String> =
+        statuses(&functions, "test::tricky").into_iter().map(|(_, status)| status).collect();
+    assert_eq!(st, ["proved", "failed", "unchecked", "failed"]);
+}
+
 /// The counterexample is read while it is live: the false conjunct, in
 /// source spelling, and the value the loop counter has there.
 #[test]

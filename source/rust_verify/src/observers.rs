@@ -58,6 +58,10 @@ pub fn check_names(names: &[String]) -> Result<(), String> {
 /// A failing assertion's conjuncts are listed up to this many; the rest are
 /// counted in `conjuncts_omitted`.
 const MAX_CONJUNCTS: usize = 32;
+/// At most this many conjuncts are evaluated in the counterexample (one
+/// solver round trip each), so that false ones beyond the first
+/// `MAX_CONJUNCTS` can still be listed first; the rest are omitted.
+const MAX_EVALUATIONS: usize = 4 * MAX_CONJUNCTS;
 /// Likewise the variables whose counterexample values are reported.
 const MAX_VALUES: usize = 64;
 /// How deeply temporaries and preconditions are expanded into their
@@ -232,7 +236,7 @@ impl ObligationObserver {
     /// only when its id names exactly one undecided assertion; otherwise
     /// which one failed is unknown, and they stay undecided.
     /// `truncated` says the verifier stopped checking obligations after the
-    /// last failure (the `--multiple-errors` budget ran out), so a later
+    /// first failure (the `--multiple-errors` budget ran out), so a later
     /// `Valid` does not speak for them.
     pub fn take_query(
         &mut self,
@@ -249,10 +253,13 @@ impl ObligationObserver {
             }
         }
         if truncated {
-            if let Some(last) =
-                pending.assertions.iter().rposition(|a| a.status == Some(Status::Failed))
+            // AIR's `only_check_earlier` disables every label after the
+            // first failed one (in label order), so a later `Valid` speaks
+            // only for the assertions before it.
+            if let Some(first) =
+                pending.assertions.iter().position(|a| a.status == Some(Status::Failed))
             {
-                for a in pending.assertions[last + 1..].iter_mut() {
+                for a in pending.assertions[first + 1..].iter_mut() {
                     if a.status == Some(Status::Proved) {
                         a.status = Some(Status::Unchecked);
                     }
@@ -593,8 +600,11 @@ impl air::query_result_observer::QueryResultObserver for ObligationObserver {
                 let mut parts = Vec::new();
                 let defs = Definitions { temps: &pending.temps, requires: &self.requires };
                 conjuncts(&a.expr, &defs, 0, &mut parts);
+                // each evaluation is a solver round trip; past the cap the
+                // conjuncts are counted as omitted, not evaluated
                 let mut evaluated: Vec<(String, Option<bool>, bool)> = parts
                     .iter()
+                    .take(MAX_EVALUATIONS)
                     .map(|(c, unexpanded)| (term_text(c), eval_bool_expr(c), *unexpanded))
                     .collect();
                 // false first: those are why the assertion failed
@@ -603,7 +613,7 @@ impl air::query_result_observer::QueryResultObserver for ObligationObserver {
                     None => 1,
                     Some(true) => 2,
                 });
-                let conjuncts_omitted = evaluated.len().saturating_sub(MAX_CONJUNCTS);
+                let conjuncts_omitted = parts.len().saturating_sub(MAX_CONJUNCTS);
                 evaluated.truncate(MAX_CONJUNCTS);
                 // what the conjuncts read, so an expanded temporary shows
                 // the variables of its definition
@@ -848,6 +858,51 @@ mod tests {
         assert!(out[0].1);
     }
 
+    /// A failing assertion with many conjuncts costs at most
+    /// `MAX_EVALUATIONS` solver round trips; the rest are counted omitted.
+    #[test]
+    fn evaluations_are_capped() {
+        use air::messages::MessageInterface;
+        let n = MAX_EVALUATIONS + 10;
+        let expr = Arc::new(ExprX::Multi(
+            MultiOp::And,
+            Arc::new((0..n).map(|i| var(&format!("c{i}"))).collect()),
+        ));
+        let mut o = ObligationObserver::from_names(&["proof-state".to_string()]).unwrap();
+        o.pending = Some(Pending {
+            assertions: vec![Assertion {
+                id: None,
+                message: String::new(),
+                span: None,
+                expr,
+                status: None,
+            }],
+            temps: HashMap::new(),
+            used_axioms: None,
+            failing: Vec::new(),
+        });
+        let mut calls = 0;
+        let mut eval = |_: &Expr| {
+            calls += 1;
+            Some(false)
+        };
+        let error = air::messages::AirMessageInterface {}
+            .bare(air::messages::MessageLevel::Error, "assertion failed");
+        air::query_result_observer::QueryResultObserver::on_check_valid_result(
+            &mut o,
+            &mut CheckValidResult::Invalid {
+                model_defs: &HashMap::new(),
+                eval_bool_expr: &mut eval,
+                assert_id: &None,
+                error: &error,
+            },
+        );
+        assert_eq!(calls, MAX_EVALUATIONS);
+        let f = &o.pending.as_ref().unwrap().failing[0];
+        assert_eq!(f.conjuncts.len(), MAX_CONJUNCTS);
+        assert_eq!(f.conjuncts_omitted, n - MAX_CONJUNCTS);
+    }
+
     #[test]
     fn free_constants_skip_bound_variables() {
         let binder =
@@ -907,6 +962,22 @@ mod tests {
         // the error budget ran out after #1: a later Valid does not speak for #2
         let q = o.take_query(&[], false, true).unwrap();
         assert_eq!(statuses(q), vec![Proved, Failed, Unchecked, Unchecked]);
+        // two failures before the budget ran out: the last round disabled
+        // everything after the first, #1, so #2 was never proved either
+        o.pending = Some(Pending {
+            temps: HashMap::new(),
+            assertions: vec![
+                assertion(0, Some(Status::Proved)),
+                assertion(1, Some(Status::Failed)),
+                assertion(2, Some(Status::Proved)),
+                assertion(3, Some(Status::Failed)),
+                assertion(4, Some(Status::Proved)),
+            ],
+            used_axioms: None,
+            failing: Vec::new(),
+        });
+        let q = o.take_query(&[], false, true).unwrap();
+        assert_eq!(statuses(q), vec![Proved, Failed, Unchecked, Failed, Unchecked]);
         // #3 failed without an Invalid callback (no model)
         pending(&mut o);
         let q = o.take_query(&[id(3)], false, false).unwrap();
