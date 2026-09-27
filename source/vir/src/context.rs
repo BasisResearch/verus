@@ -166,9 +166,7 @@ pub struct Ctx {
     /// AIR-level handles to the same shared observer object, carried here so the
     /// verifier can attach them to each `air::Context` it builds (see verifier.rs).
     pub air_observer: Option<air::air_observer::AirObserverHandle>,
-    pub query_result_observer: Option<
-        air::query_result_observer::QueryResultObserverHandle,
-    >,
+    pub query_result_observer: Option<air::query_result_observer::QueryResultObserverHandle>,
     pub arch_word_bits: ArchWordBits,
 }
 

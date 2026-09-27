@@ -87,9 +87,7 @@ pub type VirObserverHandle = std::sync::Arc<std::sync::Mutex<dyn VirObserver>>;
 pub struct Observers {
     pub vir: Option<VirObserverHandle>,
     pub air: Option<air::air_observer::AirObserverHandle>,
-    pub query_result: Option<
-        air::query_result_observer::QueryResultObserverHandle,
-    >,
+    pub query_result: Option<air::query_result_observer::QueryResultObserverHandle>,
 }
 
 use std::collections::{HashMap, VecDeque};

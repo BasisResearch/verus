@@ -541,11 +541,9 @@ pub struct Context {
     name_counters: Vec<NameCounters>,
     pub(crate) typing: Typing,
     pub(crate) debug: bool,
-    pub(crate) air_observer:
-        Option<crate::air_observer::AirObserverHandle>,
-    pub(crate) query_result_observer: Option<
-        crate::query_result_observer::QueryResultObserverHandle,
-    >,
+    pub(crate) air_observer: Option<crate::air_observer::AirObserverHandle>,
+    pub(crate) query_result_observer:
+        Option<crate::query_result_observer::QueryResultObserverHandle>,
     pub(crate) ignore_unexpected_smt: bool,
     pub(crate) rlimit: u32,
     pub(crate) air_initial_log: Emitter,
@@ -818,12 +816,17 @@ impl Context {
     pub fn set_observers(
         &mut self,
         air_observer: Option<crate::air_observer::AirObserverHandle>,
-        query_result_observer: Option<
-            crate::query_result_observer::QueryResultObserverHandle,
-        >,
+        query_result_observer: Option<crate::query_result_observer::QueryResultObserverHandle>,
     ) {
         self.air_observer = air_observer;
         self.query_result_observer = query_result_observer;
+    }
+
+    /// The query-result observer `set_observers` registered, if any.
+    pub fn query_result_observer(
+        &self,
+    ) -> Option<&crate::query_result_observer::QueryResultObserverHandle> {
+        self.query_result_observer.as_ref()
     }
 
     pub fn set_air_initial_log(&mut self, writer: Box<dyn std::io::Write + Send>) {
