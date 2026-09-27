@@ -4406,9 +4406,9 @@ pub struct TraceParam {
     /// The domain a parameter the log leaves out is taken from: what Next's
     /// calls to the step pass it (the bound of the quantifier binding the
     /// argument, or a field of a value matched against a pattern, such as a
-    /// VerusSync step's `Dom_Step_<t>_v<i>`), else its type's finite domain,
-    /// else the export's `Dom_<Type>` hole; `None` when there is none (then
-    /// it must be logged, and `TraceEnabled` leaves the step out).
+    /// VerusSync step's `Dom_Step_<t>_v<i>`), else its type's finite domain;
+    /// `None` when there is none (then it must be logged, and `TraceEnabled`
+    /// leaves the step out). A logged value outside it is a divergence.
     pub domain: Option<String>,
 }
 
@@ -4751,9 +4751,10 @@ impl Exporter {
 
     /// The finite domain of a trace parameter of type `typ`: `hole`, the
     /// set Next's calls pass it from, when there is one; else read off the
-    /// type alone as a quantifier's would be, or a `Dom_<Type>` constant the
-    /// export already declares for it; `None` otherwise (no new hole is
-    /// made).
+    /// type alone as a quantifier's would be, which holds every value of the
+    /// type; `None` otherwise (no new hole is made). A `Dom_<Type>` hole
+    /// holds only what a quantifier binds, not a value a call computes
+    /// (`pre.x + 5`), so it is never taken here.
     fn trace_domain(
         &mut self,
         typ: &Typ,
@@ -4771,13 +4772,7 @@ impl Exporter {
             self.constants = constants;
             return None;
         }
-        match domain {
-            Some((d, _)) => Some(d),
-            None => {
-                let constant = format!("Dom_{}", self.constant_typ_name(typ));
-                self.constants.contains(&constant).then_some(constant)
-            }
-        }
+        domain.map(|(d, _)| d)
     }
 
     /// The trace spec: a module extending the export that follows one logged
@@ -4808,6 +4803,7 @@ impl Exporter {
             "TraceObservedNext",
             "TraceStep",
             "TraceParam",
+            "TraceParamUnbounded",
             "TraceInit",
             "TraceNext",
             "TraceSpec",
@@ -4832,6 +4828,7 @@ impl Exporter {
             observed_next,
             step_op,
             param,
+            param_unbounded,
             init,
             next,
             spec,
@@ -4840,7 +4837,7 @@ impl Exporter {
             diagnosis,
             step_at,
             params_declared,
-        ] = <[String; 19]>::try_from(names).expect("nineteen names");
+        ] = <[String; 20]>::try_from(names).expect("twenty names");
         let arity = operators
             .iter()
             .filter_map(|k| self.functions.get(&k.0))
@@ -4990,14 +4987,19 @@ impl Exporter {
             for (i, (p, typ)) in s.params.iter().zip(typs.iter()).enumerate() {
                 let (d, _) = self.trace_codec(typ, &n, &mut memo, &mut defs);
                 let a = &n.args[i];
-                let unlogged = match &p.domain {
-                    Some(dom) => dom.clone(),
-                    None => format!(
-                        "Assert(FALSE, \"trace: {} leaves out its parameter {}, which has no domain to range over (Next binds it to no bounded variable, and its type has no finite domain or Dom_ constant)\")",
-                        s.step, p.name
+                // A logged value is narrowed to the domain when there is
+                // one (it holds every value Next passes the parameter).
+                let (op, unlogged) = match &p.domain {
+                    Some(dom) => (&param, dom.clone()),
+                    None => (
+                        &param_unbounded,
+                        format!(
+                            "Assert(FALSE, \"trace: {} leaves out its parameter {}, which has no domain to range over (Next passes it no bounded variable, and its type has no finite domain)\")",
+                            s.step, p.name
+                        ),
                     ),
                 };
-                binds.push(format!("{a} \\in {param}({e}, \"{}\", {d}, {unlogged})", p.name));
+                binds.push(format!("{a} \\in {op}({e}, \"{}\", {d}, {unlogged})", p.name));
                 args.push(a.clone());
                 match &p.domain {
                     Some(dom) => enum_binds.push(format!("{a} \\in {dom}")),
@@ -5049,10 +5051,10 @@ impl Exporter {
             "\\* Trace validation for {module_name}, the export of `{module}` (verus -V tla-export).\n"
         ));
         tla.push_str(&format!(
-            "\\* The log is newline-delimited JSON: a header line naming the module\n\\* ({{\"module\": \"{module_name}\", \"export\": \"{module}\"}}, optionally \"state\": the\n\\* observed initial state; another module or export stops TLC), then one line per step:\n\\* {{\"step\": \"<t_* name>\", \"params\": {{...}}, \"state\": {{...}}}}. A step is named by\n\\* its spec fn's last segment or full path, by the full path alone when two\n\\* steps share the last segment; a parameter the step does not declare stops\n\\* TLC. Values are in the export's encoding: a struct or enum value is an\n\\* object (an enum's with its \"tag\"), a Seq an array, a Set an array of its\n\\* elements, a Map an array of [key, value] pairs, a tuple an array, a struct\n\\* without fields {{}} (or {{\"tag\": \"unit\"}}). An object\n\\* observed in the state is partial: only the fields it names are compared, so\n\\* a ghost field is left out of the log and free in the model (an enum's tag\n\\* too: its fields are then compared under whichever variant the model has);\n\\* a key naming no field of its type stops TLC, as one naming no state field\n\\* does; a Seq may be observed partially as an object keyed by the Verus index\n\\* (\"0\", \"1\", ...; {{}} observes nothing, [] is the empty Seq).\n\\* A record inside a Set element, a Map key or a parameter is decoded whole,\n\\* so it must name every field and an enum its tag (one left out there stops\n\\* TLC). A parameter left out of \"params\" ranges over what Next's calls to\n\\* the step pass it (the bound of the quantifier binding the argument, or the\n\\* field of a value matched against a pattern, such as a VerusSync step's\n\\* Dom_Step_<t>_v<i>), else its type's finite domain or the export's\n\\* Dom_<Type> hole; with none of these it must be logged, and TraceEnabled\n\\* leaves the step out (the report's trace steps say which, \"enumerated\").\n"
+            "\\* The log is newline-delimited JSON: a header line naming the module\n\\* ({{\"module\": \"{module_name}\", \"export\": \"{module}\"}}, optionally \"state\": the\n\\* observed initial state; another module or export stops TLC), then one line per step:\n\\* {{\"step\": \"<t_* name>\", \"params\": {{...}}, \"state\": {{...}}}}. A step is named by\n\\* its spec fn's last segment or full path, by the full path alone when two\n\\* steps share the last segment; a parameter the step does not declare stops\n\\* TLC. Values are in the export's encoding: a struct or enum value is an\n\\* object (an enum's with its \"tag\"), a Seq an array, a Set an array of its\n\\* elements, a Map an array of [key, value] pairs, a tuple an array, a struct\n\\* without fields {{}} (or {{\"tag\": \"unit\"}}). An object\n\\* observed in the state is partial: only the fields it names are compared, so\n\\* a ghost field is left out of the log and free in the model (an enum's tag\n\\* too: its fields are then compared under whichever variant the model has);\n\\* a key naming no field of its type stops TLC, as one naming no state field\n\\* does; a Seq may be observed partially as an object keyed by the Verus index\n\\* (\"0\", \"1\", ...; {{}} observes nothing, [] is the empty Seq).\n\\* A record inside a Set element, a Map key or a parameter is decoded whole,\n\\* so it must name every field and an enum its tag (one left out there stops\n\\* TLC). A parameter left out of \"params\" ranges over what Next's calls to\n\\* the step pass it (the bound of the quantifier binding the argument, or the\n\\* field of a value matched against a pattern, such as a VerusSync step's\n\\* Dom_Step_<t>_v<i>), else its type's finite domain (not a Dom_<Type> hole,\n\\* which holds only what a quantifier binds, never a value a call computes);\n\\* with neither it must be logged, and TraceEnabled leaves the step out (the\n\\* report's trace steps say which, \"enumerated\"). A logged parameter outside\n\\* its domain is a step the model cannot take.\n"
         ));
         tla.push_str(&format!(
-            "\\* TraceNext conjoins Next, then the logged step, so it only ever narrows\n\\* the model: a trace TLC follows to its end ({accepted}) is a behaviour of\n\\* {module_name}. Otherwise the deepest {index} reached is the first logged step\n\\* the model cannot take from any state that explains the log so far; and\n\\* when TLC finds no initial state (0 states generated, depth 0), the header's\n\\* observed state is none of Init's, so the log diverges before its first step.\n\\* Next takes values only in the export's Dom_ holes, so the .cfg must give\n\\* each one every value the log carries for it: a logged value outside it\n\\* diverges as a step the model cannot take.\n"
+            "\\* TraceNext conjoins Next, then the logged step, so it only ever narrows\n\\* the model: a trace TLC follows to its end ({accepted}) is a behaviour of\n\\* {module_name}. Otherwise the deepest {index} reached is the first logged step\n\\* the model cannot take from any state that explains the log so far; and\n\\* when TLC finds no initial state (0 states generated, depth 0), the header's\n\\* observed state is none of Init's, so the log diverges before its first step.\n\\* Next takes values only in the export's Dom_ holes, so the .cfg must give\n\\* each one every value the log carries for it: a logged value outside it\n\\* diverges as a step the model cannot take.\n\\* A pass means the observed state sequence is a behaviour of the model: a\n\\* logged step's name and parameters count only through their effect on the\n\\* state, so a step that another of Next's steps explains (the same observed\n\\* successor) is accepted even if the model never takes the logged one there.\n"
         ));
         tla.push_str(&format!("EXTENDS {module_name}, Json, TLC, Integers, Sequences\n\n"));
         tla.push_str(&format!("CONSTANT {log}  \\* the log's path\n"));
@@ -5067,7 +5069,7 @@ impl Exporter {
             "{state_of}({e}) == IF \"state\" \\in DOMAIN {e} THEN {e}.state ELSE [{k} \\in {{}} |-> 0]\n"
         ));
         tla.push_str(&format!(
-            "\\* A logged parameter, or the domain it ranges over when left out.\n{param}({e}, {k}, {dec_op}(_), {dom_op}) ==\n    IF \"params\" \\in DOMAIN {e} /\\ {k} \\in DOMAIN {e}.params THEN {{{dec_op}({e}.params[{k}])}} ELSE {dom_op}\n"
+            "\\* A logged parameter, or the domain it ranges over when left out. The domain\n\\* holds every value Next passes it, so a logged value outside it is a step\n\\* the model cannot take.\n{param}({e}, {k}, {dec_op}(_), {dom_op}) ==\n    IF \"params\" \\in DOMAIN {e} /\\ {k} \\in DOMAIN {e}.params THEN {{{dec_op}({e}.params[{k}])}} \\cap {dom_op} ELSE {dom_op}\n\\* The same for a parameter with no domain, which must be logged.\n{param_unbounded}({e}, {k}, {dec_op}(_), {dom_op}) ==\n    IF \"params\" \\in DOMAIN {e} /\\ {k} \\in DOMAIN {e}.params THEN {{{dec_op}({e}.params[{k}])}} ELSE {dom_op}\n"
         ));
         tla.push_str(&format!(
             "\\* Every parameter logged is one of {set}, the step's declared parameters (an IF,\n\\* not a disjunction, which TLC would take as two branches of the action).\n{params_declared}({e}, {set}) ==\n    \"params\" \\in DOMAIN {e} =>\n        \\A {k} \\in DOMAIN {e}.params :\n            IF {k} \\in {set} THEN TRUE\n            ELSE Assert(FALSE, \"trace: \" \\o {e}.step \\o \" has no parameter \" \\o {k})\n\n"

@@ -3614,6 +3614,71 @@ pub open spec fn next(pre: State, post: State) -> bool {
     );
 }
 
+/// A call passing a computed value (`pre.x + 5`) gives its parameter no
+/// domain, even when the export has a `Dom_int` hole from a quantifier: the
+/// hole holds only what the quantifier binds. A logged parameter is narrowed
+/// to its domain; the step's label counts only through the state it reaches.
+#[test]
+fn tla_export_trace_spec_takes_no_hole_for_a_computed_argument() {
+    let ex = export_code(
+        r#"
+use vstd::prelude::*;
+verus! {
+pub struct State { pub x: int, pub y: int }
+pub open spec fn init(s: State) -> bool { s.x == 0 && s.y == 0 }
+pub open spec fn t_set(pre: State, post: State, n: int) -> bool { post.y == n && post.x == pre.x }
+pub open spec fn t_jump(pre: State, post: State, to: int) -> bool { post.x == to && post.y == pre.y }
+pub open spec fn next(pre: State, post: State) -> bool {
+    ||| exists|n: int| t_set(pre, post, n)
+    ||| pre.x < 10 && t_jump(pre, post, pre.x + 5)
+}
+}
+"#,
+        "test_crate",
+    );
+    let steps = ex.report["trace"]["steps"].as_array().unwrap();
+    let step = |name: &str| steps.iter().find(|s| s["step"] == name).unwrap().clone();
+    let (t_set, t_jump) = (step("t_set"), step("t_jump"));
+    assert_eq!(t_set["params"][0]["domain"], "Dom_int", "{t_set}");
+    assert_eq!(t_set["enumerated"], true);
+    assert_eq!(t_jump["params"][0]["domain"], serde_json::Value::Null, "{t_jump}");
+    assert_eq!(t_jump["enumerated"], false);
+    let (spec, tla, cfg) = trace_spec(&ex);
+    assert!(tla.contains("A pass means the observed state sequence is a behaviour"), "{}", tla);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &spec);
+    let holes = "CONSTANT Dom_int = {0, 1}\n";
+    let log = ex.dir.path().join("t.ndjson");
+    let header = r#"{"module": "State_tla", "export": "test_crate", "state": {"x": 0, "y": 0}}"#;
+    let write = |lines: &[&str]| {
+        std::fs::write(&log, format!("{header}\n{}\n", lines.join("\n"))).unwrap();
+    };
+    // t_jump to 5, outside Dom_int, is a step of the model when logged.
+    write(&[
+        r#"{"step": "t_jump", "params": {"to": 5}, "state": {"x": 5}}"#,
+        r#"{"step": "t_set", "state": {"y": 1}}"#,
+    ]);
+    let (depth, out) = follow(&jar, &spec, &cfg, &log, holes);
+    assert_eq!(depth, 3, "{}", out);
+    // Left out, it has no domain to range over: TLC stops saying why.
+    write(&[r#"{"step": "t_jump", "state": {"x": 5}}"#]);
+    let out = stops(&jar, &spec, &cfg, &log, holes);
+    assert!(
+        out.contains("trace: t_jump leaves out its parameter to, which has no domain"),
+        "{}",
+        out
+    );
+    // A logged n outside its domain (Dom_int) is a step the model cannot take.
+    write(&[r#"{"step": "t_set", "params": {"n": 7}, "state": {"x": 0}}"#]);
+    let (depth, out) = follow(&jar, &spec, &cfg, &log, holes);
+    assert_eq!(depth, 1, "{}", out);
+    // The label counts only through its effect: t_jump to 0 is never a step
+    // of the model from x 0, but t_set(0) reaches the same state.
+    write(&[r#"{"step": "t_jump", "params": {"to": 0}, "state": {"x": 0, "y": 0}}"#]);
+    let (depth, out) = follow(&jar, &spec, &cfg, &log, holes);
+    assert_eq!(depth, 2, "{}", out);
+}
+
 /// A header whose observed state is none of Init's: TLC finds no initial
 /// state and ends without error at depth 0, the divergence before the
 /// first step.

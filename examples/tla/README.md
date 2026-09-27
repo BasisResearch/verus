@@ -240,9 +240,12 @@ the step pass it: the bound of the quantifier binding the argument
 a value matched against a constructor pattern, whatever the parameter's
 position (a VerusSync step's `Dom_Step_<t>_v<i>`, a hole of the field's own
 type), the union over every call; else its type's finite domain (a `bool`,
-a `u8`) or the export's `Dom_<Type>` hole. With none of these (a call passes
-`pre.x + 5`) it must be logged, and `TraceEnabled` leaves the step out: the
-report's trace step has `"enumerated": false`. The verus-tla shape has one step, `next`, since its `Next` is not
+a `u8`). Never the export's `Dom_<Type>` hole: it holds only what a
+quantifier binds, not a value a call computes. With neither (a call passes
+`pre.x + 5` to an `int`) it must be logged, and `TraceEnabled` leaves the
+step out: the report's trace step has `"enumerated": false`. A logged
+parameter is narrowed to its domain, so a value outside it is a step the
+model cannot take. The verus-tla shape has one step, `next`, since its `Next` is not
 split into named transitions.
 
 `TraceNext` conjoins `Next` and then the logged step (so it only ever
@@ -257,6 +260,17 @@ observed state is not an initial state of the model: the log diverges
 before its first step. At a diverging step, `TraceEnabled` is the set of the model's enabled steps
 with their parameters, and `TraceDiagnosis` says whether the logged step is
 enabled at all and which observed fields no successor by it matches.
+
+**A pass means the observed state sequence is a behaviour of the model.**
+The logged step's name and parameters count only through their effect on
+the observed state: `TraceNext` requires a successor that both `Next` and the
+logged step allow, not that `Next` took it by that step. So a step another
+of `Next`'s steps explains is accepted. With `next` either
+`exists|n: int| t_set(pre, post, n)` or `pre.x < 10 && t_jump(pre, post, pre.x + 5)`,
+logging `t_jump` with `to` 0 from `x` 0, `y` 0 is followed, since `t_set(0)`
+reaches the same state, though the model's `t_jump` only ever passes
+`pre.x + 5`. Restricting `Next` to the logged step's call sites is future
+work.
 
 **The `Dom_` constants must cover every value the log carries.** Since
 `TraceNext` conjoins `Next`, and `Next` takes a step's arguments only from
