@@ -5,7 +5,11 @@
 //! function the triple reaches. It keys on nothing from any one project:
 //! datatypes become records, `vstd` collections become TLA+ sequences, sets
 //! and functions, spec functions become operators, and a quantifier is
-//! bounded from its own guard. Whatever it cannot express it refuses with a
+//! bounded from its own guard (`S.contains(x)`, `lo <= x < hi`, and
+//! `S.contains(Ctor { f: x, .. })`, which ranges `x` over the `f`s of `S`'s
+//! members built by `Ctor`). An `exists` over a step enum that a `match`
+//! dispatches is one `\E` per variant, each field bounded from the guard of
+//! the transition its arm calls. Whatever it cannot express it refuses with a
 //! source location, and whatever it cannot bound becomes a `CONSTANT` the
 //! model config must supply. Both lists come back in the [`Report`].
 //!
@@ -198,11 +202,19 @@ struct Env {
     /// Variables bound to a closure or record value, kept symbolically so a
     /// later application or field selection can be reduced.
     values: HashMap<VarIdent, (Expr, Box<Env>)>,
+    /// Locals bound (by `let` or a pattern) to a value that reads the post
+    /// state, so reading them reads primed variables.
+    primed: HashSet<VarIdent>,
 }
 
 impl Env {
     fn new() -> Self {
-        Env { roles: HashMap::new(), names: HashMap::new(), values: HashMap::new() }
+        Env {
+            roles: HashMap::new(),
+            names: HashMap::new(),
+            values: HashMap::new(),
+            primed: HashSet::new(),
+        }
     }
     fn name(&self, v: &VarIdent) -> String {
         self.names.get(v).cloned().unwrap_or_else(|| ident_name(v))
@@ -212,6 +224,36 @@ impl Env {
     /// field selected and applied, never printed.
     fn symbolic_only(&self, v: &VarIdent) -> bool {
         self.values.contains_key(v) && !self.names.contains_key(v) && !self.roles.contains_key(v)
+    }
+    /// Whether `v` reads the post state: the post-role parameter, or a local
+    /// bound to something that reads it.
+    fn post_var(&self, v: &VarIdent) -> bool {
+        self.roles.get(v) == Some(&Role::Post) || self.primed.contains(v)
+    }
+    /// Whether `e` reads the post state (primed variables), directly or
+    /// through a call it passes the post state to.
+    fn reads_post(&self, e: &Expr) -> bool {
+        let mut found = false;
+        crate::ast_visitor::expr_visitor_walk(e, &mut |x: &Expr| {
+            match &x.x {
+                ExprX::Var(u) if self.post_var(u) => found = true,
+                ExprX::ReadPlace(p, _) if self.place_reads_post(p) => found = true,
+                _ => {}
+            }
+            crate::visitor::VisitorControlFlow::Recurse
+        });
+        found
+    }
+    fn place_reads_post(&self, p: &Place) -> bool {
+        match &p.x {
+            PlaceX::Local(u) => self.post_var(u),
+            PlaceX::Field(_, inner)
+            | PlaceX::DerefMut(inner)
+            | PlaceX::ModeUnwrap(inner, _)
+            | PlaceX::UserDefinedTypInvariantObligation(inner, _) => self.place_reads_post(inner),
+            PlaceX::Index(inner, idx, ..) => self.place_reads_post(inner) || self.reads_post(idx),
+            PlaceX::Temporary(e) | PlaceX::WithExpr(e, _) => self.reads_post(e),
+        }
     }
 }
 
@@ -304,6 +346,8 @@ struct Exporter {
     datatype_names: HashMap<Path, String>,
     datatype_names_taken: HashSet<String>,
     current: String,
+    /// Whether the operators being emitted are the ones Init reaches.
+    in_init: bool,
 }
 
 fn ident_name(v: &VarIdent) -> String {
@@ -605,6 +649,10 @@ fn vstd_op(name: &str) -> Option<&'static str> {
         ("set", "is_empty") => "set_is_empty",
         ("set", "ext_equal") => "ext_equal",
         ("set", "full") => "set_full",
+        // `Set::range(lo, hi)` and the `FiniteRange::range_set` it inlines
+        // to: the integers `lo <= i < hi`.
+        ("set", "range") | ("set", "range_set") => "set_range",
+        ("set", "range_inclusive") => "set_range_inclusive",
         ("map", "dom") => "map_dom",
         ("map", "index") | ("map", "spec_index") => "map_index",
         ("map", "insert") => "map_insert",
@@ -1158,6 +1206,19 @@ impl Exporter {
                 let msg = self.assert_message(a, env, 0);
                 format!("(IF {sa} THEN {sb} ELSE Assert(FALSE, {msg}))")
             }
+            // A disjunction of two state predicates, outside what Init
+            // reaches: `IF a THEN TRUE ELSE b`, the same boolean. In an
+            // action TLC branches on a `\/` rather than evaluating it, so
+            // `b` would be evaluated even where `a` holds and guards it (`b
+            // == 0 || log[b - 1] == x` indexing `log[-1]`). Init keeps the
+            // `\/`, whose branches may assign the state.
+            ExprX::Logical(LogicalOp::Or, a, b)
+                if !self.in_init && !env.reads_post(a) && !env.reads_post(b) =>
+            {
+                let sa = self.quiet(|x| x.expr(a, env));
+                let sb = self.quiet(|x| x.expr(b, env));
+                format!("(IF {sa} THEN TRUE ELSE {sb})")
+            }
             ExprX::Logical(op, a, b) => {
                 let (sa, sb) = match op {
                     LogicalOp::And => (self.expr(a, env), self.expr(b, env)),
@@ -1565,6 +1626,11 @@ impl Exporter {
                         let value = self.quiet(|x| x.place(init, &env2));
                         let before = env2.clone();
                         let n = self.bind_var(&mut env2, name);
+                        if before.place_reads_post(init) {
+                            env2.primed.insert(name.clone());
+                        } else {
+                            env2.primed.remove(name);
+                        }
                         if let Some(v) = symbolic {
                             env2.values.insert(name.clone(), (v, Box::new(before)));
                         }
@@ -1600,6 +1666,17 @@ impl Exporter {
         for arm in arms.iter() {
             let mut env2 = env.clone();
             let (cond, lets) = self.pattern(&m, &arm.x.pattern, &mut env2);
+            // A binding of a scrutinee that reads the post state reads it too.
+            let scrutinee_primed = env.place_reads_post(place);
+            for v in env2.names.keys().cloned().collect::<Vec<_>>() {
+                if env2.names.get(&v) != env.names.get(&v) {
+                    if scrutinee_primed {
+                        env2.primed.insert(v);
+                    } else {
+                        env2.primed.remove(&v);
+                    }
+                }
+            }
             let in_lets = |x: String| {
                 if lets.is_empty() { x } else { format!("(LET {} IN {x})", lets.join(" ")) }
             };
@@ -2121,6 +2198,24 @@ impl Exporter {
             "set_finite" => format!("IsFiniteSet({})", g!(0)),
             "set_is_empty" => format!("({} = {{}})", g!(0)),
             "set_full" => self.refuse("Set::full (unbounded)", &e.span),
+            // Only integers: a `char` is a string here, with no range.
+            "set_range" | "set_range_inclusive"
+                if args.len() == 2
+                    && matches!(
+                        &*crate::ast_util::undecorate_typ(&args[0].typ),
+                        TypX::Int(r) if !matches!(r, IntRange::Char)
+                    ) =>
+            {
+                let (lo, hi) = (g!(0), g!(1));
+                if op == "set_range" {
+                    format!("({lo})..(({hi}) - 1)")
+                } else {
+                    format!("({lo})..({hi})")
+                }
+            }
+            "set_range" | "set_range_inclusive" => {
+                self.refuse("Set::range over a type other than an integer", &e.span)
+            }
             "ext_equal" => format!("({} = {})", g!(0), g!(1)),
             "map_dom" => format!("DOMAIN {}", g!(0)),
             "map_index" => format!("{}[{}]", g!(0), g!(1)),
@@ -2166,6 +2261,11 @@ impl Exporter {
         for b in binders.iter() {
             self.bind_var(&mut env2, &b.name);
         }
+        if !forall && binders.len() == 1 {
+            if let Some(out) = self.exists_per_variant(e, &binders[0], body, &env2) {
+                return out;
+            }
+        }
         // The guard: the antecedent of an implication (forall) or the
         // conjuncts of the body, a single one included (exists).
         // Explicit triggers wrap the body; the guard is underneath.
@@ -2210,6 +2310,350 @@ impl Exporter {
             out = format!("({q} {bound} : {out})");
         }
         out
+    }
+
+    /// `exists|x: T| body` for a datatype `T` that `body` matches on,
+    /// directly or in the function it passes `x` to (`next_step(pre, post,
+    /// step)`): one `\E` per variant over its fields instead of one over the
+    /// union of every variant's values, each field bounded where the arm
+    /// that variant takes guards it, reading the arm's transition (`Grant
+    /// { v, c, .. } => t_grant(pre, post, v, c, ..)` bounds `v` by
+    /// `t_grant`'s `0 <= v < pre.n`). A field no guard bounds is bounded by
+    /// its type, or is a hole. None when `x` has a guard of its own or
+    /// `body` is not such a match.
+    fn exists_per_variant(
+        &mut self,
+        e: &Expr,
+        binder: &VarBinder<Typ>,
+        body: &Expr,
+        env: &Env,
+    ) -> Option<String> {
+        let x = &binder.name;
+        let TypX::Datatype(Dt::Path(path), targs, _) = &*crate::ast_util::undecorate_typ(&binder.a)
+        else {
+            return None;
+        };
+        let d = self.datatypes.get(path)?.clone();
+        if matches!(d.x.transparency, DatatypeTransparency::Never)
+            || d.x.typ_params.len() != targs.len()
+            || d.x.variants.is_empty()
+        {
+            return None;
+        }
+        let inner = peel(body);
+        let guards: Vec<Expr> = conjuncts(&inner);
+        let unbound = [x.clone()];
+        if self.quiet(|this| this.bound_from_guard(x, &binder.a, &unbound, &guards, env)).is_some()
+        {
+            return None;
+        }
+        // The match on `x`, and the scope its arms read.
+        let (arms, arm_env, arm_unbound) = self.match_on(&inner, x, env)?;
+        let tagged = d.x.variants.len() > 1;
+        let instance = self.constant_typ_name(&binder.a);
+        let sb = self.in_branch(body, env);
+        let xname = env.name(x);
+        // Per variant: its name, fields, field binders and body, and each
+        // field's bound (from a guard, or from its type with its size and the
+        // holes that bounding added).
+        let mut all = Vec::new();
+        let mut field_bounds = Vec::new();
+        for variant in d.x.variants.iter() {
+            if variant.name.to_string() == "dummy_to_use_type_params" {
+                continue;
+            }
+            let fields: Vec<(Ident, Typ)> = variant
+                .fields
+                .iter()
+                .map(|f| {
+                    let t = crate::sst_util::subst_typ_for_datatype(&d.x.typ_params, targs, &f.a.0);
+                    (f.name.clone(), t)
+                })
+                .collect();
+            // The guarded expression each field is a parameter of.
+            let site = arms.iter().find_map(|arm| {
+                let PatternX::Constructor(_, v, pbinders) = &arm.x.pattern.x else { return None };
+                if v != &variant.name
+                    || !matches!(arm.x.guard.x, ExprX::Const(Constant::Bool(true)))
+                {
+                    return None;
+                }
+                let mut vars: HashMap<Ident, VarIdent> = HashMap::new();
+                for b in pbinders.iter() {
+                    if let PatternX::Var(PatternBinding { name, .. }) = &b.a.x {
+                        vars.insert(b.name.clone(), name.clone());
+                    }
+                }
+                Some((vars, arm.x.body.clone()))
+            });
+            let names: Vec<String> =
+                fields.iter().map(|(f, _)| self.bind(&format!("{}__", field_name(f)))).collect();
+            let mut record = Vec::new();
+            if tagged {
+                record.push(format!("tag |-> \"{}\"", variant.name));
+            }
+            for ((f, _), n) in fields.iter().zip(&names) {
+                record.push(format!("{} |-> {n}", field_name(f)));
+            }
+            let record = if record.is_empty() {
+                "[tag |-> \"unit\"]".to_string()
+            } else {
+                format!("[{}]", record.join(", "))
+            };
+            let out = format!("(LET {xname} == {record} IN {sb})");
+            let mut bounded = Vec::new();
+            for k in 0..fields.len() {
+                let from_guard = site.as_ref().and_then(|(vars, arm_body)| {
+                    self.field_bound(k, &fields, &names, vars, arm_body, &arm_env, &arm_unbound)
+                });
+                bounded.push(match from_guard {
+                    Some(d) => (Some((d, None)), 0..0),
+                    None => {
+                        let first = self.holes.len();
+                        let b =
+                            self.bound_from_type(&fields[k].1, &e.span, &mut vec![path.clone()]);
+                        (b.map(|(d, n)| (d, Some(n))), first..self.holes.len())
+                    }
+                });
+            }
+            all.push((variant.name.clone(), fields, names, out));
+            field_bounds.push(bounded);
+        }
+        // What a variant's type-bounded fields take together, counting
+        // only those of at most one value once it is split; a variant over
+        // the cap, or every variant when they are together, is split: each
+        // of its type-bounded fields of more than one value is a hole (as
+        // for a domain read off the type, [`Exporter::bound_variants`]).
+        type FieldBound = (Option<(String, Option<u128>)>, std::ops::Range<usize>);
+        let size = |bounded: &Vec<FieldBound>, split: bool| {
+            bounded
+                .iter()
+                .filter_map(|(b, _)| match b {
+                    Some((_, Some(n))) => Some(*n),
+                    Some((_, None)) => None,
+                    None => Some(1),
+                })
+                .filter(|n| !split || *n <= 1)
+                .fold(1u128, |acc, n| acc.saturating_mul(n))
+        };
+        let mut split: Vec<bool> =
+            field_bounds.iter().map(|b| size(b, false) > MAX_TYPE_DOMAIN).collect();
+        let union = field_bounds
+            .iter()
+            .zip(&split)
+            .fold(0u128, |acc, (b, s)| acc.saturating_add(size(b, *s)));
+        if union > MAX_TYPE_DOMAIN {
+            for (b, s) in field_bounds.iter().zip(split.iter_mut()) {
+                *s = *s || size(b, false) > 1;
+            }
+        }
+        for (bounded, s) in field_bounds.iter().zip(&split).rev() {
+            if !*s {
+                continue;
+            }
+            for (b, holes) in bounded.iter().rev() {
+                if matches!(b, Some((_, Some(n))) if *n > 1) {
+                    self.drop_hole_range(holes.clone());
+                }
+            }
+        }
+        let mut parts = Vec::new();
+        for ((vname, fields, names, mut out), (bounded, s)) in
+            all.into_iter().zip(field_bounds.into_iter().zip(split))
+        {
+            let mut domains = Vec::new();
+            for ((f, ftyp), (b, _)) in fields.iter().zip(bounded) {
+                let domain = match b {
+                    Some((d, None)) => d,
+                    Some((d, Some(n))) if !s || n <= 1 => d,
+                    _ => {
+                        let constant =
+                            format!("Dom_{instance}_{}_{}", sanitize(&vname), field_name(f));
+                        self.constants.insert(constant.clone());
+                        self.holes.push(Hole {
+                            variable: format!("{vname}.{}", field_name(f)),
+                            typ: typ_name(ftyp),
+                            constant: constant.clone(),
+                            location: span_string(&e.span),
+                            in_function: self.current.clone(),
+                        });
+                        constant
+                    }
+                };
+                domains.push(domain);
+            }
+            for (n, dom) in names.iter().zip(domains).rev() {
+                out = format!("(\\E {n} \\in {dom} : {out})");
+            }
+            parts.push(out);
+        }
+        if parts.is_empty() {
+            return None;
+        }
+        Some(format!("({})", parts.join(" \\/ ")))
+    }
+
+    /// The arms of the `match` on `x` that `e` is, or that the body of the
+    /// function `e` calls with `x` is, with the scope the arms read: the
+    /// callee's state parameters in the roles of the state arguments, its
+    /// other parameters (besides the one `x` fills) unbound.
+    fn match_on(
+        &mut self,
+        e: &Expr,
+        x: &VarIdent,
+        env: &Env,
+    ) -> Option<(Arms, Env, Vec<VarIdent>)> {
+        let is_x = |p: &Place| place_var(p).as_ref() == Some(x) && matches!(p.x, PlaceX::Local(_));
+        if let ExprX::Match(place, arms, _) = &e.x {
+            return is_x(place).then(|| (arms.clone(), env.clone(), vec![]));
+        }
+        let ExprX::Call { target: CallTarget::Fun(kind, fun, ..), args, .. } = &e.x else {
+            return None;
+        };
+        let callee = self.functions.get(&self.resolved_fun(kind, fun))?.clone();
+        let body = peel(callee.x.body.as_ref()?);
+        let ExprX::Match(place, arms, _) = &body.x else { return None };
+        let scrutinee = place_var(place).filter(|_| matches!(place.x, PlaceX::Local(_)))?;
+        let mut callee_env = Env::new();
+        let mut unbound = Vec::new();
+        let mut found = false;
+        for (p, a) in callee.x.params.iter().zip(args.iter()) {
+            let arg = read_var(a);
+            if arg.as_ref() == Some(x) && p.x.name == scrutinee {
+                found = true;
+            } else if let Some(role) = arg.as_ref().and_then(|v| env.roles.get(v)) {
+                callee_env.roles.insert(p.x.name.clone(), *role);
+            } else {
+                unbound.push(p.x.name.clone());
+            }
+        }
+        found.then_some((arms.clone(), callee_env, unbound))
+    }
+
+    /// The domain of field `k` of a variant read off the guard of the arm
+    /// body `arm_body` (or of the function it calls), where the field is
+    /// the pattern variable `vars[field]`: the fields before it are bound
+    /// (as `names`), the ones after it are not. The callee's `let`s that
+    /// read only bound names wrap the domain.
+    #[allow(clippy::too_many_arguments)]
+    fn field_bound(
+        &mut self,
+        k: usize,
+        fields: &[(Ident, Typ)],
+        names: &[String],
+        vars: &HashMap<Ident, VarIdent>,
+        arm_body: &Expr,
+        arm_env: &Env,
+        arm_unbound: &[VarIdent],
+    ) -> Option<String> {
+        let field_of: HashMap<VarIdent, usize> = fields
+            .iter()
+            .enumerate()
+            .filter_map(|(i, (f, _))| vars.get(f).map(|v| (v.clone(), i)))
+            .collect();
+        let target = vars.get(&fields[k].0)?.clone();
+        let arm_body = peel(arm_body);
+        // The expression whose guard bounds the field, in its scope: the
+        // arm's transition call (its parameters for the pattern variables),
+        // or the arm body itself.
+        let mut env = Env::new();
+        let mut unbound: Vec<VarIdent> = arm_unbound.to_vec();
+        let (guarded, target) = match &arm_body.x {
+            ExprX::Call { target: CallTarget::Fun(kind, fun, ..), args, .. } => {
+                let callee = self.functions.get(&self.resolved_fun(kind, fun))?.clone();
+                let mut target_param = None;
+                for (p, a) in callee.x.params.iter().zip(args.iter()) {
+                    let arg = read_var(a);
+                    match arg.as_ref().and_then(|v| field_of.get(v).map(|i| (v, *i))) {
+                        Some((_, i)) if i < k => {
+                            env.names.insert(p.x.name.clone(), names[i].clone());
+                        }
+                        Some((v, i)) => {
+                            if v == &target && i == k {
+                                target_param = Some(p.x.name.clone());
+                            }
+                            unbound.push(p.x.name.clone());
+                        }
+                        None => match arg.as_ref().and_then(|v| arm_env.roles.get(v)) {
+                            Some(role) => {
+                                env.roles.insert(p.x.name.clone(), *role);
+                            }
+                            None => unbound.push(p.x.name.clone()),
+                        },
+                    }
+                }
+                (callee.x.body.clone()?, target_param?)
+            }
+            _ => {
+                env = arm_env.clone();
+                for (v, i) in &field_of {
+                    if *i < k {
+                        env.names.insert(v.clone(), names[*i].clone());
+                    } else {
+                        unbound.push(v.clone());
+                    }
+                }
+                (arm_body.clone(), target)
+            }
+        };
+        // Reading the post state in a bound would read a primed variable
+        // before the step assigns it.
+        unbound.extend(env.roles.iter().filter(|(_, r)| **r == Role::Post).map(|(v, _)| v.clone()));
+        // The body's `let`s, as far as they read only what is bound.
+        let mut lets = Vec::new();
+        let mut e = guarded;
+        loop {
+            match &e.x {
+                ExprX::Block(stmts, Some(tail)) => {
+                    for st in stmts.iter() {
+                        let StmtX::Decl { pattern, init: Some(init), .. } = &st.x else { continue };
+                        let PatternX::Var(PatternBinding { name, .. }) = &pattern.x else {
+                            continue;
+                        };
+                        let reads_unbound = match &init.x {
+                            PlaceX::Temporary(v) | PlaceX::WithExpr(v, _) => {
+                                unbound.iter().any(|u| mentions(v, u))
+                            }
+                            _ => place_var(init).map_or(true, |b| unbound.contains(&b)),
+                        };
+                        if reads_unbound
+                            || typ_has_specfn(&pattern.typ, &self.datatypes, &mut HashSet::new())
+                        {
+                            unbound.push(name.clone());
+                            continue;
+                        }
+                        let value = self.quiet(|this| this.place(init, &env));
+                        let n = self.bind_var(&mut env, name);
+                        lets.push(format!("{n} == {value}"));
+                    }
+                    e = tail.clone();
+                }
+                _ => {
+                    // Past parentheses, boxes and triggers, maybe to a block.
+                    let p = peel(&e);
+                    let more = matches!(&p.x, ExprX::Block(st, Some(_)) if !st.is_empty());
+                    e = p;
+                    if !more {
+                        break;
+                    }
+                }
+            }
+        }
+        let guard = conjuncts(&e);
+        let typ = &fields[k].1;
+        let mut ordered = vec![target.clone()];
+        ordered.extend(unbound.into_iter().filter(|u| u != &target));
+        // The guard must bound the field on its own, but for the 0 below an
+        // unsigned type: a side taken from a type as wide as `u8` is left to
+        // the cap on domains read off a type.
+        let unsigned = matches!(
+            &*crate::ast_util::undecorate_typ(typ),
+            TypX::Int(IntRange::Nat | IntRange::U(_) | IntRange::USize)
+        );
+        let open: Typ = Arc::new(TypX::Int(if unsigned { IntRange::Nat } else { IntRange::Int }));
+        self.quiet(|this| this.bound_from_guard(&target, &open, &ordered, &guard, &env))?;
+        let dom = self.quiet(|this| this.bound_from_guard(&target, typ, &ordered, &guard, &env))?;
+        Some(if lets.is_empty() { dom } else { format!("(LET {} IN {dom})", lets.join(" ")) })
     }
 
     /// A finite domain from the type alone, with its number of elements:
@@ -2451,6 +2895,35 @@ impl Exporter {
         }
     }
 
+    /// Where `v` sits in the constructor `e`: the steps from the value to
+    /// it, each the variant to test (for a datatype of several variants)
+    /// and the field (a record label, or a tuple's 0-based position). None
+    /// when `e` is not a constructor holding `v` as a field, directly or in
+    /// a nested constructor, or has an update tail.
+    fn ctor_path(
+        &self,
+        e: &Expr,
+        v: &VarIdent,
+    ) -> Option<Vec<(Option<String>, Result<String, usize>)>> {
+        let e = peel(e);
+        let ExprX::Ctor(dt, variant, binders, None) = &e.x else { return None };
+        let tag = (!self.single_variant(dt)).then(|| variant.to_string());
+        for b in binders.iter() {
+            let field = match dt {
+                Dt::Tuple(_) => Err(b.name.parse::<usize>().ok()?),
+                Dt::Path(_) => Ok(field_name(&b.name)),
+            };
+            if read_var(&b.a).as_ref() == Some(v) {
+                return Some(vec![(tag, field)]);
+            }
+            if let Some(mut rest) = self.ctor_path(&b.a, v) {
+                rest.insert(0, (tag, field));
+                return Some(rest);
+            }
+        }
+        None
+    }
+
     /// A finite domain for `v` read off the guard's conjuncts: membership in
     /// a set, a map's domain, or an integer range from inequalities and
     /// chained comparisons (through binders not yet bound: `0 <= a < b < n`
@@ -2489,6 +2962,37 @@ impl Exporter {
                         let s = self.expr(&args[0], env);
                         let (sv, i) = (self.bind("s__"), self.bind("i__"));
                         format!("(LET {sv} == {s} IN {{{sv}[{i}] : {i} \\in 1..Len({sv})}})")
+                    }
+                    // `S.contains(Ctor { f: v, .. })`, also nested
+                    // (`Ctor { f: Inner { g: v, .. }, .. }`): `v` is the
+                    // `f` of a member of `S` built by that constructor, so
+                    // it ranges over those members' `f`s.
+                    Some(op @ ("set_contains" | "map_contains_key"))
+                        if args.len() == 2 && free(&args[0]) =>
+                    {
+                        let Some(path) = self.ctor_path(&args[1], v) else { continue };
+                        let s = self.expr(&args[0], env);
+                        let s = if op == "map_contains_key" { format!("DOMAIN {s}") } else { s };
+                        let m = self.bind("m__");
+                        let mut tests = Vec::new();
+                        let mut access = m.clone();
+                        for (tag, field) in &path {
+                            if let Some(t) = tag {
+                                tests.push(format!("{access}.tag = \"{t}\""));
+                            }
+                            access = match field {
+                                Ok(label) => format!("{access}.{label}"),
+                                Err(idx) => format!("{access}[{}]", idx + 1),
+                            };
+                        }
+                        if tests.is_empty() {
+                            format!("{{{access} : {m} \\in {s}}}")
+                        } else {
+                            let m2 = self.bind("m__");
+                            let filtered = format!("{{{m} \\in {s} : {}}}", tests.join(" /\\ "));
+                            let access2 = access.replacen(&m, &m2, 1);
+                            format!("{{{access2} : {m2} \\in {filtered}}}")
+                        }
                     }
                     _ => continue,
                 };
@@ -3808,6 +4312,7 @@ pub fn export_module(krate: &Krate, arg: &str) -> Result<Export, String> {
         datatype_names: HashMap::new(),
         datatype_names_taken: HashSet::new(),
         current: String::new(),
+        in_init: false,
     };
     for v in &state_vars {
         ex.used_names.insert(v.clone());
@@ -3843,6 +4348,7 @@ pub fn export_module(krate: &Krate, arg: &str) -> Result<Export, String> {
             ex.implications.clear();
             ex.pre_assigned.clear();
             ex.conj_level = true;
+            ex.in_init = i == 0;
             let body = match &f.x.body {
                 Some(b) => match &peel(b).x {
                     ExprX::Closure(params, body) => {
@@ -3869,6 +4375,7 @@ pub fn export_module(krate: &Krate, arg: &str) -> Result<Export, String> {
             if ex.current_tainted {
                 ex.tainted.insert(key);
             }
+            ex.in_init = false;
             match i {
                 0 => init_name = name,
                 1 => next_name = name,
@@ -3876,7 +4383,9 @@ pub fn export_module(krate: &Krate, arg: &str) -> Result<Export, String> {
             }
         }
     } else {
+        ex.in_init = true;
         init_name = ex.ensure_function(&(triple.init.clone(), Variant::Plain));
+        ex.in_init = false;
         next_name = ex.ensure_function(&(triple.next.clone(), Variant::Plain));
         // A predicate init or next reads, unprimed or primed, is a guard or helper of
         // the transition, not an invariant, unless the command line names
