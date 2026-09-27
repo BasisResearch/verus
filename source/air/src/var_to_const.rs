@@ -170,11 +170,20 @@ impl GoalScope {
 }
 
 impl LowerStmtState<'_> {
+    /// Version `n` of `x` came into being as `versioned`: recorded for the
+    /// context's own readers when asked (`record_versions`), and announced to
+    /// the observer. The declared version 0 of each variable is recorded
+    /// where it is declared, before any statement.
     fn notify_version_created(
         &mut self,
+        x: &Ident,
+        n: u32,
         versioned: &Ident,
         kind: crate::air_observer::VersionOrigin,
     ) {
+        if self.record_versions {
+            self.variable_versions.insert(versioned.to_string(), (x.to_string(), n));
+        }
         if let Some(obs) = &mut self.observer {
             obs.on_wp_version_created(versioned, kind);
         }
@@ -205,9 +214,7 @@ fn lower_stmt(
             let n = find_version(&versions, x);
             let typ = types[x].clone();
             versions.insert(x.clone(), n + 1);
-            if state.record_versions {
-                state.variable_versions.insert(rename_var(x, n + 1), (x.to_string(), n + 1));
-            }
+            let base = x;
             let x = Arc::new(rename_var(x, n + 1));
             if !state.version_decls.contains(&x) {
                 let decl = Arc::new(DeclX::Const(x.clone(), typ));
@@ -219,7 +226,7 @@ fn lower_stmt(
             } else {
                 crate::air_observer::VersionOrigin::Assign
             };
-            state.notify_version_created(&x, kind);
+            state.notify_version_created(base, n + 1, &x, kind);
             match &*stmt {
                 StmtX::Assign(_, e) => {
                     let expr1 = Arc::new(ExprX::Var(x));
@@ -262,6 +269,8 @@ fn lower_stmt(
                 if !had_explicit {
                     let renamed = Arc::new(rename_var(x, merged_version));
                     state.notify_version_created(
+                        x,
+                        merged_version,
                         &renamed,
                         crate::air_observer::VersionOrigin::BreakMerge,
                     );
@@ -303,6 +312,8 @@ fn lower_stmt(
                 if !had_explicit {
                     let renamed = Arc::new(rename_var(x, merged_version));
                     state.notify_version_created(
+                        x,
+                        merged_version,
                         &renamed,
                         crate::air_observer::VersionOrigin::BranchMerge,
                     );
