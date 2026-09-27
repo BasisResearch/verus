@@ -2904,12 +2904,13 @@ fn tla_export_reports_the_type_map_and_the_steps() {
     assert_eq!(
         map["variables"],
         serde_json::json!([
-            {"variable": "x", "field": "x", "typ": {"kind": "int", "rust": "nat"}},
-            {"variable": "y", "field": "y", "typ": {"kind": "int", "rust": "nat"}},
+            {"variable": "x", "field": "x", "label": "x", "typ": {"kind": "int", "rust": "nat"}},
+            {"variable": "y", "field": "y", "label": "y", "typ": {"kind": "int", "rust": "nat"}},
         ])
     );
     let step = &map["datatypes"]["test_crate::Step"];
     assert_eq!(step["tagged"], true);
+    assert_eq!(step["kind"], "enum");
     assert_eq!(
         names(&serde_json::json!(
             step["variants"]
@@ -2922,6 +2923,7 @@ fn tla_export_reports_the_type_map_and_the_steps() {
         ["Inc", "Dbl"]
     );
     assert_eq!(map["datatypes"]["test_crate::State"]["tagged"], false);
+    assert_eq!(map["datatypes"]["test_crate::State"]["kind"], "struct");
     // `next` is `exists|step: Step| next_step(pre, post, step)`, and
     // `next_step` matches on the step, one transition per arm.
     let steps = &ex.report["steps"];
@@ -3158,4 +3160,109 @@ fn tla_export_exports_named_expressions_in_the_models_names() {
 
 fn names_of(v: &serde_json::Value) -> Vec<String> {
     v.as_array().unwrap().iter().map(|x| x.as_str().unwrap().to_string()).collect()
+}
+
+/// Fields whose Rust name is not their record label, and datatypes whose
+/// encoding does not say whether they are structs or enums.
+const LAYOUTS: &str = r#"
+use vstd::prelude::*;
+verus! {
+pub enum One { Only { x: int } }
+pub enum Mark { Set }
+pub struct Pt(pub int, pub bool);
+pub struct S { pub tag: bool, pub vars: nat, pub one: One, pub mark: Mark, pub pt: Pt, pub o: Option<u8> }
+pub open spec fn init(s: S) -> bool {
+    s.tag == false && s.vars == 0 && s.one == (One::Only { x: 0 }) && s.mark == Mark::Set
+        && s.pt == Pt(0, true) && s.o == Option::<u8>::None
+}
+pub open spec fn next(pre: S, post: S) -> bool { post == pre }
+pub struct T(pub nat, pub bool);
+pub open spec fn t_init(t: T) -> bool { t.0 == 0 && t.1 }
+pub open spec fn t_next(pre: T, post: T) -> bool { post == pre }
+pub mod pos {
+    use super::*;
+    pub open spec fn init(t: T) -> bool { t_init(t) }
+    pub open spec fn next(pre: T, post: T) -> bool { t_next(pre, post) }
+}
+}
+"#;
+
+#[test]
+fn tla_export_type_map_names_rust_fields_and_datatype_kinds() {
+    let src = TempDir::new().expect("temp dir");
+    let entry = src.path().join("test.rs");
+    std::fs::write(&entry, format!("{}\n{}\n{}\n", FEATURE_PRELUDE, USE_PRELUDE, LAYOUTS)).unwrap();
+    let ex = export_with(&entry, "test_crate", &["--no-verify"]);
+    let map = &ex.report["type_map"];
+    let vars: Vec<(String, String, String)> = map["variables"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| {
+            let s = |k: &str| v[k].as_str().unwrap().to_string();
+            (s("variable"), s("field"), s("label"))
+        })
+        .collect();
+    let v = |a: &str, b: &str, c: &str| (a.to_string(), b.to_string(), c.to_string());
+    // A field `tag` is labelled `tag_`, a field `vars` held in `vars_v`: the
+    // field is always the Rust name.
+    assert_eq!(
+        vars,
+        [
+            v("tag_", "tag", "tag_"),
+            v("vars_v", "vars", "vars"),
+            v("one", "one", "one"),
+            v("mark", "mark", "mark"),
+            v("pt", "pt", "pt"),
+            v("o", "o", "o"),
+        ]
+    );
+    let dts = &map["datatypes"];
+    let kind = |p: &str| dts[p]["kind"].as_str().unwrap_or_else(|| panic!("{}", p)).to_string();
+    // An enum with one variant is encoded untagged, as a struct is; its kind
+    // says it is written `One::Only { x: 0 }`.
+    assert_eq!(dts["test_crate::One"]["tagged"], false);
+    assert_eq!(kind("test_crate::One"), "enum");
+    assert_eq!(dts["test_crate::One"]["variants"][0]["name"], "Only");
+    assert_eq!(dts["test_crate::Mark"]["tagged"], false);
+    assert_eq!(kind("test_crate::Mark"), "enum");
+    assert!(ex.tla.contains("(mark = [tag |-> \"unit\"])"), "{}", ex.tla);
+    assert_eq!(kind("test_crate::Pt"), "struct");
+    assert_eq!(dts["test_crate::Pt"]["variants"][0]["positional"], true);
+    assert_eq!(kind("test_crate::S"), "struct");
+    assert_eq!(kind("core::option::Option"), "enum");
+    assert_eq!(dts["core::option::Option"]["tagged"], true);
+    // A positional state's fields are `0`, `1`, labelled `v0`, `v1`.
+    let ex = export_with(&entry, "test_crate::pos", &["--no-verify"]);
+    let vars = &ex.report["type_map"]["variables"];
+    assert_eq!(
+        vars,
+        &serde_json::json!([
+            {"variable": "v0", "field": "0", "label": "v0", "typ": {"kind": "int", "rust": "nat"}},
+            {"variable": "v1", "field": "1", "label": "v1", "typ": {"kind": "bool"}},
+        ])
+    );
+}
+
+/// Run Verus with `options` on the expression model, expecting it to fail.
+fn verus_fails(options: &[&str]) -> String {
+    let src = TempDir::new().expect("temp dir");
+    let entry = src.path().join("test.rs");
+    std::fs::write(&entry, format!("{}\n{}\n{}\n", FEATURE_PRELUDE, USE_PRELUDE, EXPR_MODEL))
+        .unwrap();
+    let log = format!("--log-dir {}", src.path().join("log").display());
+    let mut options = options.to_vec();
+    options.push(&log);
+    let output = run_verus(&options, src.path(), &entry, true, true);
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    assert!(!output.status.success(), "{}", stderr);
+    stderr
+}
+
+#[test]
+fn tla_export_expr_needs_tla_export_and_a_value() {
+    let stderr = verus_fails(&["-V tla-export-expr=test_crate::exprs::cand", "--no-verify"]);
+    assert!(stderr.contains("it needs -V tla-export"), "{}", stderr);
+    let stderr = verus_fails(&["-V tla-export=test_crate", "-V tla-export-expr=", "--no-verify"]);
+    assert!(stderr.contains("-V tla-export-expr needs spec fn paths"), "{}", stderr);
 }

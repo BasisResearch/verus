@@ -211,9 +211,11 @@ counter against `Counter.tla`:
 ## Reading values back, and exporting expressions
 
 The report also carries what a tool needs to read TLC's answers back as
-Verus values. `type_map` lays out every datatype the state holds (field
-labels in declaration order, the `tag` value of each enum variant, which
-fields are positional), with each field's type as a tree over `seq`, `set`,
+Verus values. `type_map` gives each variable's state field (its Rust
+name and its record label) and lays out every datatype the state holds
+(whether it is a struct or an enum, field labels in declaration order, the
+`tag` value of each enum variant, which fields are positional), with each
+field's type as a tree over `seq`, `set`,
 `map`, `tuple`, `int`, `bool`, `char` and named datatypes, so that a TLC
 state `[x |-> 4, y |-> 0]` renders as `State { x: 4, y: 0 }` by table, not
 by guess. When `next` is `exists|step: T| body` over a datatype, `steps`

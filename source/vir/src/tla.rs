@@ -174,15 +174,27 @@ pub struct VariantLayout {
     pub fields: Vec<FieldLayout>,
 }
 
-/// How a datatype's values are records. A struct (one variant) is a record
-/// of its fields; an enum (`tagged`) a record whose `tag` field holds the
-/// variant's name beside that variant's fields. A variant with no fields is
-/// the record of its `tag` alone, and a struct with none `[tag |-> "unit"]`.
+/// Whether a datatype is a Rust struct or enum: how a value of it is
+/// written (`S { .. }` or `E::V { .. }`), which `tagged` does not say, since
+/// an enum with one variant is encoded untagged, as a struct is.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum DatatypeKind {
+    Struct,
+    Enum,
+}
+
+/// How a datatype's values are records. A datatype with one variant is a
+/// record of its fields; one with several (`tagged`) a record whose `tag`
+/// field holds the variant's name beside that variant's fields. A variant
+/// with no fields is the record of its `tag` alone, and a datatype with one
+/// variant and no fields `[tag |-> "unit"]`.
 #[derive(Debug, Clone, Serialize)]
 pub struct DatatypeLayout {
     pub path: String,
     /// Its last path segment, as a value of it is written.
     pub name: String,
+    pub kind: DatatypeKind,
     pub params: Vec<String>,
     pub tagged: bool,
     /// An `external_body` datatype: the export never builds or reads one.
@@ -190,12 +202,14 @@ pub struct DatatypeLayout {
     pub variants: Vec<VariantLayout>,
 }
 
-/// A state variable: the TLA+ variable, the state field it holds, and the
-/// field's type.
+/// A state variable: the TLA+ variable, the state field it holds (its Rust
+/// name, `0` for a positional field) and that field's record label (`v0`,
+/// or `tag_` for a field named `tag`), and the field's type.
 #[derive(Debug, Clone, Serialize)]
 pub struct VariableLayout {
     pub variable: String,
     pub field: String,
+    pub label: String,
     pub typ: TypeRef,
 }
 
@@ -3415,6 +3429,7 @@ impl Exporter {
                 DatatypeLayout {
                     path,
                     name: last_segment(&p),
+                    kind: datatype_kind(d),
                     params: d.x.typ_params.iter().map(|(n, _)| n.to_string()).collect(),
                     tagged: d.x.variants.len() > 1,
                     opaque: matches!(d.x.transparency, DatatypeTransparency::Never),
@@ -3506,6 +3521,17 @@ impl Exporter {
             out.push(StepArm { variant, function, operator, args });
         }
         Some(out)
+    }
+}
+
+/// A struct's one variant carries the struct's own name (as does an
+/// `external_body` type's); an enum's variants carry theirs. An enum whose
+/// one variant is named as the enum is taken for a struct.
+fn datatype_kind(d: &Datatype) -> DatatypeKind {
+    let Dt::Path(p) = &d.x.name else { return DatatypeKind::Struct };
+    match &d.x.variants[..] {
+        [v] if Some(&v.name) == p.segments.last() => DatatypeKind::Struct,
+        _ => DatatypeKind::Enum,
     }
 }
 
@@ -3637,9 +3663,18 @@ impl Exporter {
 
 fn encodings() -> BTreeMap<String, String> {
     [
-        ("struct", "a record of its fields, labelled by name (a positional field `0` as `v0`)"),
-        ("enum", "a record whose `tag` field is the variant's name, beside that variant's fields"),
-        ("unit", "a struct without fields is `[tag |-> \"unit\"]`"),
+        (
+            "struct",
+            "a record of its fields, labelled by name (a positional field `0` as `v0`, a field `tag` as `tag_`)",
+        ),
+        (
+            "enum",
+            "with several variants, a record whose `tag` field is the variant's name, beside that variant's fields; with one, a record of its fields as a struct (`kind` tells them apart)",
+        ),
+        (
+            "unit",
+            "a struct without fields, or an enum's one variant without fields, is `[tag |-> \"unit\"]`",
+        ),
         ("seq", "a 1-based sequence: Verus index i is TLA+ index i + 1"),
         ("set", "a set"),
         ("map", "a function whose DOMAIN is the map's domain"),
@@ -4527,11 +4562,13 @@ pub fn export_module(krate: &Krate, arg: &str, exprs: &[String]) -> Result<Expor
         exprs.iter().map(|name| ex.export_expr(name, &model, &mut pending)).collect();
     let variables = state_vars
         .iter()
+        .zip(state_dt.x.variants[0].fields.iter())
         .zip(state_fields.iter())
         .zip(ex.state_types.clone().iter())
-        .map(|((v, f), t)| VariableLayout {
+        .map(|(((v, f), label), t)| VariableLayout {
             variable: v.clone(),
-            field: f.clone(),
+            field: f.name.to_string(),
+            label: label.clone(),
             typ: ex.type_ref(t, &mut pending),
         })
         .collect();
