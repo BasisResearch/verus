@@ -246,9 +246,9 @@ pub struct StepArg {
 /// (one state parameter, or two for a pre/post pair), exported after the
 /// model with the model's own names, so its operator can be evaluated
 /// against the model's module. Its `definitions` are every operator the
-/// model's `.tla` does not already define that it needs (with those of the
-/// expressions before it), to be put in a `LET` or a module extending the
-/// model's.
+/// model's `.tla` does not already define that its operator reaches (an
+/// earlier expression's only when it calls them), to be put in a `LET` or
+/// a module extending the model's.
 #[derive(Debug, Clone, Serialize)]
 pub struct ExprExport {
     pub function: String,
@@ -260,7 +260,8 @@ pub struct ExprExport {
     pub definitions: Vec<String>,
     /// `RECURSIVE` declarations the definitions need (`f(_, _)`).
     pub recursive: Vec<String>,
-    /// Holes and refusals the expression's own operators reach. A hole
+    /// Holes and refusals in the operators outside the model's that the
+    /// expression's operator reaches. A hole
     /// whose constant the model's module declares is bounded as the model's
     /// quantifiers are; one in `undeclared` cannot be evaluated against the
     /// model, and a refusal is an `Assert(FALSE, ...)`.
@@ -467,6 +468,15 @@ struct Exporter {
     /// Every one-binder `exists` printed, by the address of its expression:
     /// the binder's name, its domain and the body, for [`Steps`].
     exists_printed: HashMap<usize, (String, String, String)>,
+    /// The operator being printed, and the operator whose body produced
+    /// each definition, hole and refusal (none outside an operator): an
+    /// exported expression carries only what its own operator reaches.
+    current_key: Option<OpKey>,
+    def_owners: Vec<Option<OpKey>>,
+    hole_owners: Vec<Option<OpKey>>,
+    refusal_owners: Vec<Option<OpKey>>,
+    /// The operators that print a Euclidean `/` or `%`.
+    euclid_users: HashSet<OpKey>,
 }
 
 fn ident_name(v: &VarIdent) -> String {
@@ -821,6 +831,7 @@ fn typ_has_specfn(
 impl Exporter {
     fn refuse(&mut self, what: impl Into<String>, span: &crate::messages::Span) -> String {
         let what = what.into();
+        self.refusal_owners.push(self.current_key.clone());
         self.refusals.push(Refusal {
             what: what.clone(),
             location: span_string(span),
@@ -1490,6 +1501,9 @@ impl Exporter {
                             return format!("({sa} {sym} {sb})");
                         }
                         self.uses_euclid = true;
+                        if let Some(k) = &self.current_key {
+                            self.euclid_users.insert(k.clone());
+                        }
                         let op = if div { EUCLID_DIV } else { EUCLID_MOD };
                         return format!("{op}({sa}, {sb})");
                     }
@@ -2353,6 +2367,7 @@ impl Exporter {
                     None => {
                         let constant = format!("Dom_{}", self.constant_typ_name(&b.a));
                         self.constants.insert(constant.clone());
+                        self.hole_owners.push(self.current_key.clone());
                         self.holes.push(Hole {
                             variable: name.clone(),
                             typ: typ_name(&b.a),
@@ -2579,6 +2594,7 @@ impl Exporter {
                             None => (format!("Dom_{instance}_{fname}"), fname.clone()),
                         };
                         self.constants.insert(constant.clone());
+                        self.hole_owners.push(self.current_key.clone());
                         self.holes.push(Hole {
                             variable,
                             typ: typ_name(ftyp),
@@ -2615,6 +2631,7 @@ impl Exporter {
     }
 
     fn drop_hole_range(&mut self, range: std::ops::Range<usize>) {
+        self.hole_owners.drain(range.clone());
         let dropped: Vec<Hole> = self.holes.drain(range).collect();
         for h in dropped {
             if !self.holes.iter().any(|k| k.constant == h.constant) {
@@ -3021,6 +3038,7 @@ impl Exporter {
         let Some(f) = self.functions.get(fun).cloned() else { return name };
         self.emitting.insert(key.clone());
         let previous = std::mem::replace(&mut self.current, fun_as_friendly_rust_name(fun));
+        let previous_key = std::mem::replace(&mut self.current_key, Some(key.clone()));
         let previous_bound = std::mem::take(&mut self.bound);
         let previous_tainted = std::mem::replace(&mut self.current_tainted, false);
         let previous_depth = std::mem::replace(&mut self.branch_depth, 0);
@@ -3088,6 +3106,7 @@ impl Exporter {
         self.arity.insert(name.clone(), params.len());
         def.push_str(&format!("{head} ==\n    {body}\n"));
         self.defs.push(def);
+        self.def_owners.push(Some(key.clone()));
         self.record_body(key);
         self.current_calls = previous_calls;
         self.current_assigned = previous_assigned;
@@ -3100,6 +3119,7 @@ impl Exporter {
             self.tainted.insert(key.clone());
         }
         self.current = previous;
+        self.current_key = previous_key;
         self.bound = previous_bound;
         self.current_tainted = previous_tainted || self.tainted.contains(key);
         self.emitting.remove(key);
@@ -3497,16 +3517,37 @@ fn euclid_defs() -> String {
     )
 }
 
+/// How far the model's own export went, before the named expressions: its
+/// definitions, holes and refusals are the first `defs`, `holes` and
+/// `refusals` of the exporter's.
+struct ModelExtent {
+    defs: usize,
+    holes: usize,
+    refusals: usize,
+    constants: BTreeSet<String>,
+    euclid: bool,
+    recursive: BTreeMap<String, usize>,
+}
+
 impl Exporter {
+    /// Every operator `key` calls, directly or through others, with itself.
+    fn reached_from(&self, key: &OpKey) -> HashSet<OpKey> {
+        let mut seen: HashSet<OpKey> = HashSet::new();
+        let mut stack = vec![key.clone()];
+        while let Some(k) = stack.pop() {
+            if seen.insert(k.clone()) {
+                stack.extend(self.calls.get(&k).into_iter().flatten().map(|c| c.callee.clone()));
+            }
+        }
+        seen
+    }
+
     /// Export the spec fn `name` (`-V tla-export-expr`) after the model:
     /// its operator, and the definitions the model's module lacks.
     fn export_expr(
         &mut self,
         name: &str,
-        model_defs: usize,
-        model_constants: &BTreeSet<String>,
-        model_euclid: bool,
-        model_recursive: &BTreeMap<String, usize>,
+        model: &ModelExtent,
         pending: &mut Vec<Path>,
     ) -> ExprExport {
         let mut out = ExprExport {
@@ -3545,35 +3586,49 @@ impl Exporter {
             ));
             return out;
         }
-        let (holes, refusals) = (self.holes.len(), self.refusals.len());
         self.conj_level = false;
         let key = (fun.clone(), Variant::Plain);
         out.operator = Some(self.ensure_function(&key));
         out.states = states;
         out.ret = Some(self.type_ref(&f.x.ret.x.typ, pending));
-        out.holes = self.holes[holes..].to_vec();
-        out.undeclared = self
-            .constants
-            .iter()
-            .filter(|c| !model_constants.contains(*c))
-            .filter(|c| out.holes.iter().any(|h| &h.constant == *c))
-            .cloned()
-            .collect();
-        out.refusals = self.refusals[refusals..].to_vec();
         out.tainted = self.tainted.contains(&key);
-        if self.uses_euclid && !model_euclid {
+        // What the expression's own operator reaches outside the model's:
+        // an earlier expression's operators are carried only when this one
+        // calls them, so its holes and refusals never leak into this entry.
+        let reached = self.reached_from(&key);
+        let own = |owner: &Option<OpKey>| owner.as_ref().is_some_and(|k| reached.contains(k));
+        out.holes = (model.holes..self.holes.len())
+            .filter(|&i| own(&self.hole_owners[i]))
+            .map(|i| self.holes[i].clone())
+            .collect();
+        out.undeclared = out
+            .holes
+            .iter()
+            .map(|h| h.constant.clone())
+            .filter(|c| !model.constants.contains(c) && self.constants.contains(c))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        out.refusals = (model.refusals..self.refusals.len())
+            .filter(|&i| own(&self.refusal_owners[i]))
+            .map(|i| self.refusals[i].clone())
+            .collect();
+        if !model.euclid && reached.iter().any(|k| self.euclid_users.contains(k)) {
             out.definitions.push(euclid_defs());
         }
-        // Every operator after the model's, without its comment: those of
-        // an earlier expression may be this one's helpers.
-        for d in &self.defs[model_defs..] {
-            let text: Vec<&str> = d.lines().filter(|l| !l.starts_with("\\*")).collect();
-            out.definitions.push(text.join("\n") + "\n");
+        // In dependency order, without their comments.
+        for i in model.defs..self.defs.len() {
+            if own(&self.def_owners[i]) {
+                let text: Vec<&str> =
+                    self.defs[i].lines().filter(|l| !l.starts_with("\\*")).collect();
+                out.definitions.push(text.join("\n") + "\n");
+            }
         }
+        let names: HashSet<&String> = reached.iter().filter_map(|k| self.op_names.get(k)).collect();
         out.recursive = self
             .recursive()
             .into_iter()
-            .filter(|(r, _)| !model_recursive.contains_key(r))
+            .filter(|(r, _)| !model.recursive.contains_key(r) && names.contains(r))
             .map(|(r, a)| if a == 0 { r } else { format!("{r}({})", vec!["_"; a].join(", ")) })
             .collect();
         out
@@ -4255,6 +4310,11 @@ pub fn export_module(krate: &Krate, arg: &str, exprs: &[String]) -> Result<Expor
         datatype_names_taken: HashSet::new(),
         current: String::new(),
         exists_printed: HashMap::new(),
+        current_key: None,
+        def_owners: Vec::new(),
+        hole_owners: Vec::new(),
+        refusal_owners: Vec::new(),
+        euclid_users: HashSet::new(),
     };
     for v in &state_vars {
         ex.used_names.insert(v.clone());
@@ -4311,6 +4371,7 @@ pub fn export_module(krate: &Krate, arg: &str, exprs: &[String]) -> Result<Expor
                 fun_as_friendly_rust_name(r),
                 span_string(&f.span)
             ));
+            ex.def_owners.push(Some(key.clone()));
             ex.record_body(&key);
             ex.emitted.insert(key.clone());
             if ex.current_tainted {
@@ -4454,17 +4515,16 @@ pub fn export_module(krate: &Krate, arg: &str, exprs: &[String]) -> Result<Expor
     let model_recursive = ex.recursive();
     let mut pending: Vec<Path> = vec![triple.state.clone()];
     let steps = if verus_tla { None } else { ex.steps(&triple.next, &mut pending) };
-    let mut expr_exports = Vec::new();
-    for name in exprs {
-        expr_exports.push(ex.export_expr(
-            name,
-            model_defs,
-            &model_constants,
-            model_euclid,
-            &model_recursive,
-            &mut pending,
-        ));
-    }
+    let model = ModelExtent {
+        defs: model_defs,
+        holes: model_holes,
+        refusals: model_refusals,
+        constants: model_constants.clone(),
+        euclid: model_euclid,
+        recursive: model_recursive.clone(),
+    };
+    let expr_exports: Vec<ExprExport> =
+        exprs.iter().map(|name| ex.export_expr(name, &model, &mut pending)).collect();
     let variables = state_vars
         .iter()
         .zip(state_fields.iter())

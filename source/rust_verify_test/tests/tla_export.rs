@@ -2975,6 +2975,9 @@ pub mod exprs {
     pub open spec fn picked(s: S) -> int { choose|x: int| x == s.n }
     pub open spec fn grew(pre: S, post: S) -> bool { post.n > pre.n && small(pre) }
     pub open spec fn first(s: S) -> Host { s.hosts[0] }
+    pub open spec fn via(s: S) -> bool { unbounded(s) && s.n < 7 }
+    pub open spec fn modded(s: S) -> bool { (s.n as int) % ((s.n as int) - 5) >= 0 }
+    pub open spec fn later(s: S) -> bool { helper(s, 0) && s.n < 9 }
 }
 }
 "#;
@@ -2992,6 +2995,9 @@ fn tla_export_exports_named_expressions_in_the_models_names() {
         "test_crate::exprs::picked",
         "test_crate::exprs::grew",
         "test_crate::exprs::first",
+        "test_crate::exprs::via",
+        "test_crate::exprs::modded",
+        "test_crate::exprs::later",
         "test_crate::exprs::missing",
     ];
     let with = export_with(
@@ -3005,7 +3011,21 @@ fn tla_export_exports_named_expressions_in_the_models_names() {
     assert_eq!(plain.report["operators"], with.report["operators"]);
     let exprs = with.report["exprs"].as_array().unwrap();
     assert_eq!(exprs.len(), names.len());
-    let cand = &exprs[0];
+    let entry = |f: &str| {
+        exprs
+            .iter()
+            .find(|e| e["function"] == format!("test_crate::exprs::{f}"))
+            .unwrap_or_else(|| panic!("no entry for {}", f))
+    };
+    let defs_of = |e: &serde_json::Value| -> Vec<String> {
+        e["definitions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| d.as_str().unwrap().to_string())
+            .collect()
+    };
+    let cand = entry("cand");
     assert_eq!(cand["operator"], "cand");
     assert_eq!(cand["states"], 1);
     assert_eq!(cand["ret"], serde_json::json!({"kind": "bool"}));
@@ -3013,32 +3033,62 @@ fn tla_export_exports_named_expressions_in_the_models_names() {
     assert_eq!(cand["tainted"], false);
     // `helper` is not in the model's module, so it comes with the expression,
     // before it; `small` is, so it does not.
-    let defs: Vec<String> = cand["definitions"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|d| d.as_str().unwrap().to_string())
-        .collect();
+    let defs = defs_of(cand);
     assert_eq!(defs.len(), 2, "{:?}", defs);
     assert!(defs[0].starts_with("helper(i) =="), "{:?}", defs);
     assert!(defs[1].starts_with("cand =="), "{:?}", defs);
     assert!(!defs.iter().any(|d| d.contains("\\*")), "{:?}", defs);
     // An unbounded quantifier is a hole whose constant the model does not
     // declare; a `choose` is refused.
-    let unbounded = &exprs[1];
+    let unbounded = entry("unbounded");
     assert_eq!(names_of(&unbounded["undeclared"]), ["Dom_int"]);
     assert_eq!(unbounded["holes"].as_array().unwrap().len(), 1);
-    let picked = &exprs[2];
+    let picked = entry("picked");
     assert_eq!(picked["tainted"], true);
     assert_eq!(picked["refusals"].as_array().unwrap().len(), 1);
     assert_eq!(picked["ret"], serde_json::json!({"kind": "int", "rust": "int"}));
     // A pair of states reads the second primed.
-    let grew = &exprs[3];
+    let grew = entry("grew");
     assert_eq!(grew["states"], 2);
-    let grew_def = grew["definitions"].as_array().unwrap().last().unwrap().as_str().unwrap();
-    assert!(grew_def.contains("(n' > n)"), "{}", grew_def);
+    let grew_defs = defs_of(grew);
+    assert_eq!(grew_defs.len(), 1, "{:?}", grew_defs);
+    assert!(grew_defs[0].contains("(n' > n)"), "{:?}", grew_defs);
+    // An entry carries only the operators its own operator reaches: never
+    // an earlier entry's hole or refusal it does not call.
+    for f in ["grew", "first", "modded", "later"] {
+        let e = entry(f);
+        let defs = defs_of(e);
+        assert!(
+            !defs.iter().any(|d| d.contains("Dom_int") || d.contains("Assert(FALSE")),
+            "{}: {:?}",
+            f,
+            defs
+        );
+        assert_eq!(names_of(&e["undeclared"]), Vec::<String>::new(), "{f}");
+        assert_eq!(e["holes"], serde_json::json!([]), "{f}");
+        assert_eq!(e["refusals"], serde_json::json!([]), "{f}");
+    }
+    // One calling an earlier entry's operator carries it, and its hole.
+    let via = entry("via");
+    let via_defs = defs_of(via);
+    assert_eq!(via_defs.len(), 2, "{:?}", via_defs);
+    assert!(via_defs[0].starts_with("unbounded =="), "{:?}", via_defs);
+    assert_eq!(names_of(&via["undeclared"]), ["Dom_int"]);
+    assert_eq!(via["holes"].as_array().unwrap().len(), 1);
+    // The Euclidean operators come with the entry that divides, only.
+    let modded_defs = defs_of(entry("modded"));
+    assert_eq!(modded_defs.len(), 2, "{:?}", modded_defs);
+    assert!(modded_defs[0].starts_with("EuclidMod("), "{:?}", modded_defs);
+    assert!(modded_defs[1].contains("EuclidMod("), "{:?}", modded_defs);
+    for f in ["cand", "grew", "via", "later"] {
+        assert!(!defs_of(entry(f)).iter().any(|d| d.contains("Euclid")), "{}", f);
+    }
+    // `helper` came with `cand`, and comes again with `later`, which calls it.
+    let later_defs = defs_of(entry("later"));
+    assert_eq!(later_defs.len(), 2, "{:?}", later_defs);
+    assert!(later_defs[0].starts_with("helper(i) =="), "{:?}", later_defs);
     // A datatype result is laid out in the type map, with what it holds.
-    let first = &exprs[4];
+    let first = entry("first");
     assert_eq!(
         first["ret"],
         serde_json::json!({"kind": "datatype", "path": "test_crate::Host", "args": []})
@@ -3063,22 +3113,47 @@ fn tla_export_exports_named_expressions_in_the_models_names() {
     );
     assert_eq!(dts["test_crate::Role"]["tagged"], true);
     assert_eq!(dts["test_crate::Role"]["variants"][1]["fields"][0]["label"], "job");
-    assert!(exprs[5]["error"].as_str().unwrap().contains("no function"), "{}", exprs[5]);
+    assert!(entry("missing")["error"].as_str().unwrap().contains("no function"));
     let Some(jar) = tla_tools() else { return };
-    // The definitions evaluate against the model's module: a module
-    // extending it with the candidate in a LET parses.
+    // Every entry that can be evaluated against the model (no error, no
+    // undeclared constant, no refusal) parses in a module extending it,
+    // with its definitions in a LET.
     let module = with.module.clone();
-    let probe = with.dir.path().join("log").join("Probe.tla");
-    std::fs::write(
-        &probe,
-        format!(
-            "---- MODULE Probe ----\nEXTENDS {module}\nC == LET\n{}IN {}\n====\n",
-            defs.join(""),
-            cand["operator"].as_str().unwrap()
-        ),
-    )
-    .unwrap();
-    sany(&jar, &probe);
+    let mut probed = Vec::new();
+    for (i, e) in exprs.iter().enumerate() {
+        let blocked = !e["error"].is_null()
+            || !e["undeclared"].as_array().unwrap().is_empty()
+            || e["tainted"] == true;
+        if blocked {
+            continue;
+        }
+        let recursive: Vec<&str> =
+            e["recursive"].as_array().unwrap().iter().map(|r| r.as_str().unwrap()).collect();
+        let recursive = if recursive.is_empty() {
+            String::new()
+        } else {
+            format!("RECURSIVE {}\n", recursive.join(", "))
+        };
+        let name = format!("Probe{i}");
+        let probe = with.dir.path().join("log").join(format!("{name}.tla"));
+        std::fs::write(
+            &probe,
+            format!(
+                "---- MODULE {name} ----\nEXTENDS {module}\nC == LET\n{recursive}{}IN {}\n====\n",
+                defs_of(e).join(""),
+                e["operator"].as_str().unwrap()
+            ),
+        )
+        .unwrap();
+        sany(&jar, &probe);
+        probed.push(e["function"].as_str().unwrap().to_string());
+    }
+    assert_eq!(
+        probed,
+        ["cand", "grew", "first", "modded", "later"]
+            .map(|f| format!("test_crate::exprs::{f}"))
+            .to_vec()
+    );
 }
 
 fn names_of(v: &serde_json::Value) -> Vec<String> {
