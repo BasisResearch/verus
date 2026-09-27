@@ -223,11 +223,13 @@ their Rust names (a name the step does not declare stops TLC), and the
 observed state after the step by field. Values are in the export's encoding:
 a struct or enum value is an object (an enum's with its `"tag"`), an `Option`
 `{"tag": "Some", "v0": 3}`, a `Seq` or tuple an array, a `Set` an array of
-its elements, a `Map` an array of `[key, value]` pairs. An object observed in
+its elements, a `Map` an array of `[key, value]` pairs, a struct without
+fields `{}` (the export's `[tag |-> "unit"]`, so `{"tag": "unit"}` too). An object observed in
 the state is partial: only the fields it names are compared, so a ghost field
 is left out of the log and stays free in the model (an enum's `"tag"` too: its
 fields are then compared under whichever variant the model has, and a field
-that variant lacks does not match); a `Seq` can be observed
+that variant lacks does not match, while a key naming no field of the type
+stops TLC, as one naming no state field does); a `Seq` can be observed
 partially as an object keyed by the Verus index (`{"1": {...}}`, and `{}`
 observes nothing, while `[]` is the empty `Seq`). A record
 inside a `Set` element, a `Map` key or a parameter is decoded whole, so it
@@ -255,6 +257,15 @@ observed state is not an initial state of the model: the log diverges
 before its first step. At a diverging step, `TraceEnabled` is the set of the model's enabled steps
 with their parameters, and `TraceDiagnosis` says whether the logged step is
 enabled at all and which observed fields no successor by it matches.
+
+**The `Dom_` constants must cover every value the log carries.** Since
+`TraceNext` conjoins `Next`, and `Next` takes a step's arguments only from
+the export's holes (a VerusSync step's `Dom_Step_<t>_v<i>`, a `Dom_<Type>`
+bound), a logged parameter or observed value outside the hole the `.cfg`
+gives is a divergence, not a malformed log: TLC stops there, and
+`TraceDiagnosis` only says the step is not enabled. Give each hole in the
+trace `.cfg` at least the values the log carries (the generated header and
+`.cfg` say so too).
 `counter_trace_ok.ndjson` and `counter_trace_bad.ndjson` name the export
 `test_crate`, as the tests export `counter.rs`. The first is followed to its
 end (depth 6);

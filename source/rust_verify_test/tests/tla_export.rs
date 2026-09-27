@@ -3271,6 +3271,16 @@ pub open spec fn next(pre: State, post: State) -> bool { exists|a: u8| t_put(pre
     std::fs::write(&log, format!("{header}\n{}\n", line.replace(r#", "b": 7}]"#, "}]"))).unwrap();
     let out = stops(&jar, &spec, &cfg, &log, "");
     assert!(out.contains("\"b\""), "{}", out);
+    // A partial record in the state naming a field its type lacks (a
+    // misspelling) stops TLC, as a misspelled state field does, rather than
+    // diverging.
+    std::fs::write(
+        &log,
+        format!("{header}\n{}\n", line.replace(r#""last": {"a""#, r#""last": {"aa""#)),
+    )
+    .unwrap();
+    let out = stops(&jar, &spec, &cfg, &log, "");
+    assert!(out.contains("trace: Rec has no field aa"), "{}", out);
 }
 
 #[test]
@@ -3676,6 +3686,14 @@ pub open spec fn next(pre: State, post: State) -> bool {
         let (depth, out) = follow(&jar, &spec, &cfg, &log, "");
         assert_eq!(depth, 1, "{to}\n{out}");
     }
+    // A label no variant declares is a malformed log, not a divergence.
+    std::fs::write(
+        &log,
+        format!("{header}\n{}\n", lines[1].replace(r#"{"v0": 2}"#, r#"{"v2": 2}"#)),
+    )
+    .unwrap();
+    let out = stops(&jar, &spec, &cfg, &log, "");
+    assert!(out.contains("trace: Mode has no field v2"), "{}", out);
     // A parameter decoded whole without its tag stops TLC with the reason.
     let bad = r#"{"step": "t_set", "params": {"m": {"v0": 1}}, "state": {}}"#;
     std::fs::write(&log, format!("{header}\n{bad}\n")).unwrap();
@@ -3685,4 +3703,98 @@ pub open spec fn next(pre: State, post: State) -> bool {
         "{}",
         out
     );
+}
+
+#[test]
+fn tla_export_trace_spec_binds_no_name_of_the_export() {
+    // Every state field is a VARIABLE the trace spec sees through EXTENDS,
+    // so the names it binds (a JSON value, a key, an index, a log line, ...)
+    // must be fresh against them: SANY rejects a rebound name.
+    let ex = export_code(
+        r#"
+use vstd::prelude::*;
+verus! {
+pub struct State { pub v: nat, pub k: nat, pub e: bool, pub j: Seq<u8>, pub p: Map<u8, bool>, pub r: Option<u8> }
+pub open spec fn init(s: State) -> bool {
+    &&& s.v == 0 &&& s.k == 0 &&& s.e == false
+    &&& s.j == Seq::<u8>::empty() &&& s.p == Map::<u8, bool>::empty() &&& s.r == None::<u8>
+}
+pub open spec fn t_go(pre: State, post: State, a: bool) -> bool {
+    &&& pre.v < 3
+    &&& post.v == pre.v + 1
+    &&& post.k == pre.k
+    &&& post.e == a
+    &&& post.j == pre.j.push(1)
+    &&& post.p == pre.p.insert(1, a)
+    &&& post.r == Some(1u8)
+}
+pub open spec fn next(pre: State, post: State) -> bool { exists|a: bool| t_go(pre, post, a) }
+}
+"#,
+        "test_crate",
+    );
+    let (spec, tla, cfg) = trace_spec(&ex);
+    assert!(tla.contains("TraceParam(e_2, k_2, Dec(_), D) ==\n"), "{}", tla);
+    assert!(tla.contains("TraceIsArray(j_2) =="), "{}", tla);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &spec);
+    let log = ex.dir.path().join("t.ndjson");
+    let header = r#"{"module": "State_tla", "export": "test_crate", "state": {"v": 0, "j": []}}"#;
+    let lines = [
+        header,
+        r#"{"step": "t_go", "params": {"a": true}, "state": {"v": 1, "k": 0, "e": true, "j": [1], "p": [[1, true]], "r": {"tag": "Some", "v0": 1}}}"#,
+        r#"{"step": "t_go", "state": {"v": 2, "e": false, "j": {"1": 1}, "p": [[1, false]]}}"#,
+    ];
+    std::fs::write(&log, lines.join("\n") + "\n").unwrap();
+    let (depth, out) = follow(&jar, &spec, &cfg, &log, "");
+    assert_eq!(depth, 3, "{}", out);
+    // A wrong value still diverges there.
+    std::fs::write(&log, format!("{header}\n{}\n", lines[1].replace(r#""v": 1"#, r#""v": 2"#)))
+        .unwrap();
+    let (depth, out) = follow(&jar, &spec, &cfg, &log, "");
+    assert_eq!(depth, 1, "{}", out);
+}
+
+#[test]
+fn tla_export_trace_spec_decodes_a_unit_struct() {
+    // A struct without fields is `[tag |-> "unit"]` in the export: the trace
+    // spec observes it from `{}` and decodes a parameter of it whole.
+    let ex = export_code(
+        r#"
+use vstd::prelude::*;
+verus! {
+pub struct Tick {}
+pub struct State { pub n: nat, pub t: Tick }
+pub open spec fn init(s: State) -> bool { s.n == 0 && s.t == Tick {} }
+pub open spec fn t_tick(pre: State, post: State, t: Tick) -> bool {
+    &&& pre.n < 2
+    &&& post.n == pre.n + 1
+    &&& post.t == t
+}
+pub open spec fn next(pre: State, post: State) -> bool { exists|t: Tick| t_tick(pre, post, t) }
+}
+"#,
+        "test_crate",
+    );
+    let (spec, _, cfg) = trace_spec(&ex);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &spec);
+    let log = ex.dir.path().join("t.ndjson");
+    let header = r#"{"module": "State_tla", "export": "test_crate", "state": {"t": {}}}"#;
+    let lines = [
+        header,
+        r#"{"step": "t_tick", "params": {"t": {}}, "state": {"n": 1, "t": {}}}"#,
+        r#"{"step": "t_tick", "params": {"t": {"tag": "unit"}}, "state": {"t": {"tag": "unit"}}}"#,
+    ];
+    std::fs::write(&log, lines.join("\n") + "\n").unwrap();
+    let (depth, out) = follow(&jar, &spec, &cfg, &log, "");
+    assert_eq!(depth, 3, "{}", out);
+    // It has no field to observe.
+    std::fs::write(
+        &log,
+        format!("{header}\n{}\n", lines[1].replace(r#""t": {}}}"#, r#""t": {"x": 1}}}"#)),
+    )
+    .unwrap();
+    let out = stops(&jar, &spec, &cfg, &log, "");
+    assert!(out.contains("trace: Tick has no field x"), "{}", out);
 }
