@@ -4195,11 +4195,16 @@ pub fn export_module(krate: &Krate, arg: &str) -> Result<Export, String> {
 #[derive(Debug, Clone, Serialize)]
 pub struct TraceStep {
     /// The name a log line gives in `"step"`: the spec fn's last segment
-    /// (`t_inc`); its full Rust path is accepted too.
+    /// (`t_inc`), its full Rust path being accepted too; or, when another
+    /// step has the same last segment, the full path, the only name then
+    /// accepted.
     pub step: String,
     pub function: String,
     /// The operator it is printed as.
     pub operator: String,
+    /// Whether another loggable step has the same last segment, so the log
+    /// must name this one by its full path.
+    pub short_name_shared: bool,
     pub params: Vec<TraceParam>,
 }
 
@@ -4208,9 +4213,11 @@ pub struct TraceParam {
     /// The key under the log line's `"params"`: the Rust parameter's name.
     pub name: String,
     pub typ: String,
-    /// The domain a parameter the log leaves out is taken from, or `None`
-    /// when its type has no finite one (then it must be logged, and the
-    /// model's enabled steps do not enumerate it).
+    /// The domain a parameter the log leaves out is taken from: the hole
+    /// constant bounding it in Next (a VerusSync step's `Dom_Step_<t>_v<i>`),
+    /// its type's finite domain, or the export's `Dom_<Type>` hole; `None`
+    /// when there is none (then it must be logged, and the model's enabled
+    /// steps do not enumerate it).
     pub domain: Option<String>,
 }
 
@@ -4382,10 +4389,20 @@ impl Exporter {
         (dec, obs)
     }
 
-    /// The finite domain of a trace parameter of type `typ`, read off the
-    /// type alone as a quantifier's would be, or a hole constant the export
-    /// already declares for it; `None` otherwise (no new hole is made).
-    fn trace_domain(&mut self, typ: &Typ, span: &crate::messages::Span) -> Option<String> {
+    /// The finite domain of a trace parameter of type `typ`: `hole`, the
+    /// constant bounding it where Next quantifies over it, when there is
+    /// one; else read off the type alone as a quantifier's would be, or a
+    /// `Dom_<Type>` constant the export already declares for it; `None`
+    /// otherwise (no new hole is made).
+    fn trace_domain(
+        &mut self,
+        typ: &Typ,
+        span: &crate::messages::Span,
+        hole: Option<String>,
+    ) -> Option<String> {
+        if hole.is_some() {
+            return hole;
+        }
         let first = self.holes.len();
         let constants = self.constants.clone();
         let domain = self.quiet(|x| x.bound_from_type(typ, span, &mut Vec::new()));
@@ -4436,6 +4453,7 @@ impl Exporter {
             "TraceEnabled",
             "TraceDiagnosis",
             "TraceStepAt",
+            "TraceParamsDeclared",
         ]
         .iter()
         .map(|n| self.trace_name(n))
@@ -4459,7 +4477,8 @@ impl Exporter {
             enabled,
             diagnosis,
             step_at,
-        ] = <[String; 18]>::try_from(names).expect("eighteen names");
+            params_declared,
+        ] = <[String; 19]>::try_from(names).expect("nineteen names");
         let mut memo = HashMap::new();
         let mut defs: Vec<String> = Vec::new();
         // The observed state: one arm per field.
@@ -4489,17 +4508,33 @@ impl Exporter {
                 continue;
             }
             let Some(f) = self.functions.get(&key.0).cloned() else { continue };
-            let roles = self.param_roles(&f);
-            let mut params = Vec::new();
-            for (p, role) in f.x.params.iter().zip(roles.iter()) {
-                if role.is_some() {
-                    continue;
-                }
-                let domain = self.trace_domain(&p.x.typ, &f.span);
-                params.push((ident_name(&p.x.name), p.x.typ.clone(), domain));
-            }
             let friendly = fun_as_friendly_rust_name(&key.0);
             let short = friendly.rsplit("::").next().unwrap_or(&friendly).to_string();
+            let parent = friendly.rsplit_once("::").map_or("", |(p, _)| p);
+            let roles = self.param_roles(&f);
+            let mut params = Vec::new();
+            for (i, p) in
+                f.x.params
+                    .iter()
+                    .zip(roles.iter())
+                    .filter(|(_, r)| r.is_none())
+                    .map(|(p, _)| p)
+                    .enumerate()
+            {
+                // A VerusSync step's parameters are the fields of its `Step`
+                // variant, which Next (in the same impl) bounds: a field of
+                // no finite domain by the hole `Dom_Step_<t>_v<i>`.
+                let hole = self
+                    .holes
+                    .iter()
+                    .find(|h| {
+                        h.variable == format!("{short}.v{i}")
+                            && h.in_function.starts_with(&format!("{parent}::"))
+                    })
+                    .map(|h| h.constant.clone());
+                let domain = self.trace_domain(&p.x.typ, &f.span, hole);
+                params.push((ident_name(&p.x.name), p.x.typ.clone(), domain));
+            }
             let mut ps = Vec::new();
             for (name, typ, domain) in params {
                 self.trace_codec(&typ, &mut memo, &mut defs);
@@ -4509,8 +4544,25 @@ impl Exporter {
                 step: short,
                 function: friendly,
                 operator: t.operator.clone(),
+                short_name_shared: false,
                 params: ps,
             });
+        }
+        // A last segment two steps share names neither: those steps are
+        // logged by their full paths, and the short name stops TLC.
+        let mut shared: Vec<(String, Vec<String>)> = Vec::new();
+        for s in &steps {
+            let same: Vec<String> =
+                steps.iter().filter(|o| o.step == s.step).map(|o| o.function.clone()).collect();
+            if same.len() > 1 && !shared.iter().any(|(n, _)| n == &s.step) {
+                shared.push((s.step.clone(), same));
+            }
+        }
+        for s in steps.iter_mut() {
+            if shared.iter().any(|(n, _)| n == &s.step) {
+                s.step = s.function.clone();
+                s.short_name_shared = true;
+            }
         }
         // The param types' decoders, in the order the steps list them.
         let mut step_arms = Vec::new();
@@ -4531,8 +4583,12 @@ impl Exporter {
             } else {
                 format!("e.step \\in {{\"{}\", \"{}\"}}", s.step, s.function)
             };
+            let declared = format!(
+                "{params_declared}(e, {{{}}})",
+                s.params.iter().map(|p| format!("\"{}\"", p.name)).collect::<Vec<_>>().join(", ")
+            );
             if s.params.is_empty() {
-                step_arms.push(format!("{guard} -> {}", s.operator));
+                step_arms.push(format!("{guard} ->\n           {declared} /\\ {}", s.operator));
                 enabled_parts.push(format!(
                     "(IF ENABLED ({} /\\ Next) THEN {{[step |-> \"{}\"]}} ELSE {{}})",
                     s.operator, s.step
@@ -4561,7 +4617,7 @@ impl Exporter {
                 }
             }
             step_arms.push(format!(
-                "{guard} ->\n           \\E {} : {}({})",
+                "{guard} ->\n           {declared} /\\ \\E {} : {}({})",
                 binds.join(", "),
                 s.operator,
                 args.join(", ")
@@ -4588,6 +4644,12 @@ impl Exporter {
                 ));
             }
         }
+        for (name, functions) in &shared {
+            step_arms.push(format!(
+                "e.step = \"{name}\" -> Assert(FALSE, \"trace: {name} names more than one step ({}): log its full path\")",
+                functions.join(", ")
+            ));
+        }
         step_arms.push(
             "OTHER -> Assert(FALSE, \"trace: the model has no step \" \\o e.step)".to_string(),
         );
@@ -4598,9 +4660,9 @@ impl Exporter {
         tla.push_str(&format!(
             "\\* Trace validation for {module_name}, the export of `{module}` (verus -V tla-export).\n"
         ));
-        tla.push_str(
-            "\\* The log is newline-delimited JSON: a header line naming the module\n\\* ({\"module\": \"...\", \"export\": \"...\"}, optionally \"state\": the observed initial\n\\* state), then one line per step: {\"step\": \"<t_* name>\", \"params\": {...},\n\\* \"state\": {...}}. Values are in the export's encoding: a struct or enum value\n\\* is an object (an enum's with its \"tag\"), a Seq an array, a Set an array of its\n\\* elements, a Map an array of [key, value] pairs, a tuple an array. An object\n\\* is partial: only the fields it names are compared, so a ghost field is left\n\\* out of the log and free in the model; a Seq may be observed partially as an\n\\* object keyed by the Verus index (\"0\", \"1\", ...). A parameter left out of\n\\* \"params\" ranges over its type's finite domain.\n",
-        );
+        tla.push_str(&format!(
+            "\\* The log is newline-delimited JSON: a header line naming the module\n\\* ({{\"module\": \"{module_name}\", \"export\": \"...\"}}, optionally \"state\": the observed\n\\* initial state; another module stops TLC), then one line per step:\n\\* {{\"step\": \"<t_* name>\", \"params\": {{...}}, \"state\": {{...}}}}. A step is named by\n\\* its spec fn's last segment or full path, by the full path alone when two\n\\* steps share the last segment; a parameter the step does not declare stops\n\\* TLC. Values are in the export's encoding: a struct or enum value is an\n\\* object (an enum's with its \"tag\"), a Seq an array, a Set an array of its\n\\* elements, a Map an array of [key, value] pairs, a tuple an array. An object\n\\* observed in the state is partial: only the fields it names are compared, so\n\\* a ghost field is left out of the log and free in the model; a Seq may be\n\\* observed partially as an object keyed by the Verus index (\"0\", \"1\", ...).\n\\* A record inside a Set element, a Map key or a parameter is decoded whole,\n\\* so it must name every field (a field left out there stops TLC). A parameter\n\\* left out of \"params\" ranges over the hole bounding it in Next (a VerusSync\n\\* step's Dom_Step_<t>_v<i>), its type's finite domain or the export's\n\\* Dom_<Type> hole; with none of these it must be logged.\n"
+        ));
         tla.push_str(&format!(
             "\\* TraceNext takes the logged step and conjoins Next, so it only ever narrows\n\\* the model: a trace TLC follows to its end ({accepted}) is a behaviour of\n\\* {module_name}. Otherwise the deepest {index} reached is the first logged step\n\\* the model cannot take from any state that explains the log so far.\n"
         ));
@@ -4617,7 +4679,10 @@ impl Exporter {
             "{state_of}(e) == IF \"state\" \\in DOMAIN e THEN e.state ELSE [k \\in {{}} |-> 0]\n"
         ));
         tla.push_str(&format!(
-            "\\* A logged parameter, or the domain it ranges over when left out.\n{param}(e, k, Dec(_), D) ==\n    IF \"params\" \\in DOMAIN e /\\ k \\in DOMAIN e.params THEN {{Dec(e.params[k])}} ELSE D\n\n"
+            "\\* A logged parameter, or the domain it ranges over when left out.\n{param}(e, k, Dec(_), D) ==\n    IF \"params\" \\in DOMAIN e /\\ k \\in DOMAIN e.params THEN {{Dec(e.params[k])}} ELSE D\n"
+        ));
+        tla.push_str(&format!(
+            "\\* Every parameter logged is one of S, the step's declared parameters (an IF,\n\\* not a disjunction, which TLC would take as two branches of the action).\n{params_declared}(e, S) ==\n    \"params\" \\in DOMAIN e =>\n        \\A k \\in DOMAIN e.params :\n            IF k \\in S THEN TRUE\n            ELSE Assert(FALSE, \"trace: \" \\o e.step \\o \" has no parameter \" \\o k)\n\n"
         ));
         let mut recursive: Vec<String> = Vec::new();
         for (d, o) in memo.values() {
@@ -4646,7 +4711,7 @@ impl Exporter {
         ));
         tla.push_str(&format!("{step_op}(e) ==\n    CASE {}\n\n", step_arms.join("\n      [] ")));
         tla.push_str(&format!(
-            "{init} ==\n    /\\ Init\n    /\\ {index} = 1\n    /\\ {observed}({state_of}({header}))\n\n"
+            "{init} ==\n    /\\ Assert(\"module\" \\in DOMAIN {header} /\\ {header}.module = \"{module_name}\",\n              \"trace: the log's header does not name the module {module_name}\")\n    /\\ Init\n    /\\ {index} = 1\n    /\\ {observed}({state_of}({header}))\n\n"
         ));
         tla.push_str(&format!(
             "{next} ==\n    /\\ {index} <= Len({trace})\n    /\\ LET e == {trace}[{index}] IN\n           /\\ {step_op}(e)\n           /\\ Next\n           /\\ {observed_next}({state_of}(e))\n    /\\ {index}' = {index} + 1\n\n"
@@ -4669,7 +4734,7 @@ impl Exporter {
         ));
         tla.push_str(&format!("{}\n", "=".repeat(trace_module.len() + 20)));
         let cfg = format!(
-            "\\* Trace validation: TLC follows the log named by {log}. It ends with no error\n\\* either way; the trace conforms when some state reaches {accepted}\n\\* (the depth of the search is the number of logged steps plus one).\nINIT {init}\nNEXT {next}\nCHECK_DEADLOCK FALSE\nCONSTANT {log} = \"trace.ndjson\"\n\\* The export's CONSTANTS, if it has any, are needed here too.\n"
+            "\\* Trace validation: TLC follows the log named by {log}. On a well-formed log\n\\* it ends with no error either way (a malformed one stops at an Assert); the trace conforms when some state reaches {accepted}\n\\* (the depth of the search is the number of logged steps plus one).\nINIT {init}\nNEXT {next}\nCHECK_DEADLOCK FALSE\nCONSTANT {log} = \"trace.ndjson\"\n\\* The export's CONSTANTS, if it has any, are needed here too.\n"
         );
         let report =
             TraceReport { module: trace_module.clone(), index_variable: index, observables, steps };

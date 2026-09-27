@@ -2905,6 +2905,15 @@ fn trace_spec(ex: &Exported) -> (PathBuf, String, String) {
     (spec, tla, cfg)
 }
 
+/// TLC on the trace spec over `log`, which it is to stop at with an error
+/// (an `Assert` of the trace spec's, or one of TLC's own): its output.
+fn stops(jar: &str, spec: &Path, cfg: &str, log: &Path, extra: &str) -> String {
+    let cfg = cfg.replace("\"trace.ndjson\"", &format!("\"{}\"", log.display()));
+    let out = tlc_output_with(jar, spec, &format!("{cfg}{extra}"), &[]);
+    assert!(out.contains("Error:"), "TLC followed {}:\n{out}", log.display());
+    out
+}
+
 /// TLC on the trace spec over `log`: the depth it reached (the logged steps
 /// followed, plus one) and its output, with `extra` appended to the .cfg.
 fn follow(jar: &str, spec: &Path, cfg: &str, log: &Path, extra: &str) -> (u64, String) {
@@ -2928,8 +2937,10 @@ fn tla_export_trace_spec_follows_a_counter_log() {
     assert_eq!(
         trace["steps"],
         serde_json::json!([
-            {"step": "t_dbl", "function": "test_crate::t_dbl", "operator": "t_dbl", "params": []},
-            {"step": "t_inc", "function": "test_crate::t_inc", "operator": "t_inc", "params": []},
+            {"step": "t_dbl", "function": "test_crate::t_dbl", "operator": "t_dbl",
+             "short_name_shared": false, "params": []},
+            {"step": "t_inc", "function": "test_crate::t_inc", "operator": "t_inc",
+             "short_name_shared": false, "params": []},
         ])
     );
     let (spec, tla, cfg) = trace_spec(&ex);
@@ -3021,4 +3032,180 @@ pub open spec fn next(pre: State, post: State) -> bool {
     std::fs::write(&log, lines[..2].join("\n").replace("\"k\": 2", "\"k\": 5") + "\n").unwrap();
     let (depth, out) = follow(&jar, &spec, &cfg, &log, "");
     assert_eq!(depth, 1, "{out}");
+}
+
+#[test]
+fn tla_export_trace_spec_stops_at_a_malformed_log() {
+    let ex = export(&fixture("counter.rs"), "test_crate");
+    let (spec, _, cfg) = trace_spec(&ex);
+    let Some(jar) = tla_tools() else { return };
+    let log = ex.dir.path().join("t.ndjson");
+    let header = r#"{"module": "State_tla", "export": "counter", "state": {"x": 0, "y": 0}}"#;
+    // A log for another module is not read as this one's.
+    std::fs::write(&log, "{\"module\": \"Other_tla\", \"export\": \"other\"}\n").unwrap();
+    let out = stops(&jar, &spec, &cfg, &log, "");
+    assert!(out.contains("trace: the log's header does not name the module State_tla"), "{}", out);
+    // A parameter the step does not declare (a misspelling) is not ignored.
+    let line = r#"{"step": "t_inc", "params": {"n": 1}, "state": {"x": 1}}"#;
+    std::fs::write(&log, format!("{header}\n{line}\n")).unwrap();
+    let out = stops(&jar, &spec, &cfg, &log, "");
+    assert!(out.contains("trace: t_inc has no parameter n"), "{}", out);
+    // Nor is a step the model does not have, or a field the state lacks.
+    let line = r#"{"step": "t_dec", "params": {}, "state": {}}"#;
+    std::fs::write(&log, format!("{header}\n{line}\n")).unwrap();
+    let out = stops(&jar, &spec, &cfg, &log, "");
+    assert!(out.contains("trace: the model has no step t_dec"), "{}", out);
+    let line = r#"{"step": "t_inc", "params": {}, "state": {"z": 1}}"#;
+    std::fs::write(&log, format!("{header}\n{line}\n")).unwrap();
+    let out = stops(&jar, &spec, &cfg, &log, "");
+    assert!(out.contains("trace: the state has no field z"), "{}", out);
+}
+
+#[test]
+fn tla_export_trace_spec_names_a_shared_step_by_its_path() {
+    let ex = export_code(
+        r#"
+use vstd::prelude::*;
+verus! {
+pub struct State { pub x: u8, pub s: Seq<u8> }
+pub open spec fn init(s: State) -> bool { s.x == 0 && s.s == Seq::<u8>::empty() }
+pub mod a {
+    use super::*;
+    pub open spec fn step(pre: State, post: State, k: u8) -> bool {
+        &&& k < 3 &&& post.x == k &&& post.s == pre.s.push(k)
+    }
+}
+pub mod b {
+    use super::*;
+    pub open spec fn step(pre: State, post: State) -> bool { &&& post.x == 200 &&& post.s == pre.s }
+}
+pub open spec fn next(pre: State, post: State) -> bool {
+    (exists|k: u8| a::step(pre, post, k)) || b::step(pre, post)
+}
+}
+"#,
+        "test_crate",
+    );
+    let steps = ex.report["trace"]["steps"].as_array().unwrap();
+    let mut named: Vec<(String, bool)> = steps
+        .iter()
+        .map(|s| (s["step"].as_str().unwrap().to_string(), s["short_name_shared"] == true))
+        .collect();
+    named.sort();
+    assert_eq!(
+        named,
+        [("test_crate::a::step".to_string(), true), ("test_crate::b::step".to_string(), true)]
+    );
+    let (spec, _, cfg) = trace_spec(&ex);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &spec);
+    let log = ex.dir.path().join("t.ndjson");
+    let header = r#"{"module": "State_tla", "export": "test_crate", "state": {"x": 0}}"#;
+    // By their full paths, each step is the one named.
+    let lines = [
+        header,
+        r#"{"step": "test_crate::a::step", "params": {"k": 1}, "state": {"x": 1, "s": [1]}}"#,
+        r#"{"step": "test_crate::b::step", "state": {"x": 200, "s": [1]}}"#,
+    ];
+    std::fs::write(&log, lines.join("\n") + "\n").unwrap();
+    let (depth, out) = follow(&jar, &spec, &cfg, &log, "");
+    assert_eq!(depth, 3, "{out}");
+    // The shared short name names neither: TLC stops rather than pick one.
+    std::fs::write(
+        &log,
+        format!("{header}\n{}\n", lines[1].replace("test_crate::a::step", "step")),
+    )
+    .unwrap();
+    let out = stops(&jar, &spec, &cfg, &log, "");
+    assert!(
+        out.contains("trace: step names more than one step (test_crate::")
+            && out.contains("): log its full path"),
+        "{}",
+        out
+    );
+}
+
+#[test]
+fn tla_export_trace_spec_follows_a_verussync_log() {
+    let ex = export(&fixture("adder_sync.rs"), "test_crate::Adder");
+    // `add(v: int)`: `v` is the `Step::add` field Next bounds by the hole
+    // `Dom_Step_add_v0`, so a log may leave it out.
+    assert_eq!(
+        ex.report["trace"]["steps"],
+        serde_json::json!([{
+            "step": "add", "function": "test_crate::Adder::State::add", "operator": "add",
+            "short_name_shared": false,
+            "params": [{"name": "v", "typ": "int", "domain": "Dom_Step_add_v0"}],
+        }])
+    );
+    let (spec, tla, cfg) = trace_spec(&ex);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &spec);
+    let constants = "CONSTANTS Dom_Step_add_v0 = {0, 1, 2}\n";
+    let log = ex.dir.path().join("t.ndjson");
+    let lines = [
+        r#"{"module": "State_tla", "export": "test_crate::Adder", "state": {"x": 0, "y": 0}}"#,
+        r#"{"step": "add", "params": {"v": 2}, "state": {"x": 2, "y": 2}}"#,
+        r#"{"step": "test_crate::Adder::State::add", "params": {}, "state": {"x": 3}}"#,
+    ];
+    std::fs::write(&log, lines.join("\n") + "\n").unwrap();
+    let (depth, out) = follow(&jar, &spec, &cfg, &log, constants);
+    assert_eq!(depth, 3, "{out}");
+    // With `v` left out, the model's enabled steps enumerate it over the
+    // hole; x going 2 to 7 is no `v` in it, so TLC stops at that step.
+    std::fs::write(&log, lines[..2].join("\n") + "\n" + &lines[2].replace("\"x\": 3", "\"x\": 7"))
+        .unwrap();
+    let spec_probe = spec.with_file_name("Probe_trace.tla");
+    std::fs::write(
+        &spec_probe,
+        tla.replace("MODULE State_tla_trace", "MODULE Probe_trace").replace(
+            "\n=====",
+            "\nProbe == trace_i = 2 => PrintT(<<\"probe\", TraceEnabled, TraceDiagnosis>>)\n=====",
+        ),
+    )
+    .unwrap();
+    let (depth, out) =
+        follow(&jar, &spec_probe, &cfg, &log, &format!("{constants}INVARIANT Probe\n"));
+    assert_eq!(depth, 2, "{out}");
+    assert!(
+        out.contains(
+            "<<\"probe\", {[params |-> [v |-> 0], step |-> \"add\"], [params |-> [v |-> 1], step |-> \"add\"], [params |-> [v |-> 2], step |-> \"add\"]}, [step_enabled |-> TRUE, unmatched |-> {\"x\"}]>>"
+        ), "{}", out);
+}
+
+#[test]
+fn tla_export_trace_spec_decodes_a_record_in_a_set_whole() {
+    let ex = export_code(
+        r#"
+use vstd::prelude::*;
+verus! {
+pub struct Rec { pub a: u8, pub b: nat }
+pub struct State { pub set: Set<Rec>, pub last: Rec }
+pub open spec fn init(s: State) -> bool {
+    &&& s.set == Set::<Rec>::empty() &&& s.last == Rec { a: 0, b: 0 }
+}
+pub open spec fn t_put(pre: State, post: State, a: u8) -> bool {
+    &&& a < 3
+    &&& post.set == pre.set.insert(Rec { a, b: 7 })
+    &&& post.last == Rec { a, b: 7 }
+}
+pub open spec fn next(pre: State, post: State) -> bool { exists|a: u8| t_put(pre, post, a) }
+}
+"#,
+        "test_crate",
+    );
+    let (spec, _, cfg) = trace_spec(&ex);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &spec);
+    let log = ex.dir.path().join("t.ndjson");
+    let header = r#"{"module": "State_tla", "export": "test_crate"}"#;
+    // In the state a record is partial (`last`), in a Set element whole.
+    let line = r#"{"step": "t_put", "params": {"a": 1}, "state": {"set": [{"a": 1, "b": 7}], "last": {"a": 1}}}"#;
+    std::fs::write(&log, format!("{header}\n{line}\n")).unwrap();
+    let (depth, out) = follow(&jar, &spec, &cfg, &log, "");
+    assert_eq!(depth, 2, "{out}");
+    // A Set element's record leaving out a field stops TLC.
+    std::fs::write(&log, format!("{header}\n{}\n", line.replace(r#", "b": 7}]"#, "}]"))).unwrap();
+    let out = stops(&jar, &spec, &cfg, &log, "");
+    assert!(out.contains("\"b\""), "{}", out);
 }
