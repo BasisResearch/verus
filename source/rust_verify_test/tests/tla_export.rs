@@ -2790,6 +2790,84 @@ fn tla_export_bounds_collections_by_holes_or_subsets() {
     assert_eq!(run.distinct, 112, "{run:?}\n{}", ex.tla);
 }
 
+/// A `Map` whose keys and values have small domains is bounded as the
+/// functions from a subset of its keys to its values, in a binder's domain;
+/// a larger one is a hole. TypeOK bounds a map's keys and values, never
+/// with this domain.
+const MAP_DOMAINS: &str = r#"
+use vstd::prelude::*;
+verus! {
+pub struct State { pub m: Map<bool, bool>, pub big: Map<u8, bool> }
+
+pub open spec fn init(s: State) -> bool {
+    &&& s.m == Map::<bool, bool>::empty()
+    &&& s.big == Map::<u8, bool>::empty()
+}
+
+pub open spec fn next(pre: State, post: State) -> bool {
+    ||| post.m == pre.m.insert(true, false) && post.big == pre.big
+    ||| post.big == pre.big.insert(1u8, true) && post.m == pre.m
+}
+
+pub open spec fn m_small(s: State) -> bool {
+    forall|t: Map<bool, bool>| #[trigger] t.dom().contains(false) ==> t != s.m
+}
+
+pub open spec fn big_no3(s: State) -> bool {
+    forall|t: Map<u8, bool>| #[trigger] t.dom().contains(3u8) ==> t != s.big
+}
+}
+"#;
+
+#[test]
+fn tla_export_bounds_a_small_map_and_leaves_a_large_one_a_hole() {
+    let ex = export_code(MAP_DOMAINS, "test_crate");
+    assert_eq!(ex.report["refusals"], serde_json::json!([]), "{}", ex.tla);
+    assert!(
+        ex.tla.contains(
+            "(\\A t \\in UNION {[d__ -> BOOLEAN] : d__ \\in SUBSET BOOLEAN} : ((FALSE \\in DOMAIN t) => ~((m = t))))"
+        ),
+        "{}",
+        ex.tla
+    );
+    assert!(ex.tla.contains("(\\A t \\in Dom_Map_u8_bool : "), "{}", ex.tla);
+    let holes: Vec<(&str, &str)> = ex.report["holes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|h| (h["constant"].as_str().unwrap(), h["typ"].as_str().unwrap()))
+        .collect();
+    assert_eq!(holes, [("Dom_Map_u8_bool", "Map_u8_bool")], "{}", ex.tla);
+    // TypeOK bounds `big`'s u8 keys and says nothing of either map's domain.
+    assert!(
+        ex.tla.contains(
+            "TypeOK ==\n    /\\ (\\A k__2 \\in DOMAIN big : (0 <= k__2 /\\ k__2 <= 255))\nInit =="
+        ),
+        "{}",
+        ex.tla
+    );
+    assert!(!ex.tla.contains("m \\in UNION"), "{}", ex.tla);
+    assert!(!ex.tla.contains("big \\in"), "{}", ex.tla);
+    assert_eq!(names(&ex.report["invariants"]), ["m_small", "big_no3"]);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let mc = ex.spec().with_file_name("MC.tla");
+    std::fs::write(
+        &mc,
+        format!(
+            "---- MODULE MC ----\nEXTENDS {}\n\
+             MC_big == {{[k \\in {{}} |-> TRUE], 1 :> TRUE, 3 :> TRUE}}\n====\n",
+            ex.module
+        ),
+    )
+    .unwrap();
+    let cfg = format!("{}CONSTANTS\n  Dom_Map_u8_bool <- MC_big\n", ex.cfg);
+    let run = tlc(&jar, &mc, &cfg);
+    assert_eq!(run.violated, Vec::<String>::new(), "{run:?}\n{}", ex.tla);
+    // m is empty or {TRUE: FALSE}, big empty or {1: TRUE}.
+    assert_eq!(run.distinct, 4, "{run:?}\n{}", ex.tla);
+}
+
 /// An or-pattern that binds nothing is the disjunction of its
 /// alternatives' conditions (it was refused, which stopped TLC at the
 /// first step of a `match` on the step).
@@ -3243,4 +3321,129 @@ pub proof fn indexed(i: int)
     sany(&jar, &ex.spec());
     let out = tlc_output_with(&jar, &ex.spec(), &ex.cfg, &[]);
     assert!(out.contains("No error has been found"), "{}", out);
+}
+
+/// A TempPred spec fn another property beside `spec()` reads is a building
+/// block of it, not a property: `done()` alone fails in the initial state.
+#[test]
+fn tla_export_verus_tla_leaves_out_a_property_another_reads() {
+    let ex = export_code(
+        &liveness_counter_with(
+            "lift_state(init()).and(always(lift_action(next()))).and(inc().weak_fairness(()))",
+            r#"
+pub open spec fn done() -> TempPred<S> { lift_state(|s: S| s.x == 3) }
+
+pub open spec fn reaches_three() -> TempPred<S> { eventually(done()) }
+"#,
+        ),
+        "test_crate",
+    );
+    assert_eq!(ex.report["refusals"], serde_json::json!([]));
+    let props = ex.report["properties"].as_array().unwrap();
+    let ops: Vec<(&str, bool)> = props
+        .iter()
+        .map(|p| (p["operator"].as_str().unwrap(), p["included"].as_bool().unwrap()))
+        .collect();
+    assert_eq!(ops, [("done", false), ("reaches_three", true)], "{}", ex.tla);
+    assert!(
+        props[0]["left_out"].as_str().unwrap().starts_with("read by the property reaches_three"),
+        "{:?}",
+        props[0]
+    );
+    assert_eq!(props[1]["left_out"], serde_json::Value::Null);
+    assert!(ex.cfg.contains("PROPERTIES\n  reaches_three\n"), "{}", ex.cfg);
+    assert!(ex.cfg.contains("\\* PROPERTY done is left out"), "{}", ex.cfg);
+    assert_eq!(ex.report["fairness_in_spec"], true);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let out = tlc_output_with(&jar, &ex.spec(), &ex.cfg, &[]);
+    assert!(out.contains("No error has been found"), "{}", out);
+}
+
+/// TLC checks an action formula only as `[][A]_vars` conjoined at the top of
+/// a property with no premise, `[]<><<A>>_vars` or `<>[][A]_vars`; a
+/// property with one anywhere else is left out of the .cfg with a note,
+/// since TLC would refuse it and with it the whole run.
+#[test]
+fn tla_export_verus_tla_action_formulas_only_where_tlc_checks_them() {
+    let ex = export_code(
+        &liveness_counter_with(
+            "lift_state(init()).and(always(lift_action(next()))).and(inc().weak_fairness(()))",
+            r#"
+pub open spec fn small_steps() -> ActionPred<S> { |s: S, s_prime: S| s_prime.x <= s.x + 1 }
+
+pub open spec fn steps_and_reaches() -> TempPred<S> {
+    always(lift_action(small_steps())).and(eventually(lift_state(|s: S| s.x == 3)))
+}
+
+pub open spec fn settles() -> TempPred<S> {
+    eventually(always(lift_action(|s: S, s_prime: S| s_prime.x == s.x)))
+}
+
+pub open spec fn keeps_incrementing() -> TempPred<S> {
+    always(eventually(lift_action(inc().forward(()))))
+}
+
+pub open spec fn increments_once() -> TempPred<S> { eventually(lift_action(inc().forward(()))) }
+
+pub proof fn small_steps_given(m: TempPred<S>)
+    requires
+        m.entails(spec()),
+        m.entails(always(lift_state(|s: S| s.x <= 3))),
+    ensures
+        m.entails(always(lift_action(small_steps()))),
+{
+    admit();
+}
+
+pub proof fn reaches_given_small_steps(m: TempPred<S>)
+    requires
+        m.entails(spec()),
+        m.entails(always(lift_action(small_steps()))),
+    ensures
+        m.entails(eventually(lift_state(|s: S| s.x == 3))),
+{
+    admit();
+}
+"#,
+        ),
+        "test_crate",
+    );
+    assert_eq!(ex.report["refusals"], serde_json::json!([]));
+    let props = ex.report["properties"].as_array().unwrap();
+    let get = |op: &str| props.iter().find(|p| p["operator"] == op).expect(op);
+    for op in ["steps_and_reaches", "settles", "keeps_incrementing"] {
+        assert_eq!(get(op)["included"], true, "{op}: {:?}", get(op));
+    }
+    assert_eq!(get("steps_and_reaches")["formula"], "([][small_steps]_vars /\\ <>((x = 3)))");
+    assert_eq!(get("keeps_incrementing")["formula"], "[](<><<inc>>_vars)");
+    let left_out = |op: &str| {
+        assert_eq!(get(op)["included"], false, "{op}: {:?}", get(op));
+        assert!(ex.cfg.contains(&format!("\\* PROPERTY {op} is left out")), "{}", ex.cfg);
+        get(op)["left_out"].as_str().unwrap().to_string()
+    };
+    assert!(left_out("increments_once").contains("<><<inc>>_vars"));
+    // Its [][A]_vars is the conclusion of `[](x <= 3) => ...`.
+    assert!(left_out("small_steps_given").contains("under the premises"));
+    // Its [][A]_vars is a premise.
+    assert!(left_out("reaches_given_small_steps").contains("[][small_steps]_vars"));
+    assert!(
+        ex.cfg.contains("PROPERTIES\n  steps_and_reaches\n  settles\n  keeps_incrementing\n"),
+        "{}",
+        ex.cfg
+    );
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let only = |p: &str| {
+        ex.cfg
+            .replace("  steps_and_reaches\n  settles\n  keeps_incrementing\n", &format!("  {p}\n"))
+    };
+    for op in ["steps_and_reaches", "settles"] {
+        let out = tlc_output_with(&jar, &ex.spec(), &only(op), &[]);
+        assert!(out.contains("No error has been found"), "{op}: {}", out);
+    }
+    // Once x is 3, inc is disabled: TLC checks []<><<inc>>_vars and finds
+    // the behaviour that stops incrementing.
+    let out = tlc_output_with(&jar, &ex.spec(), &only("keeps_incrementing"), &[]);
+    assert!(out.contains("Error: Temporal property keeps_incrementing was violated"), "{}", out);
 }

@@ -61,7 +61,9 @@ spec and noted. A lemma with a parameter that is not the receiver of its
 `ensures` (a non-`TempPred`, or a rule lemma generic over `p: TempPred`) is
 skipped with a note. Beside a spec fn `spec()`, every other spec fn of no
 parameters returning a `TempPred` that neither `spec` nor a proof fn's
-requires or ensures reads is a property under `spec()`.
+requires or ensures reads is a property under `spec()`, unless another such
+property reads it (`done()` in `eventually(done())`): a building block, left
+out of the `.cfg` as a helper invariant is.
 `always` is `[]` (`always(lift_action(a))` is `[][A]_vars`), `eventually`
 `<>`, `leads_to` `~>`, `not`/`and`/`or`/`implies` the connectives,
 `lift_state(p)` the state formula, `weak_fairness(a)` and
@@ -77,7 +79,13 @@ conjuncts, as under one `spec()`), and otherwise each property is `fairness
 every other conjunct of a spec (`always(lift_state(p))`, fairness in another
 form) is a premise of the property, `assumptions => formula`, since TLC
 cannot take `[]P` in a `Spec`. A property whose spec states no fairness is
-checked without any, and the `.cfg` says so. Fairness is never assumed. A
+checked without any, and the `.cfg` says so. TLC checks an action formula
+only as `[][A]_vars` conjoined at the top of a property with no premise,
+`[]<><<A>>_vars` (`always(eventually(lift_action(a)))`) or `<>[][A]_vars`; a
+property with one anywhere else (`eventually(lift_action(a))` alone, a spec's
+`always(lift_action(a))` for an `a` other than `next()`) would stop TLC's
+whole run, so it is left out of the `.cfg` with the reason in the report's
+`left_out`. Fairness is never assumed. A
 state predicate a property lifts is a state of the property, not an
 invariant, unless the command line names it. The report's `properties`
 lists each property with its fairness and spec; `temporal_notes` says where
