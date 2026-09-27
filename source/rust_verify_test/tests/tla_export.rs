@@ -3068,6 +3068,15 @@ pub open spec fn next(pre: State, post: State) -> bool {
         let (depth, out) = follow(&jar, &spec, &cfg, &log, "");
         assert_eq!(depth, want, "{to}\n{out}");
     }
+    // A key that is no index stops TLC; an index past the end only diverges.
+    let line = lines[2].replace(s_by_index, r#""s": {"x1": {"a": 0}}"#);
+    std::fs::write(&log, format!("{}\n{}\n{line}\n", lines[0], lines[1])).unwrap();
+    let out = stops(&jar, &spec, &cfg, &log, "");
+    assert!(out.contains("observed as an object has a key that is no index: x1"), "{}", out);
+    let line = lines[2].replace(s_by_index, r#""s": {"7": {"a": 0}}"#);
+    std::fs::write(&log, format!("{}\n{}\n{line}\n", lines[0], lines[1])).unwrap();
+    let (depth, out) = follow(&jar, &spec, &cfg, &log, "");
+    assert_eq!(depth, 2, "{out}");
     // A value the model cannot produce (k = 5 fails the guard) stops it.
     std::fs::write(&log, lines[..2].join("\n").replace("\"k\": 2", "\"k\": 5") + "\n").unwrap();
     let (depth, out) = follow(&jar, &spec, &cfg, &log, "");
@@ -3112,6 +3121,24 @@ fn tla_export_trace_spec_stops_at_a_malformed_log() {
     std::fs::write(&log, format!("{header}\n{line}\n")).unwrap();
     let out = stops(&jar, &spec, &cfg, &log, "");
     assert!(out.contains("trace: the state has no field z"), "{}", out);
+    // A misspelled "state" or "params" is not read as observing nothing,
+    // in a step line or in the header; nor is a step line without "step".
+    for (line, want) in [
+        (r#"{"step": "t_inc", "stat": {"x": 7}}"#, "trace: a step line has no key stat"),
+        (
+            r#"{"step": "t_inc", "param": {}, "state": {"x": 1}}"#,
+            "trace: a step line has no key param",
+        ),
+        (r#"{"state": {"x": 1}}"#, "trace: a step line names no step"),
+    ] {
+        std::fs::write(&log, format!("{header}\n{line}\n")).unwrap();
+        let out = stops(&jar, &spec, &cfg, &log, "");
+        assert!(out.contains(want), "{}\n{}", line, out);
+    }
+    let bad = r#"{"module": "State_tla", "export": "test_crate", "State": {"x": 7, "y": 0}}"#;
+    std::fs::write(&log, format!("{bad}\n")).unwrap();
+    let out = stops(&jar, &spec, &cfg, &log, "");
+    assert!(out.contains("trace: the log's header has no key State"), "{}", out);
 }
 
 #[test]

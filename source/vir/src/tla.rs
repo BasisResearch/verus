@@ -4607,7 +4607,7 @@ impl Exporter {
                         (
                             format!("[{p} \\in 1..Len({j}) |-> {d}({j}[{p}])]"),
                             format!(
-                                "IF {is_array}({j})\n    THEN Len({v}) = Len({j}) /\\ \\A {p} \\in 1..Len({j}) : {o}({v}[{p}], {j}[{p}])\n    ELSE \\A {k} \\in DOMAIN {j} : \\E {p} \\in 1..Len({v}) : ToString({p} - 1) = {k} /\\ {o}({v}[{p}], {j}[{k}])"
+                                "IF {is_array}({j})\n    THEN Len({v}) = Len({j}) /\\ \\A {p} \\in 1..Len({j}) : {o}({v}[{p}], {j}[{p}])\n    ELSE \\A {k} \\in DOMAIN {j} :\n        IF Len({k}) > 0 /\\ \\A {p} \\in 1..Len({k}) : SubSeq({k}, {p}, {p}) \\in {{\"0\", \"1\", \"2\", \"3\", \"4\", \"5\", \"6\", \"7\", \"8\", \"9\"}}\n        THEN \\E {p} \\in 1..Len({v}) : ToString({p} - 1) = {k} /\\ {o}({v}[{p}], {j}[{k}])\n        ELSE Assert(FALSE, \"trace: a {tname} observed as an object has a key that is no index: \" \\o {k})"
                             ),
                         )
                     }
@@ -4812,6 +4812,7 @@ impl Exporter {
             "TraceDiagnosis",
             "TraceStepAt",
             "TraceParamsDeclared",
+            "TraceKeys",
         ]
         .iter()
         .map(|n| self.trace_name(n))
@@ -4837,7 +4838,8 @@ impl Exporter {
             diagnosis,
             step_at,
             params_declared,
-        ] = <[String; 20]>::try_from(names).expect("twenty names");
+            keys,
+        ] = <[String; 21]>::try_from(names).expect("twenty-one names");
         let arity = operators
             .iter()
             .filter_map(|k| self.functions.get(&k.0))
@@ -5051,7 +5053,7 @@ impl Exporter {
             "\\* Trace validation for {module_name}, the export of `{module}` (verus -V tla-export).\n"
         ));
         tla.push_str(&format!(
-            "\\* The log is newline-delimited JSON: a header line naming the module\n\\* ({{\"module\": \"{module_name}\", \"export\": \"{module}\"}}, optionally \"state\": the\n\\* observed initial state; another module or export stops TLC), then one line per step:\n\\* {{\"step\": \"<t_* name>\", \"params\": {{...}}, \"state\": {{...}}}}. A step is named by\n\\* its spec fn's last segment or full path, by the full path alone when two\n\\* steps share the last segment; a parameter the step does not declare stops\n\\* TLC. Values are in the export's encoding: a struct or enum value is an\n\\* object (an enum's with its \"tag\"), a Seq an array, a Set an array of its\n\\* elements, a Map an array of [key, value] pairs, a tuple an array, a struct\n\\* without fields {{}} (or {{\"tag\": \"unit\"}}). An object\n\\* observed in the state is partial: only the fields it names are compared, so\n\\* a ghost field is left out of the log and free in the model (an enum's tag\n\\* too: its fields are then compared under whichever variant the model has);\n\\* a key naming no field of its type stops TLC, as one naming no state field\n\\* does; a Seq may be observed partially as an object keyed by the Verus index\n\\* (\"0\", \"1\", ...; {{}} observes nothing, [] is the empty Seq).\n\\* A record inside a Set element, a Map key or a parameter is decoded whole,\n\\* so it must name every field and an enum its tag (one left out there stops\n\\* TLC). A parameter left out of \"params\" ranges over what Next's calls to\n\\* the step pass it (the bound of the quantifier binding the argument, or the\n\\* field of a value matched against a pattern, such as a VerusSync step's\n\\* Dom_Step_<t>_v<i>), else its type's finite domain (not a Dom_<Type> hole,\n\\* which holds only what a quantifier binds, never a value a call computes);\n\\* with neither it must be logged, and TraceEnabled leaves the step out (the\n\\* report's trace steps say which, \"enumerated\"). A logged parameter outside\n\\* its domain is a step the model cannot take.\n"
+            "\\* The log is newline-delimited JSON: a header line naming the module\n\\* ({{\"module\": \"{module_name}\", \"export\": \"{module}\"}}, optionally \"state\": the\n\\* observed initial state; another module or export stops TLC), then one line per step:\n\\* {{\"step\": \"<t_* name>\", \"params\": {{...}}, \"state\": {{...}}}}. A step is named by\n\\* its spec fn's last segment or full path, by the full path alone when two\n\\* steps share the last segment; a parameter the step does not declare stops\n\\* TLC. Values are in the export's encoding: a struct or enum value is an\n\\* object (an enum's with its \"tag\"), a Seq an array, a Set an array of its\n\\* elements, a Map an array of [key, value] pairs, a tuple an array, a struct\n\\* without fields {{}} (or {{\"tag\": \"unit\"}}). An object\n\\* observed in the state is partial: only the fields it names are compared, so\n\\* a ghost field is left out of the log and free in the model (an enum's tag\n\\* too: its fields are then compared under whichever variant the model has);\n\\* a key naming no field of its type stops TLC, as one naming no state field\n\\* does; a Seq may be observed partially as an object keyed by the Verus index\n\\* (\"0\", \"1\", ...; {{}} observes nothing, [] is the empty Seq; a key\n\\* that is no index stops TLC). A key a line or the header does not define\n\\* stops TLC, so a misspelled \"state\" or \"params\" never observes nothing.\n\\* A record inside a Set element, a Map key or a parameter is decoded whole,\n\\* so it must name every field and an enum its tag (one left out there stops\n\\* TLC). A parameter left out of \"params\" ranges over what Next's calls to\n\\* the step pass it (the bound of the quantifier binding the argument, or the\n\\* field of a value matched against a pattern, such as a VerusSync step's\n\\* Dom_Step_<t>_v<i>), else its type's finite domain (not a Dom_<Type> hole,\n\\* which holds only what a quantifier binds, never a value a call computes);\n\\* with neither it must be logged, and TraceEnabled leaves the step out (the\n\\* report's trace steps say which, \"enumerated\"). A logged parameter outside\n\\* its domain is a step the model cannot take.\n"
         ));
         tla.push_str(&format!(
             "\\* TraceNext conjoins Next, then the logged step, so it only ever narrows\n\\* the model: a trace TLC follows to its end ({accepted}) is a behaviour of\n\\* {module_name}. Otherwise the deepest {index} reached is the first logged step\n\\* the model cannot take from any state that explains the log so far; and\n\\* when TLC finds no initial state (0 states generated, depth 0), the header's\n\\* observed state is none of Init's, so the log diverges before its first step.\n\\* Next takes values only in the export's Dom_ holes, so the .cfg must give\n\\* each one every value the log carries for it: a logged value outside it\n\\* diverges as a step the model cannot take.\n\\* A pass means the observed state sequence is a behaviour of the model: a\n\\* logged step's name and parameters count only through their effect on the\n\\* state, so a step that another of Next's steps explains (the same observed\n\\* successor) is accepted even if the model never takes the logged one there.\n"
@@ -5073,6 +5075,9 @@ impl Exporter {
         ));
         tla.push_str(&format!(
             "\\* Every parameter logged is one of {set}, the step's declared parameters (an IF,\n\\* not a disjunction, which TLC would take as two branches of the action).\n{params_declared}({e}, {set}) ==\n    \"params\" \\in DOMAIN {e} =>\n        \\A {k} \\in DOMAIN {e}.params :\n            IF {k} \\in {set} THEN TRUE\n            ELSE Assert(FALSE, \"trace: \" \\o {e}.step \\o \" has no parameter \" \\o {k})\n\n"
+        ));
+        tla.push_str(&format!(
+            "\\* Every key of a log line is one of {set}, so a misspelled \"state\" or\n\\* \"params\" stops TLC rather than observing nothing.\n{keys}({e}, {set}, {j}) ==\n    \\A {k} \\in DOMAIN {e} :\n        IF {k} \\in {set} THEN TRUE\n        ELSE Assert(FALSE, \"trace: \" \\o {j} \\o \" has no key \" \\o {k})\n\n"
         ));
         let mut recursive: Vec<String> = Vec::new();
         for (d, o) in memo.values() {
@@ -5103,10 +5108,10 @@ impl Exporter {
         ));
         tla.push_str(&format!("{step_op}({e}) ==\n    CASE {}\n\n", step_arms.join("\n      [] ")));
         tla.push_str(&format!(
-            "{init} ==\n    /\\ Assert(\"module\" \\in DOMAIN {header} /\\ {header}.module = \"{module_name}\",\n              \"trace: the log's header does not name the module {module_name}\")\n    /\\ Assert(\"export\" \\in DOMAIN {header} /\\ {header}.export = \"{module}\",\n              \"trace: the log's header does not name the export {module}\")\n    /\\ Init\n    /\\ {index} = 1\n    /\\ {observed}({state_of}({header}))\n\n"
+            "{init} ==\n    /\\ {keys}({header}, {{\"module\", \"export\", \"state\"}}, \"the log's header\")\n    /\\ Assert(\"module\" \\in DOMAIN {header} /\\ {header}.module = \"{module_name}\",\n              \"trace: the log's header does not name the module {module_name}\")\n    /\\ Assert(\"export\" \\in DOMAIN {header} /\\ {header}.export = \"{module}\",\n              \"trace: the log's header does not name the export {module}\")\n    /\\ Init\n    /\\ {index} = 1\n    /\\ {observed}({state_of}({header}))\n\n"
         ));
         tla.push_str(&format!(
-            "{next} ==\n    /\\ {index} <= Len({trace})\n    /\\ LET {e} == {trace}[{index}] IN\n           /\\ Next\n           /\\ {step_op}({e})\n           /\\ {observed_next}({state_of}({e}))\n    /\\ {index}' = {index} + 1\n\n"
+            "{next} ==\n    /\\ {index} <= Len({trace})\n    /\\ LET {e} == {trace}[{index}] IN\n           /\\ {keys}({e}, {{\"step\", \"params\", \"state\"}}, \"a step line\")\n           /\\ Assert(\"step\" \\in DOMAIN {e}, \"trace: a step line names no step\")\n           /\\ Next\n           /\\ {step_op}({e})\n           /\\ {observed_next}({state_of}({e}))\n    /\\ {index}' = {index} + 1\n\n"
         ));
         tla.push_str(&format!("{spec} == {init} /\\ [][{next}]_<<{vars}, {index}>>\n"));
         tla.push_str(&format!(

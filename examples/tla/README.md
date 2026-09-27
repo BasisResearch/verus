@@ -231,7 +231,9 @@ fields are then compared under whichever variant the model has, and a field
 that variant lacks does not match, while a key naming no field of the type
 stops TLC, as one naming no state field does); a `Seq` can be observed
 partially as an object keyed by the Verus index (`{"1": {...}}`, and `{}`
-observes nothing, while `[]` is the empty `Seq`). A record
+observes nothing, while `[]` is the empty `Seq`; a key that is no index
+stops TLC). A key a log line or the header does not define (`"stat"` for
+`"state"`) stops TLC too, so a misspelling never observes nothing. A record
 inside a `Set` element, a `Map` key or a parameter is decoded whole, so it
 must name every field, and an enum value its tag; one left out there stops
 TLC. A parameter left out of `"params"` ranges over what `Next`'s calls to
