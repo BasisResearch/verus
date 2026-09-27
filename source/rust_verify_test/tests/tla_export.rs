@@ -3447,3 +3447,72 @@ pub proof fn reaches_given_small_steps(m: TempPred<S>)
     let out = tlc_output_with(&jar, &ex.spec(), &only("keeps_incrementing"), &[]);
     assert!(out.contains("Error: Temporal property keeps_incrementing was violated"), "{}", out);
 }
+
+/// A state predicate a temporal property reads is checked by that property
+/// only when the property is in the .cfg: one read only by properties left
+/// out is checked as an invariant after all, and one an included property
+/// reads stays out, the report naming that property.
+#[test]
+fn tla_export_verus_tla_invariant_read_only_by_left_out_properties() {
+    let ex = export_code(
+        &liveness_counter_with(
+            "lift_state(init()).and(always(lift_action(next()))).and(inc().weak_fairness(()))",
+            r#"
+pub open spec fn below_three() -> StatePred<S> { |s: S| s.x < 3 }
+
+pub open spec fn three() -> StatePred<S> { |s: S| s.x == 3 }
+
+pub open spec fn reaches_three() -> TempPred<S> { eventually(lift_state(three())) }
+
+pub open spec fn below_then_moving() -> TempPred<S> {
+    always(lift_state(below_three()))
+        .and(eventually(lift_state(three())))
+        .and(eventually(lift_action(inc().forward(()))))
+}
+"#,
+        ),
+        "test_crate",
+    );
+    assert_eq!(ex.report["refusals"], serde_json::json!([]));
+    let props = ex.report["properties"].as_array().unwrap();
+    let get = |op: &str| props.iter().find(|p| p["operator"] == op).expect(op);
+    assert_eq!(get("reaches_three")["included"], true);
+    assert_eq!(get("below_then_moving")["included"], false);
+    // below_three is read only by below_then_moving, which is left out.
+    assert_eq!(names(&ex.report["invariants"]), ["below_three"], "{}", ex.cfg);
+    let cands = candidates(&ex.report);
+    assert!(cands.contains(&("below_three".to_string(), true)), "{:?}", cands);
+    assert!(cands.contains(&("three".to_string(), false)), "{:?}", cands);
+    let reason = |f: &str| {
+        ex.report["candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["function"].as_str().unwrap().ends_with(&format!("::{f}")))
+            .map(|c| c["reason"].as_str().unwrap().to_string())
+            .unwrap()
+    };
+    assert!(
+        reason("below_three").starts_with(
+            "read only by temporal properties left out of the .cfg (below_then_moving)"
+        ),
+        "{}",
+        reason("below_three")
+    );
+    // three is read by the included reaches_three too.
+    assert!(
+        reason("three").starts_with("read by the temporal property reaches_three"),
+        "{}",
+        reason("three")
+    );
+    assert!(ex.cfg.contains("INVARIANTS\n  below_three\n"), "{}", ex.cfg);
+    assert!(ex.cfg.contains("PROPERTIES\n  reaches_three\n"), "{}", ex.cfg);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    // TLC checks it: x reaches 3.
+    let out = tlc_output_with(&jar, &ex.spec(), &ex.cfg, &[]);
+    assert!(out.contains("Error: Invariant below_three is violated"), "{}", out);
+    let out =
+        tlc_output_with(&jar, &ex.spec(), &ex.cfg.replace("INVARIANTS\n  below_three\n", ""), &[]);
+    assert!(out.contains("No error has been found"), "{}", out);
+}

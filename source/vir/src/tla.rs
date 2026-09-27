@@ -4689,7 +4689,8 @@ pub fn export_module(krate: &Krate, arg: &str) -> Result<Export, String> {
     // The temporal properties, and the functions their formulas read: a
     // state predicate one lifts (`eventually(lift_state(done()))`) is a
     // state of the property, not an invariant, unless the command line
-    // names it.
+    // names it. It is set aside here, and checked as an invariant after all
+    // when every property that reads it is left out of the .cfg (see below).
     let in_module: Vec<Function> = krate
         .functions
         .iter()
@@ -4697,8 +4698,10 @@ pub fn export_module(krate: &Krate, arg: &str) -> Result<Export, String> {
         .cloned()
         .collect();
     let (sources, source_notes) = temporal_sources(&ex.functions, &in_module);
+    // Each candidate set aside, with the sources that read it.
+    let mut read_by_property: Vec<(Fun, Vec<usize>)> = Vec::new();
     if !triple.explicit {
-        for src in &sources {
+        for (i, src) in sources.iter().enumerate() {
             let mut read: HashSet<Fun> = HashSet::new();
             crate::ast_visitor::expr_visitor_walk(&src.formula, &mut |x: &Expr| {
                 if let ExprX::Call { target: CallTarget::Fun(_, fun, ..), .. } = &x.x {
@@ -4709,13 +4712,14 @@ pub fn export_module(krate: &Krate, arg: &str) -> Result<Export, String> {
             for f in read.clone() {
                 read.extend(reached_functions(&ex.functions, &f));
             }
-            let by = fun_as_friendly_rust_name(&src.function);
-            for (f, selected, reason) in triple.candidates.iter_mut() {
+            for (f, selected, _) in triple.candidates.iter_mut() {
                 if *selected && read.contains(f) {
                     *selected = false;
-                    *reason = format!(
-                        "read by the temporal property of {by}, which is checked as a PROPERTY; name it in -V tla-export={module}:<invariants> to check it as an invariant"
-                    );
+                    read_by_property.push((f.clone(), vec![i]));
+                } else if let Some((_, readers)) =
+                    read_by_property.iter_mut().find(|(g, _)| g == f && read.contains(f))
+                {
+                    readers.push(i);
                 }
             }
         }
@@ -4733,6 +4737,12 @@ pub fn export_module(krate: &Krate, arg: &str) -> Result<Export, String> {
     let mut next_name = String::new();
     // Each invariant, and whether it reaches a refusal.
     let mut invs: Vec<(Fun, String, bool)> = Vec::new();
+    // What init and next emit (not verus-tla): a predicate among them is a
+    // guard or helper of the transition, not an invariant.
+    let mut transition_keys: HashSet<OpKey> = HashSet::new();
+    let reached_reason = format!(
+        "reached from init/next, unprimed or primed (a guard or helper of the transition), so not taken as an invariant; name it in -V tla-export={module}:<invariants> to check it"
+    );
     if verus_tla {
         for (i, r) in roots.iter().enumerate() {
             let f = ex.functions.get(r).cloned().ok_or("root missing")?;
@@ -4786,76 +4796,21 @@ pub fn export_module(krate: &Krate, arg: &str) -> Result<Export, String> {
         // A predicate init or next reads, unprimed or primed, is a guard or helper of
         // the transition, not an invariant, unless the command line names
         // it; it is reported as excluded, never dropped silently.
-        let transitions: HashSet<OpKey> = ex.emitted.clone();
+        transition_keys = ex.emitted.clone();
         for r in &selected {
             let key = (r.clone(), Variant::Plain);
             // Read primed (`p(post)` in next), or given a state value, is a
             // guard too.
             let reached = [Variant::Plain, Variant::Primed, Variant::Record]
                 .iter()
-                .any(|v| transitions.contains(&(r.clone(), *v)));
+                .any(|v| transition_keys.contains(&(r.clone(), *v)));
             if !triple.explicit && reached {
-                outcome.insert(
-                    r.clone(),
-                    (
-                        false,
-                        format!(
-                            "reached from init/next, unprimed or primed (a guard or helper of the transition), so not taken as an invariant; name it in -V tla-export={module}:<invariants> to check it"
-                        ),
-                    ),
-                );
+                outcome.insert(r.clone(), (false, reached_reason.clone()));
                 continue;
             }
             let name = ex.ensure_function(&key);
             invs.push((r.clone(), name, ex.tainted.contains(&key)));
         }
-    }
-    for (f, _, tainted) in &invs {
-        if *tainted {
-            outcome.insert(
-                f.clone(),
-                (false, "reaches a refusal, so it is left out of the .cfg (see refusals)".into()),
-            );
-        }
-    }
-    // An invariant another checked invariant calls is a helper of that
-    // invariant (`inv(s) = big(s) ==> !marked(s)`), checked where it is
-    // called, not an invariant of its own: alone it may well not hold. Only
-    // a caller in the .cfg covers it: when every caller reaches a refusal,
-    // the helper is checked on its own. Two that call each other are both
-    // kept.
-    if !triple.explicit {
-        let checked: Vec<Fun> =
-            invs.iter().filter(|(_, _, tainted)| !tainted).map(|(f, _, _)| f.clone()).collect();
-        let reach: HashMap<Fun, HashSet<Fun>> =
-            checked.iter().map(|f| (f.clone(), reached_functions(&ex.functions, f))).collect();
-        let covers = |f: &Fun, g: &Fun| f != g && reach[f].contains(g) && !reach[g].contains(f);
-        let helpers: HashSet<Fun> =
-            checked.iter().filter(|g| checked.iter().any(|f| covers(f, g))).cloned().collect();
-        for g in &checked {
-            if !helpers.contains(g) {
-                continue;
-            }
-            // Name a caller that is itself checked on its own when there is
-            // one (a caller's callers reach the helper too).
-            let caller = checked
-                .iter()
-                .filter(|f| covers(f, g))
-                .find(|f| !helpers.contains(*f))
-                .or_else(|| checked.iter().find(|f| covers(f, g)))
-                .expect("a helper has a caller");
-            outcome.insert(
-                g.clone(),
-                (
-                    false,
-                    format!(
-                        "called by the invariant {}, so checked there rather than on its own; name it in -V tla-export={module}:<invariants> to check it",
-                        fun_as_friendly_rust_name(caller)
-                    ),
-                ),
-            );
-        }
-        invs.retain(|(f, _, _)| !helpers.contains(f));
     }
     let transitions = ex.transitions(&(triple.next.clone(), Variant::Plain));
     let init_unassigned = match ex.functions.get(&triple.init).and_then(|f| f.x.body.clone()) {
@@ -5084,6 +5039,114 @@ pub fn export_module(krate: &Krate, arg: &str) -> Result<Export, String> {
             );
             p.included = false;
         }
+    }
+    // A candidate set aside above because a temporal property reads it is
+    // checked by that property only when the property is in the .cfg: one
+    // whose readers are all left out is checked as an invariant after all.
+    for (f, readers) in &read_by_property {
+        if let Some(&i) = readers.iter().find(|&&i| properties[i].included) {
+            outcome.insert(
+                f.clone(),
+                (
+                    false,
+                    format!(
+                        "read by the temporal property {} ({}), which is checked as a PROPERTY; name it in -V tla-export={module}:<invariants> to check it as an invariant",
+                        properties[i].operator, properties[i].function
+                    ),
+                ),
+            );
+            continue;
+        }
+        let left: Vec<&str> = readers.iter().map(|&i| properties[i].operator.as_str()).collect();
+        let why = format!(
+            "read only by temporal properties left out of the .cfg ({}), so checked as an invariant",
+            left.join(", ")
+        );
+        let key = (f.clone(), Variant::Plain);
+        let reached = [Variant::Plain, Variant::Primed, Variant::Record]
+            .iter()
+            .any(|v| transition_keys.contains(&(f.clone(), *v)));
+        ex.current_calls.clear();
+        ex.current_assigned.clear();
+        ex.enclosing_assigned.clear();
+        ex.implications.clear();
+        ex.pre_assigned.clear();
+        ex.bound.clear();
+        ex.current_tainted = false;
+        ex.branch_depth = 0;
+        let name = if verus_tla {
+            // The property's lift_state may have emitted it already.
+            ex.ensure_closure_root(f)
+        } else if reached {
+            outcome.insert(f.clone(), (false, reached_reason.clone()));
+            continue;
+        } else {
+            Some(ex.ensure_function(&key))
+        };
+        match name {
+            Some(name) => {
+                invs.push((f.clone(), name, ex.tainted.contains(&key)));
+                outcome.insert(f.clone(), (true, why));
+            }
+            None => {
+                outcome.insert(
+                    f.clone(),
+                    (
+                        false,
+                        format!(
+                            "{why}, but its body is not a closure literal over the state, so it is left out"
+                        ),
+                    ),
+                );
+            }
+        }
+    }
+    for (f, _, tainted) in &invs {
+        if *tainted {
+            outcome.insert(
+                f.clone(),
+                (false, "reaches a refusal, so it is left out of the .cfg (see refusals)".into()),
+            );
+        }
+    }
+    // An invariant another checked invariant calls is a helper of that
+    // invariant (`inv(s) = big(s) ==> !marked(s)`), checked where it is
+    // called, not an invariant of its own: alone it may well not hold. Only
+    // a caller in the .cfg covers it: when every caller reaches a refusal,
+    // the helper is checked on its own. Two that call each other are both
+    // kept.
+    if !triple.explicit {
+        let checked: Vec<Fun> =
+            invs.iter().filter(|(_, _, tainted)| !tainted).map(|(f, _, _)| f.clone()).collect();
+        let reach: HashMap<Fun, HashSet<Fun>> =
+            checked.iter().map(|f| (f.clone(), reached_functions(&ex.functions, f))).collect();
+        let covers = |f: &Fun, g: &Fun| f != g && reach[f].contains(g) && !reach[g].contains(f);
+        let helpers: HashSet<Fun> =
+            checked.iter().filter(|g| checked.iter().any(|f| covers(f, g))).cloned().collect();
+        for g in &checked {
+            if !helpers.contains(g) {
+                continue;
+            }
+            // Name a caller that is itself checked on its own when there is
+            // one (a caller's callers reach the helper too).
+            let caller = checked
+                .iter()
+                .filter(|f| covers(f, g))
+                .find(|f| !helpers.contains(*f))
+                .or_else(|| checked.iter().find(|f| covers(f, g)))
+                .expect("a helper has a caller");
+            outcome.insert(
+                g.clone(),
+                (
+                    false,
+                    format!(
+                        "called by the invariant {}, so checked there rather than on its own; name it in -V tla-export={module}:<invariants> to check it",
+                        fun_as_friendly_rust_name(caller)
+                    ),
+                ),
+            );
+        }
+        invs.retain(|(f, _, _)| !helpers.contains(f));
     }
     let mut temporal_notes: Vec<String> = source_notes;
     if !properties.is_empty() {
