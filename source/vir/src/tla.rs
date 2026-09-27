@@ -167,8 +167,14 @@ struct Call {
     context: BTreeSet<String>,
 }
 
-/// An operator: a function, and which of its variants (see [`Variant`]).
-type OpKey = (Fun, Variant);
+/// An operator: a function, which of its variants (see [`Variant`]), and
+/// whether a call gives it an argument that reads the post state. Its
+/// parameters then read the post state too, so a disjunction over them keeps
+/// its `\/`, whose branches TLC may need to assign a primed variable
+/// (`pick(post.x)` with `pick(v) = v == 0 || v == 1`). The record variant
+/// is always `false`: a recursive function has that one operator, whose
+/// parameters are all read as the post state may be.
+type OpKey = (Fun, Variant, bool);
 
 /// How an operator reads its state parameters.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -800,7 +806,7 @@ impl Exporter {
         if let Some(n) = self.op_names.get(key) {
             return n.clone();
         }
-        let (fun, variant) = key;
+        let (fun, variant, post_args) = key;
         let friendly = fun_as_friendly_rust_name(fun);
         let segs: Vec<&str> = friendly.split("::").collect();
         let mut candidate = ident_name(&VarIdent(
@@ -811,6 +817,9 @@ impl Exporter {
             Variant::Plain => {}
             Variant::Primed => candidate = format!("{candidate}_post"),
             Variant::Record => candidate = format!("{candidate}_rec"),
+        }
+        if *post_args {
+            candidate = format!("{candidate}_postarg");
         }
         let taken = |this: &Self, c: &str| {
             this.used_names.contains(c)
@@ -1112,7 +1121,7 @@ impl Exporter {
             }
             ExprX::VarAt(..) => self.refuse("old(...) reference", &e.span),
             ExprX::ConstVar(fun, _) | ExprX::StaticVar(fun) => {
-                self.ensure_function(&(fun.clone(), Variant::Plain))
+                self.ensure_function(&(fun.clone(), Variant::Plain, false))
             }
             ExprX::ReadPlace(place, _) => self.place(place, env),
             ExprX::Call { target, args, .. } => self.call(e, target, args, env),
@@ -1211,7 +1220,9 @@ impl Exporter {
             // action TLC branches on a `\/` rather than evaluating it, so
             // `b` would be evaluated even where `a` holds and guards it (`b
             // == 0 || log[b - 1] == x` indexing `log[-1]`). Init keeps the
-            // `\/`, whose branches may assign the state.
+            // `\/`, whose branches may assign the state, as does a
+            // disjunction reading a local or parameter given a post-state
+            // value (see [`OpKey`]).
             ExprX::Logical(LogicalOp::Or, a, b)
                 if !self.in_init && !env.reads_post(a) && !env.reads_post(b) =>
             {
@@ -1885,7 +1896,7 @@ impl Exporter {
                 {
                     let printed: Vec<String> = args.iter().map(|a| self.expr(a, env)).collect();
                     self.conj_level = level;
-                    let name = self.ensure_function(&(fun.clone(), Variant::Record));
+                    let name = self.ensure_function(&(fun.clone(), Variant::Record, false));
                     return format!("{name}({})", printed.join(", "));
                 }
                 // Every state argument fits its role (checked above): it is
@@ -1893,15 +1904,19 @@ impl Exporter {
                 // selects the primed variant.
                 let mut printed = Vec::new();
                 let mut variant = Variant::Plain;
+                let mut post_args = false;
                 for (i, a) in args.iter().enumerate() {
                     match (roles.get(i).copied().flatten(), arg_role(a)) {
                         (Some(Role::Pre), Some(Role::Post)) => variant = Variant::Primed,
                         (Some(_), _) => {}
-                        (None, _) => printed.push(self.expr(a, env)),
+                        (None, _) => {
+                            post_args |= env.reads_post(a);
+                            printed.push(self.expr(a, env));
+                        }
                     }
                 }
                 self.conj_level = level;
-                let name = self.ensure_function(&(fun.clone(), variant));
+                let name = self.ensure_function(&(fun.clone(), variant, post_args));
                 if printed.is_empty() { name } else { format!("{name}({})", printed.join(", ")) }
             }
             CallTarget::FnSpec(f) => {
@@ -1960,10 +1975,17 @@ impl Exporter {
         for ((name, typ), a) in params.zip(args.iter()) {
             if let Some(role) = read_var(a).and_then(|v| env.roles.get(&v).copied()) {
                 env2.roles.insert(name.clone(), role);
+                env2.primed.remove(&name);
                 continue;
             }
             env2.roles.remove(&name);
             env2.names.remove(&name);
+            // A parameter given a value that reads the post state reads it.
+            if env.reads_post(a) {
+                env2.primed.insert(name.clone());
+            } else {
+                env2.primed.remove(&name);
+            }
             env2.values.insert(name.clone(), (peel(a), Box::new(env.clone())));
             if !typ_has_specfn(&typ, &self.datatypes, &mut HashSet::new()) {
                 let value = self.expr(a, env);
@@ -2512,7 +2534,9 @@ impl Exporter {
     /// The arms of the `match` on `x` that `e` is, or that the body of the
     /// function `e` calls with `x` is, with the scope the arms read: the
     /// callee's state parameters in the roles of the state arguments, its
-    /// other parameters (besides the one `x` fills) unbound.
+    /// other parameters unbound. The scrutinee (`x`, or the parameter it
+    /// fills) is unbound too: a field's domain sits outside the `LET` that
+    /// binds it.
     fn match_on(
         &mut self,
         e: &Expr,
@@ -2521,7 +2545,7 @@ impl Exporter {
     ) -> Option<(Arms, Env, Vec<VarIdent>)> {
         let is_x = |p: &Place| place_var(p).as_ref() == Some(x) && matches!(p.x, PlaceX::Local(_));
         if let ExprX::Match(place, arms, _) = &e.x {
-            return is_x(place).then(|| (arms.clone(), env.clone(), vec![]));
+            return is_x(place).then(|| (arms.clone(), env.clone(), vec![x.clone()]));
         }
         let ExprX::Call { target: CallTarget::Fun(kind, fun, ..), args, .. } = &e.x else {
             return None;
@@ -2537,6 +2561,7 @@ impl Exporter {
             let arg = read_var(a);
             if arg.as_ref() == Some(x) && p.x.name == scrutinee {
                 found = true;
+                unbound.push(p.x.name.clone());
             } else if let Some(role) = arg.as_ref().and_then(|v| env.roles.get(v)) {
                 callee_env.roles.insert(p.x.name.clone(), *role);
             } else {
@@ -2622,8 +2647,14 @@ impl Exporter {
             match &e.x {
                 ExprX::Block(stmts, Some(tail)) => {
                     for st in stmts.iter() {
-                        let StmtX::Decl { pattern, init: Some(init), .. } = &st.x else { continue };
-                        let PatternX::Var(PatternBinding { name, .. }) = &pattern.x else {
+                        let StmtX::Decl { pattern, init, .. } = &st.x else { continue };
+                        // A local this does not bind (a destructuring `let`,
+                        // or one with no value) is not in scope of the
+                        // domain: a guard reading it bounds nothing.
+                        let (PatternX::Var(PatternBinding { name, .. }), Some(init)) =
+                            (&pattern.x, init)
+                        else {
+                            pattern_names(pattern, &mut unbound);
                             continue;
                         };
                         let reads_unbound = match &init.x {
@@ -3365,7 +3396,7 @@ impl Exporter {
             self.assign_through_call(key, reach);
             return name;
         }
-        let (fun, variant) = key;
+        let (fun, variant, post_args) = key;
         let Some(f) = self.functions.get(fun).cloned() else { return name };
         self.emitting.insert(key.clone());
         let previous = std::mem::replace(&mut self.current, fun_as_friendly_rust_name(fun));
@@ -3396,6 +3427,11 @@ impl Exporter {
                 None => {
                     let n = self.bind_var(&mut env, &p.x.name);
                     params.push(n);
+                    // The record variant is one operator for every call,
+                    // some of which may pass the post state.
+                    if *post_args || *variant == Variant::Record {
+                        env.primed.insert(p.x.name.clone());
+                    }
                 }
             }
         }
@@ -3411,7 +3447,7 @@ impl Exporter {
                         None => env.name(&p.x.name),
                     })
                     .collect();
-            let rec = self.ensure_function(&(fun.clone(), Variant::Record));
+            let rec = self.ensure_function(&(fun.clone(), Variant::Record, false));
             format!("{rec}({})", args.join(", "))
         } else {
             match &f.x.body {
@@ -3423,7 +3459,7 @@ impl Exporter {
             if params.is_empty() { name.clone() } else { format!("{name}({})", params.join(", ")) };
         let mut def = String::new();
         def.push_str(&format!(
-            "\\* {}{}, {}\n",
+            "\\* {}{}{}, {}\n",
             fun_as_friendly_rust_name(fun),
             match variant {
                 Variant::Plain if !f.x.decrease.is_empty() => " (applies the record variant)",
@@ -3431,6 +3467,7 @@ impl Exporter {
                 Variant::Primed => " (read in the post state)",
                 Variant::Record => " (the state passed as a record)",
             },
+            if *post_args { " (given an argument read in the post state)" } else { "" },
             span_string(&f.span)
         ));
         self.arity.insert(name.clone(), params.len());
@@ -3856,6 +3893,26 @@ fn pattern_could_match(p: &Pattern, variant: &Ident) -> bool {
         PatternX::Or(a, b) => pattern_could_match(a, variant) || pattern_could_match(b, variant),
         PatternX::MutRef(inner) | PatternX::ImmutRef(inner) => pattern_could_match(inner, variant),
         PatternX::Wildcard(_) | PatternX::Var(_) | PatternX::Expr(_) | PatternX::Range(..) => true,
+    }
+}
+
+/// The names a pattern binds, pushed onto `out`.
+fn pattern_names(p: &Pattern, out: &mut Vec<VarIdent>) {
+    match &p.x {
+        PatternX::Var(b) => out.push(b.name.clone()),
+        PatternX::Binding { binding, sub_pat } => {
+            out.push(binding.name.clone());
+            pattern_names(sub_pat, out);
+        }
+        PatternX::Wildcard(_) | PatternX::Expr(_) | PatternX::Range(..) => {}
+        PatternX::Constructor(_, _, binders) => {
+            binders.iter().for_each(|b| pattern_names(&b.a, out));
+        }
+        PatternX::Or(a, b) => {
+            pattern_names(a, out);
+            pattern_names(b, out);
+        }
+        PatternX::MutRef(inner) | PatternX::ImmutRef(inner) => pattern_names(inner, out),
     }
 }
 
@@ -4364,7 +4421,7 @@ pub fn export_module(krate: &Krate, arg: &str) -> Result<Export, String> {
     if verus_tla {
         for (i, r) in roots.iter().enumerate() {
             let f = ex.functions.get(r).cloned().ok_or("root missing")?;
-            let key = (r.clone(), Variant::Plain);
+            let key = (r.clone(), Variant::Plain, false);
             let name = ex.op_name(&key);
             ex.current = fun_as_friendly_rust_name(r);
             ex.bound.clear();
@@ -4412,20 +4469,20 @@ pub fn export_module(krate: &Krate, arg: &str) -> Result<Export, String> {
         }
     } else {
         ex.in_init = true;
-        init_name = ex.ensure_function(&(triple.init.clone(), Variant::Plain));
+        init_name = ex.ensure_function(&(triple.init.clone(), Variant::Plain, false));
         ex.in_init = false;
-        next_name = ex.ensure_function(&(triple.next.clone(), Variant::Plain));
+        next_name = ex.ensure_function(&(triple.next.clone(), Variant::Plain, false));
         // A predicate init or next reads, unprimed or primed, is a guard or helper of
         // the transition, not an invariant, unless the command line names
         // it; it is reported as excluded, never dropped silently.
         let transitions: HashSet<OpKey> = ex.emitted.clone();
         for r in &selected {
-            let key = (r.clone(), Variant::Plain);
+            let key = (r.clone(), Variant::Plain, false);
             // Read primed (`p(post)` in next), or given a state value, is a
             // guard too.
             let reached = [Variant::Plain, Variant::Primed, Variant::Record]
                 .iter()
-                .any(|v| transitions.contains(&(r.clone(), *v)));
+                .any(|v| [false, true].iter().any(|p| transitions.contains(&(r.clone(), *v, *p))));
             if !triple.explicit && reached {
                 outcome.insert(
                     r.clone(),
@@ -4489,7 +4546,7 @@ pub fn export_module(krate: &Krate, arg: &str) -> Result<Export, String> {
         }
         invs.retain(|(f, _, _)| !helpers.contains(f));
     }
-    let transitions = ex.transitions(&(triple.next.clone(), Variant::Plain));
+    let transitions = ex.transitions(&(triple.next.clone(), Variant::Plain, false));
     let init_unassigned = match ex.functions.get(&triple.init).and_then(|f| f.x.body.clone()) {
         // verus-tla: the initial predicate is the body of the closure `init()`
         // returns, over its one parameter.
@@ -4528,7 +4585,7 @@ pub fn export_module(krate: &Krate, arg: &str) -> Result<Export, String> {
                 outcome.get(f).cloned().unwrap_or_else(|| (*selected, reason.clone()));
             Candidate {
                 function: fun_as_friendly_rust_name(f),
-                operator: ex.op_names.get(&(f.clone(), Variant::Plain)).cloned(),
+                operator: ex.op_names.get(&(f.clone(), Variant::Plain, false)).cloned(),
                 included,
                 reason,
             }
