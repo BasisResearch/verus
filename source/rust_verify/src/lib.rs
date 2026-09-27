@@ -52,6 +52,7 @@ pub mod file_loader;
 mod fn_call_to_vir;
 mod hir_hide_reveal_rewrite;
 mod import_export;
+pub mod observers;
 pub mod profiler;
 mod provenance;
 mod reach;
@@ -73,6 +74,7 @@ mod scaffold;
 #[cfg(feature = "singular")]
 pub mod singular;
 mod spans;
+pub mod test_observer;
 pub mod trait_check;
 mod trait_check_ast;
 mod trait_check_emit;

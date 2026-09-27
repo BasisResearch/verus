@@ -29,6 +29,75 @@ use rustc_error_messages::MultiSpan;
 use rustc_index::bit_set::DenseBitSet;
 use rustc_middle::ty::TyCtxt;
 use rustc_span::Span;
+
+/// Build the observer registry for a given observer name. The concrete type is
+/// known here, so each `Arc<Mutex<Concrete>>` is coerced (unsizing) into an
+/// independent per-trait handle. A consumer that implements only a subset of the
+/// traits populates only those slots. `TestObserver` implements all three.
+fn create_observer(name: &str) -> vir::vir_observer::Observers {
+    use std::sync::{Arc, Mutex};
+    match name {
+        "test" => {
+            let o = Arc::new(Mutex::new(crate::test_observer::TestObserver::new()));
+            let vir: vir::vir_observer::VirObserverHandle = o.clone();
+            let air: air::air_observer::AirObserverHandle = o.clone();
+            let query_result: air::query_result_observer::QueryResultObserverHandle = o.clone();
+            vir::vir_observer::Observers {
+                vir: Some(vir),
+                air: Some(air),
+                query_result: Some(query_result),
+            }
+        }
+        // Dedicated single-trait observers: each populates only its own slot,
+        // proving a consumer couples nothing it does not implement.
+        "air-only" => {
+            let o = Arc::new(Mutex::new(crate::test_observer::AirOnlyObserver::new()));
+            let air: air::air_observer::AirObserverHandle = o;
+            vir::vir_observer::Observers { air: Some(air), ..Default::default() }
+        }
+        "query-result-only" => {
+            let o = Arc::new(Mutex::new(crate::test_observer::QueryResultOnlyObserver::new()));
+            let qr: air::query_result_observer::QueryResultObserverHandle = o;
+            vir::vir_observer::Observers { query_result: Some(qr), ..Default::default() }
+        }
+        "vir-only" => {
+            let o = Arc::new(Mutex::new(crate::test_observer::VirOnlyObserver::new()));
+            let vir: vir::vir_observer::VirObserverHandle = o;
+            vir::vir_observer::Observers { vir: Some(vir), ..Default::default() }
+        }
+        // parse_args rejected any other name
+        _ => unreachable!("unknown observer {name}"),
+    }
+}
+
+fn create_observer_from_args(names: &[String]) -> vir::vir_observer::Observers {
+    // `coverage` and `proof-state` are one object, so they may be named together.
+    if let Some(o) = crate::observers::ObligationObserver::from_names(names) {
+        let o = Arc::new(std::sync::Mutex::new(o));
+        let air: air::air_observer::AirObserverHandle = o.clone();
+        let query_result: air::query_result_observer::QueryResultObserverHandle = o;
+        return vir::vir_observer::Observers {
+            air: Some(air),
+            query_result: Some(query_result),
+            ..Default::default()
+        };
+    }
+    // parse_args allows a test observer only alone
+    names.first().map_or_else(Default::default, |n| create_observer(n))
+}
+
+fn emit_observer_summaries(any: &dyn std::any::Any, reporter: &impl air::messages::Diagnostics) {
+    if let Some(o) = any.downcast_ref::<crate::test_observer::TestObserver>() {
+        reporter.report(&note_bare(&o.summary_json()).to_any());
+    } else if let Some(o) = any.downcast_ref::<crate::test_observer::AirOnlyObserver>() {
+        reporter.report(&note_bare(&o.summary_json()).to_any());
+    } else if let Some(o) = any.downcast_ref::<crate::test_observer::QueryResultOnlyObserver>() {
+        reporter.report(&note_bare(&o.summary_json()).to_any());
+    } else if let Some(o) = any.downcast_ref::<crate::test_observer::VirOnlyObserver>() {
+        reporter.report(&note_bare(&o.summary_json()).to_any());
+    }
+}
+
 use rustc_span::def_id::LOCAL_CRATE;
 use rustc_span::source_map::SourceMap;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -433,6 +502,9 @@ pub struct Verifier {
     /// Under `-V inst-pressure`: what cvc5 reported for each query of each
     /// function, by qid, in check order
     func_inst_pressure: HashMap<Fun, Vec<QueryInstPressure>>,
+    /// Under `-V observers=coverage` / `proof-state`: each query's
+    /// obligations and failing-assert counterexamples, not yet rendered.
+    func_observations: HashMap<Fun, Vec<crate::observers::FiledQuery>>,
     /// Errors to report after verification has run
     deferred_errors: Vec<VirErr>,
     /// Every diagnostic raised while verifying a function's obligations,
@@ -504,6 +576,12 @@ pub struct FuncDetails {
     /// filled under `-V inst-pressure`
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub inst_pressure: Vec<ResolvedQueryInstPressure>,
+    /// filled under `-V observers=coverage`
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub obligations: Vec<crate::observers::QueryObligations>,
+    /// filled under `-V observers=proof-state`
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub failing_asserts: Vec<crate::observers::FailingAssert>,
 }
 
 impl Default for FuncDetails {
@@ -517,6 +595,8 @@ impl Default for FuncDetails {
             nl_frontier: Default::default(),
             matching_loops: Default::default(),
             inst_pressure: Default::default(),
+            obligations: Default::default(),
+            failing_asserts: Default::default(),
         }
     }
 }
@@ -531,6 +611,8 @@ impl FuncDetails {
         self.nl_frontier.extend(other.nl_frontier);
         self.matching_loops.extend(other.matching_loops);
         self.inst_pressure.extend(other.inst_pressure);
+        self.obligations.extend(other.obligations);
+        self.failing_asserts.extend(other.failing_asserts);
     }
 
     pub fn to_json(&self) -> serde_json::Value {
@@ -708,6 +790,7 @@ impl Verifier {
             func_nl_frontier: HashMap::new(),
             func_matching_loops: HashMap::new(),
             func_inst_pressure: HashMap::new(),
+            func_observations: HashMap::new(),
             deferred_errors: Vec::new(),
             raised_diagnostics: Vec::new(),
             reported_diagnostics: Vec::new(),
@@ -770,6 +853,7 @@ impl Verifier {
             func_nl_frontier: HashMap::new(),
             func_matching_loops: HashMap::new(),
             func_inst_pressure: HashMap::new(),
+            func_observations: HashMap::new(),
             deferred_errors: Vec::new(),
             raised_diagnostics: Vec::new(),
             reported_diagnostics: Vec::new(),
@@ -828,6 +912,9 @@ impl Verifier {
         }
         for (fun, queries) in other.func_inst_pressure {
             self.func_inst_pressure.entry(fun).or_default().extend(queries);
+        }
+        for (fun, queries) in other.func_observations {
+            self.func_observations.entry(fun).or_default().extend(queries);
         }
         self.deferred_errors.extend(other.deferred_errors);
     }
@@ -1143,6 +1230,9 @@ impl Verifier {
         let mut invalidity = false;
         let mut timed_out = false;
         let mut used_axioms = None;
+        // the ids of this query's failures without a model, which an
+        // observer's Invalid callback did not see
+        let mut failed_here: Vec<Option<AssertId>> = Vec::new();
         // 0 for the query's first check, then one per multi-error round
         let mut round = 0usize;
         loop {
@@ -1275,6 +1365,10 @@ impl Verifier {
                 ValidityResult::Invalid(None, error, assert_id_opt)
                 | ValidityResult::Invalid(_, error @ None, assert_id_opt) => {
                     // no model, but the obligation may still be known
+                    // No model, so no observer callback: the observer
+                    // places this failure from its id (none for a
+                    // bit-vector assert) when the query is drained.
+                    failed_here.push(assert_id_opt.clone());
                     // Borrowed, not moved: the report reads the same id below.
                     if let Some(assert_id) = &assert_id_opt {
                         if prover_choice == vir::def::ProverChoice::DefaultProver {
@@ -1305,6 +1399,7 @@ impl Verifier {
                     break;
                 }
                 ValidityResult::Invalid(Some(air_model), Some(error), assert_id_opt) => {
+                    // The observer saw this one through its Invalid callback.
                     // Borrowed, not moved: the report reads the same id below.
                     if let Some(assert_id) = &assert_id_opt {
                         if prover_choice == vir::def::ProverChoice::DefaultProver {
@@ -1406,6 +1501,23 @@ impl Verifier {
         }
 
         if is_check_valid && !is_singular {
+            if let Some(obs) = air_context.query_result_observer() {
+                let mut obs = obs.lock().unwrap();
+                if let Some(o) =
+                    obs.as_any_mut().downcast_mut::<crate::observers::ObligationObserver>()
+                {
+                    if let Some(raw) = o.take_query(&failed_here, timed_out, only_check_earlier) {
+                        self.func_observations.entry(context.fun.clone()).or_default().push(
+                            crate::observers::FiledQuery {
+                                desc: context.desc.clone(),
+                                span: context.span.as_string.clone(),
+                                kind: query_op.kind(),
+                                raw,
+                            },
+                        );
+                    }
+                }
+            }
             air_context.finish_query();
         }
 
@@ -1633,6 +1745,17 @@ impl Verifier {
                 ))
                 .to_any(),
             );
+        }
+    }
+
+    /// Render each query's observed obligations and counterexamples as
+    /// source, per function.
+    fn resolve_observations(&mut self, names: &vir::air_names::SourceNames) {
+        for (fun, queries) in std::mem::take(&mut self.func_observations) {
+            let (obligations, failing) = crate::observers::resolve(names, queries);
+            let details = self.func_details.entry(fun).or_default();
+            details.obligations.extend(obligations);
+            details.failing_asserts.extend(failing);
         }
     }
 
@@ -1885,6 +2008,10 @@ impl Verifier {
             prover_choice,
         )?;
 
+        // Attach the same shared observer object to the spinoff context via its
+        // per-trait handles (real trait-object views of one object — no bridge).
+        air_context.set_observers(ctx.air_observer.clone(), ctx.query_result_observer.clone());
+
         // Write the span of spun-off query
         air_context.comment(&span.as_string);
         air_context.blank_line();
@@ -1962,6 +2089,13 @@ impl Verifier {
             profile_all_file_name.as_ref(),
             vir::def::ProverChoice::DefaultProver,
         )?;
+
+        // Attach the same shared observer object to air::Context via its per-trait
+        // handles. All views point at one object; the Arc keeps it alive on both
+        // ctx (VIR callbacks during lowering) and air_context (AIR callbacks +
+        // query results during verification).
+        air_context.set_observers(ctx.air_observer.clone(), ctx.query_result_observer.clone());
+
         if self.args.solver_version_check {
             air_context.set_expected_solver_version(match self.args.solver {
                 air::context::SmtSolver::Z3 => crate::consts::expected_z3_version().to_string(),
@@ -2615,6 +2749,16 @@ impl Verifier {
         let (time_smt_init, time_smt_run) = air_context.get_time();
         let rlimit_count = air_context.get_rlimit_count();
 
+        // Emit observer summaries as diagnostic notes. Only one underlying object
+        // exists; try each handle (a single-trait observer populates only one).
+        if let Some(obs_cell) = &ctx.observer {
+            emit_observer_summaries(obs_cell.lock().unwrap().as_any(), reporter);
+        } else if let Some(obs_cell) = &ctx.air_observer {
+            emit_observer_summaries(obs_cell.lock().unwrap().as_any(), reporter);
+        } else if let Some(obs_cell) = &ctx.query_result_observer {
+            emit_observer_summaries(obs_cell.lock().unwrap().as_any(), reporter);
+        }
+
         if let Some(journal) = resident {
             self.resident_buckets.push(crate::resident::RetainedBucket::new(
                 bucket_id.clone(),
@@ -2698,6 +2842,7 @@ impl Verifier {
             fndef_types,
             resolved_typs.unwrap(),
             self.args.debugger,
+            create_observer_from_args(&self.args.observers),
         )?;
         if self.args.log_all || self.args.log_args.log_vir_poly {
             let mut file =
@@ -3283,6 +3428,9 @@ impl Verifier {
         self.resolve_unknown_reasons(&global_ctx);
         // Join the diagnostics raised while verifying to their source spans.
         self.resolve_raised_diagnostics(&reporter);
+        if !self.func_observations.is_empty() {
+            self.resolve_observations(&global_ctx.air_source_names.borrow().clone());
+        }
         // Join what cvc5 reported (matching loops, instantiation pressure,
         // difficulty, provenance, nonlinear frontiers) back to source, per
         // function. The joins read the same symbols.

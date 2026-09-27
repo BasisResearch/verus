@@ -541,6 +541,9 @@ pub struct Context {
     name_counters: Vec<NameCounters>,
     pub(crate) typing: Typing,
     pub(crate) debug: bool,
+    pub(crate) air_observer: Option<crate::air_observer::AirObserverHandle>,
+    pub(crate) query_result_observer:
+        Option<crate::query_result_observer::QueryResultObserverHandle>,
     pub(crate) ignore_unexpected_smt: bool,
     pub(crate) rlimit: u32,
     pub(crate) air_initial_log: Emitter,
@@ -687,6 +690,8 @@ impl Context {
                 solver: solver.clone(),
             },
             debug: false,
+            air_observer: None,
+            query_result_observer: None,
             ignore_unexpected_smt: false,
             rlimit: 0,
             air_initial_log: Emitter::new(
@@ -804,6 +809,24 @@ impl Context {
         }
         let smt_data = self.smt_log.take_pipe_data();
         self.get_smt_process().send_commands(smt_data)
+    }
+
+    /// Register observers for AIR passes and for solver results. Either may be `None`;
+    /// with none registered every observer hook is a no-op.
+    pub fn set_observers(
+        &mut self,
+        air_observer: Option<crate::air_observer::AirObserverHandle>,
+        query_result_observer: Option<crate::query_result_observer::QueryResultObserverHandle>,
+    ) {
+        self.air_observer = air_observer;
+        self.query_result_observer = query_result_observer;
+    }
+
+    /// The query-result observer `set_observers` registered, if any.
+    pub fn query_result_observer(
+        &self,
+    ) -> Option<&crate::query_result_observer::QueryResultObserverHandle> {
+        self.query_result_observer.as_ref()
     }
 
     pub fn set_air_initial_log(&mut self, writer: Box<dyn std::io::Write + Send>) {
@@ -1555,11 +1578,22 @@ impl Context {
                 return ValidityResult::TypeError(err);
             }
         };
-        let (query, snapshots, local_vars, variable_versions) = crate::var_to_const::lower_query(
-            &query,
-            self.provenance || self.egraph_request.is_some() || self.speculation.is_some(),
-        );
+        let (query, snapshots, local_vars, variable_versions) = {
+            // Scope the borrow so it is released before `on_query_lowered` below
+            // (both use the same shared observer handle — no reentrant borrow).
+            let mut guard = self.air_observer.as_ref().map(|o| o.lock().unwrap());
+            let obs_ref =
+                guard.as_mut().map(|g| &mut **g as &mut dyn crate::air_observer::AirObserver);
+            crate::var_to_const::lower_query(
+                &query,
+                self.provenance || self.egraph_request.is_some() || self.speculation.is_some(),
+                obs_ref,
+            )
+        };
         self.variable_versions = variable_versions;
+        if let Some(o) = &self.air_observer {
+            o.lock().unwrap().on_query_lowered(&query, &snapshots, &local_vars);
+        }
         self.air_middle_log.log_query(&query);
         let query = crate::block_to_assert::lower_query(message_interface, &query);
         self.air_final_log.log_query(&query);
@@ -1628,6 +1662,40 @@ impl Context {
             panic!("unexpected output from SMT eval {:?}", smt_output);
         }
         smt_output[0].clone()
+    }
+
+    /// Evaluate an AIR expression against the current solver model as a boolean.
+    /// Returns `Some(true)` / `Some(false)` if the solver returns a boolean,
+    /// `None` if the expression is non-boolean or evaluation fails.
+    pub fn evaluate_bool(&mut self, expr: &crate::ast::Expr) -> Option<bool> {
+        let printer =
+            crate::printer::Printer::new(self.message_interface.clone(), true, self.solver.clone());
+        let node = printer.expr_to_node(expr);
+        // A compound value (a quantified formula, a datatype constructor)
+        // may span several lines; it is never a boolean, so it reads as None.
+        match self.solver {
+            SmtSolver::Z3 => {
+                self.smt_log.log_eval(node);
+                let smt_data = self.smt_log.take_pipe_data();
+                match self.get_smt_process().send_commands(smt_data).as_slice() {
+                    [line] if line == "true" => Some(true),
+                    [line] if line == "false" => Some(false),
+                    _ => None,
+                }
+            }
+            // cvc5 has no `eval`: it takes the command for an unknown one
+            // and the reader loses its place in the solver's output.
+            // `get-value` answers `((expr value))` on one line.
+            SmtSolver::Cvc5 => {
+                self.smt_log.log_get_value(node);
+                let smt_data = self.smt_log.take_pipe_data();
+                match self.get_smt_process().send_commands(smt_data).as_slice() {
+                    [line] if line.ends_with(" true))") => Some(true),
+                    [line] if line.ends_with(" false))") => Some(false),
+                    _ => None,
+                }
+            }
+        }
     }
 
     pub fn command(

@@ -119,7 +119,7 @@ fn update_breaks_to_versions(
     }
 }
 
-struct LowerStmtState {
+struct LowerStmtState<'a> {
     decls: Vec<Decl>,
     break_versions: HashMap<Ident, Vec<IndexMap<Ident, u32>>>,
     version_decls: HashSet<Ident>,
@@ -129,6 +129,7 @@ struct LowerStmtState {
     /// When kept, each assert reached, with the versions and snapshots in
     /// force there.
     goal_scopes: Option<Vec<(Option<AssertId>, GoalScope)>>,
+    observer: Option<&'a mut dyn crate::air_observer::AirObserver>,
 }
 
 /// The variable versions and snapshots in force at one assert of a query:
@@ -145,7 +146,7 @@ impl GoalScope {
     /// occurrence; without a `goal`, or when no assert has it, the query's
     /// last assert; before any statement when it has none.
     pub fn of(query: &Query, goal: Option<&AssertId>) -> Self {
-        let (_, _, _, _, entry, scopes) = lower_query_with(query, false, true);
+        let (_, _, _, _, entry, scopes) = lower_query_with(query, false, true, None);
         let scopes = scopes.unwrap_or_default();
         let wanted = goal.and_then(|goal| {
             scopes.iter().find(|(id, _)| id.as_ref().is_some_and(|id| **id == **goal))
@@ -168,8 +169,29 @@ impl GoalScope {
     }
 }
 
+impl LowerStmtState<'_> {
+    /// Version `n` of `x` came into being as `versioned`: recorded for the
+    /// context's own readers when asked (`record_versions`), and announced to
+    /// the observer. The declared version 0 of each variable is recorded
+    /// where it is declared, before any statement.
+    fn notify_version_created(
+        &mut self,
+        x: &Ident,
+        n: u32,
+        versioned: &Ident,
+        kind: crate::air_observer::VersionOrigin,
+    ) {
+        if self.record_versions {
+            self.variable_versions.insert(versioned.to_string(), (x.to_string(), n));
+        }
+        if let Some(obs) = &mut self.observer {
+            obs.on_wp_version_created(versioned, kind);
+        }
+    }
+}
+
 fn lower_stmt(
-    state: &mut LowerStmtState,
+    state: &mut LowerStmtState<'_>,
     versions: &mut IndexMap<Ident, u32>,
     snapshots: &mut Snapshots,
     types: &HashMap<Ident, Typ>,
@@ -188,18 +210,23 @@ fn lower_stmt(
             stmt
         }
         StmtX::Havoc(x) | StmtX::Assign(x, _) => {
+            let is_havoc = matches!(&*stmt, StmtX::Havoc(_));
             let n = find_version(&versions, x);
             let typ = types[x].clone();
             versions.insert(x.clone(), n + 1);
-            if state.record_versions {
-                state.variable_versions.insert(rename_var(x, n + 1), (x.to_string(), n + 1));
-            }
+            let base = x;
             let x = Arc::new(rename_var(x, n + 1));
             if !state.version_decls.contains(&x) {
                 let decl = Arc::new(DeclX::Const(x.clone(), typ));
                 state.decls.push(decl);
                 state.version_decls.insert(x.clone());
             }
+            let kind = if is_havoc {
+                crate::air_observer::VersionOrigin::Havoc
+            } else {
+                crate::air_observer::VersionOrigin::Assign
+            };
+            state.notify_version_created(base, n + 1, &x, kind);
             match &*stmt {
                 StmtX::Assign(_, e) => {
                     let expr1 = Arc::new(ExprX::Var(x));
@@ -275,9 +302,10 @@ fn lower_stmt(
 pub(crate) fn lower_query(
     query: &Query,
     record_versions: bool,
+    observer: Option<&mut dyn crate::air_observer::AirObserver>,
 ) -> (Query, Snapshots, Vec<Decl>, crate::context::VariableVersions) {
     let (query, snapshots, local_vars, versions, _, _) =
-        lower_query_with(query, record_versions, false);
+        lower_query_with(query, record_versions, false, observer);
     (query, snapshots, local_vars, versions)
 }
 
@@ -287,6 +315,7 @@ fn lower_query_with(
     query: &Query,
     record_versions: bool,
     record_goal_scopes: bool,
+    observer: Option<&mut dyn crate::air_observer::AirObserver>,
 ) -> (
     Query,
     Snapshots,
@@ -339,6 +368,7 @@ fn lower_query_with(
         variable_versions,
         record_versions,
         goal_scopes: record_goal_scopes.then(Vec::new),
+        observer,
     };
     let entry = GoalScope { versions: versions.clone(), snapshots: snapshots.clone() };
     let assertion = lower_stmt(&mut state, &mut versions, &mut snapshots, &types, assertion);
@@ -370,14 +400,14 @@ mod tests {
             })
         };
         let (_, _, _, versions) =
-            lower_query(&query(vec![Arc::new(StmtX::Havoc(name.clone()))]), true);
+            lower_query(&query(vec![Arc::new(StmtX::Havoc(name.clone()))]), true, None);
         assert_eq!(versions.get("balance@0"), Some(&("balance@".into(), 0)));
         assert_eq!(versions.get("balance@1"), Some(&("balance@".into(), 1)));
-        let (_, _, _, versions) = lower_query(&query(vec![]), true);
+        let (_, _, _, versions) = lower_query(&query(vec![]), true, None);
         assert_eq!(versions.len(), 1);
         assert!(!versions.contains_key("balance@1"));
         let (_, _, _, versions) =
-            lower_query(&query(vec![Arc::new(StmtX::Havoc(name.clone()))]), false);
+            lower_query(&query(vec![Arc::new(StmtX::Havoc(name.clone()))]), false, None);
         assert!(versions.is_empty());
     }
 
@@ -418,5 +448,59 @@ mod tests {
         assert_eq!(read(Some(Arc::new(vec![1]))), ("y@1".to_string(), "y@1".to_string()));
         assert_eq!(read(None), ("y@1".to_string(), "y@1".to_string()));
         assert_eq!(read(Some(Arc::new(vec![7]))), ("y@1".to_string(), "y@1".to_string()));
+    }
+
+    /// A merge takes the highest version a branch reached, so every version
+    /// the lowered query declares was announced where a branch created it.
+    #[test]
+    fn merges_announce_no_versions_of_their_own() {
+        struct Announced(Vec<(String, crate::air_observer::VersionOrigin)>);
+        impl crate::air_observer::AirObserver for Announced {
+            fn on_wp_version_created(
+                &mut self,
+                versioned: &Ident,
+                kind: crate::air_observer::VersionOrigin,
+            ) {
+                self.0.push((versioned.to_string(), kind));
+            }
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+            fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+                self
+            }
+        }
+        let x = Arc::new("x@".to_string());
+        let havoc = || Arc::new(StmtX::Havoc(x.clone()));
+        let block = |ss: Vec<Stmt>| Arc::new(StmtX::Block(Arc::new(ss)));
+        let label = Arc::new("l".to_string());
+        // a switch whose branches reach x@1 and x@2, then a breakable whose
+        // break leaves at x@3 and whose fallthrough reaches x@4
+        let query = Arc::new(QueryX {
+            local: Arc::new(vec![Arc::new(DeclX::Var(x.clone(), Arc::new(crate::ast::TypX::Int)))]),
+            assertion: block(vec![
+                Arc::new(StmtX::Switch(Arc::new(vec![
+                    block(vec![havoc()]),
+                    block(vec![havoc(), havoc()]),
+                ]))),
+                Arc::new(StmtX::Breakable(
+                    label.clone(),
+                    block(vec![havoc(), Arc::new(StmtX::Break(label.clone())), havoc()]),
+                )),
+            ]),
+        });
+        let mut announced = Announced(Vec::new());
+        let (_, _, decls, _) = lower_query(&query, false, Some(&mut announced));
+        let declared: Vec<String> = decls
+            .iter()
+            .filter_map(|d| match &**d {
+                DeclX::Const(c, _) if **c != "x@0" => Some(c.to_string()),
+                _ => None,
+            })
+            .collect();
+        let names: Vec<String> = announced.0.iter().map(|(n, _)| n.clone()).collect();
+        assert_eq!(names, ["x@1", "x@1", "x@2", "x@3", "x@4"]);
+        assert!(declared.iter().all(|d| names.contains(d)), "{:?} vs {:?}", declared, names);
+        assert!(announced.0.iter().all(|(_, k)| *k == crate::air_observer::VersionOrigin::Havoc));
     }
 }

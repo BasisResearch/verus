@@ -151,6 +151,7 @@ pub struct ArgsX {
     pub reach: Option<String>,
     /// Serve retained AIR queries over stdin/stdout after compilation.
     pub resident: bool,
+    pub observers: Vec<String>,
 }
 
 impl ArgsX {
@@ -209,6 +210,7 @@ impl ArgsX {
             inst_pressure: Default::default(),
             reach: Default::default(),
             resident: false,
+            observers: Default::default(),
         }
     }
 }
@@ -464,6 +466,7 @@ pub fn parse_args_with_imports(
     const EXTENDED_INST_PRESSURE: &str = "inst-pressure";
     const EXTENDED_DIFFICULTY: &str = "difficulty";
     const EXTENDED_TLA_EXPORT: &str = "tla-export";
+    const EXTENDED_OBSERVERS: &str = "observers";
     const EXTENDED_KEYS: &[(&str, &str)] = &[
         (
             EXTENDED_INST_PRESSURE,
@@ -518,6 +521,10 @@ pub fn parse_args_with_imports(
         (
             EXTENDED_NO_BV_SIMPLIFY,
             "internal option to disable simplification of bit-vector assertions before sending to the SMT solver",
+        ),
+        (
+            EXTENDED_OBSERVERS,
+            "Comma-separated observers: coverage and/or proof-state (reported in func-details under --output-json/--report-json)",
         ),
     ];
 
@@ -970,7 +977,18 @@ pub fn parse_args_with_imports(
         },
         inst_pressure: extended.contains_key(EXTENDED_INST_PRESSURE),
         resident: matches.opt_present(OPT_RESIDENT),
+        observers: extended
+            .get(EXTENDED_OBSERVERS)
+            .and_then(|v| v.as_ref())
+            .map(|s| s.split(',').map(|s| s.trim().to_string()).collect::<Vec<_>>())
+            .unwrap_or_default(),
     };
+
+    if extended.contains_key(EXTENDED_OBSERVERS) {
+        if let Err(msg) = crate::observers::check_names(&args.observers) {
+            error(format!("-V {EXTENDED_OBSERVERS}: {msg}"));
+        }
+    }
 
     if args.nl_frontier && !matches!(args.solver, SmtSolver::Cvc5) {
         error(

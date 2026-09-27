@@ -337,7 +337,7 @@ pub struct ProbeDetail {
 /// its switch (declared among the query's locals).
 fn prepare(context: &mut Context, query: &Query) -> Result<(Query, Vec<Fact>), TypeError> {
     let query = crate::typecheck::check_query(context, query)?;
-    let (query, _, _, _) = crate::var_to_const::lower_query(&query, false);
+    let (query, _, _, _) = crate::var_to_const::lower_query(&query, false, None);
     let mut facts = Vec::new();
     let assertion = mark_facts(&query.assertion, &mut facts);
     let mut local = (*query.local).clone();

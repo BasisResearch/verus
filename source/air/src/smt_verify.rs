@@ -112,6 +112,9 @@ pub(crate) fn smt_add_decl<'ctx>(context: &mut Context, decl: &Decl) {
             let mut infos: Vec<AssertionInfo> = Vec::new();
             let mut axiom_infos: Vec<AxiomInfo> = Vec::new();
             let labeled_expr = label_asserts(context, &mut infos, &mut axiom_infos, &expr);
+            if let Some(obs) = &context.air_observer {
+                obs.lock().unwrap().on_axiom_decl(&labeled_expr);
+            }
             for info in axiom_infos {
                 crate::typecheck::add_decl(context, &info.decl, true).unwrap();
                 context
@@ -637,6 +640,14 @@ pub(crate) fn smt_check_assertion<'ctx>(
             match reason.expect("expected :reason-unknown") {
                 SmtReasonUnknown::Canceled | SmtReasonUnknown::Unknown => {
                     context.state = ContextState::Canceled;
+                    // Notify observer of timeout/cancellation
+                    if let Some(obs) = &context.query_result_observer {
+                        obs.lock().unwrap().on_check_valid_result(
+                            &mut crate::query_result_observer::CheckValidResult::Timeout {
+                                assert_id: &None,
+                            },
+                        );
+                    }
                     ResultDetermination::Determined(ValidityResult::Canceled)
                 }
                 SmtReasonUnknown::Incomplete => ResultDetermination::Undetermined(false),
@@ -655,23 +666,21 @@ pub(crate) fn smt_check_assertion<'ctx>(
                 let smt_data = context.smt_log.take_pipe_data();
                 let smt_output = context.get_smt_process().send_commands(smt_data);
 
-                let mut smt_output = smt_output.into_iter();
-                let unsat_core_str =
-                    smt_output.next().expect("expected one line in the unsat core output");
-                assert!(smt_output.next().is_none());
-
-                let fun_names: Vec<Ident> = unsat_core_str
-                    .strip_prefix('(')
-                    .expect("invalid unsat core")
-                    .strip_suffix(')')
-                    .expect("invalid unsat core")
-                    .split_terminator(' ')
-                    .map(|x| Arc::new(x.to_owned()))
-                    .collect();
-                crate::context::UsageInfo::UsedAxioms(fun_names)
+                crate::context::UsageInfo::UsedAxioms(parse_unsat_core(&smt_output))
             } else {
                 crate::context::UsageInfo::None
             };
+
+            if let Some(obs) = &context.query_result_observer {
+                let assert_ids: Vec<Option<crate::ast::AssertId>> =
+                    infos.iter().map(|info| info.assert_id.clone()).collect();
+                obs.lock().unwrap().on_check_valid_result(
+                    &mut crate::query_result_observer::CheckValidResult::Valid {
+                        assert_ids: &assert_ids,
+                        usage_info: &usage_info,
+                    },
+                );
+            }
 
             ValidityResult::Valid(usage_info)
         }
@@ -1912,17 +1921,21 @@ fn smt_get_model(
     for def in model.iter() {
         model_defs.insert(def.name.clone(), def.clone());
     }
-    for info in infos.iter_mut() {
+    // The `QueryResultObserver::Invalid` callback exposes a live model evaluator
+    // (`eval_bool_expr`), so the solver model must stay valid across the callback.
+    // Disabling the failing assertion's label invalidates the model, so that step is
+    // deferred: first discover the failing assertion, then notify the observer while
+    // the model is live, and only then disable the label for subsequent check-sats.
+    // The disable step runs whether or not an observer is registered.
+    //
+    // Discover the failing assertion without disabling the label.
+    let mut discovered_info_index: Option<usize> = None;
+    for (i, info) in infos.iter().enumerate() {
         if let Some(def) = model_defs.get(&info.label) {
             if *def.body == "true" {
                 discovered_error = Some(info.clone());
                 discovered_assert_id = Some(info.assert_id.clone());
-
-                // Disable this label in subsequent check-sat calls to get additional errors
-                info.disabled = true;
-                let disable_label = mk_not(&ident_var(&info.label));
-                context.smt_log.log_assert(&None, &None, &disable_label);
-
+                discovered_info_index = Some(i);
                 break;
             }
         }
@@ -1956,6 +1969,31 @@ fn smt_get_model(
 
     let error = discovered_error.error;
     let e = context.message_interface.append_labels(&error, &discovered_additional_info);
+
+    // Notify the observer while the solver model is still valid.
+    // eval_expr calls context.evaluate_bool() which sends (eval ...) to the solver.
+    // This only works before the label is disabled (which invalidates the model).
+    // Clone the shared handle so `context` stays free for the eval_bool_expr closure.
+    let obs = context.query_result_observer.clone();
+    if let Some(obs) = &obs {
+        let assert_id = discovered_assert_id.clone().unwrap();
+        obs.lock().unwrap().on_check_valid_result(
+            &mut crate::query_result_observer::CheckValidResult::Invalid {
+                model_defs: &model_defs,
+                eval_bool_expr: &mut |expr| context.evaluate_bool(expr),
+                assert_id: &assert_id,
+                error: &e,
+            },
+        );
+    }
+
+    // Disable the label for subsequent check-sat calls (this invalidates the model).
+    if let Some(idx) = discovered_info_index {
+        infos[idx].disabled = true;
+        let disable_label = mk_not(&ident_var(&infos[idx].label));
+        context.smt_log.log_assert(&None, &None, &disable_label);
+    }
+
     context.state = ContextState::FoundInvalid(infos, Some(air_model.clone()));
     ValidityResult::Invalid(Some(air_model), Some(e), discovered_assert_id.unwrap())
 }
@@ -2058,6 +2096,53 @@ pub(crate) fn smt_check_query<'ctx>(
     }
 
     result
+}
+
+/// The names in a `(get-unsat-core)` reply. z3 prints the core on one line;
+/// cvc5 puts one name per line. Names may be `|quoted|`.
+pub(crate) fn parse_unsat_core(lines: &[String]) -> Vec<Ident> {
+    let text = lines.join(" ");
+    let body = text
+        .trim()
+        .strip_prefix('(')
+        .and_then(|t| t.strip_suffix(')'))
+        .unwrap_or_else(|| panic!("invalid unsat core: {:?}", lines));
+    let mut names = Vec::new();
+    let mut rest = body.trim_start();
+    while !rest.is_empty() {
+        let (name, tail) = match rest.strip_prefix('|') {
+            Some(quoted) => {
+                let end =
+                    quoted.find('|').unwrap_or_else(|| panic!("invalid unsat core: {:?}", lines));
+                (&quoted[..end], &quoted[end + 1..])
+            }
+            None => {
+                let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+                (&rest[..end], &rest[end..])
+            }
+        };
+        names.push(Arc::new(name.to_owned()));
+        rest = tail.trim_start();
+    }
+    names
+}
+
+#[cfg(test)]
+mod unsat_core_tests {
+    use super::parse_unsat_core;
+
+    fn names(lines: &[&str]) -> Vec<String> {
+        let lines: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
+        parse_unsat_core(&lines).iter().map(|n| n.to_string()).collect()
+    }
+
+    #[test]
+    fn unsat_core_parses_one_line_and_one_name_per_line() {
+        assert_eq!(names(&["(a b)"]), ["a", "b"]);
+        assert_eq!(names(&["()"]), Vec::<String>::new());
+        assert_eq!(names(&["(", "a", "|b c|", ")"]), ["a", "b c"]);
+        assert_eq!(names(&["(a", "b)"]), ["a", "b"]);
+    }
 }
 
 #[cfg(test)]

@@ -532,7 +532,10 @@ pub(crate) struct SolverState {
 }
 
 impl SolverState {
-    pub(crate) fn new(air: Context, journal: QueryJournal) -> Self {
+    pub(crate) fn new(mut air: Context, journal: QueryJournal) -> Self {
+        // `-V observers=` records are drained per query by the verifier's
+        // own query loop; a session's queries would feed them to no one.
+        air.set_observers(None, None);
         Self { air, journal }
     }
 }
@@ -6510,6 +6513,20 @@ mod tests {
         let names: BTreeSet<&str> = error.split('`').skip(3).step_by(2).collect();
         assert!(names.contains("list"), "unexpected serde message: {error}");
         assert_eq!(names, COMMANDS.iter().copied().collect::<BTreeSet<_>>(), "{error}");
+    }
+
+    /// A context a session keeps runs its queries with no `-V observers=`
+    /// attached: nothing would drain what they record.
+    #[test]
+    fn retained_contexts_carry_no_observers() {
+        let observer = Arc::new(std::sync::Mutex::new(
+            crate::observers::ObligationObserver::from_names(&["proof-state".to_string()]).unwrap(),
+        ));
+        let mut air = Context::new(Arc::new(VirMessageInterface {}), SmtSolver::Cvc5);
+        air.set_observers(Some(observer.clone()), Some(observer));
+        assert!(air.query_result_observer().is_some());
+        let state = SolverState::new(air, QueryJournal::new());
+        assert!(state.air.query_result_observer().is_none());
     }
 
     #[test]
