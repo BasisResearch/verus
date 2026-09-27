@@ -40,6 +40,13 @@
 //! a call cycle are declared RECURSIVE. A closure-valued
 //! variable is kept only symbolically; used other than in an application it
 //! is refused.
+//!
+//! verus-tla temporal properties (`TempPred`s: `always`, `eventually`,
+//! `leads_to`, `lift_state`, `weak_fairness`, ...) stated by a proof fn's
+//! `ensures` over the spec its `requires` give, or beside a spec fn `spec()`,
+//! are printed as TLA+ temporal formulas and checked as `PROPERTY`s; the
+//! fairness of their spec (`WF_vars`) goes into `Spec`, and is never
+//! assumed where the spec does not state it (see [`temporal_sources`]).
 
 use crate::ast::*;
 use crate::ast_util::{fun_as_friendly_rust_name, path_as_friendly_rust_name};
@@ -91,6 +98,39 @@ pub struct Transition {
     pub unassigned: Vec<String>,
 }
 
+/// A temporal property (a verus-tla `TempPred`), a `PROPERTY` in the `.cfg`.
+#[derive(Debug, Clone, Serialize)]
+pub struct Property {
+    pub operator: String,
+    /// The function stating it: a proof fn's `ensures`, or a spec fn beside
+    /// `spec()`.
+    pub function: String,
+    pub location: String,
+    pub formula: String,
+    /// The fairness conjuncts of its spec, as exported (`WF_vars(...)`).
+    pub fairness: Vec<String>,
+    /// Its spec's other conjuncts (neither `lift_state(init())`, `always(
+    /// lift_action(next()))` nor fairness), assumed as written.
+    pub assumptions: Vec<String>,
+    /// Where its spec came from.
+    pub spec: String,
+    /// Its spec states no fairness, so TLC checks it without any: a
+    /// behaviour may stop (stutter) anywhere.
+    pub without_fairness: bool,
+    /// In the `.cfg`: false when it reaches a refusal.
+    pub included: bool,
+    pub notes: Vec<String>,
+}
+
+/// A variable Init leaves unassigned, enumerated over its type's domain
+/// (`threads \in UNION {[d -> ...] : d \in SUBSET ...}`) before `init`
+/// filters it.
+#[derive(Debug, Clone, Serialize)]
+pub struct Enumerated {
+    pub variable: String,
+    pub domain: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct Report {
     pub module: String,
@@ -103,6 +143,9 @@ pub struct Report {
     pub next: String,
     /// The variables Init never assigns; TLC cannot compute an initial state.
     pub init_unassigned: Vec<String>,
+    /// The variables `init` leaves unassigned whose type has a small domain:
+    /// Init draws them from it.
+    pub init_enumerated: Vec<Enumerated>,
     pub invariants: Vec<String>,
     /// Every transition Next reaches, with the variables it leaves unassigned.
     pub transitions: Vec<Transition>,
@@ -113,6 +156,15 @@ pub struct Report {
     pub operators: usize,
     pub holes: Vec<Hole>,
     pub refusals: Vec<Refusal>,
+    /// The temporal properties, checked as `PROPERTY`s.
+    pub properties: Vec<Property>,
+    /// Whether the properties' fairness is in `Spec` (they share one spec);
+    /// otherwise each property is `fairness => formula` under a `Spec`
+    /// without fairness.
+    pub fairness_in_spec: bool,
+    /// Where the TLA+ reading of a temporal formula differs from verus-tla's,
+    /// and what was passed over.
+    pub temporal_notes: Vec<String>,
 }
 
 pub struct Export {
@@ -139,9 +191,15 @@ const EUCLID_B: &str = "euclid_b";
 /// a larger variant of a datatype, is a hole constant the .cfg supplies.
 const MAX_TYPE_DOMAIN: u128 = 1 << 10;
 
+/// The most initial-state combinations Init draws the variables `init`
+/// leaves unassigned from (see [`Enumerated`]).
+const MAX_INIT_STATES: u128 = 1 << 16;
+
 /// The module-level names the export generates beside the operators.
-const GENERATED_NAMES: [&str; 10] =
-    ["Init", "Next", "Spec", "vars", "Inv", "TypeOK", EUCLID_DIV, EUCLID_MOD, EUCLID_A, EUCLID_B];
+const GENERATED_NAMES: [&str; 11] = [
+    "Init", "Next", "Spec", "vars", "Inv", "TypeOK", "Fairness", EUCLID_DIV, EUCLID_MOD, EUCLID_A,
+    EUCLID_B,
+];
 
 /// How an operator is called, for [`Exporter::transitions`]: at conjunct
 /// level inside a branch (a transition of its own), at conjunct level
@@ -181,6 +239,11 @@ enum Variant {
     /// given the pre and post states other than in its roles (swapped, or
     /// one of them twice: `frame(post, post)`).
     Record,
+    /// A verus-tla action: `f().forward(input)` for a spec fn `f` of no
+    /// parameters building an `Action { precondition, transition }`, as the
+    /// operator `f(input)` over the pre and post states, so TLC names its
+    /// steps (and `WF_vars` its fairness) after `f`.
+    Forward,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -304,6 +367,10 @@ struct Exporter {
     datatype_names: HashMap<Path, String>,
     datatype_names_taken: HashSet<String>,
     current: String,
+    /// Whether a temporal formula states weak fairness.
+    uses_fairness: bool,
+    /// Where the TLA+ reading of a temporal formula differs from verus-tla's.
+    temporal_notes: BTreeSet<String>,
 }
 
 fn ident_name(v: &VarIdent) -> String {
@@ -763,6 +830,7 @@ impl Exporter {
             Variant::Plain => {}
             Variant::Primed => candidate = format!("{candidate}_post"),
             Variant::Record => candidate = format!("{candidate}_rec"),
+            Variant::Forward => {}
         }
         let taken = |this: &Self, c: &str| {
             this.used_names.contains(c)
@@ -1828,6 +1896,17 @@ impl Exporter {
                 if printed.is_empty() { name } else { format!("{name}({})", printed.join(", ")) }
             }
             CallTarget::FnSpec(f) => {
+                // verus-tla's `f().forward(input)(pre, post)` calls the
+                // action's own operator, so TLC names the step after `f`.
+                let role = |a: &Expr| read_var(a).and_then(|v| env.roles.get(&v).copied());
+                if args.len() == 2
+                    && role(&args[0]) == Some(Role::Pre)
+                    && role(&args[1]) == Some(Role::Post)
+                {
+                    if let Some(call) = self.forward_call(f, env) {
+                        return call;
+                    }
+                }
                 // The application is reduced: the closure's body sits where
                 // the application does, and the arguments are operands.
                 let closure = self.quiet(|x| {
@@ -2185,21 +2264,7 @@ impl Exporter {
                 .quiet(|x| x.bound_from_guard(&b.name, &b.a, &unbound, &guard_exprs, &env2))
             {
                 Some(d) => d,
-                None => match self.bound_from_type(&b.a, &e.span, &mut Vec::new()) {
-                    Some((d, _)) => d,
-                    None => {
-                        let constant = format!("Dom_{}", self.constant_typ_name(&b.a));
-                        self.constants.insert(constant.clone());
-                        self.holes.push(Hole {
-                            variable: name.clone(),
-                            typ: typ_name(&b.a),
-                            constant: constant.clone(),
-                            location: span_string(&e.span),
-                            in_function: self.current.clone(),
-                        });
-                        constant
-                    }
-                },
+                None => self.type_domain(&name, &b.a, &e.span),
             };
             bounds.push(format!("{name} \\in {domain}"));
         }
@@ -2241,12 +2306,32 @@ impl Exporter {
             TypX::Datatype(Dt::Path(p), args, _) => {
                 // A collection's values are TLA+ sequences, sets and
                 // functions, never records of its Rust representation: a
-                // `Seq` or `Map` is a hole named after its type
-                // (`Dom_Seq_u8`), and a `Set` the subsets of its elements'
-                // domain when that is small and has no hole (`SUBSET
-                // BOOLEAN`), else a hole too.
+                // `Seq` is a hole named after its type (`Dom_Seq_u8`), a
+                // `Set` the subsets of its elements' domain when that is
+                // small and has no hole (`SUBSET BOOLEAN`), and a `Map` the
+                // functions from a subset of its keys' domain to its values'
+                // (`(|V| + 1)^|K|` of them) when both are, else a hole too.
                 match path_as_friendly_rust_name(p).as_str() {
-                    "vstd::seq::Seq" | "vstd::map::Map" => return None,
+                    "vstd::seq::Seq" => return None,
+                    "vstd::map::Map" => {
+                        let first_hole = self.holes.len();
+                        let key = self.bound_from_type(args.first()?, span, seen);
+                        let value = self.bound_from_type(args.get(1)?, span, seen);
+                        if self.holes.len() > first_hole {
+                            self.drop_holes(first_hole);
+                            return None;
+                        }
+                        let ((kdom, k), (vdom, v)) = (key?, value?);
+                        let size = (v + 1).checked_pow(u32::try_from(k).ok()?)?;
+                        if size > MAX_TYPE_DOMAIN {
+                            return None;
+                        }
+                        let d = self.bind("d__");
+                        return Some((
+                            format!("UNION {{[{d} -> {vdom}] : {d} \\in SUBSET {kdom}}}"),
+                            size,
+                        ));
+                    }
                     "vstd::set::Set" => {
                         let first_hole = self.holes.len();
                         let elem = self.bound_from_type(args.first()?, span, seen);
@@ -2860,7 +2945,7 @@ impl Exporter {
         let previous_level = std::mem::replace(&mut self.conj_level, true);
         let mut env = Env::new();
         let roles = match variant {
-            Variant::Record => vec![None; f.x.params.len()],
+            Variant::Record | Variant::Forward => vec![None; f.x.params.len()],
             Variant::Plain | Variant::Primed => self.param_roles(&f),
         };
         let mut params = Vec::new();
@@ -2909,7 +2994,7 @@ impl Exporter {
                 Variant::Plain if !f.x.decrease.is_empty() => " (applies the record variant)",
                 Variant::Plain => "",
                 Variant::Primed => " (read in the post state)",
-                Variant::Record => " (the state passed as a record)",
+                Variant::Record | Variant::Forward => " (the state passed as a record)",
             },
             span_string(&f.span)
         ));
@@ -3480,6 +3565,634 @@ fn expr_kind(x: &ExprX) -> &'static str {
     }
 }
 
+// ─── temporal properties ───────────────────────────────────────────────────
+
+/// verus-tla's temporal operators, recognised by name on a call whose value
+/// is a `TempPred` (see [`is_temp_pred`]); any other function returning one
+/// is inlined.
+const TEMPORAL_PRIMITIVES: [&str; 14] = [
+    "always",
+    "eventually",
+    "leads_to",
+    "not",
+    "and",
+    "or",
+    "implies",
+    "lift_state",
+    "lift_action",
+    "weak_fairness",
+    "tla_forall",
+    "tla_exists",
+    "true_pred",
+    "false_pred",
+];
+
+/// Whether `typ` is verus-tla's `TempPred<S>` (by the datatype's name, so a
+/// crate carrying its own copy of `defs.rs` is recognised too).
+fn is_temp_pred(typ: &Typ) -> bool {
+    typ_datatype(typ).is_some_and(|p| last_segment(&p) == "TempPred")
+}
+
+/// Whether `typ` is the unit tuple `()`.
+fn is_unit(typ: &Typ) -> bool {
+    match &**typ {
+        TypX::Datatype(Dt::Tuple(0), ..) => true,
+        TypX::Decorate(_, _, t) | TypX::Boxed(t) => is_unit(t),
+        _ => false,
+    }
+}
+
+/// A call `e` to a crate function: the function (resolved, see
+/// [`Exporter::resolved_fun`]) and the arguments.
+fn called(e: &Expr) -> Option<(CallTargetKind, Fun, Exprs)> {
+    match &peel(e).x {
+        ExprX::Call { target: CallTarget::Fun(kind, fun, ..), args, .. } => {
+            Some((kind.clone(), fun.clone(), args.clone()))
+        }
+        _ => None,
+    }
+}
+
+/// Where a temporal property was stated, and the spec it is checked under.
+struct TemporalSource {
+    function: Fun,
+    span: crate::messages::Span,
+    /// The base of the property's operator name.
+    base: String,
+    formula: Expr,
+    /// The spec's conjuncts as written (`.and` chains are split when
+    /// printed); empty when the property has no spec.
+    spec: Vec<Expr>,
+    /// Where the spec came from, for the report.
+    spec_from: String,
+}
+
+/// The temporal properties stated in the module's functions:
+///
+/// * a proof fn whose `ensures` has `m.entails(p)`, `m` a `TempPred`
+///   parameter: `p` under the conjuncts `c` of its `requires` of the form
+///   `m.entails(c)` (verus-tla's `mutex_example.rs`); or `spec().entails(p)`
+///   for a spec expression: `p` under that expression. Every parameter must
+///   be a `TempPred`, since nothing else can be printed at module level.
+/// * else, beside a spec fn `spec()` returning a `TempPred`, every other
+///   spec fn of no parameters in the module returning one that neither
+///   `spec` nor a proof fn's property reaches: under `spec()`.
+///
+/// Returns them with what was passed over and why.
+fn temporal_sources(
+    functions: &HashMap<Fun, Function>,
+    in_module: &[Function],
+) -> (Vec<TemporalSource>, Vec<String>) {
+    let short = |f: &Function| last_segment(&f.x.name.path);
+    let mut out: Vec<TemporalSource> = Vec::new();
+    let mut notes = Vec::new();
+    let entails = |e: &Expr| -> Option<(Expr, Expr)> {
+        let (_, fun, args) = called(e)?;
+        (last_segment(&fun.path) == "entails" && args.len() == 2 && is_temp_pred(&args[0].typ))
+            .then(|| (args[0].clone(), args[1].clone()))
+    };
+    for f in in_module.iter().filter(|f| f.x.mode == Mode::Proof) {
+        let ensured: Vec<(Expr, Expr)> = f.x.ensure.0.iter().filter_map(|e| entails(e)).collect();
+        if ensured.is_empty() {
+            continue;
+        }
+        let name = fun_as_friendly_rust_name(&f.x.name);
+        if let Some(p) = f.x.params.iter().find(|p| !is_temp_pred(&p.x.typ)) {
+            notes.push(format!(
+                "{name}: not exported, its parameter `{}` is not a TempPred (only a property over the spec alone can be a PROPERTY)",
+                p.x.name.0
+            ));
+            continue;
+        }
+        let many = ensured.len() > 1;
+        for (i, (model, formula)) in ensured.into_iter().enumerate() {
+            let base = if many { format!("{}_{}", short(f), i + 1) } else { short(f) };
+            let (spec, spec_from) = match read_var(&peel(&model)) {
+                Some(m) => {
+                    let mut spec = Vec::new();
+                    for r in f.x.require.iter() {
+                        match entails(r) {
+                            Some((m2, c)) if read_var(&peel(&m2)).as_ref() == Some(&m) => {
+                                spec.push(c)
+                            }
+                            _ => notes.push(format!(
+                                "{name}: a requires clause at {} is not `{}.entails(...)`, so it is not part of the spec",
+                                span_string(&r.span),
+                                m.0
+                            )),
+                        }
+                    }
+                    (spec, format!("the requires of {name} ({}.entails(...))", m.0))
+                }
+                None => (vec![model.clone()], format!("{name}'s `.entails` receiver")),
+            };
+            out.push(TemporalSource {
+                function: f.x.name.clone(),
+                span: f.span.clone(),
+                base,
+                formula,
+                spec,
+                spec_from,
+            });
+        }
+    }
+    let spec_fn = in_module.iter().find(|f| {
+        short(f) == "spec"
+            && f.x.params.is_empty()
+            && f.x.mode == Mode::Spec
+            && is_temp_pred(&f.x.ret.x.typ)
+            && f.x.body.is_some()
+    });
+    if let Some(spec_fn) = spec_fn {
+        let mut reached = reached_functions(functions, &spec_fn.x.name);
+        for s in &out {
+            let mut roots = Vec::new();
+            crate::ast_visitor::expr_visitor_walk(&s.formula, &mut |x: &Expr| {
+                if let ExprX::Call { target: CallTarget::Fun(_, fun, ..), .. } = &x.x {
+                    roots.push(fun.clone());
+                }
+                crate::visitor::VisitorControlFlow::Recurse
+            });
+            for r in roots {
+                reached.extend(reached_functions(functions, &r));
+                reached.insert(r);
+            }
+        }
+        let spec_call = SpannedTyped::new(
+            &spec_fn.span,
+            &spec_fn.x.ret.x.typ,
+            ExprX::Call {
+                target: CallTarget::Fun(
+                    CallTargetKind::Static,
+                    spec_fn.x.name.clone(),
+                    Arc::new(vec![]),
+                    Arc::new(vec![]),
+                    CallTargetAttrs {
+                        autospec: AutospecUsage::Final,
+                        const_var: false,
+                        assume_external_allowed: false,
+                    },
+                ),
+                args: Arc::new(vec![]),
+                post_args: None,
+                body: None,
+            },
+        );
+        for f in in_module.iter() {
+            if f.x.name == spec_fn.x.name
+                || f.x.mode != Mode::Spec
+                || !f.x.params.is_empty()
+                || !is_temp_pred(&f.x.ret.x.typ)
+                || f.x.body.is_none()
+                || reached.contains(&f.x.name)
+            {
+                continue;
+            }
+            out.push(TemporalSource {
+                function: f.x.name.clone(),
+                span: f.span.clone(),
+                base: short(f),
+                formula: f.x.body.clone().expect("checked above"),
+                spec: vec![spec_call.clone()],
+                spec_from: fun_as_friendly_rust_name(&spec_fn.x.name),
+            });
+        }
+    }
+    (out, notes)
+}
+
+impl Exporter {
+    /// The domain of a binder of type `typ` named `name` (for the report):
+    /// the type's own when it is small (see [`Exporter::bound_from_type`]),
+    /// else a hole constant.
+    fn type_domain(&mut self, name: &str, typ: &Typ, span: &crate::messages::Span) -> String {
+        match self.bound_from_type(typ, span, &mut Vec::new()) {
+            Some((d, _)) => d,
+            None => {
+                let constant = format!("Dom_{}", self.constant_typ_name(typ));
+                self.constants.insert(constant.clone());
+                self.holes.push(Hole {
+                    variable: name.to_string(),
+                    typ: typ_name(typ),
+                    constant: constant.clone(),
+                    location: span_string(span),
+                    in_function: self.current.clone(),
+                });
+                constant
+            }
+        }
+    }
+
+    /// Emit an operator the export generates (a verus-tla action's forward
+    /// step, a closure-valued root) under `key` unless it is emitted or being
+    /// emitted, as [`Exporter::ensure_function`] does for a function:
+    /// `build` returns the parameters, the body and the comment line.
+    fn ensure_generated(
+        &mut self,
+        key: &OpKey,
+        build: impl FnOnce(&mut Self) -> (Vec<String>, String, String),
+    ) -> String {
+        let name = self.op_name(key);
+        let reach = match (self.conj_level, self.branch_depth > 0) {
+            (false, _) => Reach::Other,
+            (true, true) => Reach::Branch,
+            (true, false) => Reach::Conjoined,
+        };
+        self.current_calls.push(Call { callee: key.clone(), reach, context: BTreeSet::new() });
+        if self.emitted.contains(key) || self.emitting.contains(key) {
+            if self.tainted.contains(key) {
+                self.current_tainted = true;
+            }
+            self.assign_through_call(key, reach);
+            return name;
+        }
+        self.emitting.insert(key.clone());
+        let previous = std::mem::replace(&mut self.current, fun_as_friendly_rust_name(&key.0));
+        let previous_bound = std::mem::take(&mut self.bound);
+        let previous_tainted = std::mem::replace(&mut self.current_tainted, false);
+        let previous_depth = std::mem::replace(&mut self.branch_depth, 0);
+        let previous_calls = std::mem::take(&mut self.current_calls);
+        let previous_assigned = std::mem::take(&mut self.current_assigned);
+        let previous_enclosing = std::mem::take(&mut self.enclosing_assigned);
+        let previous_implications = std::mem::take(&mut self.implications);
+        let previous_pre = std::mem::take(&mut self.pre_assigned);
+        let previous_level = std::mem::replace(&mut self.conj_level, true);
+        let (params, body, comment) = build(self);
+        let head =
+            if params.is_empty() { name.clone() } else { format!("{name}({})", params.join(", ")) };
+        self.arity.insert(name.clone(), params.len());
+        self.defs.push(format!("\\* {comment}\n{head} ==\n    {body}\n"));
+        self.record_body(key);
+        self.current_calls = previous_calls;
+        self.current_assigned = previous_assigned;
+        self.enclosing_assigned = previous_enclosing;
+        self.implications = previous_implications;
+        self.pre_assigned = previous_pre;
+        self.conj_level = previous_level;
+        self.branch_depth = previous_depth;
+        if self.current_tainted {
+            self.tainted.insert(key.clone());
+        }
+        self.current = previous;
+        self.bound = previous_bound;
+        self.current_tainted = previous_tainted || self.tainted.contains(key);
+        self.emitting.remove(key);
+        self.emitted.insert(key.clone());
+        self.assign_through_call(key, reach);
+        name
+    }
+
+    /// `f().forward(input)`, verus-tla's `Action::forward` on the record a
+    /// crate spec fn `f` of no parameters builds: `f`, `forward`, the
+    /// receiver `f()` and `input`.
+    fn forward_parts(&self, e: &Expr) -> Option<(Fun, Fun, Expr, Expr)> {
+        let (kind, fun, args) = called(e)?;
+        let forward = self.resolved_fun(&kind, &fun);
+        if last_segment(&forward.path) != "forward" || args.len() != 2 {
+            return None;
+        }
+        let fwd = self.functions.get(&forward)?;
+        fwd.x.body.as_ref()?;
+        let recv_typ = &fwd.x.params.first()?.x.typ;
+        if !typ_datatype(recv_typ).is_some_and(|p| last_segment(&p) == "Action") {
+            return None;
+        }
+        let recv = peel(&args[0]);
+        let (k2, f2, a2) = called(&recv)?;
+        let f2 = self.resolved_fun(&k2, &f2);
+        let builder = self.functions.get(&f2)?;
+        if !a2.is_empty() || !builder.x.params.is_empty() || builder.x.body.is_none() {
+            return None;
+        }
+        Some((f2, forward, recv, args[1].clone()))
+    }
+
+    /// The call to the operator of the verus-tla action `e` (`f().forward(input)`):
+    /// `f(input)`, or `f` when the input is `()`.
+    fn forward_call(&mut self, e: &Expr, env: &Env) -> Option<String> {
+        let (f, forward, recv, input) = self.forward_parts(e)?;
+        let has_input = !is_unit(&input.typ);
+        let arg = if has_input { Some(self.quiet(|x| x.expr(&input, env))) } else { None };
+        let name = self.ensure_forward(&f, &forward, &recv, has_input);
+        Some(match arg {
+            Some(a) => format!("{name}({a})"),
+            None => name,
+        })
+    }
+
+    /// The operator of a verus-tla action's forward step, `forward`'s closure
+    /// over `(s, s_prime)` printed with `self` bound to `recv` (`f()`), and
+    /// `input` its one parameter (none for `()`).
+    fn ensure_forward(&mut self, f: &Fun, forward: &Fun, recv: &Expr, has_input: bool) -> String {
+        let key = (f.clone(), Variant::Forward);
+        let fwd = self.functions[forward].clone();
+        let span = self.functions.get(f).map(|b| b.span.clone()).unwrap_or(fwd.span.clone());
+        let recv = recv.clone();
+        self.ensure_generated(&key, move |x| {
+            let mut env = Env::new();
+            env.values.insert(fwd.x.params[0].x.name.clone(), (recv, Box::new(Env::new())));
+            let input = x.bind_var(&mut env, &fwd.x.params[1].x.name);
+            let mut params = Vec::new();
+            let mut lets = Vec::new();
+            if has_input {
+                params.push(input);
+            } else {
+                lets.push(format!("{input} == <<>>"));
+            }
+            let body = match fwd.x.body.as_ref().and_then(|b| x.resolve_closure(b, &env, 0)) {
+                Some((cparams, cbody, mut cenv, mut clets)) if cparams.len() == 2 => {
+                    cenv.roles.insert(cparams[0].name.clone(), Role::Pre);
+                    cenv.roles.insert(cparams[1].name.clone(), Role::Post);
+                    lets.append(&mut clets);
+                    x.expr(&cbody, &cenv)
+                }
+                _ => x.refuse("verus-tla forward that is not a closure over two states", &span),
+            };
+            let body =
+                if lets.is_empty() { body } else { format!("LET {} IN {body}", lets.join(" ")) };
+            let comment = format!(
+                "{}().forward({}), {}",
+                fun_as_friendly_rust_name(f),
+                if has_input { "input" } else { "()" },
+                span_string(&span)
+            );
+            (params, body, comment)
+        })
+    }
+
+    /// The operator of a spec fn of no parameters returning a closure over
+    /// one state (a predicate, pre role) or two (an action, pre and post),
+    /// as verus-tla's `init()`, `next()` and state predicates are written.
+    fn ensure_closure_root(&mut self, f: &Fun) -> Option<String> {
+        let func = self.functions.get(f)?.clone();
+        if !func.x.params.is_empty() {
+            return None;
+        }
+        let body = func.x.body.clone()?;
+        let ExprX::Closure(params, cbody) = &peel(&body).x else { return None };
+        if params.is_empty() || params.len() > 2 {
+            return None;
+        }
+        let (params, cbody) = (params.clone(), cbody.clone());
+        let key = (f.clone(), Variant::Plain);
+        Some(self.ensure_generated(&key, move |x| {
+            let mut env = Env::new();
+            for (k, p) in params.iter().enumerate() {
+                env.roles.insert(p.name.clone(), if k == 0 { Role::Pre } else { Role::Post });
+            }
+            let body = x.expr(&cbody, &env);
+            (vec![], body, format!("{}, {}", fun_as_friendly_rust_name(f), span_string(&func.span)))
+        }))
+    }
+
+    /// A state predicate (`StatePred`) as a TLA+ state formula: a spec fn's
+    /// closure by its operator, `enabled(a)` as `ENABLED`, anything else
+    /// reduced to a closure over one state and printed in place.
+    fn state_formula(&mut self, p: &Expr, env: &Env) -> String {
+        if let Some((kind, fun, args)) = called(p) {
+            let fun = self.resolved_fun(&kind, &fun);
+            if last_segment(&fun.path) == "enabled" && args.len() == 1 {
+                let a = self.action_formula(&args[0], env);
+                return format!("ENABLED ({a})");
+            }
+            if args.is_empty() {
+                if let Some(name) = self.ensure_closure_root(&fun) {
+                    return name;
+                }
+            }
+        }
+        match self.resolve_closure(p, env, 0) {
+            Some((params, body, mut cenv, lets)) if params.len() == 1 => {
+                cenv.roles.insert(params[0].name.clone(), Role::Pre);
+                let b = self.quiet(|x| x.expr(&body, &cenv));
+                if lets.is_empty() { b } else { format!("(LET {} IN {b})", lets.join(" ")) }
+            }
+            _ => self.refuse("lift_state of a value that is not a closure over the state", &p.span),
+        }
+    }
+
+    /// An action predicate (`ActionPred`) as a TLA+ action: a verus-tla
+    /// action's forward step or a spec fn's closure by its operator,
+    /// anything else reduced to a closure over two states and printed in
+    /// place.
+    fn action_formula(&mut self, a: &Expr, env: &Env) -> String {
+        if let Some(call) = self.quiet(|x| x.forward_call(a, env)) {
+            return call;
+        }
+        if let Some((kind, fun, args)) = called(a) {
+            let fun = self.resolved_fun(&kind, &fun);
+            if args.is_empty() {
+                if let Some(name) = self.quiet(|x| x.ensure_closure_root(&fun)) {
+                    return name;
+                }
+            }
+        }
+        match self.resolve_closure(a, env, 0) {
+            Some((params, body, mut cenv, lets)) if params.len() == 2 => {
+                cenv.roles.insert(params[0].name.clone(), Role::Pre);
+                cenv.roles.insert(params[1].name.clone(), Role::Post);
+                let b = self.quiet(|x| x.expr(&body, &cenv));
+                if lets.is_empty() { b } else { format!("(LET {} IN {b})", lets.join(" ")) }
+            }
+            _ => {
+                self.refuse("lift_action of a value that is not a closure over two states", &a.span)
+            }
+        }
+    }
+
+    /// `lift_action(a)`'s argument when `e` is one.
+    fn lifted_action(&self, e: &Expr) -> Option<Expr> {
+        let (kind, fun, args) = called(e)?;
+        let fun = self.resolved_fun(&kind, &fun);
+        (last_segment(&fun.path) == "lift_action" && args.len() == 1).then(|| args[0].clone())
+    }
+
+    /// A verus-tla temporal formula (a `TempPred` expression) as TLA+:
+    /// `always` is `[]` (`[][A]_vars` for `always(lift_action(a))`),
+    /// `eventually` `<>`, `leads_to` `~>`, `not`/`and`/`or`/`implies` the
+    /// connectives, `lift_state(p)` the state formula, `weak_fairness`
+    /// `WF_vars(A)` (for `Action::weak_fairness(input)`, `A` the action's
+    /// forward step), `tla_forall`/`tla_exists` bounded quantifiers; any
+    /// other function returning a `TempPred` is inlined.
+    fn temporal(&mut self, e: &Expr, env: &Env, depth: usize) -> String {
+        if depth > 32 {
+            return self.refuse("temporal formula nested too deep", &e.span);
+        }
+        let e = peel(e);
+        if let Some(v) = read_var(&e) {
+            if let Some((value, venv)) = env.values.get(&v).cloned() {
+                return self.temporal(&value, &venv, depth + 1);
+            }
+        }
+        let Some((kind, fun, args)) = called(&e).filter(|_| is_temp_pred(&e.typ)) else {
+            let what = format!("temporal formula of kind {}", expr_kind(&e.x));
+            return self.refuse(what, &e.span);
+        };
+        let fun = self.resolved_fun(&kind, &fun);
+        let name = last_segment(&fun.path);
+        let t = |x: &mut Self, i: usize| x.temporal(&args[i], env, depth + 1);
+        match (name.as_str(), args.len()) {
+            ("always", 1) => match self.lifted_action(&args[0]) {
+                Some(a) => format!("[][{}]_vars", self.action_formula(&a, env)),
+                None => format!("[]({})", t(self, 0)),
+            },
+            ("eventually", 1) => match self.lifted_action(&args[0]) {
+                Some(a) => {
+                    self.temporal_notes.insert(
+                        "eventually(lift_action(a)) is <><<A>>_vars, a step of A that changes the state; verus-tla's is met by an A step that leaves it unchanged too".into(),
+                    );
+                    format!("<><<{}>>_vars", self.action_formula(&a, env))
+                }
+                None => format!("<>({})", t(self, 0)),
+            },
+            ("leads_to", 2) => format!("({} ~> {})", t(self, 0), t(self, 1)),
+            ("not", 1) => format!("~({})", t(self, 0)),
+            ("and", 2) => format!("({} /\\ {})", t(self, 0), t(self, 1)),
+            ("or", 2) => format!("({} \\/ {})", t(self, 0), t(self, 1)),
+            ("implies", 2) => format!("({} => {})", t(self, 0), t(self, 1)),
+            ("lift_state", 1) => self.state_formula(&args[0], env),
+            ("lift_action", 1) => self.refuse(
+                "lift_action outside always(...) or eventually(...) (TLA+ has no bare action in a temporal formula)",
+                &e.span,
+            ),
+            ("weak_fairness", 1) => {
+                self.uses_fairness = true;
+                format!("WF_vars({})", self.action_formula(&args[0], env))
+            }
+            ("weak_fairness", 2) => {
+                self.uses_fairness = true;
+                let forward = SpannedTyped::new(
+                    &e.span,
+                    &e.typ,
+                    ExprX::Call {
+                        target: CallTarget::Fun(
+                            CallTargetKind::Static,
+                            Arc::new(FunX {
+                                path: fun.path.pop_segment().push_segment(Arc::new(
+                                    "forward".to_string(),
+                                )),
+                            }),
+                            Arc::new(vec![]),
+                            Arc::new(vec![]),
+                            CallTargetAttrs {
+                                autospec: AutospecUsage::Final,
+                                const_var: false,
+                                assume_external_allowed: false,
+                            },
+                        ),
+                        args: args.clone(),
+                        post_args: None,
+                        body: None,
+                    },
+                );
+                match self.quiet(|x| x.forward_call(&forward, env)) {
+                    Some(a) => format!("WF_vars({a})"),
+                    None => self.refuse(
+                        "weak_fairness of an Action not built by a spec fn of no parameters",
+                        &e.span,
+                    ),
+                }
+            }
+            ("tla_forall" | "tla_exists", 1) => {
+                match self.resolve_closure(&args[0], env, 0) {
+                    Some((params, body, mut cenv, lets)) if params.len() == 1 => {
+                        let n = self.bind_var(&mut cenv, &params[0].name);
+                        let domain = self.type_domain(&n, &params[0].a, &e.span);
+                        let b = self.temporal(&body, &cenv, depth + 1);
+                        let q = if name == "tla_forall" { "\\A" } else { "\\E" };
+                        let f = format!("({q} {n} \\in {domain} : {b})");
+                        if lets.is_empty() { f } else { format!("(LET {} IN {f})", lets.join(" ")) }
+                    }
+                    _ => self.refuse(format!("{name} of a value that is not a closure"), &e.span),
+                }
+            }
+            ("true_pred", 0) => "TRUE".into(),
+            ("false_pred", 0) => "FALSE".into(),
+            _ if TEMPORAL_PRIMITIVES.contains(&name.as_str()) => {
+                let what = format!("{name} with {} arguments", args.len());
+                self.refuse(what, &e.span)
+            }
+            ("new", _) => self.refuse(
+                "a TempPred built from a closure over the execution (only verus-tla's operators are exported)",
+                &e.span,
+            ),
+            _ => match self.inline_call(&fun, &args, env) {
+                Some((body, env2, lets)) => {
+                    let b = self.temporal(&body, &env2, depth + 1);
+                    if lets.is_empty() { b } else { format!("(LET {} IN {b})", lets.join(" ")) }
+                }
+                None => {
+                    let what = format!(
+                        "call to {} (a TempPred with no definition in the crate)",
+                        fun_as_friendly_rust_name(&fun)
+                    );
+                    self.refuse(what, &e.span)
+                }
+            },
+        }
+    }
+
+    /// A spec's conjuncts: `.and` chains split, and a crate spec fn of no
+    /// parameters returning a `TempPred` (`spec()`, `fairness()`) opened.
+    fn spec_conjuncts(&self, e: &Expr, depth: usize) -> Vec<Expr> {
+        let e = peel(e);
+        if depth < 16 {
+            if let Some((kind, fun, args)) = called(&e) {
+                let fun = self.resolved_fun(&kind, &fun);
+                let name = last_segment(&fun.path);
+                if name == "and" && args.len() == 2 && is_temp_pred(&e.typ) {
+                    let mut out = self.spec_conjuncts(&args[0], depth + 1);
+                    out.extend(self.spec_conjuncts(&args[1], depth + 1));
+                    return out;
+                }
+                if args.is_empty()
+                    && is_temp_pred(&e.typ)
+                    && !TEMPORAL_PRIMITIVES.contains(&name.as_str())
+                {
+                    if let Some(body) = self.functions.get(&fun).and_then(|f| f.x.body.clone()) {
+                        return self.spec_conjuncts(&body, depth + 1);
+                    }
+                }
+            }
+        }
+        vec![e]
+    }
+
+    /// Whether `e` states fairness: it calls `weak_fairness`, directly or
+    /// through the functions it calls.
+    fn states_fairness(&self, e: &Expr) -> bool {
+        let mut funs = Vec::new();
+        crate::ast_visitor::expr_visitor_walk(e, &mut |x: &Expr| {
+            if let ExprX::Call { target: CallTarget::Fun(_, fun, ..), .. } = &x.x {
+                funs.push(fun.clone());
+            }
+            crate::visitor::VisitorControlFlow::Recurse
+        });
+        funs.iter().any(|f| {
+            last_segment(&f.path) == "weak_fairness"
+                || reached_functions(&self.functions, f)
+                    .iter()
+                    .any(|g| last_segment(&g.path) == "weak_fairness")
+        })
+    }
+
+    /// Whether the spec conjunct `c` is `lift_state(init())` (`is_init`) or
+    /// `always(lift_action(next()))`, for the recognised `init`/`next`.
+    fn names_root(&self, c: &Expr, root: &Fun, is_init: bool) -> bool {
+        let Some((kind, fun, args)) = called(c) else { return false };
+        let fun = self.resolved_fun(&kind, &fun);
+        let inner = match (last_segment(&fun.path).as_str(), args.len(), is_init) {
+            ("lift_state", 1, true) => args[0].clone(),
+            ("always", 1, false) => match self.lifted_action(&args[0]) {
+                Some(a) => a,
+                None => return false,
+            },
+            _ => return false,
+        };
+        called(&inner).is_some_and(|(k, f, a)| a.is_empty() && self.resolved_fun(&k, &f) == *root)
+    }
+}
+
 /// The recognised triple.
 struct Triple {
     shape: &'static str,
@@ -3728,7 +4441,7 @@ fn recognise(krate: &Krate, module: &str, named: Option<&[String]>) -> Result<Tr
 pub fn export_module(krate: &Krate, arg: &str) -> Result<Export, String> {
     let (module, named) = parse_export_arg(arg)?;
     let module = module.as_str();
-    let triple = recognise(krate, module, named.as_deref())?;
+    let mut triple = recognise(krate, module, named.as_deref())?;
     let datatypes: HashMap<Path, Datatype> = krate
         .datatypes
         .iter()
@@ -3808,12 +4521,48 @@ pub fn export_module(krate: &Krate, arg: &str) -> Result<Export, String> {
         datatype_names: HashMap::new(),
         datatype_names_taken: HashSet::new(),
         current: String::new(),
+        uses_fairness: false,
+        temporal_notes: BTreeSet::new(),
     };
     for v in &state_vars {
         ex.used_names.insert(v.clone());
     }
     for reserved in GENERATED_NAMES.iter().copied().chain([module_name.as_str()]) {
         ex.used_names.insert(reserved.into());
+    }
+    // The temporal properties, and the functions their formulas read: a
+    // state predicate one lifts (`eventually(lift_state(done()))`) is a
+    // state of the property, not an invariant, unless the command line
+    // names it.
+    let in_module: Vec<Function> = krate
+        .functions
+        .iter()
+        .filter(|f| module_of(f).map(|m| path_as_friendly_rust_name(&m) == module).unwrap_or(false))
+        .cloned()
+        .collect();
+    let (sources, source_notes) = temporal_sources(&ex.functions, &in_module);
+    if !triple.explicit {
+        for src in &sources {
+            let mut read: HashSet<Fun> = HashSet::new();
+            crate::ast_visitor::expr_visitor_walk(&src.formula, &mut |x: &Expr| {
+                if let ExprX::Call { target: CallTarget::Fun(_, fun, ..), .. } = &x.x {
+                    read.insert(fun.clone());
+                }
+                crate::visitor::VisitorControlFlow::Recurse
+            });
+            for f in read.clone() {
+                read.extend(reached_functions(&ex.functions, &f));
+            }
+            let by = fun_as_friendly_rust_name(&src.function);
+            for (f, selected, reason) in triple.candidates.iter_mut() {
+                if *selected && read.contains(f) {
+                    *selected = false;
+                    *reason = format!(
+                        "read by the temporal property of {by}, which is checked as a PROPERTY; name it in -V tla-export={module}:<invariants> to check it as an invariant"
+                    );
+                }
+            }
+        }
     }
     let selected: Vec<Fun> =
         triple.candidates.iter().filter(|(_, s, _)| *s).map(|(f, _, _)| f.clone()).collect();
@@ -3979,6 +4728,120 @@ pub fn export_module(krate: &Krate, arg: &str) -> Result<Export, String> {
     // would leave them is disabled: TypeOK holds initially and after each
     // step.
     let type_ok = ex.type_ok();
+    // Init draws a variable `init` leaves unassigned from its type's domain
+    // when that is small and has no hole, so TLC can compute the initial
+    // states Verus allows (`init` filters them): a `Map<Tid, ThreadState>`
+    // constrained key by key, as verus-tla's mutex is. At most
+    // [`MAX_INIT_STATES`] combinations are drawn.
+    ex.bound.clear();
+    ex.current = "Init".into();
+    let mut init_enumerated: Vec<Enumerated> = Vec::new();
+    let mut combinations: u128 = 1;
+    for v in init_unassigned.clone() {
+        let Some(i) = ex.state_vars.iter().position(|x| *x == v) else { continue };
+        let typ = ex.state_types[i].clone();
+        let first_hole = ex.holes.len();
+        let span = ex.functions.get(&triple.init).map(|f| f.span.clone());
+        let Some(span) = span else { continue };
+        let bounded = ex.bound_from_type(&typ, &span, &mut vec![ex.state_path.clone()]);
+        if ex.holes.len() > first_hole {
+            ex.drop_holes(first_hole);
+            continue;
+        }
+        let Some((domain, n)) = bounded else { continue };
+        let Some(c) = combinations.checked_mul(n).filter(|c| *c <= MAX_INIT_STATES) else {
+            continue;
+        };
+        combinations = c;
+        init_enumerated.push(Enumerated { variable: v, domain });
+    }
+    let init_unassigned: Vec<String> = init_unassigned
+        .into_iter()
+        .filter(|v| !init_enumerated.iter().any(|e| e.variable == *v))
+        .collect();
+    let init_draws: String = init_enumerated
+        .iter()
+        .map(|e| format!("({} \\in {}) /\\ ", e.variable, e.domain))
+        .collect();
+    // The temporal properties, each an operator; the fairness of their spec
+    // goes into `Spec` when they share one.
+    let mut properties: Vec<Property> = Vec::new();
+    for src in &sources {
+        let base = sanitize(&src.base);
+        let mut op = base.clone();
+        let mut n = 2;
+        while ex.used_names.contains(&op)
+            || ex.locals_ever.contains(&op)
+            || ex.constants.contains(&op)
+            || is_tla_reserved(&op)
+        {
+            op = format!("{base}_{n}");
+            n += 1;
+        }
+        ex.used_names.insert(op.clone());
+        ex.bound.clear();
+        ex.current = fun_as_friendly_rust_name(&src.function);
+        ex.current_tainted = false;
+        ex.conj_level = false;
+        ex.branch_depth = 0;
+        let formula = ex.temporal(&src.formula, &Env::new(), 0);
+        let (mut fairness, mut assumptions) = (Vec::new(), Vec::new());
+        let (mut has_init, mut has_next) = (false, false);
+        let conjuncts: Vec<Expr> = src.spec.iter().flat_map(|c| ex.spec_conjuncts(c, 0)).collect();
+        for c in conjuncts {
+            if ex.names_root(&c, &triple.init, true) {
+                has_init = true;
+            } else if ex.names_root(&c, &triple.next, false) {
+                has_next = true;
+            } else if ex.states_fairness(&c) {
+                fairness.push(ex.temporal(&c, &Env::new(), 0));
+            } else {
+                assumptions.push(ex.temporal(&c, &Env::new(), 0));
+            }
+        }
+        let mut notes = Vec::new();
+        if !has_init {
+            notes.push(format!(
+                "its spec has no lift_state({}()) conjunct; TLC checks it from Init all the same",
+                last_segment(&triple.init.path)
+            ));
+        }
+        if !has_next {
+            notes.push(format!(
+                "its spec has no always(lift_action({}())) conjunct; TLC checks it under [][Next]_vars all the same",
+                last_segment(&triple.next.path)
+            ));
+        }
+        let without_fairness = fairness.is_empty();
+        properties.push(Property {
+            operator: op,
+            function: fun_as_friendly_rust_name(&src.function),
+            location: span_string(&src.span),
+            formula,
+            fairness,
+            assumptions,
+            spec: src.spec_from.clone(),
+            without_fairness,
+            included: !ex.current_tainted,
+            notes,
+        });
+    }
+    let fairness_in_spec = !properties.is_empty()
+        && properties
+            .windows(2)
+            .all(|w| w[0].fairness == w[1].fairness && w[0].assumptions == w[1].assumptions);
+    let mut temporal_notes: Vec<String> = source_notes;
+    if !properties.is_empty() {
+        temporal_notes.push(
+            "Spec's [][Next]_vars admits a step that leaves the state unchanged, as TLA+ always does; verus-tla's always(lift_action(next())) admits one only when next does, so a lasso that stutters is a behaviour of the model only when next() allows stuttering (the mutex's stutter() action does)".into(),
+        );
+    }
+    if ex.uses_fairness {
+        temporal_notes.push(
+            "WF_vars(A) is weak fairness of <<A>>_vars, a step of A that changes the state, enabled when ENABLED <<A>>_vars holds; verus-tla's weak_fairness takes A's precondition as enabled and is met by any A step. They agree for an action whose step always changes the state".into(),
+        );
+    }
+    temporal_notes.extend(ex.temporal_notes.iter().cloned());
     let inv_names: Vec<String> =
         invs.iter().filter(|(_, _, tainted)| !tainted).map(|(_, n, _)| n.clone()).collect();
     let skipped: Vec<String> =
@@ -4019,6 +4882,11 @@ pub fn export_module(krate: &Krate, arg: &str) -> Result<Export, String> {
     tla.push_str(
         "\\* What the export could not express is an Assert(FALSE, ...) that stops TLC\n\\* wherever it is evaluated.\n",
     );
+    if !properties.is_empty() {
+        tla.push_str(
+            "\\* Temporal (verus-tla): always is [], eventually <>, leads_to ~>, lift_state(p)\n\\* the state formula p, always(lift_action(a)) [][A]_vars, weak_fairness WF_vars(A)\n\\* of the action's forward step, tla_forall/tla_exists bounded quantifiers. The\n\\* fairness of the properties' spec is in Spec, each property is a PROPERTY.\n",
+        );
+    }
     tla.push_str("EXTENDS Integers, Sequences, FiniteSets, TLC\n\n");
     if !ex.constants.is_empty() {
         tla.push_str(&format!(
@@ -4063,7 +4931,7 @@ pub fn export_module(krate: &Krate, arg: &str) -> Result<Export, String> {
         tla.push('\n');
     }
     if type_ok.is_empty() {
-        tla.push_str(&format!("Init == {init_name}\n"));
+        tla.push_str(&format!("Init == {init_draws}{init_name}\n"));
         tla.push_str(&format!("Next == {next_name}\n"));
     } else {
         tla.push_str(
@@ -4072,15 +4940,51 @@ pub fn export_module(krate: &Krate, arg: &str) -> Result<Export, String> {
         for (_, p) in &type_ok {
             tla.push_str(&format!("    /\\ {p}\n"));
         }
-        tla.push_str(&format!("Init == {init_name} /\\ TypeOK\n"));
+        tla.push_str(&format!("Init == {init_draws}{init_name} /\\ TypeOK\n"));
         tla.push_str(&format!("Next == {next_name} /\\ TypeOK'\n"));
     }
-    tla.push_str("Spec == Init /\\ [][Next]_vars\n");
+    let mut spec_line = "Spec == Init /\\ [][Next]_vars".to_string();
+    if fairness_in_spec {
+        let p = &properties[0];
+        if !p.fairness.is_empty() {
+            tla.push_str(&format!(
+                "\\* The fairness of the properties' spec ({}).\nFairness ==\n",
+                p.spec
+            ));
+            for f in &p.fairness {
+                tla.push_str(&format!("    /\\ {f}\n"));
+            }
+            spec_line.push_str(" /\\ Fairness");
+        }
+        for a in &p.assumptions {
+            spec_line.push_str(&format!(" /\\ {a}"));
+        }
+    }
+    tla.push_str(&format!("{spec_line}\n"));
     if !inv_names.is_empty() {
         tla.push_str(&format!(
             "Inv == {}\n",
             inv_names.iter().map(|n| format!("({n})")).collect::<Vec<_>>().join(" /\\ ")
         ));
+    }
+    for p in &properties {
+        tla.push_str(&format!("\\* {}, {}; spec: {}\n", p.function, p.location, p.spec));
+        let premises: Vec<&String> = if fairness_in_spec {
+            vec![]
+        } else {
+            p.fairness.iter().chain(p.assumptions.iter()).collect()
+        };
+        if premises.is_empty() {
+            tla.push_str(&format!("{} ==\n    {}\n", p.operator, p.formula));
+        } else {
+            let premises: Vec<String> = premises.iter().map(|f| format!("({f})")).collect();
+            tla.push_str(&format!(
+                "{} ==\n    ({}) => ({})\n",
+                p.operator,
+                premises.join(" /\\ "),
+                p.formula
+            ));
+        }
     }
     tla.push_str(&format!("{}\n", "=".repeat(module_name.len() + 20)));
 
@@ -4099,6 +5003,25 @@ pub fn export_module(krate: &Krate, arg: &str) -> Result<Export, String> {
         cfg.push_str(&format!(
             "\\* INVARIANT {n} is left out: it reaches a refusal (see the .tla.json report)\n"
         ));
+    }
+    if properties.iter().any(|p| p.included) {
+        cfg.push_str("PROPERTIES\n");
+        for p in properties.iter().filter(|p| p.included) {
+            cfg.push_str(&format!("  {}\n", p.operator));
+        }
+    }
+    for p in &properties {
+        if !p.included {
+            cfg.push_str(&format!(
+                "\\* PROPERTY {} is left out: it reaches a refusal (see the .tla.json report)\n",
+                p.operator
+            ));
+        } else if p.without_fairness {
+            cfg.push_str(&format!(
+                "\\* PROPERTY {} is checked without fairness: its spec ({}) states none, so a\n\\* behaviour may stop anywhere\n",
+                p.operator, p.spec
+            ));
+        }
     }
     for c in candidates.iter().filter(|c| !c.included && c.reason.starts_with("reached from")) {
         cfg.push_str(&format!(
@@ -4161,6 +5084,7 @@ pub fn export_module(krate: &Krate, arg: &str) -> Result<Export, String> {
         init: init_name,
         next: next_name,
         init_unassigned,
+        init_enumerated,
         invariants: inv_names,
         transitions,
         skipped_invariants: skipped,
@@ -4168,6 +5092,9 @@ pub fn export_module(krate: &Krate, arg: &str) -> Result<Export, String> {
         operators: ex.defs.len(),
         holes: ex.holes,
         refusals: ex.refusals,
+        properties,
+        fairness_in_spec,
+        temporal_notes,
     };
     Ok(Export { module_name, tla, cfg, report })
 }

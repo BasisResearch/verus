@@ -2578,7 +2578,8 @@ fn tla_export_assigns_a_bare_bool_field() {
 
 /// A helper Init calls is printed once, orienting `s.x == s.y` by its own
 /// conjuncts alone (`x = y`), so it does not assign `y` after the caller
-/// assigned `x`: TLC stops on `x = y` with `y` unassigned. The report says so.
+/// assigned `x`. `y` is a `u8`, so Init draws it from `0..255` and `init`
+/// keeps the one value `x = y` allows; the report says so.
 const INIT_HELPER_EQUALITY: &str = r#"
 verus! {
 pub struct State { pub x: u8, pub y: u8 }
@@ -2599,13 +2600,18 @@ pub open spec fn small(s: State) -> bool { s.x < 9 }
 fn tla_export_reads_an_init_helper_as_it_is_printed() {
     let ex = export_code(INIT_HELPER_EQUALITY, "test_crate");
     assert!(ex.tla.contains("same ==\n    (x = y)"), "{}", ex.tla);
-    assert_eq!(ex.report["init_unassigned"], serde_json::json!(["y"]), "{}", ex.tla);
-    assert!(ex.cfg.contains("\\* Init never assigns y"), "{}", ex.cfg);
+    assert_eq!(ex.report["init_unassigned"], serde_json::json!([]), "{}", ex.tla);
+    assert_eq!(
+        ex.report["init_enumerated"],
+        serde_json::json!([{"variable": "y", "domain": "0..255"}])
+    );
+    assert!(ex.tla.contains("Init == (y \\in 0..255) /\\ init /\\ TypeOK\n"), "{}", ex.tla);
+    assert!(!ex.cfg.contains("Init never assigns"), "{}", ex.cfg);
     let Some(jar) = tla_tools() else { return };
     sany(&jar, &ex.spec());
-    // TLC cannot compute the initial state, as the report says.
-    let out = tlc_output(&jar, &ex.spec(), &ex.cfg);
-    assert!(out.contains("0 distinct states found"), "{}", out);
+    // One initial state, x = y = 0, and x counts to 3.
+    let run = tlc(&jar, &ex.spec(), &ex.cfg);
+    assert_eq!(run.distinct, 4, "{run:?}\n{}", ex.tla);
 }
 
 /// A helper is checked inside its caller only when that caller is in the
@@ -2894,4 +2900,159 @@ fn tla_export_refuses_reals() {
     let run = tlc(&jar, &ex.spec(), &ex.cfg);
     assert_eq!(run.violated, Vec::<String>::new(), "{}", ex.tla);
     assert_eq!(run.distinct, 3, "{run:?}\n{}", ex.tla);
+}
+
+/// verus-tla's `defs` and `Action`, as `mutex_liveness.rs` carries them.
+fn verus_tla_defs() -> String {
+    let src = std::fs::read_to_string(fixture("mutex_liveness.rs")).unwrap();
+    let start = src.find("pub mod defs {").unwrap();
+    let end = src.find("use action::*;").unwrap();
+    src[start..end].to_string()
+}
+
+#[test]
+fn tla_export_verus_tla_liveness_under_weak_fairness() {
+    let ex = export(&fixture("mutex_liveness.rs"), "test_crate");
+    assert_eq!(ex.report["shape"], "verus-tla");
+    assert_eq!(ex.report["refusals"], serde_json::json!([]));
+    assert_eq!(ex.report["holes"], serde_json::json!([]));
+    // `init` constrains the map key by key: Init draws it from the maps of
+    // a subset of {A, B} to the three thread states.
+    assert_eq!(ex.report["init_unassigned"], serde_json::json!([]));
+    assert_eq!(ex.report["init_enumerated"][0]["variable"], "threads");
+    assert!(ex.tla.contains("Init == (threads \\in UNION {[d__ -> "), "{}", ex.tla);
+    // Each `f().forward(input)` is an operator named after `f`, so TLC's
+    // steps and WF_vars read as the Verus actions.
+    assert!(ex.tla.contains("thread_acquires_lock(input) ==\n"), "{}", ex.tla);
+    assert!(ex.tla.contains("stutter ==\n"), "{}", ex.tla);
+    assert!(
+        ex.tla.contains(
+            "thread_acquires_lock([tag |-> \"A\"]) \\/ thread_releases_lock([tag |-> \"A\"])"
+        ),
+        "{}",
+        ex.tla
+    );
+    let props = ex.report["properties"].as_array().unwrap();
+    assert_eq!(props.len(), 1, "{:?}", props);
+    let p = &props[0];
+    assert_eq!(p["operator"], "both_threads_eventually_terminate");
+    assert_eq!(p["formula"], "<>(both_threads_are_terminated)");
+    assert_eq!(
+        p["fairness"],
+        serde_json::json!([
+            "(\\A tid \\in ({[tag |-> \"A\"]} \\cup {[tag |-> \"B\"]}) : WF_vars(thread_acquires_lock(tid)))",
+            "(\\A tid_2 \\in ({[tag |-> \"A\"]} \\cup {[tag |-> \"B\"]}) : WF_vars(thread_releases_lock(tid_2)))",
+        ])
+    );
+    assert_eq!(p["assumptions"], serde_json::json!([]));
+    assert_eq!(p["without_fairness"], false);
+    assert_eq!(p["included"], true);
+    assert_eq!(p["notes"], serde_json::json!([]));
+    assert_eq!(ex.report["fairness_in_spec"], true);
+    assert!(ex.tla.contains("Spec == Init /\\ [][Next]_vars /\\ Fairness\n"), "{}", ex.tla);
+    assert!(ex.cfg.contains("PROPERTIES\n  both_threads_eventually_terminate\n"), "{}", ex.cfg);
+    // The state the property waits for is not an invariant.
+    assert_eq!(ex.report["invariants"], serde_json::json!([]));
+    assert_eq!(candidates(&ex.report), [("both_threads_are_terminated".to_string(), false)]);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let out = tlc_output_with(&jar, &ex.spec(), &ex.cfg, &[]);
+    assert!(out.contains("No error has been found"), "{}", out);
+    assert!(out.contains("8 distinct states found"), "{}", out);
+
+    // Without fairness for release, a thread may hold the lock forever.
+    let src = std::fs::read_to_string(fixture("mutex_liveness.rs")).unwrap();
+    let unfair: String = src
+        .lines()
+        .filter(|l| !l.contains("thread_releases_lock().weak_fairness"))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    let dir = TempDir::new().unwrap();
+    let entry = dir.path().join("mutex_liveness.rs");
+    std::fs::write(&entry, unfair).unwrap();
+    let ex = export(&entry, "test_crate");
+    assert_eq!(ex.report["properties"][0]["fairness"].as_array().unwrap().len(), 1);
+    let out = tlc_output_with(&jar, &ex.spec(), &ex.cfg, &[]);
+    assert!(
+        out.contains("Error: Temporal property both_threads_eventually_terminate was violated"),
+        "{}",
+        out
+    );
+    assert!(out.contains("<thread_acquires_lock("), "{}", out);
+    assert!(out.contains("Stuttering"), "{}", out);
+}
+
+/// A counter in verus-tla style with its spec in `spec()`: a property under
+/// it, and one a proof fn states without fairness.
+fn liveness_counter() -> String {
+    format!(
+        r#"
+verus! {{
+{defs}
+use action::*;
+use defs::*;
+
+pub struct S {{ pub x: u8 }}
+
+pub open spec fn init() -> StatePred<S> {{ |s: S| s.x == 0 }}
+
+pub open spec fn inc() -> Action<S, (), ()> {{
+    Action {{
+        precondition: |input: (), s: S| s.x < 3,
+        transition: |input: (), s: S| (S {{ x: (s.x + 1) as u8 }}, ()),
+    }}
+}}
+
+pub open spec fn next() -> ActionPred<S> {{
+    |s: S, s_prime: S| inc().forward(())(s, s_prime) || s_prime == s
+}}
+
+pub open spec fn spec() -> TempPred<S> {{
+    lift_state(init()).and(always(lift_action(next()))).and(inc().weak_fairness(()))
+}}
+
+pub open spec fn reaches_three() -> TempPred<S> {{
+    lift_state(init()).leads_to(lift_state(|s: S| s.x == 3))
+}}
+
+pub proof fn stops_short(m: TempPred<S>)
+    requires
+        m.entails(lift_state(init())),
+        m.entails(always(lift_action(next()))),
+    ensures
+        m.entails(eventually(lift_state(|s: S| s.x == 3))),
+{{
+    admit();
+}}
+}}
+"#,
+        defs = verus_tla_defs()
+    )
+}
+
+#[test]
+fn tla_export_verus_tla_liveness_per_property_spec() {
+    let ex = export_code(&liveness_counter(), "test_crate");
+    assert_eq!(ex.report["refusals"], serde_json::json!([]));
+    let props = ex.report["properties"].as_array().unwrap();
+    let ops: Vec<&str> = props.iter().map(|p| p["operator"].as_str().unwrap()).collect();
+    assert_eq!(ops, ["stops_short", "reaches_three"]);
+    assert_eq!(props[0]["without_fairness"], true);
+    assert_eq!(props[1]["fairness"], serde_json::json!(["WF_vars(inc)"]));
+    assert_eq!(props[1]["spec"], "test_crate::spec");
+    assert_eq!(props[1]["formula"], "(init ~> (x = 3))");
+    // The two specs differ, so Spec has no fairness and each property
+    // carries its own as a premise.
+    assert_eq!(ex.report["fairness_in_spec"], false);
+    assert!(ex.tla.contains("Spec == Init /\\ [][Next]_vars\n"), "{}", ex.tla);
+    assert!(ex.tla.contains("reaches_three ==\n    ((WF_vars(inc))) => ("), "{}", ex.tla);
+    assert!(ex.cfg.contains("PROPERTY stops_short is checked without fairness"), "{}", ex.cfg);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let only = |p: &str| ex.cfg.replace("  stops_short\n  reaches_three\n", &format!("  {p}\n"));
+    let out = tlc_output_with(&jar, &ex.spec(), &only("reaches_three"), &[]);
+    assert!(out.contains("No error has been found"), "{}", out);
+    let out = tlc_output_with(&jar, &ex.spec(), &only("stops_short"), &[]);
+    assert!(out.contains("Error: Temporal property stops_short was violated"), "{}", out);
+    assert!(out.contains("Stuttering"), "{}", out);
 }
