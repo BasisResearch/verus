@@ -2817,6 +2817,51 @@ impl Exporter {
             .collect()
     }
 
+    /// The operators a trace may log: every operator Next reaches through
+    /// branches (called at conjunct level inside an `IF`, `match`,
+    /// disjunction or `exists` of Next, of an operator Next conjoins, or of
+    /// one reached so), intermediate ones included: a step that branches
+    /// into helpers is loggable by its own name, as are the helpers. Next
+    /// itself only when it reaches none (the verus-tla shape).
+    fn trace_operators(&self, next: &OpKey) -> Vec<OpKey> {
+        let branch_callees = |t: &OpKey| {
+            let mut conj: Vec<OpKey> = vec![t.clone()];
+            let mut conj_seen: HashSet<OpKey> = HashSet::from([t.clone()]);
+            let mut out = Vec::new();
+            let mut i = 0;
+            while i < conj.len() {
+                for call in self.calls.get(&conj[i]).into_iter().flatten() {
+                    match call.reach {
+                        Reach::Branch => out.push(call.callee.clone()),
+                        Reach::Conjoined => {
+                            if conj_seen.insert(call.callee.clone()) {
+                                conj.push(call.callee.clone());
+                            }
+                        }
+                        Reach::Other => {}
+                    }
+                }
+                i += 1;
+            }
+            out
+        };
+        let mut seen: HashSet<OpKey> = HashSet::from([next.clone()]);
+        let mut queue = branch_callees(next);
+        let mut found = Vec::new();
+        while let Some(t) = queue.pop() {
+            if !seen.insert(t.clone()) {
+                continue;
+            }
+            queue.extend(branch_callees(&t));
+            found.push(t);
+        }
+        if found.is_empty() {
+            found.push(next.clone());
+        }
+        found.sort_by_key(|k| self.op_names.get(k).cloned().unwrap_or_default());
+        found
+    }
+
     /// The role of each parameter: a state-typed parameter is pre or post
     /// (the first one pre, a second one post), any other is None.
     ///
@@ -4163,8 +4208,11 @@ pub fn export_module(krate: &Krate, arg: &str) -> Result<Export, String> {
         "\\* The unassigned check counts a conjunct-level v' = e, and v = e in Init (an IF,\n\\* match or disjunction when every branch assigns v; a FALSE branch assigns all;\n\\* g => b1 beside ~g => b2 when b1 and b2 both assign v).\n\\* It can miss a v' read before the conjunct that assigns it (TLC evaluates\n\\* conjuncts in order), and it does not count v' \\in S.\n",
     );
     cfg.push_str("\\* CONSTRAINT <a state predicate bounding the model>\n");
-    let (trace_module_name, trace_tla, trace_cfg, trace) =
-        ex.trace_spec(module, &module_name, &transitions);
+    let (trace_module_name, trace_tla, trace_cfg, trace) = ex.trace_spec(
+        module,
+        &module_name,
+        &ex.trace_operators(&(triple.next.clone(), Variant::Plain)),
+    );
     let report = Report {
         module: module.to_string(),
         shape: triple.shape.to_string(),
@@ -4429,7 +4477,7 @@ impl Exporter {
         &mut self,
         module: &str,
         module_name: &str,
-        transitions: &[Transition],
+        operators: &[OpKey],
     ) -> (String, String, String, TraceReport) {
         let trace_module = format!("{module_name}_trace");
         let log = self.trace_name("TraceLog");
@@ -4498,15 +4546,16 @@ impl Exporter {
         for arms in [&mut obs_arms, &mut obs_next_arms] {
             arms.push("OTHER -> Assert(FALSE, \"trace: the state has no field \" \\o k)".into());
         }
-        // The loggable steps: every transition printed as a plain operator.
+        // The loggable steps: every operator Next reaches through branches
+        // (see [`Exporter::trace_operators`]) printed as a plain operator.
         let by_name: HashMap<String, OpKey> =
             self.op_names.iter().map(|(k, n)| (n.clone(), k.clone())).collect();
         let mut steps: Vec<TraceStep> = Vec::new();
-        for t in transitions {
-            let Some(key) = by_name.get(&t.operator).cloned() else { continue };
+        for key in operators {
             if key.1 != Variant::Plain {
                 continue;
             }
+            let Some(operator) = self.op_names.get(key).cloned() else { continue };
             let Some(f) = self.functions.get(&key.0).cloned() else { continue };
             let friendly = fun_as_friendly_rust_name(&key.0);
             let short = friendly.rsplit("::").next().unwrap_or(&friendly).to_string();
@@ -4543,7 +4592,7 @@ impl Exporter {
             steps.push(TraceStep {
                 step: short,
                 function: friendly,
-                operator: t.operator.clone(),
+                operator,
                 short_name_shared: false,
                 params: ps,
             });
@@ -4661,7 +4710,7 @@ impl Exporter {
             "\\* Trace validation for {module_name}, the export of `{module}` (verus -V tla-export).\n"
         ));
         tla.push_str(&format!(
-            "\\* The log is newline-delimited JSON: a header line naming the module\n\\* ({{\"module\": \"{module_name}\", \"export\": \"...\"}}, optionally \"state\": the observed\n\\* initial state; another module stops TLC), then one line per step:\n\\* {{\"step\": \"<t_* name>\", \"params\": {{...}}, \"state\": {{...}}}}. A step is named by\n\\* its spec fn's last segment or full path, by the full path alone when two\n\\* steps share the last segment; a parameter the step does not declare stops\n\\* TLC. Values are in the export's encoding: a struct or enum value is an\n\\* object (an enum's with its \"tag\"), a Seq an array, a Set an array of its\n\\* elements, a Map an array of [key, value] pairs, a tuple an array. An object\n\\* observed in the state is partial: only the fields it names are compared, so\n\\* a ghost field is left out of the log and free in the model; a Seq may be\n\\* observed partially as an object keyed by the Verus index (\"0\", \"1\", ...).\n\\* A record inside a Set element, a Map key or a parameter is decoded whole,\n\\* so it must name every field (a field left out there stops TLC). A parameter\n\\* left out of \"params\" ranges over the hole bounding it in Next (a VerusSync\n\\* step's Dom_Step_<t>_v<i>), its type's finite domain or the export's\n\\* Dom_<Type> hole; with none of these it must be logged.\n"
+            "\\* The log is newline-delimited JSON: a header line naming the module\n\\* ({{\"module\": \"{module_name}\", \"export\": \"{module}\"}}, optionally \"state\": the\n\\* observed initial state; another module or export stops TLC), then one line per step:\n\\* {{\"step\": \"<t_* name>\", \"params\": {{...}}, \"state\": {{...}}}}. A step is named by\n\\* its spec fn's last segment or full path, by the full path alone when two\n\\* steps share the last segment; a parameter the step does not declare stops\n\\* TLC. Values are in the export's encoding: a struct or enum value is an\n\\* object (an enum's with its \"tag\"), a Seq an array, a Set an array of its\n\\* elements, a Map an array of [key, value] pairs, a tuple an array. An object\n\\* observed in the state is partial: only the fields it names are compared, so\n\\* a ghost field is left out of the log and free in the model; a Seq may be\n\\* observed partially as an object keyed by the Verus index (\"0\", \"1\", ...).\n\\* A record inside a Set element, a Map key or a parameter is decoded whole,\n\\* so it must name every field (a field left out there stops TLC). A parameter\n\\* left out of \"params\" ranges over the hole bounding it in Next (a VerusSync\n\\* step's Dom_Step_<t>_v<i>), its type's finite domain or the export's\n\\* Dom_<Type> hole; with none of these it must be logged.\n"
         ));
         tla.push_str(&format!(
             "\\* TraceNext takes the logged step and conjoins Next, so it only ever narrows\n\\* the model: a trace TLC follows to its end ({accepted}) is a behaviour of\n\\* {module_name}. Otherwise the deepest {index} reached is the first logged step\n\\* the model cannot take from any state that explains the log so far.\n"
@@ -4711,7 +4760,7 @@ impl Exporter {
         ));
         tla.push_str(&format!("{step_op}(e) ==\n    CASE {}\n\n", step_arms.join("\n      [] ")));
         tla.push_str(&format!(
-            "{init} ==\n    /\\ Assert(\"module\" \\in DOMAIN {header} /\\ {header}.module = \"{module_name}\",\n              \"trace: the log's header does not name the module {module_name}\")\n    /\\ Init\n    /\\ {index} = 1\n    /\\ {observed}({state_of}({header}))\n\n"
+            "{init} ==\n    /\\ Assert(\"module\" \\in DOMAIN {header} /\\ {header}.module = \"{module_name}\",\n              \"trace: the log's header does not name the module {module_name}\")\n    /\\ Assert(\"export\" \\in DOMAIN {header} /\\ {header}.export = \"{module}\",\n              \"trace: the log's header does not name the export {module}\")\n    /\\ Init\n    /\\ {index} = 1\n    /\\ {observed}({state_of}({header}))\n\n"
         ));
         tla.push_str(&format!(
             "{next} ==\n    /\\ {index} <= Len({trace})\n    /\\ LET e == {trace}[{index}] IN\n           /\\ {step_op}(e)\n           /\\ Next\n           /\\ {observed_next}({state_of}(e))\n    /\\ {index}' = {index} + 1\n\n"

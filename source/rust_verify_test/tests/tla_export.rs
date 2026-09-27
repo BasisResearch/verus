@@ -2934,9 +2934,15 @@ fn tla_export_trace_spec_follows_a_counter_log() {
     assert_eq!(trace["module"], "State_tla_trace");
     assert_eq!(trace["index_variable"], "trace_i");
     assert_eq!(names(&trace["observables"]), ["x", "y"]);
+    // `next_step`, which dispatches on the `Step` enum, is a step too (every
+    // operator Next reaches through branches is).
     assert_eq!(
         trace["steps"],
         serde_json::json!([
+            {"step": "next_step", "function": "test_crate::next_step", "operator": "next_step",
+             "short_name_shared": false,
+             "params": [{"name": "step", "typ": "Step",
+                         "domain": "({[tag |-> \"Inc\"]} \\cup {[tag |-> \"Dbl\"]})"}]},
             {"step": "t_dbl", "function": "test_crate::t_dbl", "operator": "t_dbl",
              "short_name_shared": false, "params": []},
             {"step": "t_inc", "function": "test_crate::t_inc", "operator": "t_inc",
@@ -2972,7 +2978,7 @@ fn tla_export_trace_spec_follows_a_counter_log() {
     assert_eq!(depth, 4, "{out}");
     assert!(
         out.contains(
-            "<<\"probe\", \"t_dbl\", {[step |-> \"t_dbl\"], [step |-> \"t_inc\"]}, [step_enabled |-> TRUE, unmatched |-> {\"x\"}]>>"
+            "<<\"probe\", \"t_dbl\", {[step |-> \"t_dbl\"], [step |-> \"t_inc\"], [params |-> [step |-> [tag |-> \"Inc\"]], step |-> \"next_step\"], [params |-> [step |-> [tag |-> \"Dbl\"]], step |-> \"next_step\"]}, [step_enabled |-> TRUE, unmatched |-> {\"x\"}]>>"
         ), "{}", out);
 }
 
@@ -2983,11 +2989,16 @@ fn tla_export_trace_spec_decodes_collections_and_parameters() {
 use vstd::prelude::*;
 verus! {
 pub enum Mode { Off, On(u8) }
+pub enum Ev { Lo(u8), Hi(u8, bool) }
 pub struct Rec { pub a: nat, pub ghost_b: int }
-pub struct State { pub s: Seq<Rec>, pub set: Set<u8>, pub m: Map<u8, bool>, pub o: Option<int>, pub mode: Mode }
+pub struct State {
+    pub s: Seq<Rec>, pub set: Set<u8>, pub m: Map<u8, bool>, pub o: Option<int>, pub mode: Mode,
+    pub mr: Map<u8, Rec>, pub ev: Ev,
+}
 pub open spec fn init(s: State) -> bool {
     &&& s.s == Seq::<Rec>::empty() &&& s.set == Set::<u8>::empty() &&& s.m == Map::<u8, bool>::empty()
     &&& s.o is None &&& s.mode == Mode::Off
+    &&& s.mr == Map::<u8, Rec>::empty() &&& s.ev == Ev::Lo(0)
 }
 pub open spec fn t_add(pre: State, post: State, k: u8, g: bool) -> bool {
     &&& k < 3
@@ -2996,6 +3007,8 @@ pub open spec fn t_add(pre: State, post: State, k: u8, g: bool) -> bool {
     &&& post.m == pre.m.insert(k, g)
     &&& post.o == Some(k as int)
     &&& post.mode == Mode::On(k)
+    &&& post.mr == pre.mr.insert(k, Rec { a: k as nat, ghost_b: if g { 1 } else { 0 } })
+    &&& post.ev == if g { Ev::Hi(k, g) } else { Ev::Lo(k) }
 }
 pub open spec fn next(pre: State, post: State) -> bool {
     exists|k: u8, g: bool| t_add(pre, post, k, g)
@@ -3018,16 +3031,31 @@ pub open spec fn next(pre: State, post: State) -> bool {
     sany(&jar, &spec);
     // `g` is left out of the log (it only reaches the ghost field), so it
     // ranges over BOOLEAN; the Seq is observed whole and then by index, its
-    // records partially.
+    // records partially, and so are a Map's values (its keys whole). Both
+    // variants of `Ev` have a field `v0`: each is compared under its tag.
     let log = ex.dir.path().join("t.ndjson");
     let lines = [
-        r#"{"module": "State_tla", "export": "test_crate", "state": {"s": [], "set": [], "m": [], "o": {"tag": "None"}}}"#,
-        r#"{"step": "t_add", "params": {"k": 2}, "state": {"s": [{"a": 2}], "set": [2], "m": [[2, true]], "o": {"tag": "Some", "v0": 2}, "mode": {"tag": "On", "v0": 2}}}"#,
-        r#"{"step": "t_add", "params": {"k": 0, "g": false}, "state": {"s": {"1": {"a": 0, "ghost_b": 0}}, "set": [0, 2], "o": {"tag": "Some"}}}"#,
+        r#"{"module": "State_tla", "export": "test_crate", "state": {"s": [], "set": [], "m": [], "o": {"tag": "None"}, "mr": [], "ev": {"tag": "Lo", "v0": 0}}}"#,
+        r#"{"step": "t_add", "params": {"k": 2}, "state": {"s": [{"a": 2}], "set": [2], "m": [[2, true]], "o": {"tag": "Some", "v0": 2}, "mode": {"tag": "On", "v0": 2}, "mr": [[2, {"a": 2}]], "ev": {"tag": "Hi", "v0": 2}}}"#,
+        r#"{"step": "t_add", "params": {"k": 0, "g": false}, "state": {"s": {"1": {"a": 0, "ghost_b": 0}}, "set": [0, 2], "o": {"tag": "Some"}, "mr": [[0, {"a": 0}], [2, {"ghost_b": 1}]], "ev": {"tag": "Lo", "v0": 0}}}"#,
     ];
     std::fs::write(&log, lines.join("\n") + "\n").unwrap();
     let (depth, out) = follow(&jar, &spec, &cfg, &log, "");
     assert_eq!(depth, 3, "{out}");
+    // A Map value's field, a Map key, or a shared label under the other tag
+    // the model cannot produce stops the log at the step observing it.
+    for (from, to) in [
+        (r#"[[0, {"a": 0}], [2, {"ghost_b": 1}]]"#, r#"[[0, {"a": 0}], [2, {"ghost_b": 0}]]"#),
+        (r#"[[0, {"a": 0}], [2, {"ghost_b": 1}]]"#, r#"[[1, {"a": 0}], [2, {"ghost_b": 1}]]"#),
+        (r#""ev": {"tag": "Lo", "v0": 0}}}"#, r#""ev": {"tag": "Hi", "v0": 0}}}"#),
+        (r#""ev": {"tag": "Lo", "v0": 0}}}"#, r#""ev": {"tag": "Lo", "v0": 2}}}"#),
+    ] {
+        let bad = lines[2].replace(from, to);
+        assert_ne!(bad, lines[2]);
+        std::fs::write(&log, format!("{}\n{}\n{bad}\n", lines[0], lines[1])).unwrap();
+        let (depth, out) = follow(&jar, &spec, &cfg, &log, "");
+        assert_eq!(depth, 2, "{to}\n{out}");
+    }
     // A value the model cannot produce (k = 5 fails the guard) stops it.
     std::fs::write(&log, lines[..2].join("\n").replace("\"k\": 2", "\"k\": 5") + "\n").unwrap();
     let (depth, out) = follow(&jar, &spec, &cfg, &log, "");
@@ -3040,11 +3068,24 @@ fn tla_export_trace_spec_stops_at_a_malformed_log() {
     let (spec, _, cfg) = trace_spec(&ex);
     let Some(jar) = tla_tools() else { return };
     let log = ex.dir.path().join("t.ndjson");
-    let header = r#"{"module": "State_tla", "export": "counter", "state": {"x": 0, "y": 0}}"#;
+    let header = r#"{"module": "State_tla", "export": "test_crate", "state": {"x": 0, "y": 0}}"#;
     // A log for another module is not read as this one's.
     std::fs::write(&log, "{\"module\": \"Other_tla\", \"export\": \"other\"}\n").unwrap();
     let out = stops(&jar, &spec, &cfg, &log, "");
     assert!(out.contains("trace: the log's header does not name the module State_tla"), "{}", out);
+    // Nor is one for another export whose state has the same name, or a
+    // header naming no export.
+    for other in
+        [r#"{"module": "State_tla", "export": "other_crate::Other"}"#, r#"{"module": "State_tla"}"#]
+    {
+        std::fs::write(&log, format!("{other}\n")).unwrap();
+        let out = stops(&jar, &spec, &cfg, &log, "");
+        assert!(
+            out.contains("trace: the log's header does not name the export test_crate"),
+            "{}",
+            out
+        );
+    }
     // A parameter the step does not declare (a misspelling) is not ignored.
     let line = r#"{"step": "t_inc", "params": {"n": 1}, "state": {"x": 1}}"#;
     std::fs::write(&log, format!("{header}\n{line}\n")).unwrap();
@@ -3130,12 +3171,18 @@ fn tla_export_trace_spec_follows_a_verussync_log() {
     let ex = export(&fixture("adder_sync.rs"), "test_crate::Adder");
     // `add(v: int)`: `v` is the `Step::add` field Next bounds by the hole
     // `Dom_Step_add_v0`, so a log may leave it out.
+    // `next_by`, the dispatch on `Step`, is loggable too, with its `Step`
+    // (which holds an int) logged.
     assert_eq!(
         ex.report["trace"]["steps"],
         serde_json::json!([{
             "step": "add", "function": "test_crate::Adder::State::add", "operator": "add",
             "short_name_shared": false,
             "params": [{"name": "v", "typ": "int", "domain": "Dom_Step_add_v0"}],
+        }, {
+            "step": "next_by", "function": "test_crate::Adder::State::next_by",
+            "operator": "next_by", "short_name_shared": false,
+            "params": [{"name": "step", "typ": "Step", "domain": null}],
         }])
     );
     let (spec, tla, cfg) = trace_spec(&ex);
@@ -3208,4 +3255,57 @@ pub open spec fn next(pre: State, post: State) -> bool { exists|a: u8| t_put(pre
     std::fs::write(&log, format!("{header}\n{}\n", line.replace(r#", "b": 7}]"#, "}]"))).unwrap();
     let out = stops(&jar, &spec, &cfg, &log, "");
     assert!(out.contains("\"b\""), "{}", out);
+}
+
+#[test]
+fn tla_export_trace_spec_logs_a_step_that_branches_into_helpers() {
+    let ex = export_code(
+        r#"
+use vstd::prelude::*;
+verus! {
+pub struct State { pub x: u8, pub y: u8 }
+pub open spec fn init(s: State) -> bool { s.x == 0 && s.y == 0 }
+pub open spec fn bump(pre: State, post: State) -> bool { post.x == 1 && post.y == pre.y }
+pub open spec fn reset(pre: State, post: State) -> bool { post.x == 0 && post.y == pre.y }
+pub open spec fn t_recv(pre: State, post: State, b: bool) -> bool {
+    if b { bump(pre, post) } else { reset(pre, post) }
+}
+pub open spec fn t_other(pre: State, post: State) -> bool {
+    ||| post.x == pre.x && post.y == 1
+    ||| bump(pre, post)
+}
+pub open spec fn next(pre: State, post: State) -> bool {
+    (exists|b: bool| t_recv(pre, post, b)) || t_other(pre, post)
+}
+}
+"#,
+        "test_crate",
+    );
+    // `t_recv` branches into `bump` and `reset`: it is a step, and so are
+    // they; `next`, which only dispatches, is not.
+    let steps = ex.report["trace"]["steps"].as_array().unwrap();
+    let named: Vec<&str> = steps.iter().map(|s| s["step"].as_str().unwrap()).collect();
+    assert_eq!(named, ["bump", "reset", "t_other", "t_recv"]);
+    assert_eq!(
+        steps[3]["params"],
+        serde_json::json!([{"name": "b", "typ": "bool", "domain": "BOOLEAN"}])
+    );
+    let (spec, _, cfg) = trace_spec(&ex);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &spec);
+    let log = ex.dir.path().join("t.ndjson");
+    let lines = [
+        r#"{"module": "State_tla", "export": "test_crate", "state": {"x": 0, "y": 0}}"#,
+        r#"{"step": "t_recv", "params": {"b": true}, "state": {"x": 1, "y": 0}}"#,
+        r#"{"step": "t_other", "params": {}, "state": {"x": 1, "y": 1}}"#,
+        r#"{"step": "t_recv", "state": {"x": 0, "y": 1}}"#,
+        r#"{"step": "bump", "params": {}, "state": {"x": 1, "y": 1}}"#,
+    ];
+    std::fs::write(&log, lines.join("\n") + "\n").unwrap();
+    let (depth, out) = follow(&jar, &spec, &cfg, &log, "");
+    assert_eq!(depth, 5, "{out}");
+    // The step's own parameter still narrows it: `b` false is `reset`.
+    std::fs::write(&log, format!("{}\n{}\n", lines[0], lines[1].replace("true", "false"))).unwrap();
+    let (depth, out) = follow(&jar, &spec, &cfg, &log, "");
+    assert_eq!(depth, 1, "{out}");
 }

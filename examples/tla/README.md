@@ -206,13 +206,15 @@ Beside every export the flag writes a trace spec, `<State>_tla_trace.tla`
 with a `.cfg` skeleton, which `EXTENDS` the export and follows one logged
 behaviour of an implementation (the report's `trace` lists its steps and
 observable fields). The log is newline-delimited JSON: a header line naming
-the module and the export, `{"module": "State_tla", "export": "counter"}`,
-optionally with `"state"`, the observed initial state (a header naming
-another module stops TLC); then one line per step,
-`{"step": "t_inc", "params": {...}, "state": {...}}`, naming the
-transition's spec fn (its last segment, or its full path; only the full path
-when two steps share the last segment, which the report marks
-`short_name_shared`), its parameters other than the pre and post states by
+the module and the export, the module path given to `-V tla-export`
+(`{"module": "State_tla", "export": "counter"}` for `counter.rs` exported as
+`counter`), optionally with `"state"`, the observed initial state (a header
+naming another module or another export stops TLC, since exports whose
+states share a name share a module name); then one line per step,
+`{"step": "t_inc", "params": {...}, "state": {...}}`, naming a spec fn Next
+reaches through its branches (a step, or a helper a step branches into; its
+last segment, or its full path; only the full path when two steps share the
+last segment, which the report marks `short_name_shared`), its parameters other than the pre and post states by
 their Rust names (a name the step does not declare stops TLC), and the
 observed state after the step by field. Values are in the export's encoding:
 a struct or enum value is an object (an enum's with its `"tag"`), an `Option`
@@ -239,9 +241,10 @@ deepest `trace_i` is the first step no model behaviour explaining the log so
 far can take. There, `TraceEnabled` is the set of the model's enabled steps
 with their parameters, and `TraceDiagnosis` says whether the logged step is
 enabled at all and which observed fields no successor by it matches.
-`counter_trace_ok.ndjson` is followed to its end (depth 6);
-`counter_trace_bad.ndjson` logs `t_dbl` where the counter took `t_inc`, and
-TLC stops at its fourth step, with `t_dbl` enabled but `x` unmatched.
+`counter_trace_ok.ndjson` and `counter_trace_bad.ndjson` name the export
+`test_crate`, as the tests export `counter.rs`. The first is followed to its
+end (depth 6);
+the second logs `t_dbl` where the counter took `t_inc`, and TLC stops at its fourth step, with `t_dbl` enabled but `x` unmatched.
 `tlc_conform` in verus-tools-mcp runs this and answers the verdict.
 
 `rust_verify_test/tests/tla_export.rs` exports the five fixtures (as crate
