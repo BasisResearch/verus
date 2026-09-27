@@ -273,4 +273,12 @@ impl Emitter {
             self.log_node(&nodes!(eval { expr }));
         }
     }
+
+    /// `(get-value (expr))`: the standard spelling of `eval`, which cvc5
+    /// answers and z3's `eval` extension does not require.
+    pub fn log_get_value(&mut self, expr: Node) {
+        if !self.is_none() {
+            self.log_node(&nodes!(get-value { Node::List(vec![expr]) }));
+        }
+    }
 }

@@ -1672,10 +1672,25 @@ impl Context {
         let printer =
             crate::printer::Printer::new(self.message_interface.clone(), true, self.solver.clone());
         let node = printer.expr_to_node(expr);
-        match self.eval_expr(node).as_str() {
-            "true" => Some(true),
-            "false" => Some(false),
-            _ => None,
+        match self.solver {
+            SmtSolver::Z3 => match self.eval_expr(node).as_str() {
+                "true" => Some(true),
+                "false" => Some(false),
+                _ => None,
+            },
+            // cvc5 has no `eval`: it takes the command for an unknown one
+            // and the reader loses its place in the solver's output.
+            // `get-value` answers `((expr value))` on one line.
+            SmtSolver::Cvc5 => {
+                self.smt_log.log_get_value(node);
+                let smt_data = self.smt_log.take_pipe_data();
+                let smt_output = self.get_smt_process().send_commands(smt_data);
+                match smt_output.as_slice() {
+                    [line] if line.ends_with(" true))") => Some(true),
+                    [line] if line.ends_with(" false))") => Some(false),
+                    _ => None,
+                }
+            }
         }
     }
 
