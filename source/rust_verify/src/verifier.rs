@@ -895,15 +895,26 @@ impl Verifier {
     /// `-V tla-export=<module>[:<inv>,...]`: write the module's transition
     /// system as TLA+ under the log directory, before simplification so `match` and
     /// constructor updates are still visible. The files are named after the
-    /// TLA+ module (`<State>_tla.tla`, `.cfg`, `.tla.json`), since TLC only
-    /// loads a module from a file of the same name.
+    /// TLA+ module (`<State>_tla.tla`, `.cfg`, `.tla.json`, and the trace
+    /// spec `<State>_tla_trace.tla` with its `.cfg`), since TLC only loads a
+    /// module from a file of the same name.
     fn export_tla(&mut self, krate: &Krate, arg: &str) -> Result<(), VirErr> {
         let export = vir::tla::export_module(krate, arg)
             .map_err(|e| crate::util::error(format!("tla-export: {e}")))?;
         let dir = self.log_dir()?;
         let json = serde_json::to_string_pretty(&export.report).unwrap_or_else(|_| "{}".into());
-        for (ext, text) in [("tla", &export.tla), ("cfg", &export.cfg), ("tla.json", &json)] {
-            let path = dir.join(format!("{}.{ext}", export.module_name));
+        // The trace spec (`<module>_trace.tla` and its `.cfg`) goes beside the
+        // export it extends, so TLC finds the export from the trace spec's
+        // directory.
+        let trace = &export.trace_module_name;
+        for (name, ext, text) in [
+            (&export.module_name, "tla", &export.tla),
+            (&export.module_name, "cfg", &export.cfg),
+            (&export.module_name, "tla.json", &json),
+            (trace, "tla", &export.trace_tla),
+            (trace, "cfg", &export.trace_cfg),
+        ] {
+            let path = dir.join(format!("{name}.{ext}"));
             std::fs::write(&path, text.as_bytes()).map_err(|err| {
                 io_vir_err(format!("tla-export: could not write {}", path.display()), err)
             })?;

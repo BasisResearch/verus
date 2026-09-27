@@ -25,6 +25,10 @@
 //! * verus-tla: `init()` and `next()` returning `spec_fn` closures over the
 //!   state, with `Action { precondition, transition }` records inlined.
 //!
+//! Beside the export, `Exporter::trace_spec` writes a trace spec that
+//! extends it and follows one logged behaviour of the implementation (the
+//! trace format is in its module header and `examples/tla/README.md`).
+//!
 //! The state datatype's fields are the TLA+ variables. A parameter of the
 //! state type in the pre role prints as the unprimed variables, one in the
 //! post role as the primed ones, so `post.f == e` becomes `f' = e`, which is
@@ -113,6 +117,8 @@ pub struct Report {
     pub operators: usize,
     pub holes: Vec<Hole>,
     pub refusals: Vec<Refusal>,
+    /// The trace spec written beside the export (see [`TraceReport`]).
+    pub trace: TraceReport,
 }
 
 pub struct Export {
@@ -121,6 +127,11 @@ pub struct Export {
     pub tla: String,
     pub cfg: String,
     pub report: Report,
+    /// The trace spec: `<module_name>_trace.tla`, extending the export, and
+    /// its `.cfg` skeleton.
+    pub trace_module_name: String,
+    pub trace_tla: String,
+    pub trace_cfg: String,
 }
 
 /// Verus's Euclidean division and remainder (the remainder is never
@@ -4152,6 +4163,8 @@ pub fn export_module(krate: &Krate, arg: &str) -> Result<Export, String> {
         "\\* The unassigned check counts a conjunct-level v' = e, and v = e in Init (an IF,\n\\* match or disjunction when every branch assigns v; a FALSE branch assigns all;\n\\* g => b1 beside ~g => b2 when b1 and b2 both assign v).\n\\* It can miss a v' read before the conjunct that assigns it (TLC evaluates\n\\* conjuncts in order), and it does not count v' \\in S.\n",
     );
     cfg.push_str("\\* CONSTRAINT <a state predicate bounding the model>\n");
+    let (trace_module_name, trace_tla, trace_cfg, trace) =
+        ex.trace_spec(module, &module_name, &transitions);
     let report = Report {
         module: module.to_string(),
         shape: triple.shape.to_string(),
@@ -4168,6 +4181,498 @@ pub fn export_module(krate: &Krate, arg: &str) -> Result<Export, String> {
         operators: ex.defs.len(),
         holes: ex.holes,
         refusals: ex.refusals,
+        trace,
     };
-    Ok(Export { module_name, tla, cfg, report })
+    Ok(Export { module_name, tla, cfg, report, trace_module_name, trace_tla, trace_cfg })
+}
+
+// ---------------------------------------------------------------------------
+// The trace spec
+// ---------------------------------------------------------------------------
+
+/// A step a trace may log: a transition operator Next reaches, by its Rust
+/// name, and its parameters other than the pre and post states.
+#[derive(Debug, Clone, Serialize)]
+pub struct TraceStep {
+    /// The name a log line gives in `"step"`: the spec fn's last segment
+    /// (`t_inc`); its full Rust path is accepted too.
+    pub step: String,
+    pub function: String,
+    /// The operator it is printed as.
+    pub operator: String,
+    pub params: Vec<TraceParam>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TraceParam {
+    /// The key under the log line's `"params"`: the Rust parameter's name.
+    pub name: String,
+    pub typ: String,
+    /// The domain a parameter the log leaves out is taken from, or `None`
+    /// when its type has no finite one (then it must be logged, and the
+    /// model's enabled steps do not enumerate it).
+    pub domain: Option<String>,
+}
+
+/// What the trace spec checks, for the report.
+#[derive(Debug, Clone, Serialize)]
+pub struct TraceReport {
+    /// The trace spec's module name; it is written as `<module>.tla` beside
+    /// the export and `EXTENDS` it.
+    pub module: String,
+    /// The variable counting the logged steps taken (1 before the first).
+    pub index_variable: String,
+    /// The keys a log line's `"state"` may carry: the state's fields, by
+    /// their record labels.
+    pub observables: Vec<String>,
+    pub steps: Vec<TraceStep>,
+}
+
+impl Exporter {
+    /// A module-level name for the trace spec, `base` unless the export
+    /// already uses it.
+    fn trace_name(&mut self, base: &str) -> String {
+        let mut candidate = base.to_string();
+        let mut n = 2;
+        while self.used_names.contains(&candidate)
+            || self.constants.contains(&candidate)
+            || self.locals_ever.contains(&candidate)
+            || is_tla_reserved(&candidate)
+        {
+            candidate = format!("{base}_{n}");
+            n += 1;
+        }
+        self.used_names.insert(candidate.clone());
+        candidate
+    }
+
+    /// The codec operators for `typ`: `Dec_T(j)`, the model value a JSON
+    /// value of the log encodes, and `Obs_T(v, j)`, whether the model value
+    /// `v` agrees with what the log observed. Generated once per type into
+    /// `defs`; every one is declared RECURSIVE, so a recursive datatype needs
+    /// nothing special.
+    fn trace_codec(
+        &mut self,
+        typ: &Typ,
+        memo: &mut HashMap<String, (String, String)>,
+        defs: &mut Vec<String>,
+    ) -> (String, String) {
+        if let TypX::Decorate(_, _, t) | TypX::Boxed(t) = &**typ {
+            return self.trace_codec(t, memo, defs);
+        }
+        let key = sanitize(&self.constant_typ_name(typ));
+        if let Some(names) = memo.get(&key) {
+            return names.clone();
+        }
+        let dec = self.trace_name(&format!("TraceDec_{key}"));
+        let obs = self.trace_name(&format!("TraceObs_{key}"));
+        memo.insert(key, (dec.clone(), obs.clone()));
+        let (dec_body, obs_body) = match &**typ {
+            TypX::Datatype(Dt::Tuple(_), args, _) => {
+                let mut items = Vec::new();
+                let mut checks = vec![format!("Len(j) = {}", args.len())];
+                for (i, a) in args.iter().enumerate() {
+                    let (d, o) = self.trace_codec(a, memo, defs);
+                    items.push(format!("{d}(j[{}])", i + 1));
+                    checks.push(format!("{o}(v[{}], j[{}])", i + 1, i + 1));
+                }
+                (format!("<<{}>>", items.join(", ")), checks.join(" /\\ "))
+            }
+            TypX::Datatype(Dt::Path(p), args, _) => {
+                match path_as_friendly_rust_name(p).as_str() {
+                    "vstd::seq::Seq" if !args.is_empty() => {
+                        let (d, o) = self.trace_codec(&args[0], memo, defs);
+                        (
+                            format!("[p \\in 1..Len(j) |-> {d}(j[p])]"),
+                            format!(
+                                "IF TraceIsArray(j)\n    THEN Len(v) = Len(j) /\\ \\A p \\in 1..Len(j) : {o}(v[p], j[p])\n    ELSE \\A k \\in DOMAIN j : \\E p \\in 1..Len(v) : ToString(p - 1) = k /\\ {o}(v[p], j[k])"
+                            ),
+                        )
+                    }
+                    "vstd::set::Set" if !args.is_empty() => {
+                        let (d, _) = self.trace_codec(&args[0], memo, defs);
+                        (format!("{{{d}(j[p]) : p \\in 1..Len(j)}}"), format!("v = {dec}(j)"))
+                    }
+                    "vstd::map::Map" if args.len() == 2 => {
+                        let (dk, _) = self.trace_codec(&args[0], memo, defs);
+                        let (dv, ov) = self.trace_codec(&args[1], memo, defs);
+                        (
+                            format!(
+                                "[k \\in {{{dk}(j[p][1]) : p \\in 1..Len(j)}} |-> {dv}(j[CHOOSE p \\in 1..Len(j) : {dk}(j[p][1]) = k][2])]"
+                            ),
+                            format!(
+                                "DOMAIN v = {{{dk}(j[p][1]) : p \\in 1..Len(j)}} /\\ \\A p \\in 1..Len(j) : {ov}(v[{dk}(j[p][1])], j[p][2])"
+                            ),
+                        )
+                    }
+                    _ => match self.datatypes.get(p).cloned() {
+                        Some(d)
+                            if d.x.typ_params.len() == args.len()
+                                && !matches!(d.x.transparency, DatatypeTransparency::Never)
+                                && !(d.x.variants.len() == 1
+                                    && d.x.variants[0].fields.is_empty()) =>
+                        {
+                            let tagged = d.x.variants.len() > 1;
+                            let mut dec_arms = Vec::new();
+                            let mut obs_arms = Vec::new();
+                            for v in d.x.variants.iter() {
+                                let vname = v.name.to_string();
+                                let mut fields = Vec::new();
+                                if tagged {
+                                    fields.push(format!("tag |-> \"{vname}\""));
+                                }
+                                for f in v.fields.iter() {
+                                    let ftyp = crate::sst_util::subst_typ_for_datatype(
+                                        &d.x.typ_params,
+                                        args,
+                                        &f.a.0,
+                                    );
+                                    let label = field_name(&f.name);
+                                    let (fd, fo) = self.trace_codec(&ftyp, memo, defs);
+                                    fields.push(format!("{label} |-> {fd}(j.{label})"));
+                                    let guard = if tagged {
+                                        format!("v.tag = \"{vname}\" /\\ k = \"{label}\"")
+                                    } else {
+                                        format!("k = \"{label}\"")
+                                    };
+                                    obs_arms.push(format!("{guard} -> {fo}(v.{label}, j[k])"));
+                                }
+                                let record = if fields.is_empty() {
+                                    "[tag |-> \"unit\"]".to_string()
+                                } else {
+                                    format!("[{}]", fields.join(", "))
+                                };
+                                if tagged {
+                                    dec_arms.push(format!("j.tag = \"{vname}\" -> {record}"));
+                                } else {
+                                    dec_arms.push(record);
+                                }
+                            }
+                            let dec_body = if tagged {
+                                format!("CASE {}", dec_arms.join("\n      [] "))
+                            } else {
+                                dec_arms.pop().unwrap_or_else(|| "j".into())
+                            };
+                            // A JSON object is partial: only the fields it
+                            // names are compared (a ghost field is left out
+                            // of the log, so free).
+                            let fields = if obs_arms.is_empty() {
+                                "TRUE".to_string()
+                            } else {
+                                obs_arms.push("OTHER -> FALSE".into());
+                                format!(
+                                    "\\A k \\in DOMAIN j \\ {{\"tag\"}} :\n        CASE {}",
+                                    obs_arms.join("\n          [] ")
+                                )
+                            };
+                            let obs_body =
+                                if tagged { format!("v.tag = j.tag /\\ {fields}") } else { fields };
+                            (dec_body, obs_body)
+                        }
+                        _ => ("j".into(), "v = j".into()),
+                    },
+                }
+            }
+            _ => ("j".into(), "v = j".into()),
+        };
+        defs.push(format!(
+            "\\* {}\n{dec}(j) ==\n    {dec_body}\n{obs}(v, j) ==\n    {obs_body}\n",
+            typ_name(typ)
+        ));
+        (dec, obs)
+    }
+
+    /// The finite domain of a trace parameter of type `typ`, read off the
+    /// type alone as a quantifier's would be, or a hole constant the export
+    /// already declares for it; `None` otherwise (no new hole is made).
+    fn trace_domain(&mut self, typ: &Typ, span: &crate::messages::Span) -> Option<String> {
+        let first = self.holes.len();
+        let constants = self.constants.clone();
+        let domain = self.quiet(|x| x.bound_from_type(typ, span, &mut Vec::new()));
+        if self.holes.len() > first {
+            self.holes.truncate(first);
+            self.constants = constants;
+            return None;
+        }
+        match domain {
+            Some((d, _)) => Some(d),
+            None => {
+                let constant = format!("Dom_{}", self.constant_typ_name(typ));
+                self.constants.contains(&constant).then_some(constant)
+            }
+        }
+    }
+
+    /// The trace spec: a module extending the export that follows one logged
+    /// behaviour. Each log line after the header names a step, its
+    /// parameters and the observed state after it; `TraceNext` takes the
+    /// logged step (so it only ever narrows `Next`, which it conjoins) and
+    /// compares the observed fields.
+    fn trace_spec(
+        &mut self,
+        module: &str,
+        module_name: &str,
+        transitions: &[Transition],
+    ) -> (String, String, String, TraceReport) {
+        let trace_module = format!("{module_name}_trace");
+        let log = self.trace_name("TraceLog");
+        let index = self.trace_name("trace_i");
+        let names: Vec<String> = [
+            "TraceLines",
+            "TraceHeader",
+            "Trace",
+            "TraceIsArray",
+            "TraceStateOf",
+            "TraceObservedKey",
+            "TraceObserved",
+            "TraceObservedKeyNext",
+            "TraceObservedNext",
+            "TraceStep",
+            "TraceParam",
+            "TraceInit",
+            "TraceNext",
+            "TraceSpec",
+            "TraceAccepted",
+            "TraceEnabled",
+            "TraceDiagnosis",
+            "TraceStepAt",
+        ]
+        .iter()
+        .map(|n| self.trace_name(n))
+        .collect();
+        let [
+            lines,
+            header,
+            trace,
+            is_array,
+            state_of,
+            observed_key,
+            observed,
+            observed_key_next,
+            observed_next,
+            step_op,
+            param,
+            init,
+            next,
+            spec,
+            accepted,
+            enabled,
+            diagnosis,
+            step_at,
+        ] = <[String; 18]>::try_from(names).expect("eighteen names");
+        let mut memo = HashMap::new();
+        let mut defs: Vec<String> = Vec::new();
+        // The observed state: one arm per field.
+        let mut obs_arms = Vec::new();
+        let mut obs_next_arms = Vec::new();
+        for ((label, var), typ) in self
+            .state_fields
+            .clone()
+            .iter()
+            .zip(self.state_vars.clone().iter())
+            .zip(self.state_types.clone().iter())
+        {
+            let (_, o) = self.trace_codec(typ, &mut memo, &mut defs);
+            obs_arms.push(format!("k = \"{label}\" -> {o}({var}, j)"));
+            obs_next_arms.push(format!("k = \"{label}\" -> {o}({var}', j)"));
+        }
+        for arms in [&mut obs_arms, &mut obs_next_arms] {
+            arms.push("OTHER -> Assert(FALSE, \"trace: the state has no field \" \\o k)".into());
+        }
+        // The loggable steps: every transition printed as a plain operator.
+        let by_name: HashMap<String, OpKey> =
+            self.op_names.iter().map(|(k, n)| (n.clone(), k.clone())).collect();
+        let mut steps: Vec<TraceStep> = Vec::new();
+        for t in transitions {
+            let Some(key) = by_name.get(&t.operator).cloned() else { continue };
+            if key.1 != Variant::Plain {
+                continue;
+            }
+            let Some(f) = self.functions.get(&key.0).cloned() else { continue };
+            let roles = self.param_roles(&f);
+            let mut params = Vec::new();
+            for (p, role) in f.x.params.iter().zip(roles.iter()) {
+                if role.is_some() {
+                    continue;
+                }
+                let domain = self.trace_domain(&p.x.typ, &f.span);
+                params.push((ident_name(&p.x.name), p.x.typ.clone(), domain));
+            }
+            let friendly = fun_as_friendly_rust_name(&key.0);
+            let short = friendly.rsplit("::").next().unwrap_or(&friendly).to_string();
+            let mut ps = Vec::new();
+            for (name, typ, domain) in params {
+                self.trace_codec(&typ, &mut memo, &mut defs);
+                ps.push(TraceParam { name, typ: typ_name(&typ), domain });
+            }
+            steps.push(TraceStep {
+                step: short,
+                function: friendly,
+                operator: t.operator.clone(),
+                params: ps,
+            });
+        }
+        // The param types' decoders, in the order the steps list them.
+        let mut step_arms = Vec::new();
+        let mut enabled_parts = Vec::new();
+        for s in &steps {
+            let f = by_name[&s.operator].0.clone();
+            let f = self.functions[&f].clone();
+            let roles = self.param_roles(&f);
+            let typs: Vec<Typ> =
+                f.x.params
+                    .iter()
+                    .zip(roles.iter())
+                    .filter(|(_, r)| r.is_none())
+                    .map(|(p, _)| p.x.typ.clone())
+                    .collect();
+            let guard = if s.function == s.step {
+                format!("e.step = \"{}\"", s.step)
+            } else {
+                format!("e.step \\in {{\"{}\", \"{}\"}}", s.step, s.function)
+            };
+            if s.params.is_empty() {
+                step_arms.push(format!("{guard} -> {}", s.operator));
+                enabled_parts.push(format!(
+                    "(IF ENABLED ({} /\\ Next) THEN {{[step |-> \"{}\"]}} ELSE {{}})",
+                    s.operator, s.step
+                ));
+                continue;
+            }
+            let mut binds = Vec::new();
+            let mut args = Vec::new();
+            let mut enum_binds = Vec::new();
+            let mut enumerable = true;
+            for (i, (p, typ)) in s.params.iter().zip(typs.iter()).enumerate() {
+                let (d, _) = self.trace_codec(typ, &mut memo, &mut defs);
+                let a = format!("a{}_", i + 1);
+                let unlogged = match &p.domain {
+                    Some(dom) => dom.clone(),
+                    None => format!(
+                        "Assert(FALSE, \"trace: {} leaves out its parameter {}, whose type has no finite domain\")",
+                        s.step, p.name
+                    ),
+                };
+                binds.push(format!("{a} \\in {param}(e, \"{}\", {d}, {unlogged})", p.name));
+                args.push(a.clone());
+                match &p.domain {
+                    Some(dom) => enum_binds.push(format!("{a} \\in {dom}")),
+                    None => enumerable = false,
+                }
+            }
+            step_arms.push(format!(
+                "{guard} ->\n           \\E {} : {}({})",
+                binds.join(", "),
+                s.operator,
+                args.join(", ")
+            ));
+            if enumerable {
+                let record = s
+                    .params
+                    .iter()
+                    .zip(args.iter())
+                    .map(|(p, a)| format!("{} |-> {a}", p.name))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let from_record = s
+                    .params
+                    .iter()
+                    .map(|p| format!("r.params.{}", p.name))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                enabled_parts.push(format!(
+                    "{{r \\in {{[step |-> \"{}\", params |-> [{record}]] : {}}} :\n        ENABLED ({}({from_record}) /\\ Next)}}",
+                    s.step,
+                    enum_binds.join(", "),
+                    s.operator,
+                ));
+            }
+        }
+        step_arms.push(
+            "OTHER -> Assert(FALSE, \"trace: the model has no step \" \\o e.step)".to_string(),
+        );
+        let observables = self.state_fields.clone();
+        let vars = self.state_vars.join(", ");
+        let mut tla = String::new();
+        tla.push_str(&format!("---- MODULE {trace_module} ----\n"));
+        tla.push_str(&format!(
+            "\\* Trace validation for {module_name}, the export of `{module}` (verus -V tla-export).\n"
+        ));
+        tla.push_str(
+            "\\* The log is newline-delimited JSON: a header line naming the module\n\\* ({\"module\": \"...\", \"export\": \"...\"}, optionally \"state\": the observed initial\n\\* state), then one line per step: {\"step\": \"<t_* name>\", \"params\": {...},\n\\* \"state\": {...}}. Values are in the export's encoding: a struct or enum value\n\\* is an object (an enum's with its \"tag\"), a Seq an array, a Set an array of its\n\\* elements, a Map an array of [key, value] pairs, a tuple an array. An object\n\\* is partial: only the fields it names are compared, so a ghost field is left\n\\* out of the log and free in the model; a Seq may be observed partially as an\n\\* object keyed by the Verus index (\"0\", \"1\", ...). A parameter left out of\n\\* \"params\" ranges over its type's finite domain.\n",
+        );
+        tla.push_str(&format!(
+            "\\* TraceNext takes the logged step and conjoins Next, so it only ever narrows\n\\* the model: a trace TLC follows to its end ({accepted}) is a behaviour of\n\\* {module_name}. Otherwise the deepest {index} reached is the first logged step\n\\* the model cannot take from any state that explains the log so far.\n"
+        ));
+        tla.push_str(&format!("EXTENDS {module_name}, Json, TLC, Integers, Sequences\n\n"));
+        tla.push_str(&format!("CONSTANT {log}  \\* the log's path\n"));
+        tla.push_str(&format!("VARIABLE {index}  \\* the next logged step to take\n\n"));
+        tla.push_str(&format!("{lines} == ndJsonDeserialize({log})\n"));
+        tla.push_str(&format!("{header} == {lines}[1]\n"));
+        tla.push_str(&format!("{trace} == SubSeq({lines}, 2, Len({lines}))\n\n"));
+        tla.push_str(&format!(
+            "\\* Whether a JSON value is an array (TLC holds it as a tuple).\n{is_array}(j) == SubSeq(ToString(j), 1, 2) = \"<<\"\n"
+        ));
+        tla.push_str(&format!(
+            "{state_of}(e) == IF \"state\" \\in DOMAIN e THEN e.state ELSE [k \\in {{}} |-> 0]\n"
+        ));
+        tla.push_str(&format!(
+            "\\* A logged parameter, or the domain it ranges over when left out.\n{param}(e, k, Dec(_), D) ==\n    IF \"params\" \\in DOMAIN e /\\ k \\in DOMAIN e.params THEN {{Dec(e.params[k])}} ELSE D\n\n"
+        ));
+        let mut recursive: Vec<String> = Vec::new();
+        for (d, o) in memo.values() {
+            recursive.push(format!("{d}(_)"));
+            recursive.push(format!("{o}(_, _)"));
+        }
+        recursive.sort();
+        if !recursive.is_empty() {
+            tla.push_str(&format!("RECURSIVE {}\n\n", recursive.join(", ")));
+        }
+        for d in &defs {
+            tla.push_str(d);
+            tla.push('\n');
+        }
+        tla.push_str(&format!(
+            "{observed_key}(k, j) ==\n    CASE {}\n",
+            obs_arms.join("\n      [] ")
+        ));
+        tla.push_str(&format!("{observed}(j) == \\A k \\in DOMAIN j : {observed_key}(k, j[k])\n"));
+        tla.push_str(&format!(
+            "\\* The same of the next state: its variables primed, never the log's index.\n{observed_key_next}(k, j) ==\n    CASE {}\n",
+            obs_next_arms.join("\n      [] ")
+        ));
+        tla.push_str(&format!(
+            "{observed_next}(j) == \\A k \\in DOMAIN j : {observed_key_next}(k, j[k])\n\n"
+        ));
+        tla.push_str(&format!("{step_op}(e) ==\n    CASE {}\n\n", step_arms.join("\n      [] ")));
+        tla.push_str(&format!(
+            "{init} ==\n    /\\ Init\n    /\\ {index} = 1\n    /\\ {observed}({state_of}({header}))\n\n"
+        ));
+        tla.push_str(&format!(
+            "{next} ==\n    /\\ {index} <= Len({trace})\n    /\\ LET e == {trace}[{index}] IN\n           /\\ {step_op}(e)\n           /\\ Next\n           /\\ {observed_next}({state_of}(e))\n    /\\ {index}' = {index} + 1\n\n"
+        ));
+        tla.push_str(&format!("{spec} == {init} /\\ [][{next}]_<<{vars}, {index}>>\n"));
+        tla.push_str(&format!(
+            "\\* The whole log was followed.\n{accepted} == {index} = Len({trace}) + 1\n\n"
+        ));
+        tla.push_str(&format!("{step_at} == {trace}[{index}]\n"));
+        tla.push_str(&format!(
+            "\\* The model's steps enabled in the current state, with their parameters\n\\* (a step whose parameter has no finite domain is not enumerated).\n{enabled} ==\n    {}\n",
+            if enabled_parts.is_empty() {
+                "{}".to_string()
+            } else {
+                enabled_parts.join("\n    \\cup ")
+            }
+        ));
+        tla.push_str(&format!(
+            "\\* At a state where the log's next step cannot be taken: whether the logged\n\\* step is enabled at all, and which observed fields no successor by it matches.\n{diagnosis} ==\n    LET e == {step_at} IN\n    [ step_enabled |-> ENABLED ({step_op}(e) /\\ Next),\n      unmatched |-> {{k \\in DOMAIN {state_of}(e) :\n                        ~ENABLED ({step_op}(e) /\\ Next /\\ {observed_key_next}(k, {state_of}(e)[k]))}} ]\n"
+        ));
+        tla.push_str(&format!("{}\n", "=".repeat(trace_module.len() + 20)));
+        let cfg = format!(
+            "\\* Trace validation: TLC follows the log named by {log}. It ends with no error\n\\* either way; the trace conforms when some state reaches {accepted}\n\\* (the depth of the search is the number of logged steps plus one).\nINIT {init}\nNEXT {next}\nCHECK_DEADLOCK FALSE\nCONSTANT {log} = \"trace.ndjson\"\n\\* The export's CONSTANTS, if it has any, are needed here too.\n"
+        );
+        let report =
+            TraceReport { module: trace_module.clone(), index_variable: index, observables, steps };
+        (trace_module, tla, cfg, report)
+    }
 }

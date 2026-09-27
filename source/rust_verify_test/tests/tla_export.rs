@@ -2895,3 +2895,130 @@ fn tla_export_refuses_reals() {
     assert_eq!(run.violated, Vec::<String>::new(), "{}", ex.tla);
     assert_eq!(run.distinct, 3, "{run:?}\n{}", ex.tla);
 }
+
+/// The trace spec written beside an export, read back.
+fn trace_spec(ex: &Exported) -> (PathBuf, String, String) {
+    let module = format!("{}_trace", ex.module);
+    let spec = ex.dir.path().join("log").join(format!("{module}.tla"));
+    let tla = std::fs::read_to_string(&spec).expect("the trace spec");
+    let cfg = std::fs::read_to_string(spec.with_extension("cfg")).expect("the trace .cfg");
+    (spec, tla, cfg)
+}
+
+/// TLC on the trace spec over `log`: the depth it reached (the logged steps
+/// followed, plus one) and its output, with `extra` appended to the .cfg.
+fn follow(jar: &str, spec: &Path, cfg: &str, log: &Path, extra: &str) -> (u64, String) {
+    let cfg = cfg.replace("\"trace.ndjson\"", &format!("\"{}\"", log.display()));
+    let out = tlc_output_with(jar, spec, &format!("{cfg}{extra}"), &[]);
+    assert!(!out.contains("Error:"), "TLC failed on {}:\n{out}", log.display());
+    let re = regex::Regex::new(r"The depth of the complete state graph search is (\d+)").unwrap();
+    let depth = re.captures(&out).unwrap_or_else(|| panic!("TLC did not finish:\n{}", out))[1]
+        .parse()
+        .unwrap();
+    (depth, out)
+}
+
+#[test]
+fn tla_export_trace_spec_follows_a_counter_log() {
+    let ex = export(&fixture("counter.rs"), "test_crate");
+    let trace = &ex.report["trace"];
+    assert_eq!(trace["module"], "State_tla_trace");
+    assert_eq!(trace["index_variable"], "trace_i");
+    assert_eq!(names(&trace["observables"]), ["x", "y"]);
+    assert_eq!(
+        trace["steps"],
+        serde_json::json!([
+            {"step": "t_dbl", "function": "test_crate::t_dbl", "operator": "t_dbl", "params": []},
+            {"step": "t_inc", "function": "test_crate::t_inc", "operator": "t_inc", "params": []},
+        ])
+    );
+    let (spec, tla, cfg) = trace_spec(&ex);
+    assert!(tla.starts_with("---- MODULE State_tla_trace ----\n"), "{}", tla);
+    assert!(tla.contains("EXTENDS State_tla, Json, TLC, Integers, Sequences\n"), "{}", tla);
+    // Only ever narrows Next: the logged step is conjoined with it.
+    assert!(tla.contains("           /\\ TraceStep(e)\n           /\\ Next\n"), "{}", tla);
+    assert!(cfg.contains("INIT TraceInit\nNEXT TraceNext\n"), "{}", cfg);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &spec);
+    let logs = std::fs::canonicalize(fixture("counter_trace_ok.ndjson")).unwrap();
+    // Five steps: the conforming log is followed to its end.
+    let (depth, _) = follow(&jar, &spec, &cfg, &logs, "");
+    assert_eq!(depth, 6);
+    // The fourth step is t_dbl where the counter took t_inc (x goes 2 to 3):
+    // TLC stops there, with t_dbl enabled but its x not the logged one.
+    let bad = std::fs::canonicalize(fixture("counter_trace_bad.ndjson")).unwrap();
+    let probe = "\nINVARIANT Probe\n";
+    let spec_probe = spec.with_file_name("Probe_trace.tla");
+    std::fs::write(
+        &spec_probe,
+        tla.replace("MODULE State_tla_trace", "MODULE Probe_trace").replace(
+            "\n=====",
+            "\nProbe == trace_i = 4 => PrintT(<<\"probe\", TraceStepAt.step, TraceEnabled, TraceDiagnosis>>)\n=====",
+        ),
+    )
+    .unwrap();
+    let (depth, out) = follow(&jar, &spec_probe, &cfg, &bad, probe);
+    assert_eq!(depth, 4, "{out}");
+    assert!(
+        out.contains(
+            "<<\"probe\", \"t_dbl\", {[step |-> \"t_dbl\"], [step |-> \"t_inc\"]}, [step_enabled |-> TRUE, unmatched |-> {\"x\"}]>>"
+        ), "{}", out);
+}
+
+#[test]
+fn tla_export_trace_spec_decodes_collections_and_parameters() {
+    let ex = export_code(
+        r#"
+use vstd::prelude::*;
+verus! {
+pub enum Mode { Off, On(u8) }
+pub struct Rec { pub a: nat, pub ghost_b: int }
+pub struct State { pub s: Seq<Rec>, pub set: Set<u8>, pub m: Map<u8, bool>, pub o: Option<int>, pub mode: Mode }
+pub open spec fn init(s: State) -> bool {
+    &&& s.s == Seq::<Rec>::empty() &&& s.set == Set::<u8>::empty() &&& s.m == Map::<u8, bool>::empty()
+    &&& s.o is None &&& s.mode == Mode::Off
+}
+pub open spec fn t_add(pre: State, post: State, k: u8, g: bool) -> bool {
+    &&& k < 3
+    &&& post.s == pre.s.push(Rec { a: k as nat, ghost_b: if g { 1 } else { 0 } })
+    &&& post.set == pre.set.insert(k)
+    &&& post.m == pre.m.insert(k, g)
+    &&& post.o == Some(k as int)
+    &&& post.mode == Mode::On(k)
+}
+pub open spec fn next(pre: State, post: State) -> bool {
+    exists|k: u8, g: bool| t_add(pre, post, k, g)
+}
+}
+"#,
+        "test_crate",
+    );
+    let steps = &ex.report["trace"]["steps"];
+    assert_eq!(steps[0]["step"], "t_add");
+    assert_eq!(
+        steps[0]["params"],
+        serde_json::json!([
+            {"name": "k", "typ": "u8", "domain": "0..255"},
+            {"name": "g", "typ": "bool", "domain": "BOOLEAN"},
+        ])
+    );
+    let (spec, _, cfg) = trace_spec(&ex);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &spec);
+    // `g` is left out of the log (it only reaches the ghost field), so it
+    // ranges over BOOLEAN; the Seq is observed whole and then by index, its
+    // records partially.
+    let log = ex.dir.path().join("t.ndjson");
+    let lines = [
+        r#"{"module": "State_tla", "export": "test_crate", "state": {"s": [], "set": [], "m": [], "o": {"tag": "None"}}}"#,
+        r#"{"step": "t_add", "params": {"k": 2}, "state": {"s": [{"a": 2}], "set": [2], "m": [[2, true]], "o": {"tag": "Some", "v0": 2}, "mode": {"tag": "On", "v0": 2}}}"#,
+        r#"{"step": "t_add", "params": {"k": 0, "g": false}, "state": {"s": {"1": {"a": 0, "ghost_b": 0}}, "set": [0, 2], "o": {"tag": "Some"}}}"#,
+    ];
+    std::fs::write(&log, lines.join("\n") + "\n").unwrap();
+    let (depth, out) = follow(&jar, &spec, &cfg, &log, "");
+    assert_eq!(depth, 3, "{out}");
+    // A value the model cannot produce (k = 5 fails the guard) stops it.
+    std::fs::write(&log, lines[..2].join("\n").replace("\"k\": 2", "\"k\": 5") + "\n").unwrap();
+    let (depth, out) = follow(&jar, &spec, &cfg, &log, "");
+    assert_eq!(depth, 1, "{out}");
+}
