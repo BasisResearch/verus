@@ -5,7 +5,10 @@
 //! - `coverage`: for every query, each obligation it asserted (an `assert`,
 //!   a postcondition, a loop invariant, a precondition of a call...) and what
 //!   became of it: `proved`, `failed`, `unknown` (the solver gave up on the
-//!   query) or `unchecked` (the query stopped before reaching it). With
+//!   query) or `unchecked` (the query stopped before reaching it). As in
+//!   Verus's own checking, an obligation after a failed one is proved
+//!   assuming the failed one held: after a failing `assert(x > 5 && x < 3)`,
+//!   `assert(x == 2)` is `proved`. With
 //!   `-V axiom-usage-info` a proved query also names the axioms in its unsat
 //!   core. This is the obligation-level counterpart of `verus-reach`, which
 //!   says which functions are used; this says which of a function's
@@ -71,6 +74,8 @@ const MAX_TEMP_DEPTH: usize = 8;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Status {
+    /// Proved assuming every earlier obligation of the query held, failed
+    /// ones included.
     Proved,
     Failed,
     /// The solver gave up (resource limit or cancellation) before deciding it.
@@ -515,7 +520,32 @@ fn is_encoding_sort(typ: &air::ast::Typ) -> bool {
         if [TYPE, DECORATION, FUEL_TYPE, FUEL_ID].contains(&n.as_str()))
 }
 
+/// `expr` without its binders' triggers and qids: the printer spells them
+/// as SMT's `(! body :pattern ...)`, which reads as a negation once
+/// rendered as source.
+fn strip_attributes(expr: &Expr) -> Expr {
+    air::visitor::map_expr_visitor(expr, &mut |e| match &**e {
+        ExprX::Bind(bind, body) => {
+            let bare = match &**bind {
+                BindX::Quant(q, bs, trigs, qid) if !trigs.is_empty() || qid.is_some() => {
+                    BindX::Quant(*q, bs.clone(), Arc::new(vec![]), None)
+                }
+                BindX::Lambda(bs, trigs, qid) if !trigs.is_empty() || qid.is_some() => {
+                    BindX::Lambda(bs.clone(), Arc::new(vec![]), None)
+                }
+                BindX::Choose(bs, trigs, qid, cond) if !trigs.is_empty() || qid.is_some() => {
+                    BindX::Choose(bs.clone(), Arc::new(vec![]), None, cond.clone())
+                }
+                _ => return e.clone(),
+            };
+            Arc::new(ExprX::Bind(Arc::new(bare), body.clone()))
+        }
+        _ => e.clone(),
+    })
+}
+
 fn term_text(expr: &Expr) -> String {
+    let expr = &strip_attributes(expr);
     let printer = air::printer::Printer::new(
         Arc::new(air::messages::AirMessageInterface {}),
         true,
@@ -583,12 +613,23 @@ impl air::query_result_observer::QueryResultObserver for ObligationObserver {
                 // postconditions share one), so the error's primary span
                 // decides between assertions with the same id.
                 let (_, error_span) = describe(error);
+                // Without a span match, the failure is placed only when its
+                // id picks out exactly one undecided assertion, as in
+                // `take_query`.
                 let undecided = |a: &Assertion| a.status.is_none() && &a.id == *assert_id;
+                let sole_undecided = || {
+                    let mut candidates =
+                        pending.assertions.iter().enumerate().filter(|(_, a)| undecided(a));
+                    match (candidates.next(), candidates.next()) {
+                        (Some((i, _)), None) => Some(i),
+                        _ => None,
+                    }
+                };
                 let Some(index) = pending
                     .assertions
                     .iter()
                     .position(|a| undecided(a) && error_span.is_some() && a.span == error_span)
-                    .or_else(|| pending.assertions.iter().position(undecided))
+                    .or_else(sole_undecided)
                 else {
                     return;
                 };
@@ -901,6 +942,69 @@ mod tests {
         let f = &o.pending.as_ref().unwrap().failing[0];
         assert_eq!(f.conjuncts.len(), MAX_CONJUNCTS);
         assert_eq!(f.conjuncts_omitted, n - MAX_CONJUNCTS);
+    }
+
+    /// A quantifier's triggers and qid are left out of its source text:
+    /// SMT's `(! body :pattern ...)` would render as a negation.
+    #[test]
+    fn quantifier_attributes_are_not_rendered() {
+        let binder =
+            Arc::new(air::ast::BinderX { name: Arc::new("i".to_string()), a: Arc::new(TypX::Int) });
+        let body = Arc::new(ExprX::Binary(BinaryOp::Le, var("i"), var("n@1")));
+        let bind = Arc::new(BindX::Quant(
+            air::ast::Quant::Forall,
+            Arc::new(vec![binder]),
+            Arc::new(vec![Arc::new(vec![var("i")])]),
+            Some(Arc::new("user_q_1".to_string())),
+        ));
+        let text = term_text(&Arc::new(ExprX::Bind(bind, body)));
+        assert!(!text.contains('!') && !text.contains(":pattern"), "{text}");
+        assert!(!text.contains(":qid"), "{text}");
+        let names = vir::air_names::SourceNames::new();
+        assert!(!render_unversioned(&names, &text).contains('!'));
+    }
+
+    /// A failure whose span matches no assertion is placed only when its
+    /// id picks out exactly one undecided assertion.
+    #[test]
+    fn an_unmatched_failure_is_placed_only_when_unambiguous() {
+        use air::messages::MessageInterface;
+        let invariant = || Assertion {
+            id: None,
+            message: String::new(),
+            span: Some("elsewhere".to_string()),
+            expr: var("x"),
+            status: None,
+        };
+        let mut o = ObligationObserver::from_names(&["coverage".to_string()]).unwrap();
+        let fail = |o: &mut ObligationObserver| {
+            let error = air::messages::AirMessageInterface {}
+                .bare(air::messages::MessageLevel::Error, "invariant not satisfied");
+            air::query_result_observer::QueryResultObserver::on_check_valid_result(
+                o,
+                &mut CheckValidResult::Invalid {
+                    model_defs: &HashMap::new(),
+                    eval_bool_expr: &mut |_: &Expr| None,
+                    assert_id: &None,
+                    error: &error,
+                },
+            );
+        };
+        let pending = |assertions| Pending {
+            assertions,
+            temps: HashMap::new(),
+            used_axioms: None,
+            failing: Vec::new(),
+        };
+        o.pending = Some(pending(vec![invariant(), invariant()]));
+        fail(&mut o);
+        let statuses = |o: &ObligationObserver| {
+            o.pending.as_ref().unwrap().assertions.iter().map(|a| a.status).collect::<Vec<_>>()
+        };
+        assert_eq!(statuses(&o), vec![None, None]);
+        o.pending = Some(pending(vec![invariant()]));
+        fail(&mut o);
+        assert_eq!(statuses(&o), vec![Some(Status::Failed)]);
     }
 
     #[test]
