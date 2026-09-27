@@ -2952,8 +2952,9 @@ fn tla_export_trace_spec_follows_a_counter_log() {
     let (spec, tla, cfg) = trace_spec(&ex);
     assert!(tla.starts_with("---- MODULE State_tla_trace ----\n"), "{}", tla);
     assert!(tla.contains("EXTENDS State_tla, Json, TLC, Integers, Sequences\n"), "{}", tla);
-    // Only ever narrows Next: the logged step is conjoined with it.
-    assert!(tla.contains("           /\\ TraceStep(e)\n           /\\ Next\n"), "{}", tla);
+    // Only ever narrows Next: the logged step is conjoined with it, after
+    // it, so the step reads the successor Next assigns.
+    assert!(tla.contains("           /\\ Next\n           /\\ TraceStep(e)\n"), "{}", tla);
     assert!(cfg.contains("INIT TraceInit\nNEXT TraceNext\n"), "{}", cfg);
     let Some(jar) = tla_tools() else { return };
     sany(&jar, &spec);
@@ -3055,6 +3056,16 @@ pub open spec fn next(pre: State, post: State) -> bool {
         std::fs::write(&log, format!("{}\n{}\n{bad}\n", lines[0], lines[1])).unwrap();
         let (depth, out) = follow(&jar, &spec, &cfg, &log, "");
         assert_eq!(depth, 2, "{to}\n{out}");
+    }
+    // An empty object observes nothing of a Seq; an empty array is the
+    // empty Seq, which `s` is not after two steps.
+    let s_by_index = r#""s": {"1": {"a": 0, "ghost_b": 0}}"#;
+    for (to, want) in [(r#""s": {}"#, 3), (r#""s": []"#, 2)] {
+        let line = lines[2].replace(s_by_index, to);
+        assert_ne!(line, lines[2]);
+        std::fs::write(&log, format!("{}\n{}\n{line}\n", lines[0], lines[1])).unwrap();
+        let (depth, out) = follow(&jar, &spec, &cfg, &log, "");
+        assert_eq!(depth, want, "{to}\n{out}");
     }
     // A value the model cannot produce (k = 5 fails the guard) stops it.
     std::fs::write(&log, lines[..2].join("\n").replace("\"k\": 2", "\"k\": 5") + "\n").unwrap();
@@ -3308,4 +3319,146 @@ pub open spec fn next(pre: State, post: State) -> bool {
     std::fs::write(&log, format!("{}\n{}\n", lines[0], lines[1].replace("true", "false"))).unwrap();
     let (depth, out) = follow(&jar, &spec, &cfg, &log, "");
     assert_eq!(depth, 1, "{out}");
+}
+
+/// A helper step reads the primed variables its caller assigned
+/// (`chk: y' = x'`): Next comes first in TraceNext, so the helper only
+/// filters the successors Next assigned. `next = t_step` conjoins the one
+/// transition, so it is loggable although it is not a branch; `frame`,
+/// which `t_step` conjoins and which branches into nothing, is not.
+#[test]
+fn tla_export_trace_spec_takes_next_before_the_logged_step() {
+    let ex = export_code(
+        r#"
+use vstd::prelude::*;
+verus! {
+pub struct State { pub x: u8, pub y: u8 }
+pub open spec fn init(s: State) -> bool { s.x == 0 && s.y == 0 }
+pub open spec fn frame(pre: State, post: State) -> bool { post.x == pre.x + 1 }
+pub open spec fn chk(pre: State, post: State) -> bool { post.y == post.x }
+pub open spec fn other(pre: State, post: State) -> bool { post.y == pre.y }
+pub open spec fn t_step(pre: State, post: State) -> bool {
+    pre.x < 3 && frame(pre, post) && (if pre.x == 0 { chk(pre, post) } else { other(pre, post) })
+}
+pub open spec fn next(pre: State, post: State) -> bool { t_step(pre, post) }
+}
+"#,
+        "test_crate",
+    );
+    let steps = ex.report["trace"]["steps"].as_array().unwrap();
+    let named: Vec<&str> = steps.iter().map(|s| s["step"].as_str().unwrap()).collect();
+    assert_eq!(named, ["chk", "other", "t_step"]);
+    let (spec, tla, cfg) = trace_spec(&ex);
+    assert!(tla.contains("ENABLED (Next /\\ chk)"), "{}", tla);
+    assert!(tla.contains("step_enabled |-> ENABLED (Next /\\ TraceStep(e))"), "{}", tla);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &spec);
+    let log = ex.dir.path().join("t.ndjson");
+    let lines = [
+        r#"{"module": "State_tla", "export": "test_crate", "state": {"x": 0, "y": 0}}"#,
+        r#"{"step": "chk", "state": {"x": 1, "y": 1}}"#,
+        r#"{"step": "other", "state": {"x": 2, "y": 1}}"#,
+        r#"{"step": "t_step", "state": {"x": 3, "y": 1}}"#,
+    ];
+    std::fs::write(&log, lines.join("\n") + "\n").unwrap();
+    let (depth, out) = follow(&jar, &spec, &cfg, &log, "");
+    assert_eq!(depth, 4, "{out}");
+    // `chk` where the model took `other` (x is 1, not 0) stops the log.
+    std::fs::write(
+        &log,
+        format!("{}\n{}\n{}\n", lines[0], lines[1], lines[2].replace("other", "chk")),
+    )
+    .unwrap();
+    let (depth, out) = follow(&jar, &spec, &cfg, &log, "");
+    assert_eq!(depth, 2, "{out}");
+}
+
+/// A guard is never a step, even reached inside a branch: `ready` reads
+/// only the pre state and `small` no state at all. The one transition Next
+/// conjoins beside a guard (`t_only`) is.
+#[test]
+fn tla_export_trace_spec_logs_no_guard() {
+    let ex = export_code(
+        r#"
+use vstd::prelude::*;
+verus! {
+pub struct State { pub x: u8, pub y: u8 }
+pub open spec fn init(s: State) -> bool { s.x == 0 && s.y == 0 }
+pub open spec fn ready(s: State) -> bool { s.x < 3 }
+pub open spec fn small(v: u8) -> bool { v < 2 }
+pub open spec fn t_a(pre: State, post: State) -> bool { ready(pre) && post.x == pre.x + 1 && post.y == pre.y }
+pub open spec fn t_c(pre: State, post: State, b: bool) -> bool {
+    if b { ready(pre) && small(pre.y) && post.x == pre.x && post.y == pre.y + 1 } else { post == pre }
+}
+pub open spec fn next(pre: State, post: State) -> bool {
+    t_a(pre, post) || (exists|b: bool| t_c(pre, post, b))
+}
+}
+"#,
+        "test_crate",
+    );
+    let steps = ex.report["trace"]["steps"].as_array().unwrap();
+    let named: Vec<&str> = steps.iter().map(|s| s["step"].as_str().unwrap()).collect();
+    assert_eq!(named, ["t_a", "t_c"]);
+    let ex = export_code(
+        r#"
+use vstd::prelude::*;
+verus! {
+pub struct State { pub x: u8 }
+pub open spec fn init(s: State) -> bool { s.x == 0 }
+pub open spec fn ready(s: State) -> bool { s.x < 3 }
+pub open spec fn t_only(pre: State, post: State) -> bool { post.x == pre.x + 1 }
+pub open spec fn next(pre: State, post: State) -> bool { ready(pre) && t_only(pre, post) }
+}
+"#,
+        "test_crate",
+    );
+    let steps = ex.report["trace"]["steps"].as_array().unwrap();
+    let named: Vec<&str> = steps.iter().map(|s| s["step"].as_str().unwrap()).collect();
+    assert_eq!(named, ["t_only"]);
+    let (spec, _, cfg) = trace_spec(&ex);
+    let Some(jar) = tla_tools() else { return };
+    let log = ex.dir.path().join("t.ndjson");
+    let lines = [
+        r#"{"module": "State_tla", "export": "test_crate", "state": {"x": 0}}"#,
+        r#"{"step": "t_only", "state": {"x": 1}}"#,
+        r#"{"step": "t_only", "state": {"x": 2}}"#,
+        r#"{"step": "t_only", "state": {"x": 3}}"#,
+        r#"{"step": "t_only", "state": {"x": 4}}"#,
+    ];
+    std::fs::write(&log, lines.join("\n") + "\n").unwrap();
+    // x = 3 is no longer ready: the fourth step stops the log.
+    let (depth, out) = follow(&jar, &spec, &cfg, &log, "");
+    assert_eq!(depth, 4, "{out}");
+}
+
+/// The verus-tla shape: `next()` is one action of closures, so the only
+/// step is `next`; an `Option` is observed by its tag, its payload too.
+#[test]
+fn tla_export_trace_spec_follows_a_verus_tla_log() {
+    let ex = export(&fixture("mutex_tla.rs"), "test_crate");
+    assert_eq!(ex.report["shape"], "verus-tla");
+    let steps = ex.report["trace"]["steps"].as_array().unwrap();
+    let named: Vec<&str> = steps.iter().map(|s| s["step"].as_str().unwrap()).collect();
+    assert_eq!(named, ["next"]);
+    let (spec, _, cfg) = trace_spec(&ex);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &spec);
+    let log = ex.dir.path().join("t.ndjson");
+    let lines = [
+        r#"{"module": "State_tla", "export": "test_crate", "state": {"holder": {"tag": "None"}, "count": 0}}"#,
+        r#"{"step": "next", "state": {"holder": {"tag": "Some", "v0": 1}, "count": 1}}"#,
+        r#"{"step": "next", "params": {}, "state": {"holder": {"tag": "None"}}}"#,
+    ];
+    std::fs::write(&log, lines.join("\n") + "\n").unwrap();
+    let (depth, out) = follow(&jar, &spec, &cfg, &log, "");
+    assert_eq!(depth, 3, "{out}");
+    // A holder no acquire gives (thread 7), or a count that jumps, stops it.
+    for (from, to) in [(r#""v0": 1"#, r#""v0": 7"#), (r#""count": 1"#, r#""count": 2"#)] {
+        let bad = lines[1].replace(from, to);
+        assert_ne!(bad, lines[1]);
+        std::fs::write(&log, format!("{}\n{bad}\n", lines[0])).unwrap();
+        let (depth, out) = follow(&jar, &spec, &cfg, &log, "");
+        assert_eq!(depth, 1, "{to}\n{out}");
+    }
 }

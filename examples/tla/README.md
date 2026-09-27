@@ -211,10 +211,14 @@ the module and the export, the module path given to `-V tla-export`
 `counter`), optionally with `"state"`, the observed initial state (a header
 naming another module or another export stops TLC, since exports whose
 states share a name share a module name); then one line per step,
-`{"step": "t_inc", "params": {...}, "state": {...}}`, naming a spec fn Next
-reaches through its branches (a step, or a helper a step branches into; its
-last segment, or its full path; only the full path when two steps share the
-last segment, which the report marks `short_name_shared`), its parameters other than the pre and post states by
+`{"step": "t_inc", "params": {...}, "state": {...}}`, naming a transition (a
+spec fn given the post state) Next reaches through its branches: a step, or
+a helper a step branches into; one Next conjoins when it branches into steps
+itself or is the only transition Next conjoins (`next = t_step`); a guard on
+the pre state or on a value is never a step. It is named by its last
+segment, or its full path; only the full path when two steps share the last
+segment, which the report marks `short_name_shared`. Then its parameters
+other than the pre and post states by
 their Rust names (a name the step does not declare stops TLC), and the
 observed state after the step by field. Values are in the export's encoding:
 a struct or enum value is an object (an enum's with its `"tag"`), an `Option`
@@ -222,7 +226,8 @@ a struct or enum value is an object (an enum's with its `"tag"`), an `Option`
 its elements, a `Map` an array of `[key, value]` pairs. An object observed in
 the state is partial: only the fields it names are compared, so a ghost field
 is left out of the log and stays free in the model; a `Seq` can be observed
-partially as an object keyed by the Verus index (`{"1": {...}}`). A record
+partially as an object keyed by the Verus index (`{"1": {...}}`, and `{}`
+observes nothing, while `[]` is the empty `Seq`). A record
 inside a `Set` element, a `Map` key or a parameter is decoded whole, so it
 must name every field; a field left out there stops TLC. A parameter left
 out of `"params"` ranges over the hole constant bounding it in `Next` (a
@@ -231,8 +236,8 @@ VerusSync step's `Dom_Step_<t>_v<i>`), else its type's finite domain (a
 be logged. The verus-tla shape has one step, `next`, since its `Next` is not
 split into named transitions.
 
-`TraceNext` takes the logged step, conjoins `Next` (so it only ever narrows
-the model) and compares the observed fields in the successor. TLC run on it
+`TraceNext` conjoins `Next` and then the logged step (so it only ever
+narrows the model, and the step reads the successor `Next` has assigned) and compares the observed fields in the successor. TLC run on it
 (`INIT TraceInit`, `NEXT TraceNext`, `CONSTANT TraceLog = "<log path>"`)
 ends without error on a well-formed log either way (the export's hole
 constants, such as `Dom_Step_add_v0`, go in its `.cfg` too): the log conforms when the depth of the search

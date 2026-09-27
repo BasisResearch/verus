@@ -2817,14 +2817,27 @@ impl Exporter {
             .collect()
     }
 
-    /// The operators a trace may log: every operator Next reaches through
-    /// branches (called at conjunct level inside an `IF`, `match`,
-    /// disjunction or `exists` of Next, of an operator Next conjoins, or of
-    /// one reached so), intermediate ones included: a step that branches
-    /// into helpers is loggable by its own name, as are the helpers. Next
-    /// itself only when it reaches none (the verus-tla shape).
+    /// The operators a trace may log: every transition (an operator given
+    /// the post state, so a guard on the pre state or on a value is never
+    /// one) Next reaches through branches (called at conjunct level inside
+    /// an `IF`, `match`, disjunction or `exists` of Next, of an operator
+    /// Next conjoins, or of one reached so), intermediate ones included: a
+    /// step that branches into helpers is loggable by its own name, as are
+    /// the helpers. A conjoined transition is loggable when it branches into
+    /// transitions itself, or when it is the only transition Next conjoins
+    /// (`next = t_step`), so the step function the shell names can be
+    /// logged. Next itself only when it reaches none (the verus-tla shape).
     fn trace_operators(&self, next: &OpKey) -> Vec<OpKey> {
-        let branch_callees = |t: &OpKey| {
+        let is_transition = |k: &OpKey| {
+            k.1 == Variant::Plain
+                && self
+                    .functions
+                    .get(&k.0)
+                    .is_some_and(|f| self.param_roles(f).contains(&Some(Role::Post)))
+        };
+        // The operators `t` reaches through branches, and those it conjoins
+        // (`t` left out), following conjoined calls.
+        let closure = |t: &OpKey| {
             let mut conj: Vec<OpKey> = vec![t.clone()];
             let mut conj_seen: HashSet<OpKey> = HashSet::from([t.clone()]);
             let mut out = Vec::new();
@@ -2843,17 +2856,40 @@ impl Exporter {
                 }
                 i += 1;
             }
-            out
+            conj.remove(0);
+            (out, conj)
+        };
+        let branches_into_steps = |c: &OpKey| closure(c).0.iter().any(|b| is_transition(b));
+        let dispatched = |t: &OpKey, queue: &mut Vec<OpKey>| {
+            let (branches, conjoined) = closure(t);
+            queue.extend(branches);
+            queue.extend(
+                conjoined.into_iter().filter(|c| is_transition(c) && branches_into_steps(c)),
+            );
         };
         let mut seen: HashSet<OpKey> = HashSet::from([next.clone()]);
-        let mut queue = branch_callees(next);
+        let mut queue = Vec::new();
+        dispatched(next, &mut queue);
+        let only: Vec<&OpKey> = self
+            .calls
+            .get(next)
+            .into_iter()
+            .flatten()
+            .filter(|c| c.reach == Reach::Conjoined && is_transition(&c.callee))
+            .map(|c| &c.callee)
+            .collect();
+        if let [only] = only[..] {
+            queue.push(only.clone());
+        }
         let mut found = Vec::new();
         while let Some(t) = queue.pop() {
             if !seen.insert(t.clone()) {
                 continue;
             }
-            queue.extend(branch_callees(&t));
-            found.push(t);
+            dispatched(&t, &mut queue);
+            if is_transition(&t) {
+                found.push(t);
+            }
         }
         if found.is_empty() {
             found.push(next.clone());
@@ -4639,7 +4675,7 @@ impl Exporter {
             if s.params.is_empty() {
                 step_arms.push(format!("{guard} ->\n           {declared} /\\ {}", s.operator));
                 enabled_parts.push(format!(
-                    "(IF ENABLED ({} /\\ Next) THEN {{[step |-> \"{}\"]}} ELSE {{}})",
+                    "(IF ENABLED (Next /\\ {}) THEN {{[step |-> \"{}\"]}} ELSE {{}})",
                     s.operator, s.step
                 ));
                 continue;
@@ -4686,7 +4722,7 @@ impl Exporter {
                     .collect::<Vec<_>>()
                     .join(", ");
                 enabled_parts.push(format!(
-                    "{{r \\in {{[step |-> \"{}\", params |-> [{record}]] : {}}} :\n        ENABLED ({}({from_record}) /\\ Next)}}",
+                    "{{r \\in {{[step |-> \"{}\", params |-> [{record}]] : {}}} :\n        ENABLED (Next /\\ {}({from_record}))}}",
                     s.step,
                     enum_binds.join(", "),
                     s.operator,
@@ -4710,10 +4746,10 @@ impl Exporter {
             "\\* Trace validation for {module_name}, the export of `{module}` (verus -V tla-export).\n"
         ));
         tla.push_str(&format!(
-            "\\* The log is newline-delimited JSON: a header line naming the module\n\\* ({{\"module\": \"{module_name}\", \"export\": \"{module}\"}}, optionally \"state\": the\n\\* observed initial state; another module or export stops TLC), then one line per step:\n\\* {{\"step\": \"<t_* name>\", \"params\": {{...}}, \"state\": {{...}}}}. A step is named by\n\\* its spec fn's last segment or full path, by the full path alone when two\n\\* steps share the last segment; a parameter the step does not declare stops\n\\* TLC. Values are in the export's encoding: a struct or enum value is an\n\\* object (an enum's with its \"tag\"), a Seq an array, a Set an array of its\n\\* elements, a Map an array of [key, value] pairs, a tuple an array. An object\n\\* observed in the state is partial: only the fields it names are compared, so\n\\* a ghost field is left out of the log and free in the model; a Seq may be\n\\* observed partially as an object keyed by the Verus index (\"0\", \"1\", ...).\n\\* A record inside a Set element, a Map key or a parameter is decoded whole,\n\\* so it must name every field (a field left out there stops TLC). A parameter\n\\* left out of \"params\" ranges over the hole bounding it in Next (a VerusSync\n\\* step's Dom_Step_<t>_v<i>), its type's finite domain or the export's\n\\* Dom_<Type> hole; with none of these it must be logged.\n"
+            "\\* The log is newline-delimited JSON: a header line naming the module\n\\* ({{\"module\": \"{module_name}\", \"export\": \"{module}\"}}, optionally \"state\": the\n\\* observed initial state; another module or export stops TLC), then one line per step:\n\\* {{\"step\": \"<t_* name>\", \"params\": {{...}}, \"state\": {{...}}}}. A step is named by\n\\* its spec fn's last segment or full path, by the full path alone when two\n\\* steps share the last segment; a parameter the step does not declare stops\n\\* TLC. Values are in the export's encoding: a struct or enum value is an\n\\* object (an enum's with its \"tag\"), a Seq an array, a Set an array of its\n\\* elements, a Map an array of [key, value] pairs, a tuple an array. An object\n\\* observed in the state is partial: only the fields it names are compared, so\n\\* a ghost field is left out of the log and free in the model; a Seq may be\n\\* observed partially as an object keyed by the Verus index (\"0\", \"1\", ...;\n\\* {{}} observes nothing, [] is the empty Seq).\n\\* A record inside a Set element, a Map key or a parameter is decoded whole,\n\\* so it must name every field (a field left out there stops TLC). A parameter\n\\* left out of \"params\" ranges over the hole bounding it in Next (a VerusSync\n\\* step's Dom_Step_<t>_v<i>), its type's finite domain or the export's\n\\* Dom_<Type> hole; with none of these it must be logged.\n"
         ));
         tla.push_str(&format!(
-            "\\* TraceNext takes the logged step and conjoins Next, so it only ever narrows\n\\* the model: a trace TLC follows to its end ({accepted}) is a behaviour of\n\\* {module_name}. Otherwise the deepest {index} reached is the first logged step\n\\* the model cannot take from any state that explains the log so far.\n"
+            "\\* TraceNext conjoins Next, then the logged step, so it only ever narrows\n\\* the model: a trace TLC follows to its end ({accepted}) is a behaviour of\n\\* {module_name}. Otherwise the deepest {index} reached is the first logged step\n\\* the model cannot take from any state that explains the log so far.\n"
         ));
         tla.push_str(&format!("EXTENDS {module_name}, Json, TLC, Integers, Sequences\n\n"));
         tla.push_str(&format!("CONSTANT {log}  \\* the log's path\n"));
@@ -4763,7 +4799,7 @@ impl Exporter {
             "{init} ==\n    /\\ Assert(\"module\" \\in DOMAIN {header} /\\ {header}.module = \"{module_name}\",\n              \"trace: the log's header does not name the module {module_name}\")\n    /\\ Assert(\"export\" \\in DOMAIN {header} /\\ {header}.export = \"{module}\",\n              \"trace: the log's header does not name the export {module}\")\n    /\\ Init\n    /\\ {index} = 1\n    /\\ {observed}({state_of}({header}))\n\n"
         ));
         tla.push_str(&format!(
-            "{next} ==\n    /\\ {index} <= Len({trace})\n    /\\ LET e == {trace}[{index}] IN\n           /\\ {step_op}(e)\n           /\\ Next\n           /\\ {observed_next}({state_of}(e))\n    /\\ {index}' = {index} + 1\n\n"
+            "{next} ==\n    /\\ {index} <= Len({trace})\n    /\\ LET e == {trace}[{index}] IN\n           /\\ Next\n           /\\ {step_op}(e)\n           /\\ {observed_next}({state_of}(e))\n    /\\ {index}' = {index} + 1\n\n"
         ));
         tla.push_str(&format!("{spec} == {init} /\\ [][{next}]_<<{vars}, {index}>>\n"));
         tla.push_str(&format!(
@@ -4779,7 +4815,7 @@ impl Exporter {
             }
         ));
         tla.push_str(&format!(
-            "\\* At a state where the log's next step cannot be taken: whether the logged\n\\* step is enabled at all, and which observed fields no successor by it matches.\n{diagnosis} ==\n    LET e == {step_at} IN\n    [ step_enabled |-> ENABLED ({step_op}(e) /\\ Next),\n      unmatched |-> {{k \\in DOMAIN {state_of}(e) :\n                        ~ENABLED ({step_op}(e) /\\ Next /\\ {observed_key_next}(k, {state_of}(e)[k]))}} ]\n"
+            "\\* At a state where the log's next step cannot be taken: whether the logged\n\\* step is enabled at all, and which observed fields no successor by it matches.\n{diagnosis} ==\n    LET e == {step_at} IN\n    [ step_enabled |-> ENABLED (Next /\\ {step_op}(e)),\n      unmatched |-> {{k \\in DOMAIN {state_of}(e) :\n                        ~ENABLED (Next /\\ {step_op}(e) /\\ {observed_key_next}(k, {state_of}(e)[k]))}} ]\n"
         ));
         tla.push_str(&format!("{}\n", "=".repeat(trace_module.len() + 20)));
         let cfg = format!(
