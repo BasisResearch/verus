@@ -13,7 +13,6 @@
 //! on_havoc                            |  +   |  0   |   0   |  0   |   +   |  +   |  +   |        |      |
 //! on_assign (names)                   |  +   |  +   |   0   |  0   |   +   |      |  +   |        |      |
 //! on_branch_merge                     |  +   |  0   |   0   |  0   |   +   |  0   |  0   |        |      |
-//! on_break_merge                      |  0   |  0   |   0   |  0   |   +   |  0   |  0   |        |      |
 //! on_variable_def (names)             |  +   |      |   0   |  0   |       |      |      |        |      |
 //! on_for_loop_var (ghost, user)       |  0   |  0   |   0   |  0   |   0   |  +   |  0   |        |      |
 //! on_reveal_string                    |      |      |       |      |       |      |      |   +    |      |
@@ -47,7 +46,6 @@ struct D {
     havocs: Vec<String>,
     assigns: Vec<String>,
     branch_merges: usize,
-    break_merges: usize,
     variable_defs: Vec<String>,
     for_loop_vars: Vec<(String, String)>,
     reveal_strings: Vec<String>,
@@ -207,7 +205,7 @@ fn val<'a>(json: &'a str, key: &str) -> &'a str {
     } else if rest.starts_with('[') {
         &rest[..rest.find(']').unwrap() + 1]
     } else {
-        let end = rest.find(|c: char| c == ',' || c == '}').unwrap_or(rest.len());
+        let end = rest.find([',', '}']).unwrap_or(rest.len());
         rest[..end].trim()
     }
 }
@@ -232,7 +230,6 @@ fn parse_note(note_text: &str) -> D {
         havocs: strings(val(json, "havocs")),
         assigns: strings(val(json, "assigns")),
         branch_merges: val(json, "branch_merges").parse().unwrap(),
-        break_merges: val(json, "break_merges").parse().unwrap(),
         variable_defs: strings(val(json, "variable_defs")),
         for_loop_vars: string_pairs(val(json, "for_loop_vars")),
         reveal_strings: strings(val(json, "reveal_strings")),
@@ -346,7 +343,7 @@ test_verify_one_file_with_options! {
         assert!(d.check_valid_invalid >= 1);
         assert!(d.check_valid_valid >= 1);
         assert!(d.check_valid_invalid_model_size.iter().all(|&s| s > 0));
-        assert!(d.eval_expr_results.iter().any(|r| *r == Some(true)),
+        assert!(d.eval_expr_results.contains(&Some(true)),
             "eval_bool_expr(true) should return Some(true), got {:?}", d.eval_expr_results);
         // Version correlations: loop-modified variables have havoc and assign entries
         assert!(!d.version_correlations.is_empty(),
@@ -369,7 +366,6 @@ test_verify_one_file_with_options! {
             "x should have >= 2 distinct lines, got {:?}", x_lines);
         // Negatives
         assert!(!d.havocs.is_empty(), "loop should produce havocs, got {:?}", d.havocs);
-        assert_eq!(d.break_merges, 0);
         assert!(d.for_loop_vars.is_empty());
         assert!(d.quantifier_binders.is_empty());
         assert!(d.lambda_decls.is_empty());
@@ -405,7 +401,6 @@ test_verify_one_file_with_options! {
         // Negatives
         assert!(d.havocs.is_empty());
         assert_eq!(d.branch_merges, 0);
-        assert_eq!(d.break_merges, 0);
         assert!(d.for_loop_vars.is_empty());
         assert!(d.lambda_decls.is_empty());
         assert!(d.choose_decls.is_empty());
@@ -435,7 +430,6 @@ test_verify_one_file_with_options! {
         // Negatives
         assert!(d.havocs.is_empty());
         assert_eq!(d.branch_merges, 0);
-        assert_eq!(d.break_merges, 0);
         assert!(d.for_loop_vars.is_empty());
         assert!(d.quantifier_binders.is_empty());
         assert!(d.lambda_decls.is_empty());
@@ -472,7 +466,6 @@ test_verify_one_file_with_options! {
         assert!(d.check_valid_invalid_model_size.iter().all(|&s| s > 0));
         // Negatives
         assert!(d.havocs.is_empty());
-        assert_eq!(d.break_merges, 0);
         assert!(d.for_loop_vars.is_empty());
     }
 }
@@ -502,8 +495,7 @@ test_verify_one_file_with_options! {
         }
     } => Err(err) => {
         let d = parse(&err);
-        // Break: loop isolation may prevent break_merge from firing,
-        // but branch_merges should increase from the if + break structure
+        // The if + break structure produces branch merges
         assert!(d.branch_merges > 0, "if should trigger branch_merge, got {}", d.branch_merges);
         // Assigns
         assert!(has(&d.assigns, "found@"), "got {:?}", d.assigns);
@@ -549,7 +541,6 @@ test_verify_one_file_with_options! {
         assert!(!d.for_loop_vars.is_empty(), "for-loop should be detected");
         // Negatives
         assert!(!d.havocs.is_empty(), "loop should produce havocs, got {:?}", d.havocs);
-        assert_eq!(d.break_merges, 0);
         assert!(d.choose_decls.is_empty());
     }
 }

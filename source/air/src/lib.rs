@@ -32,7 +32,7 @@ mod typecheck;
 mod util;
 mod var_to_const;
 pub use var_to_const::GoalScope;
-mod visitor;
+pub mod visitor;
 
 #[cfg(feature = "singular")]
 pub mod singular_manager;

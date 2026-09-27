@@ -522,7 +522,10 @@ pub fn parse_args_with_imports(
             EXTENDED_NO_BV_SIMPLIFY,
             "internal option to disable simplification of bit-vector assertions before sending to the SMT solver",
         ),
-        (EXTENDED_OBSERVERS, "Comma-separated list of observers (e.g., test)"),
+        (
+            EXTENDED_OBSERVERS,
+            "Comma-separated observers: coverage and/or proof-state (reported in func-details under --output-json/--report-json)",
+        ),
     ];
 
     let default_num_threads: usize = std::thread::available_parallelism()
@@ -980,6 +983,12 @@ pub fn parse_args_with_imports(
             .map(|s| s.split(',').map(|s| s.trim().to_string()).collect::<Vec<_>>())
             .unwrap_or_default(),
     };
+
+    if extended.contains_key(EXTENDED_OBSERVERS) {
+        if let Err(msg) = crate::observers::check_names(&args.observers) {
+            error(format!("-V {EXTENDED_OBSERVERS}: {msg}"));
+        }
+    }
 
     if args.nl_frontier && !matches!(args.solver, SmtSolver::Cvc5) {
         error(

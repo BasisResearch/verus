@@ -1,7 +1,8 @@
 use crate::ast::{BindX, Binder, BinderX, Expr, ExprX, Stmt, StmtX, Trigger};
 use std::sync::Arc;
 
-pub(crate) fn map_expr_visitor<F: FnMut(&Expr) -> Expr>(expr: &Expr, f: &mut F) -> Expr {
+/// Rebuild `expr` bottom-up, applying `f` to each node after its children.
+pub fn map_expr_visitor<F: FnMut(&Expr) -> Expr>(expr: &Expr, f: &mut F) -> Expr {
     match &**expr {
         ExprX::Const(_) => f(expr),
         ExprX::Var(_) => f(expr),

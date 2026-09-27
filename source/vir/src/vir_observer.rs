@@ -1,7 +1,7 @@
 //! VIR-level verification observer.
 //!
 //! Defines `VirObserver` — callbacks fired during VIR→AIR lowering (havoc,
-//! assign, branch/break merges, loops, quantifier binders, reveals, and
+//! assign, branch merges, loops, quantifier binders, reveals, and
 //! function/krate lifecycle).
 //!
 //! This trait is independent: it does **not** require `AirObserver` or
@@ -46,7 +46,6 @@ pub trait VirObserver: Any + Send {
     fn on_assign(&mut self, _stm: &Stm, _var: &VarIdent) {}
     fn on_variable_def(&mut self, _stm: &Stm, _var: &VarIdent) {}
     fn on_branch_merge(&mut self, _stm: &Stm) {}
-    fn on_break_merge(&mut self, _stm: &Stm) {}
     fn on_for_loop(&mut self, _stm: &Stm) {}
     fn on_quantifier_binder(&mut self, _binder: &crate::ast::VarBinder<Typ>, _exp: &Exp) {}
     fn on_reveal_string(&mut self, _lit: &std::sync::Arc<String>) {}
@@ -120,15 +119,11 @@ fn strip_version_suffix(name: &str) -> &str {
 pub struct VersionCorrelator {
     /// Per-base-variable queue of VIR statements (Havoc/Assign).
     queues: HashMap<Arc<String>, VecDeque<Stm>>,
-    /// Most recent branch merge stm.
-    last_branch_merge: Option<Stm>,
-    /// Most recent break merge stm.
-    last_break_merge: Option<Stm>,
 }
 
 impl VersionCorrelator {
     pub fn new() -> Self {
-        Self { queues: HashMap::new(), last_branch_merge: None, last_break_merge: None }
+        Self { queues: HashMap::new() }
     }
 
     /// Record a VIR-level Havoc or Assign for a variable.
@@ -137,41 +132,23 @@ impl VersionCorrelator {
         self.queues.entry(base.clone()).or_default().push_back(stm.clone());
     }
 
-    /// Record a branch merge point (from `on_branch_merge`).
-    pub fn record_branch_merge(&mut self, stm: &Stm) {
-        self.last_branch_merge = Some(stm.clone());
-    }
-
-    /// Record a break merge point (from `on_break_merge`).
-    pub fn record_break_merge(&mut self, stm: &Stm) {
-        self.last_break_merge = Some(stm.clone());
-    }
-
     /// Resolve an AIR versioned constant to its VIR origin.
     /// Returns the VIR `Stm` that caused this version to exist.
-    pub fn resolve(&mut self, versioned: &air::ast::Ident, kind: VersionOrigin) -> Option<Stm> {
-        match kind {
-            VersionOrigin::Havoc | VersionOrigin::Assign => {
-                let base = strip_version_suffix(versioned);
-                let base_key = Arc::new(base.to_string());
-                let queue = self.queues.get_mut(&base_key)?;
-                debug_assert!(
-                    !queue.is_empty(),
-                    "VIR/AIR ordering invariant violated for {}: \
-                     no VIR record available (queue empty)",
-                    versioned
-                );
-                queue.pop_front()
-            }
-            VersionOrigin::BranchMerge => self.last_branch_merge.clone(),
-            VersionOrigin::BreakMerge => self.last_break_merge.clone(),
-        }
+    pub fn resolve(&mut self, versioned: &air::ast::Ident, _kind: VersionOrigin) -> Option<Stm> {
+        let base = strip_version_suffix(versioned);
+        let base_key = Arc::new(base.to_string());
+        let queue = self.queues.get_mut(&base_key)?;
+        debug_assert!(
+            !queue.is_empty(),
+            "VIR/AIR ordering invariant violated for {}: \
+             no VIR record available (queue empty)",
+            versioned
+        );
+        queue.pop_front()
     }
 
     /// Reset between functions.
     pub fn reset(&mut self) {
         self.queues.clear();
-        self.last_branch_merge = None;
-        self.last_break_merge = None;
     }
 }

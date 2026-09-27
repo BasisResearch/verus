@@ -19,10 +19,6 @@ pub enum VersionOrigin {
     Havoc,
     /// From a `StmtX::Assign` — constrained new version (= rhs).
     Assign,
-    /// Phantom version from Switch branch reconciliation.
-    BranchMerge,
-    /// Phantom version from Breakable break reconciliation.
-    BreakMerge,
 }
 
 /// Observer for the AIR-level verification pipeline.
@@ -35,10 +31,10 @@ pub trait AirObserver: Any + Send {
 
     /// Called from `lower_query` at the moment a new WP version is created.
     ///
-    /// For `Havoc`/`Assign` origins, the Nth call for base variable `x`
-    /// corresponds to the Nth VIR-level `on_havoc` or `on_assign` callback
-    /// for `x`. For merge origins, the call corresponds to the most recent
-    /// `on_branch_merge` or `on_break_merge` callback.
+    /// The Nth call for base variable `x` corresponds to the Nth VIR-level
+    /// `on_havoc` or `on_assign` callback for `x`. Branch and break merges
+    /// create no versions: a merge takes the highest version a branch reached,
+    /// which that branch already created.
     ///
     /// See `VersionCorrelator` in `vir/src/vir_observer.rs` for a shared helper
     /// that correlates these callbacks with VIR-level data.

@@ -262,20 +262,6 @@ fn lower_stmt(
                 state.break_versions.remove(label).expect("break_versions");
             all_versions.insert(0, versions.clone());
             update_versions_from_all_branches(&all_versions, versions);
-            // Notify observer of phantom versions created by break merge reconciliation
-            for x in versions.keys() {
-                let merged_version = versions[x];
-                let had_explicit = all_versions.iter().any(|v| v[x] == merged_version);
-                if !had_explicit {
-                    let renamed = Arc::new(rename_var(x, merged_version));
-                    state.notify_version_created(
-                        x,
-                        merged_version,
-                        &renamed,
-                        crate::air_observer::VersionOrigin::BreakMerge,
-                    );
-                }
-            }
             let mut break_i: usize = 1;
             let s = update_breaks_to_versions(label, &all_versions, versions, &mut break_i, &s);
             assert!(break_i == all_versions.len());
@@ -305,20 +291,6 @@ fn lower_stmt(
                 state.all_snapshots.extend(snapshots_i);
             }
             update_versions_from_all_branches(&all_versions, versions);
-            // Notify observer of phantom versions created by merge reconciliation
-            for x in versions.keys() {
-                let merged_version = versions[x];
-                let had_explicit = all_versions.iter().any(|v| v[x] == merged_version);
-                if !had_explicit {
-                    let renamed = Arc::new(rename_var(x, merged_version));
-                    state.notify_version_created(
-                        x,
-                        merged_version,
-                        &renamed,
-                        crate::air_observer::VersionOrigin::BranchMerge,
-                    );
-                }
-            }
             for i in 0..ss.len() {
                 stmts[i] = update_branch_to_versions(&all_versions[i], versions, &stmts[i], false);
             }
@@ -476,5 +448,59 @@ mod tests {
         assert_eq!(read(Some(Arc::new(vec![1]))), ("y@1".to_string(), "y@1".to_string()));
         assert_eq!(read(None), ("y@1".to_string(), "y@1".to_string()));
         assert_eq!(read(Some(Arc::new(vec![7]))), ("y@1".to_string(), "y@1".to_string()));
+    }
+
+    /// A merge takes the highest version a branch reached, so every version
+    /// the lowered query declares was announced where a branch created it.
+    #[test]
+    fn merges_announce_no_versions_of_their_own() {
+        struct Announced(Vec<(String, crate::air_observer::VersionOrigin)>);
+        impl crate::air_observer::AirObserver for Announced {
+            fn on_wp_version_created(
+                &mut self,
+                versioned: &Ident,
+                kind: crate::air_observer::VersionOrigin,
+            ) {
+                self.0.push((versioned.to_string(), kind));
+            }
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+            fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+                self
+            }
+        }
+        let x = Arc::new("x@".to_string());
+        let havoc = || Arc::new(StmtX::Havoc(x.clone()));
+        let block = |ss: Vec<Stmt>| Arc::new(StmtX::Block(Arc::new(ss)));
+        let label = Arc::new("l".to_string());
+        // a switch whose branches reach x@1 and x@2, then a breakable whose
+        // break leaves at x@3 and whose fallthrough reaches x@4
+        let query = Arc::new(QueryX {
+            local: Arc::new(vec![Arc::new(DeclX::Var(x.clone(), Arc::new(crate::ast::TypX::Int)))]),
+            assertion: block(vec![
+                Arc::new(StmtX::Switch(Arc::new(vec![
+                    block(vec![havoc()]),
+                    block(vec![havoc(), havoc()]),
+                ]))),
+                Arc::new(StmtX::Breakable(
+                    label.clone(),
+                    block(vec![havoc(), Arc::new(StmtX::Break(label.clone())), havoc()]),
+                )),
+            ]),
+        });
+        let mut announced = Announced(Vec::new());
+        let (_, _, decls, _) = lower_query(&query, false, Some(&mut announced));
+        let declared: Vec<String> = decls
+            .iter()
+            .filter_map(|d| match &**d {
+                DeclX::Const(c, _) if **c != "x@0" => Some(c.to_string()),
+                _ => None,
+            })
+            .collect();
+        let names: Vec<String> = announced.0.iter().map(|(n, _)| n.clone()).collect();
+        assert_eq!(names, ["x@1", "x@1", "x@2", "x@3", "x@4"]);
+        assert!(declared.iter().all(|d| names.contains(d)), "{:?} vs {:?}", declared, names);
+        assert!(announced.0.iter().all(|(_, k)| *k == crate::air_observer::VersionOrigin::Havoc));
     }
 }

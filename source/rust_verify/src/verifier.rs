@@ -65,7 +65,8 @@ fn create_observer(name: &str) -> vir::vir_observer::Observers {
             let vir: vir::vir_observer::VirObserverHandle = o;
             vir::vir_observer::Observers { vir: Some(vir), ..Default::default() }
         }
-        _ => vir::vir_observer::Observers::default(),
+        // parse_args rejected any other name
+        _ => unreachable!("unknown observer {name}"),
     }
 }
 
@@ -81,9 +82,7 @@ fn create_observer_from_args(names: &[String]) -> vir::vir_observer::Observers {
             ..Default::default()
         };
     }
-    if names.len() > 1 {
-        panic!("only one observer may be specified at a time; got: {:?}", names);
-    }
+    // parse_args allows a test observer only alone
     names.first().map_or_else(Default::default, |n| create_observer(n))
 }
 
@@ -1231,8 +1230,9 @@ impl Verifier {
         let mut invalidity = false;
         let mut timed_out = false;
         let mut used_axioms = None;
-        // the ids this query failed at, for an observer that missed the answer
-        let mut failed_here: Vec<AssertId> = Vec::new();
+        // the ids of this query's failures without a model, which an
+        // observer's Invalid callback did not see
+        let mut failed_here: Vec<Option<AssertId>> = Vec::new();
         // 0 for the query's first check, then one per multi-error round
         let mut round = 0usize;
         loop {
@@ -1365,8 +1365,11 @@ impl Verifier {
                 ValidityResult::Invalid(None, error, assert_id_opt)
                 | ValidityResult::Invalid(_, error @ None, assert_id_opt) => {
                     // no model, but the obligation may still be known
+                    // No model, so no observer callback: the observer
+                    // places this failure from its id (none for a
+                    // bit-vector assert) when the query is drained.
+                    failed_here.push(assert_id_opt.clone());
                     // Borrowed, not moved: the report reads the same id below.
-                    failed_here.extend(assert_id_opt.iter().cloned());
                     if let Some(assert_id) = &assert_id_opt {
                         if prover_choice == vir::def::ProverChoice::DefaultProver {
                             default_prover_failed_assert_ids.push(assert_id.clone());
@@ -1396,8 +1399,8 @@ impl Verifier {
                     break;
                 }
                 ValidityResult::Invalid(Some(air_model), Some(error), assert_id_opt) => {
+                    // The observer saw this one through its Invalid callback.
                     // Borrowed, not moved: the report reads the same id below.
-                    failed_here.extend(assert_id_opt.iter().cloned());
                     if let Some(assert_id) = &assert_id_opt {
                         if prover_choice == vir::def::ProverChoice::DefaultProver {
                             default_prover_failed_assert_ids.push(assert_id.clone());

@@ -666,20 +666,7 @@ pub(crate) fn smt_check_assertion<'ctx>(
                 let smt_data = context.smt_log.take_pipe_data();
                 let smt_output = context.get_smt_process().send_commands(smt_data);
 
-                let mut smt_output = smt_output.into_iter();
-                let unsat_core_str =
-                    smt_output.next().expect("expected one line in the unsat core output");
-                assert!(smt_output.next().is_none());
-
-                let fun_names: Vec<Ident> = unsat_core_str
-                    .strip_prefix('(')
-                    .expect("invalid unsat core")
-                    .strip_suffix(')')
-                    .expect("invalid unsat core")
-                    .split_terminator(' ')
-                    .map(|x| Arc::new(x.to_owned()))
-                    .collect();
-                crate::context::UsageInfo::UsedAxioms(fun_names)
+                crate::context::UsageInfo::UsedAxioms(parse_unsat_core(&smt_output))
             } else {
                 crate::context::UsageInfo::None
             };
@@ -2109,6 +2096,53 @@ pub(crate) fn smt_check_query<'ctx>(
     }
 
     result
+}
+
+/// The names in a `(get-unsat-core)` reply. z3 prints the core on one line;
+/// cvc5 puts one name per line. Names may be `|quoted|`.
+pub(crate) fn parse_unsat_core(lines: &[String]) -> Vec<Ident> {
+    let text = lines.join(" ");
+    let body = text
+        .trim()
+        .strip_prefix('(')
+        .and_then(|t| t.strip_suffix(')'))
+        .unwrap_or_else(|| panic!("invalid unsat core: {:?}", lines));
+    let mut names = Vec::new();
+    let mut rest = body.trim_start();
+    while !rest.is_empty() {
+        let (name, tail) = match rest.strip_prefix('|') {
+            Some(quoted) => {
+                let end =
+                    quoted.find('|').unwrap_or_else(|| panic!("invalid unsat core: {:?}", lines));
+                (&quoted[..end], &quoted[end + 1..])
+            }
+            None => {
+                let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+                (&rest[..end], &rest[end..])
+            }
+        };
+        names.push(Arc::new(name.to_owned()));
+        rest = tail.trim_start();
+    }
+    names
+}
+
+#[cfg(test)]
+mod unsat_core_tests {
+    use super::parse_unsat_core;
+
+    fn names(lines: &[&str]) -> Vec<String> {
+        let lines: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
+        parse_unsat_core(&lines).iter().map(|n| n.to_string()).collect()
+    }
+
+    #[test]
+    fn unsat_core_parses_one_line_and_one_name_per_line() {
+        assert_eq!(names(&["(a b)"]), ["a", "b"]);
+        assert_eq!(names(&["()"]), Vec::<String>::new());
+        assert_eq!(names(&["(", "a", "|b c|", ")"]), ["a", "b c"]);
+        assert_eq!(names(&["(a", "b)"]), ["a", "b"]);
+    }
 }
 
 #[cfg(test)]

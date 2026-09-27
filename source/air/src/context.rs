@@ -1658,14 +1658,10 @@ impl Context {
         self.smt_log.log_eval(expr);
         let smt_data = self.smt_log.take_pipe_data();
         let smt_output = self.get_smt_process().send_commands(smt_data);
-        if smt_output.len() == 1 {
-            smt_output[0].clone()
-        } else {
-            // The solver prints multi-line output for compound model values (quantified
-            // formulas, algebraic data type constructors). These are never simple booleans,
-            // so return a value that callers will treat as unknown.
-            "unknown".to_string()
+        if smt_output.len() != 1 {
+            panic!("unexpected output from SMT eval {:?}", smt_output);
         }
+        smt_output[0].clone()
     }
 
     /// Evaluate an AIR expression against the current solver model as a boolean.
@@ -1675,20 +1671,25 @@ impl Context {
         let printer =
             crate::printer::Printer::new(self.message_interface.clone(), true, self.solver.clone());
         let node = printer.expr_to_node(expr);
+        // A compound value (a quantified formula, a datatype constructor)
+        // may span several lines; it is never a boolean, so it reads as None.
         match self.solver {
-            SmtSolver::Z3 => match self.eval_expr(node).as_str() {
-                "true" => Some(true),
-                "false" => Some(false),
-                _ => None,
-            },
+            SmtSolver::Z3 => {
+                self.smt_log.log_eval(node);
+                let smt_data = self.smt_log.take_pipe_data();
+                match self.get_smt_process().send_commands(smt_data).as_slice() {
+                    [line] if line == "true" => Some(true),
+                    [line] if line == "false" => Some(false),
+                    _ => None,
+                }
+            }
             // cvc5 has no `eval`: it takes the command for an unknown one
             // and the reader loses its place in the solver's output.
             // `get-value` answers `((expr value))` on one line.
             SmtSolver::Cvc5 => {
                 self.smt_log.log_get_value(node);
                 let smt_data = self.smt_log.take_pipe_data();
-                let smt_output = self.get_smt_process().send_commands(smt_data);
-                match smt_output.as_slice() {
+                match self.get_smt_process().send_commands(smt_data).as_slice() {
                     [line] if line.ends_with(" true))") => Some(true),
                     [line] if line.ends_with(" false))") => Some(false),
                     _ => None,

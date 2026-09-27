@@ -24,22 +24,45 @@
 //! AIR text until the end of the crate, when [`resolve`] renders them as
 //! source with the names the encoders recorded.
 
-use air::ast::{AssertId, Expr, ExprX, MultiOp, Query, Stmt, StmtX};
+use air::ast::{AssertId, BinaryOp, BindX, Expr, ExprX, Ident, MultiOp, Query, Stmt, StmtX};
 use air::query_result_observer::CheckValidResult;
 use serde::Serialize;
 use std::any::Any;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
 /// The observer names this module serves.
 pub const COVERAGE: &str = "coverage";
 pub const PROOF_STATE: &str = "proof-state";
 
+/// The observers the test suites register, one at a time.
+pub const TEST_OBSERVERS: &[&str] = &["test", "air-only", "query-result-only", "vir-only"];
+
+/// Whether `-V observers=` names a valid set: `coverage` and `proof-state`
+/// in any combination, or a single test observer.
+pub fn check_names(names: &[String]) -> Result<(), String> {
+    let known = |n: &str| n == COVERAGE || n == PROOF_STATE || TEST_OBSERVERS.contains(&n);
+    if names.is_empty() {
+        return Err(format!("expected a list of observers ({COVERAGE}, {PROOF_STATE})"));
+    }
+    if let Some(bad) = names.iter().find(|n| !known(n)) {
+        return Err(format!("unknown observer `{bad}`; expected {COVERAGE} and/or {PROOF_STATE}"));
+    }
+    let tests = names.iter().filter(|n| TEST_OBSERVERS.contains(&n.as_str())).count();
+    if tests > 0 && names.len() > 1 {
+        return Err(format!("a test observer cannot be combined with others: {}", names.join(",")));
+    }
+    Ok(())
+}
+
 /// A failing assertion's conjuncts are listed up to this many; the rest are
 /// counted in `conjuncts_omitted`.
 const MAX_CONJUNCTS: usize = 32;
 /// Likewise the variables whose counterexample values are reported.
 const MAX_VALUES: usize = 64;
+/// How deeply temporaries and preconditions are expanded into their
+/// definitions.
+const MAX_TEMP_DEPTH: usize = 8;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -66,6 +89,10 @@ struct Assertion {
 /// The query being checked: its assertions, and the answers so far.
 struct Pending {
     assertions: Vec<Assertion>,
+    /// Each Verus temporary (`tmp%1`) the query defines exactly once, by
+    /// `assume (= tmp%1 e)`, with its definition. `assert(a && b)` asserts
+    /// such a temporary, so its conjuncts are those of the definition.
+    temps: HashMap<String, Expr>,
     used_axioms: Option<Vec<String>>,
     failing: Vec<RawFailingAssert>,
 }
@@ -88,6 +115,10 @@ pub struct Obligation {
 pub struct Conjunct {
     pub term: String,
     pub value: Option<bool>,
+    /// A temporary or a callee's precondition (`req%f(args)`) whose
+    /// definition was not available, so it could not be split further.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub unexpanded: bool,
 }
 
 /// A variable the failing assertion reads, and its counterexample value.
@@ -106,7 +137,8 @@ pub struct RawFailingAssert {
     assert_id: Option<String>,
     message: String,
     span: Option<String>,
-    conjuncts: Vec<(String, Option<bool>)>,
+    /// (term, value, unexpanded)
+    conjuncts: Vec<(String, Option<bool>, bool)>,
     conjuncts_omitted: usize,
     values: Vec<(String, String)>,
     values_omitted: usize,
@@ -169,6 +201,11 @@ pub struct ObligationObserver {
     coverage: bool,
     proof_state: bool,
     pending: Option<Pending>,
+    /// Under proof-state: each precondition function the context declared
+    /// (`req%f`), with its parameters and definition, from the axiom
+    /// `forall params. req%f(params) == body`. A failing call's
+    /// precondition splits into the conjuncts of its body.
+    requires: HashMap<String, (Vec<Ident>, Expr)>,
 }
 
 impl ObligationObserver {
@@ -181,25 +218,33 @@ impl ObligationObserver {
             coverage,
             proof_state,
             pending: None,
+            requires: HashMap::new(),
         })
     }
 
     /// Close the query just checked and hand over what was seen of it.
     ///
-    /// `failed` are the ids the verifier saw fail, which covers answers that
-    /// reach it without the `Invalid` callback (no model, bit-vector checks).
+    /// `failed` are the ids of the failures that reached the verifier
+    /// without the `Invalid` callback (no model: bit-vector and nonlinear
+    /// checks, which carry no id at all). Such an answer has no error span,
+    /// and ids are not unique (a function's postconditions share one; loop
+    /// invariants and bit-vector asserts have none), so a failure is placed
+    /// only when its id names exactly one undecided assertion; otherwise
+    /// which one failed is unknown, and they stay undecided.
     /// `truncated` says the verifier stopped checking obligations after the
     /// last failure (the `--multiple-errors` budget ran out), so a later
     /// `Valid` does not speak for them.
     pub fn take_query(
         &mut self,
-        failed: &[AssertId],
+        failed: &[Option<AssertId>],
         timed_out: bool,
         truncated: bool,
     ) -> Option<RawQuery> {
         let mut pending = self.pending.take()?;
-        for a in pending.assertions.iter_mut() {
-            if a.status.is_none() && a.id.as_ref().is_some_and(|id| failed.contains(id)) {
+        for id in failed {
+            let mut undecided =
+                pending.assertions.iter_mut().filter(|a| a.status.is_none() && &a.id == id);
+            if let (Some(a), None) = (undecided.next(), undecided.next()) {
                 a.status = Some(Status::Failed);
             }
         }
@@ -261,15 +306,133 @@ fn collect_assertions(stmt: &Stmt, out: &mut Vec<Assertion>) {
     }
 }
 
-/// The formula's top-level conjuncts, flattening nested conjunctions.
-fn conjuncts(expr: &Expr, out: &mut Vec<Expr>) {
+/// The temporaries `stmt` defines exactly once, with their definitions.
+fn temp_definitions(stmt: &Stmt) -> HashMap<String, Expr> {
+    fn walk(stmt: &Stmt, defs: &mut HashMap<String, Vec<Expr>>) {
+        match &**stmt {
+            StmtX::Assume(e) => {
+                if let ExprX::Binary(air::ast::BinaryOp::Eq, lhs, rhs) = &**e {
+                    if let ExprX::Var(x) = &**lhs {
+                        if x.starts_with(vir::def::PREFIX_TEMP_VAR) {
+                            defs.entry(x.to_string()).or_default().push(rhs.clone());
+                        }
+                    }
+                }
+            }
+            StmtX::DeadEnd(s) | StmtX::Breakable(_, s) => walk(s, defs),
+            StmtX::Block(ss) | StmtX::Switch(ss) => {
+                for s in ss.iter() {
+                    walk(s, defs);
+                }
+            }
+            StmtX::Assert(..)
+            | StmtX::Havoc(_)
+            | StmtX::Assign(..)
+            | StmtX::Snapshot(_)
+            | StmtX::Break(_) => {}
+        }
+    }
+    let mut defs = HashMap::new();
+    walk(stmt, &mut defs);
+    defs.into_iter()
+        .filter_map(|(x, mut es)| (es.len() == 1).then(|| (x, es.pop().unwrap())))
+        .collect()
+}
+
+/// A precondition function's definition, if `axiom` is the one Verus
+/// declares for it: `forall params. req%f(params) == body` (or, with no
+/// parameters, `req%f == body`).
+fn requires_definition(axiom: &Expr) -> Option<(String, Vec<Ident>, Expr)> {
+    let (params, eq): (Vec<Ident>, &Expr) = match &**axiom {
+        ExprX::Bind(bind, body) => match &**bind {
+            BindX::Quant(air::ast::Quant::Forall, bs, _, _) => {
+                (bs.iter().map(|b| b.name.clone()).collect(), body)
+            }
+            _ => return None,
+        },
+        _ => (Vec::new(), axiom),
+    };
+    let ExprX::Binary(BinaryOp::Eq, lhs, body) = &**eq else { return None };
+    let (f, args) = match &**lhs {
+        ExprX::Apply(f, args) => (f, args.iter().collect::<Vec<_>>()),
+        ExprX::Var(f) => (f, Vec::new()),
+        _ => return None,
+    };
+    let is_param = |(a, p): (&&Expr, &Ident)| matches!(&***a, ExprX::Var(x) if x == p);
+    (f.starts_with(vir::def::PREFIX_REQUIRES)
+        && args.len() == params.len()
+        && args.iter().zip(params.iter()).all(is_param))
+    .then(|| (f.to_string(), params, body.clone()))
+}
+
+/// `body` with each parameter replaced by its argument; `None` when a
+/// binder inside `body` shadows a parameter.
+fn instantiate(params: &[Ident], args: &[Expr], body: &Expr) -> Option<Expr> {
+    let mut shadowed = false;
+    air::visitor::map_expr_visitor(body, &mut |e| {
+        if let ExprX::Bind(bind, _) = &**e {
+            let names: Vec<&Ident> = match &**bind {
+                BindX::Let(bs) => bs.iter().map(|b| &b.name).collect(),
+                BindX::Quant(_, bs, _, _)
+                | BindX::Lambda(bs, _, _)
+                | BindX::Choose(bs, _, _, _) => bs.iter().map(|b| &b.name).collect(),
+            };
+            shadowed |= names.iter().any(|n| params.contains(n));
+        }
+        e.clone()
+    });
+    if shadowed {
+        return None;
+    }
+    Some(air::visitor::map_expr_visitor(body, &mut |e| match &**e {
+        ExprX::Var(x) => match params.iter().position(|p| p == x) {
+            Some(i) => args[i].clone(),
+            None => e.clone(),
+        },
+        _ => e.clone(),
+    }))
+}
+
+/// What a failing assertion's conjuncts may be read through.
+struct Definitions<'a> {
+    temps: &'a HashMap<String, Expr>,
+    requires: &'a HashMap<String, (Vec<Ident>, Expr)>,
+}
+
+/// The formula's top-level conjuncts, flattening nested conjunctions,
+/// reading a temporary as its definition and a callee's precondition as
+/// its body at the call's arguments. Each comes with whether it is a
+/// temporary or precondition that could not be read that way.
+fn conjuncts(expr: &Expr, defs: &Definitions, depth: usize, out: &mut Vec<(Expr, bool)>) {
+    let deeper = depth < MAX_TEMP_DEPTH;
     match &**expr {
         ExprX::Multi(MultiOp::And, es) => {
             for e in es.iter() {
-                conjuncts(e, out);
+                conjuncts(e, defs, depth, out);
             }
         }
-        _ => out.push(expr.clone()),
+        // a precondition's `axiom_location`, once labelled:
+        // `%%global_location_label%%N => e`
+        ExprX::Binary(BinaryOp::Implies, label, e) if matches!(&**label, ExprX::Var(l) if l.starts_with(air::def::GLOBAL_PREFIX_LABEL)) => {
+            conjuncts(e, defs, depth, out)
+        }
+        ExprX::LabeledAxiom(_, _, e) => conjuncts(e, defs, depth, out),
+        ExprX::Var(x) if deeper && defs.temps.contains_key(&**x) => {
+            conjuncts(&defs.temps[&**x], defs, depth + 1, out)
+        }
+        ExprX::Var(x) if x.starts_with(vir::def::PREFIX_TEMP_VAR) => out.push((expr.clone(), true)),
+        ExprX::Apply(f, args) if f.starts_with(vir::def::PREFIX_REQUIRES) => {
+            let body = defs
+                .requires
+                .get(&**f)
+                .filter(|_| deeper)
+                .and_then(|(params, body)| instantiate(params, args, body));
+            match body {
+                Some(body) => conjuncts(&body, defs, depth + 1, out),
+                None => out.push((expr.clone(), true)),
+            }
+        }
+        _ => out.push((expr.clone(), false)),
     }
 }
 
@@ -336,6 +499,15 @@ fn free_constants(expr: &Expr, bound: &mut Vec<String>, out: &mut BTreeSet<Strin
     }
 }
 
+/// Sorts of the encoding's own constants (type ids like `INT`, the `$`
+/// decoration, fuel), whose counterexample values say nothing about the
+/// program.
+fn is_encoding_sort(typ: &air::ast::Typ) -> bool {
+    use vir::def::{DECORATION, FUEL_ID, FUEL_TYPE, TYPE};
+    matches!(&**typ, air::ast::TypX::Named(n)
+        if [TYPE, DECORATION, FUEL_TYPE, FUEL_ID].contains(&n.as_str()))
+}
+
 fn term_text(expr: &Expr) -> String {
     let printer = air::printer::Printer::new(
         Arc::new(air::messages::AirMessageInterface {}),
@@ -347,6 +519,14 @@ fn term_text(expr: &Expr) -> String {
 }
 
 impl air::air_observer::AirObserver for ObligationObserver {
+    fn on_axiom_decl(&mut self, expr: &Expr) {
+        if self.proof_state {
+            if let Some((f, params, body)) = requires_definition(expr) {
+                self.requires.insert(f, (params, body));
+            }
+        }
+    }
+
     fn on_query_lowered(
         &mut self,
         query: &Query,
@@ -355,7 +535,9 @@ impl air::air_observer::AirObserver for ObligationObserver {
     ) {
         let mut assertions = Vec::new();
         collect_assertions(&query.assertion, &mut assertions);
-        self.pending = Some(Pending { assertions, used_axioms: None, failing: Vec::new() });
+        let temps =
+            if self.proof_state { temp_definitions(&query.assertion) } else { HashMap::new() };
+        self.pending = Some(Pending { assertions, temps, used_axioms: None, failing: Vec::new() });
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -409,24 +591,32 @@ impl air::query_result_observer::QueryResultObserver for ObligationObserver {
                     return;
                 }
                 let mut parts = Vec::new();
-                conjuncts(&a.expr, &mut parts);
-                let mut evaluated: Vec<(String, Option<bool>)> =
-                    parts.iter().map(|c| (term_text(c), eval_bool_expr(c))).collect();
+                let defs = Definitions { temps: &pending.temps, requires: &self.requires };
+                conjuncts(&a.expr, &defs, 0, &mut parts);
+                let mut evaluated: Vec<(String, Option<bool>, bool)> = parts
+                    .iter()
+                    .map(|(c, unexpanded)| (term_text(c), eval_bool_expr(c), *unexpanded))
+                    .collect();
                 // false first: those are why the assertion failed
-                evaluated.sort_by_key(|(_, v)| match v {
+                evaluated.sort_by_key(|(_, v, _)| match v {
                     Some(false) => 0,
                     None => 1,
                     Some(true) => 2,
                 });
                 let conjuncts_omitted = evaluated.len().saturating_sub(MAX_CONJUNCTS);
                 evaluated.truncate(MAX_CONJUNCTS);
+                // what the conjuncts read, so an expanded temporary shows
+                // the variables of its definition
                 let mut symbols = BTreeSet::new();
-                free_constants(&a.expr, &mut Vec::new(), &mut symbols);
+                for (part, _) in parts.iter() {
+                    free_constants(part, &mut Vec::new(), &mut symbols);
+                }
                 let mut values: Vec<(String, String)> = symbols
                     .into_iter()
                     .filter_map(|s| {
                         let def = model_defs.get(&Arc::new(s.clone()))?;
-                        def.params.is_empty().then(|| (s, def.body.to_string()))
+                        (def.params.is_empty() && !is_encoding_sort(&def.ret))
+                            .then(|| (s, def.body.to_string()))
                     })
                     .collect();
                 let values_omitted = values.len().saturating_sub(MAX_VALUES);
@@ -509,7 +699,11 @@ pub fn resolve(
                 conjuncts: f
                     .conjuncts
                     .into_iter()
-                    .map(|(term, value)| Conjunct { term: render_unversioned(names, &term), value })
+                    .map(|(term, value, unexpanded)| Conjunct {
+                        term: render_unversioned(names, &term),
+                        value,
+                        unexpanded,
+                    })
                     .collect(),
                 conjuncts_omitted: f.conjuncts_omitted,
                 values: f
@@ -548,6 +742,20 @@ mod tests {
     }
 
     #[test]
+    fn observer_names_are_checked() {
+        let names = |ns: &[&str]| ns.iter().map(|n| n.to_string()).collect::<Vec<_>>();
+        assert!(check_names(&names(&["coverage", "proof-state"])).is_ok());
+        assert!(check_names(&names(&["test"])).is_ok());
+        assert!(
+            check_names(&names(&["covrage"])).unwrap_err().contains("unknown observer `covrage`")
+        );
+        assert!(check_names(&names(&["coverage", ""])).is_err());
+        assert!(check_names(&names(&["test", "coverage"])).is_err());
+        assert!(check_names(&names(&["test", "vir-only"])).is_err());
+        assert!(check_names(&[]).is_err());
+    }
+
+    #[test]
     fn versions_are_dropped_before_rendering() {
         let names = vir::air_names::SourceNames::new();
         assert_eq!(render_unversioned(&names, "(<= i@12 n@)"), "(i@ <= n@)");
@@ -557,9 +765,87 @@ mod tests {
     fn conjuncts_flatten_nested_ands() {
         let and = |es: Vec<Expr>| Arc::new(ExprX::Multi(MultiOp::And, Arc::new(es)));
         let e = and(vec![var("a"), and(vec![var("b"), var("c")])]);
+        let (temps, requires) = (HashMap::new(), HashMap::new());
         let mut out = Vec::new();
-        conjuncts(&e, &mut out);
+        conjuncts(&e, &Definitions { temps: &temps, requires: &requires }, 0, &mut out);
         assert_eq!(out.len(), 3);
+    }
+
+    /// `assert(a && b)` asserts a temporary; its conjuncts are its
+    /// definition's. A temporary defined on two branches is left alone.
+    #[test]
+    fn temporaries_read_as_their_definitions() {
+        let and = |es: Vec<Expr>| Arc::new(ExprX::Multi(MultiOp::And, Arc::new(es)));
+        let def = |x: &str, e: Expr| {
+            Arc::new(StmtX::Assume(Arc::new(ExprX::Binary(BinaryOp::Eq, var(x), e))))
+        };
+        let block = |ss: Vec<Stmt>| Arc::new(StmtX::Block(Arc::new(ss)));
+        let body = block(vec![
+            def("tmp%1", and(vec![var("a@0"), var("tmp%2")])),
+            def("tmp%2", and(vec![var("b@1"), var("c!")])),
+            Arc::new(StmtX::Switch(Arc::new(vec![def("tmp%3", var("d")), def("tmp%3", var("e"))]))),
+        ]);
+        let temps = temp_definitions(&body);
+        assert!(temps.contains_key("tmp%1") && !temps.contains_key("tmp%3"));
+        let requires = HashMap::new();
+        let defs = Definitions { temps: &temps, requires: &requires };
+        let split = |e: Expr| {
+            let mut out = Vec::new();
+            conjuncts(&e, &defs, 0, &mut out);
+            out.iter().map(|(c, unexpanded)| (term_text(c), *unexpanded)).collect::<Vec<_>>()
+        };
+        let s = |t: &str, u: bool| (t.to_string(), u);
+        assert_eq!(split(var("tmp%1")), [s("a@0", false), s("b@1", false), s("c!", false)]);
+        assert_eq!(split(var("tmp%3")), [s("tmp%3", true)]);
+    }
+
+    /// A failing call's precondition `req%f(args)` splits into the
+    /// conjuncts of `f`'s requires at those arguments, read through the
+    /// labels Verus puts on each requires clause.
+    #[test]
+    fn preconditions_read_as_their_definitions() {
+        let int = Arc::new(TypX::Int);
+        let binder =
+            |x: &str| Arc::new(air::ast::BinderX { name: Arc::new(x.to_string()), a: int.clone() });
+        let app =
+            |f: &str, es: Vec<Expr>| Arc::new(ExprX::Apply(Arc::new(f.to_string()), Arc::new(es)));
+        let bin = |op, a, b| Arc::new(ExprX::Binary(op, a, b));
+        let labelled = |n: &str, e| {
+            bin(BinaryOp::Implies, var(&format!("{}{}", air::def::GLOBAL_PREFIX_LABEL, n)), e)
+        };
+        let body = Arc::new(ExprX::Multi(
+            MultiOp::And,
+            Arc::new(vec![
+                labelled("0", bin(BinaryOp::Gt, var("y!"), var("five"))),
+                labelled("1", bin(BinaryOp::Lt, var("y!"), var("z!"))),
+            ]),
+        ));
+        let axiom = Arc::new(ExprX::Bind(
+            Arc::new(BindX::Quant(
+                air::ast::Quant::Forall,
+                Arc::new(vec![binder("y!"), binder("z!")]),
+                Arc::new(vec![]),
+                None,
+            )),
+            bin(BinaryOp::Eq, app("req%m!g.", vec![var("y!"), var("z!")]), body),
+        ));
+        let mut o = ObligationObserver::from_names(&["proof-state".to_string()]).unwrap();
+        air::air_observer::AirObserver::on_axiom_decl(&mut o, &axiom);
+        assert!(o.requires.contains_key("req%m!g."));
+        let temps = HashMap::new();
+        let defs = Definitions { temps: &temps, requires: &o.requires };
+        let mut out = Vec::new();
+        conjuncts(&app("req%m!g.", vec![var("a@1"), var("seven")]), &defs, 0, &mut out);
+        let terms: Vec<(String, bool)> = out.iter().map(|(c, u)| (term_text(c), *u)).collect();
+        assert_eq!(
+            terms,
+            [("(> a@1 five)".to_string(), false), ("(< a@1 seven)".to_string(), false)]
+        );
+        // a callee whose requires the context never declared stays whole
+        let mut out = Vec::new();
+        conjuncts(&app("req%m!h.", vec![var("a@1")]), &defs, 0, &mut out);
+        assert_eq!(out.len(), 1);
+        assert!(out[0].1);
     }
 
     #[test]
@@ -588,7 +874,12 @@ mod tests {
 
     #[test]
     fn take_query_fills_statuses() {
-        let mut o = ObligationObserver { coverage: true, proof_state: false, pending: None };
+        let mut o = ObligationObserver {
+            coverage: true,
+            proof_state: false,
+            pending: None,
+            requires: HashMap::new(),
+        };
         let id = |n: u64| Some(Arc::new(vec![n]));
         let assertion = |n: u64, status| Assertion {
             id: id(n),
@@ -599,6 +890,7 @@ mod tests {
         };
         let pending = |o: &mut ObligationObserver| {
             o.pending = Some(Pending {
+                temps: HashMap::new(),
                 assertions: vec![
                     assertion(0, Some(Status::Proved)),
                     assertion(1, Some(Status::Failed)),
@@ -617,12 +909,31 @@ mod tests {
         assert_eq!(statuses(q), vec![Proved, Failed, Unchecked, Unchecked]);
         // #3 failed without an Invalid callback (no model)
         pending(&mut o);
-        let q = o.take_query(&[Arc::new(vec![3])], false, false).unwrap();
+        let q = o.take_query(&[id(3)], false, false).unwrap();
         assert_eq!(statuses(q), vec![Proved, Failed, Proved, Failed]);
         // the solver gave up
         pending(&mut o);
         let q = o.take_query(&[], true, false).unwrap();
         assert_eq!(statuses(q), vec![Proved, Failed, Proved, Unknown]);
+        // two undecided postconditions share the id that failed without a
+        // model: which one failed is not known
+        o.pending = Some(Pending {
+            temps: HashMap::new(),
+            assertions: vec![assertion(5, None), assertion(5, None), assertion(6, None)],
+            used_axioms: None,
+            failing: Vec::new(),
+        });
+        let q = o.take_query(&[id(5), id(6)], false, false).unwrap();
+        assert_eq!(statuses(q), vec![Unchecked, Unchecked, Failed]);
+        // a bit-vector assert has no id, and fails without a model
+        o.pending = Some(Pending {
+            temps: HashMap::new(),
+            assertions: vec![Assertion { id: None, ..assertion(0, None) }],
+            used_axioms: None,
+            failing: Vec::new(),
+        });
+        let q = o.take_query(&[None], false, false).unwrap();
+        assert_eq!(statuses(q), vec![Failed]);
         assert!(o.take_query(&[], false, false).is_none());
     }
 }

@@ -29,7 +29,6 @@ pub struct TestObserver {
     pub havocs: Vec<String>,
     pub assigns: Vec<String>,
     pub branch_merges: usize,
-    pub break_merges: usize,
     pub variable_defs: Vec<String>,
     pub for_loop_vars: Vec<(String, String)>,
     pub reveal_strings: Vec<String>,
@@ -75,7 +74,6 @@ impl TestObserver {
             havocs: vec![],
             assigns: vec![],
             branch_merges: 0,
-            break_merges: 0,
             variable_defs: vec![],
             for_loop_vars: vec![],
             reveal_strings: vec![],
@@ -153,7 +151,7 @@ impl TestObserver {
                 "OBSERVER:{{",
                 "\"krate_function_names\":{},\"krate_datatype_names\":{},",
                 "\"havocs\":{},\"assigns\":{},",
-                "\"branch_merges\":{},\"break_merges\":{},",
+                "\"branch_merges\":{},",
                 "\"variable_defs\":{},\"for_loop_vars\":{},",
                 "\"reveal_strings\":{},",
                 "\"quantifier_binders\":{},",
@@ -181,7 +179,6 @@ impl TestObserver {
             Self::json_strings(&self.havocs),
             Self::json_strings(&self.assigns),
             self.branch_merges,
-            self.break_merges,
             Self::json_strings(&self.variable_defs),
             Self::json_string_pairs(&self.for_loop_vars),
             Self::json_strings(&self.reveal_strings),
@@ -345,15 +342,9 @@ impl vir::vir_observer::VirObserver for TestObserver {
         self.events.push(format!("assign:{}", base));
         self.correlator.record_havoc_or_assign(&base, stm);
     }
-    fn on_branch_merge(&mut self, stm: &vir::sst::Stm) {
+    fn on_branch_merge(&mut self, _stm: &vir::sst::Stm) {
         self.branch_merges += 1;
         self.events.push("branch_merge".to_string());
-        self.correlator.record_branch_merge(stm);
-    }
-    fn on_break_merge(&mut self, stm: &vir::sst::Stm) {
-        self.break_merges += 1;
-        self.events.push("break_merge".to_string());
-        self.correlator.record_break_merge(stm);
     }
     fn on_variable_def(&mut self, _stm: &vir::sst::Stm, var: &vir::ast::VarIdent) {
         self.variable_defs.push(vir::def::suffix_local_unique_id(var).to_string());

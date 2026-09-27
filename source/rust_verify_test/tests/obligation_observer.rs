@@ -164,3 +164,157 @@ fn proof_state_reports_the_false_conjunct_and_its_values() {
     assert_eq!(bump["conjuncts"][0]["term"], "(r == ((x + y) + 1))");
     assert_eq!(bump["conjuncts"][0]["value"], false);
 }
+
+const MORE: &str = r#"
+use vstd::prelude::*;
+verus!{
+fn conj(a: u32, b: u32)
+    requires a > 2,
+{
+    assert(a > 3 && b < 2);
+}
+
+fn bits(x: u32) {
+    assert(x & 1 == 0) by (bit_vector);
+}
+
+fn callee(y: u32, z: u32)
+    requires y > 5 && y < z, z < 100,
+{
+}
+
+fn caller(y: u32) {
+    callee(y, 7);
+}
+
+fn all_big(v: &Vec<u64>) -> (r: u64)
+    requires v.len() > 0,
+    ensures forall|i: int| 0 <= i < v.len() ==> v[i] <= r,
+{
+    v[0]
+}
+
+fn fine(a: u32) -> (r: u32)
+    requires a < 10,
+    ensures r == a,
+{
+    a
+}
+}
+"#;
+
+/// The failing assertion of `f`, as (term, value) per conjunct, and the
+/// symbols it reports values for.
+fn failing(
+    functions: &serde_json::Value,
+    f: &str,
+) -> (Vec<(String, serde_json::Value)>, Vec<String>) {
+    let failing = functions[f]["failing_asserts"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no failing_asserts for {}: {:#}", f, functions[f]));
+    assert_eq!(failing.len(), 1, "{failing:#?}");
+    let conjuncts = failing[0]["conjuncts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| (c["term"].as_str().unwrap().to_string(), c["value"].clone()))
+        .collect();
+    let symbols = failing[0]["values"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v["symbol"].as_str().unwrap().to_string())
+        .collect();
+    (conjuncts, symbols)
+}
+
+/// `assert(a && b)` asserts a Verus temporary; proof-state splits it into
+/// the conjuncts of its definition and reports the variables they read.
+#[test]
+fn proof_state_splits_an_asserted_conjunction() {
+    let functions = functions_for(MORE, &["-V", "observers=proof-state"]);
+    let (conjuncts, symbols) = failing(&functions, "test::conj");
+    assert_eq!(
+        conjuncts,
+        vec![
+            ("(a > 3)".to_string(), serde_json::json!(false)),
+            ("(b < 2)".to_string(), serde_json::json!(true)),
+        ]
+    );
+    assert_eq!(symbols, vec!["a!", "b!"]);
+}
+
+/// A failing call's precondition splits into the callee's requires
+/// clauses at the call's arguments.
+#[test]
+fn proof_state_splits_a_callee_precondition() {
+    let functions = functions_for(MORE, &["-V", "observers=proof-state"]);
+    let (conjuncts, symbols) = failing(&functions, "test::caller");
+    let terms: Vec<&str> = conjuncts.iter().map(|(t, _)| t.as_str()).collect();
+    assert_eq!(terms, vec!["(y > 5)", "(y < 7)", "(7 < 100)"]);
+    assert_eq!(conjuncts[0].1, serde_json::json!(false));
+    assert_eq!(symbols, vec!["y!"]);
+}
+
+/// Values are the program's: the encoding's type ids and decorations
+/// (`INT`, `$`, `TYPE%...`) are left out.
+#[test]
+fn proof_state_values_leave_out_encoding_constants() {
+    let functions = functions_for(MORE, &["-V", "observers=proof-state"]);
+    let (_, symbols) = failing(&functions, "test::all_big");
+    assert_eq!(symbols, vec!["r!", "v!"]);
+}
+
+/// A bit-vector assert fails without a model and without an assertion id;
+/// coverage still says it failed.
+#[test]
+fn coverage_marks_a_failing_bit_vector_assert_failed() {
+    let functions = functions_for(MORE, &["-V", "observers=coverage"]);
+    let s = |m: &str, st: &str| (m.to_string(), st.to_string());
+    assert!(
+        statuses(&functions, "test::bits")
+            .contains(&s("bitvector assertion not satisfied", "failed")),
+        "{:#}",
+        functions["test::bits"]
+    );
+}
+
+/// Under `-V axiom-usage-info` a proved query lists its unsat core; cvc5
+/// prints the core over several lines.
+#[test]
+fn coverage_lists_used_axioms_under_cvc5() {
+    let functions = functions_for(MORE, &["-V", "observers=coverage", "-V", "axiom-usage-info"]);
+    let queries = functions["test::fine"]["obligations"].as_array().expect("obligations");
+    let body = queries.iter().find(|q| q["kind"] == "body").expect("the body query");
+    assert!(body["used_axioms"].is_array(), "{:#}", body);
+    let with_axioms = functions
+        .as_object()
+        .unwrap()
+        .values()
+        .flat_map(|f| f["obligations"].as_array().into_iter().flatten())
+        .filter(|q| q["used_axioms"].as_array().is_some_and(|a| !a.is_empty()))
+        .count();
+    assert!(with_axioms > 0, "no proved query named an axiom: {:#}", functions);
+}
+
+/// An observer name Verus does not know is an error, not a run without it.
+#[test]
+fn unknown_observer_names_are_rejected() {
+    for (names, expected) in [
+        ("covrage", "unknown observer `covrage`"),
+        ("coverage,", "unknown observer ``"),
+        ("test,coverage", "cannot be combined"),
+    ] {
+        let tempdir = TempDir::new().expect("temp dir");
+        let entry_file = tempdir.path().join("test.rs");
+        std::fs::write(&entry_file, format!("{}\n{}\n", FEATURE_PRELUDE, USE_PRELUDE)).unwrap();
+        let observers = format!("observers={names}");
+        let output = run_verus_raw(
+            &["--crate-type=lib", "-V", &observers, entry_file.to_str().unwrap()],
+            tempdir.path(),
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "{}: {}", names, stderr);
+        assert!(stderr.contains(expected), "{}: {}", names, stderr);
+    }
+}
