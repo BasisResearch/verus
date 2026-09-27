@@ -2222,7 +2222,9 @@ fn tla_export_caps_a_domain_read_off_a_type() {
     assert!(!ex.tla.contains("0..65535 :"), "{}", ex.tla);
     assert!(!ex.tla.contains("Dom_Option"), "{}", ex.tla);
     assert!(
-        ex.tla.contains("[tag |-> \"Nudge\", v0 |-> v0__4] : v0__4 \\in 0..255}"),
+        ex.tla.contains(
+            "(\\E v0__3 \\in 0..255 : (LET st == [tag |-> \"Nudge\", v0 |-> v0__3] IN step(st)))"
+        ),
         "{}",
         ex.tla
     );
@@ -2894,4 +2896,402 @@ fn tla_export_refuses_reals() {
     let run = tlc(&jar, &ex.spec(), &ex.cfg);
     assert_eq!(run.violated, Vec::<String>::new(), "{}", ex.tla);
     assert_eq!(run.distinct, 3, "{run:?}\n{}", ex.tla);
+}
+
+/// The shapes toyDB's Raft model (`src/raft/safety.rs`) writes, which the
+/// export of it against the hand-written `tla/Raft.tla` turned up: a node set
+/// `Set::range(0, n)` (refused as an uninterpreted trait method); a
+/// quantifier guarded by `net.contains(Msg::Ping { from, round })` (a hole
+/// per binder); `b == 0 || log[b - 1] < 1` in a transition (TLC branches on
+/// the `\/` and indexes `log[-1]`); and `exists|step: Step|` whose arms call
+/// one transition each (a hole per field, and the union of every variant's
+/// values built in every state). 144 states, as a breadth-first search of
+/// the same system finds.
+const MESSAGES: &str = r#"
+use vstd::prelude::*;
+verus! {
+pub enum Msg { Ping { from: int, round: nat }, Note { log: Seq<int> } }
+
+pub struct State { pub n: nat, pub net: Set<Msg>, pub log: Seq<int> }
+
+pub open spec fn nodes(n: nat) -> Set<int> { Set::<int>::range(0, n as int) }
+
+pub open spec fn init(s: State) -> bool {
+    &&& s.n == 2
+    &&& s.net == Set::<Msg>::empty()
+    &&& s.log == Seq::<int>::empty()
+}
+
+pub open spec fn ping(pre: State, post: State, from: int, round: nat) -> bool {
+    &&& nodes(pre.n).contains(from)
+    &&& round < 2
+    &&& post == State { net: pre.net.insert(Msg::Ping { from, round }), ..pre }
+}
+
+pub open spec fn extend(pre: State, post: State, b: nat) -> bool {
+    &&& b <= pre.log.len() < 2
+    &&& (b == 0 || pre.log[b - 1] < 1)
+    &&& post == State { log: pre.log.push(b as int), ..pre }
+}
+
+pub open spec fn echo(pre: State, post: State, from: int, round: nat) -> bool {
+    &&& pre.net.contains(Msg::Ping { from, round })
+    &&& pre.log.len() < 2
+    &&& post == State { log: pre.log.push(from + round), ..pre }
+}
+
+pub enum Step { Ping { from: int, round: nat }, Extend { b: nat }, Echo { from: int, round: nat } }
+
+pub open spec fn next_step(pre: State, post: State, step: Step) -> bool {
+    match step {
+        Step::Ping { from, round } => ping(pre, post, from, round),
+        Step::Extend { b } => extend(pre, post, b),
+        Step::Echo { from, round } => echo(pre, post, from, round),
+    }
+}
+
+pub open spec fn next(pre: State, post: State) -> bool {
+    exists|step: Step| next_step(pre, post, step)
+}
+
+pub open spec fn pings_ok(s: State) -> bool {
+    forall|from: int, round: nat| #[trigger] s.net.contains(Msg::Ping { from, round })
+        ==> nodes(s.n).contains(from) && round < 2
+}
+
+pub open spec fn log_small(s: State) -> bool {
+    forall|i: int| 0 <= i < s.log.len() ==> 0 <= #[trigger] s.log[i] <= 2
+}
+}
+"#;
+
+#[test]
+fn tla_export_bounds_message_fields_and_step_fields_from_their_guards() {
+    let ex = export_code(MESSAGES, "test_crate");
+    assert_eq!(ex.report["refusals"], serde_json::json!([]), "{}", ex.tla);
+    assert_eq!(ex.report["holes"], serde_json::json!([]), "{}", ex.tla);
+    assert_eq!(names(&ex.report["invariants"]), ["pings_ok", "log_small"]);
+    // The node set is a range.
+    assert!(ex.tla.contains("(0)..((n_2) - 1)"), "{}", ex.tla);
+    // A message field ranges over the fields of the messages in `net`.
+    assert!(ex.tla.contains(".from : m__"), "{}", ex.tla);
+    assert!(ex.tla.contains(".tag = \"Ping\"}}"), "{}", ex.tla);
+    // The guarding disjunction is evaluated, not branched on.
+    assert!(ex.tla.contains("(IF (b = 0) THEN TRUE ELSE"), "{}", ex.tla);
+    // One \E per variant, over fields bounded by the transition's guard.
+    assert!(ex.tla.contains("(LET step == [tag |-> \"Extend\", b |-> b__] IN next_step(step))"));
+    assert!(!ex.tla.contains("\\cup {[tag |-> \"Extend\""), "{}", ex.tla);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let run = tlc(&jar, &ex.spec(), &ex.cfg);
+    assert_eq!(run.violated, Vec::<String>::new(), "{}", ex.tla);
+    assert_eq!(run.distinct, 144, "{run:?}\n{}", ex.tla);
+}
+
+/// Step fields are bounded from the guard of the arm a variant's values
+/// take, and only when that arm takes all of them: the first arm that could
+/// match the variant, unguarded, and binding each field plainly. Here an arm
+/// refuting a field (`R { a: true, b }`), a guarded arm (`G { b } if b > 0`)
+/// and a guarded wildcard each leave some values to a later arm, whose
+/// guard (`b < 1`, `b < 0`) would drop `x = 21, 22, 31, 32, 50`. The nine
+/// states are 0 and the eight values the arms reach (`t60` is unreachable).
+const ARMS: &str = r#"
+use vstd::prelude::*;
+verus! {
+pub struct State { pub x: int }
+
+pub open spec fn init(s: State) -> bool { s.x == 0 }
+
+pub open spec fn t10(pre: State, post: State, b: u8) -> bool {
+    &&& b < 1 &&& pre.x == 0 &&& post == State { x: 10 + b }
+}
+pub open spec fn t20(pre: State, post: State, b: u8) -> bool {
+    &&& b < 3 &&& pre.x == 0 &&& post == State { x: 20 + b }
+}
+pub open spec fn t30(pre: State, post: State, b: u8) -> bool {
+    &&& b < 3 &&& pre.x == 0 &&& post == State { x: 30 + b }
+}
+pub open spec fn t40(pre: State, post: State, b: u8) -> bool {
+    &&& b < 1 &&& pre.x == 0 &&& post == State { x: 40 + b }
+}
+pub open spec fn t60(pre: State, post: State, b: u8) -> bool {
+    &&& b < 0 &&& pre.x == 0 &&& post == State { x: 60 + b }
+}
+
+pub enum Step { R { a: bool, b: u8 }, G { b: u8 }, W { b: u8 } }
+
+pub open spec fn next_step(pre: State, post: State, step: Step) -> bool {
+    match step {
+        Step::R { a: true, b } => t10(pre, post, b),
+        Step::R { a, b } => t20(pre, post, b),
+        Step::G { b } if b > 0 => t30(pre, post, b),
+        Step::G { b } => t40(pre, post, b),
+        _ if step is W => pre.x == 0 && post == State { x: 50 },
+        Step::W { b } => t60(pre, post, b),
+    }
+}
+
+pub open spec fn next(pre: State, post: State) -> bool {
+    exists|step: Step| next_step(pre, post, step)
+}
+
+pub open spec fn small(s: State) -> bool { s.x <= 60 }
+}
+"#;
+
+#[test]
+fn tla_export_bounds_a_step_field_only_from_an_arm_taking_every_value() {
+    let ex = export_code(ARMS, "test_crate");
+    assert_eq!(ex.report["refusals"], serde_json::json!([]), "{}", ex.tla);
+    assert_eq!(ex.report["holes"], serde_json::json!([]), "{}", ex.tla);
+    // Each variant's `b` is read off its type: no arm bounds it alone.
+    assert!(!ex.tla.contains("\\in 0..(1) - 1"), "{}", ex.tla);
+    assert!(!ex.tla.contains("\\in 0..(0) - 1"), "{}", ex.tla);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let run = tlc(&jar, &ex.spec(), &ex.cfg);
+    assert_eq!(run.violated, Vec::<String>::new(), "{}", ex.tla);
+    assert_eq!(run.distinct, 9, "{run:?}\n{}", ex.tla);
+}
+
+/// A disjunction Init reaches keeps its `\/`, which TLC branches on to
+/// assign the state (two initial states), while the same disjunction in an
+/// action is evaluated. `Set::range_inclusive(lo, hi)` holds `hi` even below
+/// `lo`, as vstd's `range_set(lo, hi).insert(hi)` does.
+const INIT_OR: &str = r#"
+use vstd::prelude::*;
+verus! {
+pub struct State { pub x: int, pub y: int }
+
+pub open spec fn init(s: State) -> bool {
+    &&& s.x == 0 || s.x == 1
+    &&& s.y == 0
+}
+
+pub open spec fn next(pre: State, post: State) -> bool {
+    &&& pre.x == 0 || pre.x == 5
+    &&& pre.y < 1
+    &&& post == State { y: pre.y + 1, ..pre }
+}
+
+pub open spec fn inclusive(s: State) -> bool {
+    &&& Set::<int>::range_inclusive(3, 1).contains(1)
+    &&& !Set::<int>::range_inclusive(3, 1).contains(3)
+    &&& Set::<int>::range_inclusive(0, s.y).contains(s.y)
+}
+}
+"#;
+
+#[test]
+fn tla_export_keeps_a_disjunction_init_reaches() {
+    let ex = export_code(INIT_OR, "test_crate");
+    assert_eq!(ex.report["refusals"], serde_json::json!([]), "{}", ex.tla);
+    assert_eq!(ex.report["holes"], serde_json::json!([]), "{}", ex.tla);
+    assert!(ex.tla.contains("(x = 0) \\/ (x = 1)"), "{}", ex.tla);
+    assert!(ex.tla.contains("(IF (x = 0) THEN TRUE ELSE (x = 5))"), "{}", ex.tla);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let out = tlc_output(&jar, &ex.spec(), &ex.cfg);
+    assert!(out.contains("2 distinct states generated"), "{}", out);
+    let run = tlc(&jar, &ex.spec(), &ex.cfg);
+    assert_eq!(run.violated, Vec::<String>::new(), "{}", ex.tla);
+    // (0, 0), (1, 0) and (0, 1): the `x = 1` state takes no step.
+    assert_eq!(run.distinct, 3, "{run:?}\n{}", ex.tla);
+}
+
+/// A binder that is a field of a constructor in a membership guard ranges
+/// over that field of the members, through a nested constructor (with a
+/// tag test at each level of several variants), a tuple, and a map's keys.
+/// `wrong` holds of no member, so TLC must find it violated: the bound is
+/// not empty.
+const CTOR_FIELDS: &str = r#"
+use vstd::prelude::*;
+verus! {
+pub enum Inner { A { v: int }, B }
+pub enum Msg { Wrap { inner: Inner, t: (int, int) }, Other }
+
+pub struct State { pub net: Set<Msg>, pub m: Map<Msg, bool>, pub k: int }
+
+pub open spec fn init(s: State) -> bool {
+    &&& s.net == Set::<Msg>::empty().insert(Msg::Wrap { inner: Inner::A { v: 1 }, t: (2, 3) })
+        .insert(Msg::Wrap { inner: Inner::B, t: (7, 7) }).insert(Msg::Other)
+    &&& s.m == Map::<Msg, bool>::empty().insert(Msg::Wrap { inner: Inner::A { v: 4 }, t: (5, 6) }, true)
+    &&& s.k == 0
+}
+
+pub open spec fn next(pre: State, post: State) -> bool {
+    &&& pre.k < 2
+    &&& post == State { k: pre.k + 1, ..pre }
+}
+
+pub open spec fn nested(s: State) -> bool {
+    forall|v: int, a: int, b: int| #[trigger] s.net.contains(Msg::Wrap { inner: Inner::A { v }, t: (a, b) })
+        ==> v == 1 && a == 2 && b == 3
+}
+
+pub open spec fn keyed(s: State) -> bool {
+    forall|v: int, a: int, b: int| #[trigger] s.m.contains_key(Msg::Wrap { inner: Inner::A { v }, t: (a, b) })
+        ==> v == 4 && a + b == 11
+}
+
+pub open spec fn wrong(s: State) -> bool {
+    forall|v: int, a: int, b: int| #[trigger] s.net.contains(Msg::Wrap { inner: Inner::A { v }, t: (a, b) })
+        ==> v != 1
+}
+}
+"#;
+
+#[test]
+fn tla_export_bounds_a_nested_tuple_and_map_key_constructor_field() {
+    let ex = export_code(CTOR_FIELDS, "test_crate");
+    assert_eq!(ex.report["refusals"], serde_json::json!([]), "{}", ex.tla);
+    assert_eq!(ex.report["holes"], serde_json::json!([]), "{}", ex.tla);
+    assert!(ex.tla.contains(".inner.tag = \"A\""), "{}", ex.tla);
+    assert!(ex.tla.contains(".inner.v : m__"), "{}", ex.tla);
+    assert!(ex.tla.contains(".t[2] : m__"), "{}", ex.tla);
+    assert!(ex.tla.contains("\\in DOMAIN m : "), "{}", ex.tla);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let run = tlc(&jar, &ex.spec(), &ex.cfg);
+    // In each of the three states (`-continue`).
+    assert_eq!(run.violated, ["wrong", "wrong", "wrong"], "{}", ex.tla);
+    assert_eq!(run.distinct, 3, "{run:?}\n{}", ex.tla);
+}
+
+/// A disjunction over a value read in the post state keeps its `\/`, whose
+/// branches TLC assigns the primed variable from: through a helper given
+/// `post.x` (its own operator, whose parameter reads the post state), a
+/// `let` bound to `post.z`, and a match on `post.o`. The same helper given a
+/// pre-state value is evaluated. Nine states: the initial one, then two
+/// values of `x` and two of `z` after each of the two steps.
+const PRIMED_OR: &str = r#"
+use vstd::prelude::*;
+verus! {
+pub struct State { pub x: int, pub y: int, pub z: int, pub o: Option<int> }
+
+pub open spec fn init(s: State) -> bool {
+    &&& s.x == 0 &&& s.y == 0 &&& s.z == 0 &&& s.o == Option::<int>::None
+}
+
+pub open spec fn pick(v: int) -> bool { v == 0 || v == 1 }
+
+pub open spec fn next(pre: State, post: State) -> bool {
+    &&& pre.y < 2
+    &&& pick(pre.x)
+    &&& post.y == pre.y + 1
+    &&& post.o == Option::<int>::Some(pre.y)
+    &&& pick(post.x)
+    &&& { let h = post.z; h == 0 || h == 2 }
+    &&& match post.o { Option::Some(v) => v == 0 || v >= 1, Option::None => false }
+}
+
+pub open spec fn small(s: State) -> bool { s.x <= 1 && s.z <= 2 }
+}
+"#;
+
+#[test]
+fn tla_export_keeps_a_disjunction_over_the_post_state() {
+    let ex = export_code(PRIMED_OR, "test_crate");
+    assert_eq!(ex.report["refusals"], serde_json::json!([]), "{}", ex.tla);
+    assert_eq!(ex.report["holes"], serde_json::json!([]), "{}", ex.tla);
+    assert!(ex.tla.contains("pick(v) ==\n    (IF (v = 0) THEN TRUE ELSE (v = 1))"), "{}", ex.tla);
+    assert!(ex.tla.contains("pick_postarg(v) ==\n    ((v = 0) \\/ (v = 1))"), "{}", ex.tla);
+    assert!(ex.tla.contains("pick(x)"), "{}", ex.tla);
+    assert!(ex.tla.contains("pick_postarg(x')"), "{}", ex.tla);
+    assert!(ex.tla.contains("((h = 0) \\/ (h = 2))"), "{}", ex.tla);
+    assert!(ex.tla.contains("((v = 0) \\/ (v >= 1))"), "{}", ex.tla);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let run = tlc(&jar, &ex.spec(), &ex.cfg);
+    assert_eq!(run.violated, Vec::<String>::new(), "{}", ex.tla);
+    assert_eq!(run.distinct, 9, "{run:?}\n{}", ex.tla);
+}
+
+/// A closure, or a record of closures, that captures the post state reads
+/// it: a disjunction of its applications keeps its `\/`, whose branches
+/// assign `x'`. From `y = 0` the steps take `x` to `y` or `y + 10`.
+const CLOSURE_OR: &str = r#"
+use vstd::prelude::*;
+verus! {
+pub struct State { pub x: int, pub y: int }
+
+pub struct Pair { pub f: spec_fn(int) -> bool }
+
+pub open spec fn init(s: State) -> bool { s.x == 0 && s.y == 0 }
+
+pub open spec fn next(pre: State, post: State) -> bool {
+    let f = |v: int| post.x == v;
+    let p = Pair { f: |v: int| post.x == v };
+    &&& pre.y < 3
+    &&& post.y == pre.y + 1
+    &&& (f(pre.y) || f(pre.y + 10))
+    &&& ((p.f)(pre.y) || (p.f)(pre.y + 10))
+}
+
+pub open spec fn small(s: State) -> bool { s.y <= 3 }
+}
+"#;
+
+#[test]
+fn tla_export_keeps_a_disjunction_over_a_closure_reading_the_post_state() {
+    let ex = export_code(CLOSURE_OR, "test_crate");
+    assert_eq!(ex.report["refusals"], serde_json::json!([]), "{}", ex.tla);
+    assert_eq!(ex.report["holes"], serde_json::json!([]), "{}", ex.tla);
+    assert!(!ex.tla.contains("IF (LET"), "{}", ex.tla);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let run = tlc(&jar, &ex.spec(), &ex.cfg);
+    assert_eq!(run.violated, Vec::<String>::new(), "{}", ex.tla);
+    // (0,0); then x in {y, y+10} for y = 1..3 after each step: 1 + 2 + 2 + 2.
+    assert_eq!(run.distinct, 7, "{run:?}\n{}", ex.tla);
+}
+
+/// A step field whose guard reads the step value itself (`b < size(step)`)
+/// is not bounded from it: the domain sits outside the `LET` binding the
+/// step. It is bounded by its type (`u8`) instead, in the callee's match and
+/// in a match written inline in the `exists`. `x` runs 0..6.
+const STEP_GUARD: &str = r#"
+use vstd::prelude::*;
+verus! {
+pub struct State { pub x: int }
+
+pub enum Step { A { b: u8 }, B { c: int } }
+
+pub open spec fn size(s: Step) -> int { match s { Step::A { .. } => 3, Step::B { .. } => 2 } }
+
+pub open spec fn init(s: State) -> bool { s.x == 0 }
+
+pub open spec fn next_step(pre: State, post: State, step: Step) -> bool {
+    match step {
+        Step::A { b } => b < size(step) && pre.x < 5 && post.x == pre.x + b,
+        Step::B { c } => 0 <= c < 2 && pre.x < 5 && post.x == pre.x + c,
+    }
+}
+
+pub open spec fn next(pre: State, post: State) -> bool {
+    ||| exists|step: Step| next_step(pre, post, step)
+    ||| exists|st: Step| #![trigger size(st)] match st {
+        Step::A { b } => b < size(st) && pre.x < 4 && post.x == pre.x + b,
+        Step::B { c } => 0 <= c < 2 && pre.x < 4 && post.x == pre.x + c,
+    }
+}
+
+pub open spec fn small(s: State) -> bool { s.x <= 6 }
+}
+"#;
+
+#[test]
+fn tla_export_bounds_a_step_field_whose_guard_reads_the_step() {
+    let ex = export_code(STEP_GUARD, "test_crate");
+    assert_eq!(ex.report["refusals"], serde_json::json!([]), "{}", ex.tla);
+    assert_eq!(ex.report["holes"], serde_json::json!([]), "{}", ex.tla);
+    assert!(!ex.tla.contains("(size(step)) - 1"), "{}", ex.tla);
+    assert!(!ex.tla.contains("(size(st)) - 1"), "{}", ex.tla);
+    assert!(ex.tla.contains("\\E b__ \\in 0..255 : (LET step =="), "{}", ex.tla);
+    assert!(ex.tla.contains("\\in 0..255 : (LET st =="), "{}", ex.tla);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let run = tlc(&jar, &ex.spec(), &ex.cfg);
+    assert_eq!(run.violated, Vec::<String>::new(), "{}", ex.tla);
+    assert_eq!(run.distinct, 7, "{run:?}\n{}", ex.tla);
 }
