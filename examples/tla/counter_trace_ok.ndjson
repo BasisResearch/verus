@@ -1,0 +1,6 @@
+{"module": "State_tla", "export": "test_crate", "state": {"x": 0, "y": 0}}
+{"step": "t_inc", "params": {}, "state": {"x": 1, "y": 0}}
+{"step": "t_inc", "params": {}, "state": {"x": 2, "y": 0}}
+{"step": "t_dbl", "params": {}, "state": {"x": 2, "y": 2}}
+{"step": "t_inc", "params": {}, "state": {"x": 3}}
+{"step": "t_dbl", "params": {}, "state": {"x": 3, "y": 4}}

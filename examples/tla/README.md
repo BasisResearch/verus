@@ -200,6 +200,94 @@ conjunct order, so a `v'` read before the conjunct that assigns it (which
 stops TLC) is not reported; and it does not count `v' \in S`, so a
 transition assigning that way is reported although TLC can enumerate it.
 
+## Trace validation
+
+Beside every export the flag writes a trace spec, `<State>_tla_trace.tla`
+with a `.cfg` skeleton, which `EXTENDS` the export and follows one logged
+behaviour of an implementation (the report's `trace` lists its steps and
+observable fields). The log is newline-delimited JSON: a header line naming
+the module and the export, the module path given to `-V tla-export`
+(`{"module": "State_tla", "export": "counter"}` for `counter.rs` exported as
+`counter`), optionally with `"state"`, the observed initial state (a header
+naming another module or another export stops TLC, since exports whose
+states share a name share a module name); then one line per step,
+`{"step": "t_inc", "params": {...}, "state": {...}}`, naming a transition (a
+spec fn given the post state) Next reaches through its branches: a step, or
+a helper a step branches into; one Next conjoins when it branches into steps
+itself or is the only transition Next conjoins (`next = t_step`); a guard on
+the pre state or on a value is never a step. It is named by its last
+segment, or its full path; only the full path when two steps share the last
+segment, which the report marks `short_name_shared`. Then its parameters
+other than the pre and post states by
+their Rust names (a name the step does not declare stops TLC), and the
+observed state after the step by field. Values are in the export's encoding:
+a struct or enum value is an object (an enum's with its `"tag"`), an `Option`
+`{"tag": "Some", "v0": 3}`, a `Seq` or tuple an array, a `Set` an array of
+its elements, a `Map` an array of `[key, value]` pairs, a struct without
+fields `{}` (the export's `[tag |-> "unit"]`, so `{"tag": "unit"}` too). An object observed in
+the state is partial: only the fields it names are compared, so a ghost field
+is left out of the log and stays free in the model (an enum's `"tag"` too: its
+fields are then compared under whichever variant the model has, and a field
+that variant lacks does not match, while a key naming no field of the type
+stops TLC, as one naming no state field does); a `Seq` can be observed
+partially as an object keyed by the Verus index (`{"1": {...}}`, and `{}`
+observes nothing, while `[]` is the empty `Seq`; a key that is no index
+stops TLC). A key a log line or the header does not define (`"stat"` for
+`"state"`) stops TLC too, so a misspelling never observes nothing. A record
+inside a `Set` element, a `Map` key or a parameter is decoded whole, so it
+must name every field, and an enum value its tag; one left out there stops
+TLC. A parameter left out of `"params"` ranges over what `Next`'s calls to
+the step pass it: the bound of the quantifier binding the argument
+(`exists|n: u64| n < 3 && t_go(pre, post, n)` gives `0..2`), or the field of
+a value matched against a constructor pattern, whatever the parameter's
+position (a VerusSync step's `Dom_Step_<t>_v<i>`, a hole of the field's own
+type), the union over every call; else its type's finite domain (a `bool`,
+a `u8`). Never the export's `Dom_<Type>` hole: it holds only what a
+quantifier binds, not a value a call computes. With neither (a call passes
+`pre.x + 5` to an `int`) it must be logged, and `TraceEnabled` leaves the
+step out: the report's trace step has `"enumerated": false`. A logged
+parameter is narrowed to its domain, so a value outside it is a step the
+model cannot take. The verus-tla shape has one step, `next`, since its `Next` is not
+split into named transitions.
+
+`TraceNext` conjoins `Next` and then the logged step (so it only ever
+narrows the model, and the step reads the successor `Next` has assigned) and compares the observed fields in the successor. TLC run on it
+(`INIT TraceInit`, `NEXT TraceNext`, `CONSTANT TraceLog = "<log path>"`)
+ends without error on a well-formed log either way (the export's hole
+constants, such as `Dom_Step_add_v0`, go in its `.cfg` too): the log conforms when the depth of the search
+is the number of logged steps plus one (`TraceAccepted`); otherwise the
+deepest `trace_i` is the first step no model behaviour explaining the log so
+far can take. Depth 0 (TLC generates no initial state) means the header's
+observed state is not an initial state of the model: the log diverges
+before its first step. At a diverging step, `TraceEnabled` is the set of the model's enabled steps
+with their parameters, and `TraceDiagnosis` says whether the logged step is
+enabled at all and which observed fields no successor by it matches.
+
+**A pass means the observed state sequence is a behaviour of the model.**
+The logged step's name and parameters count only through their effect on
+the observed state: `TraceNext` requires a successor that both `Next` and the
+logged step allow, not that `Next` took it by that step. So a step another
+of `Next`'s steps explains is accepted. With `next` either
+`exists|n: int| t_set(pre, post, n)` or `pre.x < 10 && t_jump(pre, post, pre.x + 5)`,
+logging `t_jump` with `to` 0 from `x` 0, `y` 0 is followed, since `t_set(0)`
+reaches the same state, though the model's `t_jump` only ever passes
+`pre.x + 5`. Restricting `Next` to the logged step's call sites is future
+work.
+
+**The `Dom_` constants must cover every value the log carries.** Since
+`TraceNext` conjoins `Next`, and `Next` takes a step's arguments only from
+the export's holes (a VerusSync step's `Dom_Step_<t>_v<i>`, a `Dom_<Type>`
+bound), a logged parameter or observed value outside the hole the `.cfg`
+gives is a divergence, not a malformed log: TLC stops there, and
+`TraceDiagnosis` only says the step is not enabled. Give each hole in the
+trace `.cfg` at least the values the log carries (the generated header and
+`.cfg` say so too).
+`counter_trace_ok.ndjson` and `counter_trace_bad.ndjson` name the export
+`test_crate`, as the tests export `counter.rs`. The first is followed to its
+end (depth 6);
+the second logs `t_dbl` where the counter took `t_inc`, and TLC stops at its fourth step, with `t_dbl` enabled but `x` unmatched.
+`tlc_conform` in verus-tools-mcp runs this and answers the verdict.
+
 `rust_verify_test/tests/tla_export.rs` exports the five fixtures (as crate
 `test_crate`, so the modules are `test_crate`, `test_crate::Adder`,
 `test_crate::Toggle`, `test_crate::Guarded` and `test_crate`) and checks the reports. With `TLA2TOOLS_JAR` naming a
