@@ -2210,7 +2210,9 @@ impl Exporter {
                 if op == "set_range" {
                     format!("({lo})..(({hi}) - 1)")
                 } else {
-                    format!("({lo})..({hi})")
+                    // vstd's `range_set(lo, hi).insert(hi)`: `hi` even when
+                    // it is below `lo`.
+                    format!("(({lo})..({hi}) \\cup {{{hi}}})")
                 }
             }
             "set_range" | "set_range_inclusive" => {
@@ -2370,22 +2372,36 @@ impl Exporter {
                     (f.name.clone(), t)
                 })
                 .collect();
-            // The guarded expression each field is a parameter of.
-            let site = arms.iter().find_map(|arm| {
-                let PatternX::Constructor(_, v, pbinders) = &arm.x.pattern.x else { return None };
-                if v != &variant.name
-                    || !matches!(arm.x.guard.x, ExprX::Const(Constant::Bool(true)))
-                {
-                    return None;
-                }
-                let mut vars: HashMap<Ident, VarIdent> = HashMap::new();
-                for b in pbinders.iter() {
-                    if let PatternX::Var(PatternBinding { name, .. }) = &b.a.x {
-                        vars.insert(b.name.clone(), name.clone());
+            // The guarded expression each field is a parameter of: the body
+            // of the first arm that could match the variant, when that arm
+            // takes every value of it (unguarded, the variant's constructor,
+            // and each field a plain binding or `_`). An arm that takes only
+            // some (`S { a: true, b }`, `S { b, .. } if b > 0`) leaves the
+            // rest to later arms, whose guards may admit more.
+            let site = arms
+                .iter()
+                .find(|arm| pattern_could_match(&arm.x.pattern, &variant.name))
+                .and_then(|arm| {
+                    let PatternX::Constructor(_, v, pbinders) = &arm.x.pattern.x else {
+                        return None;
+                    };
+                    if v != &variant.name
+                        || !matches!(arm.x.guard.x, ExprX::Const(Constant::Bool(true)))
+                    {
+                        return None;
                     }
-                }
-                Some((vars, arm.x.body.clone()))
-            });
+                    let mut vars: HashMap<Ident, VarIdent> = HashMap::new();
+                    for b in pbinders.iter() {
+                        match &b.a.x {
+                            PatternX::Var(PatternBinding { name, .. }) => {
+                                vars.insert(b.name.clone(), name.clone());
+                            }
+                            PatternX::Wildcard(_) => {}
+                            _ => return None,
+                        }
+                    }
+                    Some((vars, arm.x.body.clone()))
+                });
             let names: Vec<String> =
                 fields.iter().map(|(f, _)| self.bind(&format!("{}__", field_name(f)))).collect();
             let mut record = Vec::new();
@@ -3829,6 +3845,18 @@ fn reached_functions(functions: &HashMap<Fun, Function>, root: &Fun) -> HashSet<
         });
     }
     seen
+}
+
+/// Whether a pattern could match a value built by `variant`: only a
+/// constructor of another variant is sure not to.
+fn pattern_could_match(p: &Pattern, variant: &Ident) -> bool {
+    match &p.x {
+        PatternX::Constructor(_, v, _) => v == variant,
+        PatternX::Binding { sub_pat, .. } => pattern_could_match(sub_pat, variant),
+        PatternX::Or(a, b) => pattern_could_match(a, variant) || pattern_could_match(b, variant),
+        PatternX::MutRef(inner) | PatternX::ImmutRef(inner) => pattern_could_match(inner, variant),
+        PatternX::Wildcard(_) | PatternX::Var(_) | PatternX::Expr(_) | PatternX::Range(..) => true,
+    }
 }
 
 /// Whether a pattern binds a name anywhere in it.

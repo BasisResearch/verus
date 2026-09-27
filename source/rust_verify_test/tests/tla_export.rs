@@ -2987,3 +2987,173 @@ fn tla_export_bounds_message_fields_and_step_fields_from_their_guards() {
     assert_eq!(run.violated, Vec::<String>::new(), "{}", ex.tla);
     assert_eq!(run.distinct, 144, "{run:?}\n{}", ex.tla);
 }
+
+/// Step fields are bounded from the guard of the arm a variant's values
+/// take, and only when that arm takes all of them: the first arm that could
+/// match the variant, unguarded, and binding each field plainly. Here an arm
+/// refuting a field (`R { a: true, b }`), a guarded arm (`G { b } if b > 0`)
+/// and a guarded wildcard each leave some values to a later arm, whose
+/// guard (`b < 1`, `b < 0`) would drop `x = 21, 22, 31, 32, 50`. The nine
+/// states are 0 and the eight values the arms reach (`t60` is unreachable).
+const ARMS: &str = r#"
+use vstd::prelude::*;
+verus! {
+pub struct State { pub x: int }
+
+pub open spec fn init(s: State) -> bool { s.x == 0 }
+
+pub open spec fn t10(pre: State, post: State, b: u8) -> bool {
+    &&& b < 1 &&& pre.x == 0 &&& post == State { x: 10 + b }
+}
+pub open spec fn t20(pre: State, post: State, b: u8) -> bool {
+    &&& b < 3 &&& pre.x == 0 &&& post == State { x: 20 + b }
+}
+pub open spec fn t30(pre: State, post: State, b: u8) -> bool {
+    &&& b < 3 &&& pre.x == 0 &&& post == State { x: 30 + b }
+}
+pub open spec fn t40(pre: State, post: State, b: u8) -> bool {
+    &&& b < 1 &&& pre.x == 0 &&& post == State { x: 40 + b }
+}
+pub open spec fn t60(pre: State, post: State, b: u8) -> bool {
+    &&& b < 0 &&& pre.x == 0 &&& post == State { x: 60 + b }
+}
+
+pub enum Step { R { a: bool, b: u8 }, G { b: u8 }, W { b: u8 } }
+
+pub open spec fn next_step(pre: State, post: State, step: Step) -> bool {
+    match step {
+        Step::R { a: true, b } => t10(pre, post, b),
+        Step::R { a, b } => t20(pre, post, b),
+        Step::G { b } if b > 0 => t30(pre, post, b),
+        Step::G { b } => t40(pre, post, b),
+        _ if step is W => pre.x == 0 && post == State { x: 50 },
+        Step::W { b } => t60(pre, post, b),
+    }
+}
+
+pub open spec fn next(pre: State, post: State) -> bool {
+    exists|step: Step| next_step(pre, post, step)
+}
+
+pub open spec fn small(s: State) -> bool { s.x <= 60 }
+}
+"#;
+
+#[test]
+fn tla_export_bounds_a_step_field_only_from_an_arm_taking_every_value() {
+    let ex = export_code(ARMS, "test_crate");
+    assert_eq!(ex.report["refusals"], serde_json::json!([]), "{}", ex.tla);
+    assert_eq!(ex.report["holes"], serde_json::json!([]), "{}", ex.tla);
+    // Each variant's `b` is read off its type: no arm bounds it alone.
+    assert!(!ex.tla.contains("\\in 0..(1) - 1"), "{}", ex.tla);
+    assert!(!ex.tla.contains("\\in 0..(0) - 1"), "{}", ex.tla);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let run = tlc(&jar, &ex.spec(), &ex.cfg);
+    assert_eq!(run.violated, Vec::<String>::new(), "{}", ex.tla);
+    assert_eq!(run.distinct, 9, "{run:?}\n{}", ex.tla);
+}
+
+/// A disjunction Init reaches keeps its `\/`, which TLC branches on to
+/// assign the state (two initial states), while the same disjunction in an
+/// action is evaluated. `Set::range_inclusive(lo, hi)` holds `hi` even below
+/// `lo`, as vstd's `range_set(lo, hi).insert(hi)` does.
+const INIT_OR: &str = r#"
+use vstd::prelude::*;
+verus! {
+pub struct State { pub x: int, pub y: int }
+
+pub open spec fn init(s: State) -> bool {
+    &&& s.x == 0 || s.x == 1
+    &&& s.y == 0
+}
+
+pub open spec fn next(pre: State, post: State) -> bool {
+    &&& pre.x == 0 || pre.x == 5
+    &&& pre.y < 1
+    &&& post == State { y: pre.y + 1, ..pre }
+}
+
+pub open spec fn inclusive(s: State) -> bool {
+    &&& Set::<int>::range_inclusive(3, 1).contains(1)
+    &&& !Set::<int>::range_inclusive(3, 1).contains(3)
+    &&& Set::<int>::range_inclusive(0, s.y).contains(s.y)
+}
+}
+"#;
+
+#[test]
+fn tla_export_keeps_a_disjunction_init_reaches() {
+    let ex = export_code(INIT_OR, "test_crate");
+    assert_eq!(ex.report["refusals"], serde_json::json!([]), "{}", ex.tla);
+    assert_eq!(ex.report["holes"], serde_json::json!([]), "{}", ex.tla);
+    assert!(ex.tla.contains("(x = 0) \\/ (x = 1)"), "{}", ex.tla);
+    assert!(ex.tla.contains("(IF (x = 0) THEN TRUE ELSE (x = 5))"), "{}", ex.tla);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let out = tlc_output(&jar, &ex.spec(), &ex.cfg);
+    assert!(out.contains("2 distinct states generated"), "{}", out);
+    let run = tlc(&jar, &ex.spec(), &ex.cfg);
+    assert_eq!(run.violated, Vec::<String>::new(), "{}", ex.tla);
+    // (0, 0), (1, 0) and (0, 1): the `x = 1` state takes no step.
+    assert_eq!(run.distinct, 3, "{run:?}\n{}", ex.tla);
+}
+
+/// A binder that is a field of a constructor in a membership guard ranges
+/// over that field of the members, through a nested constructor (with a
+/// tag test at each level of several variants), a tuple, and a map's keys.
+/// `wrong` holds of no member, so TLC must find it violated: the bound is
+/// not empty.
+const CTOR_FIELDS: &str = r#"
+use vstd::prelude::*;
+verus! {
+pub enum Inner { A { v: int }, B }
+pub enum Msg { Wrap { inner: Inner, t: (int, int) }, Other }
+
+pub struct State { pub net: Set<Msg>, pub m: Map<Msg, bool>, pub k: int }
+
+pub open spec fn init(s: State) -> bool {
+    &&& s.net == Set::<Msg>::empty().insert(Msg::Wrap { inner: Inner::A { v: 1 }, t: (2, 3) })
+        .insert(Msg::Wrap { inner: Inner::B, t: (7, 7) }).insert(Msg::Other)
+    &&& s.m == Map::<Msg, bool>::empty().insert(Msg::Wrap { inner: Inner::A { v: 4 }, t: (5, 6) }, true)
+    &&& s.k == 0
+}
+
+pub open spec fn next(pre: State, post: State) -> bool {
+    &&& pre.k < 2
+    &&& post == State { k: pre.k + 1, ..pre }
+}
+
+pub open spec fn nested(s: State) -> bool {
+    forall|v: int, a: int, b: int| #[trigger] s.net.contains(Msg::Wrap { inner: Inner::A { v }, t: (a, b) })
+        ==> v == 1 && a == 2 && b == 3
+}
+
+pub open spec fn keyed(s: State) -> bool {
+    forall|v: int, a: int, b: int| #[trigger] s.m.contains_key(Msg::Wrap { inner: Inner::A { v }, t: (a, b) })
+        ==> v == 4 && a + b == 11
+}
+
+pub open spec fn wrong(s: State) -> bool {
+    forall|v: int, a: int, b: int| #[trigger] s.net.contains(Msg::Wrap { inner: Inner::A { v }, t: (a, b) })
+        ==> v != 1
+}
+}
+"#;
+
+#[test]
+fn tla_export_bounds_a_nested_tuple_and_map_key_constructor_field() {
+    let ex = export_code(CTOR_FIELDS, "test_crate");
+    assert_eq!(ex.report["refusals"], serde_json::json!([]), "{}", ex.tla);
+    assert_eq!(ex.report["holes"], serde_json::json!([]), "{}", ex.tla);
+    assert!(ex.tla.contains(".inner.tag = \"A\""), "{}", ex.tla);
+    assert!(ex.tla.contains(".inner.v : m__"), "{}", ex.tla);
+    assert!(ex.tla.contains(".t[2] : m__"), "{}", ex.tla);
+    assert!(ex.tla.contains("\\in DOMAIN m : "), "{}", ex.tla);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let run = tlc(&jar, &ex.spec(), &ex.cfg);
+    // In each of the three states (`-continue`).
+    assert_eq!(run.violated, ["wrong", "wrong", "wrong"], "{}", ex.tla);
+    assert_eq!(run.distinct, 3, "{run:?}\n{}", ex.tla);
+}
