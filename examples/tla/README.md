@@ -225,15 +225,22 @@ a struct or enum value is an object (an enum's with its `"tag"`), an `Option`
 `{"tag": "Some", "v0": 3}`, a `Seq` or tuple an array, a `Set` an array of
 its elements, a `Map` an array of `[key, value]` pairs. An object observed in
 the state is partial: only the fields it names are compared, so a ghost field
-is left out of the log and stays free in the model; a `Seq` can be observed
+is left out of the log and stays free in the model (an enum's `"tag"` too: its
+fields are then compared under whichever variant the model has, and a field
+that variant lacks does not match); a `Seq` can be observed
 partially as an object keyed by the Verus index (`{"1": {...}}`, and `{}`
 observes nothing, while `[]` is the empty `Seq`). A record
 inside a `Set` element, a `Map` key or a parameter is decoded whole, so it
-must name every field; a field left out there stops TLC. A parameter left
-out of `"params"` ranges over the hole constant bounding it in `Next` (a
-VerusSync step's `Dom_Step_<t>_v<i>`), else its type's finite domain (a
-`bool`, a `u8`) or the export's `Dom_<Type>` hole; with none of these it must
-be logged. The verus-tla shape has one step, `next`, since its `Next` is not
+must name every field, and an enum value its tag; one left out there stops
+TLC. A parameter left out of `"params"` ranges over what `Next`'s calls to
+the step pass it: the bound of the quantifier binding the argument
+(`exists|n: u64| n < 3 && t_go(pre, post, n)` gives `0..2`), or the field of
+a value matched against a constructor pattern, whatever the parameter's
+position (a VerusSync step's `Dom_Step_<t>_v<i>`, a hole of the field's own
+type), the union over every call; else its type's finite domain (a `bool`,
+a `u8`) or the export's `Dom_<Type>` hole. With none of these (a call passes
+`pre.x + 5`) it must be logged, and `TraceEnabled` leaves the step out: the
+report's trace step has `"enumerated": false`. The verus-tla shape has one step, `next`, since its `Next` is not
 split into named transitions.
 
 `TraceNext` conjoins `Next` and then the logged step (so it only ever
@@ -243,7 +250,9 @@ ends without error on a well-formed log either way (the export's hole
 constants, such as `Dom_Step_add_v0`, go in its `.cfg` too): the log conforms when the depth of the search
 is the number of logged steps plus one (`TraceAccepted`); otherwise the
 deepest `trace_i` is the first step no model behaviour explaining the log so
-far can take. There, `TraceEnabled` is the set of the model's enabled steps
+far can take. Depth 0 (TLC generates no initial state) means the header's
+observed state is not an initial state of the model: the log diverges
+before its first step. At a diverging step, `TraceEnabled` is the set of the model's enabled steps
 with their parameters, and `TraceDiagnosis` says whether the logged step is
 enabled at all and which observed fields no successor by it matches.
 `counter_trace_ok.ndjson` and `counter_trace_bad.ndjson` name the export

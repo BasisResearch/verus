@@ -2942,11 +2942,12 @@ fn tla_export_trace_spec_follows_a_counter_log() {
             {"step": "next_step", "function": "test_crate::next_step", "operator": "next_step",
              "short_name_shared": false,
              "params": [{"name": "step", "typ": "Step",
-                         "domain": "({[tag |-> \"Inc\"]} \\cup {[tag |-> \"Dbl\"]})"}]},
+                         "domain": "({[tag |-> \"Inc\"]} \\cup {[tag |-> \"Dbl\"]})"}],
+             "enumerated": true},
             {"step": "t_dbl", "function": "test_crate::t_dbl", "operator": "t_dbl",
-             "short_name_shared": false, "params": []},
+             "short_name_shared": false, "params": [], "enumerated": true},
             {"step": "t_inc", "function": "test_crate::t_inc", "operator": "t_inc",
-             "short_name_shared": false, "params": []},
+             "short_name_shared": false, "params": [], "enumerated": true},
         ])
     );
     let (spec, tla, cfg) = trace_spec(&ex);
@@ -3180,20 +3181,23 @@ pub open spec fn next(pre: State, post: State) -> bool {
 #[test]
 fn tla_export_trace_spec_follows_a_verussync_log() {
     let ex = export(&fixture("adder_sync.rs"), "test_crate::Adder");
-    // `add(v: int)`: `v` is the `Step::add` field Next bounds by the hole
-    // `Dom_Step_add_v0`, so a log may leave it out.
-    // `next_by`, the dispatch on `Step`, is loggable too, with its `Step`
-    // (which holds an int) logged.
+    // `add(v: int)`: `v` is the field of the `Step::add` Next matches, which
+    // its `exists` bounds by the hole `Dom_Step_add_v0`, so a log may leave
+    // it out. `next_by`, the dispatch on `Step`, is loggable too, its `Step`
+    // ranging over the bound of that `exists`.
     assert_eq!(
         ex.report["trace"]["steps"],
         serde_json::json!([{
             "step": "add", "function": "test_crate::Adder::State::add", "operator": "add",
             "short_name_shared": false,
             "params": [{"name": "v", "typ": "int", "domain": "Dom_Step_add_v0"}],
+            "enumerated": true,
         }, {
             "step": "next_by", "function": "test_crate::Adder::State::next_by",
             "operator": "next_by", "short_name_shared": false,
-            "params": [{"name": "step", "typ": "Step", "domain": null}],
+            "params": [{"name": "step", "typ": "Step",
+                        "domain": "({[tag |-> \"add\", v0 |-> v0__] : v0__ \\in Dom_Step_add_v0})"}],
+            "enumerated": true,
         }])
     );
     let (spec, tla, cfg) = trace_spec(&ex);
@@ -3210,7 +3214,8 @@ fn tla_export_trace_spec_follows_a_verussync_log() {
     let (depth, out) = follow(&jar, &spec, &cfg, &log, constants);
     assert_eq!(depth, 3, "{out}");
     // With `v` left out, the model's enabled steps enumerate it over the
-    // hole; x going 2 to 7 is no `v` in it, so TLC stops at that step.
+    // hole (and `next_by`'s `Step` over the records holding it); x going 2
+    // to 7 is no `v` in it, so TLC stops at that step.
     std::fs::write(&log, lines[..2].join("\n") + "\n" + &lines[2].replace("\"x\": 3", "\"x\": 7"))
         .unwrap();
     let spec_probe = spec.with_file_name("Probe_trace.tla");
@@ -3227,7 +3232,7 @@ fn tla_export_trace_spec_follows_a_verussync_log() {
     assert_eq!(depth, 2, "{out}");
     assert!(
         out.contains(
-            "<<\"probe\", {[params |-> [v |-> 0], step |-> \"add\"], [params |-> [v |-> 1], step |-> \"add\"], [params |-> [v |-> 2], step |-> \"add\"]}, [step_enabled |-> TRUE, unmatched |-> {\"x\"}]>>"
+            "<<\"probe\", {[params |-> [step |-> [tag |-> \"add\", v0 |-> 0]], step |-> \"next_by\"], [params |-> [step |-> [tag |-> \"add\", v0 |-> 1]], step |-> \"next_by\"], [params |-> [step |-> [tag |-> \"add\", v0 |-> 2]], step |-> \"next_by\"], [params |-> [v |-> 0], step |-> \"add\"], [params |-> [v |-> 1], step |-> \"add\"], [params |-> [v |-> 2], step |-> \"add\"]}, [step_enabled |-> TRUE, unmatched |-> {\"x\"}]>>"
         ), "{}", out);
 }
 
@@ -3461,4 +3466,223 @@ fn tla_export_trace_spec_follows_a_verus_tla_log() {
         let (depth, out) = follow(&jar, &spec, &cfg, &log, "");
         assert_eq!(depth, 1, "{to}\n{out}");
     }
+}
+
+/// A step parameter ranges over the field of the `Step` value Next matches,
+/// whatever position the parameter takes: `Step::t_set(f, n)` passes its
+/// fields to `t_set(n, f)` swapped. `n` (an int) ranges over the hole
+/// `Dom_Step_t_set_v1` of its own type, and `f` over the booleans, never
+/// the other's field.
+#[test]
+fn tla_export_trace_spec_takes_a_parameter_domain_from_the_match() {
+    let ex = export_code(
+        r#"
+use vstd::prelude::*;
+verus! {
+pub struct State { pub x: int, pub b: bool }
+pub enum Step { t_set(bool, int), t_nop }
+pub open spec fn init(s: State) -> bool { s.x == 0 && !s.b }
+pub open spec fn t_set(pre: State, post: State, n: int, f: bool) -> bool {
+    post.x == n && post.b == f
+}
+pub open spec fn t_nop(pre: State, post: State) -> bool { post == pre }
+pub open spec fn next_step(pre: State, post: State, step: Step) -> bool {
+    match step {
+        Step::t_set(f, n) => t_set(pre, post, n, f),
+        Step::t_nop => t_nop(pre, post),
+    }
+}
+pub open spec fn next(pre: State, post: State) -> bool { exists|s: Step| next_step(pre, post, s) }
+}
+"#,
+        "test_crate",
+    );
+    let steps = ex.report["trace"]["steps"].as_array().unwrap();
+    let t_set = steps.iter().find(|s| s["step"] == "t_set").unwrap();
+    assert_eq!(t_set["params"][0]["name"], "n");
+    assert_eq!(t_set["params"][0]["domain"], "Dom_Step_t_set_v1", "{}", t_set);
+    assert_eq!(t_set["params"][1]["name"], "f");
+    let f_domain = t_set["params"][1]["domain"].as_str().unwrap();
+    // The booleans, as the `v0` fields of the `Step::t_set` values Next
+    // ranges over (never the int hole of `v1`).
+    assert!(f_domain.starts_with("{s__.v0 : s__ \\in "), "{}", t_set);
+    assert_eq!(t_set["enumerated"], true);
+    let (spec, _, cfg) = trace_spec(&ex);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &spec);
+    let constants = "CONSTANTS Dom_Step_t_set_v1 = {2, 7}\n";
+    let log = ex.dir.path().join("t.ndjson");
+    let lines = [
+        r#"{"module": "State_tla", "export": "test_crate", "state": {"x": 0, "b": false}}"#,
+        r#"{"step": "t_set", "params": {"n": 7}, "state": {"x": 7, "b": true}}"#,
+        r#"{"step": "t_set", "state": {"x": 2, "b": false}}"#,
+    ];
+    // `f` left out ranges over the booleans, then both over their fields.
+    std::fs::write(&log, lines.join("\n") + "\n").unwrap();
+    let (depth, out) = follow(&jar, &spec, &cfg, &log, constants);
+    assert_eq!(depth, 3, "{}", out);
+    // x = 5 is no `n` in the hole: the second step stops the log.
+    std::fs::write(&log, lines[..2].join("\n") + "\n" + &lines[2].replace("\"x\": 2", "\"x\": 5"))
+        .unwrap();
+    let (depth, out) = follow(&jar, &spec, &cfg, &log, constants);
+    assert_eq!(depth, 2, "{}", out);
+}
+
+/// A parameter Next binds with a quantifier ranges over the bound Next
+/// gives it (`exists|n: u64| n < 3 && ...`, `0..2`), which its type alone
+/// (`u64`) would not give; a parameter passed a value of no known domain
+/// must be logged, and the report says `TraceEnabled` leaves its step out.
+#[test]
+fn tla_export_trace_spec_takes_a_parameter_domain_from_a_quantifier() {
+    let ex = export_code(
+        r#"
+use vstd::prelude::*;
+verus! {
+pub struct State { pub x: u64 }
+pub open spec fn init(s: State) -> bool { s.x == 0 }
+pub open spec fn t_go(pre: State, post: State, n: u64) -> bool { post.x == pre.x + n }
+pub open spec fn t_jump(pre: State, post: State, to: int) -> bool { post.x == to }
+pub open spec fn next(pre: State, post: State) -> bool {
+    ||| exists|n: u64| n < 3 && t_go(pre, post, n)
+    ||| pre.x < 10 && t_jump(pre, post, pre.x + 5)
+}
+}
+"#,
+        "test_crate",
+    );
+    let steps = ex.report["trace"]["steps"].as_array().unwrap();
+    let step = |name: &str| steps.iter().find(|s| s["step"] == name).unwrap().clone();
+    let (t_go, t_jump) = (step("t_go"), step("t_jump"));
+    assert_eq!(t_go["params"][0]["domain"], "0..(3) - 1", "{t_go}");
+    assert_eq!(t_go["enumerated"], true);
+    assert_eq!(t_jump["params"][0]["domain"], serde_json::Value::Null, "{t_jump}");
+    assert_eq!(t_jump["enumerated"], false);
+    let (spec, tla, cfg) = trace_spec(&ex);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &spec);
+    let log = ex.dir.path().join("t.ndjson");
+    let lines = [
+        r#"{"module": "State_tla", "export": "test_crate", "state": {"x": 0}}"#,
+        r#"{"step": "t_go", "state": {"x": 2}}"#,
+        r#"{"step": "t_jump", "params": {"to": 7}, "state": {"x": 7}}"#,
+    ];
+    std::fs::write(&log, lines.join("\n") + "\n").unwrap();
+    let (depth, out) = follow(&jar, &spec, &cfg, &log, "");
+    assert_eq!(depth, 3, "{}", out);
+    // An n of 5 is outside the bound: the first step stops the log, where
+    // the enabled steps list t_go's three and not t_jump.
+    std::fs::write(&log, format!("{}\n{}\n", lines[0], lines[1].replace("\"x\": 2", "\"x\": 5")))
+        .unwrap();
+    let spec_probe = spec.with_file_name("Probe_trace.tla");
+    std::fs::write(
+        &spec_probe,
+        tla.replace("MODULE State_tla_trace", "MODULE Probe_trace").replace(
+            "\n=====",
+            "\nProbe == trace_i = 1 => PrintT(<<\"probe\", TraceEnabled>>)\n=====",
+        ),
+    )
+    .unwrap();
+    let (depth, out) = follow(&jar, &spec_probe, &cfg, &log, "INVARIANT Probe\n");
+    assert_eq!(depth, 1, "{}", out);
+    // TLC breaks a long value over lines: compared without whitespace.
+    let flat: String = out.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        flat.contains(
+            "<<\"probe\",{[params|->[n|->0],step|->\"t_go\"],[params|->[n|->1],step|->\"t_go\"],[params|->[n|->2],step|->\"t_go\"]}>>"
+        ),
+        "{}",
+        out
+    );
+    // t_jump with `to` left out stops TLC, saying why.
+    std::fs::write(&log, format!("{}\n{}\n", lines[0], r#"{"step": "t_jump", "state": {"x": 5}}"#))
+        .unwrap();
+    let out = stops(&jar, &spec, &cfg, &log, "");
+    assert!(
+        out.contains("trace: t_jump leaves out its parameter to, which has no domain"),
+        "{}",
+        out
+    );
+}
+
+/// A header whose observed state is none of Init's: TLC finds no initial
+/// state and ends without error at depth 0, the divergence before the
+/// first step.
+#[test]
+fn tla_export_trace_spec_diverges_at_a_bad_header_state() {
+    let ex = export(&fixture("counter.rs"), "test_crate");
+    let (spec, tla, cfg) = trace_spec(&ex);
+    assert!(
+        tla.contains("when TLC finds no initial state (0 states generated, depth 0)"),
+        "{}",
+        tla
+    );
+    assert!(cfg.contains("depth 0 (no initial state)"), "{}", cfg);
+    let Some(jar) = tla_tools() else { return };
+    let log = ex.dir.path().join("t.ndjson");
+    let lines = [
+        r#"{"module": "State_tla", "export": "test_crate", "state": {"x": 3, "y": 0}}"#,
+        r#"{"step": "t_inc", "params": {}, "state": {"x": 4, "y": 0}}"#,
+    ];
+    std::fs::write(&log, lines.join("\n") + "\n").unwrap();
+    let (depth, out) = follow(&jar, &spec, &cfg, &log, "");
+    assert_eq!(depth, 0, "{}", out);
+    assert!(out.contains("0 states generated"), "{}", out);
+    // The same log from x = 0 is followed past its header.
+    std::fs::write(&log, lines.join("\n").replace("\"x\": 3", "\"x\": 0") + "\n").unwrap();
+    let (depth, out) = follow(&jar, &spec, &cfg, &log, "");
+    assert_eq!(depth, 1, "{}", out);
+}
+
+/// An enum observed without its tag: the tag is free, and the fields named
+/// are compared under whichever variant the model has. Decoded whole (a
+/// parameter), an enum value must name its tag.
+#[test]
+fn tla_export_trace_spec_leaves_an_unobserved_tag_free() {
+    let ex = export_code(
+        r#"
+use vstd::prelude::*;
+verus! {
+pub enum Mode { Idle, Busy(u8), Done(u8, bool) }
+pub struct State { pub mode: Mode }
+pub open spec fn init(s: State) -> bool { s.mode == Mode::Idle }
+pub open spec fn t_busy(pre: State, post: State, n: u8) -> bool { n < 3 && post.mode == Mode::Busy(n) }
+pub open spec fn t_set(pre: State, post: State, m: Mode) -> bool { post.mode == m }
+pub open spec fn next(pre: State, post: State) -> bool {
+    ||| exists|n: u8| n < 3 && t_busy(pre, post, n)
+    ||| exists|m: Mode| t_set(pre, post, m)
+}
+}
+"#,
+        "test_crate",
+    );
+    let (spec, _, cfg) = trace_spec(&ex);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &spec);
+    let log = ex.dir.path().join("t.ndjson");
+    let header = r#"{"module": "State_tla", "export": "test_crate", "state": {"mode": {}}}"#;
+    let lines = [
+        header,
+        r#"{"step": "t_busy", "state": {"mode": {"v0": 2}}}"#,
+        r#"{"step": "t_set", "params": {"m": {"tag": "Done", "v0": 1, "v1": true}}, "state": {"mode": {"v1": true}}}"#,
+    ];
+    std::fs::write(&log, lines.join("\n") + "\n").unwrap();
+    let (depth, out) = follow(&jar, &spec, &cfg, &log, "");
+    assert_eq!(depth, 3, "{}", out);
+    // A field the model's variant does not have, or another value, stops it.
+    for (from, to) in
+        [(r#"{"v0": 2}"#, r#"{"v1": true}"#), (r#"{"v0": 2}"#, r#"{"v0": 1, "tag": "Done"}"#)]
+    {
+        std::fs::write(&log, format!("{header}\n{}\n", lines[1].replace(from, to))).unwrap();
+        let (depth, out) = follow(&jar, &spec, &cfg, &log, "");
+        assert_eq!(depth, 1, "{to}\n{out}");
+    }
+    // A parameter decoded whole without its tag stops TLC with the reason.
+    let bad = r#"{"step": "t_set", "params": {"m": {"v0": 1}}, "state": {}}"#;
+    std::fs::write(&log, format!("{header}\n{bad}\n")).unwrap();
+    let out = stops(&jar, &spec, &cfg, &log, "");
+    assert!(
+        out.contains("trace: a Mode value decoded whole (a parameter, a Set element or a Map key) must name its tag"),
+        "{}",
+        out
+    );
 }

@@ -172,6 +172,39 @@ struct Call {
     callee: OpKey,
     reach: Reach,
     context: BTreeSet<String>,
+    /// The domain each argument filling a parameter other than the pre and
+    /// post states ranges over at this call, when it is a variable with one
+    /// (see [`Dom`]); the trace spec enumerates a parameter the log leaves
+    /// out over the union of these.
+    args: Vec<Option<Dom>>,
+}
+
+/// The set a bound variable ranges over, for the trace spec's parameters:
+/// the bound its quantifier was given, a parameter's (the union over the
+/// operator's calls, resolved once every call is known), or a field of a
+/// value matched against a constructor pattern.
+#[derive(Clone, Debug)]
+enum Dom {
+    /// A closed TLA+ set expression (it reads no local), and whether it is
+    /// the domain read off the value's type ([`Exporter::bound_from_type`]),
+    /// whose hole constants are then the fields' domains.
+    Closed(String, bool),
+    /// The `i`th parameter (other than the pre and post states) of an
+    /// operator.
+    Param(OpKey, usize),
+    /// The field of the values in `of` of variant `tag` (`None` for a
+    /// datatype of one variant or a tuple): `access` reads it from `var`,
+    /// bound over those values. When `of` is its type's domain and that
+    /// split the field off into the hole `hole` of the field's type
+    /// `field_typ`, the field ranges over the hole.
+    Field {
+        of: Box<Dom>,
+        tag: Option<String>,
+        var: String,
+        access: String,
+        hole: String,
+        field_typ: String,
+    },
 }
 
 /// An operator: a function, and which of its variants (see [`Variant`]).
@@ -209,11 +242,18 @@ struct Env {
     /// Variables bound to a closure or record value, kept symbolically so a
     /// later application or field selection can be reduced.
     values: HashMap<VarIdent, (Expr, Box<Env>)>,
+    /// The set a bound variable ranges over, when known (see [`Dom`]).
+    domains: HashMap<VarIdent, Dom>,
 }
 
 impl Env {
     fn new() -> Self {
-        Env { roles: HashMap::new(), names: HashMap::new(), values: HashMap::new() }
+        Env {
+            roles: HashMap::new(),
+            names: HashMap::new(),
+            values: HashMap::new(),
+            domains: HashMap::new(),
+        }
     }
     fn name(&self, v: &VarIdent) -> String {
         self.names.get(v).cloned().unwrap_or_else(|| ident_name(v))
@@ -1603,6 +1643,9 @@ impl Exporter {
 
     fn matches(&mut self, e: &Expr, place: &Place, arms: &Arms, env: &Env) -> String {
         let scrutinee = self.quiet(|x| x.place(place, env));
+        // What the scrutinee ranges over, when it is a variable with a
+        // domain: its pattern's bindings then range over its fields'.
+        let scrutinee_domain = place_var(place).and_then(|v| env.domains.get(&v).cloned());
         // Bind the scrutinee once, under a name fresh in this operator.
         let m = self.bind("m__");
         let mut chain: Vec<(String, String)> = Vec::new();
@@ -1610,7 +1653,8 @@ impl Exporter {
         let mut arm_assigned = Vec::new();
         for arm in arms.iter() {
             let mut env2 = env.clone();
-            let (cond, lets) = self.pattern(&m, &arm.x.pattern, &mut env2);
+            let (cond, lets) =
+                self.pattern(&m, &arm.x.pattern, &mut env2, scrutinee_domain.clone());
             let in_lets = |x: String| {
                 if lets.is_empty() { x } else { format!("(LET {} IN {x})", lets.join(" ")) }
             };
@@ -1652,33 +1696,66 @@ impl Exporter {
 
     /// The condition a pattern imposes on `subject`, and the LET bindings it
     /// introduces (added to `env`). The condition reads only `subject`.
+    /// `domain` is the set `subject` ranges over, when known: a binding
+    /// ranges over it, and a constructor's fields over its fields'.
     fn pattern(
         &mut self,
         subject: &str,
         p: &Pattern,
         env: &mut Env,
+        domain: Option<Dom>,
     ) -> (Option<String>, Vec<String>) {
         match &p.x {
             PatternX::Wildcard(_) => (None, vec![]),
             PatternX::Var(PatternBinding { name, .. }) => {
+                if let Some(d) = domain {
+                    env.domains.insert(name.clone(), d);
+                }
                 let n = self.bind_var(env, name);
                 (None, vec![format!("{n} == {subject}")])
             }
             PatternX::Binding { binding: PatternBinding { name, .. }, sub_pat } => {
+                if let Some(d) = domain.clone() {
+                    env.domains.insert(name.clone(), d);
+                }
                 let n = self.bind_var(env, name);
-                let (c, mut lets) = self.pattern(subject, sub_pat, env);
+                let (c, mut lets) = self.pattern(subject, sub_pat, env, domain);
                 lets.insert(0, format!("{n} == {subject}"));
                 (c, lets)
             }
             PatternX::Constructor(dt, variant, binders) => {
                 let mut conds = Vec::new();
-                if !self.single_variant(dt) {
+                let tagged = !self.single_variant(dt);
+                if tagged {
                     conds.push(format!("({subject}.tag = \"{variant}\")"));
                 }
                 let mut lets = Vec::new();
                 for b in binders.iter() {
                     let field = self.field_access(subject, dt, &b.name);
-                    let (c, l) = self.pattern(&field, &b.a, env);
+                    let field_domain = domain.clone().map(|of| {
+                        let var = self.bind("s__");
+                        let access = self.field_access(&var, dt, &b.name);
+                        // The hole `bound_variants` gives the field when it
+                        // splits it off.
+                        let instance = self.constant_typ_name(&p.typ);
+                        let hole = match dt {
+                            Dt::Tuple(_) => format!("Dom_{instance}_v{}", b.name),
+                            Dt::Path(_) => format!(
+                                "Dom_{instance}_{}_{}",
+                                sanitize(&variant.to_string()),
+                                field_name(&b.name)
+                            ),
+                        };
+                        Dom::Field {
+                            of: Box::new(of),
+                            tag: tagged.then(|| variant.to_string()),
+                            var,
+                            access,
+                            hole,
+                            field_typ: typ_name(&b.a.typ),
+                        }
+                    });
+                    let (c, l) = self.pattern(&field, &b.a, env, field_domain);
                     if let Some(c) = c {
                         conds.push(c);
                     }
@@ -1719,8 +1796,8 @@ impl Exporter {
             // `A | B` binding nothing: either alternative's condition (an
             // alternative that always matches makes the whole one match).
             PatternX::Or(a, b) if !pattern_binds(a) && !pattern_binds(b) => {
-                let (ca, _) = self.pattern(subject, a, env);
-                let (cb, _) = self.pattern(subject, b, env);
+                let (ca, _) = self.pattern(subject, a, env, None);
+                let (cb, _) = self.pattern(subject, b, env, None);
                 match (ca, cb) {
                     (Some(x), Some(y)) => (Some(format!("({x} \\/ {y})")), vec![]),
                     _ => (None, vec![]),
@@ -1826,16 +1903,25 @@ impl Exporter {
                 // dropped, and `post` given to a single pre-role parameter
                 // selects the primed variant.
                 let mut printed = Vec::new();
+                let mut domains = Vec::new();
                 let mut variant = Variant::Plain;
                 for (i, a) in args.iter().enumerate() {
                     match (roles.get(i).copied().flatten(), arg_role(a)) {
                         (Some(Role::Pre), Some(Role::Post)) => variant = Variant::Primed,
                         (Some(_), _) => {}
-                        (None, _) => printed.push(self.expr(a, env)),
+                        (None, _) => {
+                            printed.push(self.expr(a, env));
+                            domains.push(read_var(a).and_then(|v| env.domains.get(&v).cloned()));
+                        }
                     }
                 }
                 self.conj_level = level;
-                let name = self.ensure_function(&(fun.clone(), variant));
+                let key = (fun.clone(), variant);
+                let name = self.ensure_function(&key);
+                // `ensure_function` recorded this call last.
+                if let Some(call) = self.current_calls.last_mut().filter(|c| c.callee == key) {
+                    call.args = domains;
+                }
                 if printed.is_empty() { name } else { format!("{name}({})", printed.join(", ")) }
             }
             CallTarget::FnSpec(f) => {
@@ -2192,12 +2278,16 @@ impl Exporter {
             // A binder's domain may read the binders before it (the
             // quantifiers nest) but not itself or the ones after it.
             let unbound: Vec<VarIdent> = binders[i..].iter().map(|b| b.name.clone()).collect();
+            let mut from_type = false;
             let domain = match self
                 .quiet(|x| x.bound_from_guard(&b.name, &b.a, &unbound, &guard_exprs, &env2))
             {
                 Some(d) => d,
                 None => match self.bound_from_type(&b.a, &e.span, &mut Vec::new()) {
-                    Some((d, _)) => d,
+                    Some((d, _)) => {
+                        from_type = true;
+                        d
+                    }
                     None => {
                         let constant = format!("Dom_{}", self.constant_typ_name(&b.a));
                         self.constants.insert(constant.clone());
@@ -2212,6 +2302,9 @@ impl Exporter {
                     }
                 },
             };
+            if let Some(d) = self.closed_domain(&domain, &env2, from_type) {
+                env2.domains.insert(b.name.clone(), d);
+            }
             bounds.push(format!("{name} \\in {domain}"));
         }
         let sb = if forall { self.expr(body, &env2) } else { self.in_branch(body, &env2) };
@@ -2929,7 +3022,12 @@ impl Exporter {
             (true, true) => Reach::Branch,
             (true, false) => Reach::Conjoined,
         };
-        self.current_calls.push(Call { callee: key.clone(), reach, context: BTreeSet::new() });
+        self.current_calls.push(Call {
+            callee: key.clone(),
+            reach,
+            context: BTreeSet::new(),
+            args: Vec::new(),
+        });
         if self.emitted.contains(key) || self.emitting.contains(key) {
             if self.tainted.contains(key) {
                 self.current_tainted = true;
@@ -2966,6 +3064,12 @@ impl Exporter {
                     env.roles.insert(p.x.name.clone(), *r);
                 }
                 None => {
+                    // A parameter ranges over what its calls pass (the
+                    // record variant's parameters include the states).
+                    if *variant != Variant::Record {
+                        let i = params.len();
+                        env.domains.insert(p.x.name.clone(), Dom::Param(key.clone(), i));
+                    }
                     let n = self.bind_var(&mut env, &p.x.name);
                     params.push(n);
                 }
@@ -4244,11 +4348,9 @@ pub fn export_module(krate: &Krate, arg: &str) -> Result<Export, String> {
         "\\* The unassigned check counts a conjunct-level v' = e, and v = e in Init (an IF,\n\\* match or disjunction when every branch assigns v; a FALSE branch assigns all;\n\\* g => b1 beside ~g => b2 when b1 and b2 both assign v).\n\\* It can miss a v' read before the conjunct that assigns it (TLC evaluates\n\\* conjuncts in order), and it does not count v' \\in S.\n",
     );
     cfg.push_str("\\* CONSTRAINT <a state predicate bounding the model>\n");
-    let (trace_module_name, trace_tla, trace_cfg, trace) = ex.trace_spec(
-        module,
-        &module_name,
-        &ex.trace_operators(&(triple.next.clone(), Variant::Plain)),
-    );
+    let next_key = (triple.next.clone(), Variant::Plain);
+    let (trace_module_name, trace_tla, trace_cfg, trace) =
+        ex.trace_spec(module, &module_name, &next_key, &ex.trace_operators(&next_key));
     let report = Report {
         module: module.to_string(),
         shape: triple.shape.to_string(),
@@ -4290,6 +4392,10 @@ pub struct TraceStep {
     /// must name this one by its full path.
     pub short_name_shared: bool,
     pub params: Vec<TraceParam>,
+    /// Whether `TraceEnabled` lists this step when the model can take it:
+    /// only when every parameter has a domain. A step it cannot enumerate
+    /// is left out of it, so its enabled steps are then not all the model's.
+    pub enumerated: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -4297,11 +4403,12 @@ pub struct TraceParam {
     /// The key under the log line's `"params"`: the Rust parameter's name.
     pub name: String,
     pub typ: String,
-    /// The domain a parameter the log leaves out is taken from: the hole
-    /// constant bounding it in Next (a VerusSync step's `Dom_Step_<t>_v<i>`),
-    /// its type's finite domain, or the export's `Dom_<Type>` hole; `None`
-    /// when there is none (then it must be logged, and the model's enabled
-    /// steps do not enumerate it).
+    /// The domain a parameter the log leaves out is taken from: what Next's
+    /// calls to the step pass it (the bound of the quantifier binding the
+    /// argument, or a field of a value matched against a pattern, such as a
+    /// VerusSync step's `Dom_Step_<t>_v<i>`), else its type's finite domain,
+    /// else the export's `Dom_<Type>` hole; `None` when there is none (then
+    /// it must be logged, and `TraceEnabled` leaves the step out).
     pub domain: Option<String>,
 }
 
@@ -4335,6 +4442,94 @@ impl Exporter {
         }
         self.used_names.insert(candidate.clone());
         candidate
+    }
+
+    /// `d` as a [`Dom::Closed`] when it reads no local in scope in `env`
+    /// (a bound reading an earlier binder or a parameter has no value
+    /// outside the operator) and no primed variable.
+    fn closed_domain(&self, d: &str, env: &Env, from_type: bool) -> Option<Dom> {
+        let locals: HashSet<&str> = env.names.values().map(String::as_str).collect();
+        let reads_local =
+            d.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).any(|t| locals.contains(t));
+        (!reads_local && !d.contains('\'')).then(|| Dom::Closed(d.to_string(), from_type))
+    }
+
+    /// The operators `from` reaches through its calls, `from` included.
+    fn reachable_from(&self, from: &OpKey) -> HashSet<OpKey> {
+        let mut seen = HashSet::from([from.clone()]);
+        let mut queue = vec![from.clone()];
+        while let Some(k) = queue.pop() {
+            for call in self.calls.get(&k).into_iter().flatten() {
+                if seen.insert(call.callee.clone()) {
+                    queue.push(call.callee.clone());
+                }
+            }
+        }
+        seen
+    }
+
+    /// The set `d` stands for, as a closed TLA+ expression, and whether it
+    /// is its type's domain; `None` when some call it depends on passes a
+    /// value of no known domain.
+    fn resolve_dom(
+        &self,
+        d: &Dom,
+        reachable: &HashSet<OpKey>,
+        visiting: &mut Vec<(OpKey, usize)>,
+    ) -> Option<(String, bool)> {
+        match d {
+            Dom::Closed(s, from_type) => Some((s.clone(), *from_type)),
+            Dom::Param(k, i) => self.resolve_param(k, *i, reachable, visiting),
+            Dom::Field { of, tag, var, access, hole, field_typ } => {
+                let (of, from_type) = self.resolve_dom(of, reachable, visiting)?;
+                if from_type
+                    && self.holes.iter().any(|h| &h.constant == hole && &h.typ == field_typ)
+                {
+                    return Some((hole.clone(), false));
+                }
+                let values = match tag {
+                    Some(t) => format!("{{{var} \\in {of} : {var}.tag = \"{t}\"}}"),
+                    None => of,
+                };
+                Some((format!("{{{access} : {var} \\in {values}}}"), false))
+            }
+        }
+    }
+
+    /// The set the `i`th parameter (other than the pre and post states) of
+    /// the operator `k` ranges over: the union of what every call to it in
+    /// an operator `reachable` passes, `None` when one passes a value of no
+    /// known domain, or there is no call (or only a recursive one).
+    fn resolve_param(
+        &self,
+        k: &OpKey,
+        i: usize,
+        reachable: &HashSet<OpKey>,
+        visiting: &mut Vec<(OpKey, usize)>,
+    ) -> Option<(String, bool)> {
+        if visiting.contains(&(k.clone(), i)) {
+            return None;
+        }
+        visiting.push((k.clone(), i));
+        let mut parts: Vec<String> = Vec::new();
+        let mut from_type = true;
+        let mut callers: Vec<&OpKey> = reachable.iter().collect();
+        callers.sort_by_key(|c| self.op_names.get(c).cloned().unwrap_or_default());
+        for caller in callers {
+            for call in self.calls.get(caller).into_iter().flatten().filter(|c| &c.callee == k) {
+                let (d, t) = self.resolve_dom(call.args.get(i)?.as_ref()?, reachable, visiting)?;
+                from_type &= t;
+                if !parts.contains(&d) {
+                    parts.push(d);
+                }
+            }
+        }
+        visiting.pop();
+        match parts.len() {
+            0 => None,
+            1 => parts.pop().map(|d| (d, from_type)),
+            _ => Some((format!("({})", parts.join(" \\cup ")), from_type)),
+        }
     }
 
     /// The codec operators for `typ`: `Dec_T(j)`, the model value a JSON
@@ -4439,8 +4634,17 @@ impl Exporter {
                                     dec_arms.push(record);
                                 }
                             }
+                            let tname = typ_name(typ);
                             let dec_body = if tagged {
-                                format!("CASE {}", dec_arms.join("\n      [] "))
+                                // Decoded whole, the value must say which
+                                // variant it is.
+                                dec_arms.push(format!(
+                                    "OTHER -> Assert(FALSE, \"trace: {tname} has no variant \" \\o ToString(j.tag))"
+                                ));
+                                format!(
+                                    "IF \"tag\" \\in DOMAIN j\n    THEN CASE {}\n    ELSE Assert(FALSE, \"trace: a {tname} value decoded whole (a parameter, a Set element or a Map key) must name its tag\")",
+                                    dec_arms.join("\n           [] ")
+                                )
                             } else {
                                 dec_arms.pop().unwrap_or_else(|| "j".into())
                             };
@@ -4456,8 +4660,15 @@ impl Exporter {
                                     obs_arms.join("\n          [] ")
                                 )
                             };
-                            let obs_body =
-                                if tagged { format!("v.tag = j.tag /\\ {fields}") } else { fields };
+                            // A tag left out is free too: the fields named
+                            // are compared under whichever variant `v` is.
+                            let obs_body = if tagged {
+                                format!(
+                                    "(IF \"tag\" \\in DOMAIN j THEN v.tag = j.tag ELSE TRUE) /\\ {fields}"
+                                )
+                            } else {
+                                fields
+                            };
                             (dec_body, obs_body)
                         }
                         _ => ("j".into(), "v = j".into()),
@@ -4474,10 +4685,10 @@ impl Exporter {
     }
 
     /// The finite domain of a trace parameter of type `typ`: `hole`, the
-    /// constant bounding it where Next quantifies over it, when there is
-    /// one; else read off the type alone as a quantifier's would be, or a
-    /// `Dom_<Type>` constant the export already declares for it; `None`
-    /// otherwise (no new hole is made).
+    /// set Next's calls pass it from, when there is one; else read off the
+    /// type alone as a quantifier's would be, or a `Dom_<Type>` constant the
+    /// export already declares for it; `None` otherwise (no new hole is
+    /// made).
     fn trace_domain(
         &mut self,
         typ: &Typ,
@@ -4513,9 +4724,11 @@ impl Exporter {
         &mut self,
         module: &str,
         module_name: &str,
+        next_key: &OpKey,
         operators: &[OpKey],
     ) -> (String, String, String, TraceReport) {
         let trace_module = format!("{module_name}_trace");
+        let reachable = self.reachable_from(next_key);
         let log = self.trace_name("TraceLog");
         let index = self.trace_name("trace_i");
         let names: Vec<String> = [
@@ -4595,7 +4808,6 @@ impl Exporter {
             let Some(f) = self.functions.get(&key.0).cloned() else { continue };
             let friendly = fun_as_friendly_rust_name(&key.0);
             let short = friendly.rsplit("::").next().unwrap_or(&friendly).to_string();
-            let parent = friendly.rsplit_once("::").map_or("", |(p, _)| p);
             let roles = self.param_roles(&f);
             let mut params = Vec::new();
             for (i, p) in
@@ -4606,17 +4818,19 @@ impl Exporter {
                     .map(|(p, _)| p)
                     .enumerate()
             {
-                // A VerusSync step's parameters are the fields of its `Step`
-                // variant, which Next (in the same impl) bounds: a field of
-                // no finite domain by the hole `Dom_Step_<t>_v<i>`.
+                // What Next's calls pass it: a quantifier's bound, or the
+                // field of a matched value (a VerusSync `Step` variant's,
+                // `Dom_Step_<t>_v<i>` when its type has no finite domain).
+                // A hole is taken only for a parameter of the hole's type.
                 let hole = self
-                    .holes
-                    .iter()
-                    .find(|h| {
-                        h.variable == format!("{short}.v{i}")
-                            && h.in_function.starts_with(&format!("{parent}::"))
-                    })
-                    .map(|h| h.constant.clone());
+                    .resolve_param(key, i, &reachable, &mut Vec::new())
+                    .map(|(d, _)| d)
+                    .filter(|d| {
+                        self.holes
+                            .iter()
+                            .filter(|h| &h.constant == d)
+                            .all(|h| h.typ == typ_name(&p.x.typ))
+                    });
                 let domain = self.trace_domain(&p.x.typ, &f.span, hole);
                 params.push((ident_name(&p.x.name), p.x.typ.clone(), domain));
             }
@@ -4625,12 +4839,14 @@ impl Exporter {
                 self.trace_codec(&typ, &mut memo, &mut defs);
                 ps.push(TraceParam { name, typ: typ_name(&typ), domain });
             }
+            let enumerated = ps.iter().all(|p| p.domain.is_some());
             steps.push(TraceStep {
                 step: short,
                 function: friendly,
                 operator,
                 short_name_shared: false,
                 params: ps,
+                enumerated,
             });
         }
         // A last segment two steps share names neither: those steps are
@@ -4690,7 +4906,7 @@ impl Exporter {
                 let unlogged = match &p.domain {
                     Some(dom) => dom.clone(),
                     None => format!(
-                        "Assert(FALSE, \"trace: {} leaves out its parameter {}, whose type has no finite domain\")",
+                        "Assert(FALSE, \"trace: {} leaves out its parameter {}, which has no domain to range over (Next binds it to no bounded variable, and its type has no finite domain or Dom_ constant)\")",
                         s.step, p.name
                     ),
                 };
@@ -4746,10 +4962,10 @@ impl Exporter {
             "\\* Trace validation for {module_name}, the export of `{module}` (verus -V tla-export).\n"
         ));
         tla.push_str(&format!(
-            "\\* The log is newline-delimited JSON: a header line naming the module\n\\* ({{\"module\": \"{module_name}\", \"export\": \"{module}\"}}, optionally \"state\": the\n\\* observed initial state; another module or export stops TLC), then one line per step:\n\\* {{\"step\": \"<t_* name>\", \"params\": {{...}}, \"state\": {{...}}}}. A step is named by\n\\* its spec fn's last segment or full path, by the full path alone when two\n\\* steps share the last segment; a parameter the step does not declare stops\n\\* TLC. Values are in the export's encoding: a struct or enum value is an\n\\* object (an enum's with its \"tag\"), a Seq an array, a Set an array of its\n\\* elements, a Map an array of [key, value] pairs, a tuple an array. An object\n\\* observed in the state is partial: only the fields it names are compared, so\n\\* a ghost field is left out of the log and free in the model; a Seq may be\n\\* observed partially as an object keyed by the Verus index (\"0\", \"1\", ...;\n\\* {{}} observes nothing, [] is the empty Seq).\n\\* A record inside a Set element, a Map key or a parameter is decoded whole,\n\\* so it must name every field (a field left out there stops TLC). A parameter\n\\* left out of \"params\" ranges over the hole bounding it in Next (a VerusSync\n\\* step's Dom_Step_<t>_v<i>), its type's finite domain or the export's\n\\* Dom_<Type> hole; with none of these it must be logged.\n"
+            "\\* The log is newline-delimited JSON: a header line naming the module\n\\* ({{\"module\": \"{module_name}\", \"export\": \"{module}\"}}, optionally \"state\": the\n\\* observed initial state; another module or export stops TLC), then one line per step:\n\\* {{\"step\": \"<t_* name>\", \"params\": {{...}}, \"state\": {{...}}}}. A step is named by\n\\* its spec fn's last segment or full path, by the full path alone when two\n\\* steps share the last segment; a parameter the step does not declare stops\n\\* TLC. Values are in the export's encoding: a struct or enum value is an\n\\* object (an enum's with its \"tag\"), a Seq an array, a Set an array of its\n\\* elements, a Map an array of [key, value] pairs, a tuple an array. An object\n\\* observed in the state is partial: only the fields it names are compared, so\n\\* a ghost field is left out of the log and free in the model (an enum's tag\n\\* too: its fields are then compared under whichever variant the model has);\n\\* a Seq may be observed partially as an object keyed by the Verus index\n\\* (\"0\", \"1\", ...; {{}} observes nothing, [] is the empty Seq).\n\\* A record inside a Set element, a Map key or a parameter is decoded whole,\n\\* so it must name every field and an enum its tag (one left out there stops\n\\* TLC). A parameter left out of \"params\" ranges over what Next's calls to\n\\* the step pass it (the bound of the quantifier binding the argument, or the\n\\* field of a value matched against a pattern, such as a VerusSync step's\n\\* Dom_Step_<t>_v<i>), else its type's finite domain or the export's\n\\* Dom_<Type> hole; with none of these it must be logged, and TraceEnabled\n\\* leaves the step out (the report's trace steps say which, \"enumerated\").\n"
         ));
         tla.push_str(&format!(
-            "\\* TraceNext conjoins Next, then the logged step, so it only ever narrows\n\\* the model: a trace TLC follows to its end ({accepted}) is a behaviour of\n\\* {module_name}. Otherwise the deepest {index} reached is the first logged step\n\\* the model cannot take from any state that explains the log so far.\n"
+            "\\* TraceNext conjoins Next, then the logged step, so it only ever narrows\n\\* the model: a trace TLC follows to its end ({accepted}) is a behaviour of\n\\* {module_name}. Otherwise the deepest {index} reached is the first logged step\n\\* the model cannot take from any state that explains the log so far; and\n\\* when TLC finds no initial state (0 states generated, depth 0), the header's\n\\* observed state is none of Init's, so the log diverges before its first step.\n"
         ));
         tla.push_str(&format!("EXTENDS {module_name}, Json, TLC, Integers, Sequences\n\n"));
         tla.push_str(&format!("CONSTANT {log}  \\* the log's path\n"));
@@ -4819,7 +5035,7 @@ impl Exporter {
         ));
         tla.push_str(&format!("{}\n", "=".repeat(trace_module.len() + 20)));
         let cfg = format!(
-            "\\* Trace validation: TLC follows the log named by {log}. On a well-formed log\n\\* it ends with no error either way (a malformed one stops at an Assert); the trace conforms when some state reaches {accepted}\n\\* (the depth of the search is the number of logged steps plus one).\nINIT {init}\nNEXT {next}\nCHECK_DEADLOCK FALSE\nCONSTANT {log} = \"trace.ndjson\"\n\\* The export's CONSTANTS, if it has any, are needed here too.\n"
+            "\\* Trace validation: TLC follows the log named by {log}. On a well-formed log\n\\* it ends with no error either way (a malformed one stops at an Assert); the trace conforms when some state reaches {accepted}\n\\* (the depth of the search is the number of logged steps plus one). Depth d\n\\* below that means logged step d diverged; depth 0 (no initial state) means\n\\* the header's observed state is not an initial state of the model.\nINIT {init}\nNEXT {next}\nCHECK_DEADLOCK FALSE\nCONSTANT {log} = \"trace.ndjson\"\n\\* The export's CONSTANTS, if it has any, are needed here too.\n"
         );
         let report =
             TraceReport { module: trace_module.clone(), index_variable: index, observables, steps };
