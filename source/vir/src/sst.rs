@@ -26,9 +26,30 @@ pub struct BndInfoUser {
     pub trigs: Trigs,
 }
 
+/// Why an encoder emitted a quantifier, in the terms source is written in.
+/// Recorded where the binder is built, so a reader never has to classify a
+/// generated `:qid`; the qid names nothing a user wrote and its spelling is
+/// free to change.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum QuantRole {
+    /// A spec function's defining equation
+    Definition,
+    /// The defining equation of a function's requires, ensures or mask
+    /// predicate (`req%f`, `ens%f`), which a call assumes or asserts
+    Contract,
+    /// One unfolding step of a recursive spec function (costs fuel)
+    DefinitionUnfold,
+    /// A recursive spec function at zero fuel, where unfolding stops
+    DefinitionBase,
+    /// The return type invariant of a function
+    ReturnTypeInvariant,
+}
+
 pub struct BndInfo {
     pub fun: Fun,
     pub user: Option<BndInfoUser>,
+    /// Why this quantifier exists, when the encoder said so.
+    pub role: Option<QuantRole>,
 }
 
 // For AssertBy, this records the LocalDecl vars that correspond to the VarBinders

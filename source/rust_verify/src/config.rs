@@ -117,6 +117,11 @@ pub struct ArgsX {
     pub report_long_running: bool,
     pub use_crate_name: bool,
     pub solver: SmtSolver,
+    /// After a failed check, print what cvc5 can say about it, between
+    /// `=== verus-diagnostics begin ===` and `=== verus-diagnostics end ===`
+    /// lines (see `crate::solver_diagnostics`). On under cvc5 unless
+    /// `-V no-failure-diagnostics`.
+    pub failure_diagnostics: bool,
     pub axiom_usage_info: bool,
     pub check_api_safety: bool,
     pub no_bv_simplify: bool,
@@ -166,6 +171,7 @@ impl ArgsX {
             report_long_running: Default::default(),
             use_crate_name: Default::default(),
             solver: Default::default(),
+            failure_diagnostics: false,
             axiom_usage_info: Default::default(),
             check_api_safety: Default::default(),
             no_bv_simplify: Default::default(),
@@ -302,6 +308,7 @@ pub fn parse_args_with_imports(
     program: &String,
     args: impl Iterator<Item = String>,
     vstd_import: Option<(String, String)>,
+    internal_test_mode: bool,
 ) -> (Args, Vec<String>) {
     const OPT_EXPORT: &str = "export";
     const OPT_IMPORT: &str = "import";
@@ -410,11 +417,13 @@ pub fn parse_args_with_imports(
     const EXTENDED_SPINOFF_ALL: &str = "spinoff-all";
     const EXTENDED_CAPTURE_PROFILES: &str = "capture-profiles";
     const EXTENDED_CVC5: &str = "cvc5";
+    const EXTENDED_Z3: &str = "z3";
     const EXTENDED_ALLOW_INLINE_AIR: &str = "allow-inline-air";
     const EXTENDED_USE_CRATE_NAME: &str = "use-crate-name";
     const EXTENDED_AXIOM_USAGE_INFO: &str = "axiom-usage-info";
     const EXTENDED_CHECK_API_SAFETY: &str = "check-api-safety";
     const EXTENDED_NO_BV_SIMPLIFY: &str = "no-bv-simplify";
+    const EXTENDED_NO_FAILURE_DIAGNOSTICS: &str = "no-failure-diagnostics";
     const EXTENDED_KEYS: &[(&str, &str)] = &[
         (EXTENDED_IGNORE_UNEXPECTED_SMT, "Ignore unexpected SMT output"),
         (EXTENDED_DEBUG, "Enable debugging of proof failures"),
@@ -427,7 +436,14 @@ pub fn parse_args_with_imports(
             EXTENDED_CAPTURE_PROFILES,
             "Always collect prover performance data, but don't generate output reports",
         ),
-        (EXTENDED_CVC5, "Use the cvc5 SMT solver, rather than the default (Z3)"),
+        (
+            EXTENDED_CVC5,
+            "Use the cvc5 SMT solver (the default, except for vstd and Verus's own test suite)",
+        ),
+        (
+            EXTENDED_Z3,
+            "Use the Z3 SMT solver instead of cvc5 (no failure diagnostics are printed under Z3)",
+        ),
         (EXTENDED_ALLOW_INLINE_AIR, "Allow the POTENTIALLY UNSOUND use of inline_air_stmt"),
         (
             EXTENDED_USE_CRATE_NAME,
@@ -441,6 +457,10 @@ pub fn parse_args_with_imports(
         (
             EXTENDED_NO_BV_SIMPLIFY,
             "internal option to disable simplification of bit-vector assertions before sending to the SMT solver",
+        ),
+        (
+            EXTENDED_NO_FAILURE_DIAGNOSTICS,
+            "Do not print the solver's diagnostics (matching loops, instantiation counts, nonlinear terms, e-graph equalities) after a failed check",
         ),
     ];
 
@@ -662,6 +682,24 @@ pub fn parse_args_with_imports(
         }
     }
 
+    // cvc5 verifies every real run, and on a failure says why (see
+    // `crate::solver_diagnostics`). z3 stays for vstd itself (built by vstd_build, or by
+    // cargo-verus, which passes --is-vstd) and for Verus's own test suite (internal
+    // test mode), where cvc5 is far slower on vstd's arithmetic lemmas. `-V z3`
+    // selects z3 anywhere; `-V cvc5` selects cvc5 in the test suite too.
+    if extended.contains_key(EXTENDED_CVC5) && extended.contains_key(EXTENDED_Z3) {
+        error("contradictory options -V cvc5 and -V z3".to_string());
+    }
+    let solver = if extended.contains_key(EXTENDED_Z3) {
+        SmtSolver::Z3
+    } else if extended.contains_key(EXTENDED_CVC5) {
+        SmtSolver::Cvc5
+    } else if internal_test_mode || is_vstd {
+        SmtSolver::Z3
+    } else {
+        SmtSolver::Cvc5
+    };
+
     let args = ArgsX {
         verify_root: matches.opt_present(OPT_VERIFY_ROOT),
         export: matches.opt_str(OPT_EXPORT),
@@ -786,6 +824,17 @@ pub fn parse_args_with_imports(
         allow_inline_air: extended.contains_key(EXTENDED_ALLOW_INLINE_AIR),
         debugger: extended.contains_key(EXTENDED_DEBUG),
         profile: {
+            // The profiler reads a z3 trace file, which cvc5 does not produce.
+            if matches!(solver, SmtSolver::Cvc5)
+                && (matches.opt_present(OPT_PROFILE)
+                    || matches.opt_present(OPT_PROFILE_ALL)
+                    || extended.contains_key(EXTENDED_CAPTURE_PROFILES))
+            {
+                error(
+                    "--profile, --profile-all and -V capture-profiles read a z3 trace; add -V z3 to profile with z3"
+                        .to_string(),
+                )
+            }
             if matches.opt_present(OPT_PROFILE) {
                 if matches.opt_present(OPT_PROFILE_ALL) {
                     error("--profile and --profile-all are mutually exclusive".to_string())
@@ -835,7 +884,9 @@ pub fn parse_args_with_imports(
         trace: matches.opt_present(OPT_TRACE),
         report_long_running: !matches.opt_present(OPT_NO_REPORT_LONG_RUNNING),
         use_crate_name: extended.contains_key(EXTENDED_USE_CRATE_NAME),
-        solver: if extended.contains_key(EXTENDED_CVC5) { SmtSolver::Cvc5 } else { SmtSolver::Z3 },
+        solver,
+        failure_diagnostics: matches!(solver, SmtSolver::Cvc5)
+            && !extended.contains_key(EXTENDED_NO_FAILURE_DIAGNOSTICS),
         axiom_usage_info: extended.contains_key(EXTENDED_AXIOM_USAGE_INFO),
         check_api_safety: extended.contains_key(EXTENDED_CHECK_API_SAFETY),
         no_bv_simplify: extended.contains_key(EXTENDED_NO_BV_SIMPLIFY),

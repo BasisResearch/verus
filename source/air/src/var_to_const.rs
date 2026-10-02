@@ -123,6 +123,10 @@ struct LowerStmtState {
     break_versions: HashMap<Ident, Vec<IndexMap<Ident, u32>>>,
     version_decls: HashSet<Ident>,
     all_snapshots: Snapshots,
+    /// Each SSA symbol minted, to its variable and version, when
+    /// `record_versions`: what lets solver terms read as source variables.
+    variable_versions: crate::diagnostics::VariableVersions,
+    record_versions: bool,
 }
 
 fn lower_stmt(
@@ -141,6 +145,9 @@ fn lower_stmt(
             let n = find_version(&versions, x);
             let typ = types[x].clone();
             versions.insert(x.clone(), n + 1);
+            if state.record_versions {
+                state.variable_versions.insert(rename_var(x, n + 1), (x.to_string(), n + 1));
+            }
             let x = Arc::new(rename_var(x, n + 1));
             if !state.version_decls.contains(&x) {
                 let decl = Arc::new(DeclX::Const(x.clone(), typ));
@@ -219,7 +226,12 @@ fn lower_stmt(
     }
 }
 
-pub(crate) fn lower_query(query: &Query) -> (Query, Snapshots, Vec<Decl>) {
+/// Lower `query`, and with `record_versions` say which variable and version
+/// each SSA symbol stands for.
+pub(crate) fn lower_query(
+    query: &Query,
+    record_versions: bool,
+) -> (Query, Snapshots, Vec<Decl>, crate::diagnostics::VariableVersions) {
     let QueryX { local, assertion } = &**query;
     let mut decls: Vec<Decl> = Vec::new();
     let mut versions: IndexMap<Ident, u32> = IndexMap::new();
@@ -229,6 +241,7 @@ pub(crate) fn lower_query(query: &Query) -> (Query, Snapshots, Vec<Decl>) {
     let all_snapshots: Snapshots = HashMap::new();
     let mut types: HashMap<Ident, Typ> = HashMap::new();
     let mut local_vars: Vec<Decl> = Vec::new();
+    let mut variable_versions = HashMap::new();
 
     for decl in local.iter() {
         if let DeclX::Axiom(Axiom { named, expr }) = &**decl {
@@ -243,6 +256,9 @@ pub(crate) fn lower_query(query: &Query) -> (Query, Snapshots, Vec<Decl>) {
         if let DeclX::Var(x, t) = &**decl {
             versions.insert(x.clone(), 0);
             types.insert(x.clone(), t.clone());
+            if record_versions {
+                variable_versions.insert(rename_var(x, 0), (x.to_string(), 0));
+            }
             let x = Arc::new(rename_var(x, 0));
             let decl = Arc::new(DeclX::Const(x.clone(), t.clone()));
             decls.push(decl);
@@ -251,8 +267,20 @@ pub(crate) fn lower_query(query: &Query) -> (Query, Snapshots, Vec<Decl>) {
             local_vars.push(decl.clone());
         }
     }
-    let mut state = LowerStmtState { decls, break_versions, version_decls, all_snapshots };
+    let mut state = LowerStmtState {
+        decls,
+        break_versions,
+        version_decls,
+        all_snapshots,
+        variable_versions,
+        record_versions,
+    };
     let assertion = lower_stmt(&mut state, &mut versions, &mut snapshots, &types, assertion);
     let local = Arc::new(state.decls);
-    (Arc::new(QueryX { local, assertion }), state.all_snapshots, local_vars)
+    (
+        Arc::new(QueryX { local, assertion }),
+        state.all_snapshots,
+        local_vars,
+        state.variable_versions,
+    )
 }

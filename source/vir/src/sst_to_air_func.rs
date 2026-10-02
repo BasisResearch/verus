@@ -12,7 +12,7 @@ use crate::def::{
 };
 use crate::messages::{MessageLabel, Span};
 use crate::sst::FuncCheckSst;
-use crate::sst::{BndX, ExpX, Exps, FunctionSst, ParX, Pars};
+use crate::sst::{BndX, ExpX, Exps, FunctionSst, ParX, Pars, QuantRole};
 use crate::sst_to_air::{
     ExprCtxt, ExprMode, exp_to_expr, fun_to_air_ident, typ_invariant, typ_to_air, typ_to_ids,
 };
@@ -116,6 +116,7 @@ fn func_def_quant(
     extra_trigger_terms: &Vec<Typ>,
     extra_binder: Option<Bind>,
     body: Expr,
+    role: QuantRole,
 ) -> Result<Expr, VirErr> {
     let (opts, trait_default_ensures) = if is_trait_default_ensures {
         (
@@ -136,10 +137,9 @@ fn func_def_quant(
     for extra_trigger_term in extra_trigger_terms.iter() {
         trigs.push(crate::sst_to_air::typ_to_id(ctx, extra_trigger_term));
     }
-    Ok(mk_bind_expr(
-        &func_bind_trig(ctx, qid_name.to_string(), typ_params, params, &trigs, opts),
-        &f_imply,
-    ))
+    let bind = func_bind_trig(ctx, qid_name.to_string(), typ_params, params, &trigs, opts);
+    crate::sst_to_air::record_qid_role(ctx, &bind, role);
+    Ok(mk_bind_expr(&bind, &f_imply))
 }
 
 pub(crate) fn hide_projections_air(
@@ -380,6 +380,8 @@ fn func_body_to_air(
         let opts = Some(FuncBindOpts { add_fuel: true, add_default_ensures: false });
         let bind_zero = func_bind(ctx, name_zero, &typ_params, pars, &rec_f_fuel, opts);
         let bind_body = func_bind(ctx, name_body, &typ_params, pars, &rec_f_succ, opts);
+        crate::sst_to_air::record_qid_role(ctx, &bind_zero, QuantRole::DefinitionBase);
+        crate::sst_to_air::record_qid_role(ctx, &bind_body, QuantRole::DefinitionUnfold);
         let implies_body = mk_implies(&mk_and(&def_reqs), &eq_body);
         let forall_zero = mk_bind_expr(&bind_zero, &eq_zero);
         let forall_body = mk_bind_expr(&bind_body, &implies_body);
@@ -405,6 +407,7 @@ fn func_body_to_air(
         &extra_trigger_terms,
         substs,
         def_body,
+        QuantRole::Definition,
     )?;
     let fuel_bool = str_apply(FUEL_BOOL, &vec![ident_var(&id_fuel)]);
     let def_axiom = mk_unnamed_axiom(mk_implies(&fuel_bool, &e_forall));
@@ -522,6 +525,7 @@ fn req_ens_to_air(
             &vec![],
             None,
             body,
+            QuantRole::Contract,
         )?;
         let req_ens_axiom = mk_unnamed_axiom(e_forall);
         commands.push(Arc::new(CommandX::Global(req_ens_axiom)));
@@ -540,14 +544,16 @@ pub fn func_name_to_air(
     function: &FunctionSst,
 ) -> Result<Commands, VirErr> {
     let mut commands: Vec<Command> = Vec::new();
+    // each type parameter is declared as a decoration and a type id before
+    // the value parameters, as `typ_to_ids` passes each type argument
+    let type_args = function.x.typ_params.len() * crate::def::types().len();
     let declare_rec = |commands: &mut Vec<Command>| {
         // Check whether we need to declare the recursive version too
         if function.x.has.has_body {
             if function.x.has.is_recursive {
-                let rec_f = suffix_global_id(&fun_to_air_ident(
-                    &ctx.name_ctxt,
-                    &prefix_recursive_fun(&function.x.name),
-                ));
+                let rec_fun = prefix_recursive_fun(&function.x.name);
+                let rec_f = suffix_global_id(&fun_to_air_ident(&ctx.name_ctxt, &rec_fun));
+                ctx.name_ctxt.record_source_function(&rec_f, &rec_fun, type_args);
                 let mut rec_typs =
                     vec_map(&*function.x.pars, |param| typ_to_air(ctx, &param.x.typ));
                 for _ in function.x.typ_params.iter() {
@@ -585,8 +591,9 @@ pub fn func_name_to_air(
         if let FunctionKind::TraitMethodDecl { .. } = &function.x.kind {
             names.push(crate::def::trait_default_name(&function.x.name));
         }
-        for name in names {
-            let name = suffix_global_id(&fun_to_air_ident(&ctx.name_ctxt, &name));
+        for fun in names {
+            let name = suffix_global_id(&fun_to_air_ident(&ctx.name_ctxt, &fun));
+            ctx.name_ctxt.record_source_function(&name, &fun, type_args);
             let decl = Arc::new(DeclX::Fun(name, all_typs.clone(), typ.clone()));
             commands.push(Arc::new(CommandX::Global(decl)));
         }
@@ -868,6 +875,7 @@ pub fn func_axioms_to_air(
                         &extra_trigger_terms,
                         substs,
                         body,
+                        QuantRole::Definition,
                     )?;
                     let def_axiom = mk_unnamed_axiom(e_forall);
                     decl_commands.push(Arc::new(CommandX::Global(def_axiom)));
@@ -919,17 +927,16 @@ pub fn func_axioms_to_air(
                     } else {
                         None
                     };
-                    let e_forall = mk_bind_expr(
-                        &func_bind(
-                            ctx,
-                            name,
-                            &function.x.typ_params,
-                            &function.x.pars,
-                            &f_app,
-                            opts,
-                        ),
-                        &mk_implies(&mk_and(&f_pre), &post),
+                    let bind = func_bind(
+                        ctx,
+                        name,
+                        &function.x.typ_params,
+                        &function.x.pars,
+                        &f_app,
+                        opts,
                     );
+                    crate::sst_to_air::record_qid_role(ctx, &bind, QuantRole::ReturnTypeInvariant);
+                    let e_forall = mk_bind_expr(&bind, &mk_implies(&mk_and(&f_pre), &post));
                     let inv_axiom = mk_unnamed_axiom(e_forall);
                     decl_commands.push(Arc::new(CommandX::Global(inv_axiom)));
                 }

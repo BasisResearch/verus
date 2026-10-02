@@ -150,6 +150,9 @@ pub(crate) fn smt_check_assertion<'ctx>(
     only_check_earlier: bool,
     report_long_running: Option<&mut ReportLongRunning>,
 ) -> ValidityResult {
+    // a check that returns before reading its reply must not leave the
+    // previous check's diagnostics behind for its caller to take
+    context.last_failure_diagnostics = None;
     let disabled_expr = if only_check_earlier {
         // disable all labels that come after the first known error
         let mut disabled: Vec<Expr> = Vec::new();
@@ -274,6 +277,14 @@ pub(crate) fn smt_check_assertion<'ctx>(
 
     let unsat = unsat.expect("expected sat/unsat/unknown from SMT solver");
 
+    // A failed check: read what the solver can say about it while its
+    // records still describe this check (see `crate::diagnostics`).
+    let mut failure_diagnostics = if context.failure_diagnostics && unsat != SmtOutput::Unsat {
+        Some(crate::diagnostics::read_after_failed_check(context, unsat == SmtOutput::Unknown))
+    } else {
+        None
+    };
+
     enum ResultDetermination<T> {
         Determined(ValidityResult),
         Undetermined(T),
@@ -284,6 +295,12 @@ pub(crate) fn smt_check_assertion<'ctx>(
         SmtOutput::Sat => ResultDetermination::Undetermined(false),
         SmtOutput::Unknown => {
             context.smt_log.log_get_info("reason-unknown");
+            if failure_diagnostics.is_some() {
+                // cvc5 records both when check-sat returns, so they describe
+                // this answer. A cvc5 without the keys answers `unsupported`.
+                context.smt_log.log_get_info("incomplete-id");
+                context.smt_log.log_get_info("incomplete-culprits");
+            }
             let smt_data = context.smt_log.take_pipe_data();
             let smt_output = context.get_smt_process().send_commands(smt_data);
 
@@ -295,7 +312,31 @@ pub(crate) fn smt_check_assertion<'ctx>(
             }
 
             let mut reason = None;
+            let mut unknown_reason = crate::diagnostics::UnknownReason::default();
             for line in smt_output {
+                if failure_diagnostics.is_some() {
+                    if let Some(id) =
+                        line.strip_prefix("(:incomplete-id ").and_then(|s| s.strip_suffix(')'))
+                    {
+                        if id != "NONE" {
+                            unknown_reason.incomplete_id = Some(id.to_owned());
+                        }
+                        continue;
+                    }
+                    if line.starts_with("(:incomplete-culprits ") {
+                        unknown_reason.culprit_qids =
+                            crate::diagnostics::parse_incomplete_culprits(&line);
+                        continue;
+                    }
+                    if line == "unsupported" {
+                        continue;
+                    }
+                    if let Some(r) =
+                        line.strip_prefix("(:reason-unknown ").and_then(|s| s.strip_suffix(')'))
+                    {
+                        unknown_reason.reason = r.trim_matches('"').to_owned();
+                    }
+                }
                 if context.solver.reason_unknown_canceled_strs().iter().any(|s| line == *s) {
                     assert!(reason == None);
                     reason = Some(SmtReasonUnknown::Canceled);
@@ -322,6 +363,12 @@ pub(crate) fn smt_check_assertion<'ctx>(
                 }
             }
 
+            if let Some(diagnostics) = &mut failure_diagnostics {
+                diagnostics.unknown_reason = Some(unknown_reason);
+                diagnostics.matching_loops = Some(crate::diagnostics::read_matching_loops(context));
+                diagnostics.inst_cycles = Some(crate::diagnostics::read_inst_cycles(context));
+            }
+
             match reason.expect("expected :reason-unknown") {
                 SmtReasonUnknown::Canceled | SmtReasonUnknown::Unknown => {
                     context.state = ContextState::Canceled;
@@ -331,6 +378,8 @@ pub(crate) fn smt_check_assertion<'ctx>(
             }
         }
     };
+
+    context.last_failure_diagnostics = failure_diagnostics;
 
     match unsat_result {
         ResultDetermination::Determined(r) => r,
@@ -530,6 +579,10 @@ pub(crate) fn smt_check_query<'ctx>(
         _ => panic!("internal error: query not lowered"),
     };
     let assertion = elim_zero_args_expr(assertion);
+    if context.failure_diagnostics {
+        // focuses the e-graph reading after a failed check (see `crate::diagnostics`)
+        context.failure_query = Some(assertion.clone());
+    }
 
     // add labels to assertions for error reporting
     let mut infos: Vec<AssertionInfo> = Vec::new();

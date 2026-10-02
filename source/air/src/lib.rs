@@ -1,6 +1,7 @@
 pub mod ast;
 pub mod ast_util;
 pub mod context;
+pub mod diagnostics;
 pub mod emitter;
 pub mod focus;
 pub mod messages;

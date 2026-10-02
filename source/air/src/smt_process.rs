@@ -100,19 +100,39 @@ fn reader_thread(
 }
 
 impl SmtProcess {
-    pub fn launch(solver: &SmtSolver, transcript_log: Option<Box<dyn std::io::Write>>) -> Self {
+    /// Start the solver. `failure_diagnostics` (cvc5 only) also has it keep
+    /// the records `crate::diagnostics` reads after a failed check.
+    pub fn launch(
+        solver: &SmtSolver,
+        transcript_log: Option<Box<dyn std::io::Write>>,
+        failure_diagnostics: bool,
+    ) -> Self {
         let solver_info = SolverInfo::new(solver);
+        let mut args = match solver {
+            SmtSolver::Z3 => vec!["-smt2", "-in"],
+            SmtSolver::Cvc5 => vec![
+                "--no-interactive",    // We don't need a human interface
+                "--produce-models",    // Needed for error reporting
+                "--quant-dsplit=none", // Recommended by Andrew Reynolds (@ajreynol)
+                "--no-cbqi",           // Recommended by Andrew Reynolds (@ajreynol)
+                "--user-pat=strict",   // Recommended by Andrew Reynolds (@ajreynol)
+            ],
+        };
+        if failure_diagnostics {
+            assert!(matches!(solver, SmtSolver::Cvc5));
+            // Records each instantiation's round, terms and parents for
+            // `(get-info :matching-loops)`; spends no resource units, so the
+            // search and its budget are those of a launch without it.
+            args.push("--matching-loops");
+            // Records which instance introduced the terms each one matched,
+            // for `(get-instantiation-graph)`; also spends no resource units.
+            // Capped well below cvc5's default of a million instances; the
+            // rest are counted as dropped.
+            args.push("--inst-graph");
+            args.push("--inst-graph-max=100000");
+        }
         let mut child = match std::process::Command::new(solver_info.executable())
-            .args(match solver {
-                SmtSolver::Z3 => vec!["-smt2", "-in"],
-                SmtSolver::Cvc5 => vec![
-                    "--no-interactive",    // We don't need a human interface
-                    "--produce-models",    // Needed for error reporting
-                    "--quant-dsplit=none", // Recommended by Andrew Reynolds (@ajreynol)
-                    "--no-cbqi",           // Recommended by Andrew Reynolds (@ajreynol)
-                    "--user-pat=strict",   // Recommended by Andrew Reynolds (@ajreynol)
-                ],
-            })
+            .args(args)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .spawn()

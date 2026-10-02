@@ -37,8 +37,10 @@ impl SmtSolverType {
         match self {
             SmtSolverType::Z3 => Regex::new(r"Z3 version (\d+\.\d+\.\d+) - \d+ bit")
                 .expect("failed to compile Z3 version regex"),
-            SmtSolverType::Cvc5 => Regex::new(r"This is cvc5 version (\d+\.\d+\.\d+)")
-                .expect("failed to compile cvc5 version regex"),
+            // The Basis cvc5 fork prints `cvc5 1.3.5.dev+main@e68dc63 [git ...]`.
+            SmtSolverType::Cvc5 => {
+                Regex::new(r"(?m)^cvc5 (\S+)").expect("failed to compile cvc5 version regex")
+            }
         }
     }
 
@@ -76,13 +78,13 @@ impl SmtSolverBinary {
             let path = std::path::Path::new(&file_name);
 
             if !path.is_file() {
-                // When we fail to find Z3, we warning the user but optimistically continue
-                // Since we don't currently use cvc5, we don't warning the user about it, and we bail out
-                match solver_type {
-                    SmtSolverType::Z3 => warning!(
-                        "{file_name} not found -- this is likely to cause errors or a broken build\nrun `tools/get-z3.(sh|ps1)` first"
-                    ),
-                    SmtSolverType::Cvc5 => return None,
+                // When we fail to find a solver, we warn the user but optimistically continue:
+                // z3 verifies vstd, and cvc5 verifies everything else
+                warning!(
+                    "{file_name} not found -- this is likely to cause errors or a broken build\nrun `tools/get-{solver_type}.(sh|ps1)` first"
+                );
+                if matches!(solver_type, SmtSolverType::Cvc5) {
+                    return None;
                 }
             }
             if std::env::var(solver_type.env_var_name()).is_err() && path.is_file() {

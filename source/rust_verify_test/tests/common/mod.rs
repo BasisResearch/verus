@@ -324,6 +324,15 @@ pub fn run_verus(
         } else if *option == "-V spinoff-all" {
             verus_args.push("-V".to_string());
             verus_args.push("spinoff-all".to_string());
+        } else if *option == "-V cvc5" {
+            verus_args.push("-V".to_string());
+            verus_args.push("cvc5".to_string());
+        } else if *option == "-V no-failure-diagnostics" {
+            verus_args.push("-V".to_string());
+            verus_args.push("no-failure-diagnostics".to_string());
+        } else if let Some(rlimit) = option.strip_prefix("--rlimit ") {
+            verus_args.push("--rlimit".to_string());
+            verus_args.push(rlimit.to_string());
         } else if *option == "--is-core" {
             verus_args.push("--is-core".to_string());
             is_core = true;
@@ -417,6 +426,7 @@ pub fn run_verus(
     }
 
     let mut child = std::process::Command::new(bin);
+    child.env("VERUS_CVC5_PATH", cvc5_path());
     child.env(
         "VERUS_Z3_PATH",
         std::env::var("VERUS_Z3_PATH")
@@ -441,6 +451,25 @@ pub fn run_verus(
         .expect("could not execute test rustc process");
     let run = child.wait_with_output().expect("lifetime rustc wait failed");
     run
+}
+
+/// The cvc5 that Verus verifies with outside its own test mode (and inside it
+/// under `-V cvc5`): `VERUS_CVC5_PATH`, resolved as `VERUS_Z3_PATH` is, or the
+/// one `tools/get-cvc5.sh` downloads into `source/`.
+pub fn cvc5_path() -> std::path::PathBuf {
+    let cvc5 = std::env::var("VERUS_CVC5_PATH")
+        .map(|p| {
+            let p = std::path::PathBuf::from(p);
+            if p.is_relative() { std::path::PathBuf::from("..").join(p) } else { p }
+        })
+        .unwrap_or({
+            if cfg!(target_os = "windows") {
+                std::path::PathBuf::from("..\\cvc5.exe")
+            } else {
+                std::path::PathBuf::from("../cvc5")
+            }
+        });
+    path::absolute(cvc5).expect("Failed to find absolute path for cvc5 executable")
 }
 
 pub fn run_verus_raw(args: &[&str], dir: &std::path::Path) -> std::process::Output {
@@ -478,6 +507,7 @@ pub fn run_verus_raw(args: &[&str], dir: &std::path::Path) -> std::process::Outp
     std::process::Command::new(bin)
         .current_dir(dir)
         .env("VERUS_Z3_PATH", z3)
+        .env("VERUS_CVC5_PATH", cvc5_path())
         .args(args)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -548,6 +578,7 @@ pub fn run_cargo_verus_with_target(
         });
     let z3 = path::absolute(z3).expect("Failed to find absolute path for Z3 executable");
     child.env("VERUS_Z3_PATH", z3);
+    child.env("VERUS_CVC5_PATH", cvc5_path());
 
     let mut cargo_verus_args = Vec::new();
     cargo_verus_args.push(args[0]);

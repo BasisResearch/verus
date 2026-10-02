@@ -57,9 +57,11 @@ const PREFIX_SIMPLIFY_TEMP_VAR: &str = "tmp%%";
 const PREFIX_TEMP_VAR: &str = "tmp%";
 pub const PREFIX_EXPAND_ERRORS_TEMP_VAR: &str = "expand%";
 const PREFIX_PRE_VAR: &str = "pre%";
-const PREFIX_BOX: &str = "Poly%";
-const PREFIX_UNBOX: &str = "%Poly%";
-const PREFIX_TYPE_ID: &str = "TYPE%";
+/// Datatype box/unbox: `(Poly%D. x)` and `(%Poly%D. p)`. Public because a
+/// reader rendering source terms has to drop them.
+pub const PREFIX_BOX: &str = "Poly%";
+pub const PREFIX_UNBOX: &str = "%Poly%";
+pub const PREFIX_TYPE_ID: &str = "TYPE%";
 const PREFIX_DYN_ID: &str = "DYN%";
 const PREFIX_DCR_ID: &str = "DCR%";
 const PREFIX_FNDEF_TYPE_ID: &str = "FNDEF%";
@@ -163,6 +165,60 @@ pub const SNAPSHOT_LOOP: &str = "LOOP";
 pub const SNAPSHOT_BOUNDARY: &str = "BOUNDARY";
 pub const T_HEIGHT: &str = "Height";
 pub const POLY: &str = "Poly";
+/// Every prefix the encoders in this file put on an AIR symbol, and every
+/// box/unbox head. `air_names::render_term` strips these to find the symbol
+/// a recorded source name is keyed on; `air_names::tests::every_prefix_is_listed`
+/// fails if a `PREFIX_` constant is added here without being listed, so the
+/// set stays exhaustive by construction rather than by anyone remembering.
+pub const AIR_SYMBOL_PREFIXES: &[&str] = &[
+    PREFIX_ESCAPE,
+    PREFIX_FUEL_ID,
+    PREFIX_FUEL_NAT,
+    PREFIX_REQUIRES,
+    PREFIX_ENSURES,
+    PREFIX_ENSURES_ASYNC_RET,
+    PREFIX_OPEN_INV,
+    PREFIX_NO_UNWIND_WHEN,
+    PREFIX_RECURSIVE,
+    PREFIX_SIMPLIFY_TEMP_VAR,
+    PREFIX_TEMP_VAR,
+    PREFIX_EXPAND_ERRORS_TEMP_VAR,
+    PREFIX_PRE_VAR,
+    PREFIX_BOX,
+    PREFIX_UNBOX,
+    PREFIX_TYPE_ID,
+    PREFIX_DYN_ID,
+    PREFIX_DCR_ID,
+    PREFIX_FNDEF_TYPE_ID,
+    PREFIX_TUPLE_TYPE,
+    PREFIX_CLOSURE_TYPE,
+    PREFIX_TUPLE_PARAM,
+    PREFIX_SPEC_FN_TYPE,
+    PREFIX_IMPL_IDENT,
+    PREFIX_IMPL_TUPLE,
+    PREFIX_IMPL_CLOSURE,
+    PREFIX_IMPL_FNDEF,
+    PREFIX_PROJECT,
+    PREFIX_PROJECT_DECORATION,
+    PREFIX_DEFAULT_TYP_PARAM,
+    PREFIX_PROJECT_PARAM,
+    PREFIX_TRAIT_BOUND,
+    PREFIX_TO_DYN,
+    PREFIX_STATIC,
+    PREFIX_BREAK_LABEL,
+    PREFIX_SNAPSHOT,
+    PREFIX_IMPL_TYPE_PARAM,
+];
+
+/// The box and unbox heads: `(I x)` and friends wrap a value into `Poly`,
+/// and the datatype forms are `PREFIX_BOX`/`PREFIX_UNBOX` applied to a path.
+/// A reader showing source terms drops them.
+pub const AIR_BOX_HEADS: &[&str] =
+    &[BOX_INT, BOX_BOOL, BOX_REAL, BOX_FNDEF, UNBOX_INT, UNBOX_BOOL, UNBOX_REAL, UNBOX_FNDEF];
+
+/// The `?` every global AIR symbol ends with.
+pub const AIR_GLOBAL_SUFFIX: &str = SUFFIX_GLOBAL;
+
 pub const BOX_INT: &str = "I";
 pub const BOX_BOOL: &str = "B";
 pub const BOX_REAL: &str = "R";
@@ -332,11 +388,23 @@ fn krate_ident_to_string(krate: &str) -> String {
 struct NameCtxtImpl {
     duplicate_name_counter: HashMap<String, u32>,
     stable_id_map: HashMap<u64, String>,
+    /// Every AIR symbol this context minted, to the source name it stands
+    /// for. Written by the encoders below, as they encode: the mangling is
+    /// not injective (the crate escape maps `\\`, `{` and `}` all to `$~`),
+    /// so a decoder cannot exist, and a reader that guesses at the spelling
+    /// drifts the moment the spelling changes. Recording the forward
+    /// direction is exact and cannot drift. Only read back to show solver
+    /// output as source; the encoding itself never consults it.
+    source_names: crate::air_names::SourceNames,
 }
 
 impl NameCtxtImpl {
     fn new() -> Self {
-        Self { duplicate_name_counter: HashMap::new(), stable_id_map: HashMap::new() }
+        Self {
+            duplicate_name_counter: HashMap::new(),
+            stable_id_map: HashMap::new(),
+            source_names: HashMap::new(),
+        }
     }
 
     fn krate_id_to_string(&mut self, id: u64, name: &str) -> String {
@@ -366,6 +434,108 @@ impl NameCtxt {
     fn krate_id_to_string(&self, id: u64, name: &str) -> String {
         self.imp.borrow_mut().krate_id_to_string(id, name)
     }
+
+    /// Remember that `mangled` (what the solver sees) stands for the source
+    /// name `source()` gives (what the user wrote), and hand `mangled` back.
+    /// Call this at the point of encoding; see `NameCtxtImpl::source_names`.
+    pub(crate) fn record_source_name(
+        &self,
+        mangled: String,
+        source: impl FnOnce() -> String,
+    ) -> String {
+        let mut imp = self.imp.borrow_mut();
+        if !imp.source_names.contains_key(&mangled) {
+            imp.source_names
+                .insert(mangled.clone(), crate::air_names::SourceName::Symbol(source()));
+        }
+        mangled
+    }
+
+    /// An AIR symbol that stands for an infix source operator.
+    pub(crate) fn record_source_operator(&self, symbol: &str, op: &str) {
+        let mut imp = self.imp.borrow_mut();
+        if !imp.source_names.contains_key(symbol) {
+            imp.source_names
+                .insert(symbol.to_string(), crate::air_names::SourceName::Operator(op.to_string()));
+        }
+    }
+
+    /// Record the head and range arguments of the cast application we emitted.
+    /// The value is last; the preceding atoms distinguish fixed and pointer widths.
+    pub(crate) fn record_source_cast(&self, application: &air::ast::Expr, typ: &str) {
+        use air::ast::{Constant, ExprX};
+        let ExprX::Apply(symbol, args) = &**application else { return };
+        let Some((_value, range_args)) = args.split_last() else { return };
+        let range_args: Option<Vec<String>> = range_args
+            .iter()
+            .map(|arg| match &**arg {
+                ExprX::Const(Constant::Nat(n)) => Some(n.to_string()),
+                ExprX::Var(name) => Some(name.to_string()),
+                _ => None,
+            })
+            .collect();
+        let Some(range_args) = range_args else { return };
+        let mut imp = self.imp.borrow_mut();
+        let entry = imp.source_names.entry(symbol.to_string()).or_insert_with(|| {
+            crate::air_names::SourceName::Cast { symbol: symbol.to_string(), types: HashMap::new() }
+        });
+        if let crate::air_names::SourceName::Cast { types, .. } = entry {
+            types.insert(range_args, typ.to_string());
+        }
+    }
+
+    pub(crate) fn record_source_constructor(&self, symbol: &Ident, variant: &crate::ast::Variant) {
+        self.imp.borrow_mut().source_names.insert(
+            symbol.to_string(),
+            crate::air_names::SourceName::Constructor {
+                name: variant.name.to_string(),
+                fields: variant.fields.iter().map(|f| f.name.to_string()).collect(),
+                style: variant.ctor_style,
+            },
+        );
+    }
+
+    /// A function application's head `symbol`, and how many of its leading
+    /// arguments are type arguments (`typ_to_ids` of each, decoration and
+    /// type id), so a source rendering can drop them: `s[i]` is emitted as
+    /// `(vstd!seq.Seq.index.? $ INT s i)`. Called at every call site; a head's
+    /// type arguments never change, so only the first call records it.
+    pub(crate) fn record_source_function(&self, symbol: &str, fun: &Fun, type_args: usize) {
+        let mut imp = self.imp.borrow_mut();
+        if let Some(crate::air_names::SourceName::Function { .. }) = imp.source_names.get(symbol) {
+            return;
+        }
+        imp.source_names.insert(
+            symbol.to_string(),
+            crate::air_names::SourceName::Function {
+                name: source_name_of_path(&fun.path),
+                type_args,
+            },
+        );
+    }
+
+    /// Lower a source variable as `LowerUniqueVar::lower` does, and record
+    /// its spelling at the encoding boundary.
+    pub(crate) fn var_ident(&self, ident: &VarIdent) -> Ident {
+        use crate::ast::VarIdentDisambiguate as D;
+        let mangled = unique_var_name(ident.0.to_string(), ident.1);
+        match ident.1 {
+            D::AirLocal
+            | D::VirTemp(_)
+            | D::ExpandErrorsDecl(_)
+            | D::BitVectorToAirDecl(_)
+            | D::ResInfTemp(_) => Arc::new(mangled),
+            D::VirRenumbered { id, .. } if id != 0 => {
+                Arc::new(self.record_source_name(mangled, || format!("{} (binding {id})", ident.0)))
+            }
+            _ => Arc::new(self.record_source_name(mangled, || ident.0.to_string())),
+        }
+    }
+
+    /// Every (AIR symbol, source name) pair minted so far.
+    pub fn source_names(&self) -> crate::air_names::SourceNames {
+        self.imp.borrow().source_names.clone()
+    }
 }
 
 // Only use this for printing diagnostics
@@ -393,10 +563,11 @@ impl NameCtxt {
 
     pub fn path_to_string(&self, path: &Path) -> String {
         let s = vec_map(&path.segments, |s| s.to_string()).join(PATH_SEPARATOR) + SUFFIX_PATH;
-        match &path.krate {
+        let mangled = match &path.krate {
             CrateId::Internal => s,
             krate => self.krate_to_string(krate) + KRATE_SEPARATOR + &s,
-        }
+        };
+        self.record_source_name(mangled, || source_name_of_path(path))
     }
 
     pub fn fun_to_string(&self, fun: &Fun) -> String {
@@ -735,7 +906,34 @@ pub fn prefix_no_unwind_when(ident: &Ident) -> Ident {
     Arc::new(PREFIX_NO_UNWIND_WHEN.to_string() + ident)
 }
 
+/// Markers that `prefix_path` buries inside a path's last segment, paired
+/// with how that variant reads in source. Stripping at the symbol start
+/// cannot see these, so they are undone from the structured path instead.
+/// `prefix_path` asserts its prefix is listed, so the set stays exhaustive
+/// by construction.
+pub const AIR_PATH_SEGMENT_PREFIXES: &[(&str, &str)] = &[(PREFIX_RECURSIVE, "recursive variant")];
+
+/// How a path reads in source, with any segment marker undone.
+fn source_name_of_path(path: &Path) -> String {
+    if let Some(last) = path.segments.last() {
+        for (prefix, note) in AIR_PATH_SEGMENT_PREFIXES {
+            if let Some(bare) = last.strip_prefix(*prefix) {
+                let mut segments: Vec<Ident> = (*path.segments).clone();
+                *segments.last_mut().expect("path last segment") = Arc::new(bare.to_string());
+                let bare = PathX { krate: path.krate.clone(), segments: Arc::new(segments) };
+                let friendly = crate::ast_util::path_as_friendly_rust_name(&Arc::new(bare));
+                return format!("{friendly} ({note})");
+            }
+        }
+    }
+    crate::ast_util::path_as_friendly_rust_name(path)
+}
+
 fn prefix_path(prefix: String, path: &Path) -> Path {
+    debug_assert!(
+        AIR_PATH_SEGMENT_PREFIXES.iter().any(|(p, _)| *p == prefix),
+        "prefix_path prefix {prefix} is missing from AIR_PATH_SEGMENT_PREFIXES"
+    );
     let mut segments: Vec<Ident> = (*path.segments).clone();
     let last: &mut Ident = segments.last_mut().expect("path last segment");
     *last = Arc::new(prefix + &**last);
@@ -783,7 +981,8 @@ pub fn encode_dt_as_path(dt: &Dt) -> Path {
 impl NameCtxt {
     pub fn variant_ident(&self, dt: &Dt, variant: &str) -> Ident {
         let path = encode_dt_as_path(dt);
-        Arc::new(format!("{}{}{}", self.path_to_string(&path), VARIANT_SEPARATOR, variant))
+        let mangled = format!("{}{}{}", self.path_to_string(&path), VARIANT_SEPARATOR, variant);
+        Arc::new(self.record_source_name(mangled, || variant.to_string()))
     }
 
     pub fn is_variant_ident(&self, datatype: &Dt, variant: &str) -> Ident {
@@ -797,14 +996,20 @@ impl NameCtxt {
         field: &Ident,
         internal: bool,
     ) -> Ident {
-        Arc::new(format!(
+        let mangled = format!(
             "{}{}{}{}{}",
             self.path_to_string(path),
             VARIANT_SEPARATOR,
             variant.as_str(),
             if internal { VARIANT_FIELD_INTERNAL_SEPARATOR } else { VARIANT_FIELD_SEPARATOR },
             field.as_str()
-        ))
+        );
+        let mut imp = self.imp.borrow_mut();
+        if !imp.source_names.contains_key(&mangled) {
+            imp.source_names
+                .insert(mangled.clone(), crate::air_names::SourceName::Field(field.to_string()));
+        }
+        Arc::new(mangled)
     }
 
     pub fn variant_field_ident(&self, datatype: &Path, variant: &Ident, field: &Ident) -> Ident {
@@ -900,7 +1105,7 @@ pub fn new_internal_qid(ctx: &crate::context::Ctx, name: String) -> Option<Ident
     let qid = format!("{}{}_definition", air::profiler::INTERNAL_QUANT_PREFIX, name);
 
     if let Some(fun) = ctx.fun.as_ref() {
-        let bnd_info = crate::sst::BndInfo { fun: fun.current_fun.clone(), user: None };
+        let bnd_info = crate::sst::BndInfo { fun: fun.current_fun.clone(), user: None, role: None };
         ctx.global.qid_map.borrow_mut().insert(qid.clone(), bnd_info);
     }
 

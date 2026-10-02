@@ -324,6 +324,9 @@ pub struct Verifier {
     pub func_details: HashMap<Fun, FuncDetails>,
     /// Errors to report after verification has run
     deferred_errors: Vec<VirErr>,
+    /// What the solver said about each failed check, printed after
+    /// verification (see `crate::solver_diagnostics`)
+    failed_queries: Vec<crate::solver_diagnostics::FailedQuery>,
 
     pub via_cargo_args: Option<CargoVerusArgs>,
     // Some(DepTracker) if via_cargo_args.is_some(), None otherwise
@@ -518,6 +521,7 @@ impl Verifier {
 
             func_details: HashMap::new(),
             deferred_errors: Vec::new(),
+            failed_queries: Vec::new(),
 
             dep_tracker: if via_cargo_args.is_some() { Some(dep_tracker) } else { None },
             via_cargo_args,
@@ -567,6 +571,7 @@ impl Verifier {
 
             func_details: HashMap::new(),
             deferred_errors: Vec::new(),
+            failed_queries: Vec::new(),
 
             via_cargo_args: self.via_cargo_args.clone(),
             dep_tracker: None,
@@ -600,6 +605,7 @@ impl Verifier {
         self.func_times.extend(other.func_times);
         self.func_details.absorb_with(other.func_details, |lhs, rhs| lhs.absorb(rhs));
         self.deferred_errors.extend(other.deferred_errors);
+        self.failed_queries.extend(other.failed_queries);
     }
 
     fn get_bucket<'a>(&'a self, bucket_id: &BucketId) -> &'a Bucket {
@@ -842,6 +848,35 @@ impl Verifier {
         let mut timed_out = false;
         let mut used_axioms = None;
         loop {
+            // Like the error count, only the first check of a query reported
+            // as an error: not later multi-error rounds, recommends checks or
+            // expanded errors.
+            let reported =
+                is_first_check && level == Some(MessageLevel::Error) && !self.expand_flag;
+            if let Some(diagnostics) = air_context.take_failure_diagnostics().filter(|_| reported) {
+                use crate::solver_diagnostics::{FailedQuery, Outcome};
+                let (outcome, failed_at) = match &result {
+                    ValidityResult::Canceled => (Some(Outcome::ResourceLimit), None),
+                    ValidityResult::Invalid(_, error, _) => (
+                        Some(Outcome::Failed),
+                        error
+                            .clone()
+                            .and_then(|error| error.downcast::<vir::messages::MessageX>().ok())
+                            .and_then(|error| error.spans.first().map(|s| s.as_string.clone())),
+                    ),
+                    _ => (None, None),
+                };
+                if let Some(outcome) = outcome {
+                    self.failed_queries.push(FailedQuery {
+                        fun: context.fun.clone(),
+                        desc: context.desc.clone(),
+                        span: context.span.as_string.clone(),
+                        failed_at,
+                        outcome,
+                        diagnostics,
+                    });
+                }
+            }
             match result {
                 ValidityResult::Valid(usage_info) => {
                     if (is_check_valid && is_first_check && level == Some(MessageLevel::Error))
@@ -1160,6 +1195,9 @@ impl Verifier {
             air::context::Context::new(message_interface.clone(), self.args.solver);
         air_context.set_ignore_unexpected_smt(self.args.ignore_unexpected_smt);
         air_context.set_debug(self.args.debugger);
+        if self.args.failure_diagnostics {
+            air_context.set_failure_diagnostics(true);
+        }
         if let Some(profile_file_name) = profile_file_name {
             air_context.set_profile_with_logfile_name(
                 profile_file_name.to_str().expect("invalid prover log path").to_owned(),
@@ -2537,6 +2575,22 @@ impl Verifier {
 
         if self.args.no_verify {
             return Ok(());
+        }
+
+        if !self.failed_queries.is_empty() {
+            let joiner = crate::solver_diagnostics::Joiner::capture(&global_ctx, &krate.functions);
+            let blocks = crate::solver_diagnostics::render_all(&mut self.failed_queries, &joiner);
+            self.failed_queries.clear();
+            // Under JSON diagnostics (cargo, the test harness) every line of
+            // stderr must be a diagnostic, so each block goes out as a note.
+            let json = matches!(self.error_format, Some(ErrorOutputType::Json { .. }));
+            for block in blocks {
+                if json {
+                    reporter.report(&note_bare(block.trim_end()).to_any());
+                } else {
+                    eprint!("{block}");
+                }
+            }
         }
 
         if self.args.profile && self.count_errors == 0 {

@@ -69,6 +69,9 @@ pub struct GlobalCtx {
     pub(crate) warning_ctx: Arc<WarningCtx>,
     /// Connects quantifier identifiers to the original expression
     pub qid_map: RefCell<HashMap<String, BndInfo>>,
+    /// AIR symbol -> source name, recorded by the encoders as they encode
+    /// (see `crate::air_names`), collected here from each module's NameCtxt.
+    pub air_source_names: RefCell<crate::air_names::SourceNames>,
     pub(crate) rlimit: f32,
     pub(crate) interpreter_log: Arc<std::sync::Mutex<Option<File>>>,
     pub(crate) func_call_graph_log: Arc<std::sync::Mutex<Option<FuncCallGraphLogFiles>>>,
@@ -713,6 +716,7 @@ impl GlobalCtx {
             }
         }
         let qid_map = RefCell::new(HashMap::new());
+        let air_source_names = RefCell::new(HashMap::new());
 
         let datatype_graph = crate::recursive_types::build_datatype_graph(krate, &mut span_infos);
 
@@ -730,6 +734,7 @@ impl GlobalCtx {
             trait_impl_to_extensions,
             warning_ctx,
             qid_map,
+            air_source_names,
             rlimit,
             interpreter_log,
             arch: krate.arch.word_bits,
@@ -747,6 +752,7 @@ impl GlobalCtx {
         let chosen_triggers: std::cell::RefCell<Vec<ChosenTriggers>> =
             std::cell::RefCell::new(Vec::new());
         let qid_map = RefCell::new(HashMap::new());
+        let air_source_names = RefCell::new(HashMap::new());
 
         GlobalCtx {
             chosen_triggers,
@@ -762,6 +768,7 @@ impl GlobalCtx {
             trait_impl_to_extensions: self.trait_impl_to_extensions.clone(),
             warning_ctx: self.warning_ctx.clone(),
             qid_map,
+            air_source_names,
             rlimit: self.rlimit,
             interpreter_log,
             arch: self.arch,
@@ -777,6 +784,10 @@ impl GlobalCtx {
 
     pub fn merge(&mut self, other: Self) {
         self.qid_map.borrow_mut().extend(other.qid_map.into_inner());
+        crate::air_names::merge_source_names(
+            &mut self.air_source_names.borrow_mut(),
+            other.air_source_names.into_inner(),
+        );
         self.chosen_triggers.borrow_mut().extend(other.chosen_triggers.into_inner());
     }
 
@@ -887,6 +898,13 @@ impl Ctx {
     }
 
     pub fn free(self) -> GlobalCtx {
+        // Hand this module's recorded AIR-symbol names to the crate, so a
+        // reader joining solver output to source has them after the module's
+        // NameCtxt is gone (see `crate::air_names`).
+        crate::air_names::merge_source_names(
+            &mut self.global.air_source_names.borrow_mut(),
+            self.name_ctxt.source_names(),
+        );
         self.global
     }
 

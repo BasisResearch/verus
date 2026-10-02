@@ -14,7 +14,7 @@ use crate::smt_verify::ReportLongRunning;
 use crate::typecheck::Typing;
 use sise::TreeNode as Node;
 use std::any::Any;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -125,6 +125,17 @@ pub struct Context {
     pub(crate) usage_info_enabled: bool,
     pub(crate) check_valid_used: bool,
     pub(crate) solver: SmtSolver,
+    /// Read what the solver can say about each failed check (cvc5 only; see
+    /// `crate::diagnostics`).
+    pub(crate) failure_diagnostics: bool,
+    /// The current query's lowered assertion, which focuses the e-graph
+    /// reading on the query's own terms, when `failure_diagnostics`.
+    pub(crate) failure_query: Option<crate::ast::Expr>,
+    /// SSA symbol -> AIR variable and version for the current query, when
+    /// `failure_diagnostics`.
+    pub(crate) variable_versions: crate::diagnostics::VariableVersions,
+    /// What was read about the most recent failed check, until taken.
+    pub(crate) last_failure_diagnostics: Option<crate::diagnostics::FailureDiagnostics>,
 }
 
 impl Context {
@@ -192,6 +203,10 @@ impl Context {
             usage_info_enabled: false,
             check_valid_used: false,
             solver,
+            failure_diagnostics: false,
+            failure_query: None,
+            variable_versions: HashMap::new(),
+            last_failure_diagnostics: None,
         };
         context.axiom_infos.push_scope(false);
         context.array_map.push_scope(false);
@@ -207,7 +222,8 @@ impl Context {
         // Only start the smt process if there are queries to run
         if self.smt_process.is_none() {
             let transcript_log = self.smt_transcript_log.take();
-            self.smt_process = Some(SmtProcess::launch(&self.solver, transcript_log));
+            self.smt_process =
+                Some(SmtProcess::launch(&self.solver, transcript_log, self.failure_diagnostics));
         }
         self.smt_process.as_mut().unwrap()
     }
@@ -262,6 +278,25 @@ impl Context {
 
     pub fn set_expected_solver_version(&mut self, version: String) {
         self.expected_solver_version = Some(version);
+    }
+
+    /// Read what the solver can say about every check that fails, for
+    /// `take_failure_diagnostics` (cvc5 only; must precede the first query).
+    /// Nothing is read after a check that proves its query.
+    pub fn set_failure_diagnostics(&mut self, enabled: bool) {
+        assert!(matches!(self.state, ContextState::NotStarted));
+        assert!(!enabled || matches!(self.solver, SmtSolver::Cvc5));
+        self.failure_diagnostics = enabled;
+    }
+
+    pub fn failure_diagnostics(&self) -> bool {
+        self.failure_diagnostics
+    }
+
+    /// What was read about the most recent check that failed, if it was
+    /// read; each call returns it once.
+    pub fn take_failure_diagnostics(&mut self) -> Option<crate::diagnostics::FailureDiagnostics> {
+        self.last_failure_diagnostics.take()
     }
 
     pub fn set_profile_with_logfile_name(&mut self, file_name: String) {
@@ -498,7 +533,9 @@ impl Context {
             Ok(query) => query,
             Err(err) => return ValidityResult::TypeError(err),
         };
-        let (query, snapshots, local_vars) = crate::var_to_const::lower_query(&query);
+        let (query, snapshots, local_vars, variable_versions) =
+            crate::var_to_const::lower_query(&query, self.failure_diagnostics);
+        self.variable_versions = variable_versions;
         self.air_middle_log.log_query(&query);
         let query = crate::block_to_assert::lower_query(message_interface, &query);
         self.air_final_log.log_query(&query);
