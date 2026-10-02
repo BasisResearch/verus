@@ -149,12 +149,9 @@ impl VargoContext {
             .expect("find_path for Z3 always returns a path");
         let solver_binary_cvc5 = SmtSolverBinary::find_path(SmtSolverType::Cvc5);
 
-        // check binary versions
+        // check binary versions; only z3 is pinned, any cvc5 is accepted
         if cli.command.needs_solver_version_check() && cli.options.solver_version_check {
             solver_binary_z3.check_version()?;
-            if let Some(cvc5) = &solver_binary_cvc5 {
-                cvc5.check_version()?;
-            }
         }
 
         let verus_version = match crate::util::version_info(&repo_root) {

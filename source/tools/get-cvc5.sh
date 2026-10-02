@@ -8,19 +8,23 @@
 # both together.
 
 cvc5_repo="BasisResearch/cvc5"
-cvc5_tag="basis-e68dc63e37"
+cvc5_tag="basis-6c96b55f6c"
 
 case "$(uname -s)/$(uname -m)" in
     Darwin/arm64)
         filename="cvc5-arm64-macos"
-        sha256="12a465c5f684e8b3a7170580047f6a66a517e86c10ea7dc484e74d0a3f78adc3"
+        sha256="11adb95c90e72c1f65785dfd835c856c4519870da6608f90fab8ff41706b8ba7"
         ;;
     Linux/x86_64)
         filename="cvc5-x86-linux"
-        sha256="66aa2969667607a4852377cb39b1561b315aecd4045ab554f06e576fa95e3920"
+        sha256="4803479d4124b52943e3f0d65bbfa35bb00d208d9c0ad91b3d7b00a7cac33968"
+        ;;
+    Linux/aarch64 | Linux/arm64)
+        filename="cvc5-arm64-linux"
+        sha256="39ba75c3f4990a1277d1e9a208bb3a92650b736c89b690f2482002751c381025"
         ;;
     *)
-        echo "The Basis cvc5 build is published for macOS arm64 and Linux x86_64 only." >&2
+        echo "The Basis cvc5 build is published for macOS arm64, Linux x86_64 and Linux arm64 only." >&2
         exit 1
         ;;
 esac

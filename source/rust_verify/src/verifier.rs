@@ -1395,15 +1395,12 @@ impl Verifier {
             profile_all_file_name.as_ref(),
             vir::def::ProverChoice::DefaultProver,
         )?;
-        if self.args.solver_version_check {
-            air_context.set_expected_solver_version(match self.args.solver {
-                air::context::SmtSolver::Z3 => {
-                    cargo_verus_toolchains::external_deps::Z3_VERSION.to_string()
-                }
-                air::context::SmtSolver::Cvc5 => {
-                    cargo_verus_toolchains::external_deps::CVC5_VERSION.to_string()
-                }
-            });
+        // Only z3 is pinned: any cvc5 is accepted, and the failure
+        // diagnostics read what the one in use can answer.
+        if self.args.solver_version_check && matches!(self.args.solver, SmtSolver::Z3) {
+            air_context.set_expected_solver_version(
+                cargo_verus_toolchains::external_deps::Z3_VERSION.to_string(),
+            );
         }
 
         let mut spunoff_time_smt_init = Duration::ZERO;
