@@ -146,6 +146,9 @@ pub struct ArgsX {
     /// `-V tla-export=<module>[:<inv>,...]`: write the module's transition
     /// system as TLA+, checking the named invariants (or the default ones).
     pub tla_export: Option<String>,
+    /// `-V tla-export-expr=<fn>,...`: also export these spec fns over the
+    /// state as operators, reported in the `.tla.json` beside the model.
+    pub tla_export_exprs: Vec<String>,
     /// Record cvc5's per-quantifier instantiation pressure for every query.
     pub inst_pressure: bool,
     pub reach: Option<String>,
@@ -205,6 +208,7 @@ impl ArgsX {
             nl_frontier: Default::default(),
             matching_loops: Default::default(),
             tla_export: None,
+            tla_export_exprs: Vec::new(),
             matching_loop_rounds: Default::default(),
             inst_pressure: Default::default(),
             reach: Default::default(),
@@ -464,6 +468,7 @@ pub fn parse_args_with_imports(
     const EXTENDED_INST_PRESSURE: &str = "inst-pressure";
     const EXTENDED_DIFFICULTY: &str = "difficulty";
     const EXTENDED_TLA_EXPORT: &str = "tla-export";
+    const EXTENDED_TLA_EXPORT_EXPR: &str = "tla-export-expr";
     const EXTENDED_KEYS: &[(&str, &str)] = &[
         (
             EXTENDED_INST_PRESSURE,
@@ -504,6 +509,10 @@ pub fn parse_args_with_imports(
         (
             EXTENDED_TLA_EXPORT,
             "Export the transition system in the named module (-V tla-export=crate::a::b) to TLA+ under the log directory: <State>_tla.tla (named after its module, as TLC requires), a .cfg skeleton, a .tla.json report of what was recognised, refused and left unbounded, and of every candidate invariant, and a trace spec <State>_tla_trace.tla that checks a logged implementation behaviour against the model; -V tla-export=crate::a::b:inv1,inv2 checks exactly the named invariants. The export runs before verification, and under --no-verify too",
+        ),
+        (
+            EXTENDED_TLA_EXPORT_EXPR,
+            "With -V tla-export, also export the named spec fns (-V tla-export-expr=crate::m::f,crate::m::g), each over the state or a pre/post pair, as operators in the model's names: the .tla.json lists each with the definitions the model's .tla lacks, its holes and refusals, and the layout of its result type. The .tla itself is unchanged",
         ),
         (EXTENDED_ALLOW_INLINE_AIR, "Allow the POTENTIALLY UNSOUND use of inline_air_stmt"),
         (
@@ -957,6 +966,20 @@ pub fn parse_args_with_imports(
                 "-V {EXTENDED_TLA_EXPORT} needs a module path: -V {EXTENDED_TLA_EXPORT}=crate::a::b, or crate::a::b:inv1,inv2 to name the invariants"
             )),
             None => None,
+        },
+        tla_export_exprs: match extended.get(EXTENDED_TLA_EXPORT_EXPR) {
+            Some(Some(names)) if !names.is_empty() => {
+                if !extended.contains_key(EXTENDED_TLA_EXPORT) {
+                    error(format!(
+                        "-V {EXTENDED_TLA_EXPORT_EXPR} exports expressions beside a model: it needs -V {EXTENDED_TLA_EXPORT}"
+                    ));
+                }
+                names.split(',').map(|n| n.trim().to_string()).filter(|n| !n.is_empty()).collect()
+            }
+            Some(_) => error(format!(
+                "-V {EXTENDED_TLA_EXPORT_EXPR} needs spec fn paths: -V {EXTENDED_TLA_EXPORT_EXPR}=crate::m::f,crate::m::g"
+            )),
+            None => Vec::new(),
         },
         matching_loop_rounds: match extended.get(EXTENDED_MATCHING_LOOPS) {
             // zero rounds would instantiate nothing and fail every quantified check

@@ -899,7 +899,7 @@ impl Verifier {
     /// spec `<State>_tla_trace.tla` with its `.cfg`), since TLC only loads a
     /// module from a file of the same name.
     fn export_tla(&mut self, krate: &Krate, arg: &str) -> Result<(), VirErr> {
-        let export = vir::tla::export_module(krate, arg)
+        let export = vir::tla::export_module(krate, arg, &self.args.tla_export_exprs)
             .map_err(|e| crate::util::error(format!("tla-export: {e}")))?;
         let dir = self.log_dir()?;
         let json = serde_json::to_string_pretty(&export.report).unwrap_or_else(|_| "{}".into());

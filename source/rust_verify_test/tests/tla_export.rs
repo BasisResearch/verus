@@ -2578,7 +2578,8 @@ fn tla_export_assigns_a_bare_bool_field() {
 
 /// A helper Init calls is printed once, orienting `s.x == s.y` by its own
 /// conjuncts alone (`x = y`), so it does not assign `y` after the caller
-/// assigned `x`: TLC stops on `x = y` with `y` unassigned. The report says so.
+/// assigned `x`. `y` is a `u8`, so Init draws it from `0..255` and `init`
+/// keeps the one value `x = y` allows; the report says so.
 const INIT_HELPER_EQUALITY: &str = r#"
 verus! {
 pub struct State { pub x: u8, pub y: u8 }
@@ -2599,13 +2600,18 @@ pub open spec fn small(s: State) -> bool { s.x < 9 }
 fn tla_export_reads_an_init_helper_as_it_is_printed() {
     let ex = export_code(INIT_HELPER_EQUALITY, "test_crate");
     assert!(ex.tla.contains("same ==\n    (x = y)"), "{}", ex.tla);
-    assert_eq!(ex.report["init_unassigned"], serde_json::json!(["y"]), "{}", ex.tla);
-    assert!(ex.cfg.contains("\\* Init never assigns y"), "{}", ex.cfg);
+    assert_eq!(ex.report["init_unassigned"], serde_json::json!([]), "{}", ex.tla);
+    assert_eq!(
+        ex.report["init_enumerated"],
+        serde_json::json!([{"variable": "y", "domain": "0..255"}])
+    );
+    assert!(ex.tla.contains("Init == (y \\in 0..255) /\\ init /\\ TypeOK\n"), "{}", ex.tla);
+    assert!(!ex.cfg.contains("Init never assigns"), "{}", ex.cfg);
     let Some(jar) = tla_tools() else { return };
     sany(&jar, &ex.spec());
-    // TLC cannot compute the initial state, as the report says.
-    let out = tlc_output(&jar, &ex.spec(), &ex.cfg);
-    assert!(out.contains("0 distinct states found"), "{}", out);
+    // One initial state, x = y = 0, and x counts to 3.
+    let run = tlc(&jar, &ex.spec(), &ex.cfg);
+    assert_eq!(run.distinct, 4, "{run:?}\n{}", ex.tla);
 }
 
 /// A helper is checked inside its caller only when that caller is in the
@@ -2782,6 +2788,84 @@ fn tla_export_bounds_collections_by_holes_or_subsets() {
     assert!(run.violated.iter().all(|v| v == "no3"), "{run:?}\n{}", ex.tla);
     // 7 logs (length at most 2 over {1, 2}) x 2 sets u x 2 maps x 4 sets b.
     assert_eq!(run.distinct, 112, "{run:?}\n{}", ex.tla);
+}
+
+/// A `Map` whose keys and values have small domains is bounded as the
+/// functions from a subset of its keys to its values, in a binder's domain;
+/// a larger one is a hole. TypeOK bounds a map's keys and values, never
+/// with this domain.
+const MAP_DOMAINS: &str = r#"
+use vstd::prelude::*;
+verus! {
+pub struct State { pub m: Map<bool, bool>, pub big: Map<u8, bool> }
+
+pub open spec fn init(s: State) -> bool {
+    &&& s.m == Map::<bool, bool>::empty()
+    &&& s.big == Map::<u8, bool>::empty()
+}
+
+pub open spec fn next(pre: State, post: State) -> bool {
+    ||| post.m == pre.m.insert(true, false) && post.big == pre.big
+    ||| post.big == pre.big.insert(1u8, true) && post.m == pre.m
+}
+
+pub open spec fn m_small(s: State) -> bool {
+    forall|t: Map<bool, bool>| #[trigger] t.dom().contains(false) ==> t != s.m
+}
+
+pub open spec fn big_no3(s: State) -> bool {
+    forall|t: Map<u8, bool>| #[trigger] t.dom().contains(3u8) ==> t != s.big
+}
+}
+"#;
+
+#[test]
+fn tla_export_bounds_a_small_map_and_leaves_a_large_one_a_hole() {
+    let ex = export_code(MAP_DOMAINS, "test_crate");
+    assert_eq!(ex.report["refusals"], serde_json::json!([]), "{}", ex.tla);
+    assert!(
+        ex.tla.contains(
+            "(\\A t \\in UNION {[d__ -> BOOLEAN] : d__ \\in SUBSET BOOLEAN} : ((FALSE \\in DOMAIN t) => ~((m = t))))"
+        ),
+        "{}",
+        ex.tla
+    );
+    assert!(ex.tla.contains("(\\A t \\in Dom_Map_u8_bool : "), "{}", ex.tla);
+    let holes: Vec<(&str, &str)> = ex.report["holes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|h| (h["constant"].as_str().unwrap(), h["typ"].as_str().unwrap()))
+        .collect();
+    assert_eq!(holes, [("Dom_Map_u8_bool", "Map_u8_bool")], "{}", ex.tla);
+    // TypeOK bounds `big`'s u8 keys and says nothing of either map's domain.
+    assert!(
+        ex.tla.contains(
+            "TypeOK ==\n    /\\ (\\A k__2 \\in DOMAIN big : (0 <= k__2 /\\ k__2 <= 255))\nInit =="
+        ),
+        "{}",
+        ex.tla
+    );
+    assert!(!ex.tla.contains("m \\in UNION"), "{}", ex.tla);
+    assert!(!ex.tla.contains("big \\in"), "{}", ex.tla);
+    assert_eq!(names(&ex.report["invariants"]), ["m_small", "big_no3"]);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let mc = ex.spec().with_file_name("MC.tla");
+    std::fs::write(
+        &mc,
+        format!(
+            "---- MODULE MC ----\nEXTENDS {}\n\
+             MC_big == {{[k \\in {{}} |-> TRUE], 1 :> TRUE, 3 :> TRUE}}\n====\n",
+            ex.module
+        ),
+    )
+    .unwrap();
+    let cfg = format!("{}CONSTANTS\n  Dom_Map_u8_bool <- MC_big\n", ex.cfg);
+    let run = tlc(&jar, &mc, &cfg);
+    assert_eq!(run.violated, Vec::<String>::new(), "{run:?}\n{}", ex.tla);
+    // m is empty or {TRUE: FALSE}, big empty or {1: TRUE}.
+    assert_eq!(run.distinct, 4, "{run:?}\n{}", ex.tla);
 }
 
 /// An or-pattern that binds nothing is the disjunction of its
@@ -3889,4 +3973,912 @@ pub open spec fn next(pre: State, post: State) -> bool { exists|t: Tick| t_tick(
     .unwrap();
     let out = stops(&jar, &spec, &cfg, &log, "");
     assert!(out.contains("trace: Tick has no field x"), "{}", out);
+}
+
+/// verus-tla's `defs` and `Action`, as `mutex_liveness.rs` carries them.
+fn verus_tla_defs() -> String {
+    let src = std::fs::read_to_string(fixture("mutex_liveness.rs")).unwrap();
+    let start = src.find("pub mod defs {").unwrap();
+    let end = src.find("use action::*;").unwrap();
+    src[start..end].to_string()
+}
+
+#[test]
+fn tla_export_verus_tla_liveness_under_weak_fairness() {
+    let ex = export(&fixture("mutex_liveness.rs"), "test_crate");
+    assert_eq!(ex.report["shape"], "verus-tla");
+    assert_eq!(ex.report["refusals"], serde_json::json!([]));
+    assert_eq!(ex.report["holes"], serde_json::json!([]));
+    // `init` constrains the map key by key: Init draws it from the maps of
+    // a subset of {A, B} to the three thread states.
+    assert_eq!(ex.report["init_unassigned"], serde_json::json!([]));
+    assert_eq!(ex.report["init_enumerated"][0]["variable"], "threads");
+    assert!(ex.tla.contains("Init == (threads \\in UNION {[d__ -> "), "{}", ex.tla);
+    // Each `f().forward(input)` is an operator named after `f`, so TLC's
+    // steps and WF_vars read as the Verus actions.
+    assert!(ex.tla.contains("thread_acquires_lock(input) ==\n"), "{}", ex.tla);
+    assert!(ex.tla.contains("stutter ==\n"), "{}", ex.tla);
+    assert!(
+        ex.tla.contains(
+            "thread_acquires_lock([tag |-> \"A\"]) \\/ thread_releases_lock([tag |-> \"A\"])"
+        ),
+        "{}",
+        ex.tla
+    );
+    let props = ex.report["properties"].as_array().unwrap();
+    assert_eq!(props.len(), 1, "{:?}", props);
+    let p = &props[0];
+    assert_eq!(p["operator"], "both_threads_eventually_terminate");
+    assert_eq!(p["formula"], "<>(both_threads_are_terminated)");
+    assert_eq!(
+        p["fairness"],
+        serde_json::json!([
+            "(\\A tid \\in ({[tag |-> \"A\"]} \\cup {[tag |-> \"B\"]}) : WF_vars(thread_acquires_lock(tid)))",
+            "(\\A tid \\in ({[tag |-> \"A\"]} \\cup {[tag |-> \"B\"]}) : WF_vars(thread_releases_lock(tid)))",
+        ])
+    );
+    assert_eq!(p["assumptions"], serde_json::json!([]));
+    assert_eq!(p["without_fairness"], false);
+    assert_eq!(p["included"], true);
+    assert_eq!(p["notes"], serde_json::json!([]));
+    assert_eq!(ex.report["fairness_in_spec"], true);
+    assert!(ex.tla.contains("Spec == Init /\\ [][Next]_vars /\\ Fairness\n"), "{}", ex.tla);
+    assert!(ex.cfg.contains("PROPERTIES\n  both_threads_eventually_terminate\n"), "{}", ex.cfg);
+    // The state the property waits for is not an invariant.
+    assert_eq!(ex.report["invariants"], serde_json::json!([]));
+    assert_eq!(candidates(&ex.report), [("both_threads_are_terminated".to_string(), false)]);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let out = tlc_output_with(&jar, &ex.spec(), &ex.cfg, &[]);
+    assert!(out.contains("No error has been found"), "{}", out);
+    assert!(out.contains("8 distinct states found"), "{}", out);
+
+    // Without fairness for release, a thread may hold the lock forever.
+    let src = std::fs::read_to_string(fixture("mutex_liveness.rs")).unwrap();
+    let unfair: String = src
+        .lines()
+        .filter(|l| !l.contains("thread_releases_lock().weak_fairness"))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    let dir = TempDir::new().unwrap();
+    let entry = dir.path().join("mutex_liveness.rs");
+    std::fs::write(&entry, unfair).unwrap();
+    let ex = export(&entry, "test_crate");
+    assert_eq!(ex.report["properties"][0]["fairness"].as_array().unwrap().len(), 1);
+    let out = tlc_output_with(&jar, &ex.spec(), &ex.cfg, &[]);
+    assert!(
+        out.contains("Error: Temporal property both_threads_eventually_terminate was violated"),
+        "{}",
+        out
+    );
+    assert!(out.contains("<thread_acquires_lock("), "{}", out);
+    assert!(out.contains("Stuttering"), "{}", out);
+}
+
+/// A counter in verus-tla style with its spec in `spec()`: a property under
+/// it, and one a proof fn states without fairness.
+fn liveness_counter() -> String {
+    format!(
+        r#"
+verus! {{
+{defs}
+use action::*;
+use defs::*;
+
+pub struct S {{ pub x: u8 }}
+
+pub open spec fn init() -> StatePred<S> {{ |s: S| s.x == 0 }}
+
+pub open spec fn inc() -> Action<S, (), ()> {{
+    Action {{
+        precondition: |input: (), s: S| s.x < 3,
+        transition: |input: (), s: S| (S {{ x: (s.x + 1) as u8 }}, ()),
+    }}
+}}
+
+pub open spec fn next() -> ActionPred<S> {{
+    |s: S, s_prime: S| inc().forward(())(s, s_prime) || s_prime == s
+}}
+
+pub open spec fn spec() -> TempPred<S> {{
+    lift_state(init()).and(always(lift_action(next()))).and(inc().weak_fairness(()))
+}}
+
+pub open spec fn reaches_three() -> TempPred<S> {{
+    lift_state(init()).leads_to(lift_state(|s: S| s.x == 3))
+}}
+
+pub proof fn stops_short(m: TempPred<S>)
+    requires
+        m.entails(lift_state(init())),
+        m.entails(always(lift_action(next()))),
+    ensures
+        m.entails(eventually(lift_state(|s: S| s.x == 3))),
+{{
+    admit();
+}}
+}}
+"#,
+        defs = verus_tla_defs()
+    )
+}
+
+#[test]
+fn tla_export_verus_tla_liveness_per_property_spec() {
+    let ex = export_code(&liveness_counter(), "test_crate");
+    assert_eq!(ex.report["refusals"], serde_json::json!([]));
+    let props = ex.report["properties"].as_array().unwrap();
+    let ops: Vec<&str> = props.iter().map(|p| p["operator"].as_str().unwrap()).collect();
+    assert_eq!(ops, ["stops_short", "reaches_three"]);
+    assert_eq!(props[0]["without_fairness"], true);
+    assert_eq!(props[1]["fairness"], serde_json::json!(["WF_vars(inc)"]));
+    assert_eq!(props[1]["spec"], "test_crate::spec");
+    assert_eq!(props[1]["formula"], "(init ~> (x = 3))");
+    // The two specs differ, so Spec has no fairness and each property
+    // carries its own as a premise.
+    assert_eq!(ex.report["fairness_in_spec"], false);
+    assert!(ex.tla.contains("Spec == Init /\\ [][Next]_vars\n"), "{}", ex.tla);
+    assert!(ex.tla.contains("reaches_three ==\n    ((WF_vars(inc))) => ("), "{}", ex.tla);
+    assert!(ex.cfg.contains("PROPERTY stops_short is checked without fairness"), "{}", ex.cfg);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let only = |p: &str| ex.cfg.replace("  stops_short\n  reaches_three\n", &format!("  {p}\n"));
+    let out = tlc_output_with(&jar, &ex.spec(), &only("reaches_three"), &[]);
+    assert!(out.contains("No error has been found"), "{}", out);
+    let out = tlc_output_with(&jar, &ex.spec(), &only("stops_short"), &[]);
+    assert!(out.contains("Error: Temporal property stops_short was violated"), "{}", out);
+    assert!(out.contains("Stuttering"), "{}", out);
+}
+
+/// A verus-tla counter that `inc()` and `bump(b)` (enabled only for `true`)
+/// count to 3, with `spec` as the body of `spec()` and `rest` after it.
+fn liveness_counter_with(spec: &str, rest: &str) -> String {
+    format!(
+        r#"
+verus! {{
+{defs}
+use action::*;
+use defs::*;
+
+pub struct S {{ pub x: u8 }}
+
+pub open spec fn init() -> StatePred<S> {{ |s: S| s.x == 0 }}
+
+pub open spec fn inc() -> Action<S, (), ()> {{
+    Action {{
+        precondition: |input: (), s: S| s.x < 3,
+        transition: |input: (), s: S| (S {{ x: (s.x + 1) as u8 }}, ()),
+    }}
+}}
+
+pub open spec fn bump() -> Action<S, bool, ()> {{
+    Action {{
+        precondition: |b: bool, s: S| s.x < 3 && b,
+        transition: |b: bool, s: S| (S {{ x: (s.x + 1) as u8 }}, ()),
+    }}
+}}
+
+pub open spec fn next() -> ActionPred<S> {{
+    |s: S, s_prime: S| inc().forward(())(s, s_prime) || bump().forward(true)(s, s_prime) || s_prime == s
+}}
+
+pub open spec fn spec() -> TempPred<S> {{ {spec} }}
+
+{rest}
+}}
+"#,
+        defs = verus_tla_defs()
+    )
+}
+
+/// Only WF_vars goes into Spec: a spec's `always(lift_state(p))` is the
+/// property's premise (TLC cannot take `[]P` in a Spec).
+#[test]
+fn tla_export_verus_tla_spec_assumption_is_a_premise() {
+    let ex = export_code(
+        &liveness_counter_with(
+            "lift_state(init()).and(always(lift_action(next()))).and(inc().weak_fairness(())).and(always(lift_state(|s: S| s.x <= 3)))",
+            "pub open spec fn reaches_three() -> TempPred<S> { eventually(lift_state(|s: S| s.x == 3)) }",
+        ),
+        "test_crate",
+    );
+    assert_eq!(ex.report["refusals"], serde_json::json!([]));
+    let p = &ex.report["properties"][0];
+    assert_eq!(p["fairness"], serde_json::json!(["WF_vars(inc)"]));
+    assert_eq!(p["assumptions"], serde_json::json!(["[]((x <= 3))"]));
+    assert_eq!(ex.report["fairness_in_spec"], true);
+    assert!(ex.tla.contains("Spec == Init /\\ [][Next]_vars /\\ Fairness\n"), "{}", ex.tla);
+    assert!(
+        ex.tla.contains("reaches_three ==\n    (([]((x <= 3)))) => (<>((x = 3)))\n"),
+        "{}",
+        ex.tla
+    );
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let out = tlc_output_with(&jar, &ex.spec(), &ex.cfg, &[]);
+    assert!(out.contains("No error has been found"), "{}", out);
+}
+
+/// Properties share their fairness when it comes from the same spec, even
+/// where a property's own binder would rename the fairness's (`b`).
+#[test]
+fn tla_export_verus_tla_fairness_shared_by_source() {
+    let ex = export_code(
+        &liveness_counter_with(
+            "lift_state(init()).and(always(lift_action(next()))).and(tla_forall(|b: bool| bump().weak_fairness(b)))",
+            r#"
+pub open spec fn a_first() -> TempPred<S> {
+    tla_exists(|b: bool| eventually(lift_state(|s: S| s.x == 2 || b)))
+}
+
+pub open spec fn reaches_three() -> TempPred<S> { eventually(lift_state(|s: S| s.x == 3)) }
+"#,
+        ),
+        "test_crate",
+    );
+    assert_eq!(ex.report["refusals"], serde_json::json!([]));
+    let props = ex.report["properties"].as_array().unwrap();
+    assert_eq!(props.len(), 2, "{:?}", props);
+    for p in props {
+        assert_eq!(
+            p["fairness"],
+            serde_json::json!(["(\\A b \\in BOOLEAN : WF_vars(bump(b)))"]),
+            "{}",
+            ex.tla
+        );
+    }
+    assert_eq!(ex.report["fairness_in_spec"], true);
+    assert!(ex.tla.contains("Spec == Init /\\ [][Next]_vars /\\ Fairness\n"), "{}", ex.tla);
+    assert!(ex.tla.contains("reaches_three ==\n    <>((x = 3))\n"), "{}", ex.tla);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let out = tlc_output_with(&jar, &ex.spec(), &ex.cfg, &[]);
+    assert!(out.contains("No error has been found"), "{}", out);
+}
+
+/// What a lemma's requires assume is its spec, not a property: `fair_inc()`
+/// used only there is not a PROPERTY. A `spec().entails(p)` lemma's
+/// `requires spec().entails(c)` is a conjunct of its spec, and a requires
+/// that is neither is noted. A rule lemma generic over TempPreds, and one
+/// with a non-TempPred parameter, are skipped with a note.
+#[test]
+fn tla_export_verus_tla_lemma_requires_are_the_spec() {
+    let ex = export_code(
+        &liveness_counter_with(
+            "lift_state(init()).and(always(lift_action(next())))",
+            r#"
+pub open spec fn fair_inc() -> TempPred<S> { inc().weak_fairness(()) }
+
+pub proof fn reaches(m: TempPred<S>)
+    requires
+        m.entails(spec()),
+        m.entails(fair_inc()),
+    ensures
+        m.entails(eventually(lift_state(|s: S| s.x == 3))),
+{
+    admit();
+}
+
+pub proof fn reaches_given_fairness()
+    requires
+        spec().entails(fair_inc()),
+        1u8 + 1u8 == 2u8,
+    ensures
+        spec().entails(eventually(lift_state(|s: S| s.x >= 2))),
+{
+    admit();
+}
+
+pub proof fn trans(m: TempPred<S>, p: TempPred<S>, q: TempPred<S>)
+    requires
+        m.entails(p),
+        m.entails(p.implies(q)),
+    ensures
+        m.entails(q),
+{
+    admit();
+}
+
+pub proof fn indexed(i: int)
+    ensures
+        spec().entails(eventually(lift_state(|s: S| s.x == 3))),
+{
+    admit();
+}
+"#,
+        ),
+        "test_crate",
+    );
+    assert_eq!(ex.report["refusals"], serde_json::json!([]));
+    let props = ex.report["properties"].as_array().unwrap();
+    let ops: Vec<&str> = props.iter().map(|p| p["operator"].as_str().unwrap()).collect();
+    assert_eq!(ops, ["reaches", "reaches_given_fairness"], "{}", ex.tla);
+    for p in props {
+        assert_eq!(p["fairness"], serde_json::json!(["WF_vars(inc)"]), "{}", ex.tla);
+        assert_eq!(p["without_fairness"], false);
+    }
+    let notes = props[1]["notes"].as_array().unwrap();
+    assert!(notes.iter().any(|n| n.as_str().unwrap().contains("read as a conjunct of its spec")));
+    // Both take their fairness from fair_inc's body: it is shared.
+    assert_eq!(ex.report["fairness_in_spec"], true);
+    assert!(ex.tla.contains("Spec == Init /\\ [][Next]_vars /\\ Fairness\n"), "{}", ex.tla);
+    let temporal: Vec<&str> = ex.report["temporal_notes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| n.as_str().unwrap())
+        .collect();
+    let has = |s: &str| temporal.iter().any(|n| n.contains(s));
+    assert!(has("reaches_given_fairness: a requires clause at"), "{:?}", temporal);
+    assert!(has("trans: not exported, it is generic over the TempPred `p`"), "{:?}", temporal);
+    assert!(has("indexed: not exported, its parameter `i` is not a TempPred"), "{:?}", temporal);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let out = tlc_output_with(&jar, &ex.spec(), &ex.cfg, &[]);
+    assert!(out.contains("No error has been found"), "{}", out);
+}
+
+/// A TempPred spec fn another property beside `spec()` reads is a building
+/// block of it, not a property: `done()` alone fails in the initial state.
+#[test]
+fn tla_export_verus_tla_leaves_out_a_property_another_reads() {
+    let ex = export_code(
+        &liveness_counter_with(
+            "lift_state(init()).and(always(lift_action(next()))).and(inc().weak_fairness(()))",
+            r#"
+pub open spec fn done() -> TempPred<S> { lift_state(|s: S| s.x == 3) }
+
+pub open spec fn reaches_three() -> TempPred<S> { eventually(done()) }
+"#,
+        ),
+        "test_crate",
+    );
+    assert_eq!(ex.report["refusals"], serde_json::json!([]));
+    let props = ex.report["properties"].as_array().unwrap();
+    let ops: Vec<(&str, bool)> = props
+        .iter()
+        .map(|p| (p["operator"].as_str().unwrap(), p["included"].as_bool().unwrap()))
+        .collect();
+    assert_eq!(ops, [("done", false), ("reaches_three", true)], "{}", ex.tla);
+    assert!(
+        props[0]["left_out"].as_str().unwrap().starts_with("read by the property reaches_three"),
+        "{:?}",
+        props[0]
+    );
+    assert_eq!(props[1]["left_out"], serde_json::Value::Null);
+    assert!(ex.cfg.contains("PROPERTIES\n  reaches_three\n"), "{}", ex.cfg);
+    assert!(ex.cfg.contains("\\* PROPERTY done is left out"), "{}", ex.cfg);
+    assert_eq!(ex.report["fairness_in_spec"], true);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let out = tlc_output_with(&jar, &ex.spec(), &ex.cfg, &[]);
+    assert!(out.contains("No error has been found"), "{}", out);
+}
+
+/// TLC checks an action formula only as `[][A]_vars` conjoined at the top of
+/// a property with no premise, `[]<><<A>>_vars` or `<>[][A]_vars`; a
+/// property with one anywhere else is left out of the .cfg with a note,
+/// since TLC would refuse it and with it the whole run.
+#[test]
+fn tla_export_verus_tla_action_formulas_only_where_tlc_checks_them() {
+    let ex = export_code(
+        &liveness_counter_with(
+            "lift_state(init()).and(always(lift_action(next()))).and(inc().weak_fairness(()))",
+            r#"
+pub open spec fn small_steps() -> ActionPred<S> { |s: S, s_prime: S| s_prime.x <= s.x + 1 }
+
+pub open spec fn steps_and_reaches() -> TempPred<S> {
+    always(lift_action(small_steps())).and(eventually(lift_state(|s: S| s.x == 3)))
+}
+
+pub open spec fn settles() -> TempPred<S> {
+    eventually(always(lift_action(|s: S, s_prime: S| s_prime.x == s.x)))
+}
+
+pub open spec fn keeps_incrementing() -> TempPred<S> {
+    always(eventually(lift_action(inc().forward(()))))
+}
+
+pub open spec fn increments_once() -> TempPred<S> { eventually(lift_action(inc().forward(()))) }
+
+pub proof fn small_steps_given(m: TempPred<S>)
+    requires
+        m.entails(spec()),
+        m.entails(always(lift_state(|s: S| s.x <= 3))),
+    ensures
+        m.entails(always(lift_action(small_steps()))),
+{
+    admit();
+}
+
+pub proof fn reaches_given_small_steps(m: TempPred<S>)
+    requires
+        m.entails(spec()),
+        m.entails(always(lift_action(small_steps()))),
+    ensures
+        m.entails(eventually(lift_state(|s: S| s.x == 3))),
+{
+    admit();
+}
+"#,
+        ),
+        "test_crate",
+    );
+    assert_eq!(ex.report["refusals"], serde_json::json!([]));
+    let props = ex.report["properties"].as_array().unwrap();
+    let get = |op: &str| props.iter().find(|p| p["operator"] == op).expect(op);
+    for op in ["steps_and_reaches", "settles", "keeps_incrementing"] {
+        assert_eq!(get(op)["included"], true, "{op}: {:?}", get(op));
+    }
+    assert_eq!(get("steps_and_reaches")["formula"], "([][small_steps]_vars /\\ <>((x = 3)))");
+    assert_eq!(get("keeps_incrementing")["formula"], "[](<><<inc>>_vars)");
+    let left_out = |op: &str| {
+        assert_eq!(get(op)["included"], false, "{op}: {:?}", get(op));
+        assert!(ex.cfg.contains(&format!("\\* PROPERTY {op} is left out")), "{}", ex.cfg);
+        get(op)["left_out"].as_str().unwrap().to_string()
+    };
+    assert!(left_out("increments_once").contains("<><<inc>>_vars"));
+    // Its [][A]_vars is the conclusion of `[](x <= 3) => ...`.
+    assert!(left_out("small_steps_given").contains("under the premises"));
+    // Its [][A]_vars is a premise.
+    assert!(left_out("reaches_given_small_steps").contains("[][small_steps]_vars"));
+    assert!(
+        ex.cfg.contains("PROPERTIES\n  steps_and_reaches\n  settles\n  keeps_incrementing\n"),
+        "{}",
+        ex.cfg
+    );
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let only = |p: &str| {
+        ex.cfg
+            .replace("  steps_and_reaches\n  settles\n  keeps_incrementing\n", &format!("  {p}\n"))
+    };
+    for op in ["steps_and_reaches", "settles"] {
+        let out = tlc_output_with(&jar, &ex.spec(), &only(op), &[]);
+        assert!(out.contains("No error has been found"), "{op}: {}", out);
+    }
+    // Once x is 3, inc is disabled: TLC checks []<><<inc>>_vars and finds
+    // the behaviour that stops incrementing.
+    let out = tlc_output_with(&jar, &ex.spec(), &only("keeps_incrementing"), &[]);
+    assert!(out.contains("Error: Temporal property keeps_incrementing was violated"), "{}", out);
+}
+
+/// A state predicate a temporal property reads is checked by that property
+/// only when the property is in the .cfg: one read only by properties left
+/// out is checked as an invariant after all, and one an included property
+/// reads stays out, the report naming that property.
+#[test]
+fn tla_export_verus_tla_invariant_read_only_by_left_out_properties() {
+    let ex = export_code(
+        &liveness_counter_with(
+            "lift_state(init()).and(always(lift_action(next()))).and(inc().weak_fairness(()))",
+            r#"
+pub open spec fn below_three() -> StatePred<S> { |s: S| s.x < 3 }
+
+pub open spec fn three() -> StatePred<S> { |s: S| s.x == 3 }
+
+pub open spec fn reaches_three() -> TempPred<S> { eventually(lift_state(three())) }
+
+pub open spec fn below_then_moving() -> TempPred<S> {
+    always(lift_state(below_three()))
+        .and(eventually(lift_state(three())))
+        .and(eventually(lift_action(inc().forward(()))))
+}
+"#,
+        ),
+        "test_crate",
+    );
+    assert_eq!(ex.report["refusals"], serde_json::json!([]));
+    let props = ex.report["properties"].as_array().unwrap();
+    let get = |op: &str| props.iter().find(|p| p["operator"] == op).expect(op);
+    assert_eq!(get("reaches_three")["included"], true);
+    assert_eq!(get("below_then_moving")["included"], false);
+    // below_three is read only by below_then_moving, which is left out.
+    assert_eq!(names(&ex.report["invariants"]), ["below_three"], "{}", ex.cfg);
+    let cands = candidates(&ex.report);
+    assert!(cands.contains(&("below_three".to_string(), true)), "{:?}", cands);
+    assert!(cands.contains(&("three".to_string(), false)), "{:?}", cands);
+    let reason = |f: &str| {
+        ex.report["candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["function"].as_str().unwrap().ends_with(&format!("::{f}")))
+            .map(|c| c["reason"].as_str().unwrap().to_string())
+            .unwrap()
+    };
+    assert!(
+        reason("below_three").starts_with(
+            "read only by temporal properties left out of the .cfg (below_then_moving)"
+        ),
+        "{}",
+        reason("below_three")
+    );
+    // three is read by the included reaches_three too.
+    assert!(
+        reason("three").starts_with("read by the temporal property reaches_three"),
+        "{}",
+        reason("three")
+    );
+    assert!(ex.cfg.contains("INVARIANTS\n  below_three\n"), "{}", ex.cfg);
+    assert!(ex.cfg.contains("PROPERTIES\n  reaches_three\n"), "{}", ex.cfg);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    // TLC checks it: x reaches 3.
+    let out = tlc_output_with(&jar, &ex.spec(), &ex.cfg, &[]);
+    assert!(out.contains("Error: Invariant below_three is violated"), "{}", out);
+    let out =
+        tlc_output_with(&jar, &ex.spec(), &ex.cfg.replace("INVARIANTS\n  below_three\n", ""), &[]);
+    assert!(out.contains("No error has been found"), "{}", out);
+}
+
+#[test]
+fn tla_export_reports_the_type_map_and_the_steps() {
+    let ex = export(&fixture("counter.rs"), "test_crate");
+    let map = &ex.report["type_map"];
+    assert_eq!(map["state"], "test_crate::State");
+    assert_eq!(
+        map["variables"],
+        serde_json::json!([
+            {"variable": "x", "field": "x", "label": "x", "typ": {"kind": "int", "rust": "nat"}},
+            {"variable": "y", "field": "y", "label": "y", "typ": {"kind": "int", "rust": "nat"}},
+        ])
+    );
+    let step = &map["datatypes"]["test_crate::Step"];
+    assert_eq!(step["tagged"], true);
+    assert_eq!(step["kind"], "enum");
+    assert_eq!(
+        names(&serde_json::json!(
+            step["variants"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v["name"].clone())
+                .collect::<Vec<_>>()
+        )),
+        ["Inc", "Dbl"]
+    );
+    assert_eq!(map["datatypes"]["test_crate::State"]["tagged"], false);
+    assert_eq!(map["datatypes"]["test_crate::State"]["kind"], "struct");
+    // `next` is `exists|step: Step| next_step(pre, post, step)`, and
+    // `next_step` matches on the step, one transition per arm.
+    let steps = &ex.report["steps"];
+    assert_eq!(steps["binder"], "step");
+    assert_eq!(steps["body"], "next_step(step)");
+    assert_eq!(steps["domain"], "({[tag |-> \"Inc\"]} \\cup {[tag |-> \"Dbl\"]})");
+    assert_eq!(
+        steps["arms"],
+        serde_json::json!([
+            {"variant": "Inc", "function": "test_crate::t_inc", "operator": "t_inc", "args": []},
+            {"variant": "Dbl", "function": "test_crate::t_dbl", "operator": "t_dbl", "args": []},
+        ])
+    );
+    assert_eq!(ex.report["exprs"], serde_json::json!([]));
+}
+
+#[test]
+fn tla_export_steps_name_the_fields_passed_to_each_transition() {
+    let ex = export(&fixture("adder_sync.rs"), "test_crate::Adder");
+    let steps = &ex.report["steps"];
+    assert_eq!(steps["domain"], "({[tag |-> \"add\", v0 |-> v0__] : v0__ \\in Dom_Step_add_v0})");
+    let arms = steps["arms"].as_array().unwrap();
+    let add = arms.iter().find(|a| a["variant"] == "add").expect("the add arm");
+    assert_eq!(add["operator"], "add");
+    assert_eq!(add["args"], serde_json::json!([{"param": "v", "field": "0"}]));
+    let layout = &ex.report["type_map"]["datatypes"]["test_crate::Adder::Step"];
+    let variant = layout["variants"].as_array().unwrap().iter().find(|v| v["name"] == "add");
+    assert_eq!(
+        variant.unwrap()["fields"],
+        serde_json::json!([{"label": "v0", "name": "0", "typ": {"kind": "int", "rust": "int"}}])
+    );
+}
+
+/// A model with collections, and expressions in a child module the way
+/// verus-tools-mcp's model tools append them.
+const EXPR_MODEL: &str = r#"
+use vstd::prelude::*;
+verus! {
+pub enum Role { Idle, Busy { job: nat } }
+pub struct Host { pub role: Role, pub log: Seq<u8>, pub seen: Set<int>, pub acks: Map<int, bool>, pub pair: (bool, int) }
+pub struct S { pub n: nat, pub hosts: Seq<Host> }
+pub open spec fn init(s: S) -> bool { s.n == 0 && s.hosts == Seq::<Host>::empty() }
+pub open spec fn next(pre: S, post: S) -> bool { post.n == pre.n + 1 && post.hosts == pre.hosts }
+pub open spec fn small(s: S) -> bool { s.n < 3 }
+pub open spec fn helper(s: S, i: int) -> bool { 0 <= i < s.hosts.len() ==> s.hosts[i].log.len() < 4 }
+
+pub mod exprs {
+    use super::*;
+    pub open spec fn cand(s: S) -> bool { forall|i: int| 0 <= i < s.hosts.len() ==> helper(s, i) }
+    pub open spec fn unbounded(s: S) -> bool { forall|x: int| x > s.n ==> x > 0 }
+    pub open spec fn picked(s: S) -> int { choose|x: int| x == s.n }
+    pub open spec fn grew(pre: S, post: S) -> bool { post.n > pre.n && small(pre) }
+    pub open spec fn first(s: S) -> Host { s.hosts[0] }
+    pub open spec fn via(s: S) -> bool { unbounded(s) && s.n < 7 }
+    pub open spec fn modded(s: S) -> bool { (s.n as int) % ((s.n as int) - 5) >= 0 }
+    pub open spec fn later(s: S) -> bool { helper(s, 0) && s.n < 9 }
+}
+}
+"#;
+
+#[test]
+fn tla_export_exports_named_expressions_in_the_models_names() {
+    let src = TempDir::new().expect("temp dir");
+    let entry = src.path().join("test.rs");
+    std::fs::write(&entry, format!("{}\n{}\n{}\n", FEATURE_PRELUDE, USE_PRELUDE, EXPR_MODEL))
+        .unwrap();
+    let plain = export_with(&entry, "test_crate", &["--no-verify"]);
+    let names = [
+        "test_crate::exprs::cand",
+        "test_crate::exprs::unbounded",
+        "test_crate::exprs::picked",
+        "test_crate::exprs::grew",
+        "test_crate::exprs::first",
+        "test_crate::exprs::via",
+        "test_crate::exprs::modded",
+        "test_crate::exprs::later",
+        "test_crate::exprs::missing",
+    ];
+    let with = export_with(
+        &entry,
+        "test_crate",
+        &[&format!("-V tla-export-expr={}", names.join(",")), "--no-verify"],
+    );
+    // The model is exported exactly as without the expressions.
+    assert_eq!(plain.tla, with.tla);
+    assert_eq!(plain.cfg, with.cfg);
+    assert_eq!(plain.report["operators"], with.report["operators"]);
+    let exprs = with.report["exprs"].as_array().unwrap();
+    assert_eq!(exprs.len(), names.len());
+    let entry = |f: &str| {
+        exprs
+            .iter()
+            .find(|e| e["function"] == format!("test_crate::exprs::{f}"))
+            .unwrap_or_else(|| panic!("no entry for {}", f))
+    };
+    let defs_of = |e: &serde_json::Value| -> Vec<String> {
+        e["definitions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| d.as_str().unwrap().to_string())
+            .collect()
+    };
+    let cand = entry("cand");
+    assert_eq!(cand["operator"], "cand");
+    assert_eq!(cand["states"], 1);
+    assert_eq!(cand["ret"], serde_json::json!({"kind": "bool"}));
+    assert_eq!(cand["error"], serde_json::Value::Null);
+    assert_eq!(cand["tainted"], false);
+    // `helper` is not in the model's module, so it comes with the expression,
+    // before it; `small` is, so it does not.
+    let defs = defs_of(cand);
+    assert_eq!(defs.len(), 2, "{:?}", defs);
+    assert!(defs[0].starts_with("helper(i) =="), "{:?}", defs);
+    assert!(defs[1].starts_with("cand =="), "{:?}", defs);
+    assert!(!defs.iter().any(|d| d.contains("\\*")), "{:?}", defs);
+    // An unbounded quantifier is a hole whose constant the model does not
+    // declare; a `choose` is refused.
+    let unbounded = entry("unbounded");
+    assert_eq!(names_of(&unbounded["undeclared"]), ["Dom_int"]);
+    assert_eq!(unbounded["holes"].as_array().unwrap().len(), 1);
+    let picked = entry("picked");
+    assert_eq!(picked["tainted"], true);
+    assert_eq!(picked["refusals"].as_array().unwrap().len(), 1);
+    assert_eq!(picked["ret"], serde_json::json!({"kind": "int", "rust": "int"}));
+    // A pair of states reads the second primed.
+    let grew = entry("grew");
+    assert_eq!(grew["states"], 2);
+    let grew_defs = defs_of(grew);
+    assert_eq!(grew_defs.len(), 1, "{:?}", grew_defs);
+    assert!(grew_defs[0].contains("(n' > n)"), "{:?}", grew_defs);
+    // An entry carries only the operators its own operator reaches: never
+    // an earlier entry's hole or refusal it does not call.
+    for f in ["grew", "first", "modded", "later"] {
+        let e = entry(f);
+        let defs = defs_of(e);
+        assert!(
+            !defs.iter().any(|d| d.contains("Dom_int") || d.contains("Assert(FALSE")),
+            "{}: {:?}",
+            f,
+            defs
+        );
+        assert_eq!(names_of(&e["undeclared"]), Vec::<String>::new(), "{f}");
+        assert_eq!(e["holes"], serde_json::json!([]), "{f}");
+        assert_eq!(e["refusals"], serde_json::json!([]), "{f}");
+    }
+    // One calling an earlier entry's operator carries it, and its hole.
+    let via = entry("via");
+    let via_defs = defs_of(via);
+    assert_eq!(via_defs.len(), 2, "{:?}", via_defs);
+    assert!(via_defs[0].starts_with("unbounded =="), "{:?}", via_defs);
+    assert_eq!(names_of(&via["undeclared"]), ["Dom_int"]);
+    assert_eq!(via["holes"].as_array().unwrap().len(), 1);
+    // The Euclidean operators come with the entry that divides, only.
+    let modded_defs = defs_of(entry("modded"));
+    assert_eq!(modded_defs.len(), 2, "{:?}", modded_defs);
+    assert!(modded_defs[0].starts_with("EuclidMod("), "{:?}", modded_defs);
+    assert!(modded_defs[1].contains("EuclidMod("), "{:?}", modded_defs);
+    for f in ["cand", "grew", "via", "later"] {
+        assert!(!defs_of(entry(f)).iter().any(|d| d.contains("Euclid")), "{}", f);
+    }
+    // `helper` came with `cand`, and comes again with `later`, which calls it.
+    let later_defs = defs_of(entry("later"));
+    assert_eq!(later_defs.len(), 2, "{:?}", later_defs);
+    assert!(later_defs[0].starts_with("helper(i) =="), "{:?}", later_defs);
+    // A datatype result is laid out in the type map, with what it holds.
+    let first = entry("first");
+    assert_eq!(
+        first["ret"],
+        serde_json::json!({"kind": "datatype", "path": "test_crate::Host", "args": []})
+    );
+    let dts = &with.report["type_map"]["datatypes"];
+    let host = &dts["test_crate::Host"]["variants"][0]["fields"];
+    assert_eq!(
+        host[1]["typ"],
+        serde_json::json!({"kind": "seq", "elem": {"kind": "int", "rust": "u8"}})
+    );
+    assert_eq!(
+        host[2]["typ"],
+        serde_json::json!({"kind": "set", "elem": {"kind": "int", "rust": "int"}})
+    );
+    assert_eq!(
+        host[3]["typ"],
+        serde_json::json!({"kind": "map", "key": {"kind": "int", "rust": "int"}, "value": {"kind": "bool"}})
+    );
+    assert_eq!(
+        host[4]["typ"],
+        serde_json::json!({"kind": "tuple", "elems": [{"kind": "bool"}, {"kind": "int", "rust": "int"}]})
+    );
+    assert_eq!(dts["test_crate::Role"]["tagged"], true);
+    assert_eq!(dts["test_crate::Role"]["variants"][1]["fields"][0]["label"], "job");
+    assert!(entry("missing")["error"].as_str().unwrap().contains("no function"));
+    let Some(jar) = tla_tools() else { return };
+    // Every entry that can be evaluated against the model (no error, no
+    // undeclared constant, no refusal) parses in a module extending it,
+    // with its definitions in a LET.
+    let module = with.module.clone();
+    let mut probed = Vec::new();
+    for (i, e) in exprs.iter().enumerate() {
+        let blocked = !e["error"].is_null()
+            || !e["undeclared"].as_array().unwrap().is_empty()
+            || e["tainted"] == true;
+        if blocked {
+            continue;
+        }
+        let recursive: Vec<&str> =
+            e["recursive"].as_array().unwrap().iter().map(|r| r.as_str().unwrap()).collect();
+        let recursive = if recursive.is_empty() {
+            String::new()
+        } else {
+            format!("RECURSIVE {}\n", recursive.join(", "))
+        };
+        let name = format!("Probe{i}");
+        let probe = with.dir.path().join("log").join(format!("{name}.tla"));
+        std::fs::write(
+            &probe,
+            format!(
+                "---- MODULE {name} ----\nEXTENDS {module}\nC == LET\n{recursive}{}IN {}\n====\n",
+                defs_of(e).join(""),
+                e["operator"].as_str().unwrap()
+            ),
+        )
+        .unwrap();
+        sany(&jar, &probe);
+        probed.push(e["function"].as_str().unwrap().to_string());
+    }
+    assert_eq!(
+        probed,
+        ["cand", "grew", "first", "modded", "later"]
+            .map(|f| format!("test_crate::exprs::{f}"))
+            .to_vec()
+    );
+}
+
+fn names_of(v: &serde_json::Value) -> Vec<String> {
+    v.as_array().unwrap().iter().map(|x| x.as_str().unwrap().to_string()).collect()
+}
+
+/// Fields whose Rust name is not their record label, and datatypes whose
+/// encoding does not say whether they are structs or enums.
+const LAYOUTS: &str = r#"
+use vstd::prelude::*;
+verus! {
+pub enum One { Only { x: int } }
+pub enum Mark { Set }
+pub struct Pt(pub int, pub bool);
+pub struct S { pub tag: bool, pub vars: nat, pub one: One, pub mark: Mark, pub pt: Pt, pub o: Option<u8> }
+pub open spec fn init(s: S) -> bool {
+    s.tag == false && s.vars == 0 && s.one == (One::Only { x: 0 }) && s.mark == Mark::Set
+        && s.pt == Pt(0, true) && s.o == Option::<u8>::None
+}
+pub open spec fn next(pre: S, post: S) -> bool { post == pre }
+pub struct T(pub nat, pub bool);
+pub open spec fn t_init(t: T) -> bool { t.0 == 0 && t.1 }
+pub open spec fn t_next(pre: T, post: T) -> bool { post == pre }
+pub mod pos {
+    use super::*;
+    pub open spec fn init(t: T) -> bool { t_init(t) }
+    pub open spec fn next(pre: T, post: T) -> bool { t_next(pre, post) }
+}
+}
+"#;
+
+#[test]
+fn tla_export_type_map_names_rust_fields_and_datatype_kinds() {
+    let src = TempDir::new().expect("temp dir");
+    let entry = src.path().join("test.rs");
+    std::fs::write(&entry, format!("{}\n{}\n{}\n", FEATURE_PRELUDE, USE_PRELUDE, LAYOUTS)).unwrap();
+    let ex = export_with(&entry, "test_crate", &["--no-verify"]);
+    let map = &ex.report["type_map"];
+    let vars: Vec<(String, String, String)> = map["variables"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| {
+            let s = |k: &str| v[k].as_str().unwrap().to_string();
+            (s("variable"), s("field"), s("label"))
+        })
+        .collect();
+    let v = |a: &str, b: &str, c: &str| (a.to_string(), b.to_string(), c.to_string());
+    // A field `tag` is labelled `tag_`, a field `vars` held in `vars_v`: the
+    // field is always the Rust name.
+    assert_eq!(
+        vars,
+        [
+            v("tag_", "tag", "tag_"),
+            v("vars_v", "vars", "vars"),
+            v("one", "one", "one"),
+            v("mark", "mark", "mark"),
+            v("pt", "pt", "pt"),
+            v("o", "o", "o"),
+        ]
+    );
+    let dts = &map["datatypes"];
+    let kind = |p: &str| dts[p]["kind"].as_str().unwrap_or_else(|| panic!("{}", p)).to_string();
+    // An enum with one variant is encoded untagged, as a struct is; its kind
+    // says it is written `One::Only { x: 0 }`.
+    assert_eq!(dts["test_crate::One"]["tagged"], false);
+    assert_eq!(kind("test_crate::One"), "enum");
+    assert_eq!(dts["test_crate::One"]["variants"][0]["name"], "Only");
+    assert_eq!(dts["test_crate::Mark"]["tagged"], false);
+    assert_eq!(kind("test_crate::Mark"), "enum");
+    assert!(ex.tla.contains("(mark = [tag |-> \"unit\"])"), "{}", ex.tla);
+    assert_eq!(kind("test_crate::Pt"), "struct");
+    assert_eq!(dts["test_crate::Pt"]["variants"][0]["positional"], true);
+    assert_eq!(kind("test_crate::S"), "struct");
+    assert_eq!(kind("core::option::Option"), "enum");
+    assert_eq!(dts["core::option::Option"]["tagged"], true);
+    // A positional state's fields are `0`, `1`, labelled `v0`, `v1`.
+    let ex = export_with(&entry, "test_crate::pos", &["--no-verify"]);
+    let vars = &ex.report["type_map"]["variables"];
+    assert_eq!(
+        vars,
+        &serde_json::json!([
+            {"variable": "v0", "field": "0", "label": "v0", "typ": {"kind": "int", "rust": "nat"}},
+            {"variable": "v1", "field": "1", "label": "v1", "typ": {"kind": "bool"}},
+        ])
+    );
+}
+
+/// Run Verus with `options` on the expression model, expecting it to fail.
+fn verus_fails(options: &[&str]) -> String {
+    let src = TempDir::new().expect("temp dir");
+    let entry = src.path().join("test.rs");
+    std::fs::write(&entry, format!("{}\n{}\n{}\n", FEATURE_PRELUDE, USE_PRELUDE, EXPR_MODEL))
+        .unwrap();
+    let log = format!("--log-dir {}", src.path().join("log").display());
+    let mut options = options.to_vec();
+    options.push(&log);
+    let output = run_verus(&options, src.path(), &entry, true, true);
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    assert!(!output.status.success(), "{}", stderr);
+    stderr
+}
+
+#[test]
+fn tla_export_expr_needs_tla_export_and_a_value() {
+    let stderr = verus_fails(&["-V tla-export-expr=test_crate::exprs::cand", "--no-verify"]);
+    assert!(stderr.contains("it needs -V tla-export"), "{}", stderr);
+    let stderr = verus_fails(&["-V tla-export=test_crate", "-V tla-export-expr=", "--no-verify"]);
+    assert!(stderr.contains("-V tla-export-expr needs spec fn paths"), "{}", stderr);
 }

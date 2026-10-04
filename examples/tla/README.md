@@ -36,6 +36,74 @@ is verified.
   symbolically. Module `mutex_tla`. The export has no hole and no refusal and
   checks under TLC as written: 10 distinct states, both invariants hold.
 
+- `mutex_liveness.rs`, verus-tla with liveness: verus-tla's own
+  `mutex_example.rs` with the parts of `defs.rs` and `action.rs` it uses
+  copied in. Module `mutex_liveness`. The proof fn
+  `both_threads_eventually_terminate(model)` states the spec in its
+  `requires` (`model.entails(lift_state(init()))`, `always(lift_action(
+  next()))`, and `tla_forall(|tid| thread_acquires_lock().weak_fairness(tid))`
+  with the same for release) and the property in its `ensures`
+  (`eventually(lift_state(both_threads_are_terminated()))`). The export has
+  `Fairness == /\ \A tid \in {A, B} : WF_vars(thread_acquires_lock(tid)) /\
+  ...`, `Spec == Init /\ [][Next]_vars /\ Fairness` and the property as a
+  `PROPERTY`; TLC proves it (8 distinct states), and with the release fairness
+  removed reports the lasso where a thread takes the lock and the behaviour
+  stutters forever. verus-tla's unmodified `mutex_example.rs`, built against
+  the crate (`--extern`/`--import`), exports the same way.
+
+Temporal properties are verus-tla `TempPred`s. A proof fn whose `ensures` is
+`m.entails(p)` for a `TempPred` parameter `m` gives the property `p` under
+the spec its `requires` state as `m.entails(c)`; `s.entails(p)` for a spec
+expression `s` (`spec().entails(p)`) gives `p` under `s` and the `c` of its
+`requires` of the form `s.entails(c)` (TLC checks `s /\ c => p`, which
+implies the lemma); a requires clause of any other form is left out of the
+spec and noted. A lemma with a parameter that is not the receiver of its
+`ensures` (a non-`TempPred`, or a rule lemma generic over `p: TempPred`) is
+skipped with a note. Beside a spec fn `spec()`, every other spec fn of no
+parameters returning a `TempPred` that neither `spec` nor a proof fn's
+requires or ensures reads is a property under `spec()`, unless another such
+property reads it (`done()` in `eventually(done())`): a building block, left
+out of the `.cfg` as a helper invariant is.
+`always` is `[]` (`always(lift_action(a))` is `[][A]_vars`), `eventually`
+`<>`, `leads_to` `~>`, `not`/`and`/`or`/`implies` the connectives,
+`lift_state(p)` the state formula, `weak_fairness(a)` and
+`Action::weak_fairness(input)` `WF_vars(A)` of the action (the latter of its
+forward step), `tla_forall`/`tla_exists` quantifiers bounded as any binder
+is; any other function returning a `TempPred` is inlined, and one built from
+a closure over the execution (`TempPred::new`) is refused. A spec's
+`lift_state(init())` and `always(lift_action(next()))` are `Init` and
+`[][Next]_vars`. Its fairness conjuncts (`WF_vars`, under `\A` and `/\`) go
+into `Spec` when every property takes them from the same source (the same
+conjuncts, as under one `spec()`), and otherwise each property is `fairness
+=> formula` under a `Spec` without fairness. Only fairness goes into `Spec`:
+every other conjunct of a spec (`always(lift_state(p))`, fairness in another
+form) is a premise of the property, `assumptions => formula`, since TLC
+cannot take `[]P` in a `Spec`. A property whose spec states no fairness is
+checked without any, and the `.cfg` says so. TLC checks an action formula
+only as `[][A]_vars` conjoined at the top of a property with no premise,
+`[]<><<A>>_vars` (`always(eventually(lift_action(a)))`) or `<>[][A]_vars`; a
+property with one anywhere else (`eventually(lift_action(a))` alone, a spec's
+`always(lift_action(a))` for an `a` other than `next()`) would stop TLC's
+whole run, so it is left out of the `.cfg` with the reason in the report's
+`left_out`. Fairness is never assumed. A
+state predicate a property lifts is a state of the property, not an
+invariant, unless the command line names it. The report's `properties`
+lists each property with its fairness and spec; `temporal_notes` says where
+TLA+ reads a formula differently from verus-tla: `[][Next]_vars` admits
+stuttering whatever `next` says, and `WF_vars(A)` asks for a step that
+changes the state.
+
+A verus-tla action `f().forward(input)` (for a spec fn `f` of no parameters
+building an `Action`) is the operator `f(input)` (`f` for input `()`), so
+TLC names its steps and the fairness after `f`.
+
+When `init` leaves a variable unassigned and its type has a small domain,
+Init draws it from that domain before `init` filters it (`threads \in
+UNION {[d -> ThreadStates] : d \in SUBSET Tids}` for a `Map<Tid,
+ThreadState>` constrained key by key); the report's `init_enumerated` lists
+them. A `Map` whose keys and values have small domains is bounded as the
+functions from a subset of the keys to the values.
+
 The `.cfg` sets `CHECK_DEADLOCK FALSE`: Verus has no notion of deadlock,
 so a state where no step is enabled (a counter at its bound) is not an
 error, and TLC run on the export as written, with no `-deadlock` flag,
@@ -103,7 +171,7 @@ The cap holds for the variants together too: when their union would take
 more (five variants `A(u8, bool)` ... `E(u8, bool)`, 2560 values), every
 variant of more than one value has a hole per field.
 A collection is never enumerated from its Rust representation: a `Seq` or
-`Map` is a hole named after its type (`Dom_Seq_u8`, `Dom_Map_int_bool`, or
+a `Map` of large keys or values is a hole named after its type (`Dom_Seq_u8`, `Dom_Map_int_bool`, or
 per field in a variant, `Dom_Step_Put_v0`), as is an opaque
 (`external_body`) datatype, and a `Set` is the subsets of its elements'
 domain when there are at most 2^10 of them (`Set<bool>` is `SUBSET
@@ -288,10 +356,38 @@ end (depth 6);
 the second logs `t_dbl` where the counter took `t_inc`, and TLC stops at its fourth step, with `t_dbl` enabled but `x` unmatched.
 `tlc_conform` in verus-tools-mcp runs this and answers the verdict.
 
-`rust_verify_test/tests/tla_export.rs` exports the five fixtures (as crate
+`rust_verify_test/tests/tla_export.rs` exports the six fixtures (as crate
 `test_crate`, so the modules are `test_crate`, `test_crate::Adder`,
 `test_crate::Toggle`, `test_crate::Guarded` and `test_crate`) and checks the reports. With `TLA2TOOLS_JAR` naming a
 `tla2tools.jar` it also parses every export with SANY and model-checks the
 counter against `Counter.tla`:
 
     TLA2TOOLS_JAR=/path/to/tla2tools.jar vargo test -p rust_verify_test --test tla_export
+
+## Reading values back, and exporting expressions
+
+The report also carries what a tool needs to read TLC's answers back as
+Verus values. `type_map` gives each variable's state field (its Rust
+name and its record label) and lays out every datatype the state holds
+(whether it is a struct or an enum, field labels in declaration order, the
+`tag` value of each enum variant, which fields are positional), with each
+field's type as a tree over `seq`, `set`,
+`map`, `tuple`, `int`, `bool`, `char` and named datatypes, so that a TLC
+state `[x |-> 4, y |-> 0]` renders as `State { x: 4, y: 0 }` by table, not
+by guess. When `next` is `exists|step: T| body` over a datatype, `steps`
+gives the binder, its printed domain and body, and, when the body calls a
+function matching on the step, each arm's transition with the step field
+passed for each parameter: evaluating `{step \in domain : body}` over a
+pair of states names the step TLC took (TLC itself labels every step
+`Next`).
+
+`-V tla-export-expr=crate::m::f,crate::m::g` exports the named spec fns (each
+over the state, or a pre and a post state) after the model, in the model's
+names: the `.tla` is unchanged, and each expression's entry in `exprs` lists
+its operator, the definitions the `.tla` lacks (to put in a `LET` or a
+module extending the export), any `RECURSIVE` declarations they need, the
+holes and refusals it reaches (`undeclared` naming the hole constants the
+model's module does not declare), and its result type. verus-tools-mcp's
+`model_*` tools write a candidate as such a spec fn in a child module of
+the model and read it back this way, so a candidate is type-checked by
+Verus and exported by the same code as the model.
