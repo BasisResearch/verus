@@ -172,6 +172,181 @@ pub struct Report {
     /// Where the TLA+ reading of a temporal formula differs from verus-tla's,
     /// and what was passed over.
     pub temporal_notes: Vec<String>,
+    /// How every value the state holds is laid out in TLA+, so a TLA+ value
+    /// (a TLC trace state) can be read back as the Verus value it encodes.
+    pub type_map: TypeMap,
+    /// The step structure of `next`, when its body is `exists|step: T|
+    /// body` over a datatype: what a transition's step value was can then
+    /// be recovered by evaluating `{binder \in domain : body}` over the
+    /// state pair.
+    pub steps: Option<Steps>,
+    /// The expressions `-V tla-export-expr` named, exported as operators
+    /// that the `.tla` does not carry (see [`ExprExport`]).
+    pub exprs: Vec<ExprExport>,
+}
+
+/// A Verus type, as the reverse rendering reads it. Datatypes are named by
+/// path and laid out once in [`TypeMap::datatypes`]; a type the export has
+/// no encoding for is `other`, and a value of it is shown as TLA+.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TypeRef {
+    /// `bool`: TLA+ `BOOLEAN`.
+    Bool,
+    /// `int`, `nat`, `u8`, ...: a TLA+ integer.
+    Int { rust: String },
+    /// `char`: a one-character TLA+ string.
+    Char,
+    /// `Seq<elem>`: a 1-based TLA+ sequence (Verus index `i` is TLA+ `i + 1`).
+    Seq { elem: Box<TypeRef> },
+    /// `Set<elem>`: a TLA+ set.
+    Set { elem: Box<TypeRef> },
+    /// `Map<key, value>`: a TLA+ function whose `DOMAIN` is the map's domain.
+    Map { key: Box<TypeRef>, value: Box<TypeRef> },
+    /// A tuple: a TLA+ tuple `<<a, b>>`, element `i` at index `i + 1`.
+    Tuple { elems: Vec<TypeRef> },
+    /// A struct or enum, laid out in [`TypeMap::datatypes`] under `path`,
+    /// instantiated with `args` for its type parameters.
+    Datatype { path: String, args: Vec<TypeRef> },
+    /// A datatype's type parameter, inside its layout.
+    Param { name: String },
+    /// Anything else (a closure, a real, an opaque type).
+    Other { rust: String },
+}
+
+/// A record field: its TLA+ label, its Rust name (`0` for a positional
+/// field, whose label is `v0`), and its type.
+#[derive(Debug, Clone, Serialize)]
+pub struct FieldLayout {
+    pub label: String,
+    pub name: String,
+    pub typ: TypeRef,
+}
+
+/// A variant: its name, which is also the `tag` value of a tagged datatype,
+/// and its fields in declaration order.
+#[derive(Debug, Clone, Serialize)]
+pub struct VariantLayout {
+    pub name: String,
+    /// Whether the fields are positional (`V(a, b)`, labels `v0`, `v1`).
+    pub positional: bool,
+    pub fields: Vec<FieldLayout>,
+}
+
+/// Whether a datatype is a Rust struct or enum: how a value of it is
+/// written (`S { .. }` or `E::V { .. }`), which `tagged` does not say, since
+/// an enum with one variant is encoded untagged, as a struct is.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum DatatypeKind {
+    Struct,
+    Enum,
+}
+
+/// How a datatype's values are records. A datatype with one variant is a
+/// record of its fields; one with several (`tagged`) a record whose `tag`
+/// field holds the variant's name beside that variant's fields. A variant
+/// with no fields is the record of its `tag` alone, and a datatype with one
+/// variant and no fields `[tag |-> "unit"]`.
+#[derive(Debug, Clone, Serialize)]
+pub struct DatatypeLayout {
+    pub path: String,
+    /// Its last path segment, as a value of it is written.
+    pub name: String,
+    pub kind: DatatypeKind,
+    pub params: Vec<String>,
+    pub tagged: bool,
+    /// An `external_body` datatype: the export never builds or reads one.
+    pub opaque: bool,
+    pub variants: Vec<VariantLayout>,
+}
+
+/// A state variable: the TLA+ variable, the state field it holds (its Rust
+/// name, `0` for a positional field) and that field's record label (`v0`,
+/// or `tag_` for a field named `tag`), and the field's type.
+#[derive(Debug, Clone, Serialize)]
+pub struct VariableLayout {
+    pub variable: String,
+    pub field: String,
+    pub label: String,
+    pub typ: TypeRef,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TypeMap {
+    /// The state datatype's path; its values are the variables together.
+    pub state: String,
+    pub variables: Vec<VariableLayout>,
+    /// Every datatype a variable, the step or an exported expression holds,
+    /// by path.
+    pub datatypes: BTreeMap<String, DatatypeLayout>,
+    /// How each vstd collection and scalar is encoded, in words.
+    pub encodings: BTreeMap<String, String>,
+}
+
+/// `next`'s step structure: `next == \E binder \in domain : body`.
+#[derive(Debug, Clone, Serialize)]
+pub struct Steps {
+    pub binder: String,
+    pub typ: TypeRef,
+    pub domain: String,
+    pub body: String,
+    /// When `body` calls a function matching on the step, one entry per
+    /// arm naming the transition it calls; empty otherwise.
+    pub arms: Vec<StepArm>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StepArm {
+    /// The variant the arm matches; null for a wildcard arm.
+    pub variant: Option<String>,
+    /// The function the arm calls (`crate::t_send_ack`), and its operator;
+    /// null when the arm is not a single call.
+    pub function: Option<String>,
+    pub operator: Option<String>,
+    /// The called function's parameters other than the states, each with
+    /// the step field passed for it (null when the argument is not one).
+    pub args: Vec<StepArg>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StepArg {
+    pub param: String,
+    pub field: Option<String>,
+}
+
+/// One expression named by `-V tla-export-expr`: a spec fn over the state
+/// (one state parameter, or two for a pre/post pair), exported after the
+/// model with the model's own names, so its operator can be evaluated
+/// against the model's module. Its `definitions` are every operator the
+/// model's `.tla` does not already define that its operator reaches (an
+/// earlier expression's only when it calls them), to be put in a `LET` or
+/// a module extending the model's.
+#[derive(Debug, Clone, Serialize)]
+pub struct ExprExport {
+    pub function: String,
+    pub operator: Option<String>,
+    /// The number of state parameters: 1 (read unprimed) or 2 (the second
+    /// read primed).
+    pub states: usize,
+    pub ret: Option<TypeRef>,
+    pub definitions: Vec<String>,
+    /// `RECURSIVE` declarations the definitions need (`f(_, _)`).
+    pub recursive: Vec<String>,
+    /// Holes and refusals in the operators outside the model's that the
+    /// expression's operator reaches. A hole
+    /// whose constant the model's module declares is bounded as the model's
+    /// quantifiers are; one in `undeclared` cannot be evaluated against the
+    /// model, and a refusal is an `Assert(FALSE, ...)`.
+    pub holes: Vec<Hole>,
+    /// The constants of `holes` the model's module does not declare.
+    pub undeclared: Vec<String>,
+    pub refusals: Vec<Refusal>,
+    /// Whether the operator reaches a refusal (its own or one the model's
+    /// operators already had).
+    pub tainted: bool,
+    /// Why it was not exported at all.
+    pub error: Option<String>,
 }
 
 pub struct Export {
@@ -384,6 +559,18 @@ struct Exporter {
     /// Whether the property being printed has a `[][A]_vars` conjunct, which
     /// TLC checks only when the property has no premise.
     temporal_top_action: bool,
+    /// Every one-binder `exists` printed, by the address of its expression:
+    /// the binder's name, its domain and the body, for [`Steps`].
+    exists_printed: HashMap<usize, (String, String, String)>,
+    /// The operator being printed, and the operator whose body produced
+    /// each definition, hole and refusal (none outside an operator): an
+    /// exported expression carries only what its own operator reaches.
+    current_key: Option<OpKey>,
+    def_owners: Vec<Option<OpKey>>,
+    hole_owners: Vec<Option<OpKey>>,
+    refusal_owners: Vec<Option<OpKey>>,
+    /// The operators that print a Euclidean `/` or `%`.
+    euclid_users: HashSet<OpKey>,
 }
 
 fn ident_name(v: &VarIdent) -> String {
@@ -738,6 +925,7 @@ fn typ_has_specfn(
 impl Exporter {
     fn refuse(&mut self, what: impl Into<String>, span: &crate::messages::Span) -> String {
         let what = what.into();
+        self.refusal_owners.push(self.current_key.clone());
         self.refusals.push(Refusal {
             what: what.clone(),
             location: span_string(span),
@@ -1408,6 +1596,9 @@ impl Exporter {
                             return format!("({sa} {sym} {sb})");
                         }
                         self.uses_euclid = true;
+                        if let Some(k) = &self.current_key {
+                            self.euclid_users.insert(k.clone());
+                        }
                         let op = if div { EUCLID_DIV } else { EUCLID_MOD };
                         return format!("{op}({sa}, {sb})");
                     }
@@ -2282,6 +2473,15 @@ impl Exporter {
             bounds.push(format!("{name} \\in {domain}"));
         }
         let sb = if forall { self.expr(body, &env2) } else { self.in_branch(body, &env2) };
+        if !forall && binders.len() == 1 {
+            let domain = bounds[0].split_once(" \\in ").map(|(_, d)| d.to_string());
+            if let Some(domain) = domain {
+                self.exists_printed.insert(
+                    Arc::as_ptr(e) as usize,
+                    (env2.name(&binders[0].name), domain, sb.clone()),
+                );
+            }
+        }
         let q = if forall { "\\A" } else { "\\E" };
         let mut out = sb;
         for bound in bounds.into_iter().rev() {
@@ -2505,6 +2705,7 @@ impl Exporter {
                             None => (format!("Dom_{instance}_{fname}"), fname.clone()),
                         };
                         self.constants.insert(constant.clone());
+                        self.hole_owners.push(self.current_key.clone());
                         self.holes.push(Hole {
                             variable,
                             typ: typ_name(ftyp),
@@ -2541,6 +2742,7 @@ impl Exporter {
     }
 
     fn drop_hole_range(&mut self, range: std::ops::Range<usize>) {
+        self.hole_owners.drain(range.clone());
         let dropped: Vec<Hole> = self.holes.drain(range).collect();
         for h in dropped {
             if !self.holes.iter().any(|k| k.constant == h.constant) {
@@ -2947,6 +3149,7 @@ impl Exporter {
         let Some(f) = self.functions.get(fun).cloned() else { return name };
         self.emitting.insert(key.clone());
         let previous = std::mem::replace(&mut self.current, fun_as_friendly_rust_name(fun));
+        let previous_key = std::mem::replace(&mut self.current_key, Some(key.clone()));
         let previous_bound = std::mem::take(&mut self.bound);
         let previous_tainted = std::mem::replace(&mut self.current_tainted, false);
         let previous_depth = std::mem::replace(&mut self.branch_depth, 0);
@@ -3014,6 +3217,7 @@ impl Exporter {
         self.arity.insert(name.clone(), params.len());
         def.push_str(&format!("{head} ==\n    {body}\n"));
         self.defs.push(def);
+        self.def_owners.push(Some(key.clone()));
         self.record_body(key);
         self.current_calls = previous_calls;
         self.current_assigned = previous_assigned;
@@ -3026,6 +3230,7 @@ impl Exporter {
             self.tainted.insert(key.clone());
         }
         self.current = previous;
+        self.current_key = previous_key;
         self.bound = previous_bound;
         self.current_tainted = previous_tainted || self.tainted.contains(key);
         self.emitting.remove(key);
@@ -3250,6 +3455,336 @@ impl Exporter {
 /// arguments, arithmetic) is not. A call
 /// is conjunctive so its operator is recorded as called at conjunct level;
 /// its arguments are not.
+impl Exporter {
+    /// `typ` as the reverse rendering reads it; every datatype it names is
+    /// pushed on `pending` for [`Exporter::type_map`] to lay out.
+    fn type_ref(&self, typ: &Typ, pending: &mut Vec<Path>) -> TypeRef {
+        match &**typ {
+            TypX::Bool => TypeRef::Bool,
+            TypX::Int(IntRange::Char) => TypeRef::Char,
+            TypX::Int(range) => {
+                TypeRef::Int { rust: crate::ast_util::int_range_to_type_string(range) }
+            }
+            TypX::Decorate(_, _, t) | TypX::Boxed(t) => self.type_ref(t, pending),
+            TypX::TypParam(x) => TypeRef::Param { name: x.to_string() },
+            TypX::Datatype(Dt::Tuple(_), args, _) => {
+                TypeRef::Tuple { elems: args.iter().map(|a| self.type_ref(a, pending)).collect() }
+            }
+            TypX::Datatype(Dt::Path(p), args, _) => {
+                let mut args: Vec<TypeRef> =
+                    args.iter().map(|a| self.type_ref(a, pending)).collect();
+                match (path_as_friendly_rust_name(p).as_str(), args.len()) {
+                    ("vstd::seq::Seq", 1) => TypeRef::Seq { elem: Box::new(args.remove(0)) },
+                    ("vstd::set::Set", 1) => TypeRef::Set { elem: Box::new(args.remove(0)) },
+                    ("vstd::map::Map", 2) => {
+                        let value = Box::new(args.remove(1));
+                        TypeRef::Map { key: Box::new(args.remove(0)), value }
+                    }
+                    (name, _) if self.datatypes.contains_key(p) => {
+                        pending.push(p.clone());
+                        TypeRef::Datatype { path: name.to_string(), args }
+                    }
+                    _ => TypeRef::Other { rust: typ_name(typ) },
+                }
+            }
+            _ => TypeRef::Other { rust: typ_name(typ) },
+        }
+    }
+
+    /// The layout of every datatype in `pending` and of those their fields
+    /// hold, by path.
+    fn layouts(&self, mut pending: Vec<Path>) -> BTreeMap<String, DatatypeLayout> {
+        let mut out: BTreeMap<String, DatatypeLayout> = BTreeMap::new();
+        while let Some(p) = pending.pop() {
+            let path = path_as_friendly_rust_name(&p);
+            if out.contains_key(&path) {
+                continue;
+            }
+            let Some(d) = self.datatypes.get(&p) else { continue };
+            let variants =
+                d.x.variants
+                    .iter()
+                    .filter(|v| v.name.to_string() != "dummy_to_use_type_params")
+                    .map(|v| VariantLayout {
+                        name: v.name.to_string(),
+                        positional: v.fields.first().is_some_and(|f| {
+                            f.name.chars().next().is_some_and(|c| c.is_ascii_digit())
+                        }),
+                        fields: v
+                            .fields
+                            .iter()
+                            .map(|f| FieldLayout {
+                                label: field_name(&f.name),
+                                name: f.name.to_string(),
+                                typ: self.type_ref(&f.a.0, &mut pending),
+                            })
+                            .collect(),
+                    })
+                    .collect();
+            out.insert(
+                path.clone(),
+                DatatypeLayout {
+                    path,
+                    name: last_segment(&p),
+                    kind: datatype_kind(d),
+                    params: d.x.typ_params.iter().map(|(n, _)| n.to_string()).collect(),
+                    tagged: d.x.variants.len() > 1,
+                    opaque: matches!(d.x.transparency, DatatypeTransparency::Never),
+                    variants,
+                },
+            );
+        }
+        out
+    }
+
+    /// `next`'s step structure, when its body is a one-binder `exists` over
+    /// a datatype that was printed.
+    fn steps(&self, next: &Fun, pending: &mut Vec<Path>) -> Option<Steps> {
+        let f = self.functions.get(next)?;
+        let body = peel(f.x.body.as_ref()?);
+        let ExprX::Quant(q, binders, qbody) = &body.x else { return None };
+        if !matches!(q.quant, air::ast::Quant::Exists) || binders.len() != 1 {
+            return None;
+        }
+        typ_datatype(&binders[0].a)?;
+        let (binder, domain, text) = self.exists_printed.get(&(Arc::as_ptr(&body) as usize))?;
+        Some(Steps {
+            binder: binder.clone(),
+            typ: self.type_ref(&binders[0].a, pending),
+            domain: domain.clone(),
+            body: text.clone(),
+            arms: self.step_arms(qbody, &binders[0].name).unwrap_or_default(),
+        })
+    }
+
+    /// The arms of `step_fn(pre, post, step)`'s `match step { ... }`, each
+    /// with the transition it calls: `Step::Ack { i, mi } => t_ack(pre,
+    /// post, i, mi)`.
+    fn step_arms(&self, qbody: &Expr, binder: &VarIdent) -> Option<Vec<StepArm>> {
+        let call = peel(qbody);
+        let ExprX::Call { target: CallTarget::Fun(_, fun, ..), args, .. } = &call.x else {
+            return None;
+        };
+        let idx = args.iter().position(|a| read_var(a).as_ref() == Some(binder))?;
+        let g = self.functions.get(fun)?;
+        let param = g.x.params.get(idx)?.x.name.clone();
+        let gbody = peel(g.x.body.as_ref()?);
+        let ExprX::Match(place, arms, _) = &gbody.x else { return None };
+        if place_var(place).as_ref() != Some(&param) {
+            return None;
+        }
+        let mut out = Vec::new();
+        for arm in arms.iter() {
+            let mut fields: HashMap<VarIdent, Ident> = HashMap::new();
+            let variant = match &arm.x.pattern.x {
+                PatternX::Constructor(_, variant, binders) => {
+                    for b in binders.iter() {
+                        if let PatternX::Var(binding) = &b.a.x {
+                            fields.insert(binding.name.clone(), b.name.clone());
+                        }
+                    }
+                    Some(variant.to_string())
+                }
+                _ => None,
+            };
+            let called = peel(&arm.x.body);
+            let (function, operator, args) = match &called.x {
+                ExprX::Call { target: CallTarget::Fun(_, h, ..), args, .. } => {
+                    match self.functions.get(h) {
+                        Some(hf) => {
+                            let args =
+                                hf.x.params
+                                    .iter()
+                                    .zip(args.iter())
+                                    .filter(|(p, _)| !self.is_state_typ(&p.x.typ))
+                                    .map(|(p, a)| StepArg {
+                                        param: p.x.name.0.to_string(),
+                                        field: read_var(a)
+                                            .and_then(|v| fields.get(&v))
+                                            .map(|f| f.to_string()),
+                                    })
+                                    .collect();
+                            (
+                                Some(fun_as_friendly_rust_name(h)),
+                                self.op_names.get(&(h.clone(), Variant::Plain)).cloned(),
+                                args,
+                            )
+                        }
+                        None => (Some(fun_as_friendly_rust_name(h)), None, Vec::new()),
+                    }
+                }
+                _ => (None, None, Vec::new()),
+            };
+            out.push(StepArm { variant, function, operator, args });
+        }
+        Some(out)
+    }
+}
+
+/// A struct's one variant carries the struct's own name (as does an
+/// `external_body` type's); an enum's variants carry theirs. An enum whose
+/// one variant is named as the enum is taken for a struct.
+fn datatype_kind(d: &Datatype) -> DatatypeKind {
+    let Dt::Path(p) = &d.x.name else { return DatatypeKind::Struct };
+    match &d.x.variants[..] {
+        [v] if Some(&v.name) == p.segments.last() => DatatypeKind::Struct,
+        _ => DatatypeKind::Enum,
+    }
+}
+
+/// Verus's `/` and `%` are Euclidean: the remainder is never negative.
+fn euclid_defs() -> String {
+    let (a, b) = (EUCLID_A, EUCLID_B);
+    format!(
+        "{EUCLID_MOD}({a}, {b}) == {a} % (IF {b} < 0 THEN -{b} ELSE {b})\n{EUCLID_DIV}({a}, {b}) == ({a} - {EUCLID_MOD}({a}, {b})) \\div {b}\n"
+    )
+}
+
+/// How far the model's own export went, before the named expressions: its
+/// definitions, holes and refusals are the first `defs`, `holes` and
+/// `refusals` of the exporter's.
+struct ModelExtent {
+    defs: usize,
+    holes: usize,
+    refusals: usize,
+    constants: BTreeSet<String>,
+    euclid: bool,
+    recursive: BTreeMap<String, usize>,
+}
+
+impl Exporter {
+    /// Every operator `key` calls, directly or through others, with itself.
+    fn reached_from(&self, key: &OpKey) -> HashSet<OpKey> {
+        let mut seen: HashSet<OpKey> = HashSet::new();
+        let mut stack = vec![key.clone()];
+        while let Some(k) = stack.pop() {
+            if seen.insert(k.clone()) {
+                stack.extend(self.calls.get(&k).into_iter().flatten().map(|c| c.callee.clone()));
+            }
+        }
+        seen
+    }
+
+    /// Export the spec fn `name` (`-V tla-export-expr`) after the model:
+    /// its operator, and the definitions the model's module lacks.
+    fn export_expr(
+        &mut self,
+        name: &str,
+        model: &ModelExtent,
+        pending: &mut Vec<Path>,
+    ) -> ExprExport {
+        let mut out = ExprExport {
+            function: name.to_string(),
+            operator: None,
+            states: 0,
+            ret: None,
+            definitions: Vec::new(),
+            recursive: Vec::new(),
+            holes: Vec::new(),
+            undeclared: Vec::new(),
+            refusals: Vec::new(),
+            tainted: false,
+            error: None,
+        };
+        let mut found: Vec<Fun> = self
+            .functions
+            .keys()
+            .filter(|f| fun_as_friendly_rust_name(f) == name)
+            .cloned()
+            .collect();
+        found.sort_by_key(|f| format!("{f:?}"));
+        let Some(fun) = found.first().cloned() else {
+            out.error = Some(format!("no function `{name}` in the crate"));
+            return out;
+        };
+        let f = self.functions[&fun].clone();
+        let states = f.x.params.iter().filter(|p| self.is_state_typ(&p.x.typ)).count();
+        if f.x.mode != Mode::Spec
+            || f.x.body.is_none()
+            || !(1..=2).contains(&states)
+            || states != f.x.params.len()
+        {
+            out.error = Some(format!(
+                "`{name}` is not a spec fn with a body whose parameters are the state (one, or a pre and a post state)"
+            ));
+            return out;
+        }
+        self.conj_level = false;
+        let key = (fun.clone(), Variant::Plain);
+        out.operator = Some(self.ensure_function(&key));
+        out.states = states;
+        out.ret = Some(self.type_ref(&f.x.ret.x.typ, pending));
+        out.tainted = self.tainted.contains(&key);
+        // What the expression's own operator reaches outside the model's:
+        // an earlier expression's operators are carried only when this one
+        // calls them, so its holes and refusals never leak into this entry.
+        let reached = self.reached_from(&key);
+        let own = |owner: &Option<OpKey>| owner.as_ref().is_some_and(|k| reached.contains(k));
+        out.holes = (model.holes..self.holes.len())
+            .filter(|&i| own(&self.hole_owners[i]))
+            .map(|i| self.holes[i].clone())
+            .collect();
+        out.undeclared = out
+            .holes
+            .iter()
+            .map(|h| h.constant.clone())
+            .filter(|c| !model.constants.contains(c) && self.constants.contains(c))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        out.refusals = (model.refusals..self.refusals.len())
+            .filter(|&i| own(&self.refusal_owners[i]))
+            .map(|i| self.refusals[i].clone())
+            .collect();
+        if !model.euclid && reached.iter().any(|k| self.euclid_users.contains(k)) {
+            out.definitions.push(euclid_defs());
+        }
+        // In dependency order, without their comments.
+        for i in model.defs..self.defs.len() {
+            if own(&self.def_owners[i]) {
+                let text: Vec<&str> =
+                    self.defs[i].lines().filter(|l| !l.starts_with("\\*")).collect();
+                out.definitions.push(text.join("\n") + "\n");
+            }
+        }
+        let names: HashSet<&String> = reached.iter().filter_map(|k| self.op_names.get(k)).collect();
+        out.recursive = self
+            .recursive()
+            .into_iter()
+            .filter(|(r, _)| !model.recursive.contains_key(r) && names.contains(r))
+            .map(|(r, a)| if a == 0 { r } else { format!("{r}({})", vec!["_"; a].join(", ")) })
+            .collect();
+        out
+    }
+}
+
+fn encodings() -> BTreeMap<String, String> {
+    [
+        (
+            "struct",
+            "a record of its fields, labelled by name (a positional field `0` as `v0`, a field `tag` as `tag_`)",
+        ),
+        (
+            "enum",
+            "with several variants, a record whose `tag` field is the variant's name, beside that variant's fields; with one, a record of its fields as a struct (`kind` tells them apart)",
+        ),
+        (
+            "unit",
+            "a struct without fields, or an enum's one variant without fields, is `[tag |-> \"unit\"]`",
+        ),
+        ("seq", "a 1-based sequence: Verus index i is TLA+ index i + 1"),
+        ("set", "a set"),
+        ("map", "a function whose DOMAIN is the map's domain"),
+        ("tuple", "a tuple <<a, b>>: element i at index i + 1"),
+        ("int", "an integer (every Verus integer type)"),
+        ("bool", "a boolean"),
+        ("char", "a one-character string"),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_string(), v.to_string()))
+    .collect()
+}
+
 fn conjunctive(e: &Expr) -> bool {
     match &e.x {
         ExprX::Logical(LogicalOp::And | LogicalOp::Or | LogicalOp::Implies, ..)
@@ -3867,6 +4402,7 @@ impl Exporter {
             None => {
                 let constant = format!("Dom_{}", self.constant_typ_name(typ));
                 self.constants.insert(constant.clone());
+                self.hole_owners.push(self.current_key.clone());
                 self.holes.push(Hole {
                     variable: name.to_string(),
                     typ: typ_name(typ),
@@ -3904,6 +4440,7 @@ impl Exporter {
         }
         self.emitting.insert(key.clone());
         let previous = std::mem::replace(&mut self.current, fun_as_friendly_rust_name(&key.0));
+        let previous_key = std::mem::replace(&mut self.current_key, Some(key.clone()));
         let previous_bound = std::mem::take(&mut self.bound);
         let previous_tainted = std::mem::replace(&mut self.current_tainted, false);
         let previous_depth = std::mem::replace(&mut self.branch_depth, 0);
@@ -3918,6 +4455,7 @@ impl Exporter {
             if params.is_empty() { name.clone() } else { format!("{name}({})", params.join(", ")) };
         self.arity.insert(name.clone(), params.len());
         self.defs.push(format!("\\* {comment}\n{head} ==\n    {body}\n"));
+        self.def_owners.push(Some(key.clone()));
         self.record_body(key);
         self.current_calls = previous_calls;
         self.current_assigned = previous_assigned;
@@ -3930,6 +4468,7 @@ impl Exporter {
             self.tainted.insert(key.clone());
         }
         self.current = previous;
+        self.current_key = previous_key;
         self.bound = previous_bound;
         self.current_tainted = previous_tainted || self.tainted.contains(key);
         self.emitting.remove(key);
@@ -4592,7 +5131,7 @@ fn recognise(krate: &Krate, module: &str, named: Option<&[String]>) -> Result<Tr
 /// Export the transition system named by `arg`, `-V tla-export`'s argument:
 /// a module (a `crate::a::b` path as Verus prints it), optionally followed by
 /// `:inv1,inv2` naming the invariants to check.
-pub fn export_module(krate: &Krate, arg: &str) -> Result<Export, String> {
+pub fn export_module(krate: &Krate, arg: &str, exprs: &[String]) -> Result<Export, String> {
     let (module, named) = parse_export_arg(arg)?;
     let module = module.as_str();
     let mut triple = recognise(krate, module, named.as_deref())?;
@@ -4679,6 +5218,12 @@ pub fn export_module(krate: &Krate, arg: &str) -> Result<Export, String> {
         temporal_notes: BTreeSet::new(),
         temporal_unchecked: Vec::new(),
         temporal_top_action: false,
+        exists_printed: HashMap::new(),
+        current_key: None,
+        def_owners: Vec::new(),
+        hole_owners: Vec::new(),
+        refusal_owners: Vec::new(),
+        euclid_users: HashSet::new(),
     };
     for v in &state_vars {
         ex.used_names.insert(v.clone());
@@ -4779,6 +5324,7 @@ pub fn export_module(krate: &Krate, arg: &str) -> Result<Export, String> {
                 fun_as_friendly_rust_name(r),
                 span_string(&f.span)
             ));
+            ex.def_owners.push(Some(key.clone()));
             ex.record_body(&key);
             ex.emitted.insert(key.clone());
             if ex.current_tainted {
@@ -5178,6 +5724,44 @@ pub fn export_module(krate: &Krate, arg: &str) -> Result<Export, String> {
             }
         })
         .collect();
+    // Everything above is the model; what the named expressions add after
+    // it is reported with them and kept out of the module.
+    let model_defs = ex.defs.len();
+    let model_constants = ex.constants.clone();
+    let model_holes = ex.holes.len();
+    let model_refusals = ex.refusals.len();
+    let model_euclid = ex.uses_euclid;
+    let model_recursive = ex.recursive();
+    let mut pending: Vec<Path> = vec![triple.state.clone()];
+    let steps = if verus_tla { None } else { ex.steps(&triple.next, &mut pending) };
+    let model = ModelExtent {
+        defs: model_defs,
+        holes: model_holes,
+        refusals: model_refusals,
+        constants: model_constants.clone(),
+        euclid: model_euclid,
+        recursive: model_recursive.clone(),
+    };
+    let expr_exports: Vec<ExprExport> =
+        exprs.iter().map(|name| ex.export_expr(name, &model, &mut pending)).collect();
+    let variables = state_vars
+        .iter()
+        .zip(state_dt.x.variants[0].fields.iter())
+        .zip(state_fields.iter())
+        .zip(ex.state_types.clone().iter())
+        .map(|(((v, f), label), t)| VariableLayout {
+            variable: v.clone(),
+            field: f.name.to_string(),
+            label: label.clone(),
+            typ: ex.type_ref(t, &mut pending),
+        })
+        .collect();
+    let type_map = TypeMap {
+        state: path_as_friendly_rust_name(&triple.state),
+        variables,
+        datatypes: ex.layouts(pending),
+        encodings: encodings(),
+    };
     let mut tla = String::new();
     tla.push_str(&format!("---- MODULE {module_name} ----\n"));
     tla.push_str("\\* Exported by verus -V tla-export from the Verus model in `");
@@ -5206,10 +5790,10 @@ pub fn export_module(krate: &Krate, arg: &str) -> Result<Export, String> {
         );
     }
     tla.push_str("EXTENDS Integers, Sequences, FiniteSets, TLC\n\n");
-    if !ex.constants.is_empty() {
+    if !model_constants.is_empty() {
         tla.push_str(&format!(
             "CONSTANTS {}\n\n",
-            ex.constants.iter().cloned().collect::<Vec<_>>().join(", ")
+            model_constants.iter().cloned().collect::<Vec<_>>().join(", ")
         ));
     }
     tla.push_str(&format!("VARIABLES {}\n", state_vars.join(", ")));
@@ -5226,16 +5810,14 @@ pub fn export_module(krate: &Krate, arg: &str) -> Result<Export, String> {
             renamed.join(", ")
         ));
     }
-    if ex.uses_euclid {
+    if model_euclid {
         // Verus's `/` and `%` are Euclidean: the remainder is never negative.
-        let (a, b) = (EUCLID_A, EUCLID_B);
-        tla.push_str(&format!(
-            "{EUCLID_MOD}({a}, {b}) == {a} % (IF {b} < 0 THEN -{b} ELSE {b})\n{EUCLID_DIV}({a}, {b}) == ({a} - {EUCLID_MOD}({a}, {b})) \\div {b}\n\n"
-        ));
+        tla.push_str(&euclid_defs());
+        tla.push('\n');
     }
-    let recursive = ex.recursive();
+    let recursive = &model_recursive;
     if !recursive.is_empty() {
-        for (r, arity) in &recursive {
+        for (r, arity) in recursive {
             if *arity == 0 {
                 tla.push_str(&format!("RECURSIVE {r}\n"));
             } else {
@@ -5244,7 +5826,7 @@ pub fn export_module(krate: &Krate, arg: &str) -> Result<Export, String> {
         }
         tla.push('\n');
     }
-    for d in &ex.defs {
+    for d in &ex.defs[..model_defs] {
         tla.push_str(d);
         tla.push('\n');
     }
@@ -5358,13 +5940,13 @@ pub fn export_module(krate: &Krate, arg: &str) -> Result<Export, String> {
             }
         }
     }
-    if !ex.constants.is_empty() {
+    if !model_constants.is_empty() {
         // Left unassigned on purpose: TLC stops until each is given a finite
         // set, rather than quantifying over an empty one.
         cfg.push_str(
             "\\* Domains the export could not bound. TLC stops until each is given a finite\n\\* set: uncomment the block and fill them in.\n\\* CONSTANTS\n",
         );
-        for c in &ex.constants {
+        for c in &model_constants {
             cfg.push_str(&format!("\\*   {c} = {{ ... }}\n"));
         }
     }
@@ -5399,12 +5981,15 @@ pub fn export_module(krate: &Krate, arg: &str) -> Result<Export, String> {
         transitions,
         skipped_invariants: skipped,
         candidates,
-        operators: ex.defs.len(),
-        holes: ex.holes,
-        refusals: ex.refusals,
+        operators: model_defs,
+        holes: ex.holes[..model_holes].to_vec(),
+        refusals: ex.refusals[..model_refusals].to_vec(),
         properties,
         fairness_in_spec,
         temporal_notes,
+        type_map,
+        steps,
+        exprs: expr_exports,
     };
     Ok(Export { module_name, tla, cfg, report })
 }
