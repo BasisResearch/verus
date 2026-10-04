@@ -207,3 +207,31 @@ transition assigning that way is reported although TLC can enumerate it.
 counter against `Counter.tla`:
 
     TLA2TOOLS_JAR=/path/to/tla2tools.jar vargo test -p rust_verify_test --test tla_export
+
+## Reading values back, and exporting expressions
+
+The report also carries what a tool needs to read TLC's answers back as
+Verus values. `type_map` gives each variable's state field (its Rust
+name and its record label) and lays out every datatype the state holds
+(whether it is a struct or an enum, field labels in declaration order, the
+`tag` value of each enum variant, which fields are positional), with each
+field's type as a tree over `seq`, `set`,
+`map`, `tuple`, `int`, `bool`, `char` and named datatypes, so that a TLC
+state `[x |-> 4, y |-> 0]` renders as `State { x: 4, y: 0 }` by table, not
+by guess. When `next` is `exists|step: T| body` over a datatype, `steps`
+gives the binder, its printed domain and body, and, when the body calls a
+function matching on the step, each arm's transition with the step field
+passed for each parameter: evaluating `{step \in domain : body}` over a
+pair of states names the step TLC took (TLC itself labels every step
+`Next`).
+
+`-V tla-export-expr=crate::m::f,crate::m::g` exports the named spec fns (each
+over the state, or a pre and a post state) after the model, in the model's
+names: the `.tla` is unchanged, and each expression's entry in `exprs` lists
+its operator, the definitions the `.tla` lacks (to put in a `LET` or a
+module extending the export), any `RECURSIVE` declarations they need, the
+holes and refusals it reaches (`undeclared` naming the hole constants the
+model's module does not declare), and its result type. verus-tools-mcp's
+`model_*` tools write a candidate as such a spec fn in a child module of
+the model and read it back this way, so a candidate is type-checked by
+Verus and exported by the same code as the model.

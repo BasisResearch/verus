@@ -2895,3 +2895,374 @@ fn tla_export_refuses_reals() {
     assert_eq!(run.violated, Vec::<String>::new(), "{}", ex.tla);
     assert_eq!(run.distinct, 3, "{run:?}\n{}", ex.tla);
 }
+
+#[test]
+fn tla_export_reports_the_type_map_and_the_steps() {
+    let ex = export(&fixture("counter.rs"), "test_crate");
+    let map = &ex.report["type_map"];
+    assert_eq!(map["state"], "test_crate::State");
+    assert_eq!(
+        map["variables"],
+        serde_json::json!([
+            {"variable": "x", "field": "x", "label": "x", "typ": {"kind": "int", "rust": "nat"}},
+            {"variable": "y", "field": "y", "label": "y", "typ": {"kind": "int", "rust": "nat"}},
+        ])
+    );
+    let step = &map["datatypes"]["test_crate::Step"];
+    assert_eq!(step["tagged"], true);
+    assert_eq!(step["kind"], "enum");
+    assert_eq!(
+        names(&serde_json::json!(
+            step["variants"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v["name"].clone())
+                .collect::<Vec<_>>()
+        )),
+        ["Inc", "Dbl"]
+    );
+    assert_eq!(map["datatypes"]["test_crate::State"]["tagged"], false);
+    assert_eq!(map["datatypes"]["test_crate::State"]["kind"], "struct");
+    // `next` is `exists|step: Step| next_step(pre, post, step)`, and
+    // `next_step` matches on the step, one transition per arm.
+    let steps = &ex.report["steps"];
+    assert_eq!(steps["binder"], "step");
+    assert_eq!(steps["body"], "next_step(step)");
+    assert_eq!(steps["domain"], "({[tag |-> \"Inc\"]} \\cup {[tag |-> \"Dbl\"]})");
+    assert_eq!(
+        steps["arms"],
+        serde_json::json!([
+            {"variant": "Inc", "function": "test_crate::t_inc", "operator": "t_inc", "args": []},
+            {"variant": "Dbl", "function": "test_crate::t_dbl", "operator": "t_dbl", "args": []},
+        ])
+    );
+    assert_eq!(ex.report["exprs"], serde_json::json!([]));
+}
+
+#[test]
+fn tla_export_steps_name_the_fields_passed_to_each_transition() {
+    let ex = export(&fixture("adder_sync.rs"), "test_crate::Adder");
+    let steps = &ex.report["steps"];
+    assert_eq!(steps["domain"], "({[tag |-> \"add\", v0 |-> v0__] : v0__ \\in Dom_Step_add_v0})");
+    let arms = steps["arms"].as_array().unwrap();
+    let add = arms.iter().find(|a| a["variant"] == "add").expect("the add arm");
+    assert_eq!(add["operator"], "add");
+    assert_eq!(add["args"], serde_json::json!([{"param": "v", "field": "0"}]));
+    let layout = &ex.report["type_map"]["datatypes"]["test_crate::Adder::Step"];
+    let variant = layout["variants"].as_array().unwrap().iter().find(|v| v["name"] == "add");
+    assert_eq!(
+        variant.unwrap()["fields"],
+        serde_json::json!([{"label": "v0", "name": "0", "typ": {"kind": "int", "rust": "int"}}])
+    );
+}
+
+/// A model with collections, and expressions in a child module the way
+/// verus-tools-mcp's model tools append them.
+const EXPR_MODEL: &str = r#"
+use vstd::prelude::*;
+verus! {
+pub enum Role { Idle, Busy { job: nat } }
+pub struct Host { pub role: Role, pub log: Seq<u8>, pub seen: Set<int>, pub acks: Map<int, bool>, pub pair: (bool, int) }
+pub struct S { pub n: nat, pub hosts: Seq<Host> }
+pub open spec fn init(s: S) -> bool { s.n == 0 && s.hosts == Seq::<Host>::empty() }
+pub open spec fn next(pre: S, post: S) -> bool { post.n == pre.n + 1 && post.hosts == pre.hosts }
+pub open spec fn small(s: S) -> bool { s.n < 3 }
+pub open spec fn helper(s: S, i: int) -> bool { 0 <= i < s.hosts.len() ==> s.hosts[i].log.len() < 4 }
+
+pub mod exprs {
+    use super::*;
+    pub open spec fn cand(s: S) -> bool { forall|i: int| 0 <= i < s.hosts.len() ==> helper(s, i) }
+    pub open spec fn unbounded(s: S) -> bool { forall|x: int| x > s.n ==> x > 0 }
+    pub open spec fn picked(s: S) -> int { choose|x: int| x == s.n }
+    pub open spec fn grew(pre: S, post: S) -> bool { post.n > pre.n && small(pre) }
+    pub open spec fn first(s: S) -> Host { s.hosts[0] }
+    pub open spec fn via(s: S) -> bool { unbounded(s) && s.n < 7 }
+    pub open spec fn modded(s: S) -> bool { (s.n as int) % ((s.n as int) - 5) >= 0 }
+    pub open spec fn later(s: S) -> bool { helper(s, 0) && s.n < 9 }
+}
+}
+"#;
+
+#[test]
+fn tla_export_exports_named_expressions_in_the_models_names() {
+    let src = TempDir::new().expect("temp dir");
+    let entry = src.path().join("test.rs");
+    std::fs::write(&entry, format!("{}\n{}\n{}\n", FEATURE_PRELUDE, USE_PRELUDE, EXPR_MODEL))
+        .unwrap();
+    let plain = export_with(&entry, "test_crate", &["--no-verify"]);
+    let names = [
+        "test_crate::exprs::cand",
+        "test_crate::exprs::unbounded",
+        "test_crate::exprs::picked",
+        "test_crate::exprs::grew",
+        "test_crate::exprs::first",
+        "test_crate::exprs::via",
+        "test_crate::exprs::modded",
+        "test_crate::exprs::later",
+        "test_crate::exprs::missing",
+    ];
+    let with = export_with(
+        &entry,
+        "test_crate",
+        &[&format!("-V tla-export-expr={}", names.join(",")), "--no-verify"],
+    );
+    // The model is exported exactly as without the expressions.
+    assert_eq!(plain.tla, with.tla);
+    assert_eq!(plain.cfg, with.cfg);
+    assert_eq!(plain.report["operators"], with.report["operators"]);
+    let exprs = with.report["exprs"].as_array().unwrap();
+    assert_eq!(exprs.len(), names.len());
+    let entry = |f: &str| {
+        exprs
+            .iter()
+            .find(|e| e["function"] == format!("test_crate::exprs::{f}"))
+            .unwrap_or_else(|| panic!("no entry for {}", f))
+    };
+    let defs_of = |e: &serde_json::Value| -> Vec<String> {
+        e["definitions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| d.as_str().unwrap().to_string())
+            .collect()
+    };
+    let cand = entry("cand");
+    assert_eq!(cand["operator"], "cand");
+    assert_eq!(cand["states"], 1);
+    assert_eq!(cand["ret"], serde_json::json!({"kind": "bool"}));
+    assert_eq!(cand["error"], serde_json::Value::Null);
+    assert_eq!(cand["tainted"], false);
+    // `helper` is not in the model's module, so it comes with the expression,
+    // before it; `small` is, so it does not.
+    let defs = defs_of(cand);
+    assert_eq!(defs.len(), 2, "{:?}", defs);
+    assert!(defs[0].starts_with("helper(i) =="), "{:?}", defs);
+    assert!(defs[1].starts_with("cand =="), "{:?}", defs);
+    assert!(!defs.iter().any(|d| d.contains("\\*")), "{:?}", defs);
+    // An unbounded quantifier is a hole whose constant the model does not
+    // declare; a `choose` is refused.
+    let unbounded = entry("unbounded");
+    assert_eq!(names_of(&unbounded["undeclared"]), ["Dom_int"]);
+    assert_eq!(unbounded["holes"].as_array().unwrap().len(), 1);
+    let picked = entry("picked");
+    assert_eq!(picked["tainted"], true);
+    assert_eq!(picked["refusals"].as_array().unwrap().len(), 1);
+    assert_eq!(picked["ret"], serde_json::json!({"kind": "int", "rust": "int"}));
+    // A pair of states reads the second primed.
+    let grew = entry("grew");
+    assert_eq!(grew["states"], 2);
+    let grew_defs = defs_of(grew);
+    assert_eq!(grew_defs.len(), 1, "{:?}", grew_defs);
+    assert!(grew_defs[0].contains("(n' > n)"), "{:?}", grew_defs);
+    // An entry carries only the operators its own operator reaches: never
+    // an earlier entry's hole or refusal it does not call.
+    for f in ["grew", "first", "modded", "later"] {
+        let e = entry(f);
+        let defs = defs_of(e);
+        assert!(
+            !defs.iter().any(|d| d.contains("Dom_int") || d.contains("Assert(FALSE")),
+            "{}: {:?}",
+            f,
+            defs
+        );
+        assert_eq!(names_of(&e["undeclared"]), Vec::<String>::new(), "{f}");
+        assert_eq!(e["holes"], serde_json::json!([]), "{f}");
+        assert_eq!(e["refusals"], serde_json::json!([]), "{f}");
+    }
+    // One calling an earlier entry's operator carries it, and its hole.
+    let via = entry("via");
+    let via_defs = defs_of(via);
+    assert_eq!(via_defs.len(), 2, "{:?}", via_defs);
+    assert!(via_defs[0].starts_with("unbounded =="), "{:?}", via_defs);
+    assert_eq!(names_of(&via["undeclared"]), ["Dom_int"]);
+    assert_eq!(via["holes"].as_array().unwrap().len(), 1);
+    // The Euclidean operators come with the entry that divides, only.
+    let modded_defs = defs_of(entry("modded"));
+    assert_eq!(modded_defs.len(), 2, "{:?}", modded_defs);
+    assert!(modded_defs[0].starts_with("EuclidMod("), "{:?}", modded_defs);
+    assert!(modded_defs[1].contains("EuclidMod("), "{:?}", modded_defs);
+    for f in ["cand", "grew", "via", "later"] {
+        assert!(!defs_of(entry(f)).iter().any(|d| d.contains("Euclid")), "{}", f);
+    }
+    // `helper` came with `cand`, and comes again with `later`, which calls it.
+    let later_defs = defs_of(entry("later"));
+    assert_eq!(later_defs.len(), 2, "{:?}", later_defs);
+    assert!(later_defs[0].starts_with("helper(i) =="), "{:?}", later_defs);
+    // A datatype result is laid out in the type map, with what it holds.
+    let first = entry("first");
+    assert_eq!(
+        first["ret"],
+        serde_json::json!({"kind": "datatype", "path": "test_crate::Host", "args": []})
+    );
+    let dts = &with.report["type_map"]["datatypes"];
+    let host = &dts["test_crate::Host"]["variants"][0]["fields"];
+    assert_eq!(
+        host[1]["typ"],
+        serde_json::json!({"kind": "seq", "elem": {"kind": "int", "rust": "u8"}})
+    );
+    assert_eq!(
+        host[2]["typ"],
+        serde_json::json!({"kind": "set", "elem": {"kind": "int", "rust": "int"}})
+    );
+    assert_eq!(
+        host[3]["typ"],
+        serde_json::json!({"kind": "map", "key": {"kind": "int", "rust": "int"}, "value": {"kind": "bool"}})
+    );
+    assert_eq!(
+        host[4]["typ"],
+        serde_json::json!({"kind": "tuple", "elems": [{"kind": "bool"}, {"kind": "int", "rust": "int"}]})
+    );
+    assert_eq!(dts["test_crate::Role"]["tagged"], true);
+    assert_eq!(dts["test_crate::Role"]["variants"][1]["fields"][0]["label"], "job");
+    assert!(entry("missing")["error"].as_str().unwrap().contains("no function"));
+    let Some(jar) = tla_tools() else { return };
+    // Every entry that can be evaluated against the model (no error, no
+    // undeclared constant, no refusal) parses in a module extending it,
+    // with its definitions in a LET.
+    let module = with.module.clone();
+    let mut probed = Vec::new();
+    for (i, e) in exprs.iter().enumerate() {
+        let blocked = !e["error"].is_null()
+            || !e["undeclared"].as_array().unwrap().is_empty()
+            || e["tainted"] == true;
+        if blocked {
+            continue;
+        }
+        let recursive: Vec<&str> =
+            e["recursive"].as_array().unwrap().iter().map(|r| r.as_str().unwrap()).collect();
+        let recursive = if recursive.is_empty() {
+            String::new()
+        } else {
+            format!("RECURSIVE {}\n", recursive.join(", "))
+        };
+        let name = format!("Probe{i}");
+        let probe = with.dir.path().join("log").join(format!("{name}.tla"));
+        std::fs::write(
+            &probe,
+            format!(
+                "---- MODULE {name} ----\nEXTENDS {module}\nC == LET\n{recursive}{}IN {}\n====\n",
+                defs_of(e).join(""),
+                e["operator"].as_str().unwrap()
+            ),
+        )
+        .unwrap();
+        sany(&jar, &probe);
+        probed.push(e["function"].as_str().unwrap().to_string());
+    }
+    assert_eq!(
+        probed,
+        ["cand", "grew", "first", "modded", "later"]
+            .map(|f| format!("test_crate::exprs::{f}"))
+            .to_vec()
+    );
+}
+
+fn names_of(v: &serde_json::Value) -> Vec<String> {
+    v.as_array().unwrap().iter().map(|x| x.as_str().unwrap().to_string()).collect()
+}
+
+/// Fields whose Rust name is not their record label, and datatypes whose
+/// encoding does not say whether they are structs or enums.
+const LAYOUTS: &str = r#"
+use vstd::prelude::*;
+verus! {
+pub enum One { Only { x: int } }
+pub enum Mark { Set }
+pub struct Pt(pub int, pub bool);
+pub struct S { pub tag: bool, pub vars: nat, pub one: One, pub mark: Mark, pub pt: Pt, pub o: Option<u8> }
+pub open spec fn init(s: S) -> bool {
+    s.tag == false && s.vars == 0 && s.one == (One::Only { x: 0 }) && s.mark == Mark::Set
+        && s.pt == Pt(0, true) && s.o == Option::<u8>::None
+}
+pub open spec fn next(pre: S, post: S) -> bool { post == pre }
+pub struct T(pub nat, pub bool);
+pub open spec fn t_init(t: T) -> bool { t.0 == 0 && t.1 }
+pub open spec fn t_next(pre: T, post: T) -> bool { post == pre }
+pub mod pos {
+    use super::*;
+    pub open spec fn init(t: T) -> bool { t_init(t) }
+    pub open spec fn next(pre: T, post: T) -> bool { t_next(pre, post) }
+}
+}
+"#;
+
+#[test]
+fn tla_export_type_map_names_rust_fields_and_datatype_kinds() {
+    let src = TempDir::new().expect("temp dir");
+    let entry = src.path().join("test.rs");
+    std::fs::write(&entry, format!("{}\n{}\n{}\n", FEATURE_PRELUDE, USE_PRELUDE, LAYOUTS)).unwrap();
+    let ex = export_with(&entry, "test_crate", &["--no-verify"]);
+    let map = &ex.report["type_map"];
+    let vars: Vec<(String, String, String)> = map["variables"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| {
+            let s = |k: &str| v[k].as_str().unwrap().to_string();
+            (s("variable"), s("field"), s("label"))
+        })
+        .collect();
+    let v = |a: &str, b: &str, c: &str| (a.to_string(), b.to_string(), c.to_string());
+    // A field `tag` is labelled `tag_`, a field `vars` held in `vars_v`: the
+    // field is always the Rust name.
+    assert_eq!(
+        vars,
+        [
+            v("tag_", "tag", "tag_"),
+            v("vars_v", "vars", "vars"),
+            v("one", "one", "one"),
+            v("mark", "mark", "mark"),
+            v("pt", "pt", "pt"),
+            v("o", "o", "o"),
+        ]
+    );
+    let dts = &map["datatypes"];
+    let kind = |p: &str| dts[p]["kind"].as_str().unwrap_or_else(|| panic!("{}", p)).to_string();
+    // An enum with one variant is encoded untagged, as a struct is; its kind
+    // says it is written `One::Only { x: 0 }`.
+    assert_eq!(dts["test_crate::One"]["tagged"], false);
+    assert_eq!(kind("test_crate::One"), "enum");
+    assert_eq!(dts["test_crate::One"]["variants"][0]["name"], "Only");
+    assert_eq!(dts["test_crate::Mark"]["tagged"], false);
+    assert_eq!(kind("test_crate::Mark"), "enum");
+    assert!(ex.tla.contains("(mark = [tag |-> \"unit\"])"), "{}", ex.tla);
+    assert_eq!(kind("test_crate::Pt"), "struct");
+    assert_eq!(dts["test_crate::Pt"]["variants"][0]["positional"], true);
+    assert_eq!(kind("test_crate::S"), "struct");
+    assert_eq!(kind("core::option::Option"), "enum");
+    assert_eq!(dts["core::option::Option"]["tagged"], true);
+    // A positional state's fields are `0`, `1`, labelled `v0`, `v1`.
+    let ex = export_with(&entry, "test_crate::pos", &["--no-verify"]);
+    let vars = &ex.report["type_map"]["variables"];
+    assert_eq!(
+        vars,
+        &serde_json::json!([
+            {"variable": "v0", "field": "0", "label": "v0", "typ": {"kind": "int", "rust": "nat"}},
+            {"variable": "v1", "field": "1", "label": "v1", "typ": {"kind": "bool"}},
+        ])
+    );
+}
+
+/// Run Verus with `options` on the expression model, expecting it to fail.
+fn verus_fails(options: &[&str]) -> String {
+    let src = TempDir::new().expect("temp dir");
+    let entry = src.path().join("test.rs");
+    std::fs::write(&entry, format!("{}\n{}\n{}\n", FEATURE_PRELUDE, USE_PRELUDE, EXPR_MODEL))
+        .unwrap();
+    let log = format!("--log-dir {}", src.path().join("log").display());
+    let mut options = options.to_vec();
+    options.push(&log);
+    let output = run_verus(&options, src.path(), &entry, true, true);
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    assert!(!output.status.success(), "{}", stderr);
+    stderr
+}
+
+#[test]
+fn tla_export_expr_needs_tla_export_and_a_value() {
+    let stderr = verus_fails(&["-V tla-export-expr=test_crate::exprs::cand", "--no-verify"]);
+    assert!(stderr.contains("it needs -V tla-export"), "{}", stderr);
+    let stderr = verus_fails(&["-V tla-export=test_crate", "-V tla-export-expr=", "--no-verify"]);
+    assert!(stderr.contains("-V tla-export-expr needs spec fn paths"), "{}", stderr);
+}
