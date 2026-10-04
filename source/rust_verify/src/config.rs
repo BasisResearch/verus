@@ -508,7 +508,7 @@ pub fn parse_args_with_imports(
         ),
         (
             EXTENDED_TLA_EXPORT,
-            "Export the transition system in the named module (-V tla-export=crate::a::b) to TLA+ under the log directory: <State>_tla.tla (named after its module, as TLC requires), a .cfg skeleton and a .tla.json report of what was recognised, refused and left unbounded, and of every candidate invariant; -V tla-export=crate::a::b:inv1,inv2 checks exactly the named invariants. The export runs before verification, and under --no-verify too",
+            "Export the transition system in the named module (-V tla-export=crate::a::b) to TLA+ under the log directory: <State>_tla.tla (named after its module, as TLC requires), a .cfg skeleton and a .tla.json report of what was recognised, refused and left unbounded, and of every candidate invariant; -V tla-export=crate::a::b:inv1,inv2 checks exactly the named invariants. verus-tla temporal properties (a proof fn's ensures m.entails(p) over its requires, or TempPred spec fns beside spec()) are PROPERTYs, their spec's fairness in Spec. The export runs before verification, and under --no-verify too",
         ),
         (
             EXTENDED_TLA_EXPORT_EXPR,
