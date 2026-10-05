@@ -2758,7 +2758,6 @@ impl Exporter {
         let (arms, arm_env, arm_unbound) = self.match_on(&inner, x, env)?;
         let tagged = d.x.variants.len() > 1;
         let instance = self.constant_typ_name(&binder.a);
-        let sb = self.in_branch(body, env);
         let xname = env.name(x);
         // Per variant: its name, fields, field binders and body, and each
         // field's bound (from a guard, or from its type with its size and the
@@ -2821,7 +2820,6 @@ impl Exporter {
             } else {
                 format!("[{}]", record.join(", "))
             };
-            let out = format!("(LET {xname} == {record} IN {sb})");
             let mut bounded = Vec::new();
             for k in 0..fields.len() {
                 let from_guard = site.as_ref().and_then(|(vars, arm_body)| {
@@ -2837,7 +2835,7 @@ impl Exporter {
                     }
                 });
             }
-            all.push((variant.name.clone(), fields, names, out));
+            all.push((variant.name.clone(), fields, names, record));
             field_bounds.push(bounded);
         }
         // What a variant's type-bounded fields take together, counting
@@ -2878,8 +2876,13 @@ impl Exporter {
                 }
             }
         }
-        let mut parts = Vec::new();
-        for ((vname, fields, names, mut out), (bounded, s)) in
+        // Each variant's fields' domains, and the set of its values they
+        // span: together, the binder's domain, which the step structure
+        // and a match on the binder (a field's domain, for the trace spec)
+        // read as they would from a plain `\\E binder \\in domain`.
+        let mut variants = Vec::new();
+        let mut sets = Vec::new();
+        for ((vname, fields, names, record), (bounded, s)) in
             all.into_iter().zip(field_bounds.into_iter().zip(split))
         {
             let mut domains = Vec::new();
@@ -2891,6 +2894,7 @@ impl Exporter {
                         let constant =
                             format!("Dom_{instance}_{}_{}", sanitize(&vname), field_name(f));
                         self.constants.insert(constant.clone());
+                        self.hole_owners.push(self.current_key.clone());
                         self.holes.push(Hole {
                             variable: format!("{vname}.{}", field_name(f)),
                             typ: typ_name(ftyp),
@@ -2903,13 +2907,30 @@ impl Exporter {
                 };
                 domains.push(domain);
             }
+            let binds: Vec<String> =
+                names.iter().zip(&domains).map(|(n, d)| format!("{n} \\in {d}")).collect();
+            sets.push(if binds.is_empty() {
+                format!("{{{record}}}")
+            } else {
+                format!("{{{record} : {}}}", binds.join(", "))
+            });
+            variants.push((record, names, domains));
+        }
+        if variants.is_empty() {
+            return None;
+        }
+        let union = format!("({})", sets.join(" \\cup "));
+        let mut env2 = env.clone();
+        env2.domains.insert(x.clone(), Dom::Closed(union.clone(), true));
+        let sb = self.in_branch(body, &env2);
+        self.exists_printed.insert(Arc::as_ptr(e) as usize, (xname.clone(), union, sb.clone()));
+        let mut parts = Vec::new();
+        for (record, names, domains) in variants {
+            let mut out = format!("(LET {xname} == {record} IN {sb})");
             for (n, dom) in names.iter().zip(domains).rev() {
                 out = format!("(\\E {n} \\in {dom} : {out})");
             }
             parts.push(out);
-        }
-        if parts.is_empty() {
-            return None;
         }
         Some(format!("({})", parts.join(" \\/ ")))
     }
