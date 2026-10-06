@@ -1973,8 +1973,11 @@ impl Exporter {
                     PatternX::Wildcard(_) => {}
                     _ => {
                         let r = self.refuse("destructuring let", &s.span);
-                        let n = self.bind("unused__");
-                        lets.push(format!("{n} == {r}"));
+                        // Each name the pattern binds is bound to the
+                        // refusal, so the rest of the block reads only
+                        // defined names and TLC stops where one is used.
+                        let (_, bound) = self.refused_bindings(r, pattern, &mut env2);
+                        lets.extend(bound);
                     }
                 },
                 StmtX::Decl { init: None, .. } => {}
@@ -2165,13 +2168,45 @@ impl Exporter {
             }
             PatternX::Or(..) => {
                 let r = self.refuse("or-pattern", &p.span);
-                (Some(r), vec![])
+                self.refused_bindings(r, p, env)
             }
             _ => {
                 let r = self.refuse("pattern kind", &p.span);
-                (Some(r), vec![])
+                self.refused_bindings(r, p, env)
             }
         }
+    }
+
+    /// A refused pattern: its condition is the refusal `r`, and each name
+    /// it binds is bound to `r` too (added to `env`). Left unbound, a name
+    /// would be free in the module, and SANY would reject all of it; bound
+    /// to the refusal, TLC stops only where the name is evaluated, as at
+    /// any other refusal. A pattern binding nothing binds `unused__`, so
+    /// the refusal stays in the print.
+    fn refused_bindings(
+        &mut self,
+        r: String,
+        p: &Pattern,
+        env: &mut Env,
+    ) -> (Option<String>, Vec<String>) {
+        let mut names = Vec::new();
+        pattern_names(p, &mut names);
+        let mut lets = Vec::new();
+        let mut seen = HashSet::new();
+        for v in names {
+            // The alternatives of an or-pattern bind the same names.
+            if seen.insert(v.clone()) {
+                let n = self.bind_var(env, &v);
+                env.primed.remove(&v);
+                env.domains.remove(&v);
+                lets.push(format!("{n} == {r}"));
+            }
+        }
+        if lets.is_empty() {
+            let n = self.bind("unused__");
+            lets.push(format!("{n} == {r}"));
+        }
+        (Some(r), lets)
     }
 
     // ─── calls ──────────────────────────────────────────────────────────

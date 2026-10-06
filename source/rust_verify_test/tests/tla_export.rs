@@ -2908,6 +2908,72 @@ fn tla_export_prints_an_or_pattern_as_a_disjunction() {
     assert_eq!(run.distinct, 12, "{run:?}\n{}", ex.tla);
 }
 
+/// A refused pattern in one transition: the names it binds are bound to
+/// the refusal (they were left free, so SANY rejected the whole module and
+/// TLC checked nothing). TLC stops only where such a name is evaluated, so
+/// the other transitions and the invariant are still checked.
+const REFUSED_PATTERN: &str = r#"
+verus! {
+pub struct State { pub x: int, pub e: E }
+
+pub enum E { A(int), B(int), C }
+
+pub open spec fn init(s: State) -> bool { s.x == 0 && s.e == E::C }
+
+pub open spec fn t_inc(pre: State, post: State) -> bool {
+    pre.x < 3 && post.x == pre.x + 1 && post.e == pre.e
+}
+
+pub open spec fn t_tuple(pre: State, post: State) -> bool {
+    let (a, b) = (pre.x, 1int);
+    pre.x > 100 && post.x == a + b && post.e == pre.e
+}
+
+pub open spec fn t_or(pre: State, post: State) -> bool {
+    pre.x > 100 && match pre.e {
+        E::A(n) | E::B(n) => post.x == n && post.e == pre.e,
+        E::C => false,
+    }
+}
+
+pub open spec fn next(pre: State, post: State) -> bool {
+    t_inc(pre, post) || t_tuple(pre, post) || t_or(pre, post)
+}
+
+pub open spec fn small(s: State) -> bool { s.x <= 3 }
+}
+"#;
+
+#[test]
+fn tla_export_binds_the_names_a_refused_pattern_leaves() {
+    let ex = export_code(REFUSED_PATTERN, "test_crate");
+    let refusals: Vec<String> = ex.report["refusals"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["what"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(refusals, ["destructuring let", "or-pattern"], "{}", ex.tla);
+    assert!(
+        ex.tla.contains("LET a == Assert(FALSE, \"tla-export refused: destructuring let"),
+        "{}",
+        ex.tla
+    );
+    assert!(
+        ex.tla.contains("b == Assert(FALSE, \"tla-export refused: destructuring let"),
+        "{}",
+        ex.tla
+    );
+    assert!(ex.tla.contains("n == Assert(FALSE, \"tla-export refused: or-pattern"), "{}", ex.tla);
+    assert_eq!(names(&ex.report["invariants"]), ["small"]);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let run = tlc(&jar, &ex.spec(), &ex.cfg);
+    assert_eq!(run.violated, Vec::<String>::new(), "{}", ex.tla);
+    // x in 0..3; the refused transitions are never enabled.
+    assert_eq!(run.distinct, 4, "{run:?}\n{}", ex.tla);
+}
+
 /// An Init equality of two fields after a helper that assigns one of them:
 /// the helper's assignment counts, so the other field goes on the left and
 /// the print agrees with the report (it was printed `x = y`, which TLC
