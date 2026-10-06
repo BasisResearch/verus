@@ -212,6 +212,39 @@ b'], [a |-> a', b |-> b'])`.
 A sequence literal `seq![a, b]` (an array literal viewed as a `Seq`) is the
 tuple `<<a, b>>`.
 
+The vstd operations that take a function take a closure, which is applied
+where the operation is printed: its parameters are LET-bound to the values
+the operation gives them, so its body reads whatever it reads in Verus,
+the post state included (`s.map(|i, x| x + i)` is `[i__ \in 1..Len(s) |->
+LET i == i__ - 1 x == s[i__] IN x + i]`, the index shifted once as
+everywhere). An argument that reduces to no closure (a `spec_fn` parameter
+of a helper) is refused. `Seq::map` and `map_values` are functions over the
+positions; `Seq::filter` is `SelectSeq(s, LAMBDA x : p)`; `fold_left`,
+`fold_left_alt`, `fold_right` and `fold_right_alt` are a RECURSIVE operator
+over the positions in a LET (`f(fold(k - 1), s[k])` from the left, `f(s[k],
+fold(k + 1))` from the right), and `flatten` the same with `\o`; `to_set` is
+`{s[i] : i \in 1..Len(s)}`, `no_duplicates` compares every two positions, and
+`max` and `min` CHOOSE the extremum of the elements (0 for the empty
+sequence, as vstd defines them). `Set::new(|x| p)` is `Some` of `{x \in D :
+p}` and `ISet::new(|x| p)` that set, where `D` is what a quantifier's binder
+would range over: the bound `p`'s conjuncts give `x` (`0 <= x < n` is
+`0..n-1`, `t.contains(x)` is `t`), else the values of `x`'s type when they
+are few (`BOOLEAN`), else a hole (`Dom_int`). `Set::map` is `{f(x) : x \in
+s}`, `Set::filter` `{x \in s : p}`, and `Set::fold` a RECURSIVE operator
+removing a CHOOSEn element each time, which agrees with Verus for the
+commutative `f` vstd recommends. `Map::new(keys, f)` is `[k \in keys |->
+f(k)]`, `IMap::new(|k| p, f)` the same over `p`'s comprehension,
+`map_values` and `map_entries` map over `DOMAIN m`, `filter_keys`,
+`restrict` and `remove_keys` shrink it, and `m1.union_prefer_right(m2)` is
+`m2 @@ m1`. A `Multiset` is the function from the elements it holds (a
+count above 0) to their counts, so `=` is its equality: `count` is the
+value or 0, `insert`, `add` and `singleton` add counts, `remove` and `sub`
+subtract them and drop what reaches 0, `len` sums the counts with a
+RECURSIVE operator, `contains` is `\in DOMAIN`, and a trace logs a
+multiset as a map. `Set::choose` and `Multiset::choose` are refused, as
+`choose` is: TLC's CHOOSE is one fixed value, where Verus's may be any
+value satisfying the predicate.
+
 A literal match pattern is an equality with the scrutinee (`0 => ...` is
 `IF m = 0 THEN ...`) and a range pattern its comparisons (`1..=3` is `1 <=
 m /\ m <= 3`). An or-pattern binding nothing is the disjunction of its

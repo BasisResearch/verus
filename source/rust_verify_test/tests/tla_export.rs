@@ -5282,3 +5282,470 @@ fn tla_export_expr_needs_tla_export_and_a_value() {
     let stderr = verus_fails(&["-V tla-export=test_crate", "-V tla-export-expr=", "--no-verify"]);
     assert!(stderr.contains("-V tla-export-expr needs spec fn paths"), "{}", stderr);
 }
+
+// ─── vstd collections ──────────────────────────────────────────────────
+
+/// A model over the vstd collections: `n` counts to 4, and each step pushes
+/// `n` onto `s`, inserts it into `t`, maps it to its square in `m` and adds
+/// its parity to `b`, so `s` is `0..n`, `t` its set, `m` the squares on `t`
+/// and `b` holds `(n + 1) / 2` zeros and `n / 2` ones. `STEP` assigns the
+/// derived fields `d`, `e` and `w` (reading `post`, so a closure reads the
+/// primed variables), and `INVARIANTS` are the spec fns TLC checks.
+const COLLECTIONS: &str = r#"
+use vstd::prelude::*;
+use vstd::multiset::Multiset;
+verus! {
+pub struct State {
+    pub s: Seq<int>, pub t: Set<int>, pub m: Map<int, int>, pub b: Multiset<u8>, pub n: nat,
+    pub d: Seq<int>, pub e: Set<int>, pub w: Map<int, int>,
+}
+
+pub open spec fn init(s: State) -> bool {
+    &&& s.s == Seq::<int>::empty() && s.t == Set::<int>::empty() && s.m == Map::<int, int>::empty()
+    &&& s.b == Multiset::<u8>::empty() && s.n == 0
+    &&& s.d == Seq::<int>::empty() && s.e == Set::<int>::empty() && s.w == Map::<int, int>::empty()
+}
+
+pub open spec fn next(pre: State, post: State) -> bool {
+    &&& pre.n < 4
+    &&& post.s == pre.s.push(pre.n as int)
+    &&& post.t == pre.t.insert(pre.n as int)
+    &&& post.m == pre.m.insert(pre.n as int, (pre.n * pre.n) as int)
+    &&& post.b == pre.b.insert((pre.n % 2) as u8)
+    &&& post.n == pre.n + 1
+    &&& STEP
+}
+
+INVARIANTS
+}
+"#;
+
+/// A [`COLLECTIONS`] step that leaves the derived fields alone.
+const SAME: &str = "post.d == pre.d && post.e == pre.e && post.w == pre.w";
+
+/// Export a [`COLLECTIONS`] model and check it: no refusal and no hole,
+/// every invariant in the .cfg, SANY accepts the module, and TLC finds
+/// exactly the invariants `violated` violated on the model's 5 states.
+fn check_collections(step: &str, invariants: &str, violated: &[&str]) -> Exported {
+    let code = COLLECTIONS.replace("STEP", step).replace("INVARIANTS", invariants);
+    let ex = export_code(&code, "test_crate");
+    assert_eq!(ex.report["refusals"], serde_json::json!([]), "{}", ex.tla);
+    assert_eq!(ex.report["holes"], serde_json::json!([]), "{}", ex.tla);
+    let declared = invariants.matches("pub open spec fn").count();
+    assert_eq!(names(&ex.report["invariants"]).len(), declared, "{}", ex.cfg);
+    let Some(jar) = tla_tools() else { return ex };
+    sany(&jar, &ex.spec());
+    let run = tlc(&jar, &ex.spec(), &ex.cfg);
+    let mut found = run.violated.clone();
+    found.sort();
+    found.dedup();
+    assert_eq!(found, violated, "{run:?}\n{}", ex.tla);
+    assert_eq!(run.distinct, 5, "{run:?}\n{}", ex.tla);
+    ex
+}
+
+#[test]
+fn tla_export_seq_map_is_a_function_over_the_positions() {
+    // The closure's index is the Verus index, one below the TLA+ position.
+    let ex = check_collections(
+        "post.d == post.s.map_values(|x: int| x + 1) && post.e == pre.e && post.w == pre.w",
+        r#"
+pub open spec fn indexed(s: State) -> bool {
+    s.s.map(|i: int, x: int| x + i) =~= Seq::new(s.n, |i: int| 2 * i)
+}
+pub open spec fn values(s: State) -> bool { s.d =~= Seq::new(s.n, |i: int| i + 1) }
+"#,
+        &[],
+    );
+    assert!(ex.tla.contains("|-> (LET i == i__ - 1 x == s__[i__] IN (x + i))]"), "{}", ex.tla);
+    assert!(ex.tla.contains("(LET s__ == s' IN [i__ \\in 1..Len(s__) |->"), "{}", ex.tla);
+}
+
+#[test]
+fn tla_export_seq_filter_is_selectseq() {
+    let ex = check_collections(
+        "post.d == post.s.filter(|x: int| x >= 2) && post.e == pre.e && post.w == pre.w",
+        r#"
+pub open spec fn evens(s: State) -> bool {
+    let e = s.s.filter(|x: int| x % 2 == 0);
+    e.len() == (s.n + 1) / 2 && forall|i: int| 0 <= i < e.len() ==> e[i] == 2 * i
+}
+pub open spec fn tail(s: State) -> bool { s.d.len() == (if s.n > 2 { s.n - 2 } else { 0 }) }
+"#,
+        &[],
+    );
+    assert!(
+        ex.tla.contains("SelectSeq(s', LAMBDA x__2 : (LET x == x__2 IN (x >= 2)))"),
+        "{}",
+        ex.tla
+    );
+}
+
+#[test]
+fn tla_export_seq_folds_are_recursive_operators() {
+    // Folding `push` rebuilds the sequence from the left and reverses it
+    // from the right; `wrong_order` expects the left fold to reverse, and
+    // TLC finds it violated once `s` has two elements.
+    let ex = check_collections(
+        SAME,
+        r#"
+pub open spec fn sum(s: State) -> bool {
+    s.s.fold_left(0int, |acc: int, x: int| acc + x) == s.n * (s.n - 1) / 2
+}
+pub open spec fn left(s: State) -> bool {
+    &&& s.s.fold_left(Seq::<int>::empty(), |acc: Seq<int>, x: int| acc.push(x)) =~= s.s
+    &&& s.s.fold_left_alt(Seq::<int>::empty(), |acc: Seq<int>, x: int| acc.push(x)) =~= s.s
+}
+pub open spec fn right(s: State) -> bool {
+    let rev = Seq::new(s.n, |i: int| s.n - 1 - i);
+    &&& s.s.fold_right(|x: int, acc: Seq<int>| acc.push(x), Seq::<int>::empty()) =~= rev
+    &&& s.s.fold_right_alt(|x: int, acc: Seq<int>| acc.push(x), Seq::<int>::empty()) =~= rev
+}
+pub open spec fn wrong_order(s: State) -> bool {
+    s.s.fold_left(Seq::<int>::empty(), |acc: Seq<int>, x: int| acc.push(x))
+        =~= Seq::new(s.n, |i: int| s.n - 1 - i)
+}
+"#,
+        &["wrong_order"],
+    );
+    assert!(
+        ex.tla.contains("RECURSIVE fold__(_) fold__(k__) == IF k__ = 0 THEN (0) ELSE (LET acc == fold__(k__ - 1) x == s__[k__] IN (acc + x)) IN fold__(Len(s__))"),
+        "{}",
+        ex.tla
+    );
+    assert!(ex.tla.contains("IF k__2 > Len(s__2) THEN"), "{}", ex.tla);
+}
+
+#[test]
+fn tla_export_set_new_is_bounded_by_the_guard_or_the_type() {
+    // As a quantifier's binder is: `0 <= x < n` bounds `x` by `0..n-1`,
+    // and a `bool` ranges over BOOLEAN. `Set::new` is `Some` of the set.
+    let ex = check_collections(
+        SAME,
+        r#"
+pub open spec fn guarded(s: State) -> bool { s.t =~= Set::new(|x: int| 0 <= x < s.n).unwrap() }
+pub open spec fn typed(s: State) -> bool { Set::new(|b: bool| b).unwrap() =~= set![true] && s.n >= 0 }
+pub open spec fn iset(s: State) -> bool { ISet::new(|x: int| 0 <= x && x < s.n).len() == s.n }
+"#,
+        &[],
+    );
+    assert!(
+        ex.tla.contains("[tag |-> \"Some\", v0 |-> {x \\in 0..(n) - 1 : ((0 <= x) /\\ (x < n))}]"),
+        "{}",
+        ex.tla
+    );
+    assert!(ex.tla.contains("{b_2 \\in BOOLEAN : b_2}"), "{}", ex.tla);
+}
+
+const SET_NEW_HOLE: &str = r#"
+use vstd::prelude::*;
+verus! {
+pub struct State { pub t: Set<int>, pub n: nat }
+
+pub open spec fn init(s: State) -> bool { s.t == Set::new(|x: int| x * x == 4).unwrap() && s.n == 0 }
+
+pub open spec fn next(pre: State, post: State) -> bool { pre.n < 2 && post.t == pre.t && post.n == pre.n + 1 }
+
+pub open spec fn root(s: State) -> bool { s.t =~= set![2int] }
+}
+"#;
+
+#[test]
+fn tla_export_set_new_without_a_bound_leaves_a_hole() {
+    // `x * x == 4` bounds nothing and `int` has no finite domain: the
+    // comprehension ranges over the hole `Dom_int`, given in the .cfg
+    // (the non-negative integers below 4, so the set is `{2}`).
+    let ex = export_code(SET_NEW_HOLE, "test_crate");
+    assert_eq!(ex.report["refusals"], serde_json::json!([]), "{}", ex.tla);
+    let holes = ex.report["holes"].as_array().unwrap();
+    assert_eq!(holes.len(), 1, "{holes:?}");
+    assert_eq!(holes[0]["constant"], "Dom_int");
+    assert_eq!(holes[0]["variable"], "x");
+    assert!(holes[0]["location"].as_str().unwrap().contains("test.rs:"), "{:?}", holes);
+    assert!(ex.tla.contains("{x \\in Dom_int : ((x * x) = 4)}"), "{}", ex.tla);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let run = tlc(&jar, &ex.spec(), &format!("{}CONSTANTS Dom_int = {{0, 1, 2, 3}}\n", ex.cfg));
+    assert_eq!(run.violated, Vec::<String>::new(), "{}", ex.tla);
+    assert_eq!(run.distinct, 3, "{run:?}");
+}
+
+#[test]
+fn tla_export_set_map_is_a_set_of_images() {
+    let ex = check_collections(
+        "post.d == pre.d && post.e == post.t.map(|x: int| x * 2) && post.w == pre.w",
+        r#"
+pub open spec fn doubled(s: State) -> bool {
+    s.e =~= Set::new(|y: int| 0 <= y < 2 * s.n && y % 2 == 0).unwrap()
+}
+pub open spec fn squares(s: State) -> bool { s.t.map(|x: int| x * x) =~= s.m.values() }
+"#,
+        &[],
+    );
+    assert!(ex.tla.contains("{(LET x == x__2 IN (x * 2)) : x__2 \\in t'}"), "{}", ex.tla);
+}
+
+#[test]
+fn tla_export_set_filter_is_a_subset() {
+    let ex = check_collections(
+        "post.d == pre.d && post.e == post.t.filter(|x: int| x % 2 == 1) && post.w == pre.w",
+        r#"
+pub open spec fn odds(s: State) -> bool { s.e.len() == s.n / 2 && s.e.subset_of(s.t) }
+pub open spec fn small(s: State) -> bool {
+    s.t.filter(|x: int| x < 2) =~= Set::new(|x: int| 0 <= x < 2 && x < s.n).unwrap()
+}
+"#,
+        &[],
+    );
+    assert!(ex.tla.contains("{x__2 \\in t' : (LET x == x__2 IN ((x % 2) = 1))}"), "{}", ex.tla);
+}
+
+#[test]
+fn tla_export_set_fold_is_a_recursive_operator() {
+    // vstd recommends a commutative `f`; TLC folds in CHOOSE's order.
+    let ex = check_collections(
+        SAME,
+        r#"
+pub open spec fn sum(s: State) -> bool { s.t.fold(0int, |acc: int, x: int| acc + x) == s.n * (s.n - 1) / 2 }
+pub open spec fn count(s: State) -> bool { s.t.fold(0nat, |acc: nat, x: int| acc + 1) == s.n }
+"#,
+        &[],
+    );
+    assert!(
+        ex.tla.contains("RECURSIVE fold__(_) fold__(t__) == IF t__ = {} THEN (0)"),
+        "{}",
+        ex.tla
+    );
+    assert!(ex.tla.contains("CHOOSE c__ \\in t__ : TRUE"), "{}", ex.tla);
+}
+
+#[test]
+fn tla_export_map_new_is_a_function_over_its_domain() {
+    // `Map::new(keys, f)` and `IMap::new(p, f)`, whose domain is bounded as
+    // a set comprehension's is.
+    let ex = check_collections(
+        "post.d == pre.d && post.e == pre.e && post.w == Map::new(post.t, |k: int| k + 1)",
+        r#"
+pub open spec fn squares(s: State) -> bool {
+    s.m =~= Map::new(Set::new(|k: int| 0 <= k < s.n).unwrap(), |k: int| k * k)
+}
+pub open spec fn shifted(s: State) -> bool { s.w.dom() =~= s.t && forall|k: int| s.t.contains(k) ==> s.w[k] == k + 1 }
+pub open spec fn imap(s: State) -> bool {
+    &&& IMap::new(|k: int| 0 <= k < s.n, |k: int| k * k).dom().len() == s.n
+    &&& forall|k: int| #![trigger s.m[k]] 0 <= k < s.n ==> IMap::new(|j: int| 0 <= j < s.n, |j: int| j * j)[k] == s.m[k]
+}
+"#,
+        &[],
+    );
+    assert!(ex.tla.contains("[k__ \\in t' |-> (LET k == k__ IN (k + 1))]"), "{}", ex.tla);
+}
+
+#[test]
+fn tla_export_map_values_and_entries_map_the_values() {
+    let ex = check_collections(
+        "post.d == pre.d && post.e == pre.e && post.w == post.m.map_values(|v: int| v + 1)",
+        r#"
+pub open spec fn values(s: State) -> bool { s.w =~= Map::new(s.t, |k: int| k * k + 1) }
+pub open spec fn entries(s: State) -> bool {
+    s.m.map_entries(|k: int, v: int| v - k) =~= Map::new(s.t, |k: int| k * k - k)
+}
+"#,
+        &[],
+    );
+    assert!(
+        ex.tla.contains(
+            "(LET m__2 == m' IN [k__ \\in DOMAIN m__2 |-> (LET v == m__2[k__] IN (v + 1))])"
+        ),
+        "{}",
+        ex.tla
+    );
+}
+
+#[test]
+fn tla_export_map_filter_keys_and_restrict_shrink_the_domain() {
+    let ex = check_collections(
+        "post.d == pre.d && post.e == pre.e && post.w == post.m.filter_keys(|k: int| k % 2 == 0)",
+        r#"
+pub open spec fn filtered(s: State) -> bool {
+    s.w.dom() =~= s.t.filter(|k: int| k % 2 == 0) && forall|k: int| s.w.dom().contains(k) ==> s.w[k] == k * k
+}
+pub open spec fn restricted(s: State) -> bool {
+    &&& s.m.restrict(set![0int, 1]).dom() =~= s.t.intersect(set![0int, 1])
+    &&& s.m.remove_keys(set![0int]).dom() =~= s.t.remove(0)
+}
+"#,
+        &[],
+    );
+    assert!(
+        ex.tla.contains("[y__ \\in {k__ \\in DOMAIN m__2 : (LET k == k__ IN ((k % 2) = 0))} |->"),
+        "{}",
+        ex.tla
+    );
+    assert!(ex.tla.contains("(DOMAIN m__) \\cap ((({} \\cup {0}) \\cup {1}))"), "{}", ex.tla);
+    assert!(ex.tla.contains("(DOMAIN m__2) \\ (({} \\cup {0}))"), "{}", ex.tla);
+}
+
+#[test]
+fn tla_export_map_union_prefer_right_is_the_right_map_first() {
+    // `@@` prefers its left operand, so `a.union_prefer_right(b)` is
+    // `b @@ a`.
+    let ex = check_collections(
+        SAME,
+        r#"
+pub open spec fn unioned(s: State) -> bool {
+    let u = s.m.union_prefer_right(map![0int => 7int, 9int => 9int]);
+    &&& u[0] == 7 && u[9] == 9
+    &&& u.dom() =~= s.t.union(set![0int, 9])
+    &&& (s.n < 2 || u[1] == 1)
+}
+"#,
+        &[],
+    );
+    assert!(ex.tla.contains(" @@ m)"), "{}", ex.tla);
+}
+
+#[test]
+fn tla_export_multiset_is_a_function_to_counts() {
+    // A multiset is the function from the elements it holds to their
+    // counts (never 0), so `=` is its extensional equality.
+    let ex = check_collections(
+        SAME,
+        r#"
+pub open spec fn counts(s: State) -> bool {
+    &&& s.b.count(0) == (s.n + 1) / 2 && s.b.count(1) == s.n / 2 && s.b.count(7) == 0
+    &&& s.b.len() == s.n
+    &&& s.b.contains(0) == (s.n > 0)
+}
+pub open spec fn arithmetic(s: State) -> bool {
+    &&& s.b.add(s.b).count(0) == 2 * s.b.count(0) && s.b.add(s.b).len() == 2 * s.n
+    &&& s.b.remove(0).count(0) == (if s.n == 0 { 0nat } else { (s.b.count(0) - 1) as nat })
+    &&& s.b.insert(5).remove(5) =~= s.b
+    &&& s.b.sub(s.b) =~= Multiset::empty()
+    &&& s.b.sub(Multiset::singleton(1)).len() == (if s.n >= 2 { (s.n - 1) as nat } else { s.n })
+    &&& s.b.subset_of(s.b.insert(3)) && (s.n == 0 || !s.b.insert(3).subset_of(s.b))
+    &&& s.b.update(0, 9).count(0) == 9 && s.b.update(1, 0).len() == s.b.count(0)
+}
+pub open spec fn conversions(s: State) -> bool {
+    &&& Multiset::from_set(set![1u8, 2]).len() == 2
+    &&& Multiset::from_map(map![4u8 => 2nat, 6u8 => 0nat]).len() == 2
+    &&& s.b.dom() =~= (if s.n == 0 { Set::empty() } else if s.n == 1 { set![0u8] } else { set![0u8, 1] })
+    &&& s.b.filter(|x: u8| x == 1).len() == s.n / 2
+    &&& s.s.to_multiset().count(0) == (if s.n == 0 { 0nat } else { 1nat })
+}
+"#,
+        &[],
+    );
+    // Its elements keep their type's range in TypeOK.
+    assert!(
+        ex.tla.contains("(\\A e__2 \\in DOMAIN b : (0 <= e__2 /\\ e__2 <= 255))"),
+        "{}",
+        ex.tla
+    );
+    assert!(
+        ex.tla.contains("(LET m__3 == b IN IF (7) \\in DOMAIN m__3 THEN m__3[7] ELSE 0)"),
+        "{}",
+        ex.tla
+    );
+}
+
+#[test]
+fn tla_export_seq_to_set_is_the_set_of_its_elements() {
+    let ex = check_collections(
+        "post.d == pre.d && post.e == post.s.to_set() && post.w == pre.w",
+        "pub open spec fn same(s: State) -> bool { s.e =~= s.t && s.s.push(0).to_set() =~= s.t.insert(0) }\n",
+        &[],
+    );
+    assert!(ex.tla.contains("(LET s__ == s' IN {s__[i__] : i__ \\in 1..Len(s__)})"), "{}", ex.tla);
+}
+
+#[test]
+fn tla_export_seq_flatten_concatenates() {
+    let ex = check_collections(
+        "post.d == seq![pre.d, seq![pre.n as int]].flatten() && post.e == pre.e && post.w == pre.w",
+        r#"
+pub open spec fn flat(s: State) -> bool {
+    &&& s.d =~= s.s
+    &&& seq![s.s, seq![9int], s.s].flatten() =~= s.s.push(9).add(s.s)
+    &&& Seq::<Seq<int>>::empty().flatten().len() == 0
+}
+"#,
+        &[],
+    );
+    assert!(ex.tla.contains("RECURSIVE flat__(_) flat__(k__) == IF k__ > Len(s__) THEN << >> ELSE s__[k__] \\o flat__(k__ + 1)"), "{}", ex.tla);
+}
+
+#[test]
+fn tla_export_seq_no_duplicates_compares_the_positions() {
+    let ex = check_collections(
+        SAME,
+        "pub open spec fn distinct(s: State) -> bool { s.s.no_duplicates() && (s.n == 0 || !s.s.push(0).no_duplicates()) }\n",
+        &[],
+    );
+    assert!(
+        ex.tla.contains("\\A i__, j__ \\in 1..Len(s__) : i__ # j__ => s__[i__] # s__[j__]"),
+        "{}",
+        ex.tla
+    );
+}
+
+#[test]
+fn tla_export_seq_max_and_min_choose_the_extremum() {
+    // vstd's max and min of the empty sequence are 0.
+    let ex = check_collections(
+        SAME,
+        r#"
+pub open spec fn extrema(s: State) -> bool {
+    &&& s.s.max() == (if s.n == 0 { 0 } else { s.n - 1 })
+    &&& s.s.min() == 0
+    &&& seq![3int, -2, 5].max() == 5 && seq![3int, -2, 5].min() == -2
+}
+"#,
+        &[],
+    );
+    assert!(ex.tla.contains("IF Len(s__) = 0 THEN 0 ELSE CHOOSE m__ \\in"), "{}", ex.tla);
+}
+
+const CHOOSE_AND_PARAMETER: &str = r#"
+use vstd::prelude::*;
+verus! {
+pub struct State { pub t: Set<int>, pub n: int }
+
+pub open spec fn init(s: State) -> bool { s.t == set![1int, 2] && s.n == 0 }
+
+pub open spec fn total(t: Set<int>, f: spec_fn(int, int) -> int) -> int { t.fold(0, f) }
+
+pub open spec fn next(pre: State, post: State) -> bool { pre.n < 2 && post.t == pre.t && post.n == pre.n + 1 }
+
+pub open spec fn picked(s: State) -> bool { s.t.contains(s.t.choose()) }
+pub open spec fn summed(s: State) -> bool { total(s.t, |a: int, x: int| a + x) == 3 }
+pub open spec fn small(s: State) -> bool { s.n <= 2 }
+}
+"#;
+
+#[test]
+fn tla_export_refuses_set_choose_and_a_function_parameter() {
+    // `Set::choose` stays refused, as `choose` is: TLC's CHOOSE is one
+    // fixed value, and Verus's choice is any value satisfying the
+    // predicate, so TLC's verdict would hold for one choice only. A fold
+    // given a `spec_fn` parameter has no closure to apply (`total` is an
+    // operator of its own); both refusals name their location, and the
+    // invariants reaching them are left out of the .cfg.
+    let ex = export_code(CHOOSE_AND_PARAMETER, "test_crate");
+    let refusals: Vec<(String, String)> = ex.report["refusals"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| (r["what"].as_str().unwrap().into(), r["location"].as_str().unwrap().into()))
+        .collect();
+    let at = |what: &str| refusals.iter().find(|r| r.0 == what).map(|r| r.1.clone());
+    let choose = at("choose (TLC cannot evaluate it)").unwrap_or_else(|| panic!("{:?}", refusals));
+    assert!(choose.contains("test.rs:"), "{}", choose);
+    let param = at("vstd operation given a function that does not reduce to a closure")
+        .unwrap_or_else(|| panic!("{:?}", refusals));
+    assert!(param.contains("test.rs:"), "{}", param);
+    assert_eq!(names(&ex.report["invariants"]), ["small"], "{}", ex.cfg);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let run = tlc(&jar, &ex.spec(), &ex.cfg);
+    assert_eq!(run.violated, Vec::<String>::new(), "{}", ex.tla);
+}
