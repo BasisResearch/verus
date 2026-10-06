@@ -3120,7 +3120,9 @@ fn tla_export_destructures_struct_lets_and_ref_patterns() {
         "{}",
         ex.tla
     );
-    assert!(ex.tla.contains("IF (m__.t.tag = \"Lo\") THEN TRUE ELSE FALSE"), "{}", ex.tla);
+    // A field of the whole state is its variable: `t`, not a field of a
+    // LET of the state's record.
+    assert!(ex.tla.contains("(IF (t.tag = \"Lo\") THEN TRUE ELSE FALSE)"), "{}", ex.tla);
     let Some(jar) = tla_tools() else { return };
     sany(&jar, &ex.spec());
     let run = tlc(&jar, &ex.spec(), &ex.cfg);
@@ -3246,6 +3248,218 @@ fn tla_export_lowers_verussync_require_let_and_remove_let() {
     assert_eq!(run.violated, Vec::<String>::new(), "{}", ex.tla);
     // o takes 4 values, q 4, m 4 (the subsets of its keys), slot 2.
     assert_eq!(run.distinct, 128, "{run:?}\n{}", ex.tla);
+}
+
+/// A `require let` whose pattern does not match disables the transition:
+/// `kill` makes `o` None and `q` Idle, after which `bump` and `answer` are
+/// evaluated on a non-matching variant, and TLC must neither stop at the
+/// `arbitrary()` arm nor take the step. `readd` removes a key and adds it
+/// back in one transition, which VerusSync allows. Without `kill` reached,
+/// a lowering that evaluated the `arbitrary()` arm would pass unnoticed.
+const SYNC_GUARDS: &str = r#"
+use vstd::prelude::*;
+use verus_state_machines_macros::tokenized_state_machine;
+
+verus! {
+
+pub enum Q { Ask { input: int, output: int }, Idle }
+
+tokenized_state_machine!{ M {
+    fields {
+        #[sharding(variable)] pub o: Option<int>,
+        #[sharding(variable)] pub q: Q,
+        #[sharding(map)] pub m: Map<int, int>,
+    }
+
+    init!{ initialize() {
+        init o = Some(0);
+        init q = Q::Ask { input: 0, output: 0 };
+        init m = Map::empty().insert(1, 0);
+    } }
+
+    transition!{ kill() {
+        update o = None;
+        update q = Q::Idle;
+    } }
+
+    transition!{ bump() {
+        require let Some(a) = pre.o;
+        require a < 2;
+        update o = Some(a + 1);
+    } }
+
+    transition!{ answer() {
+        require let Q::Ask { input, output } = pre.q;
+        require input < 2;
+        update q = Q::Ask { input: input + 1, output: output + input };
+    } }
+
+    transition!{ readd(k: int) {
+        remove m -= [k => let v];
+        require v < 2;
+        add m += [k => v + 1];
+    } }
+
+    #[invariant]
+    pub fn kept(&self) -> bool {
+        self.m.contains_key(1) && self.m[1] <= 2
+    }
+
+    #[inductive(initialize)] fn initialize_inductive(post: Self) { }
+    #[inductive(kill)] fn kill_inductive(pre: Self, post: Self) { }
+    #[inductive(bump)] fn bump_inductive(pre: Self, post: Self) { }
+    #[inductive(answer)] fn answer_inductive(pre: Self, post: Self) { }
+    #[inductive(readd)] fn readd_inductive(pre: Self, post: Self, k: int) { }
+}}
+
+}
+
+fn main() {}
+"#;
+
+#[test]
+fn tla_export_disables_a_require_let_that_does_not_match() {
+    let src = TempDir::new().expect("temp dir");
+    let entry = src.path().join("sync_guards.rs");
+    std::fs::write(&entry, SYNC_GUARDS).unwrap();
+    let ex = export_with(&entry, "test_crate::M", &["--no-verify"]);
+    assert_eq!(ex.report["refusals"], serde_json::json!([]), "{}", ex.tla);
+    assert!(ex.tla.contains("IF (m__.tag = \"Some\") THEN (LET a == m__.v0 IN TRUE) ELSE FALSE"));
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let cfg = format!("{}CONSTANTS\n  Dom_Step_readd_v0 = {{1, 2}}\n", ex.cfg);
+    let run = tlc(&jar, &ex.spec(), &cfg);
+    assert_eq!(run.violated, Vec::<String>::new(), "{}", ex.tla);
+    // Before `kill`: o in Some(0..=2), q in 3 Asks, m[1] in 0..=2 (readd
+    // fires): 27; after it, o None and q Idle with each m: 3.
+    assert_eq!(run.distinct, 30, "{run:?}\n{}", ex.tla);
+}
+
+/// An `_ => arbitrary()` arm outside VerusSync's `require let` may be
+/// reached, where Verus gives it some value: `arbitrary()` is refused
+/// there, as any function without a body is, so the report says so.
+const ARBITRARY_ARM: &str = r#"
+verus! {
+pub struct State { pub o: Option<int>, pub x: int }
+
+pub open spec fn get(o: Option<int>) -> int {
+    match o { Some(v) => v, _ => vstd::pervasive::arbitrary() }
+}
+
+pub open spec fn init(s: State) -> bool { s.o == Some(1int) && s.x == 0 }
+
+pub open spec fn next(pre: State, post: State) -> bool {
+    pre.x < 2 && post.o == (None::<int>) && post.x == pre.x + 1 + 0 * get(pre.o)
+}
+
+pub open spec fn small(s: State) -> bool { s.x <= 2 }
+}
+"#;
+
+#[test]
+fn tla_export_refuses_an_arbitrary_arm_outside_verussync() {
+    let ex = export_code(ARBITRARY_ARM, "test_crate");
+    let refusals: Vec<&str> = ex.report["refusals"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["what"].as_str().unwrap())
+        .collect();
+    assert_eq!(refusals, ["uninterpreted function"], "{}", ex.tla);
+    assert!(!ex.tla.contains("arbitrary() (an unspecified value)"), "{}", ex.tla);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+}
+
+/// A pattern on the whole post state binds each field to its variable
+/// (`x` is `x'`), so `x == e` assigns it as `post.x == e` does; it was a
+/// LET of the record `[x |-> x', y |-> y']`, which assigned nothing, and
+/// TLC stopped on the unassigned `x'`. A pattern on the pre state reads
+/// its variables the same way.
+const POST_PATTERN: &str = r#"
+verus! {
+pub struct State { pub x: int, pub y: int, pub z: int }
+
+pub open spec fn init(s: State) -> bool { s.x == 0 && s.y == 0 && s.z == 0 }
+
+pub open spec fn t_let(pre: State, post: State) -> bool {
+    let State { x, .. } = post;
+    let State { x: x0, y: y0, .. } = pre;
+    x0 < 2 && x == x0 + 1 && post.y == y0 + 2 && post.z == pre.z
+}
+
+pub open spec fn t_match(pre: State, post: State) -> bool {
+    pre.z < 1 && match post {
+        State { y, z, .. } => z == pre.z + 1 && y == pre.y && post.x == pre.x,
+    }
+}
+
+pub open spec fn next(pre: State, post: State) -> bool {
+    t_let(pre, post) || t_match(pre, post)
+}
+
+pub open spec fn even(s: State) -> bool { s.y == 2 * s.x && s.z <= 1 }
+}
+"#;
+
+#[test]
+fn tla_export_destructures_the_post_state() {
+    let ex = export_code(POST_PATTERN, "test_crate");
+    assert_eq!(ex.report["refusals"], serde_json::json!([]), "{}", ex.tla);
+    for t in ex.report["transitions"].as_array().unwrap() {
+        assert_eq!(t["unassigned"], serde_json::json!([]), "{}", ex.tla);
+    }
+    assert!(ex.tla.contains("(x' = (x + 1))"), "{}", ex.tla);
+    assert!(ex.tla.contains("(z' = (z + 1))"), "{}", ex.tla);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let run = tlc(&jar, &ex.spec(), &ex.cfg);
+    assert_eq!(run.violated, Vec::<String>::new(), "{}", ex.tla);
+    // x in 0..=2 (y = 2x), z in 0..=1.
+    assert_eq!(run.distinct, 6, "{run:?}\n{}", ex.tla);
+}
+
+/// A `let` whose pattern tests a variant (an or-pattern over every
+/// variant, so it always matches) puts the rest of the block under its
+/// condition, with an `Assert` where it fails. The alternatives bind `n`
+/// to different fields: taking the wrong one gives `n == 7` in `R(7, 1)`
+/// and violates `bounded`.
+const LET_GUARD: &str = r#"
+verus! {
+pub enum F { L(int, int), R(int, int) }
+pub struct State { pub f: F, pub x: int }
+
+pub open spec fn init(s: State) -> bool { s.f == F::L(0, 9) && s.x == 0 }
+
+pub open spec fn next(pre: State, post: State) -> bool {
+    let (F::L(n, _) | F::R(_, n)) = pre.f;
+    n < 2 && post.f == (if n % 2 == 0 { F::R(7, n + 1) } else { F::L(n + 1, 7) })
+        && post.x == n
+}
+
+pub open spec fn bounded(s: State) -> bool {
+    let (F::L(n, _) | F::R(_, n)) = s.f;
+    n <= 2 && s.x <= n
+}
+}
+"#;
+
+#[test]
+fn tla_export_guards_a_let_pattern_that_tests_a_variant() {
+    let ex = export_code(LET_GUARD, "test_crate");
+    assert_eq!(ex.report["refusals"], serde_json::json!([]), "{}", ex.tla);
+    assert!(
+        ex.tla.contains("(IF ((d__.tag = \"L\") \\/ (d__.tag = \"R\")) THEN (LET n == (IF (d__.tag = \"L\") THEN d__.v0 ELSE d__.v1) IN"),
+        "{}",
+        ex.tla
+    );
+    assert!(ex.tla.contains("Assert(FALSE, \"tla-export: the let pattern at"), "{}", ex.tla);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let run = tlc(&jar, &ex.spec(), &ex.cfg);
+    assert_eq!(run.violated, Vec::<String>::new(), "{}", ex.tla);
+    // L(0, 9), R(7, 1), L(2, 7).
+    assert_eq!(run.distinct, 3, "{run:?}\n{}", ex.tla);
 }
 
 /// An Init equality of two fields after a helper that assigns one of them:

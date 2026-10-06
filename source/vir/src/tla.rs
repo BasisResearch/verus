@@ -502,6 +502,11 @@ struct Env {
     primed: HashSet<VarIdent>,
     /// The set a bound variable ranges over, when known (see [`Dom`]).
     domains: HashMap<VarIdent, Dom>,
+    /// Names a pattern bound to a field of a whole state (`let State { x,
+    /// .. } = post`): the role, the state variable, and the printed name
+    /// (the variable itself, `x'`), so `x == e` assigns it as `post.x == e`
+    /// does. An entry holds only while the name is still printed so.
+    state_fields: HashMap<VarIdent, (Role, String, String)>,
 }
 
 impl Env {
@@ -512,6 +517,7 @@ impl Env {
             values: HashMap::new(),
             primed: HashSet::new(),
             domains: HashMap::new(),
+            state_fields: HashMap::new(),
         }
     }
     fn name(&self, v: &VarIdent) -> String {
@@ -1352,10 +1358,19 @@ impl Exporter {
                 {
                     Some(self.state_var(&field_name(field)))
                 }
+                PlaceX::Local(v) => self.state_field_name(v, env, role),
                 _ => None,
             },
+            ExprX::Var(v) => self.state_field_name(v, env, role),
             _ => None,
         }
+    }
+
+    /// The state variable `v` names, when a pattern bound it to a field of
+    /// the whole state in `role` (see [`Env::state_fields`]).
+    fn state_field_name(&self, v: &VarIdent, env: &Env, role: Role) -> Option<String> {
+        let (r, var, printed) = env.state_fields.get(v)?;
+        (*r == role && env.names.get(v) == Some(printed)).then(|| var.clone())
     }
 
     /// How `a = b` is printed and the variable it assigns at conjunct level.
@@ -1964,6 +1979,8 @@ impl Exporter {
                         let value = self.quiet(|x| x.place(init, &env2));
                         let before = env2.clone();
                         let n = self.bind_var(&mut env2, name);
+                        // A name shadowed here loses the domain it had.
+                        env2.domains.remove(name);
                         if before.place_reads_post(init) {
                             env2.primed.insert(name.clone());
                         } else {
@@ -2043,8 +2060,14 @@ impl Exporter {
             return (None, defs(bound));
         }
         let before = env.clone();
-        let subject = match &init.x {
-            PlaceX::Local(v) if before.names.contains_key(v) && !before.symbolic_only(v) => {
+        // A whole state is destructured as its record, so a field is its
+        // variable (see [`Exporter::pattern`]).
+        let role = place_var(init).and_then(|v| before.roles.get(&v).copied());
+        let subject = match (&init.x, role) {
+            (_, Some(role)) => self.state_record(role),
+            (PlaceX::Local(v), None)
+                if before.names.contains_key(v) && !before.symbolic_only(v) =>
+            {
                 before.name(v)
             }
             _ => {
@@ -2080,18 +2103,28 @@ impl Exporter {
         // What the scrutinee ranges over, when it is a variable with a
         // domain: its pattern's bindings then range over its fields'.
         let scrutinee_domain = place_var(place).and_then(|v| env.domains.get(&v).cloned());
-        // Bind the scrutinee once, under a name fresh in this operator.
-        let m = self.bind("m__");
+        // Bind the scrutinee once, under a name fresh in this operator; a
+        // whole state is matched as its record, so a field is its variable
+        // (see [`Exporter::pattern`]).
+        let whole_state = place_var(place).is_some_and(|v| env.roles.contains_key(&v));
+        let m = if whole_state { scrutinee.clone() } else { self.bind("m__") };
+        // VerusSync's `require let P = e` (and `assert let`) matches the
+        // macro's `tmp_for_match_<n>`, a local of `e`, after the guard
+        // `match tmp_for_match_<n> { P => true, _ => false }`.
+        let sync_tmp =
+            self.verussync && place_var(place).is_some_and(|v| v.0.starts_with("tmp_for_match_"));
         let mut chain: Vec<(String, String)> = Vec::new();
         let mut otherwise: Option<String> = None;
         let mut arm_assigned = Vec::new();
         for arm in arms.iter() {
             // `_ => arbitrary()`, the arm VerusSync's macro gives the names
-            // of a `require let` or `remove .. => let` where the pattern
-            // does not match: the transition's guard rules it out, so it is
-            // never evaluated on a step; were it, its value is unspecified
-            // and TLC stops there. It is not a refusal and taints nothing.
-            if matches!(arm.x.pattern.x, PatternX::Wildcard(_))
+            // of a `require let` where the pattern does not match: the
+            // transition's guard rules it out, so it is never evaluated on a
+            // step; were it, its value is unspecified and TLC stops there.
+            // It is not a refusal and taints nothing. Anywhere else such an
+            // arm may be reached, and `arbitrary()` is refused as usual.
+            if sync_tmp
+                && matches!(arm.x.pattern.x, PatternX::Wildcard(_))
                 && matches!(arm.x.guard.x, ExprX::Const(Constant::Bool(true)))
                 && is_arbitrary(&arm.x.body)
             {
@@ -2154,7 +2187,11 @@ impl Exporter {
         for (c, b) in chain.into_iter().rev() {
             tail = format!("IF {c} THEN {b} ELSE {tail}");
         }
-        format!("(LET {m} == {scrutinee} IN {tail})")
+        if whole_state {
+            format!("({tail})")
+        } else {
+            format!("(LET {m} == {scrutinee} IN {tail})")
+        }
     }
 
     /// The condition a pattern imposes on `subject`, and the LET bindings it
@@ -2172,16 +2209,19 @@ impl Exporter {
         match &p.x {
             PatternX::Wildcard(_) => (None, vec![]),
             PatternX::Var(PatternBinding { name, .. }) => {
-                if let Some(d) = domain {
-                    env.domains.insert(name.clone(), d);
-                }
+                // A name shadowed here loses the domain it had.
+                match domain {
+                    Some(d) => env.domains.insert(name.clone(), d),
+                    None => env.domains.remove(name),
+                };
                 let n = self.bind_var(env, name);
                 (None, vec![(n, subject.to_string())])
             }
             PatternX::Binding { binding: PatternBinding { name, .. }, sub_pat } => {
-                if let Some(d) = domain.clone() {
-                    env.domains.insert(name.clone(), d);
-                }
+                match domain.clone() {
+                    Some(d) => env.domains.insert(name.clone(), d),
+                    None => env.domains.remove(name),
+                };
                 let n = self.bind_var(env, name);
                 let (c, mut lets) = self.pattern(subject, sub_pat, env, domain);
                 lets.insert(0, (n, subject.to_string()));
@@ -2193,8 +2233,34 @@ impl Exporter {
                 if tagged {
                     conds.push(format!("({subject}.tag = \"{variant}\")"));
                 }
+                // A whole state (`let State { x, .. } = post`, `match self`
+                // on the state): each field is its state variable, and a
+                // name bound to one is that variable itself, not a LET of
+                // it, so `x == e` assigns `x'` as `post.x == e` does, and
+                // the pattern reads no field it does not bind.
+                let whole = match dt {
+                    Dt::Path(path) if *path == self.state_path => [Role::Pre, Role::Post]
+                        .into_iter()
+                        .find(|r| subject == self.state_record(*r)),
+                    _ => None,
+                };
                 let mut lets = Vec::new();
                 for b in binders.iter() {
+                    if let Some(role) = whole {
+                        let var = self.state_var(&field_name(&b.name));
+                        let printed =
+                            if role == Role::Post { format!("{var}'") } else { var.clone() };
+                        if let PatternX::Var(PatternBinding { name, .. }) = &b.a.x {
+                            env.names.insert(name.clone(), printed.clone());
+                            env.state_fields.insert(name.clone(), (role, var, printed));
+                            env.domains.remove(name);
+                            continue;
+                        }
+                        let (c, l) = self.pattern(&printed, &b.a, env, None);
+                        conds.extend(c);
+                        lets.extend(l);
+                        continue;
+                    }
                     let field = self.field_access(subject, dt, &b.name);
                     let field_domain = domain.clone().map(|of| {
                         let var = self.bind("s__");
@@ -2268,6 +2334,9 @@ impl Exporter {
             // bind the same names; each is the value the first alternative
             // that matches gives it (`x == IF cA THEN m.a ELSE m.b`, or the
             // one value when both give the same).
+            // A name bound gets no domain: the alternatives give it
+            // different ones (`A(n, _) | B(_, n)` ranges over A's first
+            // field or B's second), so a quantifier over it takes a hole.
             PatternX::Or(a, b) => {
                 let mut env_a = env.clone();
                 let (ca, la) = self.pattern(subject, a, &mut env_a, None);
@@ -2303,6 +2372,7 @@ impl Exporter {
                 let mut lets = Vec::new();
                 for (v, xa, xb) in values {
                     let n = self.bind_var(env, &v);
+                    env.domains.remove(&v);
                     let x = match &ca {
                         Some(c) if xa != xb => format!("(IF {c} THEN {xa} ELSE {xb})"),
                         _ => xa,
@@ -4876,9 +4946,11 @@ fn bool_field(e: &Expr) -> Option<(Expr, bool)> {
         ExprX::Unary(UnaryOp::Not, inner) => (peel(inner), true),
         _ => (e.clone(), false),
     };
+    // A local too, which may be a name bound to a state field (see
+    // [`Env::state_fields`]).
     let is_field = match &inner.x {
-        ExprX::UnaryOpr(UnaryOpr::Field(_), _) => true,
-        ExprX::ReadPlace(p, _) => matches!(p.x, PlaceX::Field(..)),
+        ExprX::UnaryOpr(UnaryOpr::Field(_), _) | ExprX::Var(_) => true,
+        ExprX::ReadPlace(p, _) => matches!(p.x, PlaceX::Field(..) | PlaceX::Local(_)),
         _ => false,
     };
     let is_bool = matches!(&*crate::ast_util::undecorate_typ(&inner.typ), TypX::Bool);

@@ -224,15 +224,22 @@ pattern over chars is refused, as an ordering of chars is.
 A destructuring `let` binds its value once and each name to its projection:
 `let (a, b) = e` is `LET d__ == e  a == d__[1]  b == d__[2] IN ...`, with the
 one index shift (a nested tuple projects twice, `d__[1][2]`), and `let S { f,
-g } = e` reads `d__.f` and `d__.g`; a local is projected in place. VerusSync's
+g } = e` reads `d__.f` and `d__.g`; a local is projected in place. A pattern
+on a whole state (`let State { x, .. } = post`, `match post`) binds each name
+to its state variable, so `x == e` assigns `x'` as `post.x == e` does. A `let`
+whose pattern tests a variant (`let (E::A(n) | E::B(n)) = e`, which always
+matches) puts the rest of the block under that condition. VerusSync's
 `require let P = e` reaches the export as its macro lowers it: the guard
 `match e { P => true, _ => false }`, then a tuple `let` of P's names from
 `match e { P => (names), _ => arbitrary() }`, so the guard tests the variant
-and the `let` reads the fields. That `arbitrary()` arm, which the guard rules
-out, is an `Assert(FALSE, ...)` but not a refusal. `remove m -= [k => let v]`
-is the `contains` guard, `v == m[k]` and the removal, in that order, so a
-second removal of the same key in one transition is disabled; `remove o -=
-Some(let x)` likewise. A refused pattern (a destructuring `let` binding a
+and the `let` reads the fields; where P does not match, the transition is
+disabled. That `arbitrary()` arm, which the guard rules out, is an
+`Assert(FALSE, ...)` but not a refusal. Only that arm: an `_ => arbitrary()`
+arm anywhere else may be reached, and `arbitrary()` is refused there, as any
+function without a body is. `remove m -= [k => let v]` is the `contains`
+guard, `v == m[k]` and the removal, in that order, so a second removal of the
+same key in one transition is disabled, and a removal then an `add` of the
+same key is not; `remove o -= Some(let x)` likewise. A refused pattern (a destructuring `let` binding a
 closure, a range over chars) binds each name it binds to the refusal, so TLC
 stops only where such a name is evaluated; left free, the name made SANY
 reject the whole module.
