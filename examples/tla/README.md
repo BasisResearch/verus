@@ -214,8 +214,28 @@ tuple `<<a, b>>`.
 
 A literal match pattern is an equality with the scrutinee (`0 => ...` is
 `IF m = 0 THEN ...`) and a range pattern its comparisons (`1..=3` is `1 <=
-m /\ m <= 3`). An or-pattern binding nothing is the disjunction of its
-alternatives (`Step::A | Step::B`); one that binds a name is refused.
+m /\ m <= 3`). An or-pattern is the disjunction of its alternatives
+(`Step::A | Step::B`), and a name it binds (Rust has every alternative bind
+it) is the value the first alternative that matches gives it: `E::A(n, _) |
+E::B(_, n)` binds `n == IF m.tag = "A" THEN m.v0 ELSE m.v1`. An `&` pattern
+(`match &x`, or `match self` on `&self`) is the pattern under it. A range
+pattern over chars is refused, as an ordering of chars is.
+
+A destructuring `let` binds its value once and each name to its projection:
+`let (a, b) = e` is `LET d__ == e  a == d__[1]  b == d__[2] IN ...`, with the
+one index shift (a nested tuple projects twice, `d__[1][2]`), and `let S { f,
+g } = e` reads `d__.f` and `d__.g`; a local is projected in place. VerusSync's
+`require let P = e` reaches the export as its macro lowers it: the guard
+`match e { P => true, _ => false }`, then a tuple `let` of P's names from
+`match e { P => (names), _ => arbitrary() }`, so the guard tests the variant
+and the `let` reads the fields. That `arbitrary()` arm, which the guard rules
+out, is an `Assert(FALSE, ...)` but not a refusal. `remove m -= [k => let v]`
+is the `contains` guard, `v == m[k]` and the removal, in that order, so a
+second removal of the same key in one transition is disabled; `remove o -=
+Some(let x)` likewise. A refused pattern (a destructuring `let` binding a
+closure, a range over chars) binds each name it binds to the refusal, so TLC
+stops only where such a name is evaluated; left free, the name made SANY
+reject the whole module.
 
 A closure bound by `let` (or a closure parameter) is only ever applied; passed
 to a function, compared or returned, it is a refusal.

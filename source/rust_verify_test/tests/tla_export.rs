@@ -2911,33 +2911,33 @@ fn tla_export_prints_an_or_pattern_as_a_disjunction() {
 /// A refused pattern in one transition: the names it binds are bound to
 /// the refusal (they were left free, so SANY rejected the whole module and
 /// TLC checked nothing). TLC stops only where such a name is evaluated, so
-/// the other transitions and the invariant are still checked.
+/// the other transitions and the invariant are still checked. A closure has
+/// no TLA+ value, so a destructuring `let` binding one is refused; a `char`
+/// is a TLA+ string, which has no order, so a range pattern over chars is.
 const REFUSED_PATTERN: &str = r#"
 verus! {
-pub struct State { pub x: int, pub e: E }
+pub struct State { pub x: int, pub c: char }
 
-pub enum E { A(int), B(int), C }
-
-pub open spec fn init(s: State) -> bool { s.x == 0 && s.e == E::C }
+pub open spec fn init(s: State) -> bool { s.x == 0 && s.c == 'a' }
 
 pub open spec fn t_inc(pre: State, post: State) -> bool {
-    pre.x < 3 && post.x == pre.x + 1 && post.e == pre.e
+    pre.x < 3 && post.x == pre.x + 1 && post.c == pre.c
 }
 
-pub open spec fn t_tuple(pre: State, post: State) -> bool {
-    let (a, b) = (pre.x, 1int);
-    pre.x > 100 && post.x == a + b && post.e == pre.e
+pub open spec fn t_closure(pre: State, post: State) -> bool {
+    let (f, k) = (|v: int| v + 1, 1int);
+    pre.x > 100 && post.x == pre.x + k && post.c == pre.c
 }
 
-pub open spec fn t_or(pre: State, post: State) -> bool {
-    pre.x > 100 && match pre.e {
-        E::A(n) | E::B(n) => post.x == n && post.e == pre.e,
-        E::C => false,
+pub open spec fn t_char(pre: State, post: State) -> bool {
+    pre.x > 100 && match pre.c {
+        d @ 'a'..='z' => post.x == 0 && post.c == d,
+        _ => false,
     }
 }
 
 pub open spec fn next(pre: State, post: State) -> bool {
-    t_inc(pre, post) || t_tuple(pre, post) || t_or(pre, post)
+    t_inc(pre, post) || t_closure(pre, post) || t_char(pre, post)
 }
 
 pub open spec fn small(s: State) -> bool { s.x <= 3 }
@@ -2947,24 +2947,22 @@ pub open spec fn small(s: State) -> bool { s.x <= 3 }
 #[test]
 fn tla_export_binds_the_names_a_refused_pattern_leaves() {
     let ex = export_code(REFUSED_PATTERN, "test_crate");
-    let refusals: Vec<String> = ex.report["refusals"]
+    let mut refusals: Vec<String> = ex.report["refusals"]
         .as_array()
         .unwrap()
         .iter()
         .map(|r| r["what"].as_str().unwrap().to_string())
         .collect();
-    assert_eq!(refusals, ["destructuring let", "or-pattern"], "{}", ex.tla);
-    assert!(
-        ex.tla.contains("LET a == Assert(FALSE, \"tla-export refused: destructuring let"),
+    refusals.sort();
+    assert_eq!(
+        refusals,
+        ["destructuring let binding a closure", "range pattern over chars"],
         "{}",
         ex.tla
     );
-    assert!(
-        ex.tla.contains("b == Assert(FALSE, \"tla-export refused: destructuring let"),
-        "{}",
-        ex.tla
-    );
-    assert!(ex.tla.contains("n == Assert(FALSE, \"tla-export refused: or-pattern"), "{}", ex.tla);
+    let closure = "Assert(FALSE, \"tla-export refused: destructuring let binding a closure";
+    assert!(ex.tla.contains(&format!("LET f == {closure}")), "{}", ex.tla);
+    assert!(ex.tla.contains(&format!("k == {closure}")), "{}", ex.tla);
     assert_eq!(names(&ex.report["invariants"]), ["small"]);
     let Some(jar) = tla_tools() else { return };
     sany(&jar, &ex.spec());
@@ -2972,6 +2970,282 @@ fn tla_export_binds_the_names_a_refused_pattern_leaves() {
     assert_eq!(run.violated, Vec::<String>::new(), "{}", ex.tla);
     // x in 0..3; the refused transitions are never enabled.
     assert_eq!(run.distinct, 4, "{run:?}\n{}", ex.tla);
+}
+
+/// A tuple `let` binds the value once and each name to its projection,
+/// with the one sequence index shift (`a == d__[1]`), nested ones too
+/// (`n == d__[1][1]`). A `match &x` matches what `x` does. A binding
+/// or-pattern is the disjunction of its alternatives, each name the value
+/// of the alternative that matches (`IF tag = "A" THEN v0 ELSE v1`), or the
+/// one value when both give the same. The invariants pin each projection:
+/// a wrong index or alternative violates one.
+const TUPLE_LETS: &str = r#"
+verus! {
+pub struct State { pub p: (int, int), pub q: ((int, bool), int), pub e: E }
+
+pub enum E { A(int, int), B(int, int), C }
+
+pub open spec fn init(s: State) -> bool {
+    s.p == (0int, 0int) && s.q == ((0int, false), 0int) && s.e == E::A(1, 2)
+}
+
+pub open spec fn t_swap(pre: State, post: State) -> bool {
+    let (a, b) = pre.p;
+    a < 2 && post.p == (b, a + 1) && post.q == pre.q && post.e == pre.e
+}
+
+pub open spec fn t_nested(pre: State, post: State) -> bool {
+    let ((n, flag), m) = pre.q;
+    n < 2 && post.q == ((n + 1, !flag), m + n) && post.p == pre.p && post.e == pre.e
+}
+
+pub open spec fn t_or(pre: State, post: State) -> bool {
+    match &pre.e {
+        E::A(n, _) | E::B(_, n) => {
+            post.e == (if *n == 1 { E::B(0, 1) } else { E::C }) && post.p == pre.p
+                && post.q == pre.q
+        }
+        E::C => false,
+    }
+}
+
+pub open spec fn next(pre: State, post: State) -> bool {
+    t_swap(pre, post) || t_nested(pre, post) || t_or(pre, post)
+}
+
+pub open spec fn swapped(s: State) -> bool {
+    let (a, b) = s.p;
+    b == a || b == a + 1
+}
+
+pub open spec fn flag_odd(s: State) -> bool {
+    let ((n, flag), m) = s.q;
+    flag == (n % 2 == 1) && m == n * (n - 1) / 2
+}
+
+pub open spec fn never_c(s: State) -> bool {
+    match s.e { E::A(n, _) | E::B(n, _) => n <= 1, E::C => false }
+}
+}
+"#;
+
+#[test]
+fn tla_export_destructures_tuple_lets_and_or_patterns() {
+    let ex = export_code(TUPLE_LETS, "test_crate");
+    assert_eq!(ex.report["refusals"], serde_json::json!([]), "{}", ex.tla);
+    assert_eq!(names(&ex.report["invariants"]), ["swapped", "flag_odd", "never_c"]);
+    assert!(
+        ex.tla.contains("LET d__ == p\n         a == d__[1]\n         b == d__[2] IN"),
+        "{}",
+        ex.tla
+    );
+    assert!(
+        ex.tla.contains("n == d__[1][1]\n         flag == d__[1][2]\n         m == d__[2]"),
+        "{}",
+        ex.tla
+    );
+    assert!(
+        ex.tla.contains("IF ((m__.tag = \"A\") \\/ (m__.tag = \"B\")) THEN (LET n == (IF (m__.tag = \"A\") THEN m__.v0 ELSE m__.v1) IN"),
+        "{}",
+        ex.tla
+    );
+    assert!(ex.tla.contains("THEN (LET n == m__.v0 IN (n <= 1))"), "{}", ex.tla);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let run = tlc(&jar, &ex.spec(), &ex.cfg);
+    assert_eq!(run.violated, Vec::<String>::new(), "{}", ex.tla);
+    // p takes 5 values, q 3, e 2 (A(1, 2), then B(0, 1) for good).
+    assert_eq!(run.distinct, 30, "{run:?}\n{}", ex.tla);
+}
+
+/// A `let` of a struct or of an enum of one variant reads its fields
+/// (`a == d__.a`), and a `match` on `&self` (an `&` pattern, from match
+/// ergonomics) matches what the pattern under the `&` does.
+const STRUCT_LETS: &str = r#"
+verus! {
+pub enum Wrap { Val { a: int, b: int } }
+pub struct Pair { pub x: int, pub y: int }
+pub enum Tag { Lo(int), Hi(int) }
+pub struct State { pub w: Wrap, pub pr: Pair, pub t: Tag }
+
+impl State {
+    pub open spec fn level(&self) -> int {
+        match self.t { Tag::Lo(n) => n, Tag::Hi(n) => n + 10 }
+    }
+
+    pub open spec fn is_lo(&self) -> bool {
+        match self { State { t: Tag::Lo(_), .. } => true, _ => false }
+    }
+}
+
+pub open spec fn init(s: State) -> bool {
+    s.w == Wrap::Val { a: 0, b: 1 } && s.pr == Pair { x: 0, y: 0 } && s.t == Tag::Lo(0)
+}
+
+pub open spec fn t_wrap(pre: State, post: State) -> bool {
+    let Wrap::Val { a, b } = pre.w;
+    a < 3 && post.w == Wrap::Val { a: a + 1, b: b * 2 } && post.pr == pre.pr && post.t == pre.t
+}
+
+pub open spec fn t_pair(pre: State, post: State) -> bool {
+    let Pair { x, y } = pre.pr;
+    let (u, v) = &(x + 1, y + 2);
+    x < 2 && post.pr == Pair { x: *u, y: *v } && post.w == pre.w && post.t == pre.t
+}
+
+pub open spec fn t_tag(pre: State, post: State) -> bool {
+    pre.is_lo() && pre.level() < 2 && post.t == Tag::Hi(pre.level()) && post.w == pre.w
+        && post.pr == pre.pr
+}
+
+pub open spec fn next(pre: State, post: State) -> bool {
+    t_wrap(pre, post) || t_pair(pre, post) || t_tag(pre, post)
+}
+
+pub open spec fn pow2(n: int) -> int decreases n { if n <= 0 { 1 } else { 2 * pow2(n - 1) } }
+
+pub open spec fn doubling(s: State) -> bool {
+    let Wrap::Val { a, b } = s.w;
+    b == pow2(a) && s.pr.y == 2 * s.pr.x
+}
+}
+"#;
+
+#[test]
+fn tla_export_destructures_struct_lets_and_ref_patterns() {
+    let ex = export_code(STRUCT_LETS, "test_crate");
+    assert_eq!(ex.report["refusals"], serde_json::json!([]), "{}", ex.tla);
+    assert!(
+        ex.tla.contains("LET d__ == w\n         a == d__.a\n         b == d__.b IN"),
+        "{}",
+        ex.tla
+    );
+    assert!(ex.tla.contains("IF (m__.t.tag = \"Lo\") THEN TRUE ELSE FALSE"), "{}", ex.tla);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let run = tlc(&jar, &ex.spec(), &ex.cfg);
+    assert_eq!(run.violated, Vec::<String>::new(), "{}", ex.tla);
+    // w takes 4 values, pr 3, t 2.
+    assert_eq!(run.distinct, 24, "{run:?}\n{}", ex.tla);
+}
+
+/// VerusSync's `require let P = e` is the macro's `match e { P => true, _
+/// => false }` guard and a tuple `let` of P's names from `match e { P =>
+/// (names), _ => arbitrary() }`: the guard tests the variant, the `let`
+/// reads the fields, and the `arbitrary()` arm, which the guard rules out,
+/// is an `Assert` but not a refusal. `remove m -= [k => let v]` is a
+/// `contains` guard, `v == m[k]` and the removal, in sequence, so a second
+/// removal of the same key is disabled (`take_twice` never fires, or
+/// `conserved` would fail); `remove o -= Some(let x)` likewise. (A `let`
+/// binding is not allowed by the macro in a set's `remove s -= set { .. }`.)
+const SYNC_LETS: &str = r#"
+use vstd::prelude::*;
+use verus_state_machines_macros::tokenized_state_machine;
+
+verus! {
+
+pub enum Q { Ask { input: int, output: int }, Idle }
+
+tokenized_state_machine!{ M {
+    fields {
+        #[sharding(variable)] pub o: Option<(int, int)>,
+        #[sharding(variable)] pub q: Q,
+        #[sharding(map)] pub m: Map<int, int>,
+        #[sharding(option)] pub slot: Option<int>,
+        #[sharding(variable)] pub total: int,
+    }
+
+    init!{ initialize() {
+        init o = Some((0, 0));
+        init q = Q::Ask { input: 1, output: 2 };
+        init m = Map::empty().insert(1, 10).insert(2, 20);
+        init slot = Option::Some(5);
+        init total = 0;
+    } }
+
+    transition!{ bump() {
+        require let Some((a, b)) = pre.o;
+        require a < 3;
+        update o = Some((a + 1, b + a));
+    } }
+
+    transition!{ answer() {
+        require let Q::Ask { input, output } = pre.q;
+        require input < 5;
+        update q = Q::Ask { input: output, output: input + output };
+    } }
+
+    transition!{ take(k: int) {
+        remove m -= [k => let v];
+        update total = pre.total + v;
+    } }
+
+    transition!{ take_twice(k: int) {
+        remove m -= [k => let v];
+        remove m -= [k => let w];
+        update total = pre.total + v + w;
+    } }
+
+    transition!{ empty_slot() {
+        remove slot -= Some(let x);
+        update total = pre.total + x;
+    } }
+
+    #[invariant]
+    pub fn o_sum(&self) -> bool {
+        self.o is Some && self.o.unwrap().1 == self.o.unwrap().0 * (self.o.unwrap().0 - 1) / 2
+    }
+
+    #[invariant]
+    pub fn conserved(&self) -> bool {
+        self.total + (if self.m.contains_key(1) { 10int } else { 0 })
+            + (if self.m.contains_key(2) { 20int } else { 0 })
+            + (if self.slot is Some { 5int } else { 0 }) == 35
+    }
+
+    #[inductive(initialize)] fn initialize_inductive(post: Self) { }
+    #[inductive(bump)] fn bump_inductive(pre: Self, post: Self) { }
+    #[inductive(answer)] fn answer_inductive(pre: Self, post: Self) { }
+    #[inductive(take)] fn take_inductive(pre: Self, post: Self, k: int) { }
+    #[inductive(take_twice)] fn take_twice_inductive(pre: Self, post: Self, k: int) { }
+    #[inductive(empty_slot)] fn empty_slot_inductive(pre: Self, post: Self) { }
+}}
+
+}
+
+fn main() {}
+"#;
+
+#[test]
+fn tla_export_lowers_verussync_require_let_and_remove_let() {
+    let src = TempDir::new().expect("temp dir");
+    let entry = src.path().join("sync_lets.rs");
+    std::fs::write(&entry, SYNC_LETS).unwrap();
+    let ex = export_with(&entry, "test_crate::M", &["--no-verify"]);
+    assert_eq!(ex.report["shape"], "verussync");
+    assert_eq!(ex.report["refusals"], serde_json::json!([]), "{}", ex.tla);
+    assert_eq!(names(&ex.report["invariants"]), ["o_sum", "conserved"]);
+    assert!(
+        ex.tla.contains("tla-export: arbitrary() (an unspecified value) evaluated at"),
+        "{}",
+        ex.tla
+    );
+    // The second removal reads the map the first one left.
+    assert!(
+        ex.tla.contains("(k \\in DOMAIN update_tmp_m_2) /\\ (LET w == update_tmp_m_2[k]"),
+        "{}",
+        ex.tla
+    );
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let cfg = format!(
+        "{}CONSTANTS\n  Dom_Step_take_v0 = {{1, 2}}\n  Dom_Step_take_twice_v0 = {{1, 2}}\n",
+        ex.cfg
+    );
+    let run = tlc(&jar, &ex.spec(), &cfg);
+    assert_eq!(run.violated, Vec::<String>::new(), "{}", ex.tla);
+    // o takes 4 values, q 4, m 4 (the subsets of its keys), slot 2.
+    assert_eq!(run.distinct, 128, "{run:?}\n{}", ex.tla);
 }
 
 /// An Init equality of two fields after a helper that assigns one of them:

@@ -1935,10 +1935,14 @@ impl Exporter {
 
     fn block(&mut self, e: &Expr, stmts: &Stmts, tail: &Option<Expr>, env: &Env) -> String {
         let mut env2 = env.clone();
+        // The block's definitions, in groups, each closed by the condition
+        // of a destructuring `let` that tests a variant (see
+        // [`Exporter::let_pattern`]): the rest of the block sits under it.
+        let mut groups: Vec<(Vec<String>, Option<(String, String)>)> = Vec::new();
         let mut lets = Vec::new();
         for s in stmts.iter() {
             match &s.x {
-                StmtX::Decl { pattern, init: Some(init), .. } => match &pattern.x {
+                StmtX::Decl { pattern, init: Some(init), els, .. } => match &pattern.x {
                     PatternX::Var(PatternBinding { name, .. }) => {
                         let symbolic = match &init.x {
                             PlaceX::Temporary(e) | PlaceX::WithExpr(e, _) => Some(peel(e)),
@@ -1971,13 +1975,21 @@ impl Exporter {
                         lets.push(format!("{n} == {value}"));
                     }
                     PatternX::Wildcard(_) => {}
+                    _ if els.is_none() => {
+                        let (guard, bound) =
+                            self.let_pattern(s, pattern, init, &mut env2, &mut lets);
+                        if let Some(guard) = guard {
+                            groups.push((std::mem::take(&mut lets), Some(guard)));
+                        }
+                        lets.extend(bound);
+                    }
                     _ => {
-                        let r = self.refuse("destructuring let", &s.span);
+                        let r = self.refuse("let-else", &s.span);
                         // Each name the pattern binds is bound to the
                         // refusal, so the rest of the block reads only
                         // defined names and TLC stops where one is used.
                         let (_, bound) = self.refused_bindings(r, pattern, &mut env2);
-                        lets.extend(bound);
+                        lets.extend(bound.into_iter().map(|(n, v)| format!("{n} == {v}")));
                     }
                 },
                 StmtX::Decl { init: None, .. } => {}
@@ -1985,12 +1997,82 @@ impl Exporter {
                 StmtX::Expr(_) => {}
             }
         }
-        let body = match tail {
+        groups.push((lets, None));
+        let mut body = match tail {
             Some(t) => self.expr(t, &env2),
             None => "TRUE".into(),
         };
         let _ = e;
-        if lets.is_empty() { body } else { format!("(LET {} IN {body})", lets.join("\n         ")) }
+        for (lets, guard) in groups.into_iter().rev() {
+            if let Some((cond, msg)) = guard {
+                body = format!("(IF {cond} THEN {body} ELSE Assert(FALSE, {msg}))");
+            }
+            if !lets.is_empty() {
+                body = format!("(LET {} IN {body})", lets.join("\n         "));
+            }
+        }
+        body
+    }
+
+    /// A destructuring `let pattern = init;` (`let (a, b) = e`, `let S { f,
+    /// g } = e`; VerusSync's `require let` and `remove .. => let` are
+    /// lowered by its macro to a tuple `let` of the names the pattern
+    /// binds). `init` is bound once, pushed onto `lets` unless it is a
+    /// local (`d__ == e`), and each name is its projection (`a == d__[1]`),
+    /// returned as definitions. Rust admits only patterns that always
+    /// match here, but one may still test a variant (of an enum whose other
+    /// variants are uninhabited): that condition is returned too, with the
+    /// message of the `Assert` the block prints where it fails, and the
+    /// names are then defined under it.
+    fn let_pattern(
+        &mut self,
+        s: &Stmt,
+        pattern: &Pattern,
+        init: &Place,
+        env: &mut Env,
+        lets: &mut Vec<String>,
+    ) -> (Option<(String, String)>, Vec<String>) {
+        let defs = |bound: Vec<(String, String)>| {
+            bound.into_iter().map(|(n, v)| format!("{n} == {v}")).collect::<Vec<_>>()
+        };
+        // A closure-valued name has no TLA+ value; it is only ever held
+        // symbolically, which a projection of a value cannot be.
+        if pattern_binds_closure(pattern, &self.datatypes) {
+            let r = self.refuse("destructuring let binding a closure", &s.span);
+            let (_, bound) = self.refused_bindings(r, pattern, env);
+            return (None, defs(bound));
+        }
+        let before = env.clone();
+        let subject = match &init.x {
+            PlaceX::Local(v) if before.names.contains_key(v) && !before.symbolic_only(v) => {
+                before.name(v)
+            }
+            _ => {
+                let value = self.quiet(|x| x.place(init, &before));
+                let d = self.bind("d__");
+                lets.push(format!("{d} == {value}"));
+                d
+            }
+        };
+        let domain = place_var(init).and_then(|v| before.domains.get(&v).cloned());
+        let (cond, bound) = self.pattern(&subject, pattern, env, domain);
+        // A name bound from a value that reads the post state reads it too.
+        let primed = before.place_reads_post(init);
+        let mut names = Vec::new();
+        pattern_names(pattern, &mut names);
+        for v in names {
+            if primed {
+                env.primed.insert(v);
+            } else {
+                env.primed.remove(&v);
+            }
+        }
+        let guard = cond.map(|c| {
+            let msg =
+                format!("tla-export: the let pattern at {} does not match", span_string(&s.span));
+            (c, tla_string(&msg))
+        });
+        (guard, defs(bound))
     }
 
     fn matches(&mut self, e: &Expr, place: &Place, arms: &Arms, env: &Env) -> String {
@@ -2004,9 +2086,27 @@ impl Exporter {
         let mut otherwise: Option<String> = None;
         let mut arm_assigned = Vec::new();
         for arm in arms.iter() {
+            // `_ => arbitrary()`, the arm VerusSync's macro gives the names
+            // of a `require let` or `remove .. => let` where the pattern
+            // does not match: the transition's guard rules it out, so it is
+            // never evaluated on a step; were it, its value is unspecified
+            // and TLC stops there. It is not a refusal and taints nothing.
+            if matches!(arm.x.pattern.x, PatternX::Wildcard(_))
+                && matches!(arm.x.guard.x, ExprX::Const(Constant::Bool(true)))
+                && is_arbitrary(&arm.x.body)
+            {
+                let msg = format!(
+                    "tla-export: arbitrary() (an unspecified value) evaluated at {}",
+                    span_string(&arm.x.body.span)
+                );
+                otherwise = Some(format!("Assert(FALSE, {})", tla_string(&msg)));
+                arm_assigned.push(self.state_vars.iter().cloned().collect());
+                break;
+            }
             let mut env2 = env.clone();
             let (cond, lets) =
                 self.pattern(&m, &arm.x.pattern, &mut env2, scrutinee_domain.clone());
+            let lets: Vec<String> = lets.into_iter().map(|(n, v)| format!("{n} == {v}")).collect();
             // A binding of a scrutinee that reads the post state reads it too.
             let scrutinee_primed = env.place_reads_post(place);
             for v in env2.names.keys().cloned().collect::<Vec<_>>() {
@@ -2058,16 +2158,17 @@ impl Exporter {
     }
 
     /// The condition a pattern imposes on `subject`, and the LET bindings it
-    /// introduces (added to `env`). The condition reads only `subject`.
-    /// `domain` is the set `subject` ranges over, when known: a binding
-    /// ranges over it, and a constructor's fields over its fields'.
+    /// introduces (added to `env`), each a name and its value. The
+    /// condition and the values read only `subject`. `domain` is the set
+    /// `subject` ranges over, when known: a binding ranges over it, and a
+    /// constructor's fields over its fields'.
     fn pattern(
         &mut self,
         subject: &str,
         p: &Pattern,
         env: &mut Env,
         domain: Option<Dom>,
-    ) -> (Option<String>, Vec<String>) {
+    ) -> (Option<String>, Vec<(String, String)>) {
         match &p.x {
             PatternX::Wildcard(_) => (None, vec![]),
             PatternX::Var(PatternBinding { name, .. }) => {
@@ -2075,7 +2176,7 @@ impl Exporter {
                     env.domains.insert(name.clone(), d);
                 }
                 let n = self.bind_var(env, name);
-                (None, vec![format!("{n} == {subject}")])
+                (None, vec![(n, subject.to_string())])
             }
             PatternX::Binding { binding: PatternBinding { name, .. }, sub_pat } => {
                 if let Some(d) = domain.clone() {
@@ -2083,7 +2184,7 @@ impl Exporter {
                 }
                 let n = self.bind_var(env, name);
                 let (c, mut lets) = self.pattern(subject, sub_pat, env, domain);
-                lets.insert(0, format!("{n} == {subject}"));
+                lets.insert(0, (n, subject.to_string()));
                 (c, lets)
             }
             PatternX::Constructor(dt, variant, binders) => {
@@ -2138,6 +2239,12 @@ impl Exporter {
                 let v = self.quiet(|this| this.expr(x, env));
                 (Some(format!("({subject} = {v})")), vec![])
             }
+            // A `char` is a TLA+ string, which has no order (see
+            // `Constant::Char`), as a comparison of two is refused.
+            PatternX::Range(..) if is_char_typ(&p.typ) => {
+                let r = self.refuse("range pattern over chars", &p.span);
+                self.refused_bindings(r, p, env)
+            }
             PatternX::Range(lo, hi) => {
                 let mut conds = Vec::new();
                 if let Some(lo) = lo {
@@ -2156,23 +2263,61 @@ impl Exporter {
                 };
                 (cond, vec![])
             }
-            // `A | B` binding nothing: either alternative's condition (an
-            // alternative that always matches makes the whole one match).
-            PatternX::Or(a, b) if !pattern_binds(a) && !pattern_binds(b) => {
-                let (ca, _) = self.pattern(subject, a, env, None);
-                let (cb, _) = self.pattern(subject, b, env, None);
+            // `A | B`: either alternative's condition (an alternative that
+            // always matches makes the whole one match). Rust has both
+            // bind the same names; each is the value the first alternative
+            // that matches gives it (`x == IF cA THEN m.a ELSE m.b`, or the
+            // one value when both give the same).
+            PatternX::Or(a, b) => {
+                let mut env_a = env.clone();
+                let (ca, la) = self.pattern(subject, a, &mut env_a, None);
+                let mut env_b = env.clone();
+                let (cb, lb) = self.pattern(subject, b, &mut env_b, None);
+                let mut names = Vec::new();
+                pattern_names(a, &mut names);
+                let mut values = Vec::new();
+                for v in &names {
+                    let value = |e: &Env, lets: &[(String, String)]| {
+                        let n = e.names.get(v)?;
+                        lets.iter().find(|(m, _)| m == n).map(|(_, x)| x.clone())
+                    };
+                    match (value(&env_a, &la), value(&env_b, &lb)) {
+                        (Some(xa), Some(xb)) => values.push((v.clone(), xa, xb)),
+                        _ => {
+                            let r = self.refuse("or-pattern", &p.span);
+                            return self.refused_bindings(r, p, env);
+                        }
+                    }
+                }
+                // The alternatives' own names for the bindings are unused:
+                // free them, so the bindings take their plain names.
+                for (v, _, _) in &values {
+                    for e in [&env_a, &env_b] {
+                        if let Some(n) = e.names.get(v) {
+                            if env.names.get(v) != Some(n) {
+                                self.bound.remove(n);
+                            }
+                        }
+                    }
+                }
+                let mut lets = Vec::new();
+                for (v, xa, xb) in values {
+                    let n = self.bind_var(env, &v);
+                    let x = match &ca {
+                        Some(c) if xa != xb => format!("(IF {c} THEN {xa} ELSE {xb})"),
+                        _ => xa,
+                    };
+                    lets.push((n, x));
+                }
                 match (ca, cb) {
-                    (Some(x), Some(y)) => (Some(format!("({x} \\/ {y})")), vec![]),
-                    _ => (None, vec![]),
+                    (Some(x), Some(y)) => (Some(format!("({x} \\/ {y})")), lets),
+                    _ => (None, lets),
                 }
             }
-            PatternX::Or(..) => {
-                let r = self.refuse("or-pattern", &p.span);
-                self.refused_bindings(r, p, env)
-            }
-            _ => {
-                let r = self.refuse("pattern kind", &p.span);
-                self.refused_bindings(r, p, env)
+            // `&p` and `&mut p` (from `match &x` and match ergonomics)
+            // match what `p` does: a reference is its referent here.
+            PatternX::ImmutRef(inner) | PatternX::MutRef(inner) => {
+                self.pattern(subject, inner, env, domain)
             }
         }
     }
@@ -2181,14 +2326,13 @@ impl Exporter {
     /// it binds is bound to `r` too (added to `env`). Left unbound, a name
     /// would be free in the module, and SANY would reject all of it; bound
     /// to the refusal, TLC stops only where the name is evaluated, as at
-    /// any other refusal. A pattern binding nothing binds `unused__`, so
-    /// the refusal stays in the print.
+    /// any other refusal.
     fn refused_bindings(
         &mut self,
         r: String,
         p: &Pattern,
         env: &mut Env,
-    ) -> (Option<String>, Vec<String>) {
+    ) -> (Option<String>, Vec<(String, String)>) {
         let mut names = Vec::new();
         pattern_names(p, &mut names);
         let mut lets = Vec::new();
@@ -2199,12 +2343,8 @@ impl Exporter {
                 let n = self.bind_var(env, &v);
                 env.primed.remove(&v);
                 env.domains.remove(&v);
-                lets.push(format!("{n} == {r}"));
+                lets.push((n, r.clone()));
             }
-        }
-        if lets.is_empty() {
-            let n = self.bind("unused__");
-            lets.push(format!("{n} == {r}"));
         }
         (Some(r), lets)
     }
@@ -4802,15 +4942,31 @@ fn pattern_names(p: &Pattern, out: &mut Vec<VarIdent>) {
     }
 }
 
-/// Whether a pattern binds a name anywhere in it.
-fn pattern_binds(p: &Pattern) -> bool {
+/// Whether a pattern binds a name to a closure or a record of closures.
+fn pattern_binds_closure(p: &Pattern, datatypes: &HashMap<Path, Datatype>) -> bool {
     match &p.x {
-        PatternX::Var(_) | PatternX::Binding { .. } => true,
+        PatternX::Var(b) => typ_has_specfn(&b.typ, datatypes, &mut HashSet::new()),
+        PatternX::Binding { binding, sub_pat } => {
+            typ_has_specfn(&binding.typ, datatypes, &mut HashSet::new())
+                || pattern_binds_closure(sub_pat, datatypes)
+        }
         PatternX::Wildcard(_) | PatternX::Expr(_) | PatternX::Range(..) => false,
-        PatternX::Constructor(_, _, binders) => binders.iter().any(|b| pattern_binds(&b.a)),
-        PatternX::Or(a, b) => pattern_binds(a) || pattern_binds(b),
-        PatternX::MutRef(inner) | PatternX::ImmutRef(inner) => pattern_binds(inner),
+        PatternX::Constructor(_, _, binders) => {
+            binders.iter().any(|b| pattern_binds_closure(&b.a, datatypes))
+        }
+        PatternX::Or(a, b) => {
+            pattern_binds_closure(a, datatypes) || pattern_binds_closure(b, datatypes)
+        }
+        PatternX::MutRef(inner) | PatternX::ImmutRef(inner) => {
+            pattern_binds_closure(inner, datatypes)
+        }
     }
+}
+
+/// Whether `e` is vstd's `arbitrary()`.
+fn is_arbitrary(e: &Expr) -> bool {
+    called(e)
+        .is_some_and(|(_, fun, _)| fun_as_friendly_rust_name(&fun) == "vstd::pervasive::arbitrary")
 }
 
 /// Where the assertion `cond` of VerusSync's `tmp_assert && cond` (`init`)
