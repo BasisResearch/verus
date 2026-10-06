@@ -937,12 +937,32 @@ fn mentions(e: &Expr, v: &VarIdent) -> bool {
 /// an operator both commutative and associative: `acc op g(x)` or `g(x) op
 /// acc`, `g` not reading `acc`, for `+`, `*`, `&&`, `||`, set union and
 /// intersection, `insert` and multiset addition. Every order of the
-/// elements then folds to the same value. A cast around it is the identity
-/// or a checked one (see `UnaryOp::Clip`), which TLC stops at rather than
-/// clipping.
+/// elements then folds to the same value. A cast around it must be the
+/// identity, or a checked one (see `UnaryOp::Clip`) around a sum of
+/// operands that are never negative: such a sum only grows, so every order
+/// leaves the type exactly when the total does, and TLC stops in every
+/// order or in none. Any other checked cast can leave the type in one order
+/// and not in another (`(acc + x) as nat` over `{-1, 1}`).
 fn commutative_fold_body(acc: &VarIdent, body: &Expr) -> bool {
+    let nonneg = |e: &Expr| match &peel(e).x {
+        ExprX::Const(Constant::Int(i)) => i.sign() != num_bigint::Sign::Minus,
+        _ => matches!(
+            &*crate::ast_util::undecorate_typ(&e.typ),
+            TypX::Int(IntRange::Nat | IntRange::U(_) | IntRange::USize)
+        ),
+    };
     let body = match &peel(body).x {
-        ExprX::Unary(UnaryOp::Clip { .. }, inner) => peel(inner),
+        ExprX::Unary(UnaryOp::Clip { range, .. }, inner) => {
+            let inner = peel(inner);
+            let monotone = match &inner.x {
+                ExprX::Binary(BinaryOp::Arith(ArithOp::Add(..)), a, b) => nonneg(a) && nonneg(b),
+                _ => false,
+            };
+            if !(int_typ_within(&inner.typ, range) || monotone) {
+                return false;
+            }
+            inner
+        }
         _ => peel(body),
     };
     let is_acc = |e: &Expr| read_var(e).as_ref() == Some(acc);
@@ -982,7 +1002,9 @@ fn vstd_op(name: &str) -> Option<&'static str> {
     let module = match (module, method) {
         ("iset", "new") => return Some("iset_new"),
         ("imap", "new") => return Some("imap_new"),
-        ("iset", "fold") => return Some("set_fold"),
+        // TLC builds only finite sets, where Verus's `ISet` may be infinite
+        // (one over a hole is), so its finiteness is not the export's.
+        ("iset", "finite") => return Some("iset_finite"),
         ("iset", _) => "set",
         ("imap", _) => "map",
         _ => module,
@@ -1020,8 +1042,8 @@ fn vstd_op(name: &str) -> Option<&'static str> {
         ("set", "filter") => "set_filter",
         ("set", "fold") => "set_fold",
         ("set", "choose") => "set_choose",
-        // `Set::fold` is `self.to_iset().fold(z, f)`, and a `Set` is the
-        // `ISet` of its elements.
+        // `Set::fold` is `self.to_iset().fold(z, f)` (an `ISet::fold`, which
+        // is `Set::fold` here), and a `Set` is the `ISet` of its elements.
         ("set", "to_iset") => "identity",
         ("set", "contains") => "set_contains",
         ("set", "insert") => "set_insert",
@@ -2701,7 +2723,10 @@ impl Exporter {
             return self.refuse(what, &e.span);
         };
         let p = &params[0];
-        let name = self.bind_param(&mut env2, &p.name, false);
+        // The binder ranges over what the guard bounds it by, which may read
+        // the post state (`post.t.contains(x)`).
+        let post = self.arg_reads_post(args, i, env);
+        let name = self.bind_param(&mut env2, &p.name, post);
         let guard = conjuncts(&peel(&body));
         let unbound = [p.name.clone()];
         let domain =
@@ -2954,6 +2979,9 @@ impl Exporter {
                 )
             }
             "set_choose" => self.refuse("choose (TLC cannot evaluate it)", &e.span),
+            "iset_finite" => {
+                self.refuse("ISet::finite (the export builds only finite sets)", &e.span)
+            }
             // ── maps ──
             "map_new" => {
                 let (d, x) = (g!(0), self.bind("k__"));

@@ -5347,11 +5347,14 @@ fn check_collections(step: &str, invariants: &str, violated: &[&str]) -> Exporte
 #[test]
 fn tla_export_seq_map_is_a_function_over_the_positions() {
     // The closure's index is the Verus index, one below the TLA+ position.
+    // The elements are the squares, so `x - i` tells the index from the
+    // element (`i - x` differs from `n == 3`).
     let ex = check_collections(
         "post.d == post.s.map_values(|x: int| x + 1) && post.e == pre.e && post.w == pre.w",
         r#"
 pub open spec fn indexed(s: State) -> bool {
-    s.s.map(|i: int, x: int| x + i) =~= Seq::new(s.n, |i: int| 2 * i)
+    &&& s.s.map(|i: int, x: int| x + i) =~= Seq::new(s.n, |i: int| 2 * i)
+    &&& s.s.map_values(|x: int| x * x).map(|i: int, x: int| x - i) =~= Seq::new(s.n, |i: int| i * i - i)
 }
 pub open spec fn values(s: State) -> bool { s.d =~= Seq::new(s.n, |i: int| i + 1) }
 "#,
@@ -5455,6 +5458,7 @@ fn tla_export_set_new_without_a_bound_leaves_a_hole() {
     // `x * x == 2 * x` bounds nothing and `int` has no finite domain: the
     // comprehension ranges over the hole `Dom_int`, given in the .cfg
     // (`0..3`, which holds both roots, so the set is Verus's `{0, 2}`).
+    // Over a hole the set is taken to be finite, so `Set::new` is `Some`.
     let ex = export_code(SET_NEW_HOLE, "test_crate");
     assert_eq!(ex.report["refusals"], serde_json::json!([]), "{}", ex.tla);
     let holes = ex.report["holes"].as_array().unwrap();
@@ -5631,6 +5635,9 @@ pub open spec fn arithmetic(s: State) -> bool {
     &&& s.b.subset_of(s.b.insert(3)) && (s.n == 0 || !s.b.insert(3).subset_of(s.b))
     &&& s.b.update(0, 9).count(0) == 9 && s.b.update(1, 0).len() == s.b.count(0)
     &&& s.b.update(1, 0) =~= s.b.filter(|x: u8| x != 1) && !s.b.update(1, 0).contains(1)
+    &&& (s.b has 0) == (s.n > 0) && !(s.b has 7)
+    &&& s.b <= s.b.insert(3) && (s.n == 0 || !(s.b.insert(3) <= s.b))
+    &&& s.b.is_empty() == (s.n == 0) && Multiset::<u8>::empty().is_empty()
 }
 pub open spec fn conversions(s: State) -> bool {
     &&& Multiset::from_set(set![1u8, 2]).len() == 2
@@ -5719,6 +5726,7 @@ pub open spec fn extrema(s: State) -> bool {
 
 const CHOOSE_AND_PARAMETER: &str = r#"
 use vstd::prelude::*;
+use vstd::multiset::Multiset;
 verus! {
 pub struct State { pub t: Set<int>, pub n: int }
 
@@ -5735,21 +5743,28 @@ pub open spec fn built(s: State) -> bool { members(|x: int| 0 <= x < 2).len() ==
 pub open spec fn ordered(s: State) -> bool {
     s.t.fold(Seq::<int>::empty(), |acc: Seq<int>, x: int| acc.push(x)) =~= seq![2int, 1]
 }
+pub open spec fn clipped(s: State) -> bool {
+    set![-1int, 1].fold(0nat, |acc: nat, x: int| (acc + x) as nat) == 0
+}
+pub open spec fn finite(s: State) -> bool { ISet::new(|x: int| 0 <= x < 2).finite() }
+pub open spec fn picked_count(s: State) -> bool { Multiset::singleton(s.n).choose() == s.n }
 pub open spec fn small(s: State) -> bool { s.n <= 2 }
 }
 "#;
 
 #[test]
 fn tla_export_refuses_set_choose_and_a_function_parameter() {
-    // `Set::choose` stays refused, as `choose` is: TLC's CHOOSE is one
-    // fixed value, and Verus's choice is any value satisfying the
-    // predicate, so TLC's verdict would hold for one choice only. So is a
-    // `Set::fold` of a function not seen to be commutative (`push`): Verus's
-    // fold is a choice among the orders, and TLC would hold `ordered` for
-    // the one it takes. A fold or `Set::new` given a `spec_fn` parameter
-    // has no closure to apply (`total` and `members` are operators of their
-    // own); every refusal names its location, and the invariants reaching
-    // them are left out of the .cfg.
+    // `Set::choose` and `Multiset::choose` stay refused, as `choose` is:
+    // TLC's CHOOSE is one fixed value, and Verus's choice is any value
+    // satisfying the predicate, so TLC's verdict would hold for one choice
+    // only. So is a `Set::fold` of a function not seen to be commutative
+    // (`push`, and a checked cast that `-1` leaves in one order and not in
+    // the other): Verus's fold is a choice among the orders, and TLC would
+    // hold `ordered` and `clipped` for the one it takes. `ISet::finite` is
+    // refused, as every set TLC builds is finite. A fold or `Set::new`
+    // given a `spec_fn` parameter has no closure to apply (`total` and
+    // `members` are operators of their own); every refusal names its
+    // location, and the invariants reaching them are left out of the .cfg.
     let ex = export_code(CHOOSE_AND_PARAMETER, "test_crate");
     let refusals: Vec<(String, String)> = ex.report["refusals"]
         .as_array()
@@ -5757,16 +5772,19 @@ fn tla_export_refuses_set_choose_and_a_function_parameter() {
         .iter()
         .map(|r| (r["what"].as_str().unwrap().into(), r["location"].as_str().unwrap().into()))
         .collect();
-    let at = |what: &str| refusals.iter().find(|r| r.0 == what).map(|r| r.1.clone());
-    let choose = at("choose (TLC cannot evaluate it)").unwrap_or_else(|| panic!("{:?}", refusals));
-    assert!(choose.contains("test.rs:"), "{}", choose);
-    for what in [
-        "vstd operation given a function that does not reduce to a closure",
-        "vstd operation given a predicate that does not reduce to a closure",
-        "Set::fold of a function not seen to be commutative",
+    let at = |what: &str| -> Vec<String> {
+        refusals.iter().filter(|r| r.0 == what).map(|r| r.1.clone()).collect()
+    };
+    for (what, count) in [
+        ("choose (TLC cannot evaluate it)", 2),
+        ("vstd operation given a function that does not reduce to a closure", 1),
+        ("vstd operation given a predicate that does not reduce to a closure", 1),
+        ("Set::fold of a function not seen to be commutative", 2),
+        ("ISet::finite (the export builds only finite sets)", 1),
     ] {
-        let at = at(what).unwrap_or_else(|| panic!("{what}: {:?}", refusals));
-        assert!(at.contains("test.rs:"), "{}", at);
+        let at = at(what);
+        assert_eq!(at.len(), count, "{what}: {:?}", refusals);
+        assert!(at.iter().all(|l| l.contains("test.rs:")), "{what}: {:?}", at);
     }
     assert_eq!(names(&ex.report["invariants"]), ["small"], "{}", ex.cfg);
     let Some(jar) = tla_tools() else { return };

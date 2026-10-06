@@ -229,13 +229,21 @@ sequence, as vstd defines them). `Set::new(|x| p)` is `Some` of `{x \in D :
 p}` and `ISet::new(|x| p)` that set, where `D` is what a quantifier's binder
 would range over: the bound `p`'s conjuncts give `x` (`0 <= x < n` is
 `0..n-1`, `t.contains(x)` is `t`), else the values of `x`'s type when they
-are few (`BOOLEAN`), else a hole (`Dom_int`). `Set::map` is `{f(x) : x \in
+are few (`BOOLEAN`), else a hole (`Dom_int`). Over a hole the set is taken
+to be finite: `Set::new` is `Some` of the elements the hole's values give,
+where Verus's is `None` when `p` holds for infinitely many values, so the
+`.cfg`'s `Dom_int` must hold every element. For the same reason
+`ISet::finite` is refused: every set TLC builds is finite. `Set::map` is `{f(x) : x \in
 s}`, `Set::filter` `{x \in s : p}`, and `Set::fold` a RECURSIVE operator
 removing a CHOOSEn element each time. That agrees with Verus only for a
 commutative `f` (Verus's fold is otherwise a choice among the orders, as
 `choose` is), so a fold is refused unless `f` is `acc op g(x)` or `g(x) op
 acc` with `g` not reading `acc` and `op` one of `+`, `*`, `&&`, `||`, set
-union or intersection, `insert`, or multiset addition. `Map::new(keys, f)` is `[k \in keys |->
+union or intersection, `insert`, or multiset addition. A cast around it
+must be the identity, or a checked cast of a sum of operands never negative
+(`(acc + 1) as nat`), which grows in every order; any other checked cast can
+leave its type in one order and not in another (`(acc + x) as nat` over
+`{-1, 1}`), so that fold is refused. `Map::new(keys, f)` is `[k \in keys |->
 f(k)]`, `IMap::new(|k| p, f)` the same over `p`'s comprehension,
 `map_values` and `map_entries` map over `DOMAIN m`, `filter_keys`,
 `restrict` and `remove_keys` shrink it, and `m1.union_prefer_right(m2)` is
