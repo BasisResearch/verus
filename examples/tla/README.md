@@ -55,25 +55,30 @@ is verified.
 (VerusSync's `State::next(pre, post, label)` for a machine declaring `pub
 enum Label`, nrkernel's `next(c: Constants, s1, s2, lbl: RLbl)`, IronKV's
 `next(pre, post, ios)`). A parameter of `next` that `init` also takes (same
-name and type), or one before the states, is a constant: a `CONSTANT` per field of its
-struct (`Const_c_cap`, kept in its type's range by an `ASSUME`), given by
-value in the `.cfg` (`Const_c_cap = 4`) or by `<-` for a non-scalar, behind
-`Const_c == [cap |-> Const_c_cap, ...]`. Any other parameter of `next` is a
-label, quantified per step: `Next == next_closed`, `next_closed == \E label
-\in <the label type's variants, unbounded fields as holes> : next(label)`.
-The label's fields are bounded by their types (or by the guards of the arms
+name and type, or before the states, the one `init` takes of its type) is a
+constant, unless it is an enum of several variants: a `CONSTANT` per field
+of its struct (`Const_c_cap`, kept in its type's range by an `ASSUME`),
+given by value in the `.cfg` (`Const_c_cap = 4`) or by `<-` for a
+non-scalar, behind `Const_c == [cap |-> Const_c_cap, ...]`. Any other
+parameter of `next` is a label, quantified per step: `Next == next_closed`,
+`next_closed == \E label \in <the label type's variants, unbounded fields as
+holes> : next(label)`. A label is never made a constant on its position
+alone: fixing a value that is chosen per step would drop behaviours. The
+label's fields are bounded by their types (or by the guards of the arms
 when `next` matches on the label), not by the guards of the transitions
-`next` calls, so a `u8` field ranges over `0..255`. An IO trace is a label
-too: `next` reads it as this step's events, and its domain is a hole, so TLC
-explores only the event sequences the `.cfg` gives. Any other parameter of
-`init` is quantified once in Init. Invariants are still
-predicates over the state, given the constants when they take them
-(`within(self, c)` is checked as `within == State_within(Const_c)`); a
-predicate over the state and a label is a guard, listed among the candidates
-but not checked, as is one over the state and anything else that is not a
-constant; both are named in a `NOT CHECKED` comment atop the `.tla`, and
-naming one with `:inv` is refused. The report's `parameters` lists each parameter, what it
-became and why.
+`next` calls, so a `u8` field ranges over `0..255`; a hole of a label is
+kept in its Rust type by an `ASSUME`. An IO trace is a label too: `next`
+reads it as this step's events, and its domain is a hole, so TLC explores
+only the event sequences the `.cfg` gives. Any other parameter of `init` is
+quantified once in Init. Invariants are still predicates over the state,
+given the constants when they take them (`within(self, c)` is checked as
+`within == State_within(Const_c)`; a scalar constant only to a parameter
+of its name). A hand-rolled predicate over the state and a label is a
+guard, listed among the candidates but not checked, as is one over the
+state and anything else that is not a constant; both are named in a `NOT
+CHECKED` comment atop the `.tla` and on the summary line, and naming one
+with `:inv` is refused. The report's `parameters` lists each parameter,
+what it became and why.
 
 Temporal properties are verus-tla `TempPred`s. A proof fn whose `ensures` is
 `m.entails(p)` for a `TempPred` parameter `m` gives the property `p` under

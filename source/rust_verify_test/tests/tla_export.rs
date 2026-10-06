@@ -13,6 +13,8 @@ struct Exported {
     tla: String,
     cfg: String,
     report: serde_json::Value,
+    /// What Verus printed (the `tla-export:` summary lines).
+    stderr: String,
 }
 
 impl Exported {
@@ -49,7 +51,7 @@ fn export_with(entry: &Path, module: &str, extra: &[&str]) -> Exported {
     let cfg = std::fs::read_to_string(log.join(format!("{module}.cfg"))).expect("the .cfg");
     let json = std::fs::read_to_string(log.join(format!("{module}.tla.json"))).expect("report");
     let report = serde_json::from_str(&json).expect("the report is json");
-    Exported { dir, module, tla, cfg, report }
+    Exported { dir, module, tla, cfg, report, stderr }
 }
 
 /// Write `code` (with the usual prelude) to a file and export `module`.
@@ -5359,11 +5361,18 @@ fn tla_export_quantifies_a_verussync_label() {
         ex.tla
     );
     assert!(ex.tla.contains("Next == next_closed /\\ TypeOK'"), "{}", ex.tla);
-    // A predicate over the state and a label (`add_enabled(pre, label)`) is
-    // a guard of the transition, never an invariant.
+    // VerusSync's generated predicates over the state and a label
+    // (`add_enabled(pre, label)`) are never invariants, and are not listed.
     let c = candidates(&ex.report);
-    assert!(c.contains(&("add_enabled".into(), false)), "{:?}", c);
+    assert!(!c.iter().any(|(f, _)| f == "add_enabled"), "{:?}", c);
+    assert!(!ex.tla.contains("NOT CHECKED"), "{}", ex.tla);
     assert_eq!(names(&ex.report["invariants"]), ["bounded"]);
+    // The label's hole holds only `nat`s.
+    assert!(
+        ex.tla.contains("ASSUME \\A h__ \\in Dom_Label_Read_value : (h__ >= 0)\n"),
+        "{}",
+        ex.tla
+    );
     assert_eq!(
         ex.report["transitions"],
         serde_json::json!([
@@ -5664,21 +5673,60 @@ fn export_fails(code: &str, arg: &str) -> String {
     stderr
 }
 
+/// A hand-rolled predicate over the state and next's label is a guard.
+const HAND_GUARD: &str = r#"
+use vstd::prelude::*;
+verus! {
+pub struct State { pub x: nat }
+
+pub enum Lbl { Inc, Noop }
+
+pub open spec fn init(s: State) -> bool { s.x == 0 }
+
+pub open spec fn can_inc(s: State, lbl: Lbl) -> bool { lbl is Inc && s.x < 3 }
+
+pub open spec fn next(pre: State, post: State, lbl: Lbl) -> bool {
+    ||| can_inc(pre, lbl) && post.x == pre.x + 1
+    ||| lbl is Noop && post == pre
+}
+
+pub open spec fn small(s: State) -> bool { s.x <= 3 }
+}
+"#;
+
 #[test]
 fn tla_export_refuses_to_check_a_guard_over_the_label() {
-    let ex = export_code(SYNC_LABEL, "test_crate::Meter");
+    let ex = export_code(HAND_GUARD, "test_crate");
     assert!(
-        ex.tla.contains("\\* NOT CHECKED (guards over next's label, not invariants): add_enabled, read_enabled.\n"),
+        ex.tla.contains("\\* NOT CHECKED (guards over next's label, not invariants): can_inc.\n"),
         "{}",
         ex.tla
     );
-    let stderr = export_fails(SYNC_LABEL, "test_crate::Meter:add_enabled");
-    assert!(stderr.contains("`add_enabled` in `test_crate::Meter` ("), "{}", stderr);
+    // Said on the summary line too, beside the parameters.
+    assert!(
+        ex.stderr.contains("tla-export: NOT CHECKED, predicates over the state and a label or a non-constant value: test_crate::can_inc\n"),
+        "{}",
+        ex.stderr
+    );
+    assert!(ex.stderr.contains("init/next take 1 parameters beside the state"), "{}", ex.stderr);
+    assert_eq!(names(&ex.report["invariants"]), ["small"]);
+    let stderr = export_fails(HAND_GUARD, "test_crate:can_inc");
+    assert!(stderr.contains("`can_inc` in `test_crate` ("), "{}", stderr);
     assert!(
         stderr.contains("cannot be checked as an invariant: it reads a label of next"),
         "{}",
         stderr
     );
+    // VerusSync's generated guards are not listed, but are still refused
+    // when named.
+    let stderr = export_fails(SYNC_LABEL, "test_crate::Meter:add_enabled");
+    assert!(stderr.contains("`add_enabled` in `test_crate::Meter` ("), "{}", stderr);
+    assert!(stderr.contains("cannot be checked as an invariant: it reads a label"), "{}", stderr);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let run = tlc(&jar, &ex.spec(), &ex.cfg);
+    assert_eq!(run.violated, Vec::<String>::new());
+    assert_eq!(run.distinct, 4, "{run:?}");
 }
 
 /// `init(s, start: nat)` beside `next(pre, post, by: nat)`: the same type,
@@ -5879,6 +5927,11 @@ fn tla_export_asks_for_every_constant_and_checks_its_range() {
     let ex = export_code(UNREAD_CONSTANT, "test_crate");
     assert!(ex.cfg.contains("even a field the model never reads"), "{}", ex.cfg);
     assert!(ex.cfg.contains("\\*   Const_c_unused = <a u8>\n"), "{}", ex.cfg);
+    // The trace spec's .cfg asks for them too.
+    let trace_cfg =
+        std::fs::read_to_string(ex.dir.path().join("log").join(format!("{}_trace.cfg", ex.module)))
+            .unwrap();
+    assert!(trace_cfg.contains("\\*   Const_c_cap = <a u8>\n"), "{}", trace_cfg);
     assert!(
         ex.tla.contains("ASSUME (0 <= Const_c_unused /\\ Const_c_unused <= 255)\n"),
         "{}",
@@ -5899,4 +5952,299 @@ fn tla_export_asks_for_every_constant_and_checks_its_range() {
     let out = tlc_output(&jar, &ex.spec(), &cfg);
     assert!(out.contains("Const_c_unused"), "{}", out);
     assert!(!out.contains("distinct states found"), "{}", out);
+}
+
+/// A step enum before the states that `init` does not take: nothing says it
+/// is fixed, so it is a label, chosen per step (as a constant, `Dec` would
+/// never follow `Inc`, and `never_zero` would hold). `next` matches on it,
+/// so it is also the step structure.
+const LABEL_BEFORE_STATES: &str = r#"
+use vstd::prelude::*;
+verus! {
+pub struct State { pub x: nat }
+
+pub enum Step { Inc, Dec }
+
+pub open spec fn init(s: State) -> bool { s.x == 2 }
+
+pub open spec fn next(step: Step, pre: State, post: State) -> bool {
+    match step {
+        Step::Inc => pre.x < 4 && post.x == pre.x + 1,
+        Step::Dec => pre.x > 0 && post.x == pre.x - 1,
+    }
+}
+
+pub open spec fn never_zero(s: State) -> bool { s.x != 0 }
+}
+"#;
+
+#[test]
+fn tla_export_quantifies_a_label_before_the_states() {
+    let ex = export_code(LABEL_BEFORE_STATES, "test_crate");
+    assert_eq!(parameters(&ex.report), [("next".into(), "step".into(), "label".into())]);
+    assert!(!ex.tla.contains("Const_"), "{}", ex.tla);
+    assert!(ex.cfg.contains("SPECIFICATION Spec"), "{}", ex.cfg);
+    // The label's `\E` is the step structure, its arms next's.
+    assert_eq!(ex.report["steps"]["binder"], "step");
+    let arms: Vec<&str> = ex.report["steps"]["arms"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a["variant"].as_str().unwrap())
+        .collect();
+    assert_eq!(arms, ["Inc", "Dec"]);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let run = tlc(&jar, &ex.spec(), &ex.cfg);
+    // From 2, up and down within 0..4: never_zero fails, as in Verus.
+    assert_eq!(run.violated, ["never_zero"], "{run:?}");
+}
+
+/// An enum `init` and `next` both take by one name is still a step's label:
+/// `init`'s is its own value, quantified once in Init.
+const SHARED_ENUM_LABEL: &str = r#"
+use vstd::prelude::*;
+verus! {
+pub struct State { pub x: nat }
+
+pub enum Lbl { Up, Down, Noop }
+
+pub open spec fn init(s: State, lbl: Lbl) -> bool { lbl is Noop && s.x == 1 }
+
+pub open spec fn next(pre: State, post: State, lbl: Lbl) -> bool {
+    match lbl {
+        Lbl::Up => pre.x < 2 && post.x == pre.x + 1,
+        Lbl::Down => pre.x > 0 && post.x == pre.x - 1,
+        Lbl::Noop => post == pre,
+    }
+}
+
+pub open spec fn pos(s: State) -> bool { s.x >= 1 }
+}
+"#;
+
+#[test]
+fn tla_export_keeps_an_enum_both_take_a_label() {
+    let ex = export_code(SHARED_ENUM_LABEL, "test_crate");
+    assert_eq!(
+        parameters(&ex.report),
+        [
+            ("next".into(), "lbl".into(), "label".into()),
+            ("init".into(), "lbl".into(), "init_label".into()),
+        ]
+    );
+    assert!(!ex.tla.contains("Const_"), "{}", ex.tla);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let run = tlc(&jar, &ex.spec(), &ex.cfg);
+    // x in 0..2 from 1: pos fails at 0, as in Verus. With one label for
+    // the whole behaviour (Noop, as init requires) it would hold.
+    assert_eq!(run.violated, ["pos"], "{run:?}");
+}
+
+/// A scalar constant is given to a predicate's parameter of its name only:
+/// `small(s, n)` is checked over the constant `n`, `at_least(s, k)` is a
+/// helper, listed as not checked.
+const SCALAR_CONSTANT: &str = r#"
+use vstd::prelude::*;
+verus! {
+pub struct State { pub x: nat }
+
+pub open spec fn init(n: nat, s: State) -> bool { s.x == 0 }
+
+pub open spec fn next(n: nat, pre: State, post: State) -> bool {
+    pre.x < n && post.x == pre.x + 1
+}
+
+pub open spec fn small(s: State, n: nat) -> bool { s.x <= n }
+
+pub open spec fn at_least(s: State, k: nat) -> bool { s.x >= k }
+}
+"#;
+
+#[test]
+fn tla_export_gives_a_scalar_constant_by_name() {
+    let ex = export_code(SCALAR_CONSTANT, "test_crate");
+    assert_eq!(names(&ex.report["invariants"]), ["small"]);
+    assert!(ex.tla.contains("small ==\n    test_crate_small(Const_n)\n"), "{}", ex.tla);
+    let reason = ex.report["candidates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["function"] == "test_crate::at_least")
+        .map(|c| (c["included"].as_bool().unwrap(), c["reason"].as_str().unwrap().to_string()))
+        .unwrap();
+    assert!(!reason.0);
+    assert!(
+        reason.1.contains("the constant `n` is a `nat`, and a constant that is not a struct is given only to a parameter of its name, not `k`"),
+        "{}",
+        reason.1
+    );
+    assert!(ex.stderr.contains("NOT CHECKED"), "{}", ex.stderr);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let run = tlc(&jar, &ex.spec(), &format!("{}CONSTANTS Const_n = 3\n", ex.cfg));
+    assert_eq!(run.violated, Vec::<String>::new());
+    assert_eq!(run.distinct, 4, "{run:?}");
+}
+
+/// Two constants of one struct type: a predicate's parameter of that type
+/// is given the one of its name, and one of another name is ambiguous.
+const TWO_CONSTANTS_ONE_TYPE: &str = r#"
+use vstd::prelude::*;
+verus! {
+pub struct Bound { pub v: nat }
+
+pub struct State { pub x: nat }
+
+pub open spec fn init(lo: Bound, hi: Bound, s: State) -> bool { s.x == lo.v }
+
+pub open spec fn next(lo: Bound, hi: Bound, pre: State, post: State) -> bool {
+    pre.x < hi.v && post.x == pre.x + 1
+}
+
+pub open spec fn below(s: State, hi: Bound) -> bool { s.x <= hi.v }
+
+pub open spec fn above(s: State, b: Bound) -> bool { s.x >= b.v }
+}
+"#;
+
+#[test]
+fn tla_export_gives_one_of_two_same_typed_constants_by_name() {
+    let ex = export_code(TWO_CONSTANTS_ONE_TYPE, "test_crate");
+    assert_eq!(
+        parameters(&ex.report),
+        [
+            ("next".into(), "lo".into(), "constant".into()),
+            ("next".into(), "hi".into(), "constant".into()),
+            ("init".into(), "lo".into(), "constant".into()),
+            ("init".into(), "hi".into(), "constant".into()),
+        ]
+    );
+    assert_eq!(names(&ex.report["invariants"]), ["below"]);
+    assert!(ex.tla.contains("below ==\n    test_crate_below(Const_hi)\n"), "{}", ex.tla);
+    let c = ex.report["candidates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["function"] == "test_crate::above")
+        .unwrap()
+        .clone();
+    assert!(
+        c["reason"].as_str().unwrap().contains(
+            "the constants `lo`, `hi` are `Bound`s and none is named `b`, so which one it reads is ambiguous"
+        ),
+        "{}",
+        c
+    );
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let cfg = format!("{}CONSTANTS Const_lo_v = 1\nCONSTANTS Const_hi_v = 3\n", ex.cfg);
+    let run = tlc(&jar, &ex.spec(), &cfg);
+    assert_eq!(run.violated, Vec::<String>::new());
+    assert_eq!(run.distinct, 3, "{run:?}");
+}
+
+/// `next(a: Dir, b: Dir, pre: State, post: State)`: two datatypes each
+/// appear twice, and the state is the one `init` takes. Neither `Dir` is
+/// taken by `init`, so both are labels.
+const TWO_PAIRS: &str = r#"
+use vstd::prelude::*;
+verus! {
+pub struct State { pub x: nat }
+
+pub enum Dir { Up, Stay }
+
+pub open spec fn init(s: State) -> bool { s.x == 0 }
+
+pub open spec fn next(a: Dir, b: Dir, pre: State, post: State) -> bool {
+    &&& pre.x < 4
+    &&& post.x == pre.x + (if a is Up { 1nat } else { 0nat }) + (if b is Up { 1nat } else { 0nat })
+}
+}
+"#;
+
+#[test]
+fn tla_export_takes_the_state_init_takes_of_two_pairs() {
+    let ex = export_code(TWO_PAIRS, "test_crate");
+    assert_eq!(ex.report["state_type"], "test_crate::State");
+    assert_eq!(
+        parameters(&ex.report),
+        [("next".into(), "a".into(), "label".into()), ("next".into(), "b".into(), "label".into())]
+    );
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let run = tlc(&jar, &ex.spec(), &ex.cfg);
+    assert_eq!(run.violated, Vec::<String>::new());
+    // Steps of 0, 1 or 2 while below 4: 0..5.
+    assert_eq!(run.distinct, 6, "{run:?}");
+}
+
+/// A plain `next(pre, post)` is preferred to a `next` with a label beside
+/// it (`State::next(self, post, by)`, which it quantifies itself).
+const PLAIN_NEXT_FIRST: &str = r#"
+use vstd::prelude::*;
+verus! {
+pub struct State { pub x: nat }
+
+impl State {
+    pub open spec fn next(self, post: State, by: u8) -> bool {
+        1 <= by <= 2 && self.x + by <= 3 && post.x == self.x + by
+    }
+}
+
+pub open spec fn init(s: State) -> bool { s.x == 0 }
+
+pub open spec fn next(pre: State, post: State) -> bool {
+    exists|by: u8| 1 <= by <= 2 && pre.next(post, by)
+}
+}
+"#;
+
+#[test]
+fn tla_export_prefers_a_plain_next() {
+    let ex = export_code(PLAIN_NEXT_FIRST, "test_crate");
+    assert_eq!(ex.report["next"], "next");
+    assert_eq!(ex.report["parameters"], serde_json::json!([]));
+    assert!(!ex.tla.contains("next_closed"), "{}", ex.tla);
+    assert!(!ex.stderr.contains("parameters beside the state"), "{}", ex.stderr);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let run = tlc(&jar, &ex.spec(), &ex.cfg);
+    assert_eq!(run.violated, Vec::<String>::new());
+    assert_eq!(run.distinct, 4, "{run:?}");
+}
+
+/// A candidate over the state and the constants whose name is a state
+/// variable's: its wrapper is printed under a name of its own.
+const CLOSED_NAME_TAKEN: &str = r#"
+use vstd::prelude::*;
+verus! {
+pub struct Constants { pub cap: nat }
+
+pub struct State { pub x: nat, pub within: bool }
+
+pub open spec fn init(c: Constants, s: State) -> bool { s.x == 0 && s.within }
+
+pub open spec fn next(c: Constants, pre: State, post: State) -> bool {
+    pre.x < c.cap && post.x == pre.x + 1 && post.within == (post.x <= c.cap)
+}
+
+impl State {
+    pub open spec fn within(self, c: Constants) -> bool { self.x <= c.cap }
+}
+}
+"#;
+
+#[test]
+fn tla_export_renames_a_closed_candidate_whose_name_is_taken() {
+    let ex = export_code(CLOSED_NAME_TAKEN, "test_crate");
+    let invs = names(&ex.report["invariants"]);
+    assert_eq!(invs.len(), 1, "{:?}", invs);
+    assert_ne!(invs[0], "within");
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let run = tlc(&jar, &ex.spec(), &format!("{}CONSTANTS Const_c_cap = 2\n", ex.cfg));
+    assert_eq!(run.violated, Vec::<String>::new());
+    assert_eq!(run.distinct, 3, "{run:?}");
 }

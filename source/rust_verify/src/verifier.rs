@@ -930,6 +930,18 @@ impl Verifier {
             export.report.init_unassigned.len(),
             dir.join(format!("{}.tla", export.module_name)).display()
         );
+        if !export.report.parameters.is_empty() {
+            eprintln!(
+                "tla-export: init/next take {} parameters beside the state (see the .tla.json parameters)",
+                export.report.parameters.len()
+            );
+        }
+        if !export.report.unchecked.is_empty() {
+            eprintln!(
+                "tla-export: NOT CHECKED, predicates over the state and a label or a non-constant value: {}",
+                export.report.unchecked.join(", ")
+            );
+        }
         Ok(())
     }
 
