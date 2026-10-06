@@ -5282,3 +5282,368 @@ fn tla_export_expr_needs_tla_export_and_a_value() {
     let stderr = verus_fails(&["-V tla-export=test_crate", "-V tla-export-expr=", "--no-verify"]);
     assert!(stderr.contains("-V tla-export-expr needs spec fn paths"), "{}", stderr);
 }
+
+/// A VerusSync machine with a `pub enum Label`: the macro generates
+/// `State::next(pre, post, label)`, whose label the export quantifies per
+/// step (`next_closed == \E label \in <its variants> : next(label)`).
+const SYNC_LABEL: &str = r#"
+use vstd::prelude::*;
+use verus_state_machines_macros::state_machine;
+verus! {
+state_machine!{ Meter {
+    fields { pub n: nat, }
+
+    pub enum Label {
+        Add { by: u8 },
+        Read { value: nat },
+        Idle,
+    }
+
+    #[invariant]
+    pub fn bounded(&self) -> bool { self.n <= 6 }
+
+    init!{ initialize() { init n = 0; } }
+
+    transition!{
+        add(lbl: Label) {
+            require lbl is Add;
+            require lbl->by <= 2;
+            require pre.n + lbl->by <= 6;
+            update n = (pre.n + lbl->by) as nat;
+        }
+    }
+
+    transition!{
+        read(lbl: Label) {
+            require lbl is Read;
+            require lbl->value == pre.n;
+        }
+    }
+
+    #[inductive(initialize)]
+    fn initialize_inductive(post: Self) { }
+    #[inductive(add)]
+    fn add_inductive(pre: Self, post: Self, lbl: Label) { }
+    #[inductive(read)]
+    fn read_inductive(pre: Self, post: Self, lbl: Label) { }
+}}
+}
+"#;
+
+/// The parameters the report lists: (function, param, kind).
+fn parameters(report: &serde_json::Value) -> Vec<(String, String, String)> {
+    report["parameters"]
+        .as_array()
+        .expect("parameters")
+        .iter()
+        .map(|p| {
+            let s = |k: &str| p[k].as_str().unwrap().to_string();
+            (s("function"), s("param"), s("kind"))
+        })
+        .collect()
+}
+
+#[test]
+fn tla_export_quantifies_a_verussync_label() {
+    let ex = export_code(SYNC_LABEL, "test_crate::Meter");
+    assert_eq!(ex.report["shape"], "verussync");
+    assert_eq!(ex.report["next"], "next_closed");
+    assert_eq!(ex.report["init"], "init");
+    assert_eq!(parameters(&ex.report), [("next".into(), "label".into(), "label".into())]);
+    assert_eq!(ex.report["refusals"], serde_json::json!([]));
+    // A `u8` field is its type's range; a `nat` one is a hole per field.
+    assert_eq!(names(&ex.report["holes"]), ["\"Dom_Label_Read_value\""]);
+    assert!(
+        ex.tla.contains("next_closed ==\n    (\\E label \\in ({[tag |-> \"Add\", by |-> by__] : by__ \\in 0..255} \\cup {[tag |-> \"Read\", value |-> value__] : value__ \\in Dom_Label_Read_value} \\cup {[tag |-> \"Idle\"]}) : next(label))"),
+        "{}",
+        ex.tla
+    );
+    assert!(ex.tla.contains("Next == next_closed /\\ TypeOK'"), "{}", ex.tla);
+    // A predicate over the state and a label (`add_enabled(pre, label)`) is
+    // a guard of the transition, never an invariant.
+    let c = candidates(&ex.report);
+    assert!(c.contains(&("add_enabled".into(), false)), "{:?}", c);
+    assert_eq!(names(&ex.report["invariants"]), ["bounded"]);
+    assert_eq!(
+        ex.report["transitions"],
+        serde_json::json!([
+            {"operator": "add", "unassigned": []},
+            {"operator": "read", "unassigned": []},
+        ])
+    );
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let cfg = format!("{}CONSTANTS Dom_Label_Read_value = {{0, 1, 2, 3, 4, 5, 6}}\n", ex.cfg);
+    let run = tlc(&jar, &ex.spec(), &cfg);
+    assert_eq!(run.violated, Vec::<String>::new());
+    // n takes 0..6: every Add a label bounds by its guard.
+    assert_eq!(run.distinct, 7, "{run:?}");
+}
+
+/// A hand-rolled machine with a leading constants parameter, given to init
+/// and next alike, and an invariant over the state and the constants.
+const CONSTANTS_MODEL: &str = r#"
+use vstd::prelude::*;
+verus! {
+pub struct Constants { pub cap: nat, pub step: nat }
+
+pub struct State { pub x: nat, pub resets: nat }
+
+pub enum Step { Inc, Reset }
+
+pub open spec fn init(c: Constants, s: State) -> bool { s.x == 0 && s.resets == 0 }
+
+pub open spec fn t_inc(c: Constants, pre: State, post: State) -> bool {
+    &&& pre.x + c.step <= c.cap
+    &&& post.x == pre.x + c.step
+    &&& post.resets == pre.resets
+}
+
+pub open spec fn t_reset(c: Constants, pre: State, post: State) -> bool {
+    &&& pre.resets < 2
+    &&& post.x == 0
+    &&& post.resets == pre.resets + 1
+}
+
+pub open spec fn next_step(c: Constants, pre: State, post: State, step: Step) -> bool {
+    match step {
+        Step::Inc => t_inc(c, pre, post),
+        Step::Reset => t_reset(c, pre, post),
+    }
+}
+
+pub open spec fn next(c: Constants, pre: State, post: State) -> bool {
+    exists|step: Step| next_step(c, pre, post, step)
+}
+
+impl State {
+    pub open spec fn within(self, c: Constants) -> bool { self.x <= c.cap }
+}
+
+pub open spec fn few_resets(s: State) -> bool { s.resets <= 2 }
+}
+"#;
+
+#[test]
+fn tla_export_makes_the_constants_parameter_constants() {
+    let ex = export_code(CONSTANTS_MODEL, "test_crate");
+    assert_eq!(ex.report["shape"], "hand-rolled");
+    assert_eq!(
+        (&ex.report["init"], &ex.report["next"]),
+        (&"init_closed".into(), &"next_closed".into())
+    );
+    assert_eq!(
+        parameters(&ex.report),
+        [
+            ("next".into(), "c".into(), "constant".into()),
+            ("init".into(), "c".into(), "constant".into())
+        ]
+    );
+    assert_eq!(ex.report["refusals"], serde_json::json!([]));
+    // One CONSTANT per field, each a hole with its Rust type, and the
+    // record of them passed for `c`.
+    let holes: Vec<(String, String)> = ex.report["holes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|h| (h["constant"].as_str().unwrap().into(), h["typ"].as_str().unwrap().into()))
+        .collect();
+    assert_eq!(
+        holes,
+        [("Const_c_cap".into(), "nat".into()), ("Const_c_step".into(), "nat".into())]
+    );
+    assert!(ex.tla.contains("CONSTANTS Const_c_cap, Const_c_step\n"), "{}", ex.tla);
+    assert!(ex.tla.contains("ASSUME (Const_c_cap >= 0)\n"), "{}", ex.tla);
+    assert!(
+        ex.tla.contains("Const_c == [cap |-> Const_c_cap, step |-> Const_c_step]\n"),
+        "{}",
+        ex.tla
+    );
+    assert!(ex.tla.contains("next_closed ==\n    next(Const_c)\n"), "{}", ex.tla);
+    assert!(ex.tla.contains("init_closed ==\n    init(Const_c)\n"), "{}", ex.tla);
+    assert!(ex.cfg.contains("\\*   Const_c_cap = <a nat>\n"), "{}", ex.cfg);
+    // `within(self, c)` is an invariant over the state and the constants,
+    // checked under its own name.
+    assert_eq!(names(&ex.report["invariants"]), ["within", "few_resets"]);
+    assert!(ex.tla.contains("within ==\n    State_within(Const_c)\n"), "{}", ex.tla);
+    // The step structure is next's as written.
+    assert_eq!(ex.report["steps"]["binder"], "step");
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let cfg = format!("{}CONSTANTS Const_c_cap = 4\nCONSTANTS Const_c_step = 2\n", ex.cfg);
+    let run = tlc(&jar, &ex.spec(), &cfg);
+    assert_eq!(run.violated, Vec::<String>::new());
+    // x in {0, 2, 4}, resets in 0..2.
+    assert_eq!(run.distinct, 9, "{run:?}");
+}
+
+/// nrkernel's shape: `next(pre, post, c, lbl)` with the constants after the
+/// states (init takes them too) and a label; `init` also takes a value of
+/// its own (an initial owner), quantified once in Init.
+const LABEL_AND_CONSTANTS: &str = r#"
+use vstd::prelude::*;
+verus! {
+pub struct Constants { pub n_clients: nat }
+
+pub struct State { pub owner: Option<nat>, pub grants: nat }
+
+pub enum Label {
+    Acquire { client: nat },
+    Release { client: nat },
+    Query { holder: Option<nat> },
+}
+
+pub open spec fn init(s: State, c: Constants, first: Option<nat>) -> bool {
+    &&& first matches Some(o) ==> o < c.n_clients
+    &&& s.owner == first
+    &&& s.grants == 0
+}
+
+pub open spec fn acquire(pre: State, post: State, c: Constants, lbl: Label) -> bool {
+    &&& lbl is Acquire
+    &&& lbl->Acquire_client < c.n_clients
+    &&& pre.owner is None
+    &&& pre.grants < 3
+    &&& post.owner == Some(lbl->Acquire_client)
+    &&& post.grants == pre.grants + 1
+}
+
+pub open spec fn release(pre: State, post: State, c: Constants, lbl: Label) -> bool {
+    &&& lbl is Release
+    &&& pre.owner == Some(lbl->Release_client)
+    &&& post.owner is None
+    &&& post.grants == pre.grants
+}
+
+pub open spec fn query(pre: State, post: State, c: Constants, lbl: Label) -> bool {
+    &&& lbl is Query
+    &&& lbl->Query_holder == pre.owner
+    &&& post == pre
+}
+
+pub open spec fn next(pre: State, post: State, c: Constants, lbl: Label) -> bool {
+    ||| acquire(pre, post, c, lbl)
+    ||| release(pre, post, c, lbl)
+    ||| query(pre, post, c, lbl)
+}
+
+impl State {
+    pub open spec fn inv(self, c: Constants) -> bool {
+        self.owner matches Some(o) ==> o < c.n_clients
+    }
+}
+}
+"#;
+
+#[test]
+fn tla_export_quantifies_the_label_beside_the_constants() {
+    let ex = export_code(LABEL_AND_CONSTANTS, "test_crate");
+    assert_eq!(ex.report["shape"], "hand-rolled");
+    assert_eq!(
+        parameters(&ex.report),
+        [
+            ("next".into(), "c".into(), "constant".into()),
+            ("next".into(), "lbl".into(), "label".into()),
+            ("init".into(), "c".into(), "constant".into()),
+            ("init".into(), "first".into(), "init_label".into()),
+        ]
+    );
+    assert_eq!(ex.report["refusals"], serde_json::json!([]));
+    assert!(ex.tla.contains(": next(Const_c, lbl))\n"), "{}", ex.tla);
+    assert!(ex.tla.contains(": init(Const_c, first))\n"), "{}", ex.tla);
+    assert_eq!(names(&ex.report["invariants"]), ["inv"]);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let cfg = format!(
+        "{}CONSTANTS Const_c_n_clients = 2\nCONSTANTS Dom_Label_Acquire_client = {{0, 1, 2}}\nCONSTANTS Dom_Label_Release_client = {{0, 1, 2}}\nCONSTANTS Dom_Option_nat_Some_v0 = {{0, 1, 2}}\n",
+        ex.cfg
+    );
+    let run = tlc(&jar, &ex.spec(), &cfg);
+    assert_eq!(run.violated, Vec::<String>::new());
+    // owner in {None, 0, 1} (the label's client 2 is refused by the guard,
+    // and init's `first` takes None, 0 or 1) by grants in 0..3.
+    assert_eq!(run.distinct, 12, "{run:?}");
+}
+
+/// Splinter's `MapSpec` shape: a label enum of `{input, output}` variants
+/// the transitions test with `is` and destructure. Splinter writes `require
+/// let Label::Query { input, output } = lbl;`, which this exporter still
+/// refuses (destructuring let, survey item F2); the match below is the same
+/// guard.
+const SPLINTER_MAP: &str = r#"
+use vstd::prelude::*;
+use verus_state_machines_macros::state_machine;
+verus! {
+pub enum Input { QueryInput { key: nat }, PutInput { key: nat, value: nat }, NoopInput }
+
+pub enum Output { QueryOutput { value: nat }, PutOutput, NoopOutput }
+
+state_machine!{ MapSpec {
+    fields { pub kmmap: Map<nat, nat> }
+
+    pub enum Label {
+        Query { input: Input, output: Output },
+        Put { input: Input, output: Output },
+        Noop { input: Input, output: Output },
+    }
+
+    init!{ empty() { init kmmap = Map::empty(); } }
+
+    transition!{
+        query(lbl: Label) {
+            require lbl is Query;
+            require match lbl {
+                Label::Query { input: Input::QueryInput { key }, output: Output::QueryOutput { value } } =>
+                    pre.kmmap.contains_key(key) && pre.kmmap[key] == value,
+                _ => false,
+            };
+        }
+    }
+
+    transition!{
+        put(lbl: Label) {
+            require lbl is Put;
+            require match lbl {
+                Label::Put { input: Input::PutInput { .. }, output: Output::PutOutput } => true,
+                _ => false,
+            };
+            update kmmap = pre.kmmap.insert(lbl->Put_input->PutInput_key, lbl->Put_input->PutInput_value);
+        }
+    }
+
+    #[invariant]
+    pub open spec fn small(self) -> bool { self.kmmap.dom().len() <= 2 }
+
+    #[inductive(empty)]
+    fn empty_inductive(post: Self) { }
+    #[inductive(query)]
+    fn query_inductive(pre: Self, post: Self, lbl: Label) { }
+    #[inductive(put)]
+    fn put_inductive(pre: Self, post: Self, lbl: Label) { assume(false); }
+}}
+}
+"#;
+
+#[test]
+fn tla_export_explores_a_splinter_style_label() {
+    let ex = export_code(SPLINTER_MAP, "test_crate::MapSpec");
+    assert_eq!(ex.report["shape"], "verussync");
+    assert_eq!(parameters(&ex.report), [("next".into(), "label".into(), "label".into())]);
+    assert_eq!(ex.report["refusals"], serde_json::json!([]));
+    assert!(ex.tla.contains("CONSTANTS Dom_Input_PutInput_key, Dom_Input_PutInput_value, Dom_Input_QueryInput_key, Dom_Output_QueryOutput_value\n"), "{}", ex.tla);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let mut cfg = ex.cfg.clone();
+    for c in [
+        "Dom_Input_PutInput_key",
+        "Dom_Input_PutInput_value",
+        "Dom_Input_QueryInput_key",
+        "Dom_Output_QueryOutput_value",
+    ] {
+        cfg.push_str(&format!("CONSTANTS {c} = {{0, 1}}\n"));
+    }
+    let run = tlc(&jar, &ex.spec(), &cfg);
+    assert_eq!(run.violated, Vec::<String>::new());
+    // The maps from a subset of {0, 1} to {0, 1}: 1 + 2 * 2 + 2 * 2.
+    assert_eq!(run.distinct, 9, "{run:?}");
+}

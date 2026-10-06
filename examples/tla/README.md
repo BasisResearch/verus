@@ -51,6 +51,24 @@ is verified.
   stutters forever. verus-tla's unmodified `mutex_example.rs`, built against
   the crate (`--extern`/`--import`), exports the same way.
 
+`init` and `next` may take more than the states: a label, constants or IO
+(VerusSync's `State::next(pre, post, label)` for a machine declaring `pub
+enum Label`, nrkernel's `next(c: Constants, s1, s2, lbl: RLbl)`, IronKV's
+`next(pre, post, ios)`). A parameter of `next` whose type `init` also takes,
+or one before the states, is a constant: a `CONSTANT` per field of its
+struct (`Const_c_cap`, kept in its type's range by an `ASSUME`), given by
+value in the `.cfg` (`Const_c_cap = 4`) or by `<-` for a non-scalar, behind
+`Const_c == [cap |-> Const_c_cap, ...]`. Any other parameter of `next` is a
+label, quantified per step: `Next == next_closed`, `next_closed == \E label
+\in <the label type's variants, unbounded fields as holes> : next(label)`.
+An IO trace is a label too: `next` reads it as this step's events. Any other
+parameter of `init` is quantified once in Init. Invariants are still
+predicates over the state, given the constants when they take them
+(`within(self, c)` is checked as `within == State_within(Const_c)`); a
+predicate over the state and a label is a guard, listed among the candidates
+but not checked. The report's `parameters` lists each parameter, what it
+became and why.
+
 Temporal properties are verus-tla `TempPred`s. A proof fn whose `ensures` is
 `m.entails(p)` for a `TempPred` parameter `m` gives the property `p` under
 the spec its `requires` state as `m.entails(c)`; `s.entails(p)` for a spec

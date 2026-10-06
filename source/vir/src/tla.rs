@@ -29,6 +29,50 @@
 //! * verus-tla: `init()` and `next()` returning `spec_fn` closures over the
 //!   state, with `Action { precondition, transition }` records inlined.
 //!
+//! `init` and `next` may take more than the states (hand-rolled `next(c:
+//! Constants, s1, s2, lbl: Lbl)`, `next(pre, post, c, lbl)`, `next(pre,
+//! post, ios)`, `init(s, c)`; VerusSync's `State::next(pre, post, label)`
+//! and `State::init(post, init_label)` for a machine declaring `pub enum
+//! Label`/`InitLabel`). `next`'s state is the datatype exactly two of its
+//! parameters have (the first pre, the second post), `init` the function of
+//! that name with one parameter of it. Every other parameter is one of:
+//!
+//! * a constant: a parameter of `next` whose type `init` also takes, or one
+//!   before `next`'s states. It is fixed for the whole behaviour, so it is a
+//!   `CONSTANT` the `.cfg` supplies; a struct is one `Const_<param>_<field>`
+//!   per field (TLC's `.cfg` gives a scalar by value and anything else by
+//!   `<-`), behind `Const_<param> == [field |-> Const_<param>_field, ...]`,
+//!   each reported as a hole with its Rust type and kept in its type's
+//!   range by an `ASSUME`. `init`'s parameter of that type is the same one;
+//! * a label: any other parameter of `next`. A label belongs to one step, so
+//!   Next is `\E lbl \in <domain> : next(Const_c, lbl)`, the domain read off
+//!   the label's type as a step enum's is, the union of its variants with
+//!   each unbounded field a hole of its own (`Dom_Label_Query_input`), or a
+//!   per-variant `\E` when `next` matches on the label (see
+//!   [`Exporter::exists_per_variant`]);
+//! * an init label: any other parameter of `init`, quantified once in Init
+//!   (`\E id \in Dom_AbstractEndPoint : init(id)`, IronKV's host id and
+//!   command line).
+//!
+//! An IO trace given to `next` (IronKV's `ios: Seq<LIoOp>`) is a label, not
+//! a variable: `next` reads it as the events of this step only, and nothing
+//! of it outlives the step unless the state keeps it (in a field, which is a
+//! variable already). Its domain is a hole (`Dom_Seq_..`) the `.cfg` fills
+//! with the event sequences worth exploring.
+//! `init` and `next` are then closed over these: the export adds spec fns of
+//! the states alone, `next__tla_closed(pre, post) = exists|lbl|
+//! next(C, pre, post, lbl)` and `init__tla_closed(s) = init(s, C)` (their
+//! operators `next_closed` and `init_closed`), and exports those, so the
+//! label's `\E` is bounded, recorded and traced as any other quantifier.
+//! A candidate invariant over the state and the constants (nrkernel's
+//! `inv(self, c: Constants)`) is closed the same way and checked under its
+//! own name; labels reach the invariants only through Next, so a predicate
+//! over the state and a label (VerusSync's generated `<t>_enabled(pre,
+//! label)`) is listed as a candidate that is not an invariant: it is a guard
+//! of a transition. The report's `parameters` say what each parameter became
+//! and why, and `steps` is `next`'s own step structure, its body reading the
+//! label and the constants as its operator's parameters.
+//!
 //! Beside the export, `Exporter::trace_spec` writes a trace spec that
 //! extends it and follows one logged behaviour of the implementation (the
 //! trace format is in its module header and `examples/tla/README.md`).
@@ -193,6 +237,9 @@ pub struct Report {
     /// The expressions `-V tla-export-expr` named, exported as operators
     /// that the `.tla` does not carry (see [`ExprExport`]).
     pub exprs: Vec<ExprExport>,
+    /// `init`'s and `next`'s parameters beside the states (a label, IO,
+    /// constants), and what each became; empty when they take only states.
+    pub parameters: Vec<ModelParam>,
 }
 
 /// A Verus type, as the reverse rendering reads it. Datatypes are named by
@@ -672,6 +719,10 @@ struct Exporter {
     refusal_owners: Vec<Option<OpKey>>,
     /// The operators that print a Euclidean `/` or `%`.
     euclid_users: HashSet<OpKey>,
+    /// The constants that hold a value rather than a domain (a constants
+    /// parameter of init/next, or a field of one), with their Rust types:
+    /// the .cfg gives each a value, not a set.
+    values: BTreeMap<String, String>,
 }
 
 fn ident_name(v: &VarIdent) -> String {
@@ -5708,6 +5759,57 @@ struct Triple {
     candidates: Vec<(Fun, bool, String)>,
     /// Whether the invariants were named on the command line.
     explicit: bool,
+    /// `init`'s and `next`'s parameters beside the states, and what each
+    /// becomes (see the module header).
+    extras: Vec<Extra>,
+    /// The constants: one per constants parameter of `next` (or of `init`
+    /// alone), its Rust name and type.
+    constants: Vec<(VarIdent, Typ, crate::messages::Span)>,
+    /// The candidates over the state and constants (`inv(self, c:
+    /// Constants)`): for each parameter, the constant it is given, or None
+    /// for the state.
+    closed: HashMap<Fun, Vec<Option<usize>>>,
+}
+
+/// What a parameter of `init` or `next` beside the states becomes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ExtraKind {
+    /// A step's label (or its IO): `\E` in Next, per step.
+    Label,
+    /// A parameter of `init` alone: `\E` in Init, once per behaviour.
+    InitLabel,
+    /// Fixed for the whole behaviour: a `CONSTANT`.
+    Constant(usize),
+}
+
+#[derive(Clone, Debug)]
+struct Extra {
+    /// In `init` (else in `next`).
+    in_init: bool,
+    /// Its position among the function's parameters.
+    index: usize,
+    name: VarIdent,
+    typ: Typ,
+    kind: ExtraKind,
+    why: String,
+}
+
+/// A parameter of `init` or `next` beside the states, in the report: what
+/// it became and why.
+#[derive(Debug, Clone, Serialize)]
+pub struct ModelParam {
+    /// `init` or `next`.
+    pub function: String,
+    pub param: String,
+    /// Its Rust type.
+    pub typ: String,
+    /// `label` (quantified per step in Next), `init_label` (quantified once
+    /// in Init) or `constant` (a `CONSTANT`, or a record of them, that the
+    /// .cfg supplies).
+    pub kind: String,
+    /// What it is in TLA+: the domain a label ranges over, or the constant.
+    pub tla: String,
+    pub why: String,
 }
 
 fn module_of(f: &Function) -> Option<Path> {
@@ -5777,6 +5879,83 @@ fn select_invariants(
         .collect())
 }
 
+/// What each parameter of `init` and `next` beside the states becomes
+/// (see the module header), and the constants among them.
+fn classify_extras(
+    init: &Function,
+    next: &Function,
+    is_state: &dyn Fn(&Typ) -> bool,
+) -> (Vec<Extra>, Vec<(VarIdent, Typ, crate::messages::Span)>) {
+    let mut extras = Vec::new();
+    let mut constants = Vec::new();
+    let init_extra: Vec<(usize, &Param)> =
+        init.x.params.iter().enumerate().filter(|(_, p)| !is_state(&p.x.typ)).collect();
+    let mut init_taken = vec![None; init_extra.len()];
+    let first_state = next.x.params.iter().position(|p| is_state(&p.x.typ)).unwrap_or(0);
+    for (i, p) in next.x.params.iter().enumerate() {
+        if is_state(&p.x.typ) {
+            continue;
+        }
+        let shared = (0..init_extra.len()).find(|&j| {
+            init_taken[j].is_none()
+                && crate::ast_util::types_equal(&init_extra[j].1.x.typ, &p.x.typ)
+        });
+        let (kind, why) = if let Some(j) = shared {
+            let k = constants.len();
+            init_taken[j] = Some(k);
+            (
+                ExtraKind::Constant(k),
+                format!(
+                    "init and next both take a `{}`: fixed for the whole behaviour, so a CONSTANT",
+                    typ_name(&p.x.typ)
+                ),
+            )
+        } else if i < first_state {
+            (
+                ExtraKind::Constant(constants.len()),
+                "next takes it before the states (the constants position), and init does not take it: a CONSTANT".to_string(),
+            )
+        } else {
+            (
+                ExtraKind::Label,
+                "next alone takes it, after the states: the step's label (or IO), quantified per step in Next".to_string(),
+            )
+        };
+        if let ExtraKind::Constant(_) = kind {
+            constants.push((p.x.name.clone(), p.x.typ.clone(), p.span.clone()));
+        }
+        extras.push(Extra {
+            in_init: false,
+            index: i,
+            name: p.x.name.clone(),
+            typ: p.x.typ.clone(),
+            kind,
+            why,
+        });
+    }
+    for ((i, p), taken) in init_extra.iter().zip(&init_taken) {
+        let (kind, why) = match taken {
+            Some(k) => (
+                ExtraKind::Constant(*k),
+                "init and next both take it: the same CONSTANT as next's".to_string(),
+            ),
+            None => (
+                ExtraKind::InitLabel,
+                "init alone takes it: any value init accepts, quantified once in Init".to_string(),
+            ),
+        };
+        extras.push(Extra {
+            in_init: true,
+            index: *i,
+            name: p.x.name.clone(),
+            typ: p.x.typ.clone(),
+            kind,
+            why,
+        });
+    }
+    (extras, constants)
+}
+
 fn recognise(krate: &Krate, module: &str, named: Option<&[String]>) -> Result<Triple, String> {
     let in_module: Vec<Function> = krate
         .functions
@@ -5797,26 +5976,33 @@ fn recognise(krate: &Krate, module: &str, named: Option<&[String]>) -> Result<Tr
         ));
     }
     let short = |f: &Function| last_segment(&f.x.name.path);
-    let state_of = |f: &Function| f.x.params.first().and_then(|p| typ_datatype(&p.x.typ));
     let is_bool = |f: &Function| matches!(&*f.x.ret.x.typ, TypX::Bool);
-    // Hand-rolled or VerusSync: `next(pre, post)` with two params of one datatype.
-    let next = in_module.iter().find(|f| {
-        short(f) == "next"
-            && f.x.params.len() == 2
-            && is_bool(f)
-            && state_of(f).is_some()
-            && state_of(f) == f.x.params.get(1).and_then(|p| typ_datatype(&p.x.typ))
-    });
+    // The datatype exactly two of `f`'s parameters have: the state of a
+    // `next(pre, post, ..)`, whatever else it takes beside them.
+    let state_pair = |f: &Function| -> Option<Path> {
+        let dts: Vec<Option<Path>> = f.x.params.iter().map(|p| typ_datatype(&p.x.typ)).collect();
+        dts.iter()
+            .flatten()
+            .find(|d| dts.iter().filter(|e| e.as_ref() == Some(*d)).count() == 2)
+            .cloned()
+    };
+    // Hand-rolled or VerusSync: `next(pre, post)` with two params of one
+    // datatype, and maybe a label, constants or IO beside them.
+    // `next(pre, post)` alone first, as before any extra parameter was taken.
+    let is_next = |f: &&Function| short(f) == "next" && is_bool(f) && state_pair(f).is_some();
+    let next = in_module
+        .iter()
+        .filter(is_next)
+        .find(|f| f.x.params.len() == 2)
+        .or_else(|| in_module.iter().find(is_next));
     if let Some(next) = next {
-        let state = state_of(next).unwrap();
+        let state = state_pair(next).unwrap();
+        let is_state = |t: &Typ| typ_datatype(t).as_ref() == Some(&state);
+        let states_in = |f: &Function| f.x.params.iter().filter(|p| is_state(&p.x.typ)).count();
         let init = in_module
             .iter()
-            .find(|f| {
-                short(f) == "init"
-                    && f.x.params.len() == 1
-                    && is_bool(f)
-                    && state_of(f).as_ref() == Some(&state)
-            })
+            .filter(|f| short(f) == "init" && is_bool(f) && states_in(f) == 1)
+            .min_by_key(|f| f.x.params.len())
             .ok_or_else(|| {
                 format!("found `next` in `{module}` but no `init(s: State) -> bool` beside it")
             })?;
@@ -5825,19 +6011,62 @@ fn recognise(krate: &Krate, module: &str, named: Option<&[String]>) -> Result<Tr
         } else {
             "hand-rolled"
         };
-        // Every `(State) -> bool` spec fn with a body, other than `init`.
-        let pool: Vec<Function> = in_module
-            .iter()
-            .filter(|f| {
-                f.x.params.len() == 1
-                    && is_bool(f)
-                    && state_of(f).as_ref() == Some(&state)
-                    && short(f) != "init"
-                    && f.x.mode == Mode::Spec
-                    && f.x.body.is_some()
-            })
-            .cloned()
-            .collect();
+        let (extras, constants) = classify_extras(init, next, &is_state);
+        // A type each constant has, when no other constant has it: a
+        // predicate's parameter of that type is given that constant.
+        let constant_of = |t: &Typ| -> Option<usize> {
+            let mut of = constants
+                .iter()
+                .enumerate()
+                .filter(|(_, (_, c, _))| crate::ast_util::types_equal(c, t));
+            let (i, _) = of.next()?;
+            of.next().is_none().then_some(i)
+        };
+        let label_typs: Vec<Typ> =
+            extras.iter().filter(|x| x.kind == ExtraKind::Label).map(|x| x.typ.clone()).collect();
+        // Every spec fn with a body over one state (and maybe constants)
+        // returning bool, other than `init`.
+        let mut closed: HashMap<Fun, Vec<Option<usize>>> = HashMap::new();
+        let mut over_labels: Vec<Fun> = Vec::new();
+        let pool: Vec<Function> =
+            in_module
+                .iter()
+                .filter(|f| {
+                    if !(is_bool(f)
+                        && states_in(f) == 1
+                        && short(f) != "init"
+                        && f.x.mode == Mode::Spec
+                        && f.x.body.is_some())
+                    {
+                        return false;
+                    }
+                    if f.x.params.len() == 1 {
+                        return true;
+                    }
+                    let given: Vec<Option<Option<usize>>> =
+                        f.x.params
+                            .iter()
+                            .map(|p| {
+                                if is_state(&p.x.typ) {
+                                    Some(None)
+                                } else {
+                                    constant_of(&p.x.typ).map(Some)
+                                }
+                            })
+                            .collect();
+                    if given.iter().all(|g| g.is_some()) {
+                        closed.insert(f.x.name.clone(), given.into_iter().flatten().collect());
+                        return true;
+                    }
+                    if f.x.params.iter().any(|p| {
+                        label_typs.iter().any(|l| crate::ast_util::types_equal(l, &p.x.typ))
+                    }) {
+                        over_labels.push(f.x.name.clone());
+                    }
+                    false
+                })
+                .cloned()
+                .collect();
         let candidates = if shape == "verussync" {
             // `state_machine!` generates `State::invariant(&self)` as the
             // conjunction `self.a() && self.b() && ...` of the `#[invariant]`
@@ -5884,10 +6113,22 @@ fn recognise(krate: &Krate, module: &str, named: Option<&[String]>) -> Result<Tr
         } else {
             // One named `invariant` is checked like any other, even when it
             // conjoins the rest: leaving it out could leave nothing checked.
-            select_invariants(&pool, named, module, |_| {
-                (true, "a (State) -> bool spec fn in the module".into())
+            select_invariants(&pool, named, module, |f| {
+                if closed.contains_key(&f.x.name) {
+                    (true, "a (State, constants) -> bool spec fn in the module, given the model's constants".into())
+                } else {
+                    (true, "a (State) -> bool spec fn in the module".into())
+                }
             })?
         };
+        let mut candidates = candidates;
+        for f in over_labels {
+            candidates.push((
+                f,
+                false,
+                "reads a label of next beside the state: a label is quantified per step inside Next, so a predicate over one is a guard of the transition, not an invariant".into(),
+            ));
+        }
         return Ok(Triple {
             shape,
             state,
@@ -5895,6 +6136,9 @@ fn recognise(krate: &Krate, module: &str, named: Option<&[String]>) -> Result<Tr
             next: next.x.name.clone(),
             candidates,
             explicit: named.is_some(),
+            extras,
+            constants,
+            closed,
         });
     }
     // verus-tla: `next()` returning a spec_fn over (S, S).
@@ -5933,11 +6177,306 @@ fn recognise(krate: &Krate, module: &str, named: Option<&[String]>) -> Result<Tr
             next: next.x.name.clone(),
             candidates,
             explicit: named.is_some(),
+            extras: Vec::new(),
+            constants: Vec::new(),
+            closed: HashMap::new(),
         });
     }
     Err(format!(
         "no transition system found in `{module}`: expected `next(pre, post) -> bool` and `init(s) -> bool`, or verus-tla's `next()`/`init()` closures"
     ))
+}
+
+/// What closing `init`, `next` and the candidates over their extra
+/// parameters (see the module header) produced.
+struct Closed {
+    /// The functions as written, when wrapped: `init`, `next`.
+    init: Option<Fun>,
+    next: Option<Fun>,
+    /// Each candidate over the state and constants, and its wrapper.
+    candidates: HashMap<Fun, Fun>,
+    /// Each label or init label (in init, its index): its `\E`, to read
+    /// its domain back.
+    quantifiers: Vec<(bool, usize, Expr)>,
+    /// What each constant is in TLA+.
+    constants: Vec<String>,
+    /// The constants' types, as `ASSUME`s.
+    assumes: Vec<String>,
+}
+
+impl Exporter {
+    /// A spec fn the export adds beside `of`: `of` renamed (`<name>__tla_closed`)
+    /// with the given parameters and body, returning `ret`.
+    fn synthetic(
+        &mut self,
+        of: &Function,
+        params: Vec<Param>,
+        body: Option<Expr>,
+        ret: &Typ,
+    ) -> Fun {
+        let segments = &of.x.name.path.segments;
+        let last = segments.last().map(|s| s.to_string()).unwrap_or_default();
+        let mut n = 1;
+        let fun = loop {
+            let seg = if n == 1 {
+                format!("{last}__tla_closed")
+            } else {
+                format!("{last}__tla_closed{n}")
+            };
+            let mut segs: Vec<Ident> = segments[..segments.len().saturating_sub(1)].to_vec();
+            segs.push(Arc::new(seg));
+            let path =
+                Arc::new(PathX { krate: of.x.name.path.krate.clone(), segments: Arc::new(segs) });
+            let fun = Arc::new(FunX { path });
+            if !self.functions.contains_key(&fun) {
+                break fun;
+            }
+            n += 1;
+        };
+        let mut x = of.x.clone();
+        x.name = fun.clone();
+        x.params = Arc::new(params);
+        x.ret = of.x.ret.new_x(ParamX { typ: ret.clone(), ..of.x.ret.x.clone() });
+        x.require = Arc::new(vec![]);
+        x.decrease = Arc::new(vec![]);
+        x.decrease_when = None;
+        x.decrease_by = None;
+        x.body = body;
+        self.functions.insert(fun.clone(), crate::def::Spanned::new(of.span.clone(), x));
+        fun
+    }
+
+    /// Close `init`, `next` and the candidates over the state and constants
+    /// over their parameters beside the states: each constant becomes a
+    /// `CONSTANT` (a record of one per field for a struct), and `init`,
+    /// `next` and those candidates spec fns of the states alone, which give
+    /// the constants and quantify the labels:
+    /// `next__tla_closed(pre, post) = exists|lbl| next(C, pre, post, lbl)`.
+    fn close_extras(&mut self, triple: &mut Triple) -> Closed {
+        let mut closed = Closed {
+            init: None,
+            next: None,
+            candidates: HashMap::new(),
+            quantifiers: Vec::new(),
+            constants: Vec::new(),
+            assumes: Vec::new(),
+        };
+        let next_f = self.functions[&triple.next].clone();
+        let init_f = self.functions[&triple.init].clone();
+        let span = next_f.span.clone();
+        let next_friendly = fun_as_friendly_rust_name(&triple.next);
+        // Each constant: a 0-ary operator a `ConstVar` reads.
+        let mut constant_funs: Vec<Fun> = Vec::new();
+        for (name, typ, pspan) in triple.constants.clone().iter() {
+            let base = format!("Const_{}", sanitize(&ident_name(name)));
+            let mut op = base.clone();
+            let mut n = 2;
+            while self.used_names.contains(&op)
+                || self.constants.contains(&op)
+                || is_tla_reserved(&op)
+            {
+                op = format!("{base}{n}");
+                n += 1;
+            }
+            self.used_names.insert(op.clone());
+            // A struct is a record of one constant per field, so the .cfg
+            // can give the scalar ones by value.
+            let fields: Option<Vec<(String, Typ)>> = match &*crate::ast_util::undecorate_typ(typ) {
+                TypX::Datatype(Dt::Path(p), args, _) => self.datatypes.get(p).and_then(|d| {
+                    (d.x.variants.len() == 1
+                        && !d.x.variants[0].fields.is_empty()
+                        && d.x.typ_params.len() == args.len()
+                        && !matches!(d.x.transparency, DatatypeTransparency::Never))
+                    .then(|| {
+                        d.x.variants[0]
+                            .fields
+                            .iter()
+                            .map(|f| {
+                                let t = crate::sst_util::subst_typ_for_datatype(
+                                    &d.x.typ_params,
+                                    args,
+                                    &f.a.0,
+                                );
+                                (field_name(&f.name), t)
+                            })
+                            .collect()
+                    })
+                }),
+                _ => None,
+            };
+            let mut declare = |this: &mut Self, constant: String, variable: String, t: &Typ| {
+                this.bound.clear();
+                if let Some(p) = this.type_pred(&constant, t, &mut Vec::new()) {
+                    closed.assumes.push(p);
+                }
+                this.bound.clear();
+                this.constants.insert(constant.clone());
+                this.values.insert(constant.clone(), typ_name(t));
+                this.hole_owners.push(None);
+                this.holes.push(Hole {
+                    variable,
+                    typ: typ_name(t),
+                    constant,
+                    location: span_string(pspan),
+                    in_function: next_friendly.clone(),
+                });
+            };
+            let rust = ident_name(name);
+            match fields {
+                Some(fields) => {
+                    let mut items = Vec::new();
+                    for (f, t) in &fields {
+                        let c = format!("{op}_{f}");
+                        declare(self, c.clone(), format!("{rust}.{f}"), t);
+                        items.push(format!("{f} |-> {c}"));
+                    }
+                    self.defs.push(format!(
+                        "\\* The constants `{rust}: {}` of init and next: one CONSTANT per field.\n{op} == [{}]\n",
+                        typ_name(typ),
+                        items.join(", ")
+                    ));
+                    self.def_owners.push(None);
+                    closed.constants.push(format!("{op} == [{}]", items.join(", ")));
+                }
+                None => {
+                    self.used_names.remove(&op);
+                    declare(self, op.clone(), rust.clone(), typ);
+                    closed.constants.push(format!("CONSTANT {op}"));
+                }
+            }
+            let fun = Arc::new(FunX {
+                path: Arc::new(PathX {
+                    krate: next_f.x.name.path.krate.clone(),
+                    segments: Arc::new(vec![Arc::new(format!("{op}__tla_constant"))]),
+                }),
+            });
+            let key = (fun.clone(), Variant::Plain, false);
+            self.op_names.insert(key.clone(), op.clone());
+            self.emitted.insert(key);
+            self.arity.insert(op.clone(), 0);
+            constant_funs.push(fun);
+        }
+        let bool_typ: Typ = Arc::new(TypX::Bool);
+        let var = |p: &Param| -> Expr {
+            SpannedTyped::new(&span, &p.x.typ, ExprX::Var(p.x.name.clone()))
+        };
+        let constant = |k: usize, t: &Typ| -> Expr {
+            SpannedTyped::new(
+                &span,
+                t,
+                ExprX::ConstVar(constant_funs[k].clone(), AutospecUsage::Final),
+            )
+        };
+        // `f(args)`, then `exists|x| ..` over each of `quantified` (the
+        // innermost last).
+        let call = |f: &Function, args: Vec<Expr>| -> Expr {
+            let typs: Vec<Typ> =
+                f.x.typ_params.iter().map(|t| Arc::new(TypX::TypParam(t.clone())) as Typ).collect();
+            let target = CallTarget::Fun(
+                CallTargetKind::Static,
+                f.x.name.clone(),
+                Arc::new(typs),
+                Arc::new(vec![]),
+                CallTargetAttrs {
+                    autospec: AutospecUsage::Final,
+                    const_var: false,
+                    assume_external_allowed: false,
+                },
+            );
+            SpannedTyped::new(
+                &span,
+                &bool_typ,
+                ExprX::Call { target, args: Arc::new(args), post_args: None, body: None },
+            )
+        };
+        let extras = triple.extras.clone();
+        let mut wrap = |this: &mut Self, f: &Function, in_init: bool| -> Fun {
+            let mine: Vec<&Extra> = extras.iter().filter(|x| x.in_init == in_init).collect();
+            let mut args = Vec::new();
+            let mut states = Vec::new();
+            let mut quantified = Vec::new();
+            for (i, p) in f.x.params.iter().enumerate() {
+                match mine.iter().find(|x| x.index == i).map(|x| x.kind) {
+                    None => {
+                        states.push(p.clone());
+                        args.push(var(p));
+                    }
+                    Some(ExtraKind::Constant(k)) => args.push(constant(k, &p.x.typ)),
+                    Some(ExtraKind::Label | ExtraKind::InitLabel) => {
+                        quantified.push((i, p.clone()));
+                        args.push(var(p));
+                    }
+                }
+            }
+            let mut body = call(f, args);
+            for (i, p) in quantified.into_iter().rev() {
+                let binder = Arc::new(VarBinderX { name: p.x.name.clone(), a: p.x.typ.clone() });
+                body = SpannedTyped::new(
+                    &span,
+                    &bool_typ,
+                    ExprX::Quant(
+                        Quant { quant: air::ast::Quant::Exists },
+                        Arc::new(vec![binder]),
+                        body,
+                    ),
+                );
+                closed.quantifiers.push((in_init, i, body.clone()));
+            }
+            this.synthetic(f, states, Some(body), &bool_typ)
+        };
+        let (mut next_w, mut init_w) = (None, None);
+        if extras.iter().any(|x| !x.in_init) {
+            next_w = Some(wrap(self, &next_f, false));
+        }
+        if extras.iter().any(|x| x.in_init) {
+            init_w = Some(wrap(self, &init_f, true));
+        }
+        // Their operators are `next_closed` and `init_closed`.
+        let claim = |this: &mut Self, w: &Fun, base: &str| {
+            let mut op = base.to_string();
+            let mut n = 2;
+            while this.used_names.contains(&op) || this.constants.contains(&op) {
+                op = format!("{base}{n}");
+                n += 1;
+            }
+            this.used_names.insert(op.clone());
+            this.op_names.insert((w.clone(), Variant::Plain, false), op);
+        };
+        if let Some(w) = next_w {
+            claim(self, &w, "next_closed");
+            closed.next = Some(std::mem::replace(&mut triple.next, w));
+        }
+        if let Some(w) = init_w {
+            claim(self, &w, "init_closed");
+            closed.init = Some(std::mem::replace(&mut triple.init, w));
+        }
+        for (f, given) in triple.closed.clone() {
+            let Some(func) = self.functions.get(&f).cloned() else { continue };
+            let mut args = Vec::new();
+            let mut states = Vec::new();
+            for (p, g) in func.x.params.iter().zip(&given) {
+                match g {
+                    None => {
+                        states.push(p.clone());
+                        args.push(var(p));
+                    }
+                    Some(k) => args.push(constant(*k, &p.x.typ)),
+                }
+            }
+            let w = self.synthetic(&func, states, Some(call(&func, args)), &bool_typ);
+            // The wrapper is printed under the candidate's own name.
+            let short = ident_name(&VarIdent(
+                Arc::new(last_segment(&f.path)),
+                VarIdentDisambiguate::AirLocal,
+            ));
+            if !self.used_names.contains(&short) && !is_tla_reserved(&short) {
+                self.used_names.insert(short.clone());
+                self.op_names.insert((w.clone(), Variant::Plain, false), short);
+            }
+            closed.candidates.insert(f, w);
+        }
+        closed
+    }
 }
 
 /// Export the transition system named by `arg`, `-V tla-export`'s argument:
@@ -6037,6 +6576,7 @@ pub fn export_module(krate: &Krate, arg: &str, exprs: &[String]) -> Result<Expor
         hole_owners: Vec::new(),
         refusal_owners: Vec::new(),
         euclid_users: HashSet::new(),
+        values: BTreeMap::new(),
     };
     for v in &state_vars {
         ex.used_names.insert(v.clone());
@@ -6044,6 +6584,14 @@ pub fn export_module(krate: &Krate, arg: &str, exprs: &[String]) -> Result<Expor
     for reserved in GENERATED_NAMES.iter().copied().chain([module_name.as_str()]) {
         ex.used_names.insert(reserved.into());
     }
+    // init/next over more than the state: closed over their labels and
+    // constants (see the module header).
+    let closed = (!triple.extras.is_empty()).then(|| ex.close_extras(&mut triple));
+    // The function checked for a candidate: its wrapper when it takes the
+    // constants.
+    let inv_fun = |f: &Fun| -> Fun {
+        closed.as_ref().and_then(|c| c.candidates.get(f).cloned()).unwrap_or_else(|| f.clone())
+    };
     // The temporal properties, and the functions their formulas read: a
     // state predicate one lifts (`eventually(lift_state(done()))`) is a
     // state of the property, not an invariant, unless the command line
@@ -6161,7 +6709,6 @@ pub fn export_module(krate: &Krate, arg: &str, exprs: &[String]) -> Result<Expor
         // it; it is reported as excluded, never dropped silently.
         transition_keys = ex.emitted.clone();
         for r in &selected {
-            let key = (r.clone(), Variant::Plain, false);
             // Read primed (`p(post)` in next), or given a state value, is a
             // guard too.
             let reached = [Variant::Plain, Variant::Primed, Variant::Record].iter().any(|v| {
@@ -6171,6 +6718,7 @@ pub fn export_module(krate: &Krate, arg: &str, exprs: &[String]) -> Result<Expor
                 outcome.insert(r.clone(), (false, reached_reason.clone()));
                 continue;
             }
+            let key = (inv_fun(r), Variant::Plain, false);
             let name = ex.ensure_function(&key);
             invs.push((r.clone(), name, ex.tainted.contains(&key)));
         }
@@ -6425,7 +6973,6 @@ pub fn export_module(krate: &Krate, arg: &str, exprs: &[String]) -> Result<Expor
             "read only by temporal properties left out of the .cfg ({}), so checked as an invariant",
             left.join(", ")
         );
-        let key = (f.clone(), Variant::Plain, false);
         let reached = [Variant::Plain, Variant::Primed, Variant::Record]
             .iter()
             .any(|v| [false, true].iter().any(|p| transition_keys.contains(&(f.clone(), *v, *p))));
@@ -6444,8 +6991,9 @@ pub fn export_module(krate: &Krate, arg: &str, exprs: &[String]) -> Result<Expor
             outcome.insert(f.clone(), (false, reached_reason.clone()));
             continue;
         } else {
-            Some(ex.ensure_function(&key))
+            Some(ex.ensure_function(&(inv_fun(f), Variant::Plain, false)))
         };
+        let key = (inv_fun(f), Variant::Plain, false);
         match name {
             Some(name) => {
                 invs.push((f.clone(), name, ex.tainted.contains(&key)));
@@ -6535,7 +7083,7 @@ pub fn export_module(krate: &Krate, arg: &str, exprs: &[String]) -> Result<Expor
                 outcome.get(f).cloned().unwrap_or_else(|| (*selected, reason.clone()));
             Candidate {
                 function: fun_as_friendly_rust_name(f),
-                operator: ex.op_names.get(&(f.clone(), Variant::Plain, false)).cloned(),
+                operator: ex.op_names.get(&(inv_fun(f), Variant::Plain, false)).cloned(),
                 included,
                 reason,
             }
@@ -6550,7 +7098,10 @@ pub fn export_module(krate: &Krate, arg: &str, exprs: &[String]) -> Result<Expor
     let model_euclid = ex.uses_euclid;
     let model_recursive = ex.recursive();
     let mut pending: Vec<Path> = vec![triple.state.clone()];
-    let steps = if verus_tla { None } else { ex.steps(&triple.next, &mut pending) };
+    // The step structure is that of `next` as written (its body reads its
+    // label and constants as the parameters of its operator).
+    let next_written = closed.as_ref().and_then(|c| c.next.clone()).unwrap_or(triple.next.clone());
+    let steps = if verus_tla { None } else { ex.steps(&next_written, &mut pending) };
     let model = ModelExtent {
         defs: model_defs,
         holes: model_holes,
@@ -6579,6 +7130,38 @@ pub fn export_module(krate: &Krate, arg: &str, exprs: &[String]) -> Result<Expor
         datatypes: ex.layouts(pending),
         encodings: encodings(),
     };
+    let parameters: Vec<ModelParam> = match &closed {
+        None => Vec::new(),
+        Some(c) => triple
+            .extras
+            .iter()
+            .map(|x| {
+                let tla = match x.kind {
+                    ExtraKind::Constant(k) => c.constants[k].clone(),
+                    ExtraKind::Label | ExtraKind::InitLabel => c
+                        .quantifiers
+                        .iter()
+                        .find(|(i, j, _)| *i == x.in_init && *j == x.index)
+                        .and_then(|(_, _, e)| ex.exists_printed.get(&(Arc::as_ptr(e) as usize)))
+                        .map(|(b, d, _)| format!("\\E {b} \\in {d}"))
+                        .unwrap_or_default(),
+                };
+                ModelParam {
+                    function: if x.in_init { "init" } else { "next" }.into(),
+                    param: x.name.0.to_string(),
+                    typ: typ_name(&x.typ),
+                    kind: match x.kind {
+                        ExtraKind::Label => "label",
+                        ExtraKind::InitLabel => "init_label",
+                        ExtraKind::Constant(_) => "constant",
+                    }
+                    .into(),
+                    tla,
+                    why: x.why.clone(),
+                }
+            })
+            .collect(),
+    };
     let mut tla = String::new();
     tla.push_str(&format!("---- MODULE {module_name} ----\n"));
     tla.push_str("\\* Exported by verus -V tla-export from the Verus model in `");
@@ -6606,12 +7189,38 @@ pub fn export_module(krate: &Krate, arg: &str, exprs: &[String]) -> Result<Expor
             "\\* Temporal (verus-tla): always is [], eventually <>, leads_to ~>, lift_state(p)\n\\* the state formula p, always(lift_action(a)) [][A]_vars, weak_fairness WF_vars(A)\n\\* of the action's forward step, tla_forall/tla_exists bounded quantifiers. Shared\n\\* WF_vars fairness is in Spec; other spec assumptions are a property's premises.\n",
         );
     }
+    if !parameters.is_empty() {
+        // init's constant is next's, said once.
+        let said: Vec<String> = parameters
+            .iter()
+            .filter(|p| !(p.function == "init" && p.kind == "constant"))
+            .map(|p| {
+                let what = match p.kind.as_str() {
+                    "label" => "a label, \\E per step in Next",
+                    "init_label" => "\\E once in Init",
+                    _ => "constants, a CONSTANT",
+                };
+                format!("{}'s {} ({what})", p.function, p.param)
+            })
+            .collect();
+        tla.push_str(&format!(
+            "\\* Beside the state: {}; see the .tla.json parameters.\n",
+            said.join("; ")
+        ));
+    }
     tla.push_str("EXTENDS Integers, Sequences, FiniteSets, TLC\n\n");
     if !model_constants.is_empty() {
         tla.push_str(&format!(
             "CONSTANTS {}\n\n",
             model_constants.iter().cloned().collect::<Vec<_>>().join(", ")
         ));
+    }
+    if let Some(c) = closed.as_ref().filter(|c| !c.assumes.is_empty()) {
+        tla.push_str("\\* The constants' types.\n");
+        for a in &c.assumes {
+            tla.push_str(&format!("ASSUME {a}\n"));
+        }
+        tla.push('\n');
     }
     tla.push_str(&format!("VARIABLES {}\n", state_vars.join(", ")));
     tla.push_str(&format!("vars == <<{}>>\n\n", state_vars.join(", ")));
@@ -6757,14 +7366,24 @@ pub fn export_module(krate: &Krate, arg: &str, exprs: &[String]) -> Result<Expor
             }
         }
     }
-    if !model_constants.is_empty() {
+    let domains: Vec<&String> =
+        model_constants.iter().filter(|c| !ex.values.contains_key(*c)).collect();
+    if !domains.is_empty() {
         // Left unassigned on purpose: TLC stops until each is given a finite
         // set, rather than quantifying over an empty one.
         cfg.push_str(
             "\\* Domains the export could not bound. TLC stops until each is given a finite\n\\* set: uncomment the block and fill them in.\n\\* CONSTANTS\n",
         );
-        for c in &model_constants {
+        for c in &domains {
             cfg.push_str(&format!("\\*   {c} = {{ ... }}\n"));
+        }
+    }
+    if !ex.values.is_empty() {
+        cfg.push_str(
+            "\\* The model's constants (init/next's constants parameter). TLC stops until each\n\\* is given a value: an integer, string or model value here (`C = 3`), anything\n\\* else as `C <- Op` from an operator in a module extending this one.\n\\* CONSTANTS\n",
+        );
+        for (c, t) in &ex.values {
+            cfg.push_str(&format!("\\*   {c} = <a {t}>\n"));
         }
     }
     if !init_unassigned.is_empty() {
@@ -6811,6 +7430,7 @@ pub fn export_module(krate: &Krate, arg: &str, exprs: &[String]) -> Result<Expor
         steps,
         exprs: expr_exports,
         trace,
+        parameters,
     };
     Ok(Export { module_name, tla, cfg, report, trace_module_name, trace_tla, trace_cfg })
 }
