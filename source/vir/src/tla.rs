@@ -40,7 +40,9 @@
 //! * a constant: a parameter of `next` that `init` also takes (the same
 //!   name and type, or, before `next`'s states, `init`'s one parameter of
 //!   its datatype whatever its name; a same-typed parameter of another name
-//!   is a value of its own), unless it is an enum of several variants. It
+//!   is a value of its own), unless it is a choice among variants: an enum
+//!   of several variants, or a struct holding one in a field, through
+//!   structs (`struct Lbl { op: Op }`; an `Option` field counts). It
 //!   is fixed for the whole behaviour, so it is a `CONSTANT` the `.cfg`
 //!   supplies; a struct is one `Const_<param>_<field>` per field (TLC's
 //!   `.cfg` gives a scalar by value and anything else by `<-`), behind
@@ -48,8 +50,10 @@
 //!   as a hole with its Rust type and kept in its type's range by an
 //!   `ASSUME`. `init`'s parameter is the same one. Fixing a value chosen per
 //!   step would drop behaviours, so nothing else is a constant: neither a
-//!   parameter before the states that `init` does not take, nor an enum
-//!   both take (a step's label; `init`'s is then an init label);
+//!   parameter before the states that `init` does not take, nor a choice
+//!   among variants both take (a step's label; `init`'s is then an init
+//!   label). The constants are named on the summary line, so a value
+//!   fixed that the model chooses per step shows;
 //! * a label: any other parameter of `next`. A label belongs to one step, so
 //!   Next is `\E lbl \in <domain> : next(Const_c, lbl)`. A per-variant `\E`,
 //!   its fields bounded from the arms' guards, when `next` matches on the
@@ -751,6 +755,9 @@ struct Exporter {
     values: BTreeMap<String, String>,
     /// Each `Dom_` hole's Rust type, for the `ASSUME` a label's hole gets.
     hole_typs: HashMap<String, Typ>,
+    /// The 0-ary functions standing for the model's constants (see
+    /// [`Exporter::close_extras`]), and the operator each is.
+    constant_ops: HashMap<Fun, String>,
 }
 
 fn ident_name(v: &VarIdent) -> String {
@@ -922,6 +929,21 @@ fn read_var(e: &Expr) -> Option<VarIdent> {
         ExprX::UnaryOpr(UnaryOpr::Box(_) | UnaryOpr::Unbox(_), inner) => read_var(inner),
         ExprX::Unary(UnaryOp::Trigger(_) | UnaryOp::CoerceMode { .. }, inner) => read_var(inner),
         ExprX::Block(stmts, Some(tail)) if stmts.is_empty() => read_var(tail),
+        _ => None,
+    }
+}
+
+/// The function a `ConstVar` reads, through the wrappers [`read_var`] sees
+/// through: the model's constants are read so (see
+/// [`Exporter::close_extras`]).
+fn read_const_var(e: &Expr) -> Option<Fun> {
+    match &e.x {
+        ExprX::ConstVar(f, _) => Some(f.clone()),
+        ExprX::UnaryOpr(UnaryOpr::Box(_) | UnaryOpr::Unbox(_), inner) => read_const_var(inner),
+        ExprX::Unary(UnaryOp::Trigger(_) | UnaryOp::CoerceMode { .. }, inner) => {
+            read_const_var(inner)
+        }
+        ExprX::Block(stmts, Some(tail)) if stmts.is_empty() => read_const_var(tail),
         _ => None,
     }
 }
@@ -2352,7 +2374,17 @@ impl Exporter {
                         (None, _) => {
                             post_args |= env.reads_post(a);
                             printed.push(self.expr(a, env));
-                            domains.push(read_var(a).and_then(|v| env.domains.get(&v).cloned()));
+                            // A variable with a domain, or one of the model's
+                            // constants: the one value it holds.
+                            domains.push(
+                                read_var(a).and_then(|v| env.domains.get(&v).cloned()).or_else(
+                                    || {
+                                        read_const_var(a)
+                                            .and_then(|f| self.constant_ops.get(&f))
+                                            .map(|op| Dom::Closed(format!("{{{op}}}"), false))
+                                    },
+                                ),
+                            );
                         }
                     }
                 }
@@ -5917,13 +5949,49 @@ fn select_invariants(
         .collect())
 }
 
+/// Why a value of `t` is a choice among variants, when it is one: an enum
+/// of several variants the crate declares, or a struct one of whose fields
+/// (through structs) is such an enum (`struct Lbl { op: Op }`, a label
+/// wrapped in a struct). A choice made per step is a label, never a
+/// constant.
+fn variant_choice(krate: &Krate, t: &Typ, seen: &mut Vec<Path>) -> Option<String> {
+    let TypX::Datatype(Dt::Path(p), args, _) = &*crate::ast_util::undecorate_typ(t) else {
+        return None;
+    };
+    if seen.contains(p) {
+        return None;
+    }
+    let d = krate.datatypes.iter().find(|d| matches!(&d.x.name, Dt::Path(q) if q == p))?;
+    if d.x.variants.len() > 1 {
+        return Some("an enum of several variants".into());
+    }
+    if d.x.typ_params.len() != args.len() {
+        return None;
+    }
+    seen.push(p.clone());
+    let why = d.x.variants.first().and_then(|v| {
+        v.fields.iter().find_map(|f| {
+            let ft = crate::sst_util::subst_typ_for_datatype(&d.x.typ_params, args, &f.a.0);
+            variant_choice(krate, &ft, seen).map(|_| {
+                format!(
+                    "a struct holding an enum of several variants (`{}: {}`)",
+                    field_name(&f.name),
+                    typ_name(&ft)
+                )
+            })
+        })
+    });
+    seen.pop();
+    why
+}
+
 /// What each parameter of `init` and `next` beside the states becomes
 /// (see the module header), and the constants among them.
 fn classify_extras(
     init: &Function,
     next: &Function,
     is_state: &dyn Fn(&Typ) -> bool,
-    is_enum: &dyn Fn(&Typ) -> bool,
+    choice: &dyn Fn(&Typ) -> Option<String>,
 ) -> (Vec<Extra>, Vec<(VarIdent, Typ, crate::messages::Span)>) {
     let mut extras = Vec::new();
     let mut constants = Vec::new();
@@ -5955,13 +6023,14 @@ fn classify_extras(
             );
         // Fixing a value that is chosen per step drops behaviours, so a
         // parameter is a constant only when init takes it too, and never
-        // an enum of several variants (a step's label, even when init
-        // takes one of its own).
-        let (kind, why) = if let Some(j) = shared.filter(|_| is_enum(&p.x.typ)) {
+        // a choice among variants, an enum or a struct holding one (a
+        // step's label, even when init takes one of its own).
+        let choice_of = shared.zip(choice(&p.x.typ));
+        let (kind, why) = if let Some((j, c)) = choice_of {
             (
                 ExtraKind::Label,
                 format!(
-                    "init and next both take `{}: {}`, but an enum of several variants is a step's label, chosen per step: quantified per step in Next (init's is its own, quantified once in Init)",
+                    "init and next both take `{}: {}`, but {c} is a step's label, chosen per step: quantified per step in Next (init's is its own, quantified once in Init)",
                     ident_name(&init_extra[j].1.x.name),
                     typ_name(&p.x.typ)
                 ),
@@ -6114,8 +6183,8 @@ fn recognise(krate: &Krate, module: &str, named: Option<&[String]>) -> Result<Tr
                 .find(|d| matches!(&d.x.name, Dt::Path(q) if *q == p))
                 .map(|d| d.x.variants.len())
         };
-        let is_enum = |t: &Typ| variants(t).map_or(false, |n| n > 1);
-        let (extras, constants) = classify_extras(init, next, &is_state, &is_enum);
+        let choice = |t: &Typ| variant_choice(krate, t, &mut Vec::new());
+        let (extras, constants) = classify_extras(init, next, &is_state, &choice);
         // The constant a predicate's parameter is given: the one of its
         // name and type, or else the only one of its type when that is a
         // struct (`inv(self, c: Constants)`). A scalar is too common a type
@@ -6228,7 +6297,9 @@ fn recognise(krate: &Krate, module: &str, named: Option<&[String]>) -> Result<Tr
             })
             .cloned()
             .collect();
-        let guard_why = "reads a label of next beside the state: a label is quantified per step inside Next, so a predicate over one is a guard of the transition, not an invariant";
+        // Told by the parameter's type alone: a helper over a value of the
+        // label's type (`above(s, k: u8)` beside a label `by: u8`) is one too.
+        let guard_why = "reads a value of the type of a label of next beside the state: a label is quantified per step inside Next, so a predicate over one is a guard of the transition, not an invariant";
         // Named on the command line, a predicate that cannot be checked is
         // refused, saying why, rather than not found.
         for n in named.unwrap_or(&[]) {
@@ -6517,7 +6588,18 @@ impl Exporter {
                 Some(fields) => {
                     let mut items = Vec::new();
                     for (f, t) in &fields {
-                        let c = format!("{op}_{f}");
+                        // Unique: `c.cap_x` beside `c_cap.x` would otherwise
+                        // both be `Const_c_cap_x`, one constant for two.
+                        let base = format!("{op}_{f}");
+                        let mut c = base.clone();
+                        let mut n = 2;
+                        while self.used_names.contains(&c)
+                            || self.constants.contains(&c)
+                            || is_tla_reserved(&c)
+                        {
+                            c = format!("{base}{n}");
+                            n += 1;
+                        }
                         declare(self, c.clone(), format!("{rust}.{f}"), t);
                         items.push(format!("{f} |-> {c}"));
                     }
@@ -6545,6 +6627,7 @@ impl Exporter {
             self.op_names.insert(key.clone(), op.clone());
             self.emitted.insert(key);
             self.arity.insert(op.clone(), 0);
+            self.constant_ops.insert(fun.clone(), op.clone());
             constant_funs.push(fun);
         }
         let bool_typ: Typ = Arc::new(TypX::Bool);
@@ -6769,6 +6852,7 @@ pub fn export_module(krate: &Krate, arg: &str, exprs: &[String]) -> Result<Expor
         euclid_users: HashSet::new(),
         values: BTreeMap::new(),
         hole_typs: HashMap::new(),
+        constant_ops: HashMap::new(),
     };
     for v in &state_vars {
         ex.used_names.insert(v.clone());
@@ -7452,7 +7536,7 @@ pub fn export_module(krate: &Krate, arg: &str, exprs: &[String]) -> Result<Expor
         |fs: &[Fun]| fs.iter().map(|f| last_segment(&f.path)).collect::<Vec<_>>().join(", ");
     if !triple.guards.is_empty() {
         tla.push_str(&format!(
-            "\\* NOT CHECKED (guards over next's label, not invariants): {}.\n",
+            "\\* NOT CHECKED (over a value of the type of next's label: guards, not invariants): {}.\n",
             short_names(&triple.guards)
         ));
     }

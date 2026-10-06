@@ -56,7 +56,9 @@ is verified.
 enum Label`, nrkernel's `next(c: Constants, s1, s2, lbl: RLbl)`, IronKV's
 `next(pre, post, ios)`). A parameter of `next` that `init` also takes (same
 name and type, or before the states, the one `init` takes of its type) is a
-constant, unless it is an enum of several variants: a `CONSTANT` per field
+constant, unless it is a choice among variants (an enum of several
+variants, or a struct holding one in a field, such as `struct Lbl { op:
+Op }`), which is a label: a `CONSTANT` per field
 of its struct (`Const_c_cap`, kept in its type's range by an `ASSUME`),
 given by value in the `.cfg` (`Const_c_cap = 4`) or by `<-` for a
 non-scalar, behind `Const_c == [cap |-> Const_c_cap, ...]`. Any other

@@ -931,9 +931,36 @@ impl Verifier {
             dir.join(format!("{}.tla", export.module_name)).display()
         );
         if !export.report.parameters.is_empty() {
+            // Each kind named, init's constant (next's) once: a constant is
+            // fixed for the whole behaviour, so one the model chooses per
+            // step should show here.
+            let params = &export.report.parameters;
+            let named = |kind: &str, function: &str| -> Vec<String> {
+                params
+                    .iter()
+                    .filter(|p| p.kind == kind && p.function == function)
+                    .map(|p| p.param.clone())
+                    .collect()
+            };
+            let parts: Vec<String> = [
+                ("constant", "next", "fixed for the whole behaviour, CONSTANTs the .cfg gives"),
+                ("label", "next", "\\E per step in Next"),
+                ("init_label", "init", "\\E once in Init"),
+            ]
+            .iter()
+            .filter_map(|(kind, function, what)| {
+                let names = named(kind, function);
+                let kind = kind.replace('_', " ");
+                match names.len() {
+                    0 => None,
+                    1 => Some(format!("{kind} {} ({what})", names[0])),
+                    _ => Some(format!("{kind}s {} ({what})", names.join(", "))),
+                }
+            })
+            .collect();
             eprintln!(
-                "tla-export: init/next take {} parameters beside the state (see the .tla.json parameters)",
-                export.report.parameters.len()
+                "tla-export: beside the state, init/next take {} (see the .tla.json parameters)",
+                parts.join("; ")
             );
         }
         if !export.report.unchecked.is_empty() {
