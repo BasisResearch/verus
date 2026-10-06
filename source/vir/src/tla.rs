@@ -2047,7 +2047,9 @@ impl Exporter {
     /// lowered by its macro to a tuple `let` of the names the pattern
     /// binds). `init` is bound once, pushed onto `lets` unless it is a
     /// local (`d__ == e`), and each name is its projection (`a == d__[1]`),
-    /// returned as definitions. Rust admits only patterns that always
+    /// returned as definitions. A whole state is not pushed either: each
+    /// name bound to one of its fields is that field's state variable (see
+    /// [`Exporter::pattern`]). Rust admits only patterns that always
     /// match here, but one may still test a variant (of an enum whose other
     /// variants are uninhabited): that condition is returned too, with the
     /// message of the `Assert` the block prints where it fails, and the
@@ -2132,9 +2134,11 @@ impl Exporter {
         for arm in arms.iter() {
             // `_ => arbitrary()`, the arm VerusSync's macro gives the names
             // of a `require let` or of a refutable `let` in a `remove`,
-            // `have` or `withdraw` where the pattern does not match: the
-            // transition's guard rules it out, so it is never evaluated on a
-            // step; were it, its value is unspecified and TLC stops there.
+            // `have` or `withdraw` where the pattern does not match. The
+            // transition's guard rules it out (for `assert let` and
+            // `withdraw`, a VerusSync assert, which stops TLC first, as a
+            // failed obligation), so it is never evaluated on a step; were
+            // it, its value is unspecified and TLC stops there.
             // It is not a refusal and taints nothing. Anywhere else such an
             // arm may be reached, and `arbitrary()` is refused as usual.
             if sync_tmp
@@ -2391,6 +2395,8 @@ impl Exporter {
                         }
                     }
                 }
+                // Defensive: Rust has every alternative bind every name, so
+                // each has a value in both and this is never reached.
                 let Some(values) = values else {
                     let r = self.refuse("or-pattern", &p.span);
                     return self.refused_bindings(r, p, env);
@@ -5142,13 +5148,15 @@ fn pattern_binds_closure(p: &Pattern, datatypes: &HashMap<Path, Datatype>) -> bo
 }
 
 /// Whether `place` is the scrutinee of a match VerusSync's macro puts after
-/// a guard that it matches the arm's pattern, so its `_ => arbitrary()` arm
-/// is never reached on a step. `require let P = e` (and `assert let`) binds
-/// `e` to `tmp_for_match_<n>` and guards with `match tmp_for_match_<n> { P
+/// a check that it matches the arm's pattern, so its `_ => arbitrary()` arm
+/// is never reached on a step. The check is a guard (`require`), or for
+/// `assert let` and `withdraw` a VerusSync assert, which stops TLC before
+/// the arm, as a failed obligation. `require let P = e` (and `assert let`)
+/// binds `e` to `tmp_for_match_<n>` and checks `match tmp_for_match_<n> { P
 /// => true, _ => false }`. A refutable `let` in `remove`, `have` or
 /// `withdraw` (`m -= [k => let Some(x)]`, `o -= Some(let P)`) matches the
 /// element it takes from the field's `update_tmp_<f>` (`update_tmp_m[k]`,
-/// `update_tmp_o.arrow_0()`), guarded by `contains(k)` (or `is Some`) `&&
+/// `update_tmp_o.arrow_0()`), checked by `contains(k)` (or `is Some`) `&&
 /// match .. { P => true, _ => false }`. Both names are the macro's own.
 fn sync_guarded_scrutinee(place: &Place) -> bool {
     if place_var(place).is_some_and(|v| v.0.starts_with("tmp_for_match_")) {

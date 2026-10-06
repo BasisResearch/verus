@@ -245,7 +245,9 @@ removal of the same key in one transition is disabled, and a removal then an
 refutable pattern there (`[k => let Some(x)]`, `Some(let E::A(x))`) adds its
 match to the guard and reads its names from `match m[k] { P => (names), _ =>
 arbitrary() }`, whose `arbitrary()` arm the guard rules out in the same
-way. Only those arms: an `_ => arbitrary()` arm anywhere else may be reached,
+way. For `assert let` and `withdraw` the check is a VerusSync assert, not a
+guard: where the pattern does not match, TLC stops at the failed assert
+before the arm is reached. Only those arms: an `_ => arbitrary()` arm anywhere else may be reached,
 and `arbitrary()` is refused there, as any function without a body is. A
 refused pattern (a destructuring `let` binding a closure, a range over chars)
 binds each name it binds to the refusal, so TLC stops only where such a name

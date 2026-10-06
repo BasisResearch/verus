@@ -3475,6 +3475,69 @@ fn tla_export_refuses_a_user_arbitrary_arm_in_verussync() {
     assert!(!out.contains("tla-export refused"), "{out}\n{}", ex.tla);
 }
 
+/// A refutable `let` in a `withdraw` (`m -= [k => let Some(x)]`) is checked
+/// by a VerusSync assert, not a guard: where the pattern matches (key 1) the
+/// step fires; where it does not (key 2 holds None) TLC stops at the
+/// failed assert, before the `arbitrary()` arm, whose value would be
+/// unspecified.
+const SYNC_WITHDRAW: &str = r#"
+use vstd::prelude::*;
+use verus_state_machines_macros::tokenized_state_machine;
+
+verus! {
+
+tokenized_state_machine!{ M {
+    fields {
+        #[sharding(storage_map)] pub m: Map<int, Option<int>>,
+        #[sharding(variable)] pub total: int,
+    }
+
+    init!{ initialize() {
+        init m = Map::empty().insert(1, Option::Some(3)).insert(2, Option::None);
+        init total = 0;
+    } }
+
+    transition!{ take(k: int) {
+        require pre.total == 0;
+        withdraw m -= [k => let Some(x)];
+        update total = x;
+    } }
+
+    #[invariant]
+    pub fn small(&self) -> bool { self.total <= 3 }
+
+    #[inductive(initialize)] fn initialize_inductive(post: Self) { }
+    #[inductive(take)] fn take_inductive(pre: Self, post: Self, k: int) { }
+}}
+
+}
+
+fn main() {}
+"#;
+
+#[test]
+fn tla_export_stops_at_the_assert_of_a_refutable_withdraw_let() {
+    let src = TempDir::new().expect("temp dir");
+    let entry = src.path().join("sync_withdraw.rs");
+    std::fs::write(&entry, SYNC_WITHDRAW).unwrap();
+    let ex = export_with(&entry, "test_crate::M", &["--no-verify"]);
+    assert_eq!(ex.report["shape"], "verussync");
+    assert_eq!(ex.report["refusals"], serde_json::json!([]), "{}", ex.tla);
+    assert_eq!(ex.tla.matches("arbitrary() (an unspecified value)").count(), 1, "{}", ex.tla);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    // On key 1 alone the withdrawal fires: the initial state and total 3.
+    let run = tlc(&jar, &ex.spec(), &format!("{}CONSTANTS\n  Dom_Step_take_v0 = {{1}}\n", ex.cfg));
+    assert_eq!(run.violated, Vec::<String>::new(), "{}", ex.tla);
+    assert_eq!(run.distinct, 2, "{run:?}\n{}", ex.tla);
+    // On key 2 the assert fails first.
+    let cfg = format!("{}CONSTANTS\n  Dom_Step_take_v0 = {{1, 2}}\n", ex.cfg);
+    let out = tlc_output(&jar, &ex.spec(), &cfg);
+    assert!(out.contains("tla-export: VerusSync assert in"), "{out}\n{}", ex.tla);
+    assert!(out.contains("take fails at"), "{out}\n{}", ex.tla);
+    assert!(!out.contains("an unspecified value"), "{out}\n{}", ex.tla);
+}
+
 /// A pattern on the whole post state binds each field to its variable
 /// (`x` is `x'`), so `x == e` assigns it as `post.x == e` does; it was a
 /// LET of the record `[x |-> x', y |-> y']`, which assigned nothing, and
