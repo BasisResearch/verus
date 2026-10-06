@@ -5066,3 +5066,100 @@ fn resident_fingerprints_change_with_every_verdict() {
     }
     assert!(missed.is_empty(), "verdict changed, fingerprint did not: {:#?}", missed);
 }
+
+const INITIAL_SOURCE: &str = r#"
+use vstd::prelude::*;
+verus! {
+    spec fn f(x: int) -> int { x + 1 }
+
+    proof fn helper(x: int) ensures f(x) > x {}
+
+    proof fn uses_helper(x: int) ensures f(x) > x { helper(x); }
+
+    proof fn failing(x: int) { assert(x > 0); }
+
+    #[verifier::spinoff_prover]
+    proof fn spun(x: int) ensures f(x) == x + 1 { helper(x); }
+
+    uninterp spec fn a(i: int) -> int;
+
+    #[verifier::rlimit(0.01)]
+    proof fn looping()
+        requires forall|i: int| #[trigger] a(i) < a(i + 1),
+        ensures a(0) > 100,
+    {
+    }
+}
+"#;
+
+/// The catalogue carries what the invocation itself answered for each query
+/// it checked, so a caller learns a failed run's per-query verdicts without
+/// checking every query again, and the items each query reads. A recheck of a
+/// query answers what the catalogue says it answered; a retain-only
+/// invocation, which checks nothing, carries no verdict.
+#[test]
+fn resident_catalogue_reports_initial_verdicts_and_reads() {
+    let mut worker = Worker::start(INITIAL_SOURCE, &[]);
+    let ready = worker.receive();
+    assert_eq!(ready["invocation_succeeded"], false, "{}", ready);
+    let session = ready["session"].clone();
+    let initial = |name: &str| query_of(&ready, name, "default")["initial"].clone();
+    assert_eq!(initial("::helper")["result"], "valid", "{}", ready);
+    assert_eq!(initial("::uses_helper")["result"], "valid", "{}", ready);
+    assert_eq!(initial("::spun")["result"], "valid", "{}", ready);
+    let failing = initial("::failing");
+    assert_eq!(failing["result"], "invalid", "{}", ready);
+    assert!(failing["assert_id"].is_array(), "{}", failing);
+    let diagnostics = failing["diagnostics"].as_array().unwrap();
+    assert_eq!(diagnostics[0]["level"], "error", "{}", failing);
+    assert!(diagnostics[0]["spans"][0].as_str().unwrap().contains("fixture.rs:"), "{}", failing);
+    let looping = initial("::looping");
+    assert!(
+        looping["result"] == "resource_limit" || looping["result"] == "invalid",
+        "{looping}"
+    );
+    if looping["result"] == "resource_limit" {
+        let message = looping["diagnostics"][0]["message"].as_str().unwrap();
+        assert!(message.contains("Resource limit (rlimit) exceeded"), "{}", looping);
+    }
+    for bucket in ready["buckets"].as_array().unwrap() {
+        for query in bucket["queries"].as_array().unwrap() {
+            let initial = &query["initial"];
+            assert!(initial["elapsed_ms"].is_u64(), "{}", query);
+            let checked = worker.send(json!({"command": "check", "session": session,
+                "bucket": bucket["id"], "query": query["id"]}));
+            assert_eq!(checked["result"], initial["result"], "{} rechecked as {}", query, checked);
+        }
+    }
+
+    // What each query reads: its callees and the definitions it can use,
+    // not itself, and nothing it never mentions.
+    let reads = |name: &str| -> Vec<String> {
+        query_of(&ready, name, "default")["reads"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r.as_str().unwrap().rsplit("::").next().unwrap().to_owned())
+            .collect()
+    };
+    assert_eq!(reads("::uses_helper"), ["f", "helper"], "{}", ready);
+    assert_eq!(reads("::spun"), ["f", "helper"], "{}", ready);
+    assert_eq!(reads("::helper"), ["f"], "{}", ready);
+    assert!(!reads("::failing").contains(&"helper".to_owned()), "{}", ready);
+    assert_eq!(worker.send(json!({"command": "close", "session": session}))["event"], "closed");
+    worker.finish(false);
+
+    let mut retained =
+        Worker::start_with_env(INITIAL_SOURCE, &[], &[("VERUS_RESIDENT_RETAIN_ONLY", "1")]);
+    let ready = retained.receive();
+    assert_eq!(ready["retain_only"], true, "{}", ready);
+    for bucket in ready["buckets"].as_array().unwrap() {
+        for query in bucket["queries"].as_array().unwrap() {
+            assert!(query.get("initial").is_none(), "{}", query);
+            assert!(query["reads"].is_array(), "{}", query);
+        }
+    }
+    let session = ready["session"].clone();
+    assert_eq!(retained.send(json!({"command": "close", "session": session}))["event"], "closed");
+    retained.finish(true);
+}

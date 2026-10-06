@@ -443,6 +443,10 @@ pub struct Verifier {
     /// and nothing else reads them, so the cost when unused is one push per
     /// diagnostic.
     raised_diagnostics: Vec<RaisedDiagnostic>,
+    /// Under `--resident`, the verdicts of the check-valid commands checked
+    /// since the journal last took them, in order (see
+    /// `QueryJournal::record_initial`).
+    resident_initial: Vec<crate::resident::InitialVerdict>,
     /// `raised_diagnostics` after `resolve_raised_diagnostics` has joined
     /// each one to its source coordinates.
     pub reported_diagnostics: Vec<crate::report::Diagnostic>,
@@ -712,6 +716,7 @@ impl Verifier {
             func_inst_pressure: HashMap::new(),
             deferred_errors: Vec::new(),
             raised_diagnostics: Vec::new(),
+            resident_initial: Vec::new(),
             reported_diagnostics: Vec::new(),
 
             dep_tracker: if via_cargo_args.is_some() { Some(dep_tracker) } else { None },
@@ -774,6 +779,7 @@ impl Verifier {
             func_inst_pressure: HashMap::new(),
             deferred_errors: Vec::new(),
             raised_diagnostics: Vec::new(),
+            resident_initial: Vec::new(),
             reported_diagnostics: Vec::new(),
 
             via_cargo_args: self.via_cargo_args.clone(),
@@ -1210,6 +1216,12 @@ impl Verifier {
         let mut used_axioms = None;
         // 0 for the query's first check, then one per multi-error round
         let mut round = 0usize;
+        // A resident invocation keeps each query's verdict and diagnostics
+        // for its catalogue (`resident::InitialVerdict`): the first round's
+        // verdict and failed assertion, every round's diagnostics.
+        let keep_initial = self.args.resident && is_check_valid && level.is_some();
+        let mut initial_first: Option<(bool, bool, Option<AssertId>)> = None;
+        let mut initial_diagnostics: Vec<(Message, MessageLevel)> = Vec::new();
         loop {
             // Like the resident reply, this describes the first round only, and
             // like the error count, only queries reported as errors: not
@@ -1299,6 +1311,7 @@ impl Verifier {
             round += 1;
             match result {
                 ValidityResult::Valid(usage_info) => {
+                    initial_first.get_or_insert((true, false, None));
                     if (is_check_valid && is_first_check && level == Some(MessageLevel::Error))
                         || is_singular
                     {
@@ -1327,9 +1340,13 @@ impl Verifier {
                     if !self.args.profile && !self.args.profile_all && !self.args.capture_profiles {
                         msg.push_str("; consider rerunning with --profile for more details");
                     }
+                    initial_first.get_or_insert((false, true, None));
                     if let Some(level) = level {
                         let raised = message(level, msg, &context.span);
                         self.raise_diagnostic(&context.fun, &raised, level, &None);
+                        if keep_initial {
+                            initial_diagnostics.push((raised.clone(), level));
+                        }
                         reporter.report(&raised.to_any());
                     }
                     // need to report that we need to rerun from this function (into spinoff)
@@ -1353,17 +1370,24 @@ impl Verifier {
                     if self.expand_flag {
                         invalidity = true;
                     }
+                    initial_first.get_or_insert((false, false, assert_id_opt.clone()));
                     if let Some(level) = level {
                         if let Some(error) = error {
                             // singular_invalid case
                             if let Some(raised) = error.downcast_ref::<MessageX>() {
                                 self.raise_diagnostic(&context.fun, raised, level, &assert_id_opt);
+                                if keep_initial {
+                                    initial_diagnostics.push((Arc::new(raised.clone()), level));
+                                }
                             }
                             reporter.report_as(&error, level);
                         } else {
                             // bitvector case
                             let raised = message(level, &context.desc, &context.span);
                             self.raise_diagnostic(&context.fun, &raised, level, &assert_id_opt);
+                            if keep_initial {
+                                initial_diagnostics.push((raised.clone(), level));
+                            }
                             reporter.report(&raised.to_any());
                         }
                     }
@@ -1386,11 +1410,15 @@ impl Verifier {
                         invalidity = true;
                     }
                     let error: Message = error.downcast().unwrap();
+                    initial_first.get_or_insert((false, false, assert_id_opt.clone()));
                     if let Some(level) = level {
                         // Recorded whether or not it is reported now: an
                         // expanded-error rerun reports a refined message, but
                         // this is the obligation that actually failed.
                         self.raise_diagnostic(&context.fun, &error, level, &assert_id_opt);
+                        if keep_initial {
+                            initial_diagnostics.push((error.clone(), level));
+                        }
                         if !self.expand_flag {
                             match &mut *diagnostics_to_report.borrow_mut() {
                                 Some(collected) => {
@@ -1467,7 +1495,21 @@ impl Verifier {
                 "{}: not all errors may have been reported; rerun with a higher value for --multiple-errors to find other potential errors in this function",
                 context.desc
             );
-            reporter.report(&note(&context.span, msg).to_any());
+            let raised = note(&context.span, msg);
+            if keep_initial {
+                initial_diagnostics.push((raised.clone(), MessageLevel::Note));
+            }
+            reporter.report(&raised.to_any());
+        }
+        if keep_initial {
+            let (valid, canceled, assert_id) = initial_first.unwrap_or((false, false, None));
+            self.resident_initial.push(crate::resident::InitialVerdict::new(
+                valid,
+                canceled,
+                assert_id.as_ref(),
+                initial_diagnostics.iter().map(|(message, level)| (&**message, *level)).collect(),
+                time0.elapsed(),
+            ));
         }
 
         if is_check_valid && !is_singular {
@@ -2392,6 +2434,16 @@ impl Verifier {
                                 &mut default_prover_failed_assert_ids,
                                 includes_function,
                             );
+                            // The verdicts of the queries just retained, which
+                            // a session's catalogue reports (`InitialVerdict`).
+                            let initial = std::mem::take(&mut self.resident_initial);
+                            if let Some(session) = spinoff_journal
+                                .as_mut()
+                                .or(resident.as_mut())
+                                .filter(|_| includes_function)
+                            {
+                                session.record_initial(initial);
+                            }
                             func_curr_smt_time +=
                                 query_air_context.get_time().1 - iter_curr_smt_time;
                             if let Some(func_curr_smt_rlimit_count) =

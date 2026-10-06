@@ -120,6 +120,52 @@ struct RetainedQuery {
     /// at, read from the same `QueryOp` the verifier reads. A recheck of a
     /// recommends query stays a warning.
     level: MessageLevel,
+    /// What the invocation's own check of this query answered, when it
+    /// checked it (see `InitialVerdict`).
+    initial: Option<InitialVerdict>,
+}
+
+/// What the invocation that retained a query answered when it checked it:
+/// its first round's verdict and failed assertion, the diagnostics it
+/// reported for the query (every round, as `--multiple-errors` asked), and
+/// the time it took. Verus reports verdicts per run, not per query, so
+/// without this a caller learns which queries failed only by checking every
+/// one again. A retain-only invocation checks nothing and records none.
+#[derive(Clone, Serialize)]
+pub(crate) struct InitialVerdict {
+    result: QueryResult,
+    assert_id: Option<Vec<u64>>,
+    diagnostics: Vec<SourceDiagnostic>,
+    elapsed_ms: u128,
+}
+
+impl InitialVerdict {
+    /// `canceled` for a check that ran out of its resource budget, `invalid`
+    /// for one that failed otherwise, else valid.
+    pub(crate) fn new(
+        valid: bool,
+        canceled: bool,
+        assert_id: Option<&air::ast::AssertId>,
+        diagnostics: Vec<(&MessageX, MessageLevel)>,
+        elapsed: std::time::Duration,
+    ) -> Self {
+        let result = if canceled {
+            QueryResult::ResourceLimit
+        } else if valid {
+            QueryResult::Valid
+        } else {
+            QueryResult::Invalid
+        };
+        InitialVerdict {
+            result,
+            assert_id: assert_id.map(|id| (**id).clone()),
+            diagnostics: diagnostics
+                .into_iter()
+                .map(|(message, level)| SourceDiagnostic::of(message, level))
+                .collect(),
+            elapsed_ms: elapsed.as_millis(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Serialize)]
@@ -500,6 +546,12 @@ struct QueryDescription {
     prover: &'static str,
     span: String,
     fingerprint: Fingerprint,
+    /// The items whose declarations the query reads (see
+    /// `relevance::fingerprints`), its own function among them.
+    reads: Vec<String>,
+    /// The invocation's own verdict on the query, when it checked it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    initial: Option<InitialVerdict>,
 }
 
 #[derive(Serialize)]
@@ -568,7 +620,7 @@ impl RetainedBucket {
         // print the whole base context once per query.
         let mut index = relevance::Index::new();
         for (solver, state) in states.iter().enumerate() {
-            let fingerprints = state.journal.fingerprints(&mut index);
+            let fingerprints = state.journal.fingerprints_and_reads(&mut index);
             for (local, query) in state.journal.queries.iter().enumerate() {
                 let function = fun_as_friendly_rust_name(&query.context.fun);
                 let repeat = repeats
@@ -593,7 +645,9 @@ impl RetainedBucket {
                         vir::def::ProverChoice::Singular => "singular",
                     },
                     span: query.context.span.as_string.clone(),
-                    fingerprint: fingerprints[local],
+                    fingerprint: fingerprints[local].0,
+                    reads: fingerprints[local].1.clone(),
+                    initial: query.initial.clone(),
                 });
                 addresses.push((solver, local));
             }
@@ -2192,7 +2246,7 @@ impl From<MessageLevel> for DiagnosticLevel {
     }
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 struct SourceDiagnostic {
     level: DiagnosticLevel,
     message: String,
@@ -2200,19 +2254,9 @@ struct SourceDiagnostic {
     labels: Vec<SourceLabel>,
 }
 
-#[derive(Serialize)]
-struct SourceLabel {
-    message: String,
-    span: String,
-}
-
-#[derive(Default)]
-struct QueryDiagnostics(RefCell<Vec<SourceDiagnostic>>);
-
-impl QueryDiagnostics {
-    fn record(&self, message: &ArcDynMessage, level: MessageLevel) {
-        let message = message.downcast_ref::<MessageX>().expect("VIR diagnostic message");
-        self.0.borrow_mut().push(SourceDiagnostic {
+impl SourceDiagnostic {
+    fn of(message: &MessageX, level: MessageLevel) -> Self {
+        SourceDiagnostic {
             level: level.into(),
             message: message.note.clone(),
             spans: message.spans.iter().map(|span| span.as_string.clone()).collect(),
@@ -2224,7 +2268,23 @@ impl QueryDiagnostics {
                     span: label.span.as_string.clone(),
                 })
                 .collect(),
-        });
+        }
+    }
+}
+
+#[derive(Clone, Serialize)]
+struct SourceLabel {
+    message: String,
+    span: String,
+}
+
+#[derive(Default)]
+struct QueryDiagnostics(RefCell<Vec<SourceDiagnostic>>);
+
+impl QueryDiagnostics {
+    fn record(&self, message: &ArcDynMessage, level: MessageLevel) {
+        let message = message.downcast_ref::<MessageX>().expect("VIR diagnostic message");
+        self.0.borrow_mut().push(SourceDiagnostic::of(message, level));
     }
 
     /// A diagnostic about the query as a whole rather than about one assertion
@@ -5255,6 +5315,7 @@ impl QueryJournal {
                     kind: QueryKind::from_op(op),
                     prover: commands.prover_choice,
                     level: op.message_level(),
+                    initial: None,
                 });
                 // The next declaration batch must start a scope: this query
                 // can ask to return to the prefix that ends here.
@@ -5264,9 +5325,29 @@ impl QueryJournal {
         Ok(())
     }
 
+    /// Attach the invocation's verdicts to the last `verdicts.len()` queries
+    /// recorded, in order: the check-valid commands of the batch
+    /// `record_query` retained last, which the verifier checks one by one.
+    pub(crate) fn record_initial(&mut self, verdicts: Vec<InitialVerdict>) {
+        let Some(first) = self.queries.len().checked_sub(verdicts.len()) else { return };
+        for (query, verdict) in self.queries[first..].iter_mut().zip(verdicts) {
+            query.initial = Some(verdict);
+        }
+    }
+
     /// Every retained query's fingerprint, in journal order, over the
     /// declarations each query reads of the ones below it (see `relevance`).
+    #[cfg(test)]
     fn fingerprints(&self, index: &mut relevance::Index) -> Vec<Fingerprint> {
+        relevance::fingerprints(self, index).into_iter().map(|(fingerprint, _)| fingerprint).collect()
+    }
+
+    /// Every retained query's fingerprint with the items it reads, in
+    /// journal order (see `relevance::fingerprints`).
+    fn fingerprints_and_reads(
+        &self,
+        index: &mut relevance::Index,
+    ) -> Vec<(Fingerprint, Vec<String>)> {
         relevance::fingerprints(self, index)
     }
 
