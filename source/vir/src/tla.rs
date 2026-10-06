@@ -505,10 +505,21 @@ struct Env {
     /// shadows a name (`let k = k + 1`) never inherits the domain it had.
     domains: HashMap<VarIdent, Dom>,
     /// Names a pattern bound to a field of a whole state (`let State { x,
-    /// .. } = post`): the role, the state variable, and the printed name
-    /// (the variable itself, `x'`), so `x == e` assigns it as `post.x == e`
-    /// does. An entry holds only while the name is still printed so.
-    field_binders: HashMap<VarIdent, (Role, String, String)>,
+    /// .. } = post`), so `x == e` assigns it as `post.x == e` does.
+    field_binders: HashMap<VarIdent, FieldBinder>,
+}
+
+/// A name a pattern bound to a field of a whole state (see
+/// [`Env::field_binders`]). It holds only while the name is still printed
+/// as `printed`.
+#[derive(Clone)]
+struct FieldBinder {
+    /// The role of the state the pattern is on.
+    role: Role,
+    /// The field's state variable.
+    var: String,
+    /// The name as printed: the variable, `x`, or `x'` on the post state.
+    printed: String,
 }
 
 impl Env {
@@ -1371,8 +1382,8 @@ impl Exporter {
     /// The state variable `v` names, when a pattern bound it to a field of
     /// the whole state in `role` (see [`Env::field_binders`]).
     fn state_field_name(&self, v: &VarIdent, env: &Env, role: Role) -> Option<String> {
-        let (r, var, printed) = env.field_binders.get(v)?;
-        (*r == role && env.names.get(v) == Some(printed)).then(|| var.clone())
+        let b = env.field_binders.get(v)?;
+        (b.role == role && env.names.get(v) == Some(&b.printed)).then(|| b.var.clone())
     }
 
     /// How `a = b` is printed and the variable it assigns at conjunct level.
@@ -2040,7 +2051,8 @@ impl Exporter {
     /// match here, but one may still test a variant (of an enum whose other
     /// variants are uninhabited): that condition is returned too, with the
     /// message of the `Assert` the block prints where it fails, and the
-    /// names are then defined under it, unless `init` reads the post state.
+    /// names are then defined under it, unless `init` reads the post state
+    /// or the `let` is in Init.
     fn let_pattern(
         &mut self,
         s: &Stmt,
@@ -2081,9 +2093,7 @@ impl Exporter {
         let (cond, bound) = self.pattern(&subject, pattern, env, domain, role);
         // A name bound from a value that reads the post state reads it too.
         let primed = before.place_reads_post(init);
-        let mut names = Vec::new();
-        pattern_names(pattern, &mut names);
-        for v in names {
+        for v in unique_pattern_names(pattern) {
             if primed {
                 env.primed.insert(v);
             } else {
@@ -2093,8 +2103,9 @@ impl Exporter {
         // Rust has checked that the pattern always matches, so the condition
         // only restates the value's type. On a value that reads the post
         // state it is left out: it would read a primed variable before the
-        // block assigns it, and TLC would stop there.
-        let guard = cond.filter(|_| !primed).map(|c| {
+        // block assigns it, and TLC would stop there. So in Init, which
+        // assigns the unprimed variables the condition would read.
+        let guard = cond.filter(|_| !primed && !self.in_init).map(|c| {
             let msg =
                 format!("tla-export: the let pattern at {} does not match", span_string(&s.span));
             (c, tla_string(&msg))
@@ -2131,9 +2142,11 @@ impl Exporter {
                 && matches!(arm.x.guard.x, ExprX::Const(Constant::Bool(true)))
                 && is_arbitrary(&arm.x.body)
             {
+                // The macro gives the arm the span of the whole state
+                // machine; the first arm's pattern is the user's own.
                 let msg = format!(
-                    "tla-export: arbitrary() (an unspecified value) evaluated at {}",
-                    span_string(&arm.x.body.span)
+                    "tla-export: arbitrary() (an unspecified value) evaluated where the pattern at {} does not match",
+                    span_string(&arms[0].x.pattern.span)
                 );
                 otherwise = Some(format!("Assert(FALSE, {})", tla_string(&msg)));
                 arm_assigned.push(self.state_vars.iter().cloned().collect());
@@ -2261,7 +2274,8 @@ impl Exporter {
                         };
                         if let Some(name) = name {
                             env.names.insert(name.clone(), printed.clone());
-                            env.field_binders.insert(name.clone(), (role, var, printed.clone()));
+                            let binder = FieldBinder { role, var, printed: printed.clone() };
+                            env.field_binders.insert(name.clone(), binder);
                         }
                         if let Some(sub) = sub {
                             let (c, l) = self.pattern(&printed, sub, env, None, None);
@@ -2351,17 +2365,12 @@ impl Exporter {
                 let (ca, la) = self.pattern(subject, a, &mut env_a, None, whole);
                 let mut env_b = env.clone();
                 let (cb, lb) = self.pattern(subject, b, &mut env_b, None, whole);
-                // An alternative that is itself an or-pattern lists each
-                // name once per alternative of its own.
-                let mut names = Vec::new();
-                pattern_names(a, &mut names);
-                let mut seen = HashSet::new();
-                names.retain(|v| seen.insert(v.clone()));
+                let names = unique_pattern_names(a);
                 // A name's value in an alternative: its LET's, or the state
                 // variable it names (see [`Env::field_binders`]).
                 let value = |e: &Env, lets: &[(String, String)], v: &VarIdent| {
                     let n = e.names.get(v)?;
-                    if e.field_binders.get(v).is_some_and(|(_, _, printed)| printed == n) {
+                    if e.field_binders.get(v).is_some_and(|b| b.printed == *n) {
                         return Some(n.clone());
                     }
                     lets.iter().find(|(m, _)| m == n).map(|(_, x)| x.clone())
@@ -2391,8 +2400,7 @@ impl Exporter {
                     // Both alternatives name the same state variable
                     // (`State { x, y: 0, .. } | State { x, y: 1, .. }`): so
                     // does the binding, which then assigns it.
-                    let binder =
-                        env_a.field_binders.get(&v).filter(|(_, _, printed)| *printed == xa);
+                    let binder = env_a.field_binders.get(&v).filter(|b| b.printed == xa);
                     if let Some(binder) = binder.filter(|_| xa == xb) {
                         env.names.insert(v.clone(), xa.clone());
                         env.field_binders.insert(v.clone(), binder.clone());
@@ -2429,17 +2437,11 @@ impl Exporter {
         p: &Pattern,
         env: &mut Env,
     ) -> (Option<String>, Vec<(String, String)>) {
-        let mut names = Vec::new();
-        pattern_names(p, &mut names);
         let mut lets = Vec::new();
-        let mut seen = HashSet::new();
-        for v in names {
-            // The alternatives of an or-pattern bind the same names.
-            if seen.insert(v.clone()) {
-                let n = self.bind_var(env, &v);
-                env.primed.remove(&v);
-                lets.push((n, r.clone()));
-            }
+        for v in unique_pattern_names(p) {
+            let n = self.bind_var(env, &v);
+            env.primed.remove(&v);
+            lets.push((n, r.clone()));
         }
         (Some(r), lets)
     }
@@ -5086,6 +5088,16 @@ fn pattern_could_match(p: &Pattern, variant: &Ident) -> bool {
         PatternX::MutRef(inner) | PatternX::ImmutRef(inner) => pattern_could_match(inner, variant),
         PatternX::Wildcard(_) | PatternX::Var(_) | PatternX::Expr(_) | PatternX::Range(..) => true,
     }
+}
+
+/// The names a pattern binds, each once: an or-pattern's alternatives bind
+/// the same names, so [`pattern_names`] lists each once per alternative.
+fn unique_pattern_names(p: &Pattern) -> Vec<VarIdent> {
+    let mut names = Vec::new();
+    pattern_names(p, &mut names);
+    let mut seen = HashSet::new();
+    names.retain(|v| seen.insert(v.clone()));
+    names
 }
 
 /// The names a pattern binds, pushed onto `out`.

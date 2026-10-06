@@ -230,8 +230,9 @@ to its state variable (`x`, `n` in `x: n @ ..`, and a name both alternatives
 of an or-pattern bind to the same field), so `x == e` assigns `x'` as `post.x
 == e` does, and in Init assigns `x`. A `let` whose pattern tests a variant
 (`let (E::A(n) | E::B(n)) = e`, which always matches) puts the rest of the
-block under that condition, unless the value reads the post state, where the
-condition would read a variable before the step assigns it. VerusSync's
+block under that condition, unless the value reads the post state or the
+`let` is in Init, where the condition would read a variable before the step
+or Init assigns it. VerusSync's
 `require let P = e` reaches the export as its macro lowers it: the guard
 `match e { P => true, _ => false }`, then a tuple `let` of P's names from
 `match e { P => (names), _ => arbitrary() }`, so the guard tests the variant
