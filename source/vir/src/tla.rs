@@ -961,6 +961,9 @@ fn commutative_fold_body(acc: &VarIdent, body: &Expr) -> bool {
                 ExprX::Binary(BinaryOp::Arith(ArithOp::Add(..)), a, b) => nonneg(a) && nonneg(b),
                 _ => false,
             };
+            // Verus drops a cast its operand's type already fits (`(acc *
+            // 2) as nat` reaches here uncast), so the identity case is only
+            // a safeguard.
             if !(int_typ_within(&inner.typ, range) || monotone) {
                 return false;
             }
@@ -7542,7 +7545,7 @@ impl Exporter {
                     }
                     // A multiset is logged as a map, from its elements to
                     // their counts; an element logged with count 0 is not
-                    // held (see [`vstd_op`]).
+                    // held (see [`vstd_op`]), and no count is negative.
                     ("vstd::map::Map", 2) | ("vstd::multiset::Multiset", 1) => {
                         // A multiset's one type argument is its elements'.
                         let counted = args.len() == 1;
@@ -7556,12 +7559,22 @@ impl Exporter {
                         } else {
                             format!("1..Len({j})")
                         };
+                        // Every count logged is one a multiset has, and one
+                        // logged as 0 is of an element the model does not
+                        // hold: `[[1, 1], [1, 0]]` and `[[2, -4]]` stop TLC.
+                        let unheld = if counted {
+                            format!(
+                                "(\\A {p} \\in 1..Len({j}) : {dv}({j}[{p}][2]) >= 0 /\\ ({dv}({j}[{p}][2]) = 0 => {dk}({j}[{p}][1]) \\notin DOMAIN {v})) /\\ "
+                            )
+                        } else {
+                            String::new()
+                        };
                         (
                             format!(
                                 "[{k} \\in {{{dk}({j}[{p}][1]) : {p} \\in {held}}} |-> {dv}({j}[CHOOSE {p} \\in {held} : {dk}({j}[{p}][1]) = {k}][2])]"
                             ),
                             format!(
-                                "DOMAIN {v} = {{{dk}({j}[{p}][1]) : {p} \\in {held}}} /\\ \\A {p} \\in {held} : {ov}({v}[{dk}({j}[{p}][1])], {j}[{p}][2])"
+                                "{unheld}DOMAIN {v} = {{{dk}({j}[{p}][1]) : {p} \\in {held}}} /\\ \\A {p} \\in {held} : {ov}({v}[{dk}({j}[{p}][1])], {j}[{p}][2])"
                             ),
                         )
                     }

@@ -252,11 +252,16 @@ f(k)]`, `IMap::new(|k| p, f)` the same over `p`'s comprehension,
 `m2 @@ m1`. A `Multiset` is the function from the elements it holds (a
 count above 0) to their counts, so `=` is its equality: `count` is the
 value or 0, `insert`, `add` and `singleton` add counts, `remove` and `sub`
-subtract them and drop what reaches 0, `len` sums the counts with a
-RECURSIVE operator, `contains` is `\in DOMAIN`, `to_multiset` counts a
-sequence's positions holding each element, TypeOK checks every count is
-above 0, and a trace logs a multiset as a map (an element logged with count
-0 is not held). `Set::choose` and `Multiset::choose` are refused, as
+subtract them and drop what reaches 0, `update` sets one count (dropping
+the element at 0), `from_map` keeps a map's positive counts, `from_set`
+counts each element once, `filter` keeps the counts of the elements it
+passes, `subset_of` (`<=`) compares counts, `len` sums the counts with a
+RECURSIVE operator, `contains` (`has`) is `\in DOMAIN`, `dom` is the
+`DOMAIN` and `is_empty` its emptiness, `to_multiset` counts a sequence's
+positions holding each element, TypeOK checks every count is above 0, and
+a trace logs a multiset as a map (an element logged with count 0 is not
+held, and a negative count, or a count of 0 for an element the model
+holds, stops the trace). `Set::choose` and `Multiset::choose` are refused, as
 `choose` is: TLC's CHOOSE is one fixed value, where Verus's may be any
 value satisfying the predicate.
 
@@ -422,12 +427,12 @@ name and its record label) and lays out every datatype the state holds
 field's type as a tree over `seq`, `set` (also an `ISet`), `map` (also an
 `IMap`), `multiset`, `tuple`, `int`, `bool`, `char` and named datatypes,
 so that a TLC state `[x |-> 4, y |-> 0]` renders as `State { x: 4, y: 0 }`
-by table, not by guess. When `next` is `exists|step: T| body` over a datatype, `steps`
-gives the binder, its printed domain and body, and, when the body calls a
-function matching on the step, each arm's transition with the step field
-passed for each parameter: evaluating `{step \in domain : body}` over a
-pair of states names the step TLC took (TLC itself labels every step
-`Next`).
+by table, not by guess. When `next` is `exists|step: T| body` over a
+datatype, `steps` gives the binder, its printed domain and body, and, when
+the body calls a function matching on the step, each arm's transition with
+the step field passed for each parameter: evaluating `{step \in domain :
+body}` over a pair of states names the step TLC took (TLC itself labels
+every step `Next`).
 
 `-V tla-export-expr=crate::m::f,crate::m::g` exports the named spec fns (each
 over the state, or a pre and a post state) after the model, in the model's

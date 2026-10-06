@@ -5534,12 +5534,36 @@ pub open spec fn small(s: State) -> bool {
 #[test]
 fn tla_export_set_fold_is_a_recursive_operator() {
     // TLC folds in CHOOSE's order, which agrees with every other for the
-    // commutative `f` the export accepts: `acc op g(x)` for a commutative
-    // and associative `op`, here `+`, `&&` and `insert`.
+    // commutative `f` the export accepts: `acc op g(x)` or `g(x) op acc` for
+    // a commutative and associative `op`, here each of `+`, `*`, `&&`, `||`,
+    // `insert`, `union`, `intersect` and multiset `add` and `insert`, and a
+    // cast that is the identity (`(acc * 2) as nat`, which Verus drops, the
+    // product being a `nat`). Each expected value differs from the seed's,
+    // so a wrong lowering of the operator fails TLC.
     let ex = check_collections(
         SAME,
         r#"
 pub open spec fn sum(s: State) -> bool { s.t.fold(0int, |acc: int, x: int| acc + x) == s.n * (s.n - 1) / 2 }
+pub open spec fn right(s: State) -> bool { s.t.fold(0int, |acc: int, x: int| x + acc) == s.n * (s.n - 1) / 2 }
+pub open spec fn product(s: State) -> bool {
+    s.t.fold(1int, |acc: int, x: int| acc * (x + 1))
+        == (if s.n <= 1 { 1int } else if s.n == 2 { 2 } else if s.n == 3 { 6 } else { 24 })
+}
+pub open spec fn doubling(s: State) -> bool {
+    s.t.fold(1nat, |acc: nat, x: int| (acc * 2) as nat)
+        == (if s.n == 0 { 1nat } else if s.n == 1 { 2 } else if s.n == 2 { 4 } else if s.n == 3 { 8 } else { 16 })
+}
+pub open spec fn any(s: State) -> bool { s.t.fold(false, |acc: bool, x: int| x == 2 || acc) == (s.n > 2) }
+pub open spec fn unioned(s: State) -> bool {
+    s.t.fold(Set::<int>::empty(), |acc: Set<int>, x: int| set![x + 10].union(acc)) =~= s.t.map(|x: int| x + 10)
+}
+pub open spec fn intersected(s: State) -> bool {
+    s.t.fold(s.t.insert(9), |acc: Set<int>, x: int| acc.intersect(s.t.insert(9).remove(x))) =~= set![9int]
+}
+pub open spec fn bagged(s: State) -> bool {
+    &&& s.t.fold(Multiset::<int>::empty(), |acc: Multiset<int>, x: int| acc.add(Multiset::singleton(x).insert(x))).len() == 2 * s.n
+    &&& s.t.fold(Multiset::<int>::empty(), |acc: Multiset<int>, x: int| acc.insert(x)) =~= s.s.to_multiset()
+}
 pub open spec fn seeded(s: State) -> bool { s.t.fold(10int, |acc: int, x: int| acc + x) == 10 + s.n * (s.n - 1) / 2 }
 pub open spec fn count(s: State) -> bool { s.t.fold(0nat, |acc: nat, x: int| acc + 1) == s.n }
 pub open spec fn all(s: State) -> bool { s.t.fold(true, |acc: bool, x: int| acc && x < 4) }
@@ -5774,6 +5798,9 @@ pub open spec fn ordered(s: State) -> bool {
 pub open spec fn clipped(s: State) -> bool {
     set![-1int, 1].fold(0nat, |acc: nat, x: int| (acc + x) as nat) == 0
 }
+pub open spec fn mixed(s: State) -> bool {
+    s.t.fold(0int, |acc: int, x: int| acc + (acc - x)) == -4
+}
 pub open spec fn finite(s: State) -> bool { ISet::new(|x: int| 0 <= x < 2).finite() }
 pub open spec fn picked_count(s: State) -> bool { Multiset::singleton(s.n).choose() == s.n }
 pub open spec fn small(s: State) -> bool { s.n <= 2 }
@@ -5786,9 +5813,11 @@ fn tla_export_refuses_set_choose_and_a_function_parameter() {
     // TLC's CHOOSE is one fixed value, and Verus's choice is any value
     // satisfying the predicate, so TLC's verdict would hold for one choice
     // only. So is a `Set::fold` of a function not seen to be commutative
-    // (`push`, and a checked cast that `-1` leaves in one order and not in
-    // the other): Verus's fold is a choice among the orders, and TLC would
-    // hold `ordered` and `clipped` for the one it takes. `ISet::finite` is
+    // (`push`, a checked cast that `-1` leaves in one order and not in the
+    // other, and `acc + (acc - x)`, whose right operand reads `acc`: over
+    // `{1, 2}` it is -4 in one order and -5 in the other): Verus's fold is
+    // a choice among the orders, and TLC would hold `ordered`, `clipped`
+    // and `mixed` for the one it takes. `ISet::finite` is
     // refused, as every set TLC builds is finite. A fold or `Set::new`
     // given a `spec_fn` parameter has no closure to apply (`total` and
     // `members` are operators of their own); every refusal names its
@@ -5807,7 +5836,7 @@ fn tla_export_refuses_set_choose_and_a_function_parameter() {
         ("choose (TLC cannot evaluate it)", 2),
         ("vstd operation given a function that does not reduce to a closure", 1),
         ("vstd operation given a predicate that does not reduce to a closure", 1),
-        ("Set::fold of a function not seen to be commutative", 2),
+        ("Set::fold of a function not seen to be commutative", 3),
         ("ISet::finite (the export builds only finite sets)", 1),
     ] {
         let at = at(what);
@@ -5850,9 +5879,15 @@ pub open spec fn next(pre: State, post: State) -> bool { exists|k: u8| t_add(pre
     std::fs::write(&log, lines.join("\n") + "\n").unwrap();
     let (depth, out) = follow(&jar, &spec, &cfg, &log, "");
     assert_eq!(depth, 3, "{out}");
-    // A count the model does not reach, or an element it does not hold,
-    // stops the log at the step observing it.
-    for bad in [r#""b": [[1, 3]]"#, r#""b": [[1, 2], [0, 1]]"#] {
+    // A count the model does not reach, an element it does not hold, a
+    // negative count, or a count of 0 for an element it holds stops the log
+    // at the step observing it.
+    for bad in [
+        r#""b": [[1, 3]]"#,
+        r#""b": [[1, 2], [0, 1]]"#,
+        r#""b": [[1, 2], [2, -4]]"#,
+        r#""b": [[1, 2], [1, 0]]"#,
+    ] {
         let line = lines[2].replace(r#""b": [[1, 2]]"#, bad);
         std::fs::write(&log, format!("{}\n{}\n{line}\n", lines[0], lines[1])).unwrap();
         let (depth, out) = follow(&jar, &spec, &cfg, &log, "");
