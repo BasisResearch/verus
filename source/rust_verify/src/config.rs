@@ -149,6 +149,12 @@ pub struct ArgsX {
     /// `-V tla-export-expr=<fn>,...`: also export these spec fns over the
     /// state as operators, reported in the `.tla.json` beside the model.
     pub tla_export_exprs: Vec<String>,
+    /// `-V tla-export-constant=<param>,...`: parameters of `next` (that
+    /// `init` takes too) to make constants, whatever the rules guess.
+    pub tla_export_constants: Vec<String>,
+    /// `-V tla-export-label=<param>,...`: parameters of `next` to quantify
+    /// per step, whatever the rules guess.
+    pub tla_export_labels: Vec<String>,
     /// Record cvc5's per-quantifier instantiation pressure for every query.
     pub inst_pressure: bool,
     pub reach: Option<String>,
@@ -209,6 +215,8 @@ impl ArgsX {
             matching_loops: Default::default(),
             tla_export: None,
             tla_export_exprs: Vec::new(),
+            tla_export_constants: Vec::new(),
+            tla_export_labels: Vec::new(),
             matching_loop_rounds: Default::default(),
             inst_pressure: Default::default(),
             reach: Default::default(),
@@ -469,6 +477,8 @@ pub fn parse_args_with_imports(
     const EXTENDED_DIFFICULTY: &str = "difficulty";
     const EXTENDED_TLA_EXPORT: &str = "tla-export";
     const EXTENDED_TLA_EXPORT_EXPR: &str = "tla-export-expr";
+    const EXTENDED_TLA_EXPORT_CONSTANT: &str = "tla-export-constant";
+    const EXTENDED_TLA_EXPORT_LABEL: &str = "tla-export-label";
     const EXTENDED_KEYS: &[(&str, &str)] = &[
         (
             EXTENDED_INST_PRESSURE,
@@ -513,6 +523,14 @@ pub fn parse_args_with_imports(
         (
             EXTENDED_TLA_EXPORT_EXPR,
             "With -V tla-export, also export the named spec fns (-V tla-export-expr=crate::m::f,crate::m::g), each over the state or a pre/post pair, as operators in the model's names: the .tla.json lists each with the definitions the model's .tla lacks, its holes and refusals, and the layout of its result type. The .tla itself is unchanged",
+        ),
+        (
+            EXTENDED_TLA_EXPORT_CONSTANT,
+            "With -V tla-export, make these parameters of next constants (-V tla-export-constant=c), each one init also takes by name and type: CONSTANTs the .cfg gives, fixed for the whole behaviour. For a parameter the export reads as a step's label because it is or holds a choice among variants (an enum or Option field), when it is the model's constants",
+        ),
+        (
+            EXTENDED_TLA_EXPORT_LABEL,
+            "With -V tla-export, make these parameters of next labels (-V tla-export-label=n), quantified per step in Next, and init's of the same name quantified once in Init. For a scalar init and next share by name, which the export reads as a constant, when next chooses it per step",
         ),
         (EXTENDED_ALLOW_INLINE_AIR, "Allow the POTENTIALLY UNSOUND use of inline_air_stmt"),
         (
@@ -764,6 +782,40 @@ pub fn parse_args_with_imports(
     // lemmas. `-V cvc5` stays accepted as a no-op.
     let solver = if internal_test_mode || is_vstd { SmtSolver::Z3 } else { SmtSolver::Cvc5 };
 
+    // `-V tla-export-constant=` and `-V tla-export-label=`: parameter names,
+    // beside -V tla-export, never one name in both.
+    let tla_export_params = |key: &str| -> Vec<String> {
+        match extended.get(key) {
+            Some(Some(names)) if !names.is_empty() => {
+                if !extended.contains_key(EXTENDED_TLA_EXPORT) {
+                    error(format!(
+                        "-V {key} settles a parameter of a model's next: it needs -V {EXTENDED_TLA_EXPORT}"
+                    ));
+                }
+                let names: Vec<String> = names
+                    .split(',')
+                    .map(|n| n.trim().to_string())
+                    .filter(|n| !n.is_empty())
+                    .collect();
+                let other = if key == EXTENDED_TLA_EXPORT_CONSTANT {
+                    EXTENDED_TLA_EXPORT_LABEL
+                } else {
+                    EXTENDED_TLA_EXPORT_CONSTANT
+                };
+                if let Some(Some(others)) = extended.get(other) {
+                    if let Some(n) =
+                        names.iter().find(|n| others.split(',').any(|o| o.trim() == *n))
+                    {
+                        error(format!("-V {key} and -V {other} both name `{n}`"));
+                    }
+                }
+                names
+            }
+            Some(_) => error(format!("-V {key} needs parameter names: -V {key}=c,lbl")),
+            None => Vec::new(),
+        }
+    };
+
     let args = ArgsX {
         verify_root: matches.opt_present(OPT_VERIFY_ROOT),
         export: matches.opt_str(OPT_EXPORT),
@@ -981,6 +1033,8 @@ pub fn parse_args_with_imports(
             )),
             None => Vec::new(),
         },
+        tla_export_constants: tla_export_params(EXTENDED_TLA_EXPORT_CONSTANT),
+        tla_export_labels: tla_export_params(EXTENDED_TLA_EXPORT_LABEL),
         matching_loop_rounds: match extended.get(EXTENDED_MATCHING_LOOPS) {
             // zero rounds would instantiate nothing and fail every quantified check
             Some(Some(rounds)) => Some(match rounds.parse::<u32>() {

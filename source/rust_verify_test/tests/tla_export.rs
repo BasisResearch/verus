@@ -56,10 +56,15 @@ fn export_with(entry: &Path, module: &str, extra: &[&str]) -> Exported {
 
 /// Write `code` (with the usual prelude) to a file and export `module`.
 fn export_code(code: &str, module: &str) -> Exported {
+    export_code_with(code, module, &[])
+}
+
+/// [`export_code`], with further options for Verus.
+fn export_code_with(code: &str, module: &str, extra: &[&str]) -> Exported {
     let src = TempDir::new().expect("temp dir");
     let entry = src.path().join("test.rs");
     std::fs::write(&entry, format!("{}\n{}\n{}\n", FEATURE_PRELUDE, USE_PRELUDE, code)).unwrap();
-    export(&entry, module)
+    export_with(&entry, module, extra)
 }
 
 fn fixture(name: &str) -> PathBuf {
@@ -5668,12 +5673,19 @@ fn tla_export_explores_a_splinter_style_label() {
 /// Export `code` with `-V tla-export=<arg>`, expecting it to fail: its
 /// stderr.
 fn export_fails(code: &str, arg: &str) -> String {
+    export_fails_with(code, arg, &[])
+}
+
+/// [`export_fails`], with further options for Verus.
+fn export_fails_with(code: &str, arg: &str, extra: &[&str]) -> String {
     let src = TempDir::new().expect("temp dir");
     let entry = src.path().join("test.rs");
     std::fs::write(&entry, format!("{}\n{}\n{}\n", FEATURE_PRELUDE, USE_PRELUDE, code)).unwrap();
     let log = format!("--log-dir {}", src.path().join("log").display());
     let export = format!("-V tla-export={arg}");
-    let output = run_verus(&[&export, "--no-verify", &log], src.path(), &entry, true, true);
+    let mut options = vec![export.as_str(), "--no-verify", log.as_str()];
+    options.extend_from_slice(extra);
+    let output = run_verus(&options, src.path(), &entry, true, true);
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
     assert!(!output.status.success(), "{}", stderr);
     stderr
@@ -6118,12 +6130,32 @@ fn tla_export_gives_a_scalar_constant_by_name() {
         reason.1
     );
     assert!(ex.stderr.contains("NOT CHECKED"), "{}", ex.stderr);
-    // A scalar constant is told by its name alone: warned of.
+    // A scalar constant is told by its name alone: warned of, on the
+    // summary line and atop the .tla, with the option that settles it.
     assert!(
-        ex.stderr.contains("tla-export: warning: init and next share n by name alone; if next chooses it per step, the CONSTANT drops behaviours\n"),
+        ex.stderr.contains("tla-export: warning: init and next share n by name alone; if next chooses it per step, the CONSTANT drops behaviours (-V tla-export-label=n quantifies it per step)\n"),
         "{}",
         ex.stderr
     );
+    assert!(
+        ex.tla.contains("next's n (a constant told by its name alone: CONSTANTs the .cfg gives; see the WARNING below)"),
+        "{}",
+        ex.tla
+    );
+    assert!(ex.tla.contains("\\* WARNING: init and next share n by name alone;"), "{}", ex.tla);
+    // Named a label, it is quantified per step (init's once in Init), with
+    // no warning, and `small(s, n)` is then a guard over it.
+    let label = export_code_with(SCALAR_CONSTANT, "test_crate", &["-V tla-export-label=n"]);
+    assert_eq!(
+        parameters(&label.report),
+        [
+            ("next".into(), "n".into(), "label".into()),
+            ("init".into(), "n".into(), "init_label".into()),
+        ]
+    );
+    assert!(!label.stderr.contains("warning"), "{}", label.stderr);
+    assert!(!label.tla.contains("Const_n"), "{}", label.tla);
+    assert!(label.tla.contains("NOT CHECKED"), "{}", label.tla);
     assert!(
         ex.report["parameters"][0]["why"]
             .as_str()
@@ -6727,4 +6759,287 @@ fn tla_export_quantifies_an_io_trace() {
     .unwrap();
     let out = tlc_output(&jar, &mc, &format!("{}CONSTANTS\n  Dom_Seq_Ev <- MC_ios\n", ex.cfg));
     assert!(out.contains("Assumption") && out.contains("is false"), "{}", out);
+}
+
+/// A constants struct holding an `Option` that init and next both take is
+/// read as a step's label: init's and next's `c` are chosen independently,
+/// next's anew each step, so TLC finds a violation of `small` that the model
+/// with one `c` does not have (init caps `c.cap` at 3). That is warned of,
+/// and `-V tla-export-constant=c` makes it the constant it is.
+const CHOICE_IN_CONSTANTS: &str = r#"
+use vstd::prelude::*;
+verus! {
+pub struct C { pub cap: u8, pub mode: Option<bool> }
+
+pub struct State { pub x: u8 }
+
+pub open spec fn init(s: State, c: C) -> bool { s.x == 0 && c.cap <= 3 }
+
+pub open spec fn next(pre: State, post: State, c: C) -> bool {
+    pre.x < c.cap && post.x == pre.x + 1
+}
+
+pub open spec fn within(s: State, c: C) -> bool { s.x <= c.cap }
+
+pub open spec fn small(s: State) -> bool { s.x <= 3 }
+}
+"#;
+
+#[test]
+fn tla_export_warns_of_a_constants_struct_read_as_a_label() {
+    let ex = export_code(CHOICE_IN_CONSTANTS, "test_crate");
+    assert_eq!(
+        parameters(&ex.report),
+        [
+            ("next".into(), "c".into(), "label".into()),
+            ("init".into(), "c".into(), "init_label".into()),
+        ]
+    );
+    let warning = "init and next both take c, but it is or holds a choice among variants, so it is a label: init's and next's are chosen independently, next's anew each step; if it is the model's constants, a violation may be spurious and the predicates over it are not checked (-V tla-export-constant=c makes it one)";
+    assert!(ex.stderr.contains(&format!("tla-export: warning: {warning}\n")), "{}", ex.stderr);
+    assert!(ex.tla.contains(&format!("\\* WARNING: {warning}.\n")), "{}", ex.tla);
+    assert!(ex.tla.contains("NOT CHECKED (over a value of the type of next's label"), "{}", ex.tla);
+    assert_eq!(names(&ex.report["invariants"]), ["small"]);
+    // Named a constant, it is one: no warning, and `within` is checked.
+    let fixed = export_code_with(CHOICE_IN_CONSTANTS, "test_crate", &["-V tla-export-constant=c"]);
+    assert_eq!(
+        parameters(&fixed.report),
+        [
+            ("next".into(), "c".into(), "constant".into()),
+            ("init".into(), "c".into(), "constant".into()),
+        ]
+    );
+    assert!(!fixed.stderr.contains("warning"), "{}", fixed.stderr);
+    assert!(!fixed.tla.contains("NOT CHECKED"), "{}", fixed.tla);
+    assert_eq!(names(&fixed.report["invariants"]), ["within", "small"]);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    // As a label: c.cap up to 255 in every step, past init's 3 (TLC stops
+    // at the first violation).
+    let out = tlc_output_with(&jar, &ex.spec(), &ex.cfg, &["-deadlock"]);
+    assert!(out.contains("Error: Invariant small is violated"), "{}", out);
+    // As the constant, with cap 3: x in 0..3, both invariants hold.
+    sany(&jar, &fixed.spec());
+    let mc = fixed.spec().with_file_name("MC.tla");
+    std::fs::write(
+        &mc,
+        format!(
+            "---- MODULE MC ----\nEXTENDS {}\nMC_mode == [tag |-> \"None\"]\n====\n",
+            fixed.module
+        ),
+    )
+    .unwrap();
+    let cfg = format!("{}CONSTANTS\n  Const_c_cap = 3\n  Const_c_mode <- MC_mode\n", fixed.cfg);
+    let run = tlc(&jar, &mc, &cfg);
+    assert_eq!(run.violated, Vec::<String>::new());
+    assert_eq!(run.distinct, 4, "{run:?}");
+}
+
+#[test]
+fn tla_export_refuses_a_parameter_option_it_cannot_follow() {
+    // A constant init does not take: nothing fixes it for the behaviour.
+    let stderr =
+        export_fails_with(CHOICE_IN_CONSTANTS, "test_crate", &["-V tla-export-constant=s"]);
+    assert!(
+        stderr.contains("-V tla-export-constant=s: `test_crate::next` (")
+            && stderr.contains("takes no parameter `s` beside the states (it takes `c`)"),
+        "{}",
+        stderr
+    );
+    let stderr = export_fails_with(HAND_GUARD, "test_crate", &["-V tla-export-constant=lbl"]);
+    assert!(
+        stderr.contains("'s `lbl: Lbl` is not a value `init` takes too (no parameter of `init` has its name and type), so nothing fixes it for the behaviour"),
+        "{}",
+        stderr
+    );
+    let stderr = export_fails_with(HAND_GUARD, "test_crate", &["-V tla-export-label=step"]);
+    assert!(stderr.contains("takes no parameter `step` beside the states"), "{}", stderr);
+}
+
+/// A `next` of two parameters of another datatype (`Lbl::next(self,
+/// other)`) is a helper: no `init` takes its datatype, so it does not beat
+/// the model's `next(pre, post, c, lbl)` for having two parameters.
+const NEXT_OF_ANOTHER_DATATYPE: &str = r#"
+use vstd::prelude::*;
+verus! {
+pub struct State { pub x: u8 }
+
+pub struct C { pub cap: u8 }
+
+pub enum Lbl { Inc, Dec }
+
+impl Lbl {
+    pub open spec fn next(self, other: Lbl) -> bool { true }
+}
+
+pub open spec fn init(s: State, c: C) -> bool { s.x == 0 }
+
+pub open spec fn next(pre: State, post: State, c: C, lbl: Lbl) -> bool {
+    match lbl {
+        Lbl::Inc => pre.x < c.cap && post.x == pre.x + 1,
+        Lbl::Dec => pre.x > 0 && post.x == pre.x - 1,
+    }
+}
+
+pub open spec fn within(s: State, c: C) -> bool { s.x <= c.cap }
+}
+"#;
+
+#[test]
+fn tla_export_skips_a_next_of_another_datatype() {
+    let ex = export_code(NEXT_OF_ANOTHER_DATATYPE, "test_crate");
+    assert_eq!(ex.report["next"], "next_closed");
+    assert_eq!(
+        parameters(&ex.report),
+        [
+            ("next".into(), "c".into(), "constant".into()),
+            ("next".into(), "lbl".into(), "label".into()),
+            ("init".into(), "c".into(), "constant".into()),
+        ]
+    );
+    assert_eq!(names(&ex.report["invariants"]), ["within"]);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let run = tlc(&jar, &ex.spec(), &format!("{}CONSTANTS Const_c_cap = 2\n", ex.cfg));
+    assert_eq!(run.violated, Vec::<String>::new());
+    assert_eq!(run.distinct, 3, "{run:?}");
+}
+
+/// No `init` taking the state: the refusal names the shape it looked for.
+#[test]
+fn tla_export_says_which_init_it_looked_for() {
+    let stderr = export_fails(
+        r#"
+use vstd::prelude::*;
+verus! {
+pub struct State { pub x: u8 }
+pub struct C { pub cap: u8 }
+pub open spec fn init(c: C) -> bool { c.cap > 0 }
+pub open spec fn next(pre: State, post: State, c: C) -> bool { post.x == pre.x }
+}
+"#,
+        "test_crate",
+    );
+    assert!(
+        stderr.contains("found `next` in `test_crate` but no `init` beside it returning bool with one parameter of the state type `test_crate::State` (and maybe constants or init labels beside it)"),
+        "{}",
+        stderr
+    );
+}
+
+/// By its type alone, a constant goes to one parameter of a predicate:
+/// `rel(s, a: C, b: C)` is listed as not checked, not checked as `rel(s,
+/// c, c)`; `within(s, k: C)` still gets the constant.
+const ONE_CONSTANT_TWO_PARAMETERS: &str = r#"
+use vstd::prelude::*;
+verus! {
+pub struct State { pub x: u8 }
+
+pub struct C { pub cap: u8 }
+
+pub open spec fn init(c: C, s: State) -> bool { s.x == 0 }
+
+pub open spec fn next(c: C, pre: State, post: State) -> bool {
+    pre.x < c.cap && post.x == pre.x + 1
+}
+
+pub open spec fn rel(s: State, a: C, b: C) -> bool { a.cap == b.cap }
+
+pub open spec fn within(s: State, k: C) -> bool { s.x <= k.cap }
+}
+"#;
+
+#[test]
+fn tla_export_gives_a_constant_by_type_to_one_parameter() {
+    let ex = export_code(ONE_CONSTANT_TWO_PARAMETERS, "test_crate");
+    assert_eq!(names(&ex.report["invariants"]), ["within"]);
+    let reason = ex.report["candidates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["function"] == "test_crate::rel")
+        .map(|c| (c["included"].as_bool().unwrap(), c["reason"].as_str().unwrap().to_string()))
+        .unwrap();
+    assert!(!reason.0);
+    assert!(
+        reason.1.contains("the constant `c` is the only `C`, but by its type alone a constant is given to one parameter only, and it would go to `a` and another"),
+        "{}",
+        reason.1
+    );
+    assert!(
+        ex.tla.contains("NOT CHECKED (over the state and a value that is not a constant): rel"),
+        "{}",
+        ex.tla
+    );
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+}
+
+/// `init` takes one each of two datatypes `next` takes twice, but its `c`
+/// shares its name with one of next's: that is the constant, so the other
+/// datatype is the state, and next's `d` a label.
+const STATE_SETTLED_BY_NAME: &str = r#"
+use vstd::prelude::*;
+verus! {
+pub struct State { pub x: u8 }
+
+pub struct Cfg { pub v: u8 }
+
+pub open spec fn init(c: Cfg, s: State) -> bool { s.x == 0 }
+
+pub open spec fn next(c: Cfg, pre: State, post: State, d: Cfg) -> bool {
+    d.v <= c.v && post.x == d.v
+}
+}
+"#;
+
+#[test]
+fn tla_export_takes_the_state_init_does_not_share_by_name() {
+    let ex = export_code(STATE_SETTLED_BY_NAME, "test_crate");
+    assert_eq!(ex.report["state_type"], "test_crate::State");
+    assert_eq!(
+        parameters(&ex.report),
+        [
+            ("next".into(), "c".into(), "constant".into()),
+            ("next".into(), "d".into(), "label".into()),
+            ("init".into(), "c".into(), "constant".into()),
+        ]
+    );
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    // x in 0..2: d.v up to the constant's 2, chosen per step.
+    let run = tlc(&jar, &ex.spec(), &format!("{}CONSTANTS Const_c_v = 2\n", ex.cfg));
+    assert_eq!(run.distinct, 3, "{run:?}");
+}
+
+/// init's `by: nat` beside next's `by: u8`: two values, and each reason says
+/// the other is of another type.
+#[test]
+fn tla_export_says_a_namesake_has_another_type() {
+    let ex = export_code(
+        r#"
+use vstd::prelude::*;
+verus! {
+pub struct State { pub x: nat }
+pub open spec fn init(s: State, by: nat) -> bool { s.x == by }
+pub open spec fn next(pre: State, post: State, by: u8) -> bool { by <= 2 && post.x == pre.x + by }
+}
+"#,
+        "test_crate",
+    );
+    assert_eq!(
+        parameters(&ex.report),
+        [
+            ("next".into(), "by".into(), "label".into()),
+            ("init".into(), "by".into(), "init_label".into()),
+        ]
+    );
+    let why = |i: usize| ex.report["parameters"][i]["why"].as_str().unwrap().to_string();
+    assert!(
+        why(0).contains("init takes no parameter of its name and type")
+            && why(0).contains("(init's `by` is a `nat`, another type: a value of its own)"),
+        "{}",
+        why(0)
+    );
+    assert!(why(1).contains("next's parameter of its name is a `u8`, another type"), "{}", why(1));
 }

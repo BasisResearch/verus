@@ -899,7 +899,11 @@ impl Verifier {
     /// spec `<State>_tla_trace.tla` with its `.cfg`), since TLC only loads a
     /// module from a file of the same name.
     fn export_tla(&mut self, krate: &Krate, arg: &str) -> Result<(), VirErr> {
-        let export = vir::tla::export_module(krate, arg, &self.args.tla_export_exprs)
+        let overrides = vir::tla::ParamOverrides {
+            constants: self.args.tla_export_constants.clone(),
+            labels: self.args.tla_export_labels.clone(),
+        };
+        let export = vir::tla::export_module(krate, arg, &self.args.tla_export_exprs, &overrides)
             .map_err(|e| crate::util::error(format!("tla-export: {e}")))?;
         let dir = self.log_dir()?;
         let json = serde_json::to_string_pretty(&export.report).unwrap_or_else(|_| "{}".into());
@@ -963,11 +967,14 @@ impl Verifier {
                 parts.join("; ")
             );
         }
-        if !export.report.scalar_constants.is_empty() {
-            eprintln!(
-                "tla-export: warning: init and next share {} by name alone; if next chooses it per step, the CONSTANT drops behaviours",
-                export.report.scalar_constants.join(", ")
-            );
+        for warning in [
+            vir::tla::scalar_constant_warning(&export.report.scalar_constants),
+            vir::tla::choice_label_warning(&export.report.choice_labels),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            eprintln!("tla-export: warning: {warning}");
         }
         if !export.report.unchecked.is_empty() {
             eprintln!(

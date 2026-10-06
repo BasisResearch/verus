@@ -59,11 +59,18 @@ name and type, or before the states, the one `init` takes of its type) is a
 constant, unless it is a choice among variants (an enum of several
 variants, or a struct holding one in a field, such as `struct Lbl { op:
 Op }`, an `Option` included but not vstd's collections), which is a
-label. A scalar constant is told by its name alone, so the summary line
-warns that it drops behaviours if `next` chooses it per step. When the
-state or `next` is ambiguous (`init` takes one each of two datatypes
-`next` takes twice, or several `next`s take more than the states and not
-exactly one shares a parameter with `init`), the export refuses. A
+label. Both are guesses, warned of on the summary line and atop the
+`.tla`: a scalar constant is told by its name alone, and drops behaviours
+if `next` chooses it per step; a label both take (such as a constants
+struct with an `Option` field) is chosen apart from init's and anew each
+step, so a violation may be spurious and the predicates over it are not
+checked. `-V tla-export-constant=c` and `-V tla-export-label=n` settle
+them. A `next` whose state no `init` takes (a helper `Lbl::next(self,
+other: Lbl)`) is not the model's. When `init` takes one each of two
+datatypes `next` takes twice, the state is the one whose `init` parameter
+shares its name with none of `next`'s; when that does not settle it, or
+several `next`s take more than the states and not exactly one shares a
+parameter with `init`, the export refuses. A
 constant is a `CONSTANT` per field of its struct (`Const_c_cap`, kept in its type's range by an `ASSUME`),
 given by value in the `.cfg` (`Const_c_cap = 4`) or by `<-` for a
 non-scalar, behind `Const_c == [cap |-> Const_c_cap, ...]`. Any other
@@ -80,7 +87,7 @@ only the event sequences the `.cfg` gives. Any other parameter of `init` is
 quantified once in Init. Invariants are still predicates over the state,
 given the constants when they take them (`within(self, c)` is checked as
 `within == State_within(Const_c)`; a scalar constant only to a parameter
-of its name). A hand-rolled predicate over the state and a label is a
+of its name, and a struct by its type alone to one parameter only). A hand-rolled predicate over the state and a label is a
 guard, listed among the candidates but not checked, as is one over the
 state and anything else that is not a constant; both are named in a `NOT
 CHECKED` comment atop the `.tla` and on the summary line, and naming one

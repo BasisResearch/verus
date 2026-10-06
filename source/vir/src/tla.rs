@@ -35,10 +35,13 @@
 //! and `State::init(post, init_label)` for a machine declaring `pub enum
 //! Label`/`InitLabel`). `next`'s state is the datatype exactly two of its
 //! parameters have (the first pre, the second post), `init` the function of
-//! that name with one parameter of it. When `init` takes one each of two
-//! such datatypes, or several `next`s take more than the states and not
-//! exactly one shares a parameter with `init`, the export refuses rather
-//! than guess. Every other parameter is one of:
+//! that name with one parameter of it (a `next` whose state no `init` takes,
+//! such as a helper `Lbl::next(self, other: Lbl)`, is not the model's). When
+//! `init` takes one each of two such datatypes, the state is the one whose
+//! parameter of `init` shares its name with none of `next`'s (that one is a
+//! value they share); when that does not settle it, or several `next`s take
+//! more than the states and not exactly one shares a parameter with `init`,
+//! the export refuses rather than guess. Every other parameter is one of:
 //!
 //! * a constant: a parameter of `next` that `init` also takes (the same
 //!   name and type, or, before `next`'s states, `init`'s one parameter of
@@ -57,8 +60,13 @@
 //!   parameter before the states that `init` does not take, nor a choice
 //!   among variants both take (a step's label; `init`'s is then an init
 //!   label). The constants are named on the summary line, so a value
-//!   fixed that the model chooses per step shows, and one that is not a
-//!   struct, told by its name alone, is warned of there;
+//!   fixed that the model chooses per step shows. Two readings are guesses,
+//!   warned of on the summary line and atop the `.tla`: a constant that is
+//!   not a struct, told by its name alone, and a label both take that is or
+//!   holds a choice (a constants struct with an `Option` field is then
+//!   chosen anew each step, apart from init's). `-V
+//!   tla-export-constant=<param>` and `-V tla-export-label=<param>` settle
+//!   them (see [`ParamOverrides`]);
 //! * a label: any other parameter of `next`. A label belongs to one step, so
 //!   Next is `\E lbl \in <domain> : next(Const_c, lbl)`. A per-variant `\E`,
 //!   its fields bounded from the arms' guards, when `next` matches on the
@@ -88,7 +96,8 @@
 //! A candidate invariant over the state and the constants is closed the
 //! same way and checked under its own name: a parameter is given the
 //! constant of its name and type, or the only constant of its type when
-//! that is a struct (nrkernel's `inv(self, c: Constants)`); a scalar alone
+//! that is a struct (nrkernel's `inv(self, c: Constants)`), to one
+//! parameter only (`rel(s, a: C, b: C)` is not checked); a scalar alone
 //! is too common a type (`at_least(s, k: nat)` beside a constant `n: nat`
 //! is a helper). Labels reach the invariants only through Next, so a
 //! hand-rolled predicate over the state and a label is listed as a
@@ -280,6 +289,13 @@ pub struct Report {
     /// line's warning; not in the .tla.json.
     #[serde(skip)]
     pub scalar_constants: Vec<String>,
+    /// The labels init takes too, by name and type, made labels for being or
+    /// holding a choice among variants (`c: Constants` with an `Option`
+    /// field): init's and next's are chosen independently, next's anew each
+    /// step, so they may be constants misread. For the summary line's
+    /// warning; not in the .tla.json.
+    #[serde(skip)]
+    pub choice_labels: Vec<String>,
 }
 
 /// A Verus type, as the reverse rendering reads it. Datatypes are named by
@@ -5871,7 +5887,35 @@ struct Extra {
     name: VarIdent,
     typ: Typ,
     kind: ExtraKind,
+    /// Whether `kind` is a guess the summary line warns of.
+    guess: Guess,
     why: String,
+}
+
+/// Whether a parameter's kind is a guess (see [`classify_extras`]), for the
+/// summary line's warning.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Guess {
+    /// Settled by the rules, or named on the command line.
+    Settled,
+    /// A constant that is not a struct, told by its name alone: next may
+    /// choose it per step.
+    ScalarConstant,
+    /// A label though init takes it too, since it is or holds a choice
+    /// among variants: it may be the model's constants.
+    ChoiceLabel,
+}
+
+/// `-V tla-export-constant=<param>,...` and `-V tla-export-label=<param>,...`:
+/// parameters of `next` (by name) whose kind the command line settles, where
+/// the rules can only guess (a scalar both take is a constant, a struct
+/// holding a choice a label).
+#[derive(Clone, Debug, Default)]
+pub struct ParamOverrides {
+    /// Made constants (init must take them too).
+    pub constants: Vec<String>,
+    /// Made labels (init's of the same name an init label).
+    pub labels: Vec<String>,
 }
 
 /// A parameter of `init` or `next` beside the states, in the report: what
@@ -6005,23 +6049,29 @@ fn variant_choice(krate: &Krate, t: &Typ, seen: &mut Vec<Path>) -> Option<String
 }
 
 /// What each parameter of `init` and `next` beside the states becomes
-/// (see the module header), and the constants among them.
+/// (see the module header), and the constants among them. `overrides`
+/// settles a parameter the rules can only guess at (refused when it names
+/// no parameter of `next`, or a constant `init` does not take).
 fn classify_extras(
     init: &Function,
     next: &Function,
     is_state: &dyn Fn(&Typ) -> bool,
     choice: &dyn Fn(&Typ) -> Option<String>,
-) -> (Vec<Extra>, Vec<(VarIdent, Typ, crate::messages::Span)>) {
+    overrides: &ParamOverrides,
+) -> Result<(Vec<Extra>, Vec<(VarIdent, Typ, crate::messages::Span)>), String> {
     let mut extras = Vec::new();
     let mut constants = Vec::new();
     let init_extra: Vec<(usize, &Param)> =
         init.x.params.iter().enumerate().filter(|(_, p)| !is_state(&p.x.typ)).collect();
     let mut init_taken = vec![None; init_extra.len()];
     let first_state = next.x.params.iter().position(|p| is_state(&p.x.typ)).unwrap_or(0);
+    let next_at =
+        || format!("`{}` ({})", fun_as_friendly_rust_name(&next.x.name), span_string(&next.span));
     for (i, p) in next.x.params.iter().enumerate() {
         if is_state(&p.x.typ) {
             continue;
         }
+        let name = ident_name(&p.x.name);
         // init's parameters of this type it has not given to another.
         let same_typ: Vec<usize> = (0..init_extra.len())
             .filter(|&j| {
@@ -6040,17 +6090,53 @@ fn classify_extras(
                         .then(|| same_typ[0])
                 },
             );
+        // init's parameter of this name and another type: a value of its own.
+        let namesake = init_extra
+            .iter()
+            .find(|(_, q)| {
+                q.x.name.0 == p.x.name.0 && !crate::ast_util::types_equal(&q.x.typ, &p.x.typ)
+            })
+            .map_or(String::new(), |(_, q)| {
+                format!(
+                    " (init's `{name}` is a `{}`, another type: a value of its own)",
+                    typ_name(&q.x.typ)
+                )
+            });
+        let forced_constant = overrides.constants.contains(&name);
+        let forced_label = overrides.labels.contains(&name);
+        if forced_constant && shared.is_none() {
+            return Err(format!(
+                "-V tla-export-constant={name}: {}'s `{name}: {}` is not a value `init` takes too (no parameter of `init` has its name and type), so nothing fixes it for the behaviour",
+                next_at(),
+                typ_name(&p.x.typ)
+            ));
+        }
         // Fixing a value that is chosen per step drops behaviours, so a
         // parameter is a constant only when init takes it too, and never
         // a choice among variants, an enum or a struct holding one (a
-        // step's label, even when init takes one of its own).
+        // step's label, even when init takes one of its own), unless the
+        // command line says otherwise.
         let choice_of = shared.zip(choice(&p.x.typ));
-        let (kind, why) = if let Some((j, c)) = choice_of {
+        let (kind, guess, why) = if forced_label {
             (
                 ExtraKind::Label,
+                Guess::Settled,
                 format!(
-                    "init and next both take `{}: {}`, but {c} is a step's label, chosen per step: quantified per step in Next (init's is its own, quantified once in Init), and a predicate over it is not checked as an invariant",
-                    ident_name(&init_extra[j].1.x.name),
+                    "-V tla-export-label names it: the step's label, quantified per step in Next{}",
+                    if shared.is_some() {
+                        " (init's of its name is its own, quantified once in Init)"
+                    } else {
+                        ""
+                    }
+                ),
+            )
+        } else if let (Some((j, c)), false) = (&choice_of, forced_constant) {
+            (
+                ExtraKind::Label,
+                Guess::ChoiceLabel,
+                format!(
+                    "init and next both take `{}: {}`, but {c} is a step's label, chosen per step: quantified per step in Next (init's is its own, quantified once in Init), and a predicate over it is not checked as an invariant; if it is the model's constants, -V tla-export-constant={name} makes it one",
+                    ident_name(&init_extra[*j].1.x.name),
                     typ_name(&p.x.typ)
                 ),
             )
@@ -6059,15 +6145,21 @@ fn classify_extras(
             init_taken[j] = Some(k);
             // A struct shared by name is a constants record; a scalar is
             // told by its name alone, and may be next's per-step choice.
-            let scalar = if typ_datatype(&p.x.typ).is_none() {
-                "; a scalar told by its name alone: if next chooses it per step, fixing it drops behaviours"
+            let (guess, told) = if forced_constant {
+                (Guess::Settled, "; -V tla-export-constant names it")
+            } else if typ_datatype(&p.x.typ).is_none() {
+                (
+                    Guess::ScalarConstant,
+                    "; a scalar told by its name alone: if next chooses it per step, fixing it drops behaviours (-V tla-export-label quantifies it per step)",
+                )
             } else {
-                ""
+                (Guess::Settled, "")
             };
             (
                 ExtraKind::Constant(k),
+                guess,
                 format!(
-                    "init and next both take `{}: {}`: fixed for the whole behaviour, so a CONSTANT{scalar}",
+                    "init and next both take `{}: {}`: fixed for the whole behaviour, so a CONSTANT{told}",
                     ident_name(&init_extra[j].1.x.name),
                     typ_name(&p.x.typ)
                 ),
@@ -6075,11 +6167,15 @@ fn classify_extras(
         } else if i < first_state {
             (
                 ExtraKind::Label,
-                "next takes it before the states, but init does not take it: nothing says it is fixed for the behaviour, so it is chosen per step, quantified per step in Next".to_string(),
+                Guess::Settled,
+                format!(
+                    "next takes it before the states, but init does not take it: nothing says it is fixed for the behaviour, so it is chosen per step, quantified per step in Next{namesake}"
+                ),
             )
-        } else if let Some(&j) = same_typ.first() {
+        } else if let (Some(&j), true) = (same_typ.first(), namesake.is_empty()) {
             (
                 ExtraKind::Label,
+                Guess::Settled,
                 format!(
                     "next alone takes it, after the states: the step's label (or IO), quantified per step in Next (init's `{}` has its type but not its name, so it is not taken for the same value)",
                     ident_name(&init_extra[j].1.x.name)
@@ -6088,7 +6184,10 @@ fn classify_extras(
         } else {
             (
                 ExtraKind::Label,
-                "next alone takes it, after the states: the step's label (or IO), quantified per step in Next".to_string(),
+                Guess::Settled,
+                format!(
+                    "next takes it after the states, and init takes no parameter of its name and type: the step's label (or IO), quantified per step in Next{namesake}"
+                ),
             )
         };
         if let ExtraKind::Constant(_) = kind {
@@ -6100,20 +6199,49 @@ fn classify_extras(
             name: p.x.name.clone(),
             typ: p.x.typ.clone(),
             kind,
+            guess,
             why,
         });
     }
+    // Every name on the command line is one of next's parameters.
+    for (flag, names) in
+        [("tla-export-constant", &overrides.constants), ("tla-export-label", &overrides.labels)]
+    {
+        for n in names.iter() {
+            if !extras.iter().any(|x| ident_name(&x.name) == *n) {
+                let beside: Vec<String> =
+                    extras.iter().map(|x| format!("`{}`", ident_name(&x.name))).collect();
+                return Err(format!(
+                    "-V {flag}={n}: {} takes no parameter `{n}` beside the states ({})",
+                    next_at(),
+                    if beside.is_empty() {
+                        "it takes only the states".to_string()
+                    } else {
+                        format!("it takes {}", beside.join(", "))
+                    }
+                ));
+            }
+        }
+    }
     for ((i, p), taken) in init_extra.iter().zip(&init_taken) {
-        let (kind, why) = match taken {
-            Some(k) => (
+        let next_namesake = next.x.params.iter().find(|q| q.x.name.0 == p.x.name.0);
+        let (kind, why) = match (taken, next_namesake) {
+            (Some(k), _) => (
                 ExtraKind::Constant(*k),
                 "init and next both take it: the same CONSTANT as next's".to_string(),
             ),
-            None if next.x.params.iter().any(|q| q.x.name.0 == p.x.name.0) => (
+            (None, Some(q)) if !crate::ast_util::types_equal(&q.x.typ, &p.x.typ) => (
+                ExtraKind::InitLabel,
+                format!(
+                    "next's parameter of its name is a `{}`, another type, so init's is a value of its own: any value init accepts, quantified once in Init",
+                    typ_name(&q.x.typ)
+                ),
+            ),
+            (None, Some(_)) => (
                 ExtraKind::InitLabel,
                 "next's parameter of its name is a step's label, so init's is a value of its own: any value init accepts, quantified once in Init".to_string(),
             ),
-            None => (
+            (None, None) => (
                 ExtraKind::InitLabel,
                 "init alone takes it: any value init accepts, quantified once in Init".to_string(),
             ),
@@ -6124,13 +6252,19 @@ fn classify_extras(
             name: p.x.name.clone(),
             typ: p.x.typ.clone(),
             kind,
+            guess: Guess::Settled,
             why,
         });
     }
-    (extras, constants)
+    Ok((extras, constants))
 }
 
-fn recognise(krate: &Krate, module: &str, named: Option<&[String]>) -> Result<Triple, String> {
+fn recognise(
+    krate: &Krate,
+    module: &str,
+    named: Option<&[String]>,
+    overrides: &ParamOverrides,
+) -> Result<Triple, String> {
     let in_module: Vec<Function> = krate
         .functions
         .iter()
@@ -6169,17 +6303,35 @@ fn recognise(krate: &Krate, module: &str, named: Option<&[String]>) -> Result<Tr
                     == 1
         })
     };
+    // Whether `init`'s parameter of datatype `d` has the name of one of
+    // `f`'s of that datatype: a value they share by name (`init(c: Cfg, s)`
+    // beside `next(c: Cfg, pre, post, d: Cfg)`), so not the state.
+    let shares_name_of = |f: &Function, d: &Path| {
+        let of_d = |p: &&Param| typ_datatype(&p.x.typ).as_ref() == Some(d);
+        in_module.iter().filter(|g| short(g) == "init").any(|g| {
+            g.x.params.iter().filter(of_d).count() == 1
+                && g.x
+                    .params
+                    .iter()
+                    .filter(of_d)
+                    .any(|q| f.x.params.iter().filter(of_d).any(|p| p.x.name.0 == q.x.name.0))
+        })
+    };
     // The state of a `next(pre, post, ..)`: the datatype two of its
     // parameters have, whatever else it takes beside them. When two
     // datatypes do (`next(a: L, b: L, pre: S, post: S)`), the one an `init`
-    // takes once; when `init` takes one of each, which is the state is
-    // ambiguous, and refused rather than guessed.
+    // takes once; when `init` takes one of each, the one whose parameter of
+    // `init` does not share its name with one of `next`'s (that is a value
+    // they share); failing that, which is the state is ambiguous, and
+    // refused rather than guessed.
     let state_pair = |f: &Function| -> Result<Option<Path>, String> {
         let pairs = pairs_of(f);
         let taken: Vec<&Path> = pairs.iter().filter(|d| init_takes(d)).collect();
+        let unshared: Vec<&&Path> = taken.iter().filter(|d| !shares_name_of(f, d)).collect();
         match taken.len() {
             0 => Ok(pairs.first().cloned()),
             1 => Ok(Some(taken[0].clone())),
+            _ if unshared.len() == 1 => Ok(Some((*unshared[0]).clone())),
             _ => Err(format!(
                 "`next` in `{module}` ({}) takes two parameters of each of {}, and `init` takes one of each: which is the state is ambiguous",
                 span_string(&f.span),
@@ -6198,6 +6350,20 @@ fn recognise(krate: &Krate, module: &str, named: Option<&[String]>) -> Result<Tr
         .iter()
         .filter(|f| short(f) == "next" && is_bool(f) && !pairs_of(f).is_empty())
         .collect();
+    // Only a `next` whose state an `init` takes is a model's (a helper
+    // `Lbl::next(self, other: Lbl)` is not, and must not beat `next(pre,
+    // post, c, lbl)` for having two parameters); when none is, they all
+    // stay, for the refusal below to name.
+    let modelled: Vec<&Function> = nexts
+        .iter()
+        .copied()
+        .filter(|f| match state_pair(f) {
+            Ok(Some(s)) => init_takes(&s),
+            Ok(None) => false,
+            Err(_) => true,
+        })
+        .collect();
+    let nexts = if modelled.is_empty() { nexts } else { modelled };
     let next = match nexts.iter().find(|f| f.x.params.len() == 2) {
         Some(f) => Some(*f),
         None if nexts.len() <= 1 => nexts.first().copied(),
@@ -6257,7 +6423,10 @@ fn recognise(krate: &Krate, module: &str, named: Option<&[String]>) -> Result<Tr
             .filter(|f| short(f) == "init" && is_bool(f) && states_in(f) == 1)
             .min_by_key(|f| f.x.params.len())
             .ok_or_else(|| {
-                format!("found `next` in `{module}` but no `init(s: State) -> bool` beside it")
+                format!(
+                    "found `next` in `{module}` but no `init` beside it returning bool with one parameter of the state type `{}` (and maybe constants or init labels beside it)",
+                    path_as_friendly_rust_name(&state)
+                )
             })?;
         let shape = if in_module.iter().any(|f| short(f) == "next_by") {
             "verussync"
@@ -6274,20 +6443,20 @@ fn recognise(krate: &Krate, module: &str, named: Option<&[String]>) -> Result<Tr
                 .map(|d| d.x.variants.len())
         };
         let choice = |t: &Typ| variant_choice(krate, t, &mut Vec::new());
-        let (extras, constants) = classify_extras(init, next, &is_state, &choice);
+        let (extras, constants) = classify_extras(init, next, &is_state, &choice, overrides)?;
         // The constant a predicate's parameter is given: the one of its
         // name and type, or else the only one of its type when that is a
         // struct (`inv(self, c: Constants)`). A scalar is too common a type
         // to stand for the constant alone (`at_least(s, k: nat)` beside a
-        // constant `n: nat` is a helper, not an invariant over `n`).
-        let constant_of = |p: &Param| -> Option<usize> {
+        // constant `n: nat` is a helper, not an invariant over `n`). With
+        // whether it went by name.
+        let constant_of = |p: &Param| -> Option<(usize, bool)> {
             let of: Vec<usize> = (0..constants.len())
                 .filter(|&i| crate::ast_util::types_equal(&constants[i].1, &p.x.typ))
                 .collect();
-            of.iter()
-                .copied()
-                .find(|&i| constants[i].0.0 == p.x.name.0)
-                .or_else(|| (of.len() == 1 && variants(&p.x.typ) == Some(1)).then(|| of[0]))
+            of.iter().copied().find(|&i| constants[i].0.0 == p.x.name.0).map(|i| (i, true)).or_else(
+                || (of.len() == 1 && variants(&p.x.typ) == Some(1)).then(|| (of[0], false)),
+            )
         };
         let label_typs: Vec<Typ> =
             extras.iter().filter(|x| x.kind == ExtraKind::Label).map(|x| x.typ.clone()).collect();
@@ -6311,17 +6480,38 @@ fn recognise(krate: &Krate, module: &str, named: Option<&[String]>) -> Result<Tr
                 if f.x.params.len() == 1 {
                     return true;
                 }
-                let given: Vec<Option<Option<usize>>> =
-                    f.x.params
-                        .iter()
-                        .map(|p| {
-                            if is_state(&p.x.typ) {
-                                Some(None)
-                            } else {
-                                constant_of(p).map(Some)
-                            }
-                        })
-                        .collect();
+                let of: Vec<Option<(usize, bool)>> = f
+                    .x
+                    .params
+                    .iter()
+                    .map(|p| if is_state(&p.x.typ) { None } else { constant_of(p) })
+                    .collect();
+                // By its type alone, a constant goes to one parameter only:
+                // `rel(s, a: C, b: C)` is not `rel(s, c, c)`.
+                let doubled: Vec<bool> = of
+                    .iter()
+                    .map(|g| match g {
+                        Some((k, false)) => {
+                            of.iter().filter(|h| matches!(h, Some((j, _)) if j == k)).count() > 1
+                        }
+                        _ => false,
+                    })
+                    .collect();
+                let given: Vec<Option<Option<usize>>> = f
+                    .x
+                    .params
+                    .iter()
+                    .zip(of.iter().zip(&doubled))
+                    .map(|(p, (g, d))| {
+                        if is_state(&p.x.typ) {
+                            Some(None)
+                        } else if *d {
+                            None
+                        } else {
+                            g.map(|(k, _)| Some(k))
+                        }
+                    })
+                    .collect();
                 if given.iter().all(|g| g.is_some()) {
                     closed.insert(f.x.name.clone(), given.into_iter().flatten().collect());
                     return true;
@@ -6340,10 +6530,17 @@ fn recognise(krate: &Krate, module: &str, named: Option<&[String]>) -> Result<Tr
                         .x
                         .params
                         .iter()
-                        .zip(&given)
-                        .filter(|(_, g)| g.is_none())
-                        .map(|(p, _)| {
+                        .zip(given.iter().zip(of.iter().zip(&doubled)))
+                        .filter(|(_, (g, _))| g.is_none())
+                        .map(|(p, (_, (o, d)))| {
                             let t = typ_name(&p.x.typ);
+                            if let (Some((k, _)), true) = (o, d) {
+                                return format!(
+                                    "the constant `{}` is the only `{t}`, but by its type alone a constant is given to one parameter only, and it would go to `{}` and another",
+                                    ident_name(&constants[*k].0),
+                                    ident_name(&p.x.name)
+                                );
+                            }
                             let of = |k: ExtraKind| {
                                 extras.iter().any(|x| {
                                     x.kind == k && crate::ast_util::types_equal(&x.typ, &p.x.typ)
@@ -6507,6 +6704,13 @@ fn recognise(krate: &Krate, module: &str, named: Option<&[String]>) -> Result<Tr
     };
     let next = in_module.iter().find(|f| short(f) == "next" && closure_state(f, 2).is_some());
     if let Some(next) = next {
+        if let Some(n) = overrides.constants.first().or(overrides.labels.first()) {
+            return Err(format!(
+                "-V tla-export-constant/-label names `{n}`, but `{}` ({}) is a verus-tla `next()` with no parameters beside the states",
+                fun_as_friendly_rust_name(&next.x.name),
+                span_string(&next.span)
+            ));
+        }
         let state = closure_state(next, 2).expect("checked above");
         // `init()` and the invariants are closures over the state itself: a
         // `() -> spec_fn(int) -> bool` beside them is a helper.
@@ -6848,13 +7052,42 @@ impl Exporter {
     }
 }
 
+/// The warning for constants told by their names alone (`n` both take, not
+/// a struct), on the summary line and atop the .tla; None for none.
+pub fn scalar_constant_warning(names: &[String]) -> Option<String> {
+    (!names.is_empty()).then(|| {
+        format!(
+            "init and next share {} by name alone; if next chooses it per step, the CONSTANT drops behaviours (-V tla-export-label={} quantifies it per step)",
+            names.join(", "),
+            names.join(",")
+        )
+    })
+}
+
+/// The warning for labels init takes too, made labels for holding a choice
+/// among variants; None for none.
+pub fn choice_label_warning(names: &[String]) -> Option<String> {
+    (!names.is_empty()).then(|| {
+        format!(
+            "init and next both take {}, but it is or holds a choice among variants, so it is a label: init's and next's are chosen independently, next's anew each step; if it is the model's constants, a violation may be spurious and the predicates over it are not checked (-V tla-export-constant={} makes it one)",
+            names.join(", "),
+            names.join(",")
+        )
+    })
+}
+
 /// Export the transition system named by `arg`, `-V tla-export`'s argument:
 /// a module (a `crate::a::b` path as Verus prints it), optionally followed by
 /// `:inv1,inv2` naming the invariants to check.
-pub fn export_module(krate: &Krate, arg: &str, exprs: &[String]) -> Result<Export, String> {
+pub fn export_module(
+    krate: &Krate,
+    arg: &str,
+    exprs: &[String],
+    overrides: &ParamOverrides,
+) -> Result<Export, String> {
     let (module, named) = parse_export_arg(arg)?;
     let module = module.as_str();
-    let mut triple = recognise(krate, module, named.as_deref())?;
+    let mut triple = recognise(krate, module, named.as_deref(), overrides)?;
     let datatypes: HashMap<Path, Datatype> = krate
         .datatypes
         .iter()
@@ -7606,15 +7839,32 @@ pub fn export_module(krate: &Krate, arg: &str, exprs: &[String]) -> Result<Expor
             "\\* Temporal (verus-tla): always is [], eventually <>, leads_to ~>, lift_state(p)\n\\* the state formula p, always(lift_action(a)) [][A]_vars, weak_fairness WF_vars(A)\n\\* of the action's forward step, tla_forall/tla_exists bounded quantifiers. Shared\n\\* WF_vars fairness is in Spec; other spec assumptions are a property's premises.\n",
         );
     }
+    // next's parameters whose kind is a guess of the given sort, for the
+    // warnings.
+    let guessed = |g: Guess| -> Vec<String> {
+        triple
+            .extras
+            .iter()
+            .filter(|x| !x.in_init && x.guess == g)
+            .map(|x| ident_name(&x.name))
+            .collect()
+    };
     if !parameters.is_empty() {
-        // init's constant is next's, said once.
+        // init's constant is next's, said once; a guess is said to be one.
         let said: Vec<String> = parameters
             .iter()
-            .filter(|p| !(p.function == "init" && p.kind == "constant"))
-            .map(|p| {
-                let what = match p.kind.as_str() {
-                    "label" => "a label, \\E per step in Next",
-                    "init_label" => "\\E once in Init",
+            .zip(&triple.extras)
+            .filter(|(p, _)| !(p.function == "init" && p.kind == "constant"))
+            .map(|(p, x)| {
+                let what = match (p.kind.as_str(), x.guess) {
+                    ("label", Guess::ChoiceLabel) => {
+                        "a label, \\E per step in Next, though init takes it too: it holds a choice; see the WARNING below"
+                    }
+                    ("label", _) => "a label, \\E per step in Next",
+                    ("init_label", _) => "\\E once in Init",
+                    (_, Guess::ScalarConstant) => {
+                        "a constant told by its name alone: CONSTANTs the .cfg gives; see the WARNING below"
+                    }
                     _ => "a constant: CONSTANTs the .cfg gives",
                 };
                 format!("{}'s {} ({what})", p.function, p.param)
@@ -7624,6 +7874,15 @@ pub fn export_module(krate: &Krate, arg: &str, exprs: &[String]) -> Result<Expor
             "\\* Beside the state: {}; see the .tla.json parameters.\n",
             said.join("; ")
         ));
+        for warning in [
+            scalar_constant_warning(&guessed(Guess::ScalarConstant)),
+            choice_label_warning(&guessed(Guess::ChoiceLabel)),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            tla.push_str(&format!("\\* WARNING: {warning}.\n"));
+        }
     }
     // The predicates over more than the state are candidates no invariant
     // checks: said here as well as in the .tla.json candidates.
@@ -7877,12 +8136,8 @@ pub fn export_module(krate: &Krate, arg: &str, exprs: &[String]) -> Result<Expor
             .chain(&triple.unclosed)
             .map(|f| fun_as_friendly_rust_name(f))
             .collect(),
-        scalar_constants: triple
-            .constants
-            .iter()
-            .filter(|(_, t, _)| typ_datatype(t).is_none())
-            .map(|(n, _, _)| ident_name(n))
-            .collect(),
+        scalar_constants: guessed(Guess::ScalarConstant),
+        choice_labels: guessed(Guess::ChoiceLabel),
     };
     Ok(Export { module_name, tla, cfg, report, trace_module_name, trace_tla, trace_cfg })
 }
