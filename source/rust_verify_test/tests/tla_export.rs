@@ -5376,7 +5376,9 @@ fn tla_export_quantifies_a_verussync_label() {
     let cfg = format!("{}CONSTANTS Dom_Label_Read_value = {{0, 1, 2, 3, 4, 5, 6}}\n", ex.cfg);
     let run = tlc(&jar, &ex.spec(), &cfg);
     assert_eq!(run.violated, Vec::<String>::new());
-    // n takes 0..6: every Add a label bounds by its guard.
+    // n takes 0..6. The label's `by` ranges over its type (0..255 above),
+    // not the guard `by <= 2`, which `next` reaches through a call; the
+    // guard still refuses every larger one.
     assert_eq!(run.distinct, 7, "{run:?}");
 }
 
@@ -5646,4 +5648,255 @@ fn tla_export_explores_a_splinter_style_label() {
     assert_eq!(run.violated, Vec::<String>::new());
     // The maps from a subset of {0, 1} to {0, 1}: 1 + 2 * 2 + 2 * 2.
     assert_eq!(run.distinct, 9, "{run:?}");
+}
+
+/// Export `code` with `-V tla-export=<arg>`, expecting it to fail: its
+/// stderr.
+fn export_fails(code: &str, arg: &str) -> String {
+    let src = TempDir::new().expect("temp dir");
+    let entry = src.path().join("test.rs");
+    std::fs::write(&entry, format!("{}\n{}\n{}\n", FEATURE_PRELUDE, USE_PRELUDE, code)).unwrap();
+    let log = format!("--log-dir {}", src.path().join("log").display());
+    let export = format!("-V tla-export={arg}");
+    let output = run_verus(&[&export, "--no-verify", &log], src.path(), &entry, true, true);
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    assert!(!output.status.success(), "{}", stderr);
+    stderr
+}
+
+#[test]
+fn tla_export_refuses_to_check_a_guard_over_the_label() {
+    let ex = export_code(SYNC_LABEL, "test_crate::Meter");
+    assert!(
+        ex.tla.contains("\\* NOT CHECKED (guards over next's label, not invariants): add_enabled, read_enabled.\n"),
+        "{}",
+        ex.tla
+    );
+    let stderr = export_fails(SYNC_LABEL, "test_crate::Meter:add_enabled");
+    assert!(stderr.contains("`add_enabled` in `test_crate::Meter` ("), "{}", stderr);
+    assert!(
+        stderr.contains("cannot be checked as an invariant: it reads a label of next"),
+        "{}",
+        stderr
+    );
+}
+
+/// `init(s, start: nat)` beside `next(pre, post, by: nat)`: the same type,
+/// but two values, `start` once and `by` per step, not one constant.
+const SAME_TYPE_TWO_VALUES: &str = r#"
+use vstd::prelude::*;
+verus! {
+pub struct State { pub x: nat }
+
+pub open spec fn init(s: State, start: nat) -> bool { start <= 1 && s.x == start }
+
+pub open spec fn next(pre: State, post: State, by: nat) -> bool {
+    &&& 2 <= by <= 3
+    &&& pre.x + by <= 7
+    &&& post.x == pre.x + by
+}
+
+pub open spec fn small(s: State) -> bool { s.x <= 7 }
+
+pub open spec fn above(s: State, k: u8) -> bool { s.x >= k }
+}
+"#;
+
+#[test]
+fn tla_export_does_not_share_a_value_by_its_type_alone() {
+    let ex = export_code(SAME_TYPE_TWO_VALUES, "test_crate");
+    assert_eq!(
+        parameters(&ex.report),
+        [
+            ("next".into(), "by".into(), "label".into()),
+            ("init".into(), "start".into(), "init_label".into()),
+        ]
+    );
+    assert!(!ex.tla.contains("Const_"), "{}", ex.tla);
+    // `above(s, k)` reads a `u8` that is neither a constant nor a label: a
+    // candidate, said not to be checked.
+    let c = candidates(&ex.report);
+    assert!(c.contains(&("above".into(), false)), "{:?}", c);
+    assert!(
+        ex.tla.contains(
+            "\\* NOT CHECKED (over the state and a value that is not a constant): above; see\n"
+        ),
+        "{}",
+        ex.tla
+    );
+    let stderr = export_fails(SAME_TYPE_TWO_VALUES, "test_crate:above");
+    assert!(stderr.contains("`u8` is neither a constant nor a label of init/next"), "{}", stderr);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let mut cfg = ex.cfg.clone();
+    for h in names(&ex.report["holes"]) {
+        cfg.push_str(&format!("CONSTANTS {} = {{0, 1, 2, 3}}\n", h.trim_matches('"')));
+    }
+    let run = tlc(&jar, &ex.spec(), &cfg);
+    assert_eq!(run.violated, Vec::<String>::new());
+    // From 0 or 1, steps of 2 or 3 up to 7: every x in 0..7. One value for
+    // start and by (as one constant) reaches at most {1, 3, 5, 7}.
+    assert_eq!(run.distinct, 8, "{run:?}");
+}
+
+/// Two labels: a direction and an amount, each chosen per step.
+const TWO_LABELS: &str = r#"
+use vstd::prelude::*;
+verus! {
+pub struct State { pub x: nat }
+
+pub enum Dir { Up, Reset }
+
+pub open spec fn init(s: State) -> bool { s.x == 0 }
+
+pub open spec fn next(pre: State, post: State, d: Dir, by: u8) -> bool {
+    match d {
+        Dir::Up => 2 <= by <= 3 && pre.x + by <= 6 && post.x == pre.x + by,
+        Dir::Reset => post.x == 0,
+    }
+}
+}
+"#;
+
+#[test]
+fn tla_export_quantifies_two_labels() {
+    let ex = export_code(TWO_LABELS, "test_crate");
+    assert_eq!(
+        parameters(&ex.report),
+        [("next".into(), "d".into(), "label".into()), ("next".into(), "by".into(), "label".into())]
+    );
+    // Each its own binder, the outer the first.
+    let tla: Vec<String> = ex.report["parameters"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["tla"].as_str().unwrap().to_string())
+        .collect();
+    assert!(tla[0].starts_with("\\E d \\in "), "{:?}", tla);
+    assert!(tla[1].starts_with("\\E by \\in "), "{:?}", tla);
+    assert!(ex.tla.contains(": next(d, by)))\n"), "{}", ex.tla);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let run = tlc(&jar, &ex.spec(), &ex.cfg);
+    assert_eq!(run.violated, Vec::<String>::new());
+    // Steps of 2 or 3 up to 6: {0, 2, 3, 4, 5, 6}; one amount for every
+    // step reaches {0, 2, 4, 6} or {0, 3, 6}.
+    assert_eq!(run.distinct, 6, "{run:?}");
+}
+
+/// A record `next` alone takes after the states is a label, even named
+/// like constants: nothing says it is fixed, so it is chosen per step.
+const CONFIG_AFTER_STATES: &str = r#"
+use vstd::prelude::*;
+verus! {
+pub struct State { pub x: u8 }
+
+pub struct Cfg { pub step: u8 }
+
+pub open spec fn init(s: State) -> bool { s.x == 0 }
+
+pub open spec fn next(pre: State, post: State, c: Cfg) -> bool {
+    1 <= c.step <= 2 && pre.x + c.step <= 4 && post.x == pre.x + c.step
+}
+}
+"#;
+
+#[test]
+fn tla_export_quantifies_a_record_after_the_states() {
+    let ex = export_code(CONFIG_AFTER_STATES, "test_crate");
+    assert_eq!(parameters(&ex.report), [("next".into(), "c".into(), "label".into())]);
+    assert!(!ex.tla.contains("Const_"), "{}", ex.tla);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let run = tlc(&jar, &ex.spec(), &ex.cfg);
+    assert_eq!(run.violated, Vec::<String>::new());
+    // Steps of 1 or 2 up to 4: every x in 0..4.
+    assert_eq!(run.distinct, 5, "{run:?}");
+}
+
+/// A record only `init` takes is quantified once in Init, not a constant:
+/// a predicate over it is not checked, and says why.
+const INIT_ONLY_RECORD: &str = r#"
+use vstd::prelude::*;
+verus! {
+pub struct State { pub x: nat }
+
+pub struct Cfg { pub cap: nat }
+
+pub open spec fn init(s: State, c: Cfg) -> bool { s.x == 0 }
+
+pub open spec fn next(pre: State, post: State) -> bool { pre.x < 3 && post.x == pre.x + 1 }
+
+pub open spec fn within(s: State, c: Cfg) -> bool { s.x <= c.cap }
+}
+"#;
+
+#[test]
+fn tla_export_lists_a_predicate_over_an_init_label_as_not_checked() {
+    let ex = export_code(INIT_ONLY_RECORD, "test_crate");
+    assert_eq!(parameters(&ex.report), [("init".into(), "c".into(), "init_label".into())]);
+    let within: Vec<&serde_json::Value> = ex.report["candidates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|c| c["function"] == "test_crate::within")
+        .collect();
+    assert_eq!(within.len(), 1, "{}", ex.report["candidates"]);
+    assert_eq!(within[0]["included"], false);
+    assert!(
+        within[0]["reason"].as_str().unwrap().contains("`Cfg` is init's alone"),
+        "{}",
+        within[0]
+    );
+    assert!(
+        ex.tla.contains("NOT CHECKED (over the state and a value that is not a constant): within;"),
+        "{}",
+        ex.tla
+    );
+    let stderr = export_fails(INIT_ONLY_RECORD, "test_crate:within");
+    assert!(stderr.contains("cannot be checked as an invariant"), "{}", stderr);
+}
+
+/// A constants field the model never reads still needs a value; a value
+/// out of its type's range fails the ASSUME, and none at all stops TLC.
+const UNREAD_CONSTANT: &str = r#"
+use vstd::prelude::*;
+verus! {
+pub struct Constants { pub cap: u8, pub unused: u8 }
+
+pub struct State { pub x: u8 }
+
+pub open spec fn init(c: Constants, s: State) -> bool { s.x == 0 }
+
+pub open spec fn next(c: Constants, pre: State, post: State) -> bool {
+    pre.x < c.cap && post.x == pre.x + 1
+}
+}
+"#;
+
+#[test]
+fn tla_export_asks_for_every_constant_and_checks_its_range() {
+    let ex = export_code(UNREAD_CONSTANT, "test_crate");
+    assert!(ex.cfg.contains("even a field the model never reads"), "{}", ex.cfg);
+    assert!(ex.cfg.contains("\\*   Const_c_unused = <a u8>\n"), "{}", ex.cfg);
+    assert!(
+        ex.tla.contains("ASSUME (0 <= Const_c_unused /\\ Const_c_unused <= 255)\n"),
+        "{}",
+        ex.tla
+    );
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let cfg = format!("{}CONSTANTS Const_c_cap = 3\nCONSTANTS Const_c_unused = 9\n", ex.cfg);
+    let run = tlc(&jar, &ex.spec(), &cfg);
+    assert_eq!(run.violated, Vec::<String>::new());
+    assert_eq!(run.distinct, 4, "{run:?}");
+    // Out of the field's range: the ASSUME fails before any state.
+    let cfg = format!("{}CONSTANTS Const_c_cap = 3\nCONSTANTS Const_c_unused = 300\n", ex.cfg);
+    let out = tlc_output(&jar, &ex.spec(), &cfg);
+    assert!(out.contains("Assumption") && out.contains("is false"), "{}", out);
+    // Left unassigned: TLC stops.
+    let cfg = format!("{}CONSTANTS Const_c_cap = 3\n", ex.cfg);
+    let out = tlc_output(&jar, &ex.spec(), &cfg);
+    assert!(out.contains("Const_c_unused"), "{}", out);
+    assert!(!out.contains("distinct states found"), "{}", out);
 }

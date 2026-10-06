@@ -37,19 +37,25 @@
 //! parameters have (the first pre, the second post), `init` the function of
 //! that name with one parameter of it. Every other parameter is one of:
 //!
-//! * a constant: a parameter of `next` whose type `init` also takes, or one
-//!   before `next`'s states. It is fixed for the whole behaviour, so it is a
+//! * a constant: a parameter of `next` that `init` also takes (the same
+//!   name and type; a same-typed parameter of another name is a value of
+//!   its own), or one before `next`'s states (`init`'s one parameter of its
+//!   datatype, whatever its name, being the same). It is fixed for the whole behaviour, so it is a
 //!   `CONSTANT` the `.cfg` supplies; a struct is one `Const_<param>_<field>`
 //!   per field (TLC's `.cfg` gives a scalar by value and anything else by
 //!   `<-`), behind `Const_<param> == [field |-> Const_<param>_field, ...]`,
 //!   each reported as a hole with its Rust type and kept in its type's
 //!   range by an `ASSUME`. `init`'s parameter of that type is the same one;
 //! * a label: any other parameter of `next`. A label belongs to one step, so
-//!   Next is `\E lbl \in <domain> : next(Const_c, lbl)`, the domain read off
-//!   the label's type as a step enum's is, the union of its variants with
-//!   each unbounded field a hole of its own (`Dom_Label_Query_input`), or a
-//!   per-variant `\E` when `next` matches on the label (see
-//!   [`Exporter::exists_per_variant`]);
+//!   Next is `\E lbl \in <domain> : next(Const_c, lbl)`. A per-variant `\E`,
+//!   its fields bounded from the arms' guards, when `next` matches on the
+//!   label (see [`Exporter::exists_per_variant`]); otherwise the domain is
+//!   read off the label's type alone, the union of its variants with each
+//!   field bounded by its type (`0..255` for a `u8`) or a hole of its own
+//!   (`Dom_Label_Query_input`). A guard in a transition `next` calls
+//!   (`require lbl->by <= 2` in VerusSync) does not bound it (survey F18);
+//!   the check is exact over the domain the `.cfg` gives, and a hole
+//!   under-approximates as any other does;
 //! * an init label: any other parameter of `init`, quantified once in Init
 //!   (`\E id \in Dom_AbstractEndPoint : init(id)`, IronKV's host id and
 //!   command line).
@@ -58,7 +64,7 @@
 //! a variable: `next` reads it as the events of this step only, and nothing
 //! of it outlives the step unless the state keeps it (in a field, which is a
 //! variable already). Its domain is a hole (`Dom_Seq_..`) the `.cfg` fills
-//! with the event sequences worth exploring.
+//! with the event sequences worth exploring, and only those are explored.
 //! `init` and `next` are then closed over these: the export adds spec fns of
 //! the states alone, `next__tla_closed(pre, post) = exists|lbl|
 //! next(C, pre, post, lbl)` and `init__tla_closed(s) = init(s, C)` (their
@@ -69,7 +75,10 @@
 //! own name; labels reach the invariants only through Next, so a predicate
 //! over the state and a label (VerusSync's generated `<t>_enabled(pre,
 //! label)`) is listed as a candidate that is not an invariant: it is a guard
-//! of a transition. The report's `parameters` say what each parameter became
+//! of a transition. So is a predicate over the state and anything that is
+//! not a constant (an init label, a type two constants share). Both are
+//! named in a `NOT CHECKED` comment at the top of the `.tla`, and naming one
+//! on the command line is refused. The report's `parameters` say what each parameter became
 //! and why, and `steps` is `next`'s own step structure, its body reading the
 //! label and the constants as its operator's parameters.
 //!
@@ -5762,13 +5771,20 @@ struct Triple {
     /// `init`'s and `next`'s parameters beside the states, and what each
     /// becomes (see the module header).
     extras: Vec<Extra>,
-    /// The constants: one per constants parameter of `next` (or of `init`
-    /// alone), its Rust name and type.
+    /// The constants: one per constants parameter of `next` (a parameter
+    /// of `init` alone is an init label, never a constant), its Rust name
+    /// and type.
     constants: Vec<(VarIdent, Typ, crate::messages::Span)>,
     /// The candidates over the state and constants (`inv(self, c:
     /// Constants)`): for each parameter, the constant it is given, or None
     /// for the state.
     closed: HashMap<Fun, Vec<Option<usize>>>,
+    /// The predicates over the state and a label of `next`: guards, listed
+    /// as candidates but never checked.
+    guards: Vec<Fun>,
+    /// The predicates over the state and something that is neither a
+    /// constant nor a label: listed as candidates but never checked.
+    unclosed: Vec<Fun>,
 }
 
 /// What a parameter of `init` or `next` beside the states becomes.
@@ -5896,17 +5912,32 @@ fn classify_extras(
         if is_state(&p.x.typ) {
             continue;
         }
-        let shared = (0..init_extra.len()).find(|&j| {
-            init_taken[j].is_none()
-                && crate::ast_util::types_equal(&init_extra[j].1.x.typ, &p.x.typ)
-        });
+        // init's parameters of this type it has not given to another.
+        let same_typ: Vec<usize> = (0..init_extra.len())
+            .filter(|&j| {
+                init_taken[j].is_none()
+                    && crate::ast_util::types_equal(&init_extra[j].1.x.typ, &p.x.typ)
+            })
+            .collect();
+        // The same parameter of init: its name and type. The type alone is
+        // not enough (`init(s, start: nat)` beside `next(pre, post, by:
+        // nat)` takes two values, not one), except for a constants
+        // parameter by position whose datatype init takes once.
+        let shared =
+            same_typ.iter().copied().find(|&j| init_extra[j].1.x.name.0 == p.x.name.0).or_else(
+                || {
+                    (i < first_state && same_typ.len() == 1 && typ_datatype(&p.x.typ).is_some())
+                        .then(|| same_typ[0])
+                },
+            );
         let (kind, why) = if let Some(j) = shared {
             let k = constants.len();
             init_taken[j] = Some(k);
             (
                 ExtraKind::Constant(k),
                 format!(
-                    "init and next both take a `{}`: fixed for the whole behaviour, so a CONSTANT",
+                    "init and next both take `{}: {}`: fixed for the whole behaviour, so a CONSTANT",
+                    ident_name(&init_extra[j].1.x.name),
                     typ_name(&p.x.typ)
                 ),
             )
@@ -5914,6 +5945,14 @@ fn classify_extras(
             (
                 ExtraKind::Constant(constants.len()),
                 "next takes it before the states (the constants position), and init does not take it: a CONSTANT".to_string(),
+            )
+        } else if let Some(&j) = same_typ.first() {
+            (
+                ExtraKind::Label,
+                format!(
+                    "next alone takes it, after the states: the step's label (or IO), quantified per step in Next (init's `{}` has its type but not its name, so it is not taken for the same value)",
+                    ident_name(&init_extra[j].1.x.name)
+                ),
             )
         } else {
             (
@@ -5978,13 +6017,28 @@ fn recognise(krate: &Krate, module: &str, named: Option<&[String]>) -> Result<Tr
     let short = |f: &Function| last_segment(&f.x.name.path);
     let is_bool = |f: &Function| matches!(&*f.x.ret.x.typ, TypX::Bool);
     // The datatype exactly two of `f`'s parameters have: the state of a
-    // `next(pre, post, ..)`, whatever else it takes beside them.
+    // `next(pre, post, ..)`, whatever else it takes beside them. When two
+    // datatypes do (`next(a: L, b: L, pre: S, post: S)`), the one an `init`
+    // takes once.
     let state_pair = |f: &Function| -> Option<Path> {
         let dts: Vec<Option<Path>> = f.x.params.iter().map(|p| typ_datatype(&p.x.typ)).collect();
-        dts.iter()
+        let pairs: Vec<&Path> = dts
+            .iter()
             .flatten()
-            .find(|d| dts.iter().filter(|e| e.as_ref() == Some(*d)).count() == 2)
-            .cloned()
+            .filter(|d| dts.iter().filter(|e| e.as_ref() == Some(*d)).count() == 2)
+            .collect();
+        let init_takes = |d: &Path| {
+            in_module.iter().any(|g| {
+                short(g) == "init"
+                    && g.x
+                        .params
+                        .iter()
+                        .filter(|p| typ_datatype(&p.x.typ).as_ref() == Some(d))
+                        .count()
+                        == 1
+            })
+        };
+        pairs.iter().find(|d| init_takes(d)).or(pairs.first()).map(|d| (*d).clone())
     };
     // Hand-rolled or VerusSync: `next(pre, post)` with two params of one
     // datatype, and maybe a label, constants or IO beside them.
@@ -6027,46 +6081,106 @@ fn recognise(krate: &Krate, module: &str, named: Option<&[String]>) -> Result<Tr
         // Every spec fn with a body over one state (and maybe constants)
         // returning bool, other than `init`.
         let mut closed: HashMap<Fun, Vec<Option<usize>>> = HashMap::new();
-        let mut over_labels: Vec<Fun> = Vec::new();
-        let pool: Vec<Function> =
-            in_module
+        let mut over_labels: Vec<&Function> = Vec::new();
+        // The rest over the state and something else, with why not.
+        let mut unclosed: Vec<(&Function, String)> = Vec::new();
+        let pool: Vec<Function> = in_module
+            .iter()
+            .filter(|f| {
+                if !(is_bool(f)
+                    && states_in(f) == 1
+                    && short(f) != "init"
+                    && f.x.mode == Mode::Spec
+                    && f.x.body.is_some())
+                {
+                    return false;
+                }
+                if f.x.params.len() == 1 {
+                    return true;
+                }
+                let given: Vec<Option<Option<usize>>> =
+                    f.x.params
+                        .iter()
+                        .map(|p| {
+                            if is_state(&p.x.typ) {
+                                Some(None)
+                            } else {
+                                constant_of(&p.x.typ).map(Some)
+                            }
+                        })
+                        .collect();
+                if given.iter().all(|g| g.is_some()) {
+                    closed.insert(f.x.name.clone(), given.into_iter().flatten().collect());
+                    return true;
+                }
+                if f.x
+                    .params
+                    .iter()
+                    .any(|p| label_typs.iter().any(|l| crate::ast_util::types_equal(l, &p.x.typ)))
+                {
+                    over_labels.push(*f);
+                } else if !extras.is_empty() {
+                    // Beside init/next's own parameters, a predicate
+                    // over the state and more may be meant as an
+                    // invariant given them: say why it is not one.
+                    let why: Vec<String> = f
+                        .x
+                        .params
+                        .iter()
+                        .zip(&given)
+                        .filter(|(_, g)| g.is_none())
+                        .map(|(p, _)| {
+                            let t = typ_name(&p.x.typ);
+                            let of = |k: ExtraKind| {
+                                extras.iter().any(|x| {
+                                    x.kind == k && crate::ast_util::types_equal(&x.typ, &p.x.typ)
+                                })
+                            };
+                            if of(ExtraKind::InitLabel) {
+                                format!(
+                                    "`{t}` is init's alone, quantified once in Init, not a constant"
+                                )
+                            } else if constants
+                                .iter()
+                                .any(|(_, c, _)| crate::ast_util::types_equal(c, &p.x.typ))
+                            {
+                                format!(
+                                    "two constants are `{t}`s, so which one it reads is ambiguous"
+                                )
+                            } else {
+                                format!("`{t}` is neither a constant nor a label of init/next")
+                            }
+                        })
+                        .collect();
+                    unclosed.push((
+                        *f,
+                        format!(
+                            "reads more than the state, and cannot be given it ({}): not checked",
+                            why.join("; ")
+                        ),
+                    ));
+                }
+                false
+            })
+            .cloned()
+            .collect();
+        let guard_why = "reads a label of next beside the state: a label is quantified per step inside Next, so a predicate over one is a guard of the transition, not an invariant";
+        // Named on the command line, a predicate that cannot be checked is
+        // refused, saying why, rather than not found.
+        for n in named.unwrap_or(&[]) {
+            let is = |f: &Function| short(f) == *n || fun_as_friendly_rust_name(&f.x.name) == *n;
+            let why = over_labels
                 .iter()
-                .filter(|f| {
-                    if !(is_bool(f)
-                        && states_in(f) == 1
-                        && short(f) != "init"
-                        && f.x.mode == Mode::Spec
-                        && f.x.body.is_some())
-                    {
-                        return false;
-                    }
-                    if f.x.params.len() == 1 {
-                        return true;
-                    }
-                    let given: Vec<Option<Option<usize>>> =
-                        f.x.params
-                            .iter()
-                            .map(|p| {
-                                if is_state(&p.x.typ) {
-                                    Some(None)
-                                } else {
-                                    constant_of(&p.x.typ).map(Some)
-                                }
-                            })
-                            .collect();
-                    if given.iter().all(|g| g.is_some()) {
-                        closed.insert(f.x.name.clone(), given.into_iter().flatten().collect());
-                        return true;
-                    }
-                    if f.x.params.iter().any(|p| {
-                        label_typs.iter().any(|l| crate::ast_util::types_equal(l, &p.x.typ))
-                    }) {
-                        over_labels.push(f.x.name.clone());
-                    }
-                    false
-                })
-                .cloned()
-                .collect();
+                .find(|f| is(f))
+                .map(|f| (*f, guard_why.to_string()))
+                .or_else(|| unclosed.iter().find(|(f, _)| is(f)).cloned());
+            if let Some((f, why)) = why {
+                return Err(format!(
+                    "`{n}` in `{module}` ({}) cannot be checked as an invariant: it {why}",
+                    span_string(&f.span)
+                ));
+            }
+        }
         let candidates = if shape == "verussync" {
             // `state_machine!` generates `State::invariant(&self)` as the
             // conjunction `self.a() && self.b() && ...` of the `#[invariant]`
@@ -6122,13 +6236,14 @@ fn recognise(krate: &Krate, module: &str, named: Option<&[String]>) -> Result<Tr
             })?
         };
         let mut candidates = candidates;
-        for f in over_labels {
-            candidates.push((
-                f,
-                false,
-                "reads a label of next beside the state: a label is quantified per step inside Next, so a predicate over one is a guard of the transition, not an invariant".into(),
-            ));
+        for f in &over_labels {
+            candidates.push((f.x.name.clone(), false, guard_why.into()));
         }
+        for (f, why) in &unclosed {
+            candidates.push((f.x.name.clone(), false, why.clone()));
+        }
+        let guards = over_labels.iter().map(|f| f.x.name.clone()).collect();
+        let unclosed = unclosed.iter().map(|(f, _)| f.x.name.clone()).collect();
         return Ok(Triple {
             shape,
             state,
@@ -6139,6 +6254,8 @@ fn recognise(krate: &Krate, module: &str, named: Option<&[String]>) -> Result<Tr
             extras,
             constants,
             closed,
+            guards,
+            unclosed,
         });
     }
     // verus-tla: `next()` returning a spec_fn over (S, S).
@@ -6180,6 +6297,8 @@ fn recognise(krate: &Krate, module: &str, named: Option<&[String]>) -> Result<Tr
             extras: Vec::new(),
             constants: Vec::new(),
             closed: HashMap::new(),
+            guards: Vec::new(),
+            unclosed: Vec::new(),
         });
     }
     Err(format!(
@@ -6984,6 +7103,7 @@ pub fn export_module(krate: &Krate, arg: &str, exprs: &[String]) -> Result<Expor
         ex.bound.clear();
         ex.current_tainted = false;
         ex.branch_depth = 0;
+        let key = (inv_fun(f), Variant::Plain, false);
         let name = if verus_tla {
             // The property's lift_state may have emitted it already.
             ex.ensure_closure_root(f)
@@ -6991,9 +7111,8 @@ pub fn export_module(krate: &Krate, arg: &str, exprs: &[String]) -> Result<Expor
             outcome.insert(f.clone(), (false, reached_reason.clone()));
             continue;
         } else {
-            Some(ex.ensure_function(&(inv_fun(f), Variant::Plain, false)))
+            Some(ex.ensure_function(&key))
         };
-        let key = (inv_fun(f), Variant::Plain, false);
         match name {
             Some(name) => {
                 invs.push((f.clone(), name, ex.tainted.contains(&key)));
@@ -7208,6 +7327,22 @@ pub fn export_module(krate: &Krate, arg: &str, exprs: &[String]) -> Result<Expor
             said.join("; ")
         ));
     }
+    // The predicates over more than the state are candidates no invariant
+    // checks: said here as well as in the .tla.json candidates.
+    let short_names =
+        |fs: &[Fun]| fs.iter().map(|f| last_segment(&f.path)).collect::<Vec<_>>().join(", ");
+    if !triple.guards.is_empty() {
+        tla.push_str(&format!(
+            "\\* NOT CHECKED (guards over next's label, not invariants): {}.\n",
+            short_names(&triple.guards)
+        ));
+    }
+    if !triple.unclosed.is_empty() {
+        tla.push_str(&format!(
+            "\\* NOT CHECKED (over the state and a value that is not a constant): {}; see\n\\* the .tla.json candidates.\n",
+            short_names(&triple.unclosed)
+        ));
+    }
     tla.push_str("EXTENDS Integers, Sequences, FiniteSets, TLC\n\n");
     if !model_constants.is_empty() {
         tla.push_str(&format!(
@@ -7380,7 +7515,7 @@ pub fn export_module(krate: &Krate, arg: &str, exprs: &[String]) -> Result<Expor
     }
     if !ex.values.is_empty() {
         cfg.push_str(
-            "\\* The model's constants (init/next's constants parameter). TLC stops until each\n\\* is given a value: an integer, string or model value here (`C = 3`), anything\n\\* else as `C <- Op` from an operator in a module extending this one.\n\\* CONSTANTS\n",
+            "\\* The model's constants (init/next's constants parameter). TLC stops until each\n\\* is given a value: an integer, string or model value here (`C = 3`), anything\n\\* else as `C <- Op` from an operator in a module extending this one. TLC needs\n\\* every one, even a field the model never reads: any value of its type will do.\n\\* CONSTANTS\n",
         );
         for (c, t) in &ex.values {
             cfg.push_str(&format!("\\*   {c} = <a {t}>\n"));
