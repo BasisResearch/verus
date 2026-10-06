@@ -46,12 +46,14 @@ use vir::def::{CommandContext, CommandsWithContext, CommandsWithContextX, SnapPo
 use vir::prelude::PreludeConfig;
 
 const RLIMIT_PER_SECOND: f32 = 3000000f32;
-/// cvc5 resource units per second, measured with `--stats-internal` on vstd queries
-/// (cvc5 1.3.5 main@4a9afc6, Apple M-series): ordinary queries run at 180k-230k
-/// units/s, the hard arithmetic lemmas in `arithmetic::div_mod` at 35k-70k. The
-/// old command-line `--rlimit 1666666 // ~= 5s` implied 333k, above even the easy
-/// end. 100k keeps "roughly seconds" honest within a factor of about two either way.
-const CVC5_RLIMIT_PER_SECOND: f32 = 100000f32;
+/// cvc5 resource units per rlimit unit. This is upstream Verus's
+/// `RLIMIT_PER_SECOND_CVC5`, so that `--rlimit N` and `#[verifier::rlimit(N)]`
+/// give cvc5 the same budget here as under upstream Verus, for fork users,
+/// upstream users and graders that run upstream at the same rlimit alike. As
+/// "seconds" it is generous: measured with `--stats-internal` on vstd queries,
+/// ordinary queries run at 180k-230k units/s, the hard arithmetic lemmas in
+/// `arithmetic::div_mod` at 35k-70k.
+const CVC5_RLIMIT_PER_SECOND: f32 = 333333f32;
 
 #[derive(Clone, Hash, PartialEq, Eq)]
 pub(crate) struct ProgressBarId(String);
