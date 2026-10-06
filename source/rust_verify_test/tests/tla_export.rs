@@ -5365,6 +5365,26 @@ pub open spec fn values(s: State) -> bool { s.d =~= Seq::new(s.n, |i: int| i + 1
 }
 
 #[test]
+fn tla_export_closure_body_reads_the_post_state() {
+    // A closure's body reads the post state as it does in Verus: `post.n`
+    // is `n'` inside the comprehension, assigned by an earlier conjunct.
+    let ex = check_collections(
+        r#"post.d == pre.s.push(pre.n as int).map_values(|x: int| x + post.n)
+            && post.e == post.t.filter(|y: int| y + 1 < post.n)
+            && post.w == post.m.map_values(|v: int| v + post.n)"#,
+        r#"
+pub open spec fn shifted(s: State) -> bool { s.d =~= Seq::new(s.n, |i: int| i + s.n) }
+pub open spec fn below(s: State) -> bool { s.e =~= Set::new(|x: int| 0 <= x < s.n - 1).unwrap() }
+pub open spec fn values(s: State) -> bool { s.w =~= Map::new(s.t, |k: int| k * k + s.n) }
+"#,
+        &[],
+    );
+    assert!(ex.tla.contains("(LET x == s__[i__] IN (x + n'))"), "{}", ex.tla);
+    assert!(ex.tla.contains("IN ((y + 1) < n'))"), "{}", ex.tla);
+    assert!(ex.tla.contains("IN (v + n'))"), "{}", ex.tla);
+}
+
+#[test]
 fn tla_export_seq_filter_is_selectseq() {
     let ex = check_collections(
         "post.d == post.s.filter(|x: int| x >= 2) && post.e == pre.e && post.w == pre.w",
@@ -5388,7 +5408,8 @@ pub open spec fn tail(s: State) -> bool { s.d.len() == (if s.n > 2 { s.n - 2 } e
 fn tla_export_seq_folds_are_recursive_operators() {
     // Folding `push` rebuilds the sequence from the left and reverses it
     // from the right; `wrong_order` expects the left fold to reverse, and
-    // TLC finds it violated once `s` has two elements.
+    // TLC finds it violated once `s` has two elements. `seeded` folds from
+    // seeds that are no identity, so the seed is seen once, at its end.
     let ex = check_collections(
         SAME,
         r#"
@@ -5407,6 +5428,12 @@ pub open spec fn right(s: State) -> bool {
 pub open spec fn wrong_order(s: State) -> bool {
     s.s.fold_left(Seq::<int>::empty(), |acc: Seq<int>, x: int| acc.push(x))
         =~= Seq::new(s.n, |i: int| s.n - 1 - i)
+}
+pub open spec fn seeded(s: State) -> bool {
+    let rev = Seq::new(s.n, |i: int| s.n - 1 - i);
+    &&& s.s.fold_left(10int, |acc: int, x: int| acc + x) == 10 + s.n * (s.n - 1) / 2
+    &&& s.s.fold_left(seq![9int], |acc: Seq<int>, x: int| acc.push(x)) =~= seq![9int].add(s.s)
+    &&& s.s.fold_right(|x: int, acc: Seq<int>| acc.push(x), seq![9int]) =~= seq![9int].add(rev)
 }
 "#,
         &["wrong_order"],
@@ -5513,6 +5540,7 @@ fn tla_export_set_fold_is_a_recursive_operator() {
         SAME,
         r#"
 pub open spec fn sum(s: State) -> bool { s.t.fold(0int, |acc: int, x: int| acc + x) == s.n * (s.n - 1) / 2 }
+pub open spec fn seeded(s: State) -> bool { s.t.fold(10int, |acc: int, x: int| acc + x) == 10 + s.n * (s.n - 1) / 2 }
 pub open spec fn count(s: State) -> bool { s.t.fold(0nat, |acc: nat, x: int| acc + 1) == s.n }
 pub open spec fn all(s: State) -> bool { s.t.fold(true, |acc: bool, x: int| acc && x < 4) }
 pub open spec fn doubled(s: State) -> bool {
@@ -5826,6 +5854,84 @@ pub open spec fn next(pre: State, post: State) -> bool { exists|k: u8| t_add(pre
     // stops the log at the step observing it.
     for bad in [r#""b": [[1, 3]]"#, r#""b": [[1, 2], [0, 1]]"#] {
         let line = lines[2].replace(r#""b": [[1, 2]]"#, bad);
+        std::fs::write(&log, format!("{}\n{}\n{line}\n", lines[0], lines[1])).unwrap();
+        let (depth, out) = follow(&jar, &spec, &cfg, &log, "");
+        assert_eq!(depth, 2, "{bad}\n{out}");
+    }
+}
+
+const INFINITE_COLLECTIONS: &str = r#"
+use vstd::prelude::*;
+use vstd::multiset::Multiset;
+verus! {
+pub struct State { pub i: ISet<u8>, pub m: IMap<u8, u8>, pub b: Multiset<u8>, pub n: nat }
+
+pub open spec fn init(s: State) -> bool {
+    &&& s.i == ISet::<u8>::empty() && s.m == IMap::<u8, u8>::empty()
+    &&& s.b == Multiset::<u8>::empty() && s.n == 0
+}
+pub open spec fn t_add(pre: State, post: State, k: u8) -> bool {
+    &&& pre.n < 3 && k < 3
+    &&& post.i == pre.i.insert(k)
+    &&& post.m == pre.m.insert(k, (k + 1) as u8)
+    &&& post.b == pre.b.insert(k)
+    &&& post.n == pre.n + 1
+}
+pub open spec fn next(pre: State, post: State) -> bool { exists|k: u8| t_add(pre, post, k) }
+
+pub open spec fn counted(i: ISet<u8>) -> nat { i.len() }
+pub open spec fn members(s: State) -> bool {
+    let j = s.i.insert(7);
+    &&& forall|x: u8| s.i.contains(x) <==> s.b.contains(x)
+    &&& counted(s.i) <= s.n && j.contains(7) && !s.i.remove(0).contains(0)
+    &&& forall|k: u8| s.m.contains_key(k) ==> s.i.contains(k) && s.m[k] == k + 1
+}
+}
+"#;
+
+#[test]
+fn tla_export_iset_imap_and_multiset_state_fields() {
+    // An `ISet` and an `IMap` are a TLA+ set and function wherever the
+    // export reads their type, as a `Set` and a `Map` are: TypeOK keeps
+    // their elements in range, `type_map` calls them `set` and `map` (and a
+    // `Multiset` a `multiset`), a trace logs them as a `Set` and a `Map`,
+    // and a `let` or a parameter holding one is a value, not a closure.
+    let ex = export_code(INFINITE_COLLECTIONS, "test_crate");
+    assert_eq!(ex.report["refusals"], serde_json::json!([]), "{}", ex.tla);
+    assert_eq!(ex.report["holes"], serde_json::json!([]), "{}", ex.tla);
+    assert_eq!(names(&ex.report["invariants"]), ["members"], "{}", ex.cfg);
+    let u8_ = serde_json::json!({"kind": "int", "rust": "u8"});
+    let typ = |v: &str| {
+        let vars = ex.report["type_map"]["variables"].as_array().unwrap();
+        vars.iter().find(|x| x["variable"] == v).unwrap()["typ"].clone()
+    };
+    assert_eq!(typ("i"), serde_json::json!({"kind": "set", "elem": u8_}));
+    assert_eq!(typ("m"), serde_json::json!({"kind": "map", "key": u8_, "value": u8_}));
+    assert_eq!(typ("b"), serde_json::json!({"kind": "multiset", "elem": u8_}));
+    assert!(ex.tla.contains("(\\A e__ \\in i : (0 <= e__ /\\ e__ <= 255))"), "{}", ex.tla);
+    assert!(ex.tla.contains("(\\A k__ \\in DOMAIN m : ((0 <= k__ /\\ k__ <= 255)"), "{}", ex.tla);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    // The multisets of at most 3 elements of {0, 1, 2}.
+    let run = tlc(&jar, &ex.spec(), &ex.cfg);
+    assert_eq!(run.violated, Vec::<String>::new(), "{}", ex.tla);
+    assert_eq!(run.distinct, 20, "{run:?}");
+    let (spec, _, cfg) = trace_spec(&ex);
+    sany(&jar, &spec);
+    let log = ex.dir.path().join("t.ndjson");
+    let lines = [
+        r#"{"module": "State_tla", "export": "test_crate", "state": {"i": [], "m": [], "b": [], "n": 0}}"#,
+        r#"{"step": "t_add", "params": {"k": 1}, "state": {"i": [1], "m": [[1, 2]], "b": [[1, 1]], "n": 1}}"#,
+        r#"{"step": "t_add", "params": {"k": 1}, "state": {"i": [1], "m": [[1, 2]], "b": [[1, 2]], "n": 2}}"#,
+    ];
+    std::fs::write(&log, lines.join("\n") + "\n").unwrap();
+    let (depth, out) = follow(&jar, &spec, &cfg, &log, "");
+    assert_eq!(depth, 3, "{out}");
+    // A set element or a map value the model does not reach stops the log
+    // at the step observing it.
+    for bad in [r#""i": [0, 1]"#, r#""m": [[1, 3]]"#] {
+        let line = lines[2]
+            .replace(if bad.contains("\"i\"") { r#""i": [1]"# } else { r#""m": [[1, 2]]"# }, bad);
         std::fs::write(&log, format!("{}\n{}\n{line}\n", lines[0], lines[1])).unwrap();
         let (depth, out) = follow(&jar, &spec, &cfg, &log, "");
         assert_eq!(depth, 2, "{bad}\n{out}");

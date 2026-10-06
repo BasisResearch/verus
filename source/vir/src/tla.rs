@@ -213,6 +213,9 @@ pub enum TypeRef {
     Set { elem: Box<TypeRef> },
     /// `Map<key, value>`: a TLA+ function whose `DOMAIN` is the map's domain.
     Map { key: Box<TypeRef>, value: Box<TypeRef> },
+    /// `Multiset<elem>`: a TLA+ function from the elements it holds to their
+    /// counts, each above 0.
+    Multiset { elem: Box<TypeRef> },
     /// A tuple: a TLA+ tuple `<<a, b>>`, element `i` at index `i + 1`.
     Tuple { elems: Vec<TypeRef> },
     /// A struct or enum, laid out in [`TypeMap::datatypes`] under `path`,
@@ -1106,6 +1109,19 @@ fn vstd_op(name: &str) -> Option<&'static str> {
     })
 }
 
+/// The friendly name of a datatype as the export reads it: an `ISet` or
+/// `IMap` is the `Set` or `Map` it is exported as (see [`vstd_op`]), a TLA+
+/// set or function, never a record of the closure that represents it in
+/// Rust.
+fn collection_name(p: &Path) -> String {
+    let name = path_as_friendly_rust_name(p);
+    match name.as_str() {
+        "vstd::iset::ISet" => "vstd::set::Set".to_string(),
+        "vstd::imap::IMap" => "vstd::map::Map".to_string(),
+        _ => name,
+    }
+}
+
 /// Whether a type carries a spec_fn anywhere: such values are reduced
 /// symbolically and never printed.
 fn typ_has_specfn(
@@ -1118,6 +1134,10 @@ fn typ_has_specfn(
         TypX::Datatype(Dt::Path(p), args, _) => {
             if args.iter().any(|a| typ_has_specfn(a, datatypes, seen)) {
                 return true;
+            }
+            // An `ISet` or `IMap` is a value, whatever its Rust fields hold.
+            if collection_name(p) != path_as_friendly_rust_name(p) {
+                return false;
             }
             if !seen.insert(p.clone()) {
                 return false;
@@ -3583,8 +3603,10 @@ impl Exporter {
                 // small and has no hole (`SUBSET BOOLEAN`), and a `Map` the
                 // functions from a subset of its keys' domain to its values'
                 // (`(|V| + 1)^|K|` of them) when both are, else a hole too.
-                match path_as_friendly_rust_name(p).as_str() {
-                    "vstd::seq::Seq" => return None,
+                // An `ISet` and an `IMap` are a `Set` and a `Map`; a
+                // `Multiset`'s counts are unbounded, so it is a hole.
+                match collection_name(p).as_str() {
+                    "vstd::seq::Seq" | "vstd::multiset::Multiset" => return None,
                     "vstd::map::Map" => {
                         let first_hole = self.holes.len();
                         let key = self.bound_from_type(args.first()?, span, seen);
@@ -4070,7 +4092,7 @@ impl Exporter {
                 }
                 conj(parts)
             }
-            TypX::Datatype(Dt::Path(p), args, _) => match path_as_friendly_rust_name(p).as_str() {
+            TypX::Datatype(Dt::Path(p), args, _) => match collection_name(p).as_str() {
                 "vstd::seq::Seq" => {
                     let i = self.bind("i__");
                     let inner = self.type_pred(&format!("{subject}[{i}]"), args.first()?, seen)?;
@@ -4699,9 +4721,13 @@ impl Exporter {
             TypX::Datatype(Dt::Path(p), args, _) => {
                 let mut args: Vec<TypeRef> =
                     args.iter().map(|a| self.type_ref(a, pending)).collect();
-                match (path_as_friendly_rust_name(p).as_str(), args.len()) {
+                // An `ISet` and an `IMap` are a `Set` and a `Map` here.
+                match (collection_name(p).as_str(), args.len()) {
                     ("vstd::seq::Seq", 1) => TypeRef::Seq { elem: Box::new(args.remove(0)) },
                     ("vstd::set::Set", 1) => TypeRef::Set { elem: Box::new(args.remove(0)) },
+                    ("vstd::multiset::Multiset", 1) => {
+                        TypeRef::Multiset { elem: Box::new(args.remove(0)) }
+                    }
                     ("vstd::map::Map", 2) => {
                         let value = Box::new(args.remove(1));
                         TypeRef::Map { key: Box::new(args.remove(0)), value }
@@ -5001,6 +5027,7 @@ fn encodings() -> BTreeMap<String, String> {
         ("seq", "a 1-based sequence: Verus index i is TLA+ index i + 1"),
         ("set", "a set"),
         ("map", "a function whose DOMAIN is the map's domain"),
+        ("multiset", "a function from the elements it holds to their counts, each above 0"),
         ("tuple", "a tuple <<a, b>>: element i at index i + 1"),
         ("int", "an integer (every Verus integer type)"),
         ("bool", "a boolean"),
@@ -7495,8 +7522,9 @@ impl Exporter {
                 (format!("<<{}>>", items.join(", ")), checks.join(" /\\ "))
             }
             TypX::Datatype(Dt::Path(path), args, _) => {
-                match path_as_friendly_rust_name(path).as_str() {
-                    "vstd::seq::Seq" if !args.is_empty() => {
+                // An `ISet` and an `IMap` are logged as a `Set` and a `Map`.
+                match (collection_name(path).as_str(), args.len()) {
+                    ("vstd::seq::Seq", 1..) => {
                         let (d, o) = self.trace_codec(&args[0], n, memo, defs);
                         (
                             format!("[{p} \\in 1..Len({j}) |-> {d}({j}[{p}])]"),
@@ -7505,7 +7533,7 @@ impl Exporter {
                             ),
                         )
                     }
-                    "vstd::set::Set" if !args.is_empty() => {
+                    ("vstd::set::Set", 1..) => {
                         let (d, _) = self.trace_codec(&args[0], n, memo, defs);
                         (
                             format!("{{{d}({j}[{p}]) : {p} \\in 1..Len({j})}}"),
@@ -7515,18 +7543,18 @@ impl Exporter {
                     // A multiset is logged as a map, from its elements to
                     // their counts; an element logged with count 0 is not
                     // held (see [`vstd_op`]).
-                    name @ ("vstd::map::Map" | "vstd::multiset::Multiset")
-                        if args.len() == if name == "vstd::map::Map" { 2 } else { 1 } =>
-                    {
+                    ("vstd::map::Map", 2) | ("vstd::multiset::Multiset", 1) => {
+                        // A multiset's one type argument is its elements'.
+                        let counted = args.len() == 1;
                         let nat = Arc::new(TypX::Int(IntRange::Nat));
-                        let vtyp = args.get(1).unwrap_or(&nat);
+                        let vtyp = if counted { &nat } else { &args[1] };
                         let (dk, _) = self.trace_codec(&args[0], n, memo, defs);
                         let (dv, ov) = self.trace_codec(vtyp, n, memo, defs);
-                        let held = if name == "vstd::map::Map" {
-                            format!("1..Len({j})")
-                        } else {
+                        let held = if counted {
                             // `r` is bound nowhere else in a decoder.
                             format!("{{{r} \\in 1..Len({j}) : {dv}({j}[{r}][2]) > 0}}")
+                        } else {
+                            format!("1..Len({j})")
                         };
                         (
                             format!(

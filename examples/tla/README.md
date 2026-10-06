@@ -233,8 +233,10 @@ are few (`BOOLEAN`), else a hole (`Dom_int`). Over a hole the set is taken
 to be finite: `Set::new` is `Some` of the elements the hole's values give,
 where Verus's is `None` when `p` holds for infinitely many values, so the
 `.cfg`'s `Dom_int` must hold every element. For the same reason
-`ISet::finite` is refused: every set TLC builds is finite. `Set::map` is `{f(x) : x \in
-s}`, `Set::filter` `{x \in s : p}`, and `Set::fold` a RECURSIVE operator
+`ISet::finite` is refused: every set TLC builds is finite. An `ISet` and an
+`IMap` are otherwise a `Set` and a `Map`, in TypeOK, the trace and
+`type_map` as in expressions. `Set::map` is `{f(x) : x \in s}`,
+`Set::filter` `{x \in s : p}`, and `Set::fold` a RECURSIVE operator
 removing a CHOOSEn element each time. That agrees with Verus only for a
 commutative `f` (Verus's fold is otherwise a choice among the orders, as
 `choose` is), so a fold is refused unless `f` is `acc op g(x)` or `g(x) op
@@ -417,10 +419,10 @@ Verus values. `type_map` gives each variable's state field (its Rust
 name and its record label) and lays out every datatype the state holds
 (whether it is a struct or an enum, field labels in declaration order, the
 `tag` value of each enum variant, which fields are positional), with each
-field's type as a tree over `seq`, `set`,
-`map`, `tuple`, `int`, `bool`, `char` and named datatypes, so that a TLC
-state `[x |-> 4, y |-> 0]` renders as `State { x: 4, y: 0 }` by table, not
-by guess. When `next` is `exists|step: T| body` over a datatype, `steps`
+field's type as a tree over `seq`, `set` (also an `ISet`), `map` (also an
+`IMap`), `multiset`, `tuple`, `int`, `bool`, `char` and named datatypes,
+so that a TLC state `[x |-> 4, y |-> 0]` renders as `State { x: 4, y: 0 }`
+by table, not by guess. When `next` is `exists|step: T| body` over a datatype, `steps`
 gives the binder, its printed domain and body, and, when the body calls a
 function matching on the step, each arm's transition with the step field
 passed for each parameter: evaluating `{step \in domain : body}` over a
