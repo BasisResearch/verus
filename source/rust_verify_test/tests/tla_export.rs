@@ -5442,19 +5442,19 @@ use vstd::prelude::*;
 verus! {
 pub struct State { pub t: Set<int>, pub n: nat }
 
-pub open spec fn init(s: State) -> bool { s.t == Set::new(|x: int| x * x == 4).unwrap() && s.n == 0 }
+pub open spec fn init(s: State) -> bool { s.t == Set::new(|x: int| x * x == 2 * x).unwrap() && s.n == 0 }
 
 pub open spec fn next(pre: State, post: State) -> bool { pre.n < 2 && post.t == pre.t && post.n == pre.n + 1 }
 
-pub open spec fn root(s: State) -> bool { s.t =~= set![2int] }
+pub open spec fn roots(s: State) -> bool { s.t =~= set![0int, 2] }
 }
 "#;
 
 #[test]
 fn tla_export_set_new_without_a_bound_leaves_a_hole() {
-    // `x * x == 4` bounds nothing and `int` has no finite domain: the
+    // `x * x == 2 * x` bounds nothing and `int` has no finite domain: the
     // comprehension ranges over the hole `Dom_int`, given in the .cfg
-    // (the non-negative integers below 4, so the set is `{2}`).
+    // (`0..3`, which holds both roots, so the set is Verus's `{0, 2}`).
     let ex = export_code(SET_NEW_HOLE, "test_crate");
     assert_eq!(ex.report["refusals"], serde_json::json!([]), "{}", ex.tla);
     let holes = ex.report["holes"].as_array().unwrap();
@@ -5462,7 +5462,7 @@ fn tla_export_set_new_without_a_bound_leaves_a_hole() {
     assert_eq!(holes[0]["constant"], "Dom_int");
     assert_eq!(holes[0]["variable"], "x");
     assert!(holes[0]["location"].as_str().unwrap().contains("test.rs:"), "{:?}", holes);
-    assert!(ex.tla.contains("{x \\in Dom_int : ((x * x) = 4)}"), "{}", ex.tla);
+    assert!(ex.tla.contains("{x \\in Dom_int : ((x * x) = (2 * x))}"), "{}", ex.tla);
     let Some(jar) = tla_tools() else { return };
     sany(&jar, &ex.spec());
     let run = tlc(&jar, &ex.spec(), &format!("{}CONSTANTS Dom_int = {{0, 1, 2, 3}}\n", ex.cfg));
@@ -5502,12 +5502,18 @@ pub open spec fn small(s: State) -> bool {
 
 #[test]
 fn tla_export_set_fold_is_a_recursive_operator() {
-    // vstd recommends a commutative `f`; TLC folds in CHOOSE's order.
+    // TLC folds in CHOOSE's order, which agrees with every other for the
+    // commutative `f` the export accepts: `acc op g(x)` for a commutative
+    // and associative `op`, here `+`, `&&` and `insert`.
     let ex = check_collections(
         SAME,
         r#"
 pub open spec fn sum(s: State) -> bool { s.t.fold(0int, |acc: int, x: int| acc + x) == s.n * (s.n - 1) / 2 }
 pub open spec fn count(s: State) -> bool { s.t.fold(0nat, |acc: nat, x: int| acc + 1) == s.n }
+pub open spec fn all(s: State) -> bool { s.t.fold(true, |acc: bool, x: int| acc && x < 4) }
+pub open spec fn doubled(s: State) -> bool {
+    s.t.fold(Set::<int>::empty(), |acc: Set<int>, x: int| acc.insert(2 * x)) =~= s.t.map(|x: int| 2 * x)
+}
 "#,
         &[],
     );
@@ -5624,20 +5630,26 @@ pub open spec fn arithmetic(s: State) -> bool {
     &&& s.b.sub(Multiset::singleton(1)).len() == (if s.n >= 2 { (s.n - 1) as nat } else { s.n })
     &&& s.b.subset_of(s.b.insert(3)) && (s.n == 0 || !s.b.insert(3).subset_of(s.b))
     &&& s.b.update(0, 9).count(0) == 9 && s.b.update(1, 0).len() == s.b.count(0)
+    &&& s.b.update(1, 0) =~= s.b.filter(|x: u8| x != 1) && !s.b.update(1, 0).contains(1)
 }
 pub open spec fn conversions(s: State) -> bool {
     &&& Multiset::from_set(set![1u8, 2]).len() == 2
     &&& Multiset::from_map(map![4u8 => 2nat, 6u8 => 0nat]).len() == 2
+    &&& Multiset::from_map(map![4u8 => 2nat, 6u8 => 0nat]) =~= Multiset::singleton(4u8).insert(4)
+    &&& !Multiset::from_map(map![4u8 => 2nat, 6u8 => 0nat]).contains(6)
     &&& s.b.dom() =~= (if s.n == 0 { Set::empty() } else if s.n == 1 { set![0u8] } else { set![0u8, 1] })
     &&& s.b.filter(|x: u8| x == 1).len() == s.n / 2
     &&& s.s.to_multiset().count(0) == (if s.n == 0 { 0nat } else { 1nat })
+    &&& seq![1u8, 1, 2].to_multiset().count(1) == 2 && seq![1u8, 1, 2].to_multiset().len() == 3
+    &&& s.s.add(s.s).to_multiset() =~= s.s.to_multiset().add(s.s.to_multiset())
 }
 "#,
         &[],
     );
-    // Its elements keep their type's range in TypeOK.
+    // Its counts are above 0 in TypeOK, and its elements keep their type's
+    // range.
     assert!(
-        ex.tla.contains("(\\A e__2 \\in DOMAIN b : (0 <= e__2 /\\ e__2 <= 255))"),
+        ex.tla.contains("(\\A e__2 \\in DOMAIN b : (b[e__2] > 0 /\\ (0 <= e__2 /\\ e__2 <= 255)))"),
         "{}",
         ex.tla
     );
@@ -5713,11 +5725,16 @@ pub struct State { pub t: Set<int>, pub n: int }
 pub open spec fn init(s: State) -> bool { s.t == set![1int, 2] && s.n == 0 }
 
 pub open spec fn total(t: Set<int>, f: spec_fn(int, int) -> int) -> int { t.fold(0, f) }
+pub open spec fn members(p: spec_fn(int) -> bool) -> Set<int> { Set::new(p).unwrap() }
 
 pub open spec fn next(pre: State, post: State) -> bool { pre.n < 2 && post.t == pre.t && post.n == pre.n + 1 }
 
 pub open spec fn picked(s: State) -> bool { s.t.contains(s.t.choose()) }
 pub open spec fn summed(s: State) -> bool { total(s.t, |a: int, x: int| a + x) == 3 }
+pub open spec fn built(s: State) -> bool { members(|x: int| 0 <= x < 2).len() == 2 }
+pub open spec fn ordered(s: State) -> bool {
+    s.t.fold(Seq::<int>::empty(), |acc: Seq<int>, x: int| acc.push(x)) =~= seq![2int, 1]
+}
 pub open spec fn small(s: State) -> bool { s.n <= 2 }
 }
 "#;
@@ -5726,10 +5743,13 @@ pub open spec fn small(s: State) -> bool { s.n <= 2 }
 fn tla_export_refuses_set_choose_and_a_function_parameter() {
     // `Set::choose` stays refused, as `choose` is: TLC's CHOOSE is one
     // fixed value, and Verus's choice is any value satisfying the
-    // predicate, so TLC's verdict would hold for one choice only. A fold
-    // given a `spec_fn` parameter has no closure to apply (`total` is an
-    // operator of its own); both refusals name their location, and the
-    // invariants reaching them are left out of the .cfg.
+    // predicate, so TLC's verdict would hold for one choice only. So is a
+    // `Set::fold` of a function not seen to be commutative (`push`): Verus's
+    // fold is a choice among the orders, and TLC would hold `ordered` for
+    // the one it takes. A fold or `Set::new` given a `spec_fn` parameter
+    // has no closure to apply (`total` and `members` are operators of their
+    // own); every refusal names its location, and the invariants reaching
+    // them are left out of the .cfg.
     let ex = export_code(CHOOSE_AND_PARAMETER, "test_crate");
     let refusals: Vec<(String, String)> = ex.report["refusals"]
         .as_array()
@@ -5740,12 +5760,56 @@ fn tla_export_refuses_set_choose_and_a_function_parameter() {
     let at = |what: &str| refusals.iter().find(|r| r.0 == what).map(|r| r.1.clone());
     let choose = at("choose (TLC cannot evaluate it)").unwrap_or_else(|| panic!("{:?}", refusals));
     assert!(choose.contains("test.rs:"), "{}", choose);
-    let param = at("vstd operation given a function that does not reduce to a closure")
-        .unwrap_or_else(|| panic!("{:?}", refusals));
-    assert!(param.contains("test.rs:"), "{}", param);
+    for what in [
+        "vstd operation given a function that does not reduce to a closure",
+        "vstd operation given a predicate that does not reduce to a closure",
+        "Set::fold of a function not seen to be commutative",
+    ] {
+        let at = at(what).unwrap_or_else(|| panic!("{what}: {:?}", refusals));
+        assert!(at.contains("test.rs:"), "{}", at);
+    }
     assert_eq!(names(&ex.report["invariants"]), ["small"], "{}", ex.cfg);
     let Some(jar) = tla_tools() else { return };
     sany(&jar, &ex.spec());
     let run = tlc(&jar, &ex.spec(), &ex.cfg);
     assert_eq!(run.violated, Vec::<String>::new(), "{}", ex.tla);
+}
+
+#[test]
+fn tla_export_trace_spec_decodes_a_multiset_as_a_map() {
+    // A multiset is logged as a map from its elements to their counts; an
+    // element logged with count 0 is not held, as `Multiset::count` has it.
+    let ex = export_code(
+        r#"
+use vstd::prelude::*;
+use vstd::multiset::Multiset;
+verus! {
+pub struct State { pub b: Multiset<u8> }
+pub open spec fn init(s: State) -> bool { s.b == Multiset::<u8>::empty() }
+pub open spec fn t_add(pre: State, post: State, k: u8) -> bool { k < 3 && post.b == pre.b.insert(k) }
+pub open spec fn next(pre: State, post: State) -> bool { exists|k: u8| t_add(pre, post, k) }
+}
+"#,
+        "test_crate",
+    );
+    let (spec, _, cfg) = trace_spec(&ex);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &spec);
+    let log = ex.dir.path().join("t.ndjson");
+    let lines = [
+        r#"{"module": "State_tla", "export": "test_crate", "state": {"b": []}}"#,
+        r#"{"step": "t_add", "params": {"k": 1}, "state": {"b": [[1, 1], [2, 0]]}}"#,
+        r#"{"step": "t_add", "params": {"k": 1}, "state": {"b": [[1, 2]]}}"#,
+    ];
+    std::fs::write(&log, lines.join("\n") + "\n").unwrap();
+    let (depth, out) = follow(&jar, &spec, &cfg, &log, "");
+    assert_eq!(depth, 3, "{out}");
+    // A count the model does not reach, or an element it does not hold,
+    // stops the log at the step observing it.
+    for bad in [r#""b": [[1, 3]]"#, r#""b": [[1, 2], [0, 1]]"#] {
+        let line = lines[2].replace(r#""b": [[1, 2]]"#, bad);
+        std::fs::write(&log, format!("{}\n{}\n{line}\n", lines[0], lines[1])).unwrap();
+        let (depth, out) = follow(&jar, &spec, &cfg, &log, "");
+        assert_eq!(depth, 2, "{bad}\n{out}");
+    }
 }

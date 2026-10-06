@@ -231,8 +231,11 @@ would range over: the bound `p`'s conjuncts give `x` (`0 <= x < n` is
 `0..n-1`, `t.contains(x)` is `t`), else the values of `x`'s type when they
 are few (`BOOLEAN`), else a hole (`Dom_int`). `Set::map` is `{f(x) : x \in
 s}`, `Set::filter` `{x \in s : p}`, and `Set::fold` a RECURSIVE operator
-removing a CHOOSEn element each time, which agrees with Verus for the
-commutative `f` vstd recommends. `Map::new(keys, f)` is `[k \in keys |->
+removing a CHOOSEn element each time. That agrees with Verus only for a
+commutative `f` (Verus's fold is otherwise a choice among the orders, as
+`choose` is), so a fold is refused unless `f` is `acc op g(x)` or `g(x) op
+acc` with `g` not reading `acc` and `op` one of `+`, `*`, `&&`, `||`, set
+union or intersection, `insert`, or multiset addition. `Map::new(keys, f)` is `[k \in keys |->
 f(k)]`, `IMap::new(|k| p, f)` the same over `p`'s comprehension,
 `map_values` and `map_entries` map over `DOMAIN m`, `filter_keys`,
 `restrict` and `remove_keys` shrink it, and `m1.union_prefer_right(m2)` is
@@ -240,8 +243,10 @@ f(k)]`, `IMap::new(|k| p, f)` the same over `p`'s comprehension,
 count above 0) to their counts, so `=` is its equality: `count` is the
 value or 0, `insert`, `add` and `singleton` add counts, `remove` and `sub`
 subtract them and drop what reaches 0, `len` sums the counts with a
-RECURSIVE operator, `contains` is `\in DOMAIN`, and a trace logs a
-multiset as a map. `Set::choose` and `Multiset::choose` are refused, as
+RECURSIVE operator, `contains` is `\in DOMAIN`, `to_multiset` counts a
+sequence's positions holding each element, TypeOK checks every count is
+above 0, and a trace logs a multiset as a map (an element logged with count
+0 is not held). `Set::choose` and `Multiset::choose` are refused, as
 `choose` is: TLC's CHOOSE is one fixed value, where Verus's may be any
 value satisfying the predicate.
 
