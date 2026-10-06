@@ -3580,6 +3580,7 @@ pub open spec fn t_set(pre: State, post: State, v: int) -> bool { post.x == v &&
 pub open spec fn t_or(pre: State, post: State) -> bool {
     match pre.g { (G::A(n) | G::B(n)) | G::C(n) => post.x == n && post.g == pre.g }
 }
+
 pub open spec fn next(pre: State, post: State) -> bool {
     ||| exists|k: int| 0 <= k < 3 && t_put(pre, post, k)
     ||| exists|k: int| 0 <= k < 3 && { let k = k + 10; t_set(pre, post, k) }
@@ -3602,6 +3603,89 @@ pub open spec fn next(pre: State, post: State) -> bool {
     assert!(!ex.tla.contains("n_2 =="), "{}", ex.tla);
     let Some(jar) = tla_tools() else { return };
     sany(&jar, &ex.spec());
+}
+
+/// A pattern on the state in `init` binds each name to its variable, so
+/// `x == 0` and `!f` assign it, and the report and the .cfg agree with the
+/// print: Init assigns every variable, and none is drawn from its type
+/// (`f \in BOOLEAN`). A `match` on the state counts the same way.
+const INIT_PATTERN: &str = r#"
+verus! {
+pub struct State { pub x: int, pub y: int, pub f: bool }
+
+pub open spec fn init(s: State) -> bool {
+    let State { x, f, .. } = s;
+    x == 0 && !f && match s { State { y, .. } => y == 0 }
+}
+
+pub open spec fn next(pre: State, post: State) -> bool {
+    pre.x < 2 && post.x == pre.x + 1 && post.y == pre.y + 2 && post.f == !pre.f
+}
+
+pub open spec fn paired(s: State) -> bool { s.y == 2 * s.x && s.f == (s.x % 2 == 1) }
+}
+"#;
+
+#[test]
+fn tla_export_init_assigns_through_a_pattern_on_the_state() {
+    let ex = export_code(INIT_PATTERN, "test_crate");
+    assert_eq!(ex.report["refusals"], serde_json::json!([]), "{}", ex.tla);
+    assert_eq!(ex.report["init_unassigned"], serde_json::json!([]), "{}", ex.tla);
+    assert!(!ex.cfg.contains("Init never assigns"), "{}", ex.cfg);
+    assert!(!ex.tla.contains("\\in BOOLEAN"), "{}", ex.tla);
+    assert!(ex.tla.contains("(f = FALSE)"), "{}", ex.tla);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let run = tlc(&jar, &ex.spec(), &ex.cfg);
+    assert_eq!(run.violated, Vec::<String>::new(), "{}", ex.tla);
+    assert_eq!(run.distinct, 3, "{run:?}\n{}", ex.tla);
+}
+
+/// On the post state, `x: n @ 0..=255` names `x'` itself, as `x` would, so
+/// `n == e` assigns it; the `let`'s condition, which Rust has checked
+/// always holds, is left out, since it would read `x'` before the step
+/// assigns it and stop TLC. An or-pattern whose alternatives bind `y` to
+/// the same field binds it to `y'`, so it assigns too (it was refused).
+const POST_BINDERS: &str = r#"
+verus! {
+pub struct State { pub x: u8, pub y: u8 }
+
+pub open spec fn init(s: State) -> bool { s.x == 0 && s.y == 0 }
+
+pub open spec fn t_bind(pre: State, post: State) -> bool {
+    let State { x: n @ 0..=255, .. } = post;
+    pre.x < 2 && n == pre.x + 1 && post.y == pre.y
+}
+
+pub open spec fn t_or(pre: State, post: State) -> bool {
+    pre.x == 2 && pre.y < 3 && post.x == 0 && match post {
+        State { y, x: 0 } | State { y, x: 1 } => y == pre.y + 1,
+        _ => false,
+    }
+}
+
+pub open spec fn next(pre: State, post: State) -> bool { t_bind(pre, post) || t_or(pre, post) }
+
+pub open spec fn small(s: State) -> bool { s.x <= 2 && s.y <= 3 }
+}
+"#;
+
+#[test]
+fn tla_export_assigns_through_post_state_bindings_and_or_patterns() {
+    let ex = export_code(POST_BINDERS, "test_crate");
+    assert_eq!(ex.report["refusals"], serde_json::json!([]), "{}", ex.tla);
+    for t in ex.report["transitions"].as_array().unwrap() {
+        assert_eq!(t["unassigned"], serde_json::json!([]), "{}", ex.tla);
+    }
+    assert!(ex.tla.contains("(x' = (x + 1))"), "{}", ex.tla);
+    assert!(ex.tla.contains("(y' = (y + 1))"), "{}", ex.tla);
+    assert!(!ex.tla.contains("the let pattern at"), "{}", ex.tla);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let run = tlc(&jar, &ex.spec(), &ex.cfg);
+    assert_eq!(run.violated, Vec::<String>::new(), "{}", ex.tla);
+    // x in 0..=2, y in 0..=3.
+    assert_eq!(run.distinct, 12, "{run:?}\n{}", ex.tla);
 }
 
 /// An Init equality of two fields after a helper that assigns one of them:

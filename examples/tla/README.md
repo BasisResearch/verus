@@ -226,9 +226,12 @@ A destructuring `let` binds its value once and each name to its projection:
 one index shift (a nested tuple projects twice, `d__[1][2]`), and `let S { f,
 g } = e` reads `d__.f` and `d__.g`; a local is projected in place. A pattern
 on a whole state (`let State { x, .. } = post`, `match post`) binds each name
-to its state variable, so `x == e` assigns `x'` as `post.x == e` does. A `let`
-whose pattern tests a variant (`let (E::A(n) | E::B(n)) = e`, which always
-matches) puts the rest of the block under that condition. VerusSync's
+to its state variable (`x`, `n` in `x: n @ ..`, and a name both alternatives
+of an or-pattern bind to the same field), so `x == e` assigns `x'` as `post.x
+== e` does, and in Init assigns `x`. A `let` whose pattern tests a variant
+(`let (E::A(n) | E::B(n)) = e`, which always matches) puts the rest of the
+block under that condition, unless the value reads the post state, where the
+condition would read a variable before the step assigns it. VerusSync's
 `require let P = e` reaches the export as its macro lowers it: the guard
 `match e { P => true, _ => false }`, then a tuple `let` of P's names from
 `match e { P => (names), _ => arbitrary() }`, so the guard tests the variant
