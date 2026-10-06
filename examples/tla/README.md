@@ -234,15 +234,18 @@ matches) puts the rest of the block under that condition. VerusSync's
 `match e { P => (names), _ => arbitrary() }`, so the guard tests the variant
 and the `let` reads the fields; where P does not match, the transition is
 disabled. That `arbitrary()` arm, which the guard rules out, is an
-`Assert(FALSE, ...)` but not a refusal. Only that arm: an `_ => arbitrary()`
-arm anywhere else may be reached, and `arbitrary()` is refused there, as any
-function without a body is. `remove m -= [k => let v]` is the `contains`
-guard, `v == m[k]` and the removal, in that order, so a second removal of the
-same key in one transition is disabled, and a removal then an `add` of the
-same key is not; `remove o -= Some(let x)` likewise. A refused pattern (a destructuring `let` binding a
-closure, a range over chars) binds each name it binds to the refusal, so TLC
-stops only where such a name is evaluated; left free, the name made SANY
-reject the whole module.
+`Assert(FALSE, ...)` but not a refusal. `remove m -= [k => let v]` is the
+`contains` guard, `v == m[k]` and the removal, in that order, so a second
+removal of the same key in one transition is disabled, and a removal then an
+`add` of the same key is not; `remove o -= Some(let x)` likewise. A
+refutable pattern there (`[k => let Some(x)]`, `Some(let E::A(x))`) adds its
+match to the guard and reads its names from `match m[k] { P => (names), _ =>
+arbitrary() }`, whose `arbitrary()` arm the guard rules out in the same
+way. Only those arms: an `_ => arbitrary()` arm anywhere else may be reached,
+and `arbitrary()` is refused there, as any function without a body is. A
+refused pattern (a destructuring `let` binding a closure, a range over chars)
+binds each name it binds to the refusal, so TLC stops only where such a name
+is evaluated; left free, the name made SANY reject the whole module.
 
 A closure bound by `let` (or a closure parameter) is only ever applied; passed
 to a function, compared or returned, it is a refusal.

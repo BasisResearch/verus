@@ -501,6 +501,8 @@ struct Env {
     /// state, so reading them reads primed variables.
     primed: HashSet<VarIdent>,
     /// The set a bound variable ranges over, when known (see [`Dom`]).
+    /// rustc gives every binding its own `VarIdent`, so a binder that
+    /// shadows a name (`let k = k + 1`) never inherits the domain it had.
     domains: HashMap<VarIdent, Dom>,
     /// Names a pattern bound to a field of a whole state (`let State { x,
     /// .. } = post`): the role, the state variable, and the printed name
@@ -1979,8 +1981,6 @@ impl Exporter {
                         let value = self.quiet(|x| x.place(init, &env2));
                         let before = env2.clone();
                         let n = self.bind_var(&mut env2, name);
-                        // A name shadowed here loses the domain it had.
-                        env2.domains.remove(name);
                         if before.place_reads_post(init) {
                             env2.primed.insert(name.clone());
                         } else {
@@ -2108,17 +2108,16 @@ impl Exporter {
         // (see [`Exporter::pattern`]).
         let whole_state = place_var(place).is_some_and(|v| env.roles.contains_key(&v));
         let m = if whole_state { scrutinee.clone() } else { self.bind("m__") };
-        // VerusSync's `require let P = e` (and `assert let`) matches the
-        // macro's `tmp_for_match_<n>`, a local of `e`, after the guard
-        // `match tmp_for_match_<n> { P => true, _ => false }`.
-        let sync_tmp =
-            self.verussync && place_var(place).is_some_and(|v| v.0.starts_with("tmp_for_match_"));
+        // A match VerusSync's macro puts after a guard that it matches (see
+        // [`sync_guarded_scrutinee`]).
+        let sync_tmp = self.verussync && sync_guarded_scrutinee(place);
         let mut chain: Vec<(String, String)> = Vec::new();
         let mut otherwise: Option<String> = None;
         let mut arm_assigned = Vec::new();
         for arm in arms.iter() {
             // `_ => arbitrary()`, the arm VerusSync's macro gives the names
-            // of a `require let` where the pattern does not match: the
+            // of a `require let` or of a refutable `let` in a `remove`,
+            // `have` or `withdraw` where the pattern does not match: the
             // transition's guard rules it out, so it is never evaluated on a
             // step; were it, its value is unspecified and TLC stops there.
             // It is not a refusal and taints nothing. Anywhere else such an
@@ -2209,19 +2208,16 @@ impl Exporter {
         match &p.x {
             PatternX::Wildcard(_) => (None, vec![]),
             PatternX::Var(PatternBinding { name, .. }) => {
-                // A name shadowed here loses the domain it had.
-                match domain {
-                    Some(d) => env.domains.insert(name.clone(), d),
-                    None => env.domains.remove(name),
-                };
+                if let Some(d) = domain {
+                    env.domains.insert(name.clone(), d);
+                }
                 let n = self.bind_var(env, name);
                 (None, vec![(n, subject.to_string())])
             }
             PatternX::Binding { binding: PatternBinding { name, .. }, sub_pat } => {
-                match domain.clone() {
-                    Some(d) => env.domains.insert(name.clone(), d),
-                    None => env.domains.remove(name),
-                };
+                if let Some(d) = domain.clone() {
+                    env.domains.insert(name.clone(), d);
+                }
                 let n = self.bind_var(env, name);
                 let (c, mut lets) = self.pattern(subject, sub_pat, env, domain);
                 lets.insert(0, (n, subject.to_string()));
@@ -2253,7 +2249,6 @@ impl Exporter {
                         if let PatternX::Var(PatternBinding { name, .. }) = &b.a.x {
                             env.names.insert(name.clone(), printed.clone());
                             env.state_fields.insert(name.clone(), (role, var, printed));
-                            env.domains.remove(name);
                             continue;
                         }
                         let (c, l) = self.pattern(&printed, &b.a, env, None);
@@ -2342,8 +2337,12 @@ impl Exporter {
                 let (ca, la) = self.pattern(subject, a, &mut env_a, None);
                 let mut env_b = env.clone();
                 let (cb, lb) = self.pattern(subject, b, &mut env_b, None);
+                // An alternative that is itself an or-pattern lists each
+                // name once per alternative of its own.
                 let mut names = Vec::new();
                 pattern_names(a, &mut names);
+                let mut seen = HashSet::new();
+                names.retain(|v| seen.insert(v.clone()));
                 let mut values = Vec::new();
                 for v in &names {
                     let value = |e: &Env, lets: &[(String, String)]| {
@@ -2372,7 +2371,6 @@ impl Exporter {
                 let mut lets = Vec::new();
                 for (v, xa, xb) in values {
                     let n = self.bind_var(env, &v);
-                    env.domains.remove(&v);
                     let x = match &ca {
                         Some(c) if xa != xb => format!("(IF {c} THEN {xa} ELSE {xb})"),
                         _ => xa,
@@ -2412,7 +2410,6 @@ impl Exporter {
             if seen.insert(v.clone()) {
                 let n = self.bind_var(env, &v);
                 env.primed.remove(&v);
-                env.domains.remove(&v);
                 lets.push((n, r.clone()));
             }
         }
@@ -5033,6 +5030,27 @@ fn pattern_binds_closure(p: &Pattern, datatypes: &HashMap<Path, Datatype>) -> bo
             pattern_binds_closure(inner, datatypes)
         }
     }
+}
+
+/// Whether `place` is the scrutinee of a match VerusSync's macro puts after
+/// a guard that it matches the arm's pattern, so its `_ => arbitrary()` arm
+/// is never reached on a step. `require let P = e` (and `assert let`) binds
+/// `e` to `tmp_for_match_<n>` and guards with `match tmp_for_match_<n> { P
+/// => true, _ => false }`. A refutable `let` in `remove`, `have` or
+/// `withdraw` (`m -= [k => let Some(x)]`, `o -= Some(let P)`) matches the
+/// element it takes from the field's `update_tmp_<f>` (`update_tmp_m[k]`,
+/// `update_tmp_o.arrow_0()`), guarded by `contains(k)` (or `is Some`) `&&
+/// match .. { P => true, _ => false }`. Both names are the macro's own.
+fn sync_guarded_scrutinee(place: &Place) -> bool {
+    if place_var(place).is_some_and(|v| v.0.starts_with("tmp_for_match_")) {
+        return true;
+    }
+    let PlaceX::Temporary(e) = &place.x else { return false };
+    called(e).is_some_and(|(_, fun, args)| {
+        let f = fun_as_friendly_rust_name(&fun);
+        ["::index", "::spec_index", "::arrow_0"].iter().any(|m| f.ends_with(m))
+            && args.first().and_then(read_var).is_some_and(|v| v.0.starts_with("update_tmp_"))
+    })
 }
 
 /// Whether `e` is vstd's `arbitrary()`.
