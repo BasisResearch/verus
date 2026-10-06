@@ -936,16 +936,71 @@ fn mentions(e: &Expr, v: &VarIdent) -> bool {
     found
 }
 
+/// Whether a type mentions a type parameter (`A`, `(K, V)`, `Seq<K>`).
+fn typ_mentions_param(typ: &Typ) -> bool {
+    crate::ast_visitor::typ_visitor_check(typ, &mut |t: &Typ| match &**t {
+        TypX::TypParam(_) => Err(()),
+        _ => Ok(()),
+    })
+    .is_err()
+}
+
+/// The operator, both commutative and associative, that `e` applies to two
+/// operands, with them: `+`, `*`, `&&`, `||`, set union and intersection
+/// (also as `+` and `*`, vstd's `spec_add` and `spec_mul`) and multiset
+/// addition.
+fn ac_operator(e: &Expr) -> Option<(&'static str, Expr, Expr)> {
+    match &e.x {
+        ExprX::Binary(BinaryOp::Arith(ArithOp::Add(..)), a, b) => Some(("+", a.clone(), b.clone())),
+        ExprX::Binary(BinaryOp::Arith(ArithOp::Mul(..)), a, b) => Some(("*", a.clone(), b.clone())),
+        ExprX::Logical(LogicalOp::And, a, b) => Some(("&&", a.clone(), b.clone())),
+        ExprX::Logical(LogicalOp::Or, a, b) => Some(("||", a.clone(), b.clone())),
+        ExprX::Call { target: CallTarget::Fun(_, fun, ..), args, .. } if args.len() == 2 => {
+            let name = fun_as_friendly_rust_name(fun);
+            let op = match vstd_op(&name) {
+                Some(op @ ("set_union" | "set_intersect" | "multiset_add")) => op,
+                // `s + t` and `s * t` on sets, which `vstd_op` leaves to
+                // their vstd bodies.
+                _ => {
+                    let segs: Vec<&str> = name.split("::").collect();
+                    let module = segs.get(1).map(|m| m.trim_end_matches("_lib"));
+                    match (segs[0], module, segs[segs.len() - 1]) {
+                        ("vstd", Some("set" | "iset"), "spec_add") => "set_union",
+                        ("vstd", Some("set" | "iset"), "spec_mul") => "set_intersect",
+                        _ => return None,
+                    }
+                }
+            };
+            Some((op, args[0].clone(), args[1].clone()))
+        }
+        _ => None,
+    }
+}
+
+/// The operands of a chain of the operator `op` (see [`ac_operator`]):
+/// `acc + x + 1` is `[acc, x, 1]`.
+fn ac_leaves(e: &Expr, op: &str, leaves: &mut Vec<Expr>) {
+    let e = peel(e);
+    match ac_operator(&e) {
+        Some((o, a, b)) if o == op => {
+            ac_leaves(&a, op, leaves);
+            ac_leaves(&b, op, leaves);
+        }
+        _ => leaves.push(e),
+    }
+}
+
 /// Whether the body of a fold's closure `|acc, x| body` combines `acc` with
-/// an operator both commutative and associative: `acc op g(x)` or `g(x) op
-/// acc`, `g` not reading `acc`, for `+`, `*`, `&&`, `||`, set union and
-/// intersection, `insert` and multiset addition. Every order of the
-/// elements then folds to the same value. A cast around it must be the
-/// identity, or a checked one (see `UnaryOp::Clip`) around a sum of
-/// operands that are never negative: such a sum only grows, so every order
-/// leaves the type exactly when the total does, and TLC stops in every
-/// order or in none. Any other checked cast can leave the type in one order
-/// and not in another (`(acc + x) as nat` over `{-1, 1}`).
+/// an operator both commutative and associative (see [`ac_operator`]): a
+/// chain of it with `acc` one operand and no other operand reading `acc`
+/// (`acc + x + 1`, `g(x) || acc`), or `acc.insert(g(x))` for a set or a
+/// multiset. Every order of the elements then folds to the same value. A
+/// cast around it must be the identity, or a checked one (see
+/// `UnaryOp::Clip`) around a sum of operands that are never negative: such
+/// a sum only grows, so every order leaves the type exactly when the total
+/// does, and TLC stops in every order or in none. Any other checked cast
+/// can leave the type in one order and not in another (`(acc + x) as nat`
+/// over `{-1, 1}`).
 fn commutative_fold_body(acc: &VarIdent, body: &Expr) -> bool {
     let nonneg = |e: &Expr| match &peel(e).x {
         ExprX::Const(Constant::Int(i)) => i.sign() != num_bigint::Sign::Minus,
@@ -954,13 +1009,17 @@ fn commutative_fold_body(acc: &VarIdent, body: &Expr) -> bool {
             TypX::Int(IntRange::Nat | IntRange::U(_) | IntRange::USize)
         ),
     };
+    let leaves = |e: &Expr| {
+        let (op, ..) = ac_operator(e)?;
+        let mut leaves = Vec::new();
+        ac_leaves(e, op, &mut leaves);
+        Some(leaves)
+    };
     let body = match &peel(body).x {
         ExprX::Unary(UnaryOp::Clip { range, .. }, inner) => {
             let inner = peel(inner);
-            let monotone = match &inner.x {
-                ExprX::Binary(BinaryOp::Arith(ArithOp::Add(..)), a, b) => nonneg(a) && nonneg(b),
-                _ => false,
-            };
+            let monotone = matches!(ac_operator(&inner), Some(("+", ..)))
+                && leaves(&inner).is_some_and(|l| l.iter().all(nonneg));
             // Verus drops a cast its operand's type already fits (`(acc *
             // 2) as nat` reaches here uncast), so the identity case is only
             // a safeguard.
@@ -972,14 +1031,13 @@ fn commutative_fold_body(acc: &VarIdent, body: &Expr) -> bool {
         _ => peel(body),
     };
     let is_acc = |e: &Expr| read_var(e).as_ref() == Some(acc);
-    let either =
-        |a: &Expr, b: &Expr| is_acc(a) && !mentions(b, acc) || is_acc(b) && !mentions(a, acc);
+    if let Some(leaves) = leaves(&body) {
+        let (accs, others): (Vec<&Expr>, Vec<&Expr>) = leaves.iter().partition(|l| is_acc(l));
+        return accs.len() == 1 && !others.iter().any(|l| mentions(l, acc));
+    }
     match &body.x {
-        ExprX::Binary(BinaryOp::Arith(ArithOp::Add(..) | ArithOp::Mul(..)), a, b)
-        | ExprX::Logical(LogicalOp::And | LogicalOp::Or, a, b) => either(a, b),
         ExprX::Call { target: CallTarget::Fun(_, fun, ..), args, .. } if args.len() == 2 => {
             match vstd_op(&fun_as_friendly_rust_name(fun)) {
-                Some("set_union" | "set_intersect" | "multiset_add") => either(&args[0], &args[1]),
                 Some("set_insert" | "multiset_insert") => {
                     is_acc(&args[0]) && !mentions(&args[1], acc)
                 }
@@ -1064,6 +1122,8 @@ fn vstd_op(name: &str) -> Option<&'static str> {
         ("set", "is_empty") => "set_is_empty",
         ("set", "ext_equal") => "ext_equal",
         ("set", "full") => "set_full",
+        // `Set::new(|a| !self.contains(a))`: `None` for an infinite type.
+        ("set", "complement") => "set_complement",
         // `Set::range(lo, hi)` and the `FiniteRange::range_set` it inlines
         // to: the integers `lo <= i < hi`.
         ("set", "range") | ("set", "range_set") => "set_range",
@@ -1084,6 +1144,9 @@ fn vstd_op(name: &str) -> Option<&'static str> {
         ("map", "restrict") => "map_restrict",
         ("map", "remove_keys") => "map_remove_keys",
         ("map", "union_prefer_right") => "map_union_prefer_right",
+        // `Map::kv_pairs` is `self.dom().map(|k| (k, self[k]))`, and
+        // `IMap::kv_pairs` the same as a comprehension over `(K, V)`.
+        ("map", "kv_pairs") => "map_kv_pairs",
         // A multiset is a function from the elements it holds (a count
         // above zero) to their counts, so equal multisets are equal values.
         ("multiset", "empty") => "map_empty",
@@ -2752,11 +2815,19 @@ impl Exporter {
         let name = self.bind_param(&mut env2, &p.name, post);
         let guard = conjuncts(&peel(&body));
         let unbound = [p.name.clone()];
-        let domain =
-            match self.quiet(|x| x.bound_from_guard(&p.name, &p.a, &unbound, &guard, &env2)) {
-                Some(d) => d,
-                None => self.type_domain(&name, &p.a, &e.span),
-            };
+        let domain = match self
+            .quiet(|x| x.bound_from_guard(&p.name, &p.a, &unbound, &guard, &env2))
+        {
+            Some(d) => d,
+            // A hole over a type parameter (vstd's `Set::complement`
+            // ranges over `A`) is one constant for every instantiation,
+            // so no `.cfg` can give it each one's values.
+            None if typ_mentions_param(&p.a) => {
+                let what = "set comprehension over a type parameter (no hole can stand for every instantiation)";
+                return self.refuse(what, &e.span);
+            }
+            None => self.type_domain(&name, &p.a, &e.span),
+        };
         let b = self.expr(&body, &env2);
         let set = format!("{{{name} \\in {domain} : {b}}}");
         if lets.is_empty() { set } else { format!("(LET {} IN {set})", lets.join(" ")) }
@@ -2828,6 +2899,7 @@ impl Exporter {
             "set_finite" => format!("IsFiniteSet({})", g!(0)),
             "set_is_empty" => format!("({} = {{}})", g!(0)),
             "set_full" => self.refuse("Set::full (unbounded)", &e.span),
+            "set_complement" => self.refuse("Set::complement (unbounded)", &e.span),
             // Only integers: a `char` is a string here, with no range.
             "set_range" | "set_range_inclusive"
                 if args.len() == 2
@@ -3043,6 +3115,10 @@ impl Exporter {
                 format!(
                     "(LET {m} == {v} IN [{x} \\in (DOMAIN {m}) {set_op} ({keys}) |-> {m}[{x}]])"
                 )
+            }
+            "map_kv_pairs" => {
+                let (v, m, k) = (g!(0), self.bind("m__"), self.bind("k__"));
+                format!("(LET {m} == {v} IN {{<<{k}, {m}[{k}]>> : {k} \\in DOMAIN {m}}})")
             }
             // `@@` prefers its left operand.
             "map_union_prefer_right" => format!("({} @@ {})", g!(1), g!(0)),
@@ -7067,8 +7143,12 @@ pub fn export_module(krate: &Krate, arg: &str, exprs: &[String]) -> Result<Expor
     tla.push_str("`.\n\\* Mapping: structs are records; enum values are records with a `tag`;\n");
     tla.push_str("\\* Seq is a 1-based sequence (every index shifted once); Set is a set;\n");
     tla.push_str(
-        "\\* Map is a function (dom = DOMAIN, insert = :> @@); Option is a record tagged\n",
+        "\\* Map is a function (dom = DOMAIN, insert = :> @@); an ISet or IMap is a Set or\n",
     );
+    tla.push_str(
+        "\\* Map; Multiset is a function from the elements it holds to their counts (each\n",
+    );
+    tla.push_str("\\* above 0, count = the value or 0); Option is a record tagged\n");
     tla.push_str(
         "\\* None/Some with field v0; nat/int/uN are Int, and TypeOK keeps each variable\n",
     );

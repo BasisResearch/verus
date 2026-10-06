@@ -233,21 +233,27 @@ are few (`BOOLEAN`), else a hole (`Dom_int`). Over a hole the set is taken
 to be finite: `Set::new` is `Some` of the elements the hole's values give,
 where Verus's is `None` when `p` holds for infinitely many values, so the
 `.cfg`'s `Dom_int` must hold every element. For the same reason
-`ISet::finite` is refused: every set TLC builds is finite. An `ISet` and an
+`ISet::finite` is refused: every set TLC builds is finite, and so are
+`Set::full` and `Set::complement`, `None` for an infinite type. A
+comprehension over a hole of a type parameter (`ISet::new(|b: A| b != a)`
+in a generic function, or vstd's own generic bodies) is refused: one hole
+would stand for every instantiation. An `ISet` and an
 `IMap` are otherwise a `Set` and a `Map`, in TypeOK, the trace and
 `type_map` as in expressions. `Set::map` is `{f(x) : x \in s}`,
 `Set::filter` `{x \in s : p}`, and `Set::fold` a RECURSIVE operator
 removing a CHOOSEn element each time. That agrees with Verus only for a
 commutative `f` (Verus's fold is otherwise a choice among the orders, as
-`choose` is), so a fold is refused unless `f` is `acc op g(x)` or `g(x) op
-acc` with `g` not reading `acc` and `op` one of `+`, `*`, `&&`, `||`, set
-union or intersection, `insert`, or multiset addition. A cast around it
+`choose` is), so a fold is refused unless `f` is a chain of one operator
+`op` with `acc` one operand and no other reading it (`acc + x + 1`, `g(x)
+|| acc`), `op` one of `+`, `*`, `&&`, `||`, set union or intersection (also
+as `+` and `*`) or multiset addition, or else `acc.insert(g(x))`. A cast around it
 must be the identity, or a checked cast of a sum of operands never negative
 (`(acc + 1) as nat`), which grows in every order; any other checked cast can
 leave its type in one order and not in another (`(acc + x) as nat` over
 `{-1, 1}`), so that fold is refused. `Map::new(keys, f)` is `[k \in keys |->
 f(k)]`, `IMap::new(|k| p, f)` the same over `p`'s comprehension,
-`map_values` and `map_entries` map over `DOMAIN m`, `filter_keys`,
+`map_values` and `map_entries` map over `DOMAIN m`, `kv_pairs` is
+`{<<k, m[k]>> : k \in DOMAIN m}`, `filter_keys`,
 `restrict` and `remove_keys` shrink it, and `m1.union_prefer_right(m2)` is
 `m2 @@ m1`. A `Multiset` is the function from the elements it holds (a
 count above 0) to their counts, so `=` is its equality: `count` is the

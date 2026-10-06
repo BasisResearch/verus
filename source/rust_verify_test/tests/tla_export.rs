@@ -5525,6 +5525,9 @@ pub open spec fn odds(s: State) -> bool { s.e.len() == s.n / 2 && s.e.subset_of(
 pub open spec fn small(s: State) -> bool {
     s.t.filter(|x: int| x < 2) =~= Set::new(|x: int| 0 <= x < 2 && x < s.n).unwrap()
 }
+pub open spec fn as_iset(s: State) -> bool {
+    s.t.to_iset().filter(|x: int| x < 2).len() == (if s.n < 2 { s.n } else { 2 }) && s.t.to_iset().contains(0) == (s.n > 0)
+}
 "#,
         &[],
     );
@@ -5536,7 +5539,8 @@ fn tla_export_set_fold_is_a_recursive_operator() {
     // TLC folds in CHOOSE's order, which agrees with every other for the
     // commutative `f` the export accepts: `acc op g(x)` or `g(x) op acc` for
     // a commutative and associative `op`, here each of `+`, `*`, `&&`, `||`,
-    // `insert`, `union`, `intersect` and multiset `add` and `insert`, and a
+    // `insert`, `union`, `intersect` (also as `+` and `*`) and multiset `add`
+    // and `insert`, also chained (`acc + x + 1`, `2 * acc * (x + 1)`), and a
     // cast that is the identity (`(acc * 2) as nat`, which Verus drops, the
     // product being a `nat`). Each expected value differs from the seed's,
     // so a wrong lowering of the operator fails TLC.
@@ -5569,6 +5573,15 @@ pub open spec fn count(s: State) -> bool { s.t.fold(0nat, |acc: nat, x: int| acc
 pub open spec fn all(s: State) -> bool { s.t.fold(true, |acc: bool, x: int| acc && x < 4) }
 pub open spec fn doubled(s: State) -> bool {
     s.t.fold(Set::<int>::empty(), |acc: Set<int>, x: int| acc.insert(2 * x)) =~= s.t.map(|x: int| 2 * x)
+}
+pub open spec fn chained(s: State) -> bool {
+    &&& s.t.fold(0int, |acc: int, x: int| acc + x + 1) == s.n * (s.n - 1) / 2 + s.n
+    &&& s.t.fold(0nat, |acc: nat, x: int| (acc + 1 + 1) as nat) == 2 * s.n
+    &&& s.t.fold(1int, |acc: int, x: int| 2 * acc * (x + 1)) == (if s.n <= 1 { 1int } else if s.n == 2 { 2 } else if s.n == 3 { 6 } else { 24 }) * (if s.n == 0 { 1int } else if s.n == 1 { 2 } else if s.n == 2 { 4 } else if s.n == 3 { 8 } else { 16 })
+}
+pub open spec fn operators(s: State) -> bool {
+    &&& s.t.fold(Set::<int>::empty(), |acc: Set<int>, x: int| acc + set![x + 10]) =~= s.t.map(|x: int| x + 10)
+    &&& s.t.fold(s.t.insert(9), |acc: Set<int>, x: int| s.t.insert(9).remove(x) * acc) =~= set![9int]
 }
 "#,
         &[],
@@ -5625,6 +5638,8 @@ pub open spec fn entries(s: State) -> bool {
 
 #[test]
 fn tla_export_map_filter_keys_and_restrict_shrink_the_domain() {
+    // Each keeps the values of the keys it keeps (the squares); `kv_pairs`
+    // pairs each key with its value, for an `IMap` too.
     let ex = check_collections(
         "post.d == pre.d && post.e == pre.e && post.w == post.m.filter_keys(|k: int| k % 2 == 0)",
         r#"
@@ -5632,8 +5647,12 @@ pub open spec fn filtered(s: State) -> bool {
     s.w.dom() =~= s.t.filter(|k: int| k % 2 == 0) && forall|k: int| s.w.dom().contains(k) ==> s.w[k] == k * k
 }
 pub open spec fn restricted(s: State) -> bool {
-    &&& s.m.restrict(set![0int, 1]).dom() =~= s.t.intersect(set![0int, 1])
-    &&& s.m.remove_keys(set![0int]).dom() =~= s.t.remove(0)
+    &&& s.m.restrict(set![0int, 1]) =~= Map::new(s.t.intersect(set![0int, 1]), |k: int| k * k)
+    &&& s.m.remove_keys(set![0int]) =~= Map::new(s.t.remove(0), |k: int| k * k)
+}
+pub open spec fn pairs(s: State) -> bool {
+    &&& s.m.kv_pairs() =~= s.t.map(|k: int| (k, k * k))
+    &&& IMap::new(|k: int| s.m.contains_key(k), |k: int| s.m[k]).kv_pairs() =~= s.t.map(|k: int| (k, k * k)).to_iset()
 }
 "#,
         &[],
@@ -5645,6 +5664,9 @@ pub open spec fn restricted(s: State) -> bool {
     );
     assert!(ex.tla.contains("(DOMAIN m__) \\cap ((({} \\cup {0}) \\cup {1}))"), "{}", ex.tla);
     assert!(ex.tla.contains("(DOMAIN m__2) \\ (({} \\cup {0}))"), "{}", ex.tla);
+    // Both `kv_pairs` are the pairs over the domain, not a comprehension
+    // over the hole of `(K, V)` that `IMap::kv_pairs`'s body would give.
+    assert_eq!(ex.tla.matches("IN {<<k__").count(), 2, "{}", ex.tla);
 }
 
 #[test]
@@ -5737,6 +5759,7 @@ fn tla_export_seq_flatten_concatenates() {
 pub open spec fn flat(s: State) -> bool {
     &&& s.d =~= s.s
     &&& seq![s.s, seq![9int], s.s].flatten() =~= s.s.push(9).add(s.s)
+    &&& seq![s.s, seq![9int], s.s].flatten_alt() =~= s.s.push(9).add(s.s)
     &&& Seq::<Seq<int>>::empty().flatten().len() == 0
 }
 "#,
@@ -5801,7 +5824,11 @@ pub open spec fn clipped(s: State) -> bool {
 pub open spec fn mixed(s: State) -> bool {
     s.t.fold(0int, |acc: int, x: int| acc + (acc - x)) == -4
 }
+pub open spec fn scaled(s: State) -> bool { s.t.fold(0int, |acc: int, x: int| acc * 2 + x) == 4 }
 pub open spec fn finite(s: State) -> bool { ISet::new(|x: int| 0 <= x < 2).finite() }
+pub open spec fn others<A>(a: A) -> ISet<A> { ISet::new(|b: A| b != a) }
+pub open spec fn complemented(s: State) -> bool { s.t.complement() is Some }
+pub open spec fn generic(s: State) -> bool { others(1int).contains(2) }
 pub open spec fn picked_count(s: State) -> bool { Multiset::singleton(s.n).choose() == s.n }
 pub open spec fn small(s: State) -> bool { s.n <= 2 }
 }
@@ -5817,8 +5844,13 @@ fn tla_export_refuses_set_choose_and_a_function_parameter() {
     // other, and `acc + (acc - x)`, whose right operand reads `acc`: over
     // `{1, 2}` it is -4 in one order and -5 in the other): Verus's fold is
     // a choice among the orders, and TLC would hold `ordered`, `clipped`
-    // and `mixed` for the one it takes. `ISet::finite` is
-    // refused, as every set TLC builds is finite. A fold or `Set::new`
+    // and `mixed` for the one it takes; `acc * 2 + x` chains `+` over an
+    // operand reading `acc`, so `scaled` is refused too. `ISet::finite` is
+    // refused, as every set TLC builds is finite, and `Set::complement`, as
+    // `Set::full` is: it is `None` for an infinite type. A comprehension
+    // whose binder only a hole bounds is refused when the binder's type is a
+    // type parameter (`others`, and vstd's generic bodies): one hole would
+    // stand for every instantiation. A fold or `Set::new`
     // given a `spec_fn` parameter has no closure to apply (`total` and
     // `members` are operators of their own); every refusal names its
     // location, and the invariants reaching them are left out of the .cfg.
@@ -5836,8 +5868,10 @@ fn tla_export_refuses_set_choose_and_a_function_parameter() {
         ("choose (TLC cannot evaluate it)", 2),
         ("vstd operation given a function that does not reduce to a closure", 1),
         ("vstd operation given a predicate that does not reduce to a closure", 1),
-        ("Set::fold of a function not seen to be commutative", 3),
+        ("Set::fold of a function not seen to be commutative", 4),
         ("ISet::finite (the export builds only finite sets)", 1),
+        ("Set::complement (unbounded)", 1),
+        ("set comprehension over a type parameter (no hole can stand for every instantiation)", 1),
     ] {
         let at = at(what);
         assert_eq!(at.len(), count, "{what}: {:?}", refusals);
@@ -5920,6 +5954,8 @@ pub open spec fn members(s: State) -> bool {
     &&& forall|x: u8| s.i.contains(x) <==> s.b.contains(x)
     &&& counted(s.i) <= s.n && j.contains(7) && !s.i.remove(0).contains(0)
     &&& forall|k: u8| s.m.contains_key(k) ==> s.i.contains(k) && s.m[k] == k + 1
+    &&& exists|x: ISet<bool>| x.contains(true) && !x.contains(false)
+    &&& exists|x: IMap<bool, bool>| x.contains_key(true) && x[true] == false && !x.contains_key(false)
 }
 }
 "#;
@@ -5930,7 +5966,8 @@ fn tla_export_iset_imap_and_multiset_state_fields() {
     // export reads their type, as a `Set` and a `Map` are: TypeOK keeps
     // their elements in range, `type_map` calls them `set` and `map` (and a
     // `Multiset` a `multiset`), a trace logs them as a `Set` and a `Map`,
-    // and a `let` or a parameter holding one is a value, not a closure.
+    // a `let` or a parameter holding one is a value, not a closure, and a
+    // binder of one ranges over the sets or functions of its elements.
     let ex = export_code(INFINITE_COLLECTIONS, "test_crate");
     assert_eq!(ex.report["refusals"], serde_json::json!([]), "{}", ex.tla);
     assert_eq!(ex.report["holes"], serde_json::json!([]), "{}", ex.tla);
@@ -5945,6 +5982,13 @@ fn tla_export_iset_imap_and_multiset_state_fields() {
     assert_eq!(typ("b"), serde_json::json!({"kind": "multiset", "elem": u8_}));
     assert!(ex.tla.contains("(\\A e__ \\in i : (0 <= e__ /\\ e__ <= 255))"), "{}", ex.tla);
     assert!(ex.tla.contains("(\\A k__ \\in DOMAIN m : ((0 <= k__ /\\ k__ <= 255)"), "{}", ex.tla);
+    // A binder of an `ISet` or `IMap` type ranges as a `Set`'s or `Map`'s.
+    assert!(ex.tla.contains("\\E x_2 \\in (SUBSET BOOLEAN) :"), "{}", ex.tla);
+    assert!(
+        ex.tla.contains("\\E x_3 \\in UNION {[d__ -> BOOLEAN] : d__ \\in SUBSET BOOLEAN} :"),
+        "{}",
+        ex.tla
+    );
     let Some(jar) = tla_tools() else { return };
     sany(&jar, &ex.spec());
     // The multisets of at most 3 elements of {0, 1, 2}.
@@ -5971,4 +6015,31 @@ fn tla_export_iset_imap_and_multiset_state_fields() {
         let (depth, out) = follow(&jar, &spec, &cfg, &log, "");
         assert_eq!(depth, 2, "{bad}\n{out}");
     }
+}
+
+#[test]
+fn tla_export_multiset_binder_is_a_hole() {
+    // A multiset's counts are unbounded, so a binder of a `Multiset` type
+    // ranges over a hole, as a `Seq`'s does.
+    let ex = export_code(
+        r#"
+use vstd::prelude::*;
+use vstd::multiset::Multiset;
+verus! {
+pub struct State { pub b: Multiset<int>, pub n: nat }
+pub open spec fn init(s: State) -> bool { s.b == Multiset::<int>::empty() && s.n == 0 }
+pub open spec fn next(pre: State, post: State) -> bool { pre.n < 1 && post.b == pre.b.insert(0) && post.n == pre.n + 1 }
+pub open spec fn some(s: State) -> bool { exists|c: Multiset<int>| c.len() == s.n && c.subset_of(s.b) }
+}
+"#,
+        "test_crate",
+    );
+    assert_eq!(ex.report["refusals"], serde_json::json!([]), "{}", ex.tla);
+    let holes = ex.report["holes"].as_array().unwrap();
+    assert_eq!(holes.len(), 1, "{holes:?}");
+    assert_eq!(holes[0]["constant"], "Dom_Multiset_int");
+    assert!(holes[0]["location"].as_str().unwrap().contains("test.rs:"), "{:?}", holes);
+    assert!(ex.tla.contains("\\E c \\in Dom_Multiset_int :"), "{}", ex.tla);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
 }
