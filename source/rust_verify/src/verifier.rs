@@ -963,6 +963,12 @@ impl Verifier {
                 parts.join("; ")
             );
         }
+        if !export.report.scalar_constants.is_empty() {
+            eprintln!(
+                "tla-export: warning: init and next share {} by name alone; if next chooses it per step, the CONSTANT drops behaviours",
+                export.report.scalar_constants.join(", ")
+            );
+        }
         if !export.report.unchecked.is_empty() {
             eprintln!(
                 "tla-export: NOT CHECKED, predicates over the state and a label or a non-constant value: {}",

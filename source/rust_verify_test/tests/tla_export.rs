@@ -5863,7 +5863,7 @@ pub struct Cfg { pub step: u8 }
 pub open spec fn init(s: State) -> bool { s.x == 0 }
 
 pub open spec fn next(pre: State, post: State, c: Cfg) -> bool {
-    1 <= c.step <= 2 && pre.x + c.step <= 4 && post.x == pre.x + c.step
+    2 <= c.step <= 3 && pre.x + c.step <= 6 && post.x == pre.x + c.step
 }
 }
 "#;
@@ -5877,8 +5877,9 @@ fn tla_export_quantifies_a_record_after_the_states() {
     sany(&jar, &ex.spec());
     let run = tlc(&jar, &ex.spec(), &ex.cfg);
     assert_eq!(run.violated, Vec::<String>::new());
-    // Steps of 1 or 2 up to 4: every x in 0..4.
-    assert_eq!(run.distinct, 5, "{run:?}");
+    // Steps of 2 or 3 up to 6: {0, 2, 3, 4, 5, 6}; one step for the whole
+    // behaviour reaches {0, 2, 4, 6} or {0, 3, 6}.
+    assert_eq!(run.distinct, 6, "{run:?}");
 }
 
 /// A record only `init` takes is quantified once in Init, not a constant:
@@ -5925,11 +5926,12 @@ fn tla_export_lists_a_predicate_over_an_init_label_as_not_checked() {
 }
 
 /// A constants field the model never reads still needs a value; a value
-/// out of its type's range fails the ASSUME, and none at all stops TLC.
+/// out of its type's range (a `bool` included) fails the ASSUME, and none
+/// at all stops TLC.
 const UNREAD_CONSTANT: &str = r#"
 use vstd::prelude::*;
 verus! {
-pub struct Constants { pub cap: u8, pub unused: u8 }
+pub struct Constants { pub cap: u8, pub unused: u8, pub flag: bool }
 
 pub struct State { pub x: u8 }
 
@@ -5956,18 +5958,34 @@ fn tla_export_asks_for_every_constant_and_checks_its_range() {
         "{}",
         ex.tla
     );
+    assert!(ex.tla.contains("ASSUME Const_c_flag \\in BOOLEAN\n"), "{}", ex.tla);
     let Some(jar) = tla_tools() else { return };
     sany(&jar, &ex.spec());
-    let cfg = format!("{}CONSTANTS Const_c_cap = 3\nCONSTANTS Const_c_unused = 9\n", ex.cfg);
+    let cfg = format!(
+        "{}CONSTANTS Const_c_cap = 3\nCONSTANTS Const_c_unused = 9\nCONSTANTS Const_c_flag = TRUE\n",
+        ex.cfg
+    );
     let run = tlc(&jar, &ex.spec(), &cfg);
     assert_eq!(run.violated, Vec::<String>::new());
     assert_eq!(run.distinct, 4, "{run:?}");
     // Out of the field's range: the ASSUME fails before any state.
-    let cfg = format!("{}CONSTANTS Const_c_cap = 3\nCONSTANTS Const_c_unused = 300\n", ex.cfg);
+    let cfg = format!(
+        "{}CONSTANTS Const_c_cap = 3\nCONSTANTS Const_c_unused = 300\nCONSTANTS Const_c_flag = TRUE\n",
+        ex.cfg
+    );
     let out = tlc_output(&jar, &ex.spec(), &cfg);
     assert!(out.contains("Assumption") && out.contains("is false"), "{}", out);
+    // A bool given a number stops TLC at its ASSUME too (TLC cannot
+    // compare 3 with TRUE).
+    let cfg = format!(
+        "{}CONSTANTS Const_c_cap = 3\nCONSTANTS Const_c_unused = 9\nCONSTANTS Const_c_flag = 3\n",
+        ex.cfg
+    );
+    let out = tlc_output(&jar, &ex.spec(), &cfg);
+    assert!(out.contains("Evaluating assumption"), "{}", out);
+    assert!(!out.contains("distinct states found"), "{}", out);
     // Left unassigned: TLC stops.
-    let cfg = format!("{}CONSTANTS Const_c_cap = 3\n", ex.cfg);
+    let cfg = format!("{}CONSTANTS Const_c_cap = 3\nCONSTANTS Const_c_flag = TRUE\n", ex.cfg);
     let out = tlc_output(&jar, &ex.spec(), &cfg);
     assert!(out.contains("Const_c_unused"), "{}", out);
     assert!(!out.contains("distinct states found"), "{}", out);
@@ -6100,6 +6118,20 @@ fn tla_export_gives_a_scalar_constant_by_name() {
         reason.1
     );
     assert!(ex.stderr.contains("NOT CHECKED"), "{}", ex.stderr);
+    // A scalar constant is told by its name alone: warned of.
+    assert!(
+        ex.stderr.contains("tla-export: warning: init and next share n by name alone; if next chooses it per step, the CONSTANT drops behaviours\n"),
+        "{}",
+        ex.stderr
+    );
+    assert!(
+        ex.report["parameters"][0]["why"]
+            .as_str()
+            .unwrap()
+            .contains("a scalar told by its name alone"),
+        "{}",
+        ex.report["parameters"]
+    );
     let Some(jar) = tla_tools() else { return };
     sany(&jar, &ex.spec());
     let run = tlc(&jar, &ex.spec(), &format!("{}CONSTANTS Const_n = 3\n", ex.cfg));
@@ -6443,4 +6475,256 @@ fn tla_export_trace_spec_follows_a_log_beside_constants_and_a_label() {
     std::fs::write(&log, format!("{}\n{bad}\n", lines[0])).unwrap();
     let (depth, out) = follow(&jar, &spec, &cfg, &log, constants);
     assert_eq!(depth, 1, "{out}");
+}
+
+/// A constants struct holding a vstd collection is still constants: `Seq`
+/// is a struct over an enum inside vstd, but a value, not a choice. One
+/// holding an `Option` is a choice, and says so.
+const SEQ_IN_CONSTANTS: &str = r#"
+use vstd::prelude::*;
+verus! {
+pub struct Constants { pub cap: nat, pub ids: Seq<nat> }
+
+pub struct State { pub x: nat }
+
+pub open spec fn init(c: Constants, s: State) -> bool { s.x == 0 }
+
+pub open spec fn next(c: Constants, pre: State, post: State) -> bool {
+    pre.x < c.cap && pre.x < c.ids.len() && post.x == pre.x + 1
+}
+
+impl State {
+    pub open spec fn inv(self, c: Constants) -> bool { self.x <= c.cap }
+}
+}
+"#;
+
+const OPTION_IN_CONSTANTS: &str = r#"
+use vstd::prelude::*;
+verus! {
+pub struct Constants { pub cap: nat, pub limit: Option<nat> }
+
+pub struct State { pub x: nat }
+
+pub open spec fn init(c: Constants, s: State) -> bool { s.x == 0 }
+
+pub open spec fn next(c: Constants, pre: State, post: State) -> bool {
+    pre.x < c.cap && post.x == pre.x + 1
+}
+}
+"#;
+
+#[test]
+fn tla_export_keeps_a_constants_struct_holding_a_seq_constants() {
+    let ex = export_code(SEQ_IN_CONSTANTS, "test_crate");
+    assert_eq!(
+        parameters(&ex.report),
+        [
+            ("next".into(), "c".into(), "constant".into()),
+            ("init".into(), "c".into(), "constant".into())
+        ]
+    );
+    assert_eq!(names(&ex.report["invariants"]), ["inv"]);
+    assert!(!ex.tla.contains("NOT CHECKED"), "{}", ex.tla);
+    assert!(
+        ex.tla.contains("ASSUME (\\A i__ \\in 1..Len(Const_c_ids) : (Const_c_ids[i__] >= 0))\n"),
+        "{}",
+        ex.tla
+    );
+    assert!(ex.cfg.contains("\\*   Const_c_ids = <a Seq_nat>\n"), "{}", ex.cfg);
+    let opt = export_code(OPTION_IN_CONSTANTS, "test_crate");
+    assert_eq!(
+        parameters(&opt.report),
+        [
+            ("next".into(), "c".into(), "label".into()),
+            ("init".into(), "c".into(), "init_label".into())
+        ]
+    );
+    let why = opt.report["parameters"][0]["why"].as_str().unwrap();
+    assert!(
+        why.contains(
+            "a struct holding an `Option`, a choice of None or Some (`limit: Option_nat`)"
+        ) && why.contains("a predicate over it is not checked as an invariant"),
+        "{}",
+        why
+    );
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    // A sequence is not a .cfg value: an MC module gives it.
+    let mc = ex.spec().with_file_name("MC.tla");
+    std::fs::write(
+        &mc,
+        format!("---- MODULE MC ----\nEXTENDS {}\nMC_ids == <<7, 8>>\n====\n", ex.module),
+    )
+    .unwrap();
+    let cfg = format!("{}CONSTANTS\n  Const_c_cap = 4\n  Const_c_ids <- MC_ids\n", ex.cfg);
+    let run = tlc(&jar, &mc, &cfg);
+    assert_eq!(run.violated, Vec::<String>::new());
+    // x below both cap (4) and the length of ids (2): 0..2.
+    assert_eq!(run.distinct, 3, "{run:?}");
+}
+
+/// `init` takes one each of two datatypes that `next` takes twice: which is
+/// the state is ambiguous, refused rather than guessed (the first in
+/// `next`'s order would make `L` the state and `pre`, `post` labels).
+const AMBIGUOUS_STATE: &str = r#"
+use vstd::prelude::*;
+verus! {
+pub struct State { pub x: nat }
+
+pub struct L { pub k: u8 }
+
+pub open spec fn init(s: State, l: L) -> bool { s.x == 0 }
+
+pub open spec fn next(a: L, b: L, pre: State, post: State) -> bool {
+    pre.x < 3 && post.x == pre.x + 1
+}
+}
+"#;
+
+#[test]
+fn tla_export_refuses_an_ambiguous_state() {
+    let stderr = export_fails(AMBIGUOUS_STATE, "test_crate");
+    assert!(
+        stderr.contains("`next` in `test_crate` (")
+            && stderr.contains(
+                "takes two parameters of each of `test_crate::L` and `test_crate::State`, and `init` takes one of each: which is the state is ambiguous"
+            ),
+        "{}",
+        stderr
+    );
+}
+
+/// A helper `State::next(self, post, by)` beside the model's `next(c, pre,
+/// post)`: the one sharing a parameter with `init` is the model's. When none
+/// does, the export refuses.
+const TWO_NEXTS: &str = r#"
+use vstd::prelude::*;
+verus! {
+pub struct Constants { pub cap: nat }
+
+pub struct State { pub x: nat }
+
+impl State {
+    pub open spec fn next(self, post: State, by: nat) -> bool { post.x == self.x + by }
+}
+
+pub open spec fn init(c: Constants, s: State) -> bool { s.x == 0 }
+
+pub open spec fn next(c: Constants, pre: State, post: State) -> bool {
+    pre.x < c.cap && post.x == pre.x + 1
+}
+}
+"#;
+
+const TWO_NEXTS_NEITHER_SHARES: &str = r#"
+use vstd::prelude::*;
+verus! {
+pub struct State { pub x: nat }
+
+impl State {
+    pub open spec fn next(self, post: State, by: nat) -> bool { post.x == self.x + by }
+}
+
+pub open spec fn init(s: State) -> bool { s.x == 0 }
+
+pub open spec fn next(pre: State, post: State, step: u8) -> bool {
+    step <= 1 && pre.x < 3 && post.x == pre.x + step
+}
+}
+"#;
+
+#[test]
+fn tla_export_takes_the_next_sharing_a_parameter_with_init() {
+    let ex = export_code(TWO_NEXTS, "test_crate");
+    assert_eq!(
+        parameters(&ex.report),
+        [
+            ("next".into(), "c".into(), "constant".into()),
+            ("init".into(), "c".into(), "constant".into())
+        ]
+    );
+    assert!(ex.tla.contains("next_closed ==\n    next(Const_c)\n"), "{}", ex.tla);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let run = tlc(&jar, &ex.spec(), &format!("{}CONSTANTS Const_c_cap = 2\n", ex.cfg));
+    assert_eq!(run.violated, Vec::<String>::new());
+    assert_eq!(run.distinct, 3, "{run:?}");
+    let stderr = export_fails(TWO_NEXTS_NEITHER_SHARES, "test_crate");
+    assert!(
+        stderr.contains("`test_crate` has several `next`s taking more than the states (`test_crate::State::next` at ")
+            && stderr.contains("none shares a parameter with `init`: which is the model's is ambiguous"),
+        "{}",
+        stderr
+    );
+}
+
+/// An IO trace (IronKV's `next(pre, post, ios: Seq<LIoOp>)`) is a label:
+/// its domain is a hole the .cfg fills with the event sequences worth
+/// exploring, kept in its Rust type by an ASSUME.
+const IO_TRACE: &str = r#"
+use vstd::prelude::*;
+verus! {
+pub struct State { pub x: u8 }
+
+pub enum Ev { Send { v: u8 }, Recv }
+
+pub open spec fn init(s: State) -> bool { s.x == 0 }
+
+pub open spec fn next(pre: State, post: State, ios: Seq<Ev>) -> bool {
+    &&& ios.len() == 1
+    &&& ios[0] is Send
+    &&& pre.x < 3
+    &&& post.x == pre.x + 1
+}
+
+pub open spec fn small(s: State) -> bool { s.x <= 3 }
+}
+"#;
+
+#[test]
+fn tla_export_quantifies_an_io_trace() {
+    let ex = export_code(IO_TRACE, "test_crate");
+    assert_eq!(parameters(&ex.report), [("next".into(), "ios".into(), "label".into())]);
+    assert_eq!(ex.report["parameters"][0]["tla"], "\\E ios \\in Dom_Seq_Ev");
+    assert_eq!(names(&ex.report["holes"]), ["\"Dom_Seq_Ev\""]);
+    assert!(
+        ex.tla.contains("next_closed ==\n    (\\E ios \\in Dom_Seq_Ev : next(ios))\n"),
+        "{}",
+        ex.tla
+    );
+    assert!(
+        ex.tla.contains("ASSUME \\A h__ \\in Dom_Seq_Ev : (\\A i__ \\in 1..Len(h__) : (h__[i__].tag = \"Send\" => (0 <= h__[i__].v /\\ h__[i__].v <= 255)))\n"),
+        "{}",
+        ex.tla
+    );
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let mc = ex.spec().with_file_name("MC.tla");
+    let run_with = |ios: &str| {
+        std::fs::write(
+            &mc,
+            format!("---- MODULE MC ----\nEXTENDS {}\nMC_ios == {ios}\n====\n", ex.module),
+        )
+        .unwrap();
+        tlc(&jar, &mc, &format!("{}CONSTANTS\n  Dom_Seq_Ev <- MC_ios\n", ex.cfg))
+    };
+    // With a send among the explored traces, x climbs to 3.
+    let run = run_with("{<<>>, <<[tag |-> \"Recv\"]>>, <<[tag |-> \"Send\", v |-> 0]>>}");
+    assert_eq!(run.violated, Vec::<String>::new());
+    assert_eq!(run.distinct, 4, "{run:?}");
+    // Without one, no step is enabled.
+    let run = run_with("{<<>>, <<[tag |-> \"Recv\"]>>}");
+    assert_eq!(run.distinct, 1, "{run:?}");
+    // A value out of the event's type fails the ASSUME.
+    std::fs::write(
+        &mc,
+        format!(
+            "---- MODULE MC ----\nEXTENDS {}\nMC_ios == {{<<[tag |-> \"Send\", v |-> 300]>>}}\n====\n",
+            ex.module
+        ),
+    )
+    .unwrap();
+    let out = tlc_output(&jar, &mc, &format!("{}CONSTANTS\n  Dom_Seq_Ev <- MC_ios\n", ex.cfg));
+    assert!(out.contains("Assumption") && out.contains("is false"), "{}", out);
 }
