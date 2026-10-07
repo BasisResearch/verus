@@ -36,19 +36,26 @@
 //! Label`/`InitLabel`). `next`'s state is the datatype exactly two of its
 //! parameters have (the first pre, the second post), `init` the function of
 //! that name with one parameter of it (a `next` whose state no `init` takes,
-//! such as a helper `Lbl::next(self, other: Lbl)`, is not the model's). When
-//! `init` takes one each of two such datatypes, the state is the one whose
-//! parameter of `init` shares its name with none of `next`'s (that one is a
-//! value they share); when that does not settle it, or several `next`s take
-//! more than the states and not exactly one shares a parameter with `init`,
-//! the export refuses rather than guess. Every other parameter is one of:
+//! or whose state another `next` takes beside its states, such as a helper
+//! `Lbl::next(self, other: Lbl)`, is not the model's; `next`s of two
+//! datatypes beyond that are refused). When `init` takes one each of two
+//! such datatypes, the state is the one whose parameter of `init` shares
+//! its name with none of `next`'s (that one is a value they share). Of
+//! several `next`s, `next(pre, post)` is the model's beside an `init(s)` of
+//! the state alone; otherwise it is the one that shares a parameter with
+//! `init`, or else the one `next(pre, post)` (a helper `State::next(self,
+//! post)` does not beat `next(c, pre, post)` beside `init(c, s)`). When
+//! these do not settle it, the export refuses rather than guess. Types are
+//! compared through `&` (`init(s, c: &C)` and `next(pre, post, c: C)` take
+//! one value). Every other parameter is one of:
 //!
 //! * a constant: a parameter of `next` that `init` also takes (the same
 //!   name and type, or, before `next`'s states, `init`'s one parameter of
 //!   its datatype whatever its name; a same-typed parameter of another name
 //!   is a value of its own), unless it is a choice among variants: an enum
 //!   of several variants, or a struct holding one in a field, through
-//!   structs (`struct Lbl { op: Op }`; an `Option` field counts, vstd's
+//!   structs and tuples (`struct Lbl { op: Op }`, `pair: (Op, u8)`; an
+//!   `Option` field counts, vstd's
 //!   collections do not: a `Seq<Id>` field is a value). It
 //!   is fixed for the whole behaviour, so it is a `CONSTANT` the `.cfg`
 //!   supplies; a struct is one `Const_<param>_<field>` per field (TLC's
@@ -917,6 +924,27 @@ fn typ_name(typ: &Typ) -> String {
     typ_name_with(typ, &mut |p: &Path| last_segment(p))
 }
 
+/// A type as Rust spells it (`(Op, u8)`, `Option<nat>`), for what the
+/// user reads; [`typ_name`] is the identifier the export names holes by.
+fn rust_typ_name(typ: &Typ) -> String {
+    match &**typ {
+        TypX::Datatype(Dt::Path(p), args, _) if !args.is_empty() => {
+            let args: Vec<String> = args.iter().map(rust_typ_name).collect();
+            format!("{}<{}>", last_segment(p), args.join(", "))
+        }
+        TypX::Datatype(Dt::Tuple(_), args, _) => {
+            let args: Vec<String> = args.iter().map(rust_typ_name).collect();
+            if args.len() == 1 {
+                format!("({},)", args[0])
+            } else {
+                format!("({})", args.join(", "))
+            }
+        }
+        TypX::Decorate(_, _, t) | TypX::Boxed(t) => rust_typ_name(t),
+        _ => typ_name(typ),
+    }
+}
+
 /// [`typ_name`], with `datatype` naming each datatype.
 fn typ_name_with(typ: &Typ, datatype: &mut dyn FnMut(&Path) -> String) -> String {
     match &**typ {
@@ -972,6 +1000,19 @@ fn read_const_var(e: &Expr) -> Option<Fun> {
         ExprX::Block(stmts, Some(tail)) if stmts.is_empty() => read_const_var(tail),
         _ => None,
     }
+}
+
+/// Whether two parameters have one type, through `&` and `Box`: `init(s,
+/// c: &C)` and `next(pre, post, c: C)` take one value, as the state's
+/// parameters are told through them too.
+fn same_typ(a: &Typ, b: &Typ) -> bool {
+    fn strip(t: &Typ) -> Typ {
+        match &**t {
+            TypX::Decorate(_, _, u) | TypX::Boxed(u) => strip(u),
+            _ => t.clone(),
+        }
+    }
+    crate::ast_util::types_equal(&strip(a), &strip(b))
 }
 
 fn place_var(p: &Place) -> Option<VarIdent> {
@@ -6004,20 +6045,41 @@ fn select_invariants(
 }
 
 /// Why a value of `t` is a choice among variants, when it is one: an enum
-/// of several variants the crate declares, or a struct one of whose fields
-/// (through structs) is such an enum (`struct Lbl { op: Op }`, a label
-/// wrapped in a struct). A choice made per step is a label, never a
-/// constant. vstd's collections are values, whatever their representation
-/// (`Seq` is a struct over an enum `SeqInner`): a constants struct holding a
-/// `Seq<Id>` is still constants.
+/// of several variants the crate declares, or a struct or tuple one of
+/// whose fields (through structs and tuples) is such an enum (`struct Lbl {
+/// op: Op }`, a label wrapped in a struct; `pair: (Op, u8)`). A choice made
+/// per step is a label, never a constant. vstd's collections are values,
+/// whatever their representation (`Seq` is a struct over an enum
+/// `SeqInner`): a constants struct holding a `Seq<Id>` is still constants.
 fn variant_choice(krate: &Krate, t: &Typ, seen: &mut Vec<Path>) -> Option<String> {
-    let TypX::Datatype(Dt::Path(p), args, _) = &*crate::ast_util::undecorate_typ(t) else {
-        return None;
+    // What a field or component `ft` that is a choice for `why` is.
+    let holding = |ft: &Typ, why: String| -> String {
+        let option = typ_datatype(ft)
+            .map_or(false, |q| path_as_friendly_rust_name(&q) == "core::option::Option");
+        if option {
+            "an `Option`, a choice of None or Some".into()
+        } else if matches!(&*crate::ast_util::undecorate_typ(ft), TypX::Datatype(Dt::Tuple(_), ..))
+        {
+            why
+        } else {
+            "an enum of several variants".into()
+        }
     };
-    if seen.contains(p) || path_as_friendly_rust_name(p).starts_with("vstd::") {
+    let (p, args) = match &*crate::ast_util::undecorate_typ(t) {
+        TypX::Datatype(Dt::Path(p), args, _) => (p.clone(), args.clone()),
+        TypX::Datatype(Dt::Tuple(_), args, _) => {
+            return args.iter().enumerate().find_map(|(i, a)| {
+                variant_choice(krate, a, seen).map(|why| {
+                    format!("a tuple holding {} (`.{i}: {}`)", holding(a, why), rust_typ_name(a))
+                })
+            });
+        }
+        _ => return None,
+    };
+    if seen.contains(&p) || path_as_friendly_rust_name(&p).starts_with("vstd::") {
         return None;
     }
-    let d = krate.datatypes.iter().find(|d| matches!(&d.x.name, Dt::Path(q) if q == p))?;
+    let d = krate.datatypes.iter().find(|d| matches!(&d.x.name, Dt::Path(q) if *q == p))?;
     if d.x.variants.len() > 1 {
         return Some("an enum of several variants".into());
     }
@@ -6027,19 +6089,13 @@ fn variant_choice(krate: &Krate, t: &Typ, seen: &mut Vec<Path>) -> Option<String
     seen.push(p.clone());
     let why = d.x.variants.first().and_then(|v| {
         v.fields.iter().find_map(|f| {
-            let ft = crate::sst_util::subst_typ_for_datatype(&d.x.typ_params, args, &f.a.0);
-            variant_choice(krate, &ft, seen).map(|_| {
-                let option = typ_datatype(&ft)
-                    .map_or(false, |q| path_as_friendly_rust_name(&q) == "core::option::Option");
+            let ft = crate::sst_util::subst_typ_for_datatype(&d.x.typ_params, &args, &f.a.0);
+            variant_choice(krate, &ft, seen).map(|why| {
                 format!(
                     "a struct holding {} (`{}: {}`)",
-                    if option {
-                        "an `Option`, a choice of None or Some"
-                    } else {
-                        "an enum of several variants"
-                    },
+                    holding(&ft, why),
                     field_name(&f.name),
-                    typ_name(&ft)
+                    rust_typ_name(&ft)
                 )
             })
         })
@@ -6073,29 +6129,24 @@ fn classify_extras(
         }
         let name = ident_name(&p.x.name);
         // init's parameters of this type it has not given to another.
-        let same_typ: Vec<usize> = (0..init_extra.len())
-            .filter(|&j| {
-                init_taken[j].is_none()
-                    && crate::ast_util::types_equal(&init_extra[j].1.x.typ, &p.x.typ)
-            })
+        let of_typ: Vec<usize> = (0..init_extra.len())
+            .filter(|&j| init_taken[j].is_none() && same_typ(&init_extra[j].1.x.typ, &p.x.typ))
             .collect();
         // The same parameter of init: its name and type. The type alone is
         // not enough (`init(s, start: nat)` beside `next(pre, post, by:
         // nat)` takes two values, not one), except for a constants
         // parameter by position whose datatype init takes once.
         let shared =
-            same_typ.iter().copied().find(|&j| init_extra[j].1.x.name.0 == p.x.name.0).or_else(
+            of_typ.iter().copied().find(|&j| init_extra[j].1.x.name.0 == p.x.name.0).or_else(
                 || {
-                    (i < first_state && same_typ.len() == 1 && typ_datatype(&p.x.typ).is_some())
-                        .then(|| same_typ[0])
+                    (i < first_state && of_typ.len() == 1 && typ_datatype(&p.x.typ).is_some())
+                        .then(|| of_typ[0])
                 },
             );
         // init's parameter of this name and another type: a value of its own.
         let namesake = init_extra
             .iter()
-            .find(|(_, q)| {
-                q.x.name.0 == p.x.name.0 && !crate::ast_util::types_equal(&q.x.typ, &p.x.typ)
-            })
+            .find(|(_, q)| q.x.name.0 == p.x.name.0 && !same_typ(&q.x.typ, &p.x.typ))
             .map_or(String::new(), |(_, q)| {
                 format!(
                     " (init's `{name}` is a `{}`, another type: a value of its own)",
@@ -6172,7 +6223,7 @@ fn classify_extras(
                     "next takes it before the states, but init does not take it: nothing says it is fixed for the behaviour, so it is chosen per step, quantified per step in Next{namesake}"
                 ),
             )
-        } else if let (Some(&j), true) = (same_typ.first(), namesake.is_empty()) {
+        } else if let (Some(&j), true) = (of_typ.first(), namesake.is_empty()) {
             (
                 ExtraKind::Label,
                 Guess::Settled,
@@ -6230,7 +6281,7 @@ fn classify_extras(
                 ExtraKind::Constant(*k),
                 "init and next both take it: the same CONSTANT as next's".to_string(),
             ),
-            (None, Some(q)) if !crate::ast_util::types_equal(&q.x.typ, &p.x.typ) => (
+            (None, Some(q)) if !same_typ(&q.x.typ, &p.x.typ) => (
                 ExtraKind::InitLabel,
                 format!(
                     "next's parameter of its name is a `{}`, another type, so init's is a value of its own: any value init accepts, quantified once in Init",
@@ -6364,14 +6415,68 @@ fn recognise(
         })
         .collect();
     let nexts = if modelled.is_empty() { nexts } else { modelled };
-    let next = match nexts.iter().find(|f| f.x.params.len() == 2) {
+    // When they are `next`s of different datatypes, one whose datatype
+    // another takes beside its states is a helper on that other's label
+    // (`Lbl::next(self, other: Lbl)` beside `next(pre, post, l: Lbl)`, even
+    // when `init` takes an `Lbl` too); if that leaves several datatypes,
+    // which machine is the model's is ambiguous.
+    let state_of = |f: &Function| state_pair(f).ok().flatten();
+    let states: Vec<Path> = nexts.iter().filter_map(|f| state_of(f)).collect();
+    let nexts: Vec<&Function> = if states.iter().all(|s| *s == states[0]) {
+        nexts
+    } else {
+        let beside = |s: &Path| {
+            nexts.iter().any(|g| {
+                state_of(g).as_ref() != Some(s)
+                    && g.x.params.iter().any(|p| {
+                        typ_datatype(&p.x.typ).as_ref() == Some(s)
+                            && typ_datatype(&p.x.typ) != state_of(g)
+                    })
+            })
+        };
+        let kept: Vec<&Function> = nexts
+            .iter()
+            .copied()
+            .filter(|f| !state_of(f).as_ref().map_or(false, |s| beside(s)))
+            .collect();
+        let left: Vec<Path> = kept.iter().filter_map(|f| state_of(f)).collect();
+        if left.iter().any(|s| *s != left[0]) {
+            return Err(format!(
+                "`{module}` has `next`s of several datatypes that an `init` takes ({}): which is the model's state is ambiguous; rename the others",
+                kept.iter()
+                    .map(|f| format!(
+                        "`{}` at {}",
+                        fun_as_friendly_rust_name(&f.x.name),
+                        span_string(&f.span)
+                    ))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        kept
+    };
+    // `init` of the state alone, beside a `next` of it.
+    let plain_init = |f: &Function| {
+        let Some(s) = state_of(f) else { return false };
+        in_module.iter().any(|g| {
+            short(g) == "init"
+                && g.x.params.len() == 1
+                && typ_datatype(&g.x.params[0].x.typ).as_ref() == Some(&s)
+        })
+    };
+    let plain: Vec<&Function> = nexts.iter().copied().filter(|f| f.x.params.len() == 2).collect();
+    let next = match plain.iter().find(|f| plain_init(f)) {
+        // `next(pre, post)` beside `init(s)`: the model as before any extra
+        // parameter was taken.
         Some(f) => Some(*f),
         None if nexts.len() <= 1 => nexts.first().copied(),
         None => {
-            // Several, each with parameters beside the states (a helper
-            // `State::next(self, post, by)` beside the model's `next(c,
-            // pre, post)`): the one that shares a parameter with `init`
-            // (its name and type), refused when that does not settle it.
+            // Several, beside an `init` taking more than the state (a
+            // helper `State::next(self, post, by)`, or `State::next(self,
+            // post)`, beside the model's `next(c, pre, post)` and `init(c,
+            // s)`): the one that shares a parameter with `init` (its name
+            // and type), or else the one `next(pre, post)`; refused when
+            // that does not settle it.
             let shares = |f: &Function| -> bool {
                 let Ok(Some(s)) = state_pair(f) else { return false };
                 let is_s = |t: &Typ| typ_datatype(t).as_ref() == Some(&s);
@@ -6383,19 +6488,21 @@ fn recognise(
                     })
                     .any(|g| {
                         f.x.params.iter().filter(|p| !is_s(&p.x.typ)).any(|p| {
-                            g.x.params.iter().any(|q| {
-                                q.x.name.0 == p.x.name.0
-                                    && crate::ast_util::types_equal(&q.x.typ, &p.x.typ)
-                            })
+                            g.x.params
+                                .iter()
+                                .any(|q| q.x.name.0 == p.x.name.0 && same_typ(&q.x.typ, &p.x.typ))
                         })
                     })
             };
             let sharing: Vec<&Function> = nexts.iter().copied().filter(|f| shares(f)).collect();
             if sharing.len() == 1 {
                 Some(sharing[0])
+            } else if sharing.is_empty() && plain.len() == 1 {
+                Some(plain[0])
             } else {
                 return Err(format!(
-                    "`{module}` has several `next`s taking more than the states ({}), and {}: which is the model's is ambiguous; rename the others",
+                    "`{module}` has several `next`s{} ({}), and {}: which is the model's is ambiguous; rename the others",
+                    if plain.is_empty() { " taking more than the states" } else { "" },
                     nexts
                         .iter()
                         .map(|f| format!(
@@ -6451,9 +6558,8 @@ fn recognise(
         // constant `n: nat` is a helper, not an invariant over `n`). With
         // whether it went by name.
         let constant_of = |p: &Param| -> Option<(usize, bool)> {
-            let of: Vec<usize> = (0..constants.len())
-                .filter(|&i| crate::ast_util::types_equal(&constants[i].1, &p.x.typ))
-                .collect();
+            let of: Vec<usize> =
+                (0..constants.len()).filter(|&i| same_typ(&constants[i].1, &p.x.typ)).collect();
             of.iter().copied().find(|&i| constants[i].0.0 == p.x.name.0).map(|i| (i, true)).or_else(
                 || (of.len() == 1 && variants(&p.x.typ) == Some(1)).then(|| (of[0], false)),
             )
@@ -6519,7 +6625,7 @@ fn recognise(
                 if f.x
                     .params
                     .iter()
-                    .any(|p| label_typs.iter().any(|l| crate::ast_util::types_equal(l, &p.x.typ)))
+                    .any(|p| label_typs.iter().any(|l| same_typ(l, &p.x.typ)))
                 {
                     over_labels.push(*f);
                 } else if !extras.is_empty() {
@@ -6543,7 +6649,7 @@ fn recognise(
                             }
                             let of = |k: ExtraKind| {
                                 extras.iter().any(|x| {
-                                    x.kind == k && crate::ast_util::types_equal(&x.typ, &p.x.typ)
+                                    x.kind == k && same_typ(&x.typ, &p.x.typ)
                                 })
                             };
                             if of(ExtraKind::InitLabel) {
@@ -6552,7 +6658,7 @@ fn recognise(
                                 )
                             } else if let Some(c) = constants
                                 .iter()
-                                .filter(|(_, c, _)| crate::ast_util::types_equal(c, &p.x.typ))
+                                .filter(|(_, c, _)| same_typ(c, &p.x.typ))
                                 .map(|(n, _, _)| format!("`{}`", ident_name(n)))
                                 .reduce(|a, b| format!("{a}, {b}"))
                             {
@@ -6872,7 +6978,7 @@ impl Exporter {
                 }
                 this.bound.clear();
                 this.constants.insert(constant.clone());
-                this.values.insert(constant.clone(), typ_name(t));
+                this.values.insert(constant.clone(), rust_typ_name(t));
                 this.hole_owners.push(None);
                 this.holes.push(Hole {
                     variable,
@@ -7794,6 +7900,10 @@ pub fn export_module(
                         .find(|(i, j, _)| *i == x.in_init && *j == x.index)
                         .and_then(|(_, _, e)| ex.exists_printed.get(&(Arc::as_ptr(e) as usize)))
                         .map(|(b, d, _)| format!("\\E {b} \\in {d}"))
+                        // Every one-binder `\E` records its domain as it is
+                        // printed, and the wrappers are Init and Next, so
+                        // this is a guard against a future printing path,
+                        // never left as an empty `tla`.
                         .unwrap_or_else(|| "(domain not recorded)".to_string()),
                 };
                 ModelParam {

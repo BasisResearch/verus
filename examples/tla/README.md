@@ -57,20 +57,26 @@ enum Label`, nrkernel's `next(c: Constants, s1, s2, lbl: RLbl)`, IronKV's
 `next(pre, post, ios)`). A parameter of `next` that `init` also takes (same
 name and type, or before the states, the one `init` takes of its type) is a
 constant, unless it is a choice among variants (an enum of several
-variants, or a struct holding one in a field, such as `struct Lbl { op:
-Op }`, an `Option` included but not vstd's collections), which is a
+variants, or a struct or tuple holding one in a field, such as `struct
+Lbl { op: Op }` or `pair: (Op, u8)`, an `Option` included but not vstd's
+collections), which is a
 label. Both are guesses, warned of on the summary line and atop the
 `.tla`: a scalar constant is told by its name alone, and drops behaviours
 if `next` chooses it per step; a label both take (such as a constants
 struct with an `Option` field) is chosen apart from init's and anew each
 step, so a violation may be spurious and the predicates over it are not
 checked. `-V tla-export-constant=c` and `-V tla-export-label=n` settle
-them. A `next` whose state no `init` takes (a helper `Lbl::next(self,
-other: Lbl)`) is not the model's. When `init` takes one each of two
-datatypes `next` takes twice, the state is the one whose `init` parameter
-shares its name with none of `next`'s; when that does not settle it, or
-several `next`s take more than the states and not exactly one shares a
-parameter with `init`, the export refuses. A
+them. Types are compared through `&`: `init(s, c: &C)` and `next(pre,
+post, c: C)` take one value. A `next` whose state no `init` takes, or
+whose state another `next` takes beside its states (a helper
+`Lbl::next(self, other: Lbl)`), is not the model's. When `init` takes one
+each of two datatypes `next` takes twice, the state is the one whose
+`init` parameter shares its name with none of `next`'s. Of several
+`next`s, `next(pre, post)` is the model's beside an `init(s)` of the
+state alone; otherwise the one sharing a parameter with `init` is (a
+helper `State::next(self, post)` does not beat `next(c, pre, post)`
+beside `init(c, s)`). When these do not settle it, or `next`s of two
+datatypes are left, the export refuses. A
 constant is a `CONSTANT` per field of its struct (`Const_c_cap`, kept in its type's range by an `ASSUME`),
 given by value in the `.cfg` (`Const_c_cap = 4`) or by `<-` for a
 non-scalar, behind `Const_c == [cap |-> Const_c_cap, ...]`. Any other
