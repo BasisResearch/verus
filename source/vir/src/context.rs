@@ -929,6 +929,18 @@ impl Ctx {
                     names.push(hide.clone());
                 }
             }
+            // Statement-level hide(f) / reveal(f) inside the body are ExprX::Fuel nodes,
+            // not `hidden` attributes; they also reach set_fuel, so declare their fuel ids.
+            if let Some(body) = &function.x.body {
+                crate::ast_visitor::expr_visitor_walk(body, &mut |expr| {
+                    if let crate::ast::ExprX::Fuel(f, _, _) = &expr.x {
+                        if declared.insert(f.clone()) {
+                            names.push(f.clone());
+                        }
+                    }
+                    crate::ast_visitor::VisitorControlFlow::Recurse
+                });
+            }
         }
         for name in names {
             let id = crate::def::prefix_fuel_id(&fun_to_air_ident(&self.name_ctxt, &name));
