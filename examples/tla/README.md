@@ -273,8 +273,46 @@ value satisfying the predicate.
 
 A literal match pattern is an equality with the scrutinee (`0 => ...` is
 `IF m = 0 THEN ...`) and a range pattern its comparisons (`1..=3` is `1 <=
-m /\ m <= 3`). An or-pattern binding nothing is the disjunction of its
-alternatives (`Step::A | Step::B`); one that binds a name is refused.
+m /\ m <= 3`). An or-pattern is the disjunction of its alternatives
+(`Step::A | Step::B`), and a name it binds (Rust has every alternative bind
+it) is the value the first alternative that matches gives it: `E::A(n, _) |
+E::B(_, n)` binds `n == IF m.tag = "A" THEN m.v0 ELSE m.v1`. An `&` pattern
+(`match &x`, or `match self` on `&self`) is the pattern under it. A range
+pattern over chars is refused, as an ordering of chars is.
+
+A destructuring `let` binds its value once and each name to its projection:
+`let (a, b) = e` is `LET d__ == e  a == d__[1]  b == d__[2] IN ...`, with the
+one index shift (a nested tuple projects twice, `d__[1][2]`), and `let S { f,
+g } = e` reads `d__.f` and `d__.g`; a local is projected in place. A pattern
+on a whole state (`let State { x, .. } = post`, `match post`) binds each name
+to its state variable (`x`, `n` in `x: n @ ..`, and a name both alternatives
+of an or-pattern bind to the same field), so `x == e` assigns `x'` as `post.x
+== e` does, and in Init assigns `x`. A `let` whose pattern tests a variant
+(`let (E::A(n) | E::B(n)) = e`, which always matches) puts the rest of the
+block under that condition, unless the value reads the post state or the
+`let` is in Init, where the condition would read a variable before the step
+or Init assigns it.
+
+VerusSync's `require let P = e` reaches the export as its macro lowers it: the
+guard `match e { P => true, _ => false }`, then a tuple `let` of P's names from
+`match e { P => (names), _ => arbitrary() }`, so the guard tests the variant
+and the `let` reads the fields; where P does not match, the transition is
+disabled. That `arbitrary()` arm, which the guard rules out, is an
+`Assert(FALSE, ...)` but not a refusal. `remove m -= [k => let v]` is the
+`contains` guard, `v == m[k]` and the removal, in that order, so a second
+removal of the same key in one transition is disabled, and a removal then an
+`add` of the same key is not; `remove o -= Some(let x)` likewise. A refutable
+pattern there (`[k => let Some(x)]`, `Some(let E::A(x))`) adds its match to the
+guard and reads its names from `match m[k] { P => (names), _ => arbitrary() }`,
+whose `arbitrary()` arm the guard rules out in the same way. For `assert let`
+and `withdraw` the check is a VerusSync assert, not a guard: where the pattern
+does not match, TLC stops at the failed assert before the arm is reached. These
+are the only exempt arms: an `_ => arbitrary()` arm anywhere else may be
+reached, so `arbitrary()` is refused there, as any function without a body is.
+
+A refused pattern (a destructuring `let` binding a closure, a range over chars)
+binds each name it binds to the refusal, so TLC stops only where such a name is
+evaluated; left free, the name made SANY reject the whole module.
 
 A closure bound by `let` (or a closure parameter) is only ever applied; passed
 to a function, compared or returned, it is a refusal.
