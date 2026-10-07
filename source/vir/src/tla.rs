@@ -614,7 +614,25 @@ struct Env {
     /// state, so reading them reads primed variables.
     primed: HashSet<VarIdent>,
     /// The set a bound variable ranges over, when known (see [`Dom`]).
+    /// rustc gives every binding its own `VarIdent`, so a binder that
+    /// shadows a name (`let k = k + 1`) never inherits the domain it had.
     domains: HashMap<VarIdent, Dom>,
+    /// Names a pattern bound to a field of a whole state (`let State { x,
+    /// .. } = post`), so `x == e` assigns it as `post.x == e` does.
+    field_binders: HashMap<VarIdent, FieldBinder>,
+}
+
+/// A name a pattern bound to a field of a whole state (see
+/// [`Env::field_binders`]). It holds only while the name is still printed
+/// as `printed`.
+#[derive(Clone)]
+struct FieldBinder {
+    /// The role of the state the pattern is on.
+    role: Role,
+    /// The field's state variable.
+    var: String,
+    /// The name as printed: the variable, `x`, or `x'` on the post state.
+    printed: String,
 }
 
 impl Env {
@@ -625,6 +643,7 @@ impl Env {
             values: HashMap::new(),
             primed: HashSet::new(),
             domains: HashMap::new(),
+            field_binders: HashMap::new(),
         }
     }
     fn name(&self, v: &VarIdent) -> String {
@@ -1718,10 +1737,19 @@ impl Exporter {
                 {
                     Some(self.state_var(&field_name(field)))
                 }
+                PlaceX::Local(v) => self.state_field_name(v, env, role),
                 _ => None,
             },
+            ExprX::Var(v) => self.state_field_name(v, env, role),
             _ => None,
         }
+    }
+
+    /// The state variable `v` names, when a pattern bound it to a field of
+    /// the whole state in `role` (see [`Env::field_binders`]).
+    fn state_field_name(&self, v: &VarIdent, env: &Env, role: Role) -> Option<String> {
+        let b = env.field_binders.get(v)?;
+        (b.role == role && env.names.get(v) == Some(&b.printed)).then(|| b.var.clone())
     }
 
     /// How `a = b` is printed and the variable it assigns at conjunct level.
@@ -2301,10 +2329,14 @@ impl Exporter {
 
     fn block(&mut self, e: &Expr, stmts: &Stmts, tail: &Option<Expr>, env: &Env) -> String {
         let mut env2 = env.clone();
+        // The block's definitions, in groups, each closed by the condition
+        // of a destructuring `let` that tests a variant (see
+        // [`Exporter::let_pattern`]): the rest of the block sits under it.
+        let mut groups: Vec<(Vec<String>, Option<(String, String)>)> = Vec::new();
         let mut lets = Vec::new();
         for s in stmts.iter() {
             match &s.x {
-                StmtX::Decl { pattern, init: Some(init), .. } => match &pattern.x {
+                StmtX::Decl { pattern, init: Some(init), els, .. } => match &pattern.x {
                     PatternX::Var(PatternBinding { name, .. }) => {
                         let symbolic = match &init.x {
                             PlaceX::Temporary(e) | PlaceX::WithExpr(e, _) => Some(peel(e)),
@@ -2337,10 +2369,23 @@ impl Exporter {
                         lets.push(format!("{n} == {value}"));
                     }
                     PatternX::Wildcard(_) => {}
+                    _ if els.is_none() => {
+                        let (guard, bound) =
+                            self.let_pattern(s, pattern, init, &mut env2, &mut lets);
+                        if let Some(guard) = guard {
+                            groups.push((std::mem::take(&mut lets), Some(guard)));
+                        }
+                        lets.extend(bound);
+                    }
+                    // Defensive: Verus rejects a let-else in spec code
+                    // ("let-else in spec/proof"), so this is never reached.
                     _ => {
-                        let r = self.refuse("destructuring let", &s.span);
-                        let n = self.bind("unused__");
-                        lets.push(format!("{n} == {r}"));
+                        let r = self.refuse("let-else", &s.span);
+                        // Each name the pattern binds is bound to the
+                        // refusal, so the rest of the block reads only
+                        // defined names and TLC stops where one is used.
+                        let (_, bound) = self.refused_bindings(r, pattern, &mut env2);
+                        lets.extend(bound.into_iter().map(|(n, v)| format!("{n} == {v}")));
                     }
                 },
                 StmtX::Decl { init: None, .. } => {}
@@ -2348,12 +2393,94 @@ impl Exporter {
                 StmtX::Expr(_) => {}
             }
         }
-        let body = match tail {
+        groups.push((lets, None));
+        let mut body = match tail {
             Some(t) => self.expr(t, &env2),
             None => "TRUE".into(),
         };
         let _ = e;
-        if lets.is_empty() { body } else { format!("(LET {} IN {body})", lets.join("\n         ")) }
+        for (lets, guard) in groups.into_iter().rev() {
+            if let Some((cond, msg)) = guard {
+                body = format!("(IF {cond} THEN {body} ELSE Assert(FALSE, {msg}))");
+            }
+            if !lets.is_empty() {
+                body = format!("(LET {} IN {body})", lets.join("\n         "));
+            }
+        }
+        body
+    }
+
+    /// A destructuring `let pattern = init;` (`let (a, b) = e`, `let S { f,
+    /// g } = e`; VerusSync's `require let` and `remove .. => let` are
+    /// lowered by its macro to a tuple `let` of the names the pattern
+    /// binds). `init` is bound once, pushed onto `lets` unless it is a
+    /// local (`d__ == e`), and each name is its projection (`a == d__[1]`),
+    /// returned as definitions. A whole state is not pushed either: each
+    /// name bound to one of its fields is that field's state variable (see
+    /// [`Exporter::pattern`]). Rust admits only patterns that always
+    /// match here, but one may still test a variant (of an enum whose other
+    /// variants are uninhabited): that condition is returned too, with the
+    /// message of the `Assert` the block prints where it fails, and the
+    /// names are then defined under it, unless `init` reads the post state
+    /// or the `let` is in Init.
+    fn let_pattern(
+        &mut self,
+        s: &Stmt,
+        pattern: &Pattern,
+        init: &Place,
+        env: &mut Env,
+        lets: &mut Vec<String>,
+    ) -> (Option<(String, String)>, Vec<String>) {
+        let defs = |bound: Vec<(String, String)>| {
+            bound.into_iter().map(|(n, v)| format!("{n} == {v}")).collect::<Vec<_>>()
+        };
+        // A closure-valued name has no TLA+ value; it is only ever held
+        // symbolically, which a projection of a value cannot be.
+        if pattern_binds_closure(pattern, &self.datatypes) {
+            let r = self.refuse("destructuring let binding a closure", &s.span);
+            let (_, bound) = self.refused_bindings(r, pattern, env);
+            return (None, defs(bound));
+        }
+        let before = env.clone();
+        // A whole state is destructured as its record, so a field is its
+        // variable (see [`Exporter::pattern`]).
+        let role = place_var(init).and_then(|v| before.roles.get(&v).copied());
+        let subject = match (&init.x, role) {
+            (_, Some(role)) => self.state_record(role),
+            (PlaceX::Local(v), None)
+                if before.names.contains_key(v) && !before.symbolic_only(v) =>
+            {
+                before.name(v)
+            }
+            _ => {
+                let value = self.quiet(|x| x.place(init, &before));
+                let d = self.bind("d__");
+                lets.push(format!("{d} == {value}"));
+                d
+            }
+        };
+        let domain = place_var(init).and_then(|v| before.domains.get(&v).cloned());
+        let (cond, bound) = self.pattern(&subject, pattern, env, domain, role);
+        // A name bound from a value that reads the post state reads it too.
+        let primed = before.place_reads_post(init);
+        for v in unique_pattern_names(pattern) {
+            if primed {
+                env.primed.insert(v);
+            } else {
+                env.primed.remove(&v);
+            }
+        }
+        // Rust has checked that the pattern always matches, so the condition
+        // only restates the value's type. On a value that reads the post
+        // state it is left out: it would read a primed variable before the
+        // block assigns it, and TLC would stop there. So in Init, which
+        // assigns the unprimed variables the condition would read.
+        let guard = cond.filter(|_| !primed && !self.in_init).map(|c| {
+            let msg =
+                format!("tla-export: the let pattern at {} does not match", span_string(&s.span));
+            (c, tla_string(&msg))
+        });
+        (guard, defs(bound))
     }
 
     fn matches(&mut self, e: &Expr, place: &Place, arms: &Arms, env: &Env) -> String {
@@ -2361,15 +2488,46 @@ impl Exporter {
         // What the scrutinee ranges over, when it is a variable with a
         // domain: its pattern's bindings then range over its fields'.
         let scrutinee_domain = place_var(place).and_then(|v| env.domains.get(&v).cloned());
-        // Bind the scrutinee once, under a name fresh in this operator.
-        let m = self.bind("m__");
+        // Bind the scrutinee once, under a name fresh in this operator; a
+        // whole state is matched as its record, so a field is its variable
+        // (see [`Exporter::pattern`]).
+        let whole_state = place_var(place).and_then(|v| env.roles.get(&v).copied());
+        let m = if whole_state.is_some() { scrutinee.clone() } else { self.bind("m__") };
+        // A match VerusSync's macro puts after a guard that it matches (see
+        // [`sync_guarded_scrutinee`]).
+        let sync_tmp = self.verussync && sync_guarded_scrutinee(place);
         let mut chain: Vec<(String, String)> = Vec::new();
         let mut otherwise: Option<String> = None;
         let mut arm_assigned = Vec::new();
         for arm in arms.iter() {
+            // `_ => arbitrary()`, the arm VerusSync's macro gives the names
+            // of a `require let` or of a refutable `let` in a `remove`,
+            // `have` or `withdraw` where the pattern does not match. The
+            // transition's guard rules it out (for `assert let` and
+            // `withdraw`, a VerusSync assert, which stops TLC first, as a
+            // failed obligation), so it is never evaluated on a step; were
+            // it, its value is unspecified and TLC stops there.
+            // It is not a refusal and taints nothing. Anywhere else such an
+            // arm may be reached, and `arbitrary()` is refused as usual.
+            if sync_tmp
+                && matches!(arm.x.pattern.x, PatternX::Wildcard(_))
+                && matches!(arm.x.guard.x, ExprX::Const(Constant::Bool(true)))
+                && is_arbitrary(&arm.x.body)
+            {
+                // The macro gives the arm the span of the whole state
+                // machine; the first arm's pattern is the user's own.
+                let msg = format!(
+                    "tla-export: arbitrary() (an unspecified value) evaluated where the pattern at {} does not match",
+                    span_string(&arms[0].x.pattern.span)
+                );
+                otherwise = Some(format!("Assert(FALSE, {})", tla_string(&msg)));
+                arm_assigned.push(self.state_vars.iter().cloned().collect());
+                break;
+            }
             let mut env2 = env.clone();
             let (cond, lets) =
-                self.pattern(&m, &arm.x.pattern, &mut env2, scrutinee_domain.clone());
+                self.pattern(&m, &arm.x.pattern, &mut env2, scrutinee_domain.clone(), whole_state);
+            let lets: Vec<String> = lets.into_iter().map(|(n, v)| format!("{n} == {v}")).collect();
             // A binding of a scrutinee that reads the post state reads it too.
             let scrutinee_primed = env.place_reads_post(place);
             for v in env2.names.keys().cloned().collect::<Vec<_>>() {
@@ -2417,20 +2575,28 @@ impl Exporter {
         for (c, b) in chain.into_iter().rev() {
             tail = format!("IF {c} THEN {b} ELSE {tail}");
         }
-        format!("(LET {m} == {scrutinee} IN {tail})")
+        if whole_state.is_some() {
+            format!("({tail})")
+        } else {
+            format!("(LET {m} == {scrutinee} IN {tail})")
+        }
     }
 
     /// The condition a pattern imposes on `subject`, and the LET bindings it
-    /// introduces (added to `env`). The condition reads only `subject`.
-    /// `domain` is the set `subject` ranges over, when known: a binding
-    /// ranges over it, and a constructor's fields over its fields'.
+    /// introduces (added to `env`), each a name and its value. The
+    /// condition and the values read only `subject`. `domain` is the set
+    /// `subject` ranges over, when known: a binding ranges over it, and a
+    /// constructor's fields over its fields'. `whole` is the role of the
+    /// state `subject` is, when it is a whole state (its record): a field is
+    /// then its state variable.
     fn pattern(
         &mut self,
         subject: &str,
         p: &Pattern,
         env: &mut Env,
         domain: Option<Dom>,
-    ) -> (Option<String>, Vec<String>) {
+        whole: Option<Role>,
+    ) -> (Option<String>, Vec<(String, String)>) {
         match &p.x {
             PatternX::Wildcard(_) => (None, vec![]),
             PatternX::Var(PatternBinding { name, .. }) => {
@@ -2438,15 +2604,15 @@ impl Exporter {
                     env.domains.insert(name.clone(), d);
                 }
                 let n = self.bind_var(env, name);
-                (None, vec![format!("{n} == {subject}")])
+                (None, vec![(n, subject.to_string())])
             }
             PatternX::Binding { binding: PatternBinding { name, .. }, sub_pat } => {
                 if let Some(d) = domain.clone() {
                     env.domains.insert(name.clone(), d);
                 }
                 let n = self.bind_var(env, name);
-                let (c, mut lets) = self.pattern(subject, sub_pat, env, domain);
-                lets.insert(0, format!("{n} == {subject}"));
+                let (c, mut lets) = self.pattern(subject, sub_pat, env, domain, whole);
+                lets.insert(0, (n, subject.to_string()));
                 (c, lets)
             }
             PatternX::Constructor(dt, variant, binders) => {
@@ -2455,8 +2621,35 @@ impl Exporter {
                 if tagged {
                     conds.push(format!("({subject}.tag = \"{variant}\")"));
                 }
+                // A whole state (`let State { x, .. } = post`, `match self`
+                // on the state): each field is its state variable, and a
+                // name bound to one (`x`, or `n` in `x: n @ ..`) is that
+                // variable itself, not a LET of it, so `x == e` assigns `x'`
+                // as `post.x == e` does, and the pattern reads no field it
+                // does not bind.
+                let whole = match dt {
+                    Dt::Path(path) if *path == self.state_path => whole,
+                    _ => None,
+                };
                 let mut lets = Vec::new();
                 for b in binders.iter() {
+                    if let Some(role) = whole {
+                        let var = self.state_var(&field_name(&b.name));
+                        let printed =
+                            if role == Role::Post { format!("{var}'") } else { var.clone() };
+                        let (name, sub) = state_field_binder(&b.a);
+                        if let Some(name) = name {
+                            env.names.insert(name.clone(), printed.clone());
+                            let binder = FieldBinder { role, var, printed: printed.clone() };
+                            env.field_binders.insert(name.clone(), binder);
+                        }
+                        if let Some(sub) = sub {
+                            let (c, l) = self.pattern(&printed, sub, env, None, None);
+                            conds.extend(c);
+                            lets.extend(l);
+                        }
+                        continue;
+                    }
                     let field = self.field_access(subject, dt, &b.name);
                     let field_domain = domain.clone().map(|of| {
                         let var = self.bind("s__");
@@ -2481,7 +2674,7 @@ impl Exporter {
                             field_typ: typ_name(&b.a.typ),
                         }
                     });
-                    let (c, l) = self.pattern(&field, &b.a, env, field_domain);
+                    let (c, l) = self.pattern(&field, &b.a, env, field_domain, None);
                     if let Some(c) = c {
                         conds.push(c);
                     }
@@ -2501,6 +2694,12 @@ impl Exporter {
                 let v = self.quiet(|this| this.expr(x, env));
                 (Some(format!("({subject} = {v})")), vec![])
             }
+            // A `char` is a TLA+ string, which has no order (see
+            // `Constant::Char`), as a comparison of two is refused.
+            PatternX::Range(..) if is_char_typ(&p.typ) => {
+                let r = self.refuse("range pattern over chars", &p.span);
+                self.refused_bindings(r, p, env)
+            }
             PatternX::Range(lo, hi) => {
                 let mut conds = Vec::new();
                 if let Some(lo) = lo {
@@ -2519,25 +2718,100 @@ impl Exporter {
                 };
                 (cond, vec![])
             }
-            // `A | B` binding nothing: either alternative's condition (an
-            // alternative that always matches makes the whole one match).
-            PatternX::Or(a, b) if !pattern_binds(a) && !pattern_binds(b) => {
-                let (ca, _) = self.pattern(subject, a, env, None);
-                let (cb, _) = self.pattern(subject, b, env, None);
+            // `A | B`: either alternative's condition (an alternative that
+            // always matches makes the whole one match). Rust has both
+            // bind the same names; each is the value the first alternative
+            // that matches gives it (`x == IF cA THEN m.a ELSE m.b`, or the
+            // one value when both give the same).
+            // A name bound gets no domain: the alternatives give it
+            // different ones (`A(n, _) | B(_, n)` ranges over A's first
+            // field or B's second), so a quantifier over it takes a hole.
+            PatternX::Or(a, b) => {
+                let mut env_a = env.clone();
+                let (ca, la) = self.pattern(subject, a, &mut env_a, None, whole);
+                let mut env_b = env.clone();
+                let (cb, lb) = self.pattern(subject, b, &mut env_b, None, whole);
+                let names = unique_pattern_names(a);
+                // A name's value in an alternative: its LET's, or the state
+                // variable it names (see [`Env::field_binders`]).
+                let value = |e: &Env, lets: &[(String, String)], v: &VarIdent| {
+                    let n = e.names.get(v)?;
+                    if e.field_binders.get(v).is_some_and(|b| b.printed == *n) {
+                        return Some(n.clone());
+                    }
+                    lets.iter().find(|(m, _)| m == n).map(|(_, x)| x.clone())
+                };
+                let values: Option<Vec<_>> = names
+                    .iter()
+                    .map(|v| Some((v.clone(), value(&env_a, &la, v)?, value(&env_b, &lb, v)?)))
+                    .collect();
+                // The alternatives' own names for the bindings are unused:
+                // free them, so the bindings (or the refusal's) take their
+                // plain names.
+                for v in &names {
+                    for e in [&env_a, &env_b] {
+                        if let Some(n) = e.names.get(v) {
+                            if env.names.get(v) != Some(n) {
+                                self.bound.remove(n);
+                            }
+                        }
+                    }
+                }
+                // Defensive: Rust has every alternative bind every name, so
+                // each has a value in both and this is never reached.
+                let Some(values) = values else {
+                    let r = self.refuse("or-pattern", &p.span);
+                    return self.refused_bindings(r, p, env);
+                };
+                let mut lets = Vec::new();
+                for (v, xa, xb) in values {
+                    // Both alternatives name the same state variable
+                    // (`State { x, y: 0, .. } | State { x, y: 1, .. }`): so
+                    // does the binding, which then assigns it.
+                    let binder = env_a.field_binders.get(&v).filter(|b| b.printed == xa);
+                    if let Some(binder) = binder.filter(|_| xa == xb) {
+                        env.names.insert(v.clone(), xa.clone());
+                        env.field_binders.insert(v.clone(), binder.clone());
+                        continue;
+                    }
+                    let n = self.bind_var(env, &v);
+                    let x = match &ca {
+                        Some(c) if xa != xb => format!("(IF {c} THEN {xa} ELSE {xb})"),
+                        _ => xa,
+                    };
+                    lets.push((n, x));
+                }
                 match (ca, cb) {
-                    (Some(x), Some(y)) => (Some(format!("({x} \\/ {y})")), vec![]),
-                    _ => (None, vec![]),
+                    (Some(x), Some(y)) => (Some(format!("({x} \\/ {y})")), lets),
+                    _ => (None, lets),
                 }
             }
-            PatternX::Or(..) => {
-                let r = self.refuse("or-pattern", &p.span);
-                (Some(r), vec![])
-            }
-            _ => {
-                let r = self.refuse("pattern kind", &p.span);
-                (Some(r), vec![])
+            // `&p` and `&mut p` (from `match &x` and match ergonomics)
+            // match what `p` does: a reference is its referent here.
+            PatternX::ImmutRef(inner) | PatternX::MutRef(inner) => {
+                self.pattern(subject, inner, env, domain, whole)
             }
         }
+    }
+
+    /// A refused pattern: its condition is the refusal `r`, and each name
+    /// it binds is bound to `r` too (added to `env`). Left unbound, a name
+    /// would be free in the module, and SANY would reject all of it; bound
+    /// to the refusal, TLC stops only where the name is evaluated, as at
+    /// any other refusal.
+    fn refused_bindings(
+        &mut self,
+        r: String,
+        p: &Pattern,
+        env: &mut Env,
+    ) -> (Option<String>, Vec<(String, String)>) {
+        let mut lets = Vec::new();
+        for v in unique_pattern_names(p) {
+            let n = self.bind_var(env, &v);
+            env.primed.remove(&v);
+            lets.push((n, r.clone()));
+        }
+        (Some(r), lets)
     }
 
     // ─── calls ──────────────────────────────────────────────────────────
@@ -4798,8 +5072,68 @@ impl Exporter {
     /// state only when every variable is assigned (`x = e`), else it stops
     /// ("current state is not a legal state").
     fn init_unassigned(&self, body: &Expr, states: &HashSet<VarIdent>) -> Vec<String> {
-        let assigned = self.init_assigns(body, states, &BTreeSet::new(), 0);
+        let binders = self.state_binders(body, states);
+        let assigned = self.init_assigns(body, states, &binders, &BTreeSet::new(), 0);
         self.state_vars.iter().filter(|v| !assigned.contains(*v)).cloned().collect()
+    }
+
+    /// The names a pattern on a state in `states` binds to its fields, each
+    /// to its state variable, in `e`'s `let`s and `match`es (`let State { x,
+    /// .. } = s`), as [`Exporter::pattern`] prints them. A `let` that
+    /// [`Exporter::block`] refuses (a let-else, or one binding a closure)
+    /// binds its names to the refusal, so it binds none here.
+    fn state_binders(&self, e: &Expr, states: &HashSet<VarIdent>) -> HashMap<VarIdent, String> {
+        let mut out = HashMap::new();
+        crate::ast_visitor::expr_visitor_walk(e, &mut |x: &Expr| {
+            let on_state = |p: &Place| place_var(p).is_some_and(|v| states.contains(&v));
+            match &x.x {
+                ExprX::Block(stmts, _) => {
+                    for s in stmts.iter() {
+                        if let StmtX::Decl { pattern, init: Some(init), els: None, .. } = &s.x {
+                            if on_state(init) && !pattern_binds_closure(pattern, &self.datatypes) {
+                                out.extend(self.state_pattern_binders(pattern));
+                            }
+                        }
+                    }
+                }
+                ExprX::Match(place, arms, _) if on_state(place) => {
+                    for arm in arms.iter() {
+                        out.extend(self.state_pattern_binders(&arm.x.pattern));
+                    }
+                }
+                _ => {}
+            }
+            crate::visitor::VisitorControlFlow::Recurse
+        });
+        out
+    }
+
+    /// The names a pattern on a whole state binds to its fields (see
+    /// [`Exporter::state_binders`]): an or-pattern's, where both
+    /// alternatives bind them to the same field. Each field's binder is
+    /// read by [`state_field_binder`], as [`Exporter::pattern`] reads it.
+    fn state_pattern_binders(&self, p: &Pattern) -> HashMap<VarIdent, String> {
+        match &p.x {
+            PatternX::Constructor(Dt::Path(path), _, binders) if *path == self.state_path => {
+                binders
+                    .iter()
+                    .filter_map(|b| {
+                        let (name, _) = state_field_binder(&b.a);
+                        Some((name?.clone(), self.state_var(&field_name(&b.name))))
+                    })
+                    .collect()
+            }
+            PatternX::Binding { sub_pat: inner, .. }
+            | PatternX::ImmutRef(inner)
+            | PatternX::MutRef(inner) => self.state_pattern_binders(inner),
+            PatternX::Or(a, b) => {
+                let b = self.state_pattern_binders(b);
+                let mut a = self.state_pattern_binders(a);
+                a.retain(|v, var| b.get(v) == Some(var));
+                a
+            }
+            _ => HashMap::new(),
+        }
     }
 
     /// The state variables `e` assigns on every path, `states` holding the
@@ -4813,14 +5147,17 @@ impl Exporter {
     /// disjunction every branch of which assigns (a `false` branch assigns
     /// everything), and two conjoined implications of complementary guards
     /// (`g ==> b1`, `!g ==> b2`) for what both consequents assign, and a bare
-    /// or negated bool field (`s.done`, `!s.done`). `before` holds what the
-    /// conjuncts before `e` assigned, so `s.x == s.y` assigns whichever of the
-    /// two is not yet assigned. A closure application is not followed and
-    /// counts as assigning everything, so nothing is reported for it.
+    /// or negated bool field (`s.done`, `!s.done`). A name `binders` maps to
+    /// a state variable is that field (see [`Exporter::state_binders`]).
+    /// `before` holds what the conjuncts before `e` assigned, so `s.x ==
+    /// s.y` assigns whichever of the two is not yet assigned. A closure
+    /// application is not followed and counts as assigning everything, so
+    /// nothing is reported for it.
     fn init_assigns(
         &self,
         e: &Expr,
         states: &HashSet<VarIdent>,
+        binders: &HashMap<VarIdent, String>,
         before: &BTreeSet<String>,
         depth: usize,
     ) -> BTreeSet<String> {
@@ -4833,6 +5170,9 @@ impl Exporter {
         let is_state = |x: &Expr| read_var(x).is_some_and(|v| states.contains(&v));
         let field = |x: &Expr| -> Option<String> {
             let x = peel(x);
+            if let Some(v) = read_var(&x).and_then(|v| binders.get(&v)) {
+                return Some(v.clone());
+            }
             let (dt, field, base) = match &x.x {
                 ExprX::UnaryOpr(UnaryOpr::Field(FieldOpr { datatype, field, .. }), inner) => {
                     (datatype, field, read_var(inner))
@@ -4867,7 +5207,7 @@ impl Exporter {
                     let seen: BTreeSet<String> = before.union(&s).cloned().collect();
                     match &c.x {
                         ExprX::Logical(LogicalOp::Implies, g, b) => {
-                            let a = self.init_assigns(b, states, &seen, depth);
+                            let a = self.init_assigns(b, states, binders, &seen, depth);
                             for (g2, a2) in &implications {
                                 if complementary(g, g2) {
                                     s.extend(a.intersection(a2).cloned());
@@ -4875,31 +5215,33 @@ impl Exporter {
                             }
                             implications.push((g.clone(), a));
                         }
-                        _ => s.extend(self.init_assigns(&c, states, &seen, depth)),
+                        _ => s.extend(self.init_assigns(&c, states, binders, &seen, depth)),
                     }
                 }
                 s
             }
             ExprX::Logical(LogicalOp::Or, a, b) => meet(vec![
-                self.init_assigns(a, states, before, depth),
-                self.init_assigns(b, states, before, depth),
+                self.init_assigns(a, states, binders, before, depth),
+                self.init_assigns(b, states, binders, before, depth),
             ]),
             ExprX::If(_, t, Some(f)) => meet(vec![
-                self.init_assigns(t, states, before, depth),
-                self.init_assigns(f, states, before, depth),
+                self.init_assigns(t, states, binders, before, depth),
+                self.init_assigns(f, states, binders, before, depth),
             ]),
             ExprX::Match(_, arms, _) => meet(
-                arms.iter().map(|a| self.init_assigns(&a.x.body, states, before, depth)).collect(),
+                arms.iter()
+                    .map(|a| self.init_assigns(&a.x.body, states, binders, before, depth))
+                    .collect(),
             ),
-            ExprX::Block(_, Some(tail)) => self.init_assigns(tail, states, before, depth),
+            ExprX::Block(_, Some(tail)) => self.init_assigns(tail, states, binders, before, depth),
             // Wrappers that print as their operand (VerusSync labels each
             // `init` with a ProofNote).
             ExprX::UnaryOpr(UnaryOpr::ProofNote(_) | UnaryOpr::CustomErr(_), inner)
             | ExprX::Unary(UnaryOp::Trigger(_) | UnaryOp::CoerceMode { .. }, inner) => {
-                self.init_assigns(inner, states, before, depth)
+                self.init_assigns(inner, states, binders, before, depth)
             }
             ExprX::Quant(q, _, body) if matches!(q.quant, air::ast::Quant::Exists) => {
-                self.init_assigns(body, states, before, depth)
+                self.init_assigns(body, states, binders, before, depth)
             }
             ExprX::Binary(BinaryOp::Eq(_), a, b) | ExprX::BinaryOpr(BinaryOpr::ExtEq(..), a, b) => {
                 if is_state(a) || is_state(b) {
@@ -4945,7 +5287,8 @@ impl Exporter {
                 // The callee is printed once, orienting `s.x == s.y` by what
                 // its own conjuncts assign (see [`Exporter::orient`]), so
                 // what the caller assigned before the call is not seen.
-                self.init_assigns(body, &inner, &BTreeSet::new(), depth + 1)
+                let binders = self.state_binders(body, &inner);
+                self.init_assigns(body, &inner, &binders, &BTreeSet::new(), depth + 1)
             }
             ExprX::Call { target: CallTarget::FnSpec(_), .. } => all(),
             _ => BTreeSet::new(),
@@ -5438,9 +5781,11 @@ fn bool_field(e: &Expr) -> Option<(Expr, bool)> {
         ExprX::Unary(UnaryOp::Not, inner) => (peel(inner), true),
         _ => (e.clone(), false),
     };
+    // A local too, which may be a name bound to a state field (see
+    // [`Env::field_binders`]).
     let is_field = match &inner.x {
-        ExprX::UnaryOpr(UnaryOpr::Field(_), _) => true,
-        ExprX::ReadPlace(p, _) => matches!(p.x, PlaceX::Field(..)),
+        ExprX::UnaryOpr(UnaryOpr::Field(_), _) | ExprX::Var(_) => true,
+        ExprX::ReadPlace(p, _) => matches!(p.x, PlaceX::Field(..) | PlaceX::Local(_)),
         _ => false,
     };
     let is_bool = matches!(&*crate::ast_util::undecorate_typ(&inner.typ), TypX::Bool);
@@ -5484,6 +5829,32 @@ fn pattern_could_match(p: &Pattern, variant: &Ident) -> bool {
     }
 }
 
+/// A field's pattern in a pattern on a whole state (see
+/// [`Exporter::pattern`]): the name it binds to the field's state variable
+/// (`x`, or `n` in `x: n @ ..`), and the pattern the field must still match
+/// (`0..=255` in `x: n @ 0..=255`, or the whole pattern when it binds no
+/// name to the field). [`Exporter::state_pattern_binders`] reads it the same
+/// way, so Init's assignment count agrees with the print.
+fn state_field_binder(p: &Pattern) -> (Option<&VarIdent>, Option<&Pattern>) {
+    match &p.x {
+        PatternX::Var(PatternBinding { name, .. }) => (Some(name), None),
+        PatternX::Binding { binding: PatternBinding { name, .. }, sub_pat } => {
+            (Some(name), Some(sub_pat))
+        }
+        _ => (None, Some(p)),
+    }
+}
+
+/// The names a pattern binds, each once: an or-pattern's alternatives bind
+/// the same names, so [`pattern_names`] lists each once per alternative.
+fn unique_pattern_names(p: &Pattern) -> Vec<VarIdent> {
+    let mut names = Vec::new();
+    pattern_names(p, &mut names);
+    let mut seen = HashSet::new();
+    names.retain(|v| seen.insert(v.clone()));
+    names
+}
+
 /// The names a pattern binds, pushed onto `out`.
 fn pattern_names(p: &Pattern, out: &mut Vec<VarIdent>) {
     match &p.x {
@@ -5504,15 +5875,54 @@ fn pattern_names(p: &Pattern, out: &mut Vec<VarIdent>) {
     }
 }
 
-/// Whether a pattern binds a name anywhere in it.
-fn pattern_binds(p: &Pattern) -> bool {
+/// Whether a pattern binds a name to a closure or a record of closures.
+fn pattern_binds_closure(p: &Pattern, datatypes: &HashMap<Path, Datatype>) -> bool {
     match &p.x {
-        PatternX::Var(_) | PatternX::Binding { .. } => true,
+        PatternX::Var(b) => typ_has_specfn(&b.typ, datatypes, &mut HashSet::new()),
+        PatternX::Binding { binding, sub_pat } => {
+            typ_has_specfn(&binding.typ, datatypes, &mut HashSet::new())
+                || pattern_binds_closure(sub_pat, datatypes)
+        }
         PatternX::Wildcard(_) | PatternX::Expr(_) | PatternX::Range(..) => false,
-        PatternX::Constructor(_, _, binders) => binders.iter().any(|b| pattern_binds(&b.a)),
-        PatternX::Or(a, b) => pattern_binds(a) || pattern_binds(b),
-        PatternX::MutRef(inner) | PatternX::ImmutRef(inner) => pattern_binds(inner),
+        PatternX::Constructor(_, _, binders) => {
+            binders.iter().any(|b| pattern_binds_closure(&b.a, datatypes))
+        }
+        PatternX::Or(a, b) => {
+            pattern_binds_closure(a, datatypes) || pattern_binds_closure(b, datatypes)
+        }
+        PatternX::MutRef(inner) | PatternX::ImmutRef(inner) => {
+            pattern_binds_closure(inner, datatypes)
+        }
     }
+}
+
+/// Whether `place` is the scrutinee of a match VerusSync's macro puts after
+/// a check that it matches the arm's pattern, so its `_ => arbitrary()` arm
+/// is never reached on a step. The check is a guard (`require`), or for
+/// `assert let` and `withdraw` a VerusSync assert, which stops TLC before
+/// the arm, as a failed obligation. `require let P = e` (and `assert let`)
+/// binds `e` to `tmp_for_match_<n>` and checks `match tmp_for_match_<n> { P
+/// => true, _ => false }`. A refutable `let` in `remove`, `have` or
+/// `withdraw` (`m -= [k => let Some(x)]`, `o -= Some(let P)`) matches the
+/// element it takes from the field's `update_tmp_<f>` (`update_tmp_m[k]`,
+/// `update_tmp_o.arrow_0()`), checked by `contains(k)` (or `is Some`) `&&
+/// match .. { P => true, _ => false }`. Both names are the macro's own.
+fn sync_guarded_scrutinee(place: &Place) -> bool {
+    if place_var(place).is_some_and(|v| v.0.starts_with("tmp_for_match_")) {
+        return true;
+    }
+    let PlaceX::Temporary(e) = &place.x else { return false };
+    called(e).is_some_and(|(_, fun, args)| {
+        let f = fun_as_friendly_rust_name(&fun);
+        ["::index", "::spec_index", "::arrow_0"].iter().any(|m| f.ends_with(m))
+            && args.first().and_then(read_var).is_some_and(|v| v.0.starts_with("update_tmp_"))
+    })
+}
+
+/// Whether `e` is vstd's `arbitrary()`.
+fn is_arbitrary(e: &Expr) -> bool {
+    called(e)
+        .is_some_and(|(_, fun, _)| fun_as_friendly_rust_name(&fun) == "vstd::pervasive::arbitrary")
 }
 
 /// Where the assertion `cond` of VerusSync's `tmp_assert && cond` (`init`)
