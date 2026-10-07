@@ -120,23 +120,25 @@
   "partial_after": {
     "binary": "/data/home/kirancodes/Documents/code/verus-research/wt-export-partial/source/target-verus/release/verus",
     "group": "partial",
-    "phase": "acceptance-after",
+    "phase": "bounded-final-partial",
     "export_seconds": 90,
     "tlc_seconds": 30,
-    "jobs": 1,
+    "jobs": 2,
     "sha256": {
       "verus": "5ffa1cb2b1e0df2bbed030d98414f20640f9c0613551a62be858ad320bf87a2a",
-      "rust_verify": "00249f193739131885503cf8dead48ee0527cc09e5784c7108a69db95776d06c"
+      "rust_verify": "876698000df07ece19d638fdc93650c9ad6024b68158bc420d6d5f373e980537"
     },
     "rows": [
       {
         "id": "nr/UnboundedLog-mono",
         "export_rc": 0,
+        "export_seconds": 2.509,
         "status": "tlc_error",
         "refusals": 0,
         "holes": 42,
         "restrictions": 13,
         "reasons": [],
+        "sany_status": "ok",
         "tlc_rc": 151,
         "errors": [
           "Error: The constant parameter Table_arbitrary__tla_closed2 is not assigned a value by the configuration file."
@@ -145,11 +147,13 @@
       {
         "id": "splinter/AbstractJournal",
         "export_rc": 0,
+        "export_seconds": 1.305,
         "status": "complete",
         "refusals": 0,
         "holes": 17,
         "restrictions": 8,
         "reasons": [],
+        "sany_status": "ok",
         "tlc_rc": 0,
         "generated": 413,
         "distinct": 72,
@@ -158,11 +162,13 @@
       {
         "id": "splinter/AbstractMap",
         "export_rc": 0,
+        "export_seconds": 1.504,
         "status": "complete",
         "refusals": 0,
         "holes": 10,
         "restrictions": 7,
         "reasons": [],
+        "sany_status": "ok",
         "tlc_rc": 0,
         "generated": 33,
         "distinct": 3,
@@ -171,24 +177,28 @@
       {
         "id": "splinter/CrashTolerantJournal",
         "export_rc": 0,
+        "export_seconds": 1.204,
         "status": "exploring_timeout",
         "refusals": 0,
         "holes": 28,
         "restrictions": 24,
         "reasons": [],
+        "sany_status": "ok",
         "tlc_rc": 124,
-        "generated": 240,
-        "distinct": 29,
+        "generated": 288,
+        "distinct": 35,
         "errors": []
       },
       {
         "id": "splinter/CrashTolerantMap",
         "export_rc": 0,
+        "export_seconds": 1.304,
         "status": "tlc_error",
         "refusals": 0,
         "holes": 19,
         "restrictions": 20,
         "reasons": [],
+        "sany_status": "ok",
         "tlc_rc": 151,
         "errors": [
           "Error: The constant parameter Dom_Key is not assigned a value by the configuration file."
@@ -197,11 +207,13 @@
       {
         "id": "splinter/LinkedJournal",
         "export_rc": 0,
+        "export_seconds": 1.91,
         "status": "invariant_violation",
         "refusals": 0,
         "holes": 29,
-        "restrictions": 32,
+        "restrictions": 28,
         "reasons": [],
+        "sany_status": "ok",
         "tlc_rc": 12,
         "generated": 9,
         "distinct": 4,
@@ -321,85 +333,6 @@
       ]
     }
   ],
-  "collections_after": {
-    "binary": "/data/home/kirancodes/Documents/code/verus-research/wt-export-partial/source/target-verus/release/verus",
-    "group": "collections",
-    "phase": "acceptance-collections",
-    "export_seconds": 90,
-    "tlc_seconds": 30,
-    "jobs": 3,
-    "sha256": {
-      "verus": "5ffa1cb2b1e0df2bbed030d98414f20640f9c0613551a62be858ad320bf87a2a",
-      "rust_verify": "00249f193739131885503cf8dead48ee0527cc09e5784c7108a69db95776d06c"
-    },
-    "rows": [
-      {
-        "id": "nr/UnboundedLog",
-        "export_rc": 0,
-        "status": "exported",
-        "refusals": 0,
-        "holes": 41,
-        "restrictions": 11,
-        "reasons": []
-      },
-      {
-        "id": "ironkv/delegation_map_t",
-        "export_rc": 1,
-        "status": "export_error"
-      },
-      {
-        "id": "ironkv/host_protocol_t",
-        "export_rc": 0,
-        "status": "exported",
-        "refusals": 0,
-        "holes": 101,
-        "restrictions": 51,
-        "reasons": []
-      },
-      {
-        "id": "ironkv/host_impl_t",
-        "export_rc": 1,
-        "status": "export_error"
-      },
-      {
-        "id": "nrkernel/hlspec",
-        "export_rc": 0,
-        "status": "exported",
-        "refusals": 1,
-        "holes": 48,
-        "restrictions": 19,
-        "reasons": [
-          "choose (TLC cannot evaluate it)"
-        ]
-      },
-      {
-        "id": "nrkernel/mmu_rl1",
-        "export_rc": 0,
-        "status": "exported",
-        "refusals": 189,
-        "holes": 59,
-        "restrictions": 24,
-        "reasons": [
-          "partial-read analysis exceeds its expansion limit"
-        ]
-      },
-      {
-        "id": "nrkernel/mmu_rl2",
-        "export_rc": 124,
-        "status": "export_error"
-      },
-      {
-        "id": "nrkernel/mmu_rl3",
-        "export_rc": 124,
-        "status": "export_error"
-      },
-      {
-        "id": "nrkernel/os",
-        "export_rc": 124,
-        "status": "export_error"
-      }
-    ]
-  },
   "fixture_parent": {
     "binary": "/data/home/kirancodes/Documents/code/verus-research/wt-export-nrkernel/source/target-verus/release/verus",
     "group": "fixtures",
@@ -480,77 +413,91 @@
   "fixture_after": {
     "binary": "/data/home/kirancodes/Documents/code/verus-research/wt-export-partial/source/target-verus/release/verus",
     "group": "fixtures",
-    "phase": "acceptance-fixtures",
+    "phase": "bounded-final-fixtures",
     "export_seconds": 90,
     "tlc_seconds": 30,
-    "jobs": 1,
+    "jobs": 2,
     "sha256": {
       "verus": "5ffa1cb2b1e0df2bbed030d98414f20640f9c0613551a62be858ad320bf87a2a",
-      "rust_verify": "00249f193739131885503cf8dead48ee0527cc09e5784c7108a69db95776d06c"
+      "rust_verify": "876698000df07ece19d638fdc93650c9ad6024b68158bc420d6d5f373e980537"
     },
     "rows": [
       {
         "id": "adder_sync",
         "export_rc": 0,
+        "export_seconds": 0.604,
         "status": "exported",
         "refusals": 0,
         "holes": 1,
         "restrictions": 0,
-        "reasons": []
+        "reasons": [],
+        "sany_status": "ok"
       },
       {
         "id": "assert_sync",
         "export_rc": 0,
+        "export_seconds": 0.604,
         "status": "exported",
         "refusals": 0,
         "holes": 0,
         "restrictions": 0,
-        "reasons": []
+        "reasons": [],
+        "sany_status": "ok"
       },
       {
         "id": "counter",
         "export_rc": 0,
+        "export_seconds": 0.605,
         "status": "exported",
         "refusals": 0,
         "holes": 0,
         "restrictions": 0,
-        "reasons": []
+        "reasons": [],
+        "sany_status": "ok"
       },
       {
         "id": "mutex_liveness",
         "export_rc": 0,
+        "export_seconds": 0.605,
         "status": "exported",
         "refusals": 0,
         "holes": 0,
         "restrictions": 0,
-        "reasons": []
+        "reasons": [],
+        "sany_status": "ok"
       },
       {
         "id": "mutex_tla",
         "export_rc": 0,
+        "export_seconds": 0.706,
         "status": "exported",
         "refusals": 0,
         "holes": 0,
         "restrictions": 0,
-        "reasons": []
+        "reasons": [],
+        "sany_status": "ok"
       },
       {
         "id": "toggle_sync",
         "export_rc": 0,
+        "export_seconds": 0.705,
         "status": "exported",
         "refusals": 0,
         "holes": 0,
         "restrictions": 0,
-        "reasons": []
+        "reasons": [],
+        "sany_status": "ok"
       },
       {
         "id": "toydb",
         "export_rc": 0,
+        "export_seconds": 1.908,
         "status": "exported",
         "refusals": 0,
         "holes": 3,
         "restrictions": 0,
-        "reasons": []
+        "reasons": [],
+        "sany_status": "ok"
       }
     ]
   },
@@ -755,21 +702,15 @@
   "bounds": [
     {
       "id": "nr/UnboundedLog-mono",
-      "file": "MC.tla",
-      "unchanged": true,
-      "sha256": "a54fcdbc4f5c23582a61ca71d80723532bd92b16225a9b3bbc5ca2bab5a568c7"
-    },
-    {
-      "id": "nr/UnboundedLog-mono",
       "file": "MC.cfg",
       "unchanged": true,
       "sha256": "ae1037d89032471b6e04c6aaadcf8c7dd48c351e9b57e0b835a54b1b4a22c620"
     },
     {
-      "id": "splinter/AbstractJournal",
+      "id": "nr/UnboundedLog-mono",
       "file": "MC.tla",
       "unchanged": true,
-      "sha256": "c09d8b0a574f6a88c4ccd7b3dad5363a2cac80307b73273f2423171686f2368c"
+      "sha256": "a54fcdbc4f5c23582a61ca71d80723532bd92b16225a9b3bbc5ca2bab5a568c7"
     },
     {
       "id": "splinter/AbstractJournal",
@@ -778,10 +719,10 @@
       "sha256": "d76106ef99644849ffa418c3ddaafc6c45506a1a490ddc8ea6f1c1f54202be8f"
     },
     {
-      "id": "splinter/AbstractMap",
+      "id": "splinter/AbstractJournal",
       "file": "MC.tla",
       "unchanged": true,
-      "sha256": "0f720742e30c55c85e327e79ca6438386ff8e4b10e8a8af05344af811a1606d0"
+      "sha256": "c09d8b0a574f6a88c4ccd7b3dad5363a2cac80307b73273f2423171686f2368c"
     },
     {
       "id": "splinter/AbstractMap",
@@ -790,10 +731,10 @@
       "sha256": "382513109b0446183344f547aebfb647d9fbc3bdb889c53b756958399f13a966"
     },
     {
-      "id": "splinter/CrashTolerantJournal",
+      "id": "splinter/AbstractMap",
       "file": "MC.tla",
       "unchanged": true,
-      "sha256": "939952abfffe61daddd5cf3c83da64323f6b035287ec306d9be23a9c5ca9a1d6"
+      "sha256": "0f720742e30c55c85e327e79ca6438386ff8e4b10e8a8af05344af811a1606d0"
     },
     {
       "id": "splinter/CrashTolerantJournal",
@@ -802,10 +743,10 @@
       "sha256": "24d03b449eeb46b495fb1dbd89773d3e9160a9c2078ee511d8e5d0503d5e2814"
     },
     {
-      "id": "splinter/CrashTolerantMap",
+      "id": "splinter/CrashTolerantJournal",
       "file": "MC.tla",
       "unchanged": true,
-      "sha256": "551a422f295fcdb641357b95bc29a4a91695d0b19617d0106d9f8ec9e6ca163a"
+      "sha256": "939952abfffe61daddd5cf3c83da64323f6b035287ec306d9be23a9c5ca9a1d6"
     },
     {
       "id": "splinter/CrashTolerantMap",
@@ -814,26 +755,591 @@
       "sha256": "dfad426d68bfe87194c2bd3206a1f32a26cac65d0c5c3bc7a76c2eee729400d6"
     },
     {
-      "id": "splinter/LinkedJournal",
+      "id": "splinter/CrashTolerantMap",
       "file": "MC.tla",
       "unchanged": true,
-      "sha256": "19d7382da27db2cafa7faf43ace552d35d8ef85d3a0ebba36c5734ad650b9db4"
+      "sha256": "551a422f295fcdb641357b95bc29a4a91695d0b19617d0106d9f8ec9e6ca163a"
     },
     {
       "id": "splinter/LinkedJournal",
       "file": "MC.cfg",
       "unchanged": true,
       "sha256": "dd78a3709745ec97ffb40b72a4ad10beb26aba9aa21eb6fc3a8cda128dc9b568"
+    },
+    {
+      "id": "splinter/LinkedJournal",
+      "file": "MC.tla",
+      "unchanged": true,
+      "sha256": "19d7382da27db2cafa7faf43ace552d35d8ef85d3a0ebba36c5734ad650b9db4"
+    },
+    {
+      "id": "splinter/PagedBetree",
+      "file": "MC.cfg",
+      "unchanged": true,
+      "sha256": "71c0d7f43c1cb91142fed2f73dae9df429a9f97c6e79bd87d8e2038cdb21c21a"
+    },
+    {
+      "id": "splinter/PagedBetree",
+      "file": "MC.tla",
+      "unchanged": true,
+      "sha256": "e9bab152d8a64495c3cdbe800b9e96d87934737764f5fdea09765236689deaa3"
+    },
+    {
+      "id": "splinter/PivotBetree",
+      "file": "MC.cfg",
+      "unchanged": true,
+      "sha256": "8d35621312779f0d0bf2a1e7e556c1139b1e212af2aa4bfbff909314515ce56b"
+    },
+    {
+      "id": "splinter/PivotBetree",
+      "file": "MC.tla",
+      "unchanged": true,
+      "sha256": "96364023876479dde667923471750bf0b53bdb85adfe53cf6ef5d937d68ce3c3"
     }
   ],
   "tests": {
+    "result": "test result: ok. 207 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 82.58s",
+    "TLA2TOOLS_JAR": "/Users/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar",
+    "log_sha256": "113e7fe547d88b993637616dc3102db0a0da21a34493ad9da03beb672a6d40ce"
+  },
+  "regression_source_sha256": {
+    "source/vir/src/tla.rs": "d5bf402e3dc35a22e27c2cad203eb215dbb04d9587f4382e3ba907fa10bc6170",
+    "source/rust_verify_test/tests/tla_export.rs": "041478ae99814d4f732417841a88ae0204e71e07bc59fb85f6ca07b7341104a9",
+    "source/rust_verify_test/tests/tla_export_fixtures/compat/raft.rs": "2f0e5792394f381c78d94410d6a01a37ead06309e1abcec20e9e66b437e4f7cd"
+  },
+  "partial_after_64f1c6e3": {
+    "binary": "/data/home/kirancodes/Documents/code/verus-research/wt-export-partial/source/target-verus/release/verus",
+    "group": "partial",
+    "phase": "acceptance-after",
+    "export_seconds": 90,
+    "tlc_seconds": 30,
+    "jobs": 1,
+    "sha256": {
+      "verus": "5ffa1cb2b1e0df2bbed030d98414f20640f9c0613551a62be858ad320bf87a2a",
+      "rust_verify": "00249f193739131885503cf8dead48ee0527cc09e5784c7108a69db95776d06c"
+    },
+    "rows": [
+      {
+        "id": "nr/UnboundedLog-mono",
+        "export_rc": 0,
+        "status": "tlc_error",
+        "refusals": 0,
+        "holes": 42,
+        "restrictions": 13,
+        "reasons": [],
+        "tlc_rc": 151,
+        "errors": [
+          "Error: The constant parameter Table_arbitrary__tla_closed2 is not assigned a value by the configuration file."
+        ]
+      },
+      {
+        "id": "splinter/AbstractJournal",
+        "export_rc": 0,
+        "status": "complete",
+        "refusals": 0,
+        "holes": 17,
+        "restrictions": 8,
+        "reasons": [],
+        "tlc_rc": 0,
+        "generated": 413,
+        "distinct": 72,
+        "errors": []
+      },
+      {
+        "id": "splinter/AbstractMap",
+        "export_rc": 0,
+        "status": "complete",
+        "refusals": 0,
+        "holes": 10,
+        "restrictions": 7,
+        "reasons": [],
+        "tlc_rc": 0,
+        "generated": 33,
+        "distinct": 3,
+        "errors": []
+      },
+      {
+        "id": "splinter/CrashTolerantJournal",
+        "export_rc": 0,
+        "status": "exploring_timeout",
+        "refusals": 0,
+        "holes": 28,
+        "restrictions": 24,
+        "reasons": [],
+        "tlc_rc": 124,
+        "generated": 240,
+        "distinct": 29,
+        "errors": []
+      },
+      {
+        "id": "splinter/CrashTolerantMap",
+        "export_rc": 0,
+        "status": "tlc_error",
+        "refusals": 0,
+        "holes": 19,
+        "restrictions": 20,
+        "reasons": [],
+        "tlc_rc": 151,
+        "errors": [
+          "Error: The constant parameter Dom_Key is not assigned a value by the configuration file."
+        ]
+      },
+      {
+        "id": "splinter/LinkedJournal",
+        "export_rc": 0,
+        "status": "invariant_violation",
+        "refusals": 0,
+        "holes": 29,
+        "restrictions": 32,
+        "reasons": [],
+        "tlc_rc": 12,
+        "generated": 9,
+        "distinct": 4,
+        "errors": [
+          "Error: Invariant inv is violated.",
+          "Error: The behavior up to this point is:"
+        ]
+      }
+    ]
+  },
+  "collections_after_64f1c6e3": {
+    "binary": "/data/home/kirancodes/Documents/code/verus-research/wt-export-partial/source/target-verus/release/verus",
+    "group": "collections",
+    "phase": "acceptance-collections",
+    "export_seconds": 90,
+    "tlc_seconds": 30,
+    "jobs": 3,
+    "sha256": {
+      "verus": "5ffa1cb2b1e0df2bbed030d98414f20640f9c0613551a62be858ad320bf87a2a",
+      "rust_verify": "00249f193739131885503cf8dead48ee0527cc09e5784c7108a69db95776d06c"
+    },
+    "rows": [
+      {
+        "id": "nr/UnboundedLog",
+        "export_rc": 0,
+        "status": "exported",
+        "refusals": 0,
+        "holes": 41,
+        "restrictions": 11,
+        "reasons": []
+      },
+      {
+        "id": "ironkv/delegation_map_t",
+        "export_rc": 1,
+        "status": "export_error"
+      },
+      {
+        "id": "ironkv/host_protocol_t",
+        "export_rc": 0,
+        "status": "exported",
+        "refusals": 0,
+        "holes": 101,
+        "restrictions": 51,
+        "reasons": []
+      },
+      {
+        "id": "ironkv/host_impl_t",
+        "export_rc": 1,
+        "status": "export_error"
+      },
+      {
+        "id": "nrkernel/hlspec",
+        "export_rc": 0,
+        "status": "exported",
+        "refusals": 1,
+        "holes": 48,
+        "restrictions": 19,
+        "reasons": [
+          "choose (TLC cannot evaluate it)"
+        ]
+      },
+      {
+        "id": "nrkernel/mmu_rl1",
+        "export_rc": 0,
+        "status": "exported",
+        "refusals": 189,
+        "holes": 59,
+        "restrictions": 24,
+        "reasons": [
+          "partial-read analysis exceeds its expansion limit"
+        ]
+      },
+      {
+        "id": "nrkernel/mmu_rl2",
+        "export_rc": 124,
+        "status": "export_error"
+      },
+      {
+        "id": "nrkernel/mmu_rl3",
+        "export_rc": 124,
+        "status": "export_error"
+      },
+      {
+        "id": "nrkernel/os",
+        "export_rc": 124,
+        "status": "export_error"
+      }
+    ]
+  },
+  "fixture_after_64f1c6e3": {
+    "binary": "/data/home/kirancodes/Documents/code/verus-research/wt-export-partial/source/target-verus/release/verus",
+    "group": "fixtures",
+    "phase": "acceptance-fixtures",
+    "export_seconds": 90,
+    "tlc_seconds": 30,
+    "jobs": 1,
+    "sha256": {
+      "verus": "5ffa1cb2b1e0df2bbed030d98414f20640f9c0613551a62be858ad320bf87a2a",
+      "rust_verify": "00249f193739131885503cf8dead48ee0527cc09e5784c7108a69db95776d06c"
+    },
+    "rows": [
+      {
+        "id": "adder_sync",
+        "export_rc": 0,
+        "status": "exported",
+        "refusals": 0,
+        "holes": 1,
+        "restrictions": 0,
+        "reasons": []
+      },
+      {
+        "id": "assert_sync",
+        "export_rc": 0,
+        "status": "exported",
+        "refusals": 0,
+        "holes": 0,
+        "restrictions": 0,
+        "reasons": []
+      },
+      {
+        "id": "counter",
+        "export_rc": 0,
+        "status": "exported",
+        "refusals": 0,
+        "holes": 0,
+        "restrictions": 0,
+        "reasons": []
+      },
+      {
+        "id": "mutex_liveness",
+        "export_rc": 0,
+        "status": "exported",
+        "refusals": 0,
+        "holes": 0,
+        "restrictions": 0,
+        "reasons": []
+      },
+      {
+        "id": "mutex_tla",
+        "export_rc": 0,
+        "status": "exported",
+        "refusals": 0,
+        "holes": 0,
+        "restrictions": 0,
+        "reasons": []
+      },
+      {
+        "id": "toggle_sync",
+        "export_rc": 0,
+        "status": "exported",
+        "refusals": 0,
+        "holes": 0,
+        "restrictions": 0,
+        "reasons": []
+      },
+      {
+        "id": "toydb",
+        "export_rc": 0,
+        "status": "exported",
+        "refusals": 0,
+        "holes": 3,
+        "restrictions": 0,
+        "reasons": []
+      }
+    ]
+  },
+  "tests_64f1c6e3": {
     "result": "test result: ok. 204 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 83.81s",
     "TLA2TOOLS_JAR": "/Users/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar",
     "log_sha256": "5b394f9c9de414a0df0353c57b653d51f0e1f0e29ec338b28b3dff82ee2216f4"
   },
-  "regression_source_sha256": {
-    "source/vir/src/tla.rs": "7b81ac45a3b5f7e59521f282614c1d73bee3b7716c771f6376516317699461b0",
-    "source/rust_verify_test/tests/tla_export.rs": "c74c5c65dd2a83feac2ef2b3001b6b3ea503a946565e90a816ddcb4ab51f9f01",
-    "source/rust_verify_test/tests/tla_export_fixtures/compat/raft.rs": "2f0e5792394f381c78d94410d6a01a37ead06309e1abcec20e9e66b437e4f7cd"
+  "definedness_regressions": {
+    "regressed_commit": "64f1c6e334c842b66008fee2de7bb8e82f1dc6bf",
+    "original": {
+      "binary": "/data/home/kirancodes/Documents/code/verus-research/base/verus/source/target-verus/release/verus",
+      "group": "regressions",
+      "phase": "expansion-original",
+      "export_seconds": 90,
+      "tlc_seconds": 30,
+      "jobs": 2,
+      "sha256": {
+        "verus": "5ffa1cb2b1e0df2bbed030d98414f20640f9c0613551a62be858ad320bf87a2a",
+        "rust_verify": "547a07fb788e1ef1e158c2cc2278e30ad4f33ca7736b867a4d8955e855ce7412"
+      },
+      "rows": [
+        {
+          "id": "splinter/PagedBetree",
+          "export_rc": 0,
+          "export_seconds": 1.104,
+          "status": "complete",
+          "refusals": 0,
+          "holes": 37,
+          "restrictions": 0,
+          "reasons": [],
+          "tlc_rc": 0,
+          "generated": 173,
+          "distinct": 25,
+          "errors": []
+        },
+        {
+          "id": "splinter/PivotBetree",
+          "export_rc": 0,
+          "export_seconds": 1.305,
+          "status": "complete",
+          "refusals": 0,
+          "holes": 42,
+          "restrictions": 0,
+          "reasons": [],
+          "tlc_rc": 0,
+          "generated": 133,
+          "distinct": 25,
+          "errors": []
+        },
+        {
+          "id": "nrkernel/mmu_rl1",
+          "export_rc": 0,
+          "export_seconds": 8.411,
+          "status": "exported",
+          "refusals": 95,
+          "holes": 39,
+          "restrictions": 0,
+          "reasons": [
+            "binary operator Bitwise(BitAnd, Allow)",
+            "binary operator Bitwise(Shl(ArchWordSize, false), Allow)",
+            "binary operator Bitwise(Shl(ArchWordSize, false), Error(ArchWordSize))",
+            "binary operator Bitwise(Shr, Allow)",
+            "uninterpreted function"
+          ]
+        },
+        {
+          "id": "nrkernel/mmu_rl2",
+          "export_rc": 0,
+          "export_seconds": 9.118,
+          "status": "exported",
+          "refusals": 108,
+          "holes": 87,
+          "restrictions": 0,
+          "reasons": [
+            "ISet::finite (the export builds only finite sets)",
+            "binary operator Bitwise(BitAnd, Allow)",
+            "binary operator Bitwise(Shl(ArchWordSize, false), Allow)",
+            "binary operator Bitwise(Shl(ArchWordSize, false), Error(ArchWordSize))",
+            "binary operator Bitwise(Shr, Allow)",
+            "uninterpreted function"
+          ]
+        },
+        {
+          "id": "nrkernel/mmu_rl3",
+          "export_rc": 0,
+          "export_seconds": 9.134,
+          "status": "exported",
+          "refusals": 101,
+          "holes": 86,
+          "restrictions": 0,
+          "reasons": [
+            "ISet::finite (the export builds only finite sets)",
+            "binary operator Bitwise(BitAnd, Allow)",
+            "binary operator Bitwise(BitXor, Allow)",
+            "binary operator Bitwise(Shl(ArchWordSize, false), Allow)",
+            "binary operator Bitwise(Shl(ArchWordSize, false), Error(ArchWordSize))",
+            "binary operator Bitwise(Shr, Allow)",
+            "uninterpreted function"
+          ]
+        },
+        {
+          "id": "nrkernel/os",
+          "export_rc": 0,
+          "export_seconds": 8.718,
+          "status": "exported",
+          "refusals": 135,
+          "holes": 318,
+          "restrictions": 0,
+          "reasons": [
+            "ISet::finite (the export builds only finite sets)",
+            "binary operator Bitwise(BitAnd, Allow)",
+            "binary operator Bitwise(BitXor, Allow)",
+            "binary operator Bitwise(Shl(ArchWordSize, false), Allow)",
+            "binary operator Bitwise(Shl(ArchWordSize, false), Error(ArchWordSize))",
+            "binary operator Bitwise(Shr, Allow)",
+            "choose (TLC cannot evaluate it)",
+            "integer type bound",
+            "uninterpreted function"
+          ]
+        }
+      ]
+    },
+    "before": {
+      "binary": "/data/home/kirancodes/Documents/code/verus-research/wt-export-partial/source/target-verus/release/verus",
+      "group": "regressions",
+      "phase": "expansion-before",
+      "export_seconds": 90,
+      "tlc_seconds": 30,
+      "jobs": 3,
+      "sha256": {
+        "verus": "5ffa1cb2b1e0df2bbed030d98414f20640f9c0613551a62be858ad320bf87a2a",
+        "rust_verify": "00249f193739131885503cf8dead48ee0527cc09e5784c7108a69db95776d06c"
+      },
+      "rows": [
+        {
+          "id": "splinter/PagedBetree",
+          "export_rc": 0,
+          "export_seconds": 1.611,
+          "status": "sany_error",
+          "refusals": 0,
+          "holes": 37,
+          "restrictions": 34,
+          "reasons": [],
+          "tlc_rc": 150,
+          "errors": [
+            "Error: Parsing or semantic analysis failed."
+          ]
+        },
+        {
+          "id": "splinter/PivotBetree",
+          "export_rc": 0,
+          "export_seconds": 1.809,
+          "status": "sany_error",
+          "refusals": 0,
+          "holes": 42,
+          "restrictions": 66,
+          "reasons": [],
+          "tlc_rc": 150,
+          "errors": [
+            "Error: Parsing or semantic analysis failed."
+          ]
+        },
+        {
+          "id": "nrkernel/mmu_rl1",
+          "export_rc": 0,
+          "export_seconds": 25.708,
+          "status": "exported",
+          "refusals": 189,
+          "holes": 59,
+          "restrictions": 24,
+          "reasons": [
+            "partial-read analysis exceeds its expansion limit"
+          ]
+        },
+        {
+          "id": "nrkernel/mmu_rl2",
+          "export_rc": 124,
+          "export_seconds": 90.087,
+          "status": "export_error"
+        },
+        {
+          "id": "nrkernel/mmu_rl3",
+          "export_rc": 124,
+          "export_seconds": 90.067,
+          "status": "export_error"
+        },
+        {
+          "id": "nrkernel/os",
+          "export_rc": 124,
+          "export_seconds": 90.102,
+          "status": "export_error"
+        }
+      ]
+    },
+    "after": {
+      "binary": "/data/home/kirancodes/Documents/code/verus-research/wt-export-partial/source/target-verus/release/verus",
+      "group": "regressions",
+      "phase": "bounded-final",
+      "export_seconds": 90,
+      "tlc_seconds": 30,
+      "jobs": 2,
+      "sha256": {
+        "verus": "5ffa1cb2b1e0df2bbed030d98414f20640f9c0613551a62be858ad320bf87a2a",
+        "rust_verify": "876698000df07ece19d638fdc93650c9ad6024b68158bc420d6d5f373e980537"
+      },
+      "rows": [
+        {
+          "id": "splinter/PagedBetree",
+          "export_rc": 0,
+          "export_seconds": 1.204,
+          "status": "complete",
+          "refusals": 0,
+          "holes": 37,
+          "restrictions": 34,
+          "reasons": [],
+          "sany_status": "ok",
+          "tlc_rc": 0,
+          "generated": 173,
+          "distinct": 25,
+          "errors": []
+        },
+        {
+          "id": "splinter/PivotBetree",
+          "export_rc": 0,
+          "export_seconds": 1.306,
+          "status": "complete",
+          "refusals": 0,
+          "holes": 42,
+          "restrictions": 65,
+          "reasons": [],
+          "sany_status": "ok",
+          "tlc_rc": 0,
+          "generated": 133,
+          "distinct": 25,
+          "errors": []
+        },
+        {
+          "id": "nrkernel/mmu_rl1",
+          "export_rc": 0,
+          "export_seconds": 8.92,
+          "status": "exported",
+          "refusals": 0,
+          "holes": 59,
+          "restrictions": 24,
+          "reasons": [],
+          "sany_status": "ok"
+        },
+        {
+          "id": "nrkernel/mmu_rl2",
+          "export_rc": 0,
+          "export_seconds": 8.614,
+          "status": "exported",
+          "refusals": 0,
+          "holes": 107,
+          "restrictions": 54,
+          "reasons": [],
+          "sany_status": "ok"
+        },
+        {
+          "id": "nrkernel/mmu_rl3",
+          "export_rc": 0,
+          "export_seconds": 8.613,
+          "status": "exported",
+          "refusals": 0,
+          "holes": 112,
+          "restrictions": 67,
+          "reasons": [],
+          "sany_status": "ok"
+        },
+        {
+          "id": "nrkernel/os",
+          "export_rc": 0,
+          "export_seconds": 11.623,
+          "status": "exported",
+          "refusals": 7,
+          "holes": 356,
+          "restrictions": 195,
+          "reasons": [
+            "choose (TLC cannot evaluate it)",
+            "integer type bound"
+          ],
+          "sany_status": "ok"
+        }
+      ]
+    }
   }
 }

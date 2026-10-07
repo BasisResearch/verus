@@ -10041,3 +10041,130 @@ pub open spec fn next(pre: State, post: State) -> bool {
     sany(&jar, &ex.spec());
     assert_eq!(tlc(&jar, &ex.spec(), &ex.cfg).distinct, 1);
 }
+
+/// PagedBetree substitutes through a mutually recursive map constructor.
+/// The inner definedness body must see the outer operator's declaration.
+#[test]
+fn tla_export_mutually_recursive_substitution_definedness() {
+    let ex = export_code_with(
+        r#"
+use vstd::map::*;
+use vstd::set::*;
+verus! {
+pub struct State { pub m: Map<nat, nat>, pub n: nat }
+pub open spec fn substitute(m: Map<nat, nat>, n: nat) -> nat
+    decreases n, 1nat
+{
+    if n == 0 { m[0] } else { replaced_children(m, n) }
+}
+pub open spec fn replaced_children(m: Map<nat, nat>, n: nat) -> nat
+    decreases n, 0nat
+{
+    let replacement = substitute(m, (n - 1) as nat);
+    Map::<nat, nat>::new(Set::empty().insert(0), |k: nat| replacement)[0]
+}
+pub open spec fn init(s: State) -> bool { s.m == Map::empty() && s.n == 0 }
+pub open spec fn next(pre: State, post: State) -> bool {
+    ||| (post.m == pre.m && post.n == substitute(pre.m, 2))
+    ||| (pre.n == 0 && post == State { n: 1, ..pre })
+}
+pub open spec fn bounded(s: State) -> bool { s.n <= 1 }
+}
+"#,
+        "test_crate",
+        &["--no-verify"],
+    );
+    assert!(ex.report["refusals"].as_array().unwrap().is_empty(), "{}", ex.report);
+    let declaration = ex.tla.find("RECURSIVE Defined_substitute(").unwrap();
+    let inner_body = ex
+        .tla
+        .lines()
+        .find(|line| line.starts_with("Defined_replaced_children(") && line.contains(" =="))
+        .unwrap_or_else(|| panic!("{}", ex.tla));
+    let inner_body = ex.tla.find(inner_body).unwrap();
+    assert!(declaration < inner_body, "{}", ex.tla);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let run = tlc(&jar, &ex.spec(), &ex.cfg);
+    assert_eq!(run.distinct, 2);
+    assert!(run.violated.is_empty());
+}
+
+/// Forty shared helper layers have 2^40 paths but only forty bodies and one
+/// partial read. Definedness must follow the DAG, not expand all paths.
+#[test]
+fn tla_export_definedness_expansion_shares_helper_arguments() {
+    let mut code = String::from(
+        "use vstd::map::*;\nverus! {\npub struct State { pub m: Map<int, int>, pub n: nat }\npub open spec fn f0(m: Map<int, int>) -> int { m[0] }\n",
+    );
+    for i in 1..=40 {
+        code.push_str(&format!(
+            "pub open spec fn f{i}(m: Map<int, int>) -> int {{ f{}(m) + f{}(m) }}\n",
+            i - 1,
+            i - 1
+        ));
+    }
+    code.push_str(
+        r#"
+pub open spec fn init(s: State) -> bool { s.m == Map::empty() && s.n == 0 }
+pub open spec fn next(pre: State, post: State) -> bool {
+    ||| (f40(pre.m) == 0 && post == State { n: 2, ..pre })
+    ||| (pre.n == 0 && post == State { n: 1, ..pre })
+}
+pub open spec fn bounded(s: State) -> bool { s.n <= 1 }
+}
+"#,
+    );
+    let started = std::time::Instant::now();
+    let ex = export_code_with(&code, "test_crate", &["--no-verify"]);
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(30),
+        "shared DAG export exceeded 30 seconds"
+    );
+    assert!(ex.report["refusals"].as_array().unwrap().is_empty(), "{}", ex.report);
+    assert!(ex.tla.len() < 40_000, "expanded output: {} bytes", ex.tla.len());
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    // TLC eagerly preprocesses the duplicated value DAG itself. Exercise its
+    // semantics on eight layers; the export/SANY bound above covers all forty.
+    let small =
+        export_code_with(&code.replace("f40(pre.m)", "f8(pre.m)"), "test_crate", &["--no-verify"]);
+    let run = tlc(&jar, &small.spec(), &small.cfg);
+    assert_eq!(run.distinct, 2);
+    assert!(run.violated.is_empty());
+}
+
+/// A helper's domain guard passes the state as a record even when its value
+/// call uses the flattened state variables. The guard's variant must be emitted.
+#[test]
+fn tla_export_definedness_emits_guard_only_record_helper() {
+    let ex = export_code_with(
+        r#"
+use vstd::map::*;
+verus! {
+pub struct State { pub m: Map<int, int>, pub n: nat }
+pub open spec fn core_mem(s: State) -> Map<int, int> {
+    let _ = vstd::pervasive::spec_affirm(true);
+    s.m
+}
+pub open spec fn read(s: State) -> int { core_mem(s)[0] }
+pub open spec fn init(s: State) -> bool { s.m == Map::empty() && s.n == 0 }
+pub open spec fn next(pre: State, post: State) -> bool {
+    ||| (read(pre) == 7 && post == State { n: 2, ..pre })
+    ||| (pre.n == 0 && post == State { n: 1, ..pre })
+}
+pub open spec fn bounded(s: State) -> bool { s.n <= 1 }
+}
+"#,
+        "test_crate",
+        &["--no-verify"],
+    );
+    assert!(ex.report["refusals"].as_array().unwrap().is_empty(), "{}", ex.report);
+    assert!(ex.tla.contains("core_mem_rec(s) =="), "{}", ex.tla);
+    assert!(!ex.tla.contains("Table_spec_affirm"), "{}", ex.tla);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let run = tlc(&jar, &ex.spec(), &ex.cfg);
+    assert_eq!(run.distinct, 2);
+    assert!(run.violated.is_empty());
+}

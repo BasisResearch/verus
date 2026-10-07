@@ -629,7 +629,7 @@ struct Env {
     names: HashMap<VarIdent, String>,
     /// Variables bound to a closure or record value, kept symbolically so a
     /// later application or field selection can be reduced.
-    values: HashMap<VarIdent, (Expr, Box<Env>)>,
+    values: HashMap<VarIdent, (Expr, Arc<Env>)>,
     /// Locals bound (by `let` or a pattern) to a value that reads the post
     /// state, so reading them reads primed variables.
     primed: HashSet<VarIdent>,
@@ -1036,6 +1036,10 @@ struct Exporter {
     stable_lengths: Vec<String>,
     safety_facts: Vec<String>,
     defined_functions: HashMap<Fun, String>,
+    // One analysis of a repeated helper application per guard context. Sharing
+    // these immutable snapshots also keeps speculative exporter clones cheap.
+    read_calls: Arc<HashMap<(Fun, Vec<String>, Vec<bool>, Vec<String>), Vec<(String, Expr)>>>,
+    read_work: usize,
     /// The 0-ary functions standing for the model's constants (see
     /// [`Exporter::close_extras`]), and the operator each is.
     constant_ops: HashMap<Fun, String>,
@@ -1858,6 +1862,7 @@ impl Exporter {
         if requirements.is_empty() {
             s
         } else {
+            self.ensure_guard_dependencies(&requirements);
             for (g, site) in &requirements {
                 self.restriction(format!("partial read: enclosing predicate is FALSE outside {g}; this restricts unspecified source values"), site);
             }
@@ -1870,7 +1875,12 @@ impl Exporter {
     /// with their arguments substituted, so a projection helper cannot hide
     /// an off-domain read from the enclosing predicate.
     fn read_requirements(&mut self, e: &Expr, env: &Env, depth: usize) -> Vec<(String, Expr)> {
-        if depth > 64 {
+        if depth == 0 {
+            self.read_calls = Arc::new(HashMap::new());
+            self.read_work = 0;
+        }
+        self.read_work += 1;
+        if depth > 1024 || self.read_work > 65536 {
             return vec![(
                 self.refuse("partial-read analysis exceeds its expansion limit", &e.span),
                 e.clone(),
@@ -1960,7 +1970,7 @@ impl Exporter {
                             let rs = self.read_requirements(&body, &scope, depth + 1);
                             if !rs.is_empty() {
                                 let domain = if op == Some("imap_new") {
-                                    self.clone().comprehension(&e, args, 0, env)
+                                    self.safety_render(false, |x| x.comprehension(&e, args, 0, env))
                                 } else if op == Some("imap_total") {
                                     collection_element(&e.typ)
                                         .map(|t| format!("Dom_{}", self.constant_typ_name(&t)))
@@ -2009,18 +2019,62 @@ impl Exporter {
                                     ));
                                 } else {
                                     if let Some(body) = &f.x.body {
-                                        let mut scope = Env::new();
-                                        for (p, a) in f.x.params.iter().zip(args.iter()) {
-                                            scope.names.insert(
-                                                p.x.name.clone(),
-                                                self.safety_value(a, env),
-                                            );
-                                            scope.values.insert(
-                                                p.x.name.clone(),
-                                                (a.clone(), Box::new(env.clone())),
-                                            );
+                                        let arguments: Vec<_> = args
+                                            .iter()
+                                            .map(|a| self.safety_value(a, env))
+                                            .collect();
+                                        let primed: Vec<_> =
+                                            args.iter().map(|a| env.reads_post(a)).collect();
+                                        let cacheable = !f.x.params.iter().any(|p| {
+                                            typ_has_specfn(
+                                                &p.x.typ,
+                                                &self.datatypes,
+                                                &mut HashSet::new(),
+                                            )
+                                        });
+                                        let key = (
+                                            fun.clone(),
+                                            arguments.clone(),
+                                            primed.clone(),
+                                            self.safety_facts.clone(),
+                                        );
+                                        if cacheable && let Some(rs) = self.read_calls.get(&key) {
+                                            out.extend(rs.clone());
+                                        } else {
+                                            let mut scope = Env::new();
+                                            for (((p, a), printed), primed) in
+                                                f.x.params
+                                                    .iter()
+                                                    .zip(args.iter())
+                                                    .zip(arguments)
+                                                    .zip(primed)
+                                            {
+                                                scope.names.insert(p.x.name.clone(), printed);
+                                                if primed {
+                                                    scope.primed.insert(p.x.name.clone());
+                                                }
+                                                // Arguments have already been checked above. A
+                                                // value parameter is defined; revisiting its source
+                                                // at every use expands a shared DAG into a tree.
+                                                if typ_has_specfn(
+                                                    &p.x.typ,
+                                                    &self.datatypes,
+                                                    &mut HashSet::new(),
+                                                ) {
+                                                    scope.values.insert(
+                                                        p.x.name.clone(),
+                                                        (a.clone(), Arc::new(env.clone())),
+                                                    );
+                                                }
+                                            }
+                                            let rs =
+                                                self.read_requirements(body, &scope, depth + 1);
+                                            if cacheable {
+                                                Arc::make_mut(&mut self.read_calls)
+                                                    .insert(key, rs.clone());
+                                            }
+                                            out.extend(rs);
                                         }
-                                        out.extend(self.read_requirements(body, &scope, depth + 1));
                                     }
                                 }
                             }
@@ -2126,6 +2180,8 @@ impl Exporter {
         let name = self.bind(&format!("Defined_{}", last_segment(&fun.path)));
         self.used_names.insert(name.clone());
         self.defined_functions.insert(fun.clone(), name.clone());
+        self.defs.push(format!("RECURSIVE {name}({})\n", vec!["_"; f.x.params.len()].join(", ")));
+        self.def_owners.push(self.current_key.clone());
         let previous_bound = std::mem::take(&mut self.bound);
         let previous_facts = std::mem::take(&mut self.safety_facts);
         let mut scope = Env::new();
@@ -2144,12 +2200,12 @@ impl Exporter {
                 .unwrap_or_default();
         self.bound = previous_bound;
         self.safety_facts = previous_facts;
+        self.ensure_guard_dependencies(&rs);
         for (g, site) in &rs {
             self.restriction(format!("partial read in value helper {}: enclosing predicate is FALSE outside {g}; this restricts unspecified source values", fun_as_friendly_rust_name(fun)), site);
         }
         self.defs.push(format!(
-            "RECURSIVE {name}({})\n{name}({}) ==\n    {}\n",
-            vec!["_"; params.len()].join(", "),
+            "{name}({}) ==\n    {}\n",
             params.join(", "),
             requirements_and(&rs)
         ));
@@ -2197,20 +2253,59 @@ impl Exporter {
         }
     }
 
-    fn safety_value(&mut self, e: &Expr, env: &Env) -> String {
+    // Analysis may render values that never become guards. Reserve operator
+    // names here, but emit bodies only for references in the retained guard.
+    // Otherwise an unused probe can introduce new uninterpreted table holes.
+    fn safety_render(
+        &mut self,
+        reserve_locals: bool,
+        render: impl Fn(&mut Self) -> String,
+    ) -> String {
         let mut probe = self.clone();
         probe.in_safety = true;
-        probe.quiet(|x| x.expr(e, env))
+        let first_call = probe.current_calls.len();
+        let mut value = probe.quiet(|x| render(x));
+        let calls = probe.current_calls[first_call..].to_vec();
+        let mut renamed = false;
+        for call in calls {
+            if let Some(f) = probe.functions.get(&call.callee.0) {
+                self.functions.entry(call.callee.0.clone()).or_insert_with(|| f.clone());
+            }
+            let name = self.op_name(&call.callee);
+            renamed |= probe.op_names.get(&call.callee) != Some(&name);
+        }
+        if renamed {
+            probe = self.clone();
+            probe.in_safety = true;
+            value = probe.quiet(|x| render(x));
+        }
+        if reserve_locals {
+            self.bound.extend(probe.bound);
+            self.locals_ever.extend(probe.locals_ever);
+        }
+        value
+    }
+
+    fn ensure_guard_dependencies(&mut self, requirements: &[(String, Expr)]) {
+        let names: HashMap<_, _> =
+            self.op_names.iter().map(|(k, n)| (n.clone(), k.clone())).collect();
+        let mut seen = HashSet::new();
+        for (guard, _) in requirements {
+            for word in guard.split(|c: char| !c.is_alphanumeric() && c != '_') {
+                if let Some(key) = names.get(word) {
+                    if seen.insert(key.clone()) {
+                        self.quiet(|x| x.ensure_function(key));
+                    }
+                }
+            }
+        }
+    }
+
+    fn safety_value(&mut self, e: &Expr, env: &Env) -> String {
+        self.safety_render(false, |x| x.expr(e, env))
     }
     fn safety_place(&mut self, p: &Place, env: &Env) -> String {
-        let mut probe = self.clone();
-        probe.in_safety = true;
-        let value = probe.quiet(|x| x.place(p, env));
-        // A returned LET/match expression binds names inside its value.
-        // Reserve those before naming an enclosing destructuring binding.
-        self.bound.extend(probe.bound);
-        self.locals_ever.extend(probe.locals_ever);
-        value
+        self.safety_render(true, |x| x.place(p, env))
     }
 
     fn add_guard_fact(&mut self, e: &Expr, env: &Env) {
@@ -3317,7 +3412,7 @@ impl Exporter {
                         if closure_valued {
                             if let Some(v) = symbolic {
                                 env2.names.remove(name);
-                                env2.values.insert(name.clone(), (v, Box::new(env2.clone())));
+                                env2.values.insert(name.clone(), (v, Arc::new(env2.clone())));
                                 continue;
                             }
                         }
@@ -3341,7 +3436,7 @@ impl Exporter {
                             env2.primed.remove(name);
                         }
                         if let Some(v) = symbolic {
-                            env2.values.insert(name.clone(), (v, Box::new(before)));
+                            env2.values.insert(name.clone(), (v, Arc::new(before)));
                         }
                         lets.push(format!("{n} == {value}"));
                     }
@@ -4370,7 +4465,7 @@ impl Exporter {
             } else {
                 env2.primed.remove(&name);
             }
-            env2.values.insert(name.clone(), (peel(a), Box::new(env.clone())));
+            env2.values.insert(name.clone(), (peel(a), Arc::new(env.clone())));
             if !typ_has_specfn(&typ, &self.datatypes, &mut HashSet::new()) {
                 let value = self.expr(a, env);
                 let n = self.bind_var(env2, &name);
@@ -8288,7 +8383,7 @@ impl Exporter {
         let recv = recv.clone();
         self.ensure_generated(&key, move |x| {
             let mut env = Env::new();
-            env.values.insert(fwd.x.params[0].x.name.clone(), (recv, Box::new(Env::new())));
+            env.values.insert(fwd.x.params[0].x.name.clone(), (recv, Arc::new(Env::new())));
             let input = x.bind_var(&mut env, &fwd.x.params[1].x.name);
             let mut params = Vec::new();
             let mut lets = Vec::new();
@@ -10071,6 +10166,8 @@ pub fn export_module(
         stable_lengths: Vec::new(),
         safety_facts: Vec::new(),
         defined_functions: HashMap::new(),
+        read_calls: Arc::new(HashMap::new()),
+        read_work: 0,
         constant_ops: HashMap::new(),
         instances: Vec::new(),
         assoc_types: krate.assoc_type_impls.clone(),

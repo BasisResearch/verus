@@ -8,6 +8,7 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import time
 
 ROOT = Path(__file__).resolve().parents[2]
 CAMPAIGN = ROOT.parent / 'campaign-real/results'
@@ -18,9 +19,12 @@ COLLECTIONS = ['nr/UnboundedLog', 'ironkv/delegation_map_t', 'ironkv/host_protoc
                'nrkernel/mmu_rl2', 'nrkernel/mmu_rl3', 'nrkernel/os']
 
 
+REGRESSIONS = ['splinter/PagedBetree', 'splinter/PivotBetree', 'nrkernel/mmu_rl1', 'nrkernel/mmu_rl2', 'nrkernel/mmu_rl3', 'nrkernel/os']
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument('group', choices=['partial', 'collections', 'fixtures'])
+    ap.add_argument('group', choices=['partial', 'collections', 'fixtures', 'regressions'])
     ap.add_argument('phase')
     ap.add_argument('--verus', type=Path, required=True)
     ap.add_argument('--export-seconds', type=int, default=90)
@@ -40,7 +44,7 @@ def main():
         # The documented base/toydb checkout lacks safety.rs on this box.
         inputs.append(('toydb', ROOT.parent/'trace-arm-eval/toydb/src/raft/safety.rs', 'safety'))
     else:
-        inputs = [(name, None, None) for name in (PARTIAL if args.group == 'partial' else COLLECTIONS)]
+        inputs = [(name, None, None) for name in ({'partial': PARTIAL, 'collections': COLLECTIONS, 'regressions': REGRESSIONS}[args.group])]
     def run_one(item):
         name, source, module = item
         out = dest / name
@@ -57,15 +61,28 @@ def main():
             cmd[cmd.index('--log-dir')+1] = str(export)
             cmd = [str(ROOT.parent/'campaign-real'/x) if x.startswith('sources/') else x for x in cmd]
         (out/'command.json').write_text(json.dumps(cmd, indent=2)+'\n')
+        started = time.monotonic()
         p = subprocess.run(cmd, cwd=ROOT, env=env, capture_output=True, text=True)
         (out/'export.log').write_text(p.stdout+p.stderr)
-        row = {'id':name, 'export_rc':p.returncode, 'status':'export_error'}
+        row = {'id':name, 'export_rc':p.returncode, 'export_seconds':round(time.monotonic()-started,3), 'status':'export_error'}
         reports = list(export.glob('*.tla.json'))
         if p.returncode == 0 and reports:
             report = json.loads(reports[0].read_text())
             row.update(status='exported', refusals=len(report['refusals']), holes=len(report['holes']),
                        restrictions=len(report.get('restrictions', [])),
                        reasons=sorted({r['what'] for r in report['refusals']}))
+            spec = next(export.glob('*_tla.tla'))
+            jar = Path.home()/'.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar'
+            sany = ['timeout', '30', 'java', '-cp', str(jar), 'tla2sany.SANY', str(spec)]
+            (out/'SANY-command.json').write_text(json.dumps(sany, indent=2)+'\n')
+            check = subprocess.run(sany, cwd=ROOT, env=env, capture_output=True, text=True)
+            result = check.stdout+check.stderr
+            (out/'SANY.log').write_text(result)
+            row['sany_status'] = 'ok' if (check.returncode == 0 and
+                f'Semantic processing of module {spec.stem}' in result and
+                not re.search(r'error', result, re.I)) else 'error'
+            if row['sany_status'] == 'error':
+                row['status'] = 'sany_error'
             if args.group != 'fixtures' and (CAMPAIGN/name/'MC-command.json').exists():
                 spec = next(export.glob('*_tla.tla'))
                 shutil.copyfile(spec, out/spec.name)

@@ -32,7 +32,7 @@ A carrier is a `CONSTANT Dom_<Type>` and a source-located hole. Its `ASSUME` req
 
 Carrier-relative finiteness and totality are approximations, not statements about an infinite source universe. Likewise, disabling a conjunct on an unspecified read restricts source behaviors: it is not justified by claiming that Verus itself disables the action. Each inserted restriction records `what`, `location`, and `in_function` in the JSON report's `restrictions` field and is warned of in the TLA header. The field is omitted when empty. Named-expression exports do not leak their restrictions into the main module.
 
-Analysis rendering uses an isolated exporter snapshot so it cannot duplicate holes/refusals or alter assignment bookkeeping. Returned local expressions reserve their bound names before an enclosing destructuring binding is named. Recursive helper checks and captured `let` values preserve their lexical scopes. Unresolved type parameters and analysis expansion limits remain source-located refusals.
+Analysis rendering uses an isolated exporter snapshot so it cannot duplicate holes/refusals or alter assignment bookkeeping. Operator names are reserved during analysis, and dependencies of retained guards are emitted in the real exporter; unused speculative values cannot introduce table holes. Returned local expressions reserve their bound names before an enclosing destructuring binding is named. Recursive helper checks and captured `let` values preserve their lexical scopes. Unresolved type parameters and analysis expansion limits remain source-located refusals.
 
 ## Compatibility and cast fixes
 
@@ -57,7 +57,7 @@ Here “usable TLC run” means completion, an invariant counterexample, or cont
 | nr/UnboundedLog-mono | 1 → 0 | evaluation/configuration error → evaluation/configuration error | 70 → — |
 | splinter/AbstractJournal | 0 → 0 | evaluation/configuration error → complete | 27 → 72 |
 | splinter/AbstractMap | 0 → 0 | evaluation/configuration error → complete | 3 → 3 |
-| splinter/CrashTolerantJournal | 0 → 0 | evaluation/configuration error → exploring at 30 s | 26 → 29 |
+| splinter/CrashTolerantJournal | 0 → 0 | evaluation/configuration error → exploring at 30 s | 26 → 35 |
 | splinter/CrashTolerantMap | 0 → 0 | evaluation/configuration error → evaluation/configuration error | 2 → — |
 | splinter/LinkedJournal | 0 → 0 | evaluation/configuration error → invariant violation | 1 → 4 |
 
@@ -71,6 +71,28 @@ CrashTolerantMap now exposes the explicit `Dom_Key` carrier for `TotalKMMap::emp
 
 AbstractMap now completes with **33 generated / 3 distinct states**, using the original sources, adapter, and bounds. The undefined cast at `MsgHistory_v.rs:189` disables the affected predicate instead of crashing TLC. A dedicated recursive-cast regression reproduces this boundary.
 
+## Definedness regression repair
+
+The lane-4 report was reproduced on clean `64f1c6e3`. There were two causes:
+
+* `ensure_defined` registered a mutually recursive helper internally but appended its TLA `RECURSIVE` declaration only after walking its dependencies. In PagedBetree/PivotBetree, `Defined_replaced_children` therefore referenced `Defined_substitute` before SANY had seen its declaration. The declaration now precedes dependency traversal. A separate guard-only variant issue in nrkernel (`core_mem_rec`) came from rendering in a disposable exporter clone: its definition was discarded while its name survived in a guard. Retained guards now commit their operator dependencies. Speculative values that never become guards remain isolated, avoiding unused table holes such as `Table_spec_affirm`.
+* Helper arguments were checked at the call and stored as symbolic source expressions in every formal. Each formal use re-analyzed those arguments, and repeated helper calls re-expanded their bodies. Deep copies of captured environments amplified this. Ordinary arguments are now checked once; closures retain symbolic substitution. Repeated helper applications are memoized within a guard context, keyed by instantiated function, printed arguments, post-state flags, and safety facts. Captured environments use shared immutable `Arc` snapshots. Analysis has a 65,536-visit / 1,024-depth limit with an explicit source-located refusal if exceeded; none of these campaign replays reaches it.
+
+The new regressions cover PagedBetree-style mutual substitution through a map constructor, a guard-only record helper (without leaking an unused `spec_affirm` table), and forty shared helper layers with 2^40 call paths. The latter must export in under 30 seconds, with zero refusals and less than 40 KB of TLA; SANY checks all forty layers and TLC checks the same behavior at eight layers because TLC itself eagerly preprocesses the value graph.
+
+| Machine | Original campaign | Clean `64f1c6e3` | Fixed replay |
+| --- | --- | --- | --- |
+| splinter/PagedBetree | TLC completes, 25 distinct | SANY: undefined `Defined_substitute` | TLC completes, 25 distinct / 173 generated |
+| splinter/PivotBetree | TLC completes, 25 distinct | SANY: undefined `Defined_substitute` | TLC completes, 25 distinct / 133 generated |
+| nrkernel/mmu_rl1 | 95 refusals, 8.4 s | 189 expansion refusals, 25.7 s | 0 refusals, 8.9 s; SANY passes |
+| nrkernel/mmu_rl2 | 108 refusals, 9.1 s | export timeout at 90 s | 0 refusals, 8.6 s; SANY passes |
+| nrkernel/mmu_rl3 | 101 refusals, 9.1 s | export timeout at 90 s | 0 refusals, 8.6 s; SANY passes |
+| nrkernel/os | 135 refusals, 8.7 s | export timeout at 90 s | 7 refusals, 11.6 s; SANY passes |
+
+The remaining OS refusals are `choose` and integer type bounds, not expansion limits. The four nrkernel modules have no saved campaign MC command; the result is successful export and SANY, not a claim of TLC exploration. The two trees use their unchanged campaign configurations. Export timings are wall-clock observations under a 90-second cap, with two concurrent regression replays.
+
+The original six machines were replayed again: **6/6 zero-refusal exports and 4/6 usable TLC runs**, unchanged from the prior acceptance result. Together, the twelve replays yield **11/12 zero-refusal exports and 12/12 SANY passes**; the eight with saved TLC configurations yield six usable runs. This repair is a new commit followed by a plain push; lane 4 owns the subsequent rebase.
+
 ## Total-collection campaign exports
 
 | Module | Before refusals/status | After refusals/status | Remaining issue |
@@ -80,27 +102,27 @@ AbstractMap now completes with **33 generated / 3 distinct states**, using the o
 | ironkv/host_protocol_t | 6 | 0 | explicit holes require assignments |
 | ironkv/host_impl_t | no transition triple | no transition triple | no transition triple |
 | nrkernel/hlspec | 4 | 1 | choose (TLC cannot evaluate it) |
-| nrkernel/mmu_rl1 | 95 | 189 | partial-read analysis exceeds its expansion limit |
-| nrkernel/mmu_rl2 | 108 | 90 s export timeout | 90 s export timeout |
-| nrkernel/mmu_rl3 | 101 | 90 s export timeout | 90 s export timeout |
-| nrkernel/os | 135 | 90 s export timeout | 90 s export timeout |
+| nrkernel/mmu_rl1 | 95 | 0 | explicit holes require assignments |
+| nrkernel/mmu_rl2 | 108 | 0 | explicit holes require assignments |
+| nrkernel/mmu_rl3 | 101 | 0 | explicit holes require assignments |
+| nrkernel/os | 135 | 7 | choose and integer type bounds |
 
-Zero-refusal supplemental exports: **0/9 → 2/9**.
+Zero-refusal supplemental exports: **0/9 → 5/9**. The four MMU/OS rows use this repair's replay; the other five retain the prior measurement recorded under `collections_after_64f1c6e3`.
 
-The lower trait lane now represents `KeyTrait::cmp_spec` and other uninterpreted trait functions as explicit table holes; zero refusals does not eliminate the need to supply interpretations. General closure/generic-call specialization remains outside this lane; no adapter was changed to bypass it. In particular, a carrier over an unresolved type parameter stays a refusal. The broad nrkernel MMU/OS exports are also measured for analysis limits and timeouts; their unsuccessful results are not counted as successful models.
+The lower trait lane now represents `KeyTrait::cmp_spec` and other uninterpreted trait functions as explicit table holes; zero refusals does not eliminate the need to supply interpretations. General closure/generic-call specialization remains outside this lane; no adapter was changed to bypass it. In particular, a carrier over an unresolved type parameter stays a refusal. The broad nrkernel MMU/OS exports now finish within the campaign time limit and pass SANY; export success does not establish a TLC result.
 
 The nine supplemental modules have no saved `MC-command.json` in this campaign, so these are export-only measurements, not claimed TLC successes. Two modules do not define a discoverable transition triple. The before column uses the original campaign binary; improvements include lower-lane changes, especially bit operations and trait tables.
 
 ## Validation and remaining work
 
-**204 exporter tests passed, 0 failed**, with `TLA2TOOLS_JAR` set. The vstd rebuild verified 2,045 functions with no errors. All 28 generated fixture files and all 12 saved campaign bound/configuration files compare byte-identically. The full golden regression and the separate raw re-export check both pass.
+**207 exporter tests passed, 0 failed**, with `TLA2TOOLS_JAR` set. The vstd rebuild verified 2,045 functions with no errors. All 28 generated fixture files and all 16 saved campaign bound/configuration files compare byte-identically. The full golden regression and the separate raw re-export check both pass.
 
-Eleven new TLC-backed tests cover partial reads, carriers, recursive helpers and casts, lazy conditional values, invalidation of inferred shape facts, and redundant guards. A separate golden regression pins Raft and every example's four generated files.
+Fourteen new TLC-backed tests cover partial reads, carriers, recursive helpers and casts, lazy conditional values, invalidation of inferred shape facts, redundant guards, recursive substitution declarations, guard-only dependencies, and bounded shared-helper analysis. A separate golden regression pins Raft and every example's four generated files.
 
 Remaining campaign limitations (not hidden as successful exploration):
 
 1. NR needs a function-table interpretation and CrashTolerantMap needs its explicit `Dom_Key` carrier assignment. Neither was invented or added to the campaign configuration.
-2. The broad nrkernel models still encounter the analysis limits/timeouts shown above; `hlspec` retains its `choose` refusal.
+2. `os` retains seven `choose` / integer-type-bound refusals; `hlspec` retains its `choose` refusal.
 3. Zero refusals in the supplemental exports still requires assigning their explicit holes before meaningful TLC exploration.
 
 
@@ -116,11 +138,12 @@ export TMPDIR=$HOME/tmp
 export TLA2TOOLS_JAR=$HOME/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar
 (cd source && timeout 900 ../tools/vargo/target/release/vargo test --release -p rust_verify_test --test tla_export -- --test-threads=4)
 python3 audit/export-partial/replay.py partial final-before --verus ../base/verus/source/target-verus/release/verus
-python3 audit/export-partial/replay.py partial acceptance-after --verus source/target-verus/release/verus
+python3 audit/export-partial/replay.py regressions bounded-final --verus source/target-verus/release/verus --jobs 2
+python3 audit/export-partial/replay.py partial bounded-final-partial --verus source/target-verus/release/verus
 python3 audit/export-partial/replay.py collections collections-before --verus ../base/verus/source/target-verus/release/verus
 python3 audit/export-partial/replay.py collections acceptance-collections --verus source/target-verus/release/verus
 python3 audit/export-partial/replay.py fixtures final-parent --verus ../wt-export-nrkernel/source/target-verus/release/verus
-python3 audit/export-partial/replay.py fixtures acceptance-fixtures --verus source/target-verus/release/verus
+python3 audit/export-partial/replay.py fixtures bounded-final-fixtures --verus source/target-verus/release/verus
 ```
 
 The helper requires the existing `../campaign-real` sources/results tree. Raw commands, exports, reports, and logs are retained locally in its output directories; compact measurements are committed here. No Cove `report` tool was available.
