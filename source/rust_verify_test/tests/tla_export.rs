@@ -3360,8 +3360,8 @@ fn tla_export_disables_a_require_let_that_does_not_match() {
 }
 
 /// An `_ => arbitrary()` arm outside VerusSync's `require let` may be
-/// reached, where Verus gives it some value: `arbitrary()` is refused
-/// there, as any function without a body is, so the report says so.
+/// reached, where Verus gives it some value: `arbitrary()` is a nullary
+/// table hole whose interpretation the model author must supply.
 const ARBITRARY_ARM: &str = r#"
 verus! {
 pub struct State { pub o: Option<int>, pub x: int }
@@ -3381,7 +3381,7 @@ pub open spec fn small(s: State) -> bool { s.x <= 2 }
 "#;
 
 #[test]
-fn tla_export_refuses_an_arbitrary_arm_outside_verussync() {
+fn tla_export_tables_an_arbitrary_arm_outside_verussync() {
     let ex = export_code(ARBITRARY_ARM, "test_crate");
     let refusals: Vec<&str> = ex.report["refusals"]
         .as_array()
@@ -3389,15 +3389,19 @@ fn tla_export_refuses_an_arbitrary_arm_outside_verussync() {
         .iter()
         .map(|r| r["what"].as_str().unwrap())
         .collect();
-    assert_eq!(refusals, ["uninterpreted function"], "{}", ex.tla);
+    assert!(refusals.is_empty(), "{}", ex.tla);
     assert!(!ex.tla.contains("arbitrary() (an unspecified value)"), "{}", ex.tla);
     let Some(jar) = tla_tools() else { return };
     sany(&jar, &ex.spec());
+    let cfg = supply_arbitrary_int(&ex, &ex.cfg);
+    let run = tlc(&jar, &ex.spec(), &cfg);
+    assert!(run.violated.is_empty(), "{:?}", run);
+    assert_eq!(run.distinct, 3);
 }
 
 /// In a VerusSync model too, only the `_ => arbitrary()` arms of the
 /// macro's own matches are exempt: `user_arb`'s `match` on a field may
-/// reach its arm, so `arbitrary()` is refused there. `have m >= [k => let
+/// reach its arm, so `arbitrary()` is a table hole there. `have m >= [k => let
 /// Some(x)]` is guarded like `remove`: on key 2, which holds None, `peek`
 /// is disabled. An `assert let` that does not match (`check` after `kill`)
 /// stops TLC at the VerusSync assert, before the `let` reads the fields.
@@ -3458,7 +3462,7 @@ fn main() {}
 "#;
 
 #[test]
-fn tla_export_refuses_a_user_arbitrary_arm_in_verussync() {
+fn tla_export_tables_a_user_arbitrary_arm_in_verussync() {
     let src = TempDir::new().expect("temp dir");
     let entry = src.path().join("sync_arbitrary.rs");
     std::fs::write(&entry, SYNC_ARBITRARY).unwrap();
@@ -3470,12 +3474,13 @@ fn tla_export_refuses_a_user_arbitrary_arm_in_verussync() {
         .iter()
         .map(|r| r["what"].as_str().unwrap())
         .collect();
-    assert_eq!(refusals, ["uninterpreted function"], "{}", ex.tla);
+    assert!(refusals.is_empty(), "{}", ex.tla);
     // `peek`'s and `check`'s arms are exempt; `user_arb`'s is not.
     assert_eq!(ex.tla.matches("arbitrary() (an unspecified value)").count(), 2, "{}", ex.tla);
     let Some(jar) = tla_tools() else { return };
     sany(&jar, &ex.spec());
     let cfg = format!("{}CONSTANTS\n  Dom_Step_peek_v0 = {{1, 2}}\n", ex.cfg);
+    let cfg = supply_arbitrary_int(&ex, &cfg);
     let out = tlc_output(&jar, &ex.spec(), &cfg);
     // TLC evaluates `peek(2)` and `user_arb` on the initial state, and
     // `check` after `kill` two steps on: only the assert stops it.
@@ -9537,4 +9542,139 @@ pub open spec fn inv(s: State) -> bool { value(s.x) == Some(s.x) }
     std::fs::write(ex.spec(), text).unwrap();
     let bad = tlc_output(&jar, &ex.spec(), &cfg);
     assert!(bad.contains("Assumption") && bad.contains("false"), "{}", bad);
+}
+
+// Raft's actual Init predicate (toydb c23eebe8), with only the payload types
+// reduced. Its length and element constraints are not a whole-value TLC
+// assignment. They also do not leave an unconstrained sequence to widen.
+const RAFT_RELATIONAL_INIT: &str = r#"
+use vstd::prelude::*;
+verus! {
+pub struct Host { pub term: nat, pub ready: bool }
+pub struct GState {
+    pub n: nat, pub hosts: Seq<Host>, pub net: Set<bool>,
+    pub leader_log: Map<nat, Seq<bool>>, pub leader_of: Map<nat, int>,
+    pub voters: Map<nat, Set<int>>, pub elect_log: Map<nat, Seq<bool>>,
+    pub elect_votes: Map<nat, Map<int, Seq<bool>>>, pub commits: Set<bool>,
+    pub reads: Set<bool>, pub read_hwm: Map<nat, nat>,
+}
+pub open spec fn init_host() -> Host { Host { term: 0, ready: false } }
+pub open spec fn init(s: GState) -> bool {
+    &&& s.n >= 1
+    &&& s.hosts.len() == s.n
+    &&& forall|i: int| 0 <= i < s.n ==> s.hosts[i] == init_host()
+    &&& s.net == Set::<bool>::empty()
+    &&& s.leader_log == Map::<nat, Seq<bool>>::empty()
+    &&& s.leader_of == Map::<nat, int>::empty()
+    &&& s.voters == Map::<nat, Set<int>>::empty()
+    &&& s.elect_log == Map::<nat, Seq<bool>>::empty()
+    &&& s.elect_votes == Map::<nat, Map<int, Seq<bool>>>::empty()
+    &&& s.commits == Set::<bool>::empty()
+    &&& s.reads == Set::<bool>::empty()
+    &&& s.read_hwm == Map::<nat, nat>::empty()
+}
+pub open spec fn next(pre: GState, post: GState) -> bool { post == pre }
+}
+"#;
+
+#[test]
+fn tla_export_raft_init_is_byte_identical() {
+    let ex = export_code(RAFT_RELATIONAL_INIT, "test_crate");
+    // Pin the complete emitted operator from the original Raft export, not
+    // merely absence of the new domain name or its final Init wrapper.
+    let expected = r#"init ==
+    ((((((((((((n >= 1) /\ (n = Len(hosts))) /\ (\A i \in 0..(n) - 1 : (((0 <= i) /\ (i < n)) => (hosts[(i) + 1] = init_host)))) /\ (net = {})) /\ (leader_log = [k__ \in {} |-> k__])) /\ (leader_of = [k__2 \in {} |-> k__2])) /\ (voters = [k__3 \in {} |-> k__3])) /\ (elect_log = [k__4 \in {} |-> k__4])) /\ (elect_votes = [k__5 \in {} |-> k__5])) /\ (commits = {})) /\ (reads = {})) /\ (read_hwm = [k__6 \in {} |-> k__6]))
+"#;
+    let operator = ex.tla.split("init ==\n").nth(1).unwrap().split("\n\n").next().unwrap();
+    assert_eq!(format!("init ==\n{}\n", operator), expected);
+    assert!(ex.tla.contains("\nInit == init /\\ TypeOK\n"), "{}", ex.tla);
+    assert_eq!(ex.report["init_unassigned"], serde_json::json!(["hosts"]));
+    assert_eq!(ex.report["init_enumerated"], serde_json::json!([]));
+    assert_eq!(ex.report["holes"], serde_json::json!([]));
+    assert!(ex.report.get("init_fields_unassigned").is_none());
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    // Like RaftExportMC, supply the relationally specified sequence in the
+    // harness, without modifying the emitted Init or adding a carrier hole.
+    let text = ex
+        .tla
+        .replace("====", "RaftInit == n = 2 /\\ hosts = <<init_host, init_host>> /\\ Init\n====");
+    std::fs::write(ex.spec(), text).unwrap();
+    let run = tlc(&jar, &ex.spec(), "INIT RaftInit\nNEXT Next\nCHECK_DEADLOCK FALSE\n");
+    assert_eq!(run.distinct, 1);
+}
+
+#[test]
+fn tla_export_relational_init_helper_and_incomplete_index_guard() {
+    let code = r#"
+use vstd::prelude::*;
+verus! {
+pub struct State { pub hosts: Seq<bool> }
+pub open spec fn initialize(s: State) -> bool {
+    s.hosts.len() == 2 && forall|i: int| 0 <= i < 2 ==> s.hosts[i] == false
+}
+pub open spec fn init(s: State) -> bool { initialize(s) }
+pub open spec fn next(pre: State, post: State) -> bool { post == pre }
+}
+"#;
+    let ex = export_code(code, "test_crate");
+    assert_eq!(ex.report["holes"], serde_json::json!([]));
+    assert!(ex.tla.contains("\nInit == init\n"), "{}", ex.tla);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    std::fs::write(
+        ex.spec(),
+        ex.tla.replace("====", "Seed == hosts = <<FALSE, FALSE>> /\\ Init\n===="),
+    )
+    .unwrap();
+    assert_eq!(tlc(&jar, &ex.spec(), "INIT Seed\nNEXT Next\n").distinct, 1);
+
+    // A shorter or conditional range, or a circular equality, does leave a
+    // gap. None may be mistaken for the complete relational initializer.
+    for partial in [
+        code.replace("i < 2", "i < 1"),
+        code.replace("0 <= i < 2", "0 <= i < 2 && i == 0"),
+        code.replace("s.hosts[i] == false", "s.hosts[i] == s.hosts[i]"),
+    ] {
+        let ex = export_code(&partial, "test_crate");
+        assert_eq!(ex.report["init_enumerated"][0]["domain"], "Dom_Seq_bool");
+        sany(&jar, &ex.spec());
+        std::fs::write(
+            ex.spec(),
+            ex.tla.replace("====", "Carrier == {<<FALSE, FALSE>>, <<FALSE, TRUE>>}\n===="),
+        )
+        .unwrap();
+        let cfg = format!("{}\nCONSTANT Dom_Seq_bool <- Carrier\n", ex.cfg);
+        assert_eq!(tlc(&jar, &ex.spec(), &cfg).distinct, 2);
+    }
+}
+
+#[test]
+fn tla_export_complete_record_init_never_adds_a_carrier() {
+    for initializer in
+        ["s.r == R { n: 1, b: true }", "s.r.n == 1 && s.r.b == true", "initialize(s)"]
+    {
+        let code = format!(
+            r#"
+verus! {{
+pub struct R {{ pub n: nat, pub b: bool }}
+pub struct State {{ pub r: R }}
+pub open spec fn initialize(s: State) -> bool {{ s.r.n == 1 && s.r.b == true }}
+pub open spec fn init(s: State) -> bool {{ {initializer} }}
+pub open spec fn next(pre: State, post: State) -> bool {{ post == pre }}
+}}
+"#
+        );
+        let ex = export_code(&code, "test_crate");
+        assert_eq!(ex.report["holes"], serde_json::json!([]), "{}", ex.tla);
+        assert!(ex.tla.contains("\nInit == init /\\ TypeOK\n"));
+        let Some(jar) = tla_tools() else { continue };
+        sany(&jar, &ex.spec());
+        std::fs::write(
+            ex.spec(),
+            ex.tla.replace("====", "Seed == r = [n |-> 1, b |-> TRUE] /\\ Init\n===="),
+        )
+        .unwrap();
+        assert_eq!(tlc(&jar, &ex.spec(), "INIT Seed\nNEXT Next\n").distinct, 1);
+    }
 }

@@ -1,7 +1,7 @@
 Lane 2: fixed-width bit operations and partial Init
 
 Scope: source/vir/src/tla.rs and source/rust_verify_test/tests/tla_export.rs.
-Base branch: kg/export-traits. The base was 9abf2c0e during implementation.
+Base branch: kg/export-traits, rebased onto be74b723 for final validation.
 
 Design
 ------
@@ -24,9 +24,10 @@ Recursion avoids constructing a huge power of two just to shift a small u64.
 The jar still cannot represent results outside signed 32-bit integers: those
 stop with TLC arithmetic overflow, never wrapping or silently weakening the
 model. In particular, the actual 1 << 52 address maximum cannot execute in
-this jar if the preceding opaque-constant blocker is resolved.
+this jar when the opaque width table is configured with 52.
 
-Partial Init enumerates every incomplete top-level value, then evaluates the
+Partial Init preserves legacy finite enumeration, then widens only genuinely
+incomplete values the old exporter still reported as unassigned. It evaluates the
 original Init predicate and TypeOK. Small finite scalar/enum/record domains
 are exact; finite record products are no longer silently abandoned at the
 old combination cap. Unbounded collections and scalars get Dom_<Type> holes.
@@ -39,8 +40,9 @@ gets its four-value record domain; Init filters to the two allowed records.
 For nrkernel/os_ext, diagnostics identify shootdown_vec.vaddr and allocated
 as unassigned, rather than claiming its assigned open_requests is free.
 The init_enumerated entries describe the domain of each drawn whole variable.
-Leaf reporting is conservative through calls passing subrecords rather than
-whole states; no predicate is removed or replaced by the report.
+Leaf reporting follows direct assignments, constructors, and whole-state
+helpers. Complete records and relational sequence initializers are not widened.
+No predicate is removed or replaced by the report.
 
 Validation and campaign
 -----------------------
@@ -59,60 +61,67 @@ export timeout. check_campaign.py runs SANY for all six exports and a separate
 30-second, one-worker, 1-GiB OS-external probe. That probe is supplementary:
 the original campaign stopped these six machines at export/SANY, and saved no
 nrkernel MC configuration or exploration bounds. No invented bounds are
-presented as a completed campaign run. The other five remain blocked by
-reported refusals and are not counted as explored.
+presented as a completed campaign run. No other layer is counted as explored: the original campaign supplied no
+nrkernel MC configurations, and the current exports alone are not exploration.
 
-Compatibility exception (acceptance requirement not met)
---------------------------------------------------------
-All six examples/tla source fixtures must compare byte-identically, including
-the .tla, .cfg, trace module and JSON report. The comparison script records
-that check.
+Raft compatibility: cause and correction
+---------------------------------------
+All 35 artifacts from six examples/tla fixtures and Toydb are byte-identical
+to the original baseline: TLA modules, configs, JSON reports and trace files.
 
-The requested base/toydb working checkout is now main and has no safety.rs.
-The exact source from origin/yl/raft-safety-refine at
-c23eebe8c678bda4693748f8a5cbe05ddba2b2ff was extracted read-only into this
-worktree and exported with the twelve invariants used by its export.sh.
-Its old export reports hosts as unassigned: Init constrains the sequence's
-length and every element through a forall, instead of assigning it whole.
-The general partial-Init rule necessarily adds Dom_Seq_MHost and an Init
-enumeration there. Therefore Toydb's module/cfg/report change (its trace
-module is unchanged). Existing Toydb harnesses must supply the new carrier.
-No project-name special case or out-of-lane sequence-builder rewrite was
-added just to conceal this incompatibility. Keep this PR draft until the
-compatibility requirement is reconciled with the general Init behavior.
+The requested base/toydb checkout is now main and has no safety.rs. The exact
+origin/yl/raft-safety-refine source at c23eebe8c678bda4693748f8a5cbe05ddba2b2ff
+was extracted read-only and exported with its export.sh's twelve invariants.
 
-Remaining blockers, ranked by number of affected machines
----------------------------------------------------------
-1. Opaque MAX_PHYADDR_WIDTH: all six. Rendering the previously refused shift
-   visits its operand for the first time and exposes this external_body
-   constant; do not replace it with the source implementation's literal 52.
-   Opaque arbitrary() also occurs in five layers. These belong to the
-   traits/opaque lane below this PR.
-2. ISet::finite: four machines (hlspec, mmu_rl2, mmu_rl3, os), eleven refusal
-   sites. Infinite collection semantics belong to the partial-operations lane.
-3. choose: hlspec and os, two sites; left to the partial-operations lane.
-4. Integer-type bound: os, six sites; remains an explicit refusal.
+Cause: Raft specifies hosts by its length and a full-range forall equating
+every host to init_host(), which returns a complete record literal. My first
+implementation incorrectly equated "TLC cannot assign the whole variable"
+with "the source leaves a field unconstrained" and added Dom_Seq_MHost.
+Those are different questions. The old assignment diagnostic is retained
+byte-for-byte; the new completeness analysis recognizes the relation and
+suppresses widening. No Raft-specific code or module-name condition is used.
 
-Source locations and complete remaining refusal lists are in campaign.json.
-The new features remove all 420 bit-operation refusal sites; six newly
-reachable opaque-constant sites explain why total refusals fall by 414.
-Every layer's previously unassigned Init variables now has an explicit domain.
-This is exporter progress, not a successful verification of nrkernel.
+The corrected enumeration first executes the old finite-domain path, with
+its existing cap. Only still-unassigned variables with incomplete leaves
+qualify for new enumeration. A sequence length equality plus a forall over
+exactly 0 <= i < length with a non-circular element equality is recognized
+as relational initialization, including through a whole-state helper.
+A shorter range, an additional guard, or a circular equality is not complete.
+
+The regression test pins Raft's entire emitted init operator and its Init
+wrapper. It also runs TLC with the existing kind of harness: n and hosts are
+supplied before the untouched Init. Separate tests cover the helper case,
+incomplete/circular index guards, and complete record fields, literals and
+helpers. mmu_rl2.hist is likewise completely constrained field-by-field:
+its legacy assignment diagnostic remains, without an unnecessary new carrier.
+
+Remaining blockers, ranked by affected machines
+----------------------------------------------
+1. ISet::finite: hlspec, mmu_rl2, mmu_rl3 and os (eleven sites).
+2. choose: hlspec and os (two sites).
+3. Integer-type bounds: os (six sites).
+The first two belong to the partial-operations lane above this PR.
+The updated traits parent now exports opaque constants/functions as table
+holes. The supplemental OS-external probe supplies MAX_PHYADDR_WIDTH=52 in
+that table; the actual shift then exceeds TLC's signed 32-bit integers.
 
 Final results
 -------------
-181 exporter tests passed with TLA2TOOLS_JAR enabled; vstd: 2045 verified.
-All six campaign exports pass SANY before and after.
+192 exporter tests pass, including the traits lane's tests and the new
+regressions, with TLA2TOOLS_JAR enabled. vstd: 2045 verified, zero errors.
+All six campaign exports pass SANY on the parent and after this change.
 
-Machine     Refusals before -> after   Init unassigned before -> after
-hlspec        4 -> 4                    2 -> 0
-mmu_rl1      95 -> 2                    3 -> 0
-mmu_rl2     108 -> 4                    4 -> 0
-mmu_rl3     101 -> 5                    3 -> 0
-os          135 -> 14                   3 -> 0
-os_ext        1 -> 1                    2 -> 0
+Machine     Original refusals   Traits-parent refusals   After
+hlspec        4                   3                      2
+mmu_rl1      95                  94                      0
+mmu_rl2     108                 107                      2
+mmu_rl3     101                 100                      3
+os          135                 134                      12
+os_ext        1                   1                      0
 
-Total refusals: 444 -> 30. Bit-operation refusals: 420 -> 0.
-Refusal-free machines: 0/6 -> 0/6. Completed TLC exploration: 0/6 -> 0/6.
-Compatibility: all 30 artifacts from the six examples are byte-identical.
-Toydb: two of five artifacts identical; its module, config and JSON differ.
+Total refusals: original 444; updated parent 439; after 19.
+Bit-operation refusals: 420 -> 0.
+Refusal-free machines: 0/6 -> 2/6 (mmu_rl1 and os_ext).
+Completed TLC exploration: 0/6 -> 0/6.
+Compatibility: all 35 artifacts are byte-identical, including all five Toydb
+artifacts. No compatibility exception remains.

@@ -9,7 +9,7 @@ for name in ['hlspec','mmu_rl1','mmu_rl2','mmu_rl3','os','os_ext']:
  row={'machine':name,'sany_ok':p.returncode==0 and '*** Errors' not in p.stdout and 'Fatal errors' not in p.stdout}
  if name=='os_ext':
   j=json.loads((d/'State_tla.tla.json').read_text())
-  vals={'Const_c_core_count':'1','Const_c_node_count':'1','Const_c_phys_mem_size':'8192','Const_c_range_mem':'<<0, 1>>','Const_c_range_ptmem':'<<4096, 8192>>','Dom_MemRegion_MemRegion_base':'{4096}','Dom_MemRegion_MemRegion_size':'{4096}','Dom_ShootdownVector_ShootdownVector_open_requests':'{{}}','Dom_ISet_MemRegion':'{{}}'}
+  vals={'Const_c_core_count':'1','Const_c_node_count':'1','Const_c_phys_mem_size':'8192','Const_c_range_mem':'<<0, 1>>','Const_c_range_ptmem':'<<4096, 8192>>','Dom_MemRegion_MemRegion_base':'{4096}','Dom_MemRegion_MemRegion_size':'{4096}','Dom_ShootdownVector_ShootdownVector_open_requests':'{{}}','Dom_ISet_MemRegion':'{{}}','Dom_usize':'{52}','Table_MAX_PHYADDR_WIDTH':r'[args \in {<<>>} |-> 52]'}
   defs=[];cfg='INIT Init\nNEXT Next\nCHECK_DEADLOCK FALSE\nCONSTRAINT Bound\n'
   for c in sorted({h['constant'] for h in j['holes']}):
    defs.append('Value_'+c+' == '+vals.get(c,'{0}'));cfg+='CONSTANT '+c+' <- Value_'+c+'\n'

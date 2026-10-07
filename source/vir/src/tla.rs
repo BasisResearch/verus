@@ -5594,8 +5594,160 @@ impl Exporter {
         for (v, t) in self.state_vars.iter().zip(&self.state_types) {
             self.init_leaves(v, t, &mut vec![self.state_path.clone()], &mut leaves);
         }
-        leaves.retain(|v| !assigned.iter().any(|a| v == a || v.starts_with(&format!("{a}."))));
+        let relational = self.init_relational_sequences(body, states, &binders, 0);
+        leaves.retain(|v| {
+            !assigned
+                .iter()
+                .chain(relational.iter())
+                .any(|a| v == a || v.starts_with(&format!("{a}.")))
+        });
         (vars, leaves)
+    }
+
+    /// A relational sequence initializer can completely specify every element
+    /// without giving TLC a whole-variable assignment. Preserve its original
+    /// export (and assignment diagnostic): a finite carrier would restrict the
+    /// source relation, not fill in an unconstrained field.
+    fn init_relational_sequences(
+        &self,
+        e: &Expr,
+        states: &HashSet<VarIdent>,
+        binders: &HashMap<VarIdent, String>,
+        depth: usize,
+    ) -> BTreeSet<String> {
+        let e = peel(e);
+        if let ExprX::Block(_, Some(tail)) = &e.x {
+            return self.init_relational_sequences(tail, states, binders, depth);
+        }
+        let call_args = |e: &Expr, op: &str| -> Option<Exprs> {
+            let e = peel(e);
+            if let ExprX::Call { target: CallTarget::Fun(_, f, ..), args, .. } = &e.x {
+                if vstd_op(&fun_as_friendly_rust_name(f)) == Some(op) {
+                    return Some(args.clone());
+                }
+            }
+            None
+        };
+        let equality = |e: &Expr| -> Option<(Expr, Expr)> {
+            match &peel(e).x {
+                ExprX::Binary(BinaryOp::Eq(_), a, b)
+                | ExprX::BinaryOpr(BinaryOpr::ExtEq(..), a, b) => Some((a.clone(), b.clone())),
+                _ => None,
+            }
+        };
+        let parts = conjuncts(&e);
+        let mut lengths = Vec::new();
+        let mut out = BTreeSet::new();
+        for c in &parts {
+            if let Some((a, b)) = equality(c) {
+                for (a, b) in [(&a, &b), (&b, &a)] {
+                    if let Some(args) = call_args(a, "seq_len") {
+                        if let Some(field) = self.init_field_path(&args[0], states, binders) {
+                            lengths.push((field, b.clone()));
+                        }
+                    }
+                }
+            }
+            // Follow a helper taking the whole state; only unconditional
+            // conjuncts contribute facts. Never combine different disjuncts.
+            if let ExprX::Call { target: CallTarget::Fun(kind, fun, ..), args, .. } = &peel(c).x {
+                if depth < 16 {
+                    if let Some(f) = self.functions.get(&self.resolved_fun(kind, fun)) {
+                        if let Some(body) = &f.x.body {
+                            let inner: HashSet<_> =
+                                f.x.params
+                                    .iter()
+                                    .zip(args.iter())
+                                    .filter(|(p, a)| {
+                                        self.is_state_typ(&p.x.typ)
+                                            && read_var(a).is_some_and(|v| states.contains(&v))
+                                    })
+                                    .map(|(p, _)| p.x.name.clone())
+                                    .collect();
+                            if !inner.is_empty() {
+                                let bs = self.state_binders(body, &inner);
+                                out.extend(self.init_relational_sequences(
+                                    body,
+                                    &inner,
+                                    &bs,
+                                    depth + 1,
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        for c in &parts {
+            let c = peel(c);
+            let ExprX::Quant(q, qs, body) = &c.x else { continue };
+            if !matches!(q.quant, air::ast::Quant::Forall) || qs.len() != 1 {
+                continue;
+            }
+            let body = peel(body);
+            let ExprX::Logical(LogicalOp::Implies, guard, value) = &body.x else { continue };
+            let Some((a, b)) = equality(value) else { continue };
+            for (a, b) in [(&a, &b), (&b, &a)] {
+                let Some(args) = call_args(a, "seq_index") else { continue };
+                if args.len() != 2 || read_var(&args[1]).as_ref() != Some(&qs[0].name) {
+                    continue;
+                }
+                let Some(field) = self.init_field_path(&args[0], states, binders) else { continue };
+                // A circular element equality does not define the collection.
+                let mut circular = false;
+                crate::ast_visitor::expr_visitor_walk(b, &mut |x: &Expr| {
+                    circular |= self.init_field_path(x, states, binders).as_ref() == Some(&field);
+                    circular |= read_var(x).is_some_and(|v| states.contains(&v));
+                    crate::visitor::VisitorControlFlow::Recurse
+                });
+                if circular {
+                    continue;
+                }
+                if lengths.iter().any(|(f, len)| {
+                    f == &field && Self::init_full_index_range(guard, &qs[0].name, len)
+                }) {
+                    out.insert(field);
+                }
+            }
+        }
+        out
+    }
+
+    /// Exactly 0 <= i < length; an additional guard would leave elements free.
+    fn init_full_index_range(guard: &Expr, index: &VarIdent, length: &Expr) -> bool {
+        let mut comparisons = Vec::new();
+        for c in conjuncts(guard) {
+            match &peel(&c).x {
+                ExprX::Binary(BinaryOp::Inequality(op), a, b) => {
+                    comparisons.push((*op, a.clone(), b.clone()));
+                }
+                ExprX::Multi(MultiOp::Chained(ops), args) => {
+                    for (i, op) in ops.iter().enumerate() {
+                        let ChainedOp::Inequality(op) = op else { return false };
+                        comparisons.push((*op, args[i].clone(), args[i + 1].clone()));
+                    }
+                }
+                _ => return false,
+            }
+        }
+        let mut lower = false;
+        let mut upper = false;
+        for (op, a, b) in comparisons {
+            if matches!(op, InequalityOp::Le)
+                && matches!(&peel(&a).x, ExprX::Const(Constant::Int(i)) if i.to_string() == "0")
+                && read_var(&b).as_ref() == Some(index)
+            {
+                lower = true;
+            } else if matches!(op, InequalityOp::Lt)
+                && read_var(&a).as_ref() == Some(index)
+                && same_expr(&b, length)
+            {
+                upper = true;
+            } else {
+                return false;
+            }
+        }
+        lower && upper
     }
 
     /// Struct leaves for diagnostics; collections, enums and recursive types
@@ -9039,15 +9191,38 @@ pub fn export_module(
     ex.bound.clear();
     ex.current = "Init".into();
     ex.current_key = None;
-    ex.init_domains = true;
     let init_hole_start = ex.holes.len();
     let mut init_enumerated: Vec<Enumerated> = Vec::new();
-    for v in init_unassigned.clone() {
-        let Some(i) = ex.state_vars.iter().position(|x| *x == v) else { continue };
+    // Preserve the legacy finite-domain path, including its enumeration cap.
+    // Only variables it still reports as unassigned are candidates for widening.
+    let mut combinations = 1u128;
+    for v in &init_unassigned {
+        let Some(i) = ex.state_vars.iter().position(|x| x == v) else { continue };
         let typ = ex.state_types[i].clone();
         let Some(span) = ex.functions.get(&triple.init).map(|f| f.span.clone()) else { continue };
-        let domain = ex.type_domain(&v, &typ, &span);
-        init_enumerated.push(Enumerated { variable: v, domain });
+        let first_hole = ex.holes.len();
+        let bounded = ex.bound_from_type(&typ, &span, &mut vec![ex.state_path.clone()]);
+        if ex.holes.len() > first_hole {
+            ex.drop_holes(first_hole);
+            continue;
+        }
+        let Some((domain, n)) = bounded else { continue };
+        let Some(c) = combinations.checked_mul(n).filter(|c| *c <= 1 << 16) else { continue };
+        combinations = c;
+        init_enumerated.push(Enumerated { variable: v.clone(), domain });
+    }
+    ex.init_domains = true;
+    for v in &init_unassigned {
+        if init_enumerated.iter().any(|e| &e.variable == v)
+            || !init_fields_unassigned.iter().any(|f| f == v || f.starts_with(&format!("{v}.")))
+        {
+            continue;
+        }
+        let Some(i) = ex.state_vars.iter().position(|x| x == v) else { continue };
+        let typ = ex.state_types[i].clone();
+        let Some(span) = ex.functions.get(&triple.init).map(|f| f.span.clone()) else { continue };
+        let domain = ex.type_domain(v, &typ, &span);
+        init_enumerated.push(Enumerated { variable: v.clone(), domain });
     }
     let init_hole_end = ex.holes.len();
     let init_domain_warning = (init_hole_end > init_hole_start).then(||

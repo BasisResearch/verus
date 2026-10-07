@@ -151,21 +151,21 @@
   },
   {
     "file": "safety/GState_tla.cfg",
-    "equal": false,
+    "equal": true,
     "before_sha256": "eb12beca600714588a82fb1822d473615f947848839487780cf60d4898c69108",
-    "after_sha256": "8ddb0f3b148e0a326283bb4dbe0b00e43cb2e45673c578e79fa42210cafd83d2"
+    "after_sha256": "eb12beca600714588a82fb1822d473615f947848839487780cf60d4898c69108"
   },
   {
     "file": "safety/GState_tla.tla",
-    "equal": false,
+    "equal": true,
     "before_sha256": "97529bd4ed13f71080e27f0df7a577f7dc13c6c58716da8217ab0402d1c6b7dc",
-    "after_sha256": "699dc6e6ab49e3868d545a320a5184cbf00dbf07ba0d46969d11af04e13a1d90"
+    "after_sha256": "97529bd4ed13f71080e27f0df7a577f7dc13c6c58716da8217ab0402d1c6b7dc"
   },
   {
     "file": "safety/GState_tla.tla.json",
-    "equal": false,
+    "equal": true,
     "before_sha256": "e2c2502f6f15a2411c72421c09916628090fad3907d452e1ee733486886af4a8",
-    "after_sha256": "a457e9f9c1b40dd1bcad531ef5cd2518fcd7a4485b64bbca72d99b65dc8362d3"
+    "after_sha256": "e2c2502f6f15a2411c72421c09916628090fad3907d452e1ee733486886af4a8"
   },
   {
     "file": "safety/GState_tla_trace.cfg",
