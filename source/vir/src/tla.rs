@@ -323,6 +323,9 @@ pub enum TypeRef {
     Set { elem: Box<TypeRef> },
     /// `Map<key, value>`: a TLA+ function whose `DOMAIN` is the map's domain.
     Map { key: Box<TypeRef>, value: Box<TypeRef> },
+    /// `Multiset<elem>`: a TLA+ function from the elements it holds to their
+    /// counts, each above 0.
+    Multiset { elem: Box<TypeRef> },
     /// A tuple: a TLA+ tuple `<<a, b>>`, element `i` at index `i + 1`.
     Tuple { elems: Vec<TypeRef> },
     /// A struct or enum, laid out in [`TypeMap::datatypes`] under `path`,
@@ -1101,9 +1104,122 @@ fn mentions(e: &Expr, v: &VarIdent) -> bool {
     found
 }
 
+/// Whether a type mentions a type parameter (`A`, `(K, V)`, `Seq<K>`).
+fn typ_mentions_param(typ: &Typ) -> bool {
+    crate::ast_visitor::typ_visitor_check(typ, &mut |t: &Typ| match &**t {
+        TypX::TypParam(_) => Err(()),
+        _ => Ok(()),
+    })
+    .is_err()
+}
+
+/// The operator, both commutative and associative, that `e` applies to two
+/// operands, with them: `+`, `*`, `&&`, `||`, set union and intersection
+/// (also as `+` and `*`, vstd's `spec_add` and `spec_mul`) and multiset
+/// addition.
+fn ac_operator(e: &Expr) -> Option<(&'static str, Expr, Expr)> {
+    match &e.x {
+        ExprX::Binary(BinaryOp::Arith(ArithOp::Add(..)), a, b) => Some(("+", a.clone(), b.clone())),
+        ExprX::Binary(BinaryOp::Arith(ArithOp::Mul(..)), a, b) => Some(("*", a.clone(), b.clone())),
+        ExprX::Logical(LogicalOp::And, a, b) => Some(("&&", a.clone(), b.clone())),
+        ExprX::Logical(LogicalOp::Or, a, b) => Some(("||", a.clone(), b.clone())),
+        ExprX::Call { target: CallTarget::Fun(_, fun, ..), args, .. } if args.len() == 2 => {
+            let name = fun_as_friendly_rust_name(fun);
+            let op = match vstd_op(&name) {
+                Some(op @ ("set_union" | "set_intersect" | "multiset_add")) => op,
+                // `s + t` and `s * t` on sets, which `vstd_op` leaves to
+                // their vstd bodies.
+                _ => {
+                    let segs: Vec<&str> = name.split("::").collect();
+                    let module = segs.get(1).map(|m| m.trim_end_matches("_lib"));
+                    match (segs[0], module, segs[segs.len() - 1]) {
+                        ("vstd", Some("set" | "iset"), "spec_add") => "set_union",
+                        ("vstd", Some("set" | "iset"), "spec_mul") => "set_intersect",
+                        _ => return None,
+                    }
+                }
+            };
+            Some((op, args[0].clone(), args[1].clone()))
+        }
+        _ => None,
+    }
+}
+
+/// The operands of a chain of the operator `op` (see [`ac_operator`]):
+/// `acc + x + 1` is `[acc, x, 1]`.
+fn ac_leaves(e: &Expr, op: &str, leaves: &mut Vec<Expr>) {
+    let e = peel(e);
+    match ac_operator(&e) {
+        Some((o, a, b)) if o == op => {
+            ac_leaves(&a, op, leaves);
+            ac_leaves(&b, op, leaves);
+        }
+        _ => leaves.push(e),
+    }
+}
+
+/// Whether the body of a fold's closure `|acc, x| body` combines `acc` with
+/// an operator both commutative and associative (see [`ac_operator`]): a
+/// chain of it with `acc` one operand and no other operand reading `acc`
+/// (`acc + x + 1`, `g(x) || acc`), or `acc.insert(g(x))` for a set or a
+/// multiset. Every order of the elements then folds to the same value. A
+/// cast around it must be the identity, or a checked one (see
+/// `UnaryOp::Clip`) around a sum of operands that are never negative: such
+/// a sum only grows, so every order leaves the type exactly when the total
+/// does, and TLC stops in every order or in none. Any other checked cast
+/// can leave the type in one order and not in another (`(acc + x) as nat`
+/// over `{-1, 1}`).
+fn commutative_fold_body(acc: &VarIdent, body: &Expr) -> bool {
+    let nonneg = |e: &Expr| match &peel(e).x {
+        ExprX::Const(Constant::Int(i)) => i.sign() != num_bigint::Sign::Minus,
+        _ => matches!(
+            &*crate::ast_util::undecorate_typ(&e.typ),
+            TypX::Int(IntRange::Nat | IntRange::U(_) | IntRange::USize)
+        ),
+    };
+    let leaves = |e: &Expr| {
+        let (op, ..) = ac_operator(e)?;
+        let mut leaves = Vec::new();
+        ac_leaves(e, op, &mut leaves);
+        Some(leaves)
+    };
+    let body = match &peel(body).x {
+        ExprX::Unary(UnaryOp::Clip { range, .. }, inner) => {
+            let inner = peel(inner);
+            let monotone = matches!(ac_operator(&inner), Some(("+", ..)))
+                && leaves(&inner).is_some_and(|l| l.iter().all(nonneg));
+            // Verus drops a cast its operand's type already fits (`(acc *
+            // 2) as nat` reaches here uncast), so the identity case is only
+            // a safeguard.
+            if !(int_typ_within(&inner.typ, range) || monotone) {
+                return false;
+            }
+            inner
+        }
+        _ => peel(body),
+    };
+    let is_acc = |e: &Expr| read_var(e).as_ref() == Some(acc);
+    if let Some(leaves) = leaves(&body) {
+        let (accs, others): (Vec<&Expr>, Vec<&Expr>) = leaves.iter().partition(|l| is_acc(l));
+        return accs.len() == 1 && !others.iter().any(|l| mentions(l, acc));
+    }
+    match &body.x {
+        ExprX::Call { target: CallTarget::Fun(_, fun, ..), args, .. } if args.len() == 2 => {
+            match vstd_op(&fun_as_friendly_rust_name(fun)) {
+                Some("set_insert" | "multiset_insert") => {
+                    is_acc(&args[0]) && !mentions(&args[1], acc)
+                }
+                _ => false,
+            }
+        }
+        _ => false,
+    }
+}
+
 /// A known `vstd` operation, by the friendly name of its function. The
 /// name carries an `impl&%N` segment rather than the type, so the key is
-/// the module (seq, set, map, and their `_lib` siblings) plus the method.
+/// the module (seq, set, map, multiset, iset, imap, and their `_lib`
+/// siblings) plus the method.
 fn vstd_op(name: &str) -> Option<&'static str> {
     let segs: Vec<&str> = name.split("::").collect();
     if segs.len() < 3 || segs[0] != "vstd" {
@@ -1111,6 +1227,20 @@ fn vstd_op(name: &str) -> Option<&'static str> {
     }
     let module = segs[1].trim_end_matches("_lib");
     let method = segs[segs.len() - 1];
+    // An `ISet` or `IMap` is a TLA+ set or function as a `Set` or `Map` is
+    // (the export only builds finite ones), so its operations are theirs;
+    // only the constructors differ (`ISet::new` and `IMap::new` take
+    // predicates, `Set::new` returns an `Option`, `Map::new` takes a set).
+    let module = match (module, method) {
+        ("iset", "new") => return Some("iset_new"),
+        ("imap", "new") => return Some("imap_new"),
+        // TLC builds only finite sets, where Verus's `ISet` may be infinite
+        // (one over a hole is), so its finiteness is not the export's.
+        ("iset", "finite") => return Some("iset_finite"),
+        ("iset", _) => "set",
+        ("imap", _) => "map",
+        _ => module,
+    };
     Some(match (module, method) {
         ("seq", "len") => "seq_len",
         ("seq", "index") | ("seq", "spec_index") => "seq_index",
@@ -1128,6 +1258,25 @@ fn vstd_op(name: &str) -> Option<&'static str> {
         ("seq", "new") => "seq_new",
         ("seq", "contains") => "seq_contains",
         ("seq", "ext_equal") => "ext_equal",
+        ("seq", "map") => "seq_map",
+        ("seq", "map_values") => "seq_map_values",
+        ("seq", "filter") => "seq_filter",
+        ("seq", "fold_left") | ("seq", "fold_left_alt") => "seq_fold_left",
+        ("seq", "fold_right") | ("seq", "fold_right_alt") => "seq_fold_right",
+        ("seq", "to_set") => "seq_to_set",
+        ("seq", "to_multiset") => "seq_to_multiset",
+        ("seq", "flatten") | ("seq", "flatten_alt") => "seq_flatten",
+        ("seq", "no_duplicates") => "seq_no_duplicates",
+        ("seq", "max") => "seq_max",
+        ("seq", "min") => "seq_min",
+        ("set", "new") => "set_new",
+        ("set", "map") => "set_map",
+        ("set", "filter") => "set_filter",
+        ("set", "fold") => "set_fold",
+        ("set", "choose") => "set_choose",
+        // `Set::fold` is `self.to_iset().fold(z, f)` (an `ISet::fold`, which
+        // is `Set::fold` here), and a `Set` is the `ISet` of its elements.
+        ("set", "to_iset") => "identity",
         ("set", "contains") => "set_contains",
         ("set", "insert") => "set_insert",
         ("set", "remove") => "set_remove",
@@ -1141,6 +1290,8 @@ fn vstd_op(name: &str) -> Option<&'static str> {
         ("set", "is_empty") => "set_is_empty",
         ("set", "ext_equal") => "ext_equal",
         ("set", "full") => "set_full",
+        // `Set::new(|a| !self.contains(a))`: `None` for an infinite type.
+        ("set", "complement") => "set_complement",
         // `Set::range(lo, hi)` and the `FiniteRange::range_set` it inlines
         // to: the integers `lo <= i < hi`.
         ("set", "range") | ("set", "range_set") => "set_range",
@@ -1154,12 +1305,55 @@ fn vstd_op(name: &str) -> Option<&'static str> {
         ("map", "len") => "map_len",
         ("map", "values") => "map_values",
         ("map", "ext_equal") => "ext_equal",
+        ("map", "new") => "map_new",
+        ("map", "map_values") => "map_map_values",
+        ("map", "map_entries") => "map_map_entries",
+        ("map", "filter_keys") => "map_filter_keys",
+        ("map", "restrict") => "map_restrict",
+        ("map", "remove_keys") => "map_remove_keys",
+        ("map", "union_prefer_right") => "map_union_prefer_right",
+        // `Map::kv_pairs` is `self.dom().map(|k| (k, self[k]))`, and
+        // `IMap::kv_pairs` the same as a comprehension over `(K, V)`.
+        ("map", "kv_pairs") => "map_kv_pairs",
+        // A multiset is a function from the elements it holds (a count
+        // above zero) to their counts, so equal multisets are equal values.
+        ("multiset", "empty") => "map_empty",
+        ("multiset", "count") => "multiset_count",
+        ("multiset", "len") => "multiset_len",
+        ("multiset", "singleton") => "multiset_singleton",
+        ("multiset", "insert") => "multiset_insert",
+        ("multiset", "remove") => "multiset_remove",
+        ("multiset", "add") => "multiset_add",
+        ("multiset", "sub") => "multiset_sub",
+        ("multiset", "contains") | ("multiset", "spec_has") => "map_contains_key",
+        ("multiset", "dom") => "map_dom",
+        ("multiset", "update") => "multiset_update",
+        ("multiset", "from_map") => "multiset_from_map",
+        ("multiset", "from_set") => "multiset_from_set",
+        ("multiset", "filter") => "multiset_filter",
+        ("multiset", "subset_of") | ("multiset", "spec_le") => "multiset_subset_of",
+        ("multiset", "is_empty") => "multiset_is_empty",
+        ("multiset", "ext_equal") => "ext_equal",
+        ("multiset", "choose") => "set_choose",
         // An array is a sequence here (`seq![a, b]` is `[a, b].view()`), so
         // its view is the identity.
         ("array", "array_view") | ("array", "view") => "array_view",
         ("array", "array_index") => "seq_index",
         _ => return None,
     })
+}
+
+/// The friendly name of a datatype as the export reads it: an `ISet` or
+/// `IMap` is the `Set` or `Map` it is exported as (see [`vstd_op`]), a TLA+
+/// set or function, never a record of the closure that represents it in
+/// Rust.
+fn collection_name(p: &Path) -> String {
+    let name = path_as_friendly_rust_name(p);
+    match name.as_str() {
+        "vstd::iset::ISet" => "vstd::set::Set".to_string(),
+        "vstd::imap::IMap" => "vstd::map::Map".to_string(),
+        _ => name,
+    }
 }
 
 /// Whether a type carries a spec_fn anywhere: such values are reduced
@@ -1174,6 +1368,10 @@ fn typ_has_specfn(
         TypX::Datatype(Dt::Path(p), args, _) => {
             if args.iter().any(|a| typ_has_specfn(a, datatypes, seen)) {
                 return true;
+            }
+            // An `ISet` or `IMap` is a value, whatever its Rust fields hold.
+            if collection_name(p) != path_as_friendly_rust_name(p) {
+                return false;
             }
             if !seen.insert(p.clone()) {
                 return false;
@@ -2710,6 +2908,109 @@ impl Exporter {
         }
     }
 
+    /// Whether the `i`th argument of a call reads the post state.
+    fn arg_reads_post(&self, args: &Exprs, i: usize, env: &Env) -> bool {
+        args.get(i).is_some_and(|a| env.reads_post(a))
+    }
+
+    /// The closure of `arity` parameters that the function argument `i` of
+    /// a vstd operation reduces to, if it reduces to one.
+    fn fn_arg(
+        &mut self,
+        args: &Exprs,
+        i: usize,
+        arity: usize,
+        env: &Env,
+    ) -> Option<(VarBinders<Typ>, Expr, Env, Vec<String>)> {
+        let f = args.get(i)?;
+        self.quiet(|x| x.resolve_closure(f, env, 0)).filter(|(params, ..)| params.len() == arity)
+    }
+
+    /// The function argument `i` of a vstd operation applied to `values`
+    /// (printed TLA+ expressions, each with whether it reads the post
+    /// state): the closure it reduces to, with its parameters LET-bound to
+    /// them. An argument that reduces to no closure of that many parameters
+    /// (a `spec_fn` parameter of the caller) is refused.
+    fn apply_arg(
+        &mut self,
+        e: &Expr,
+        args: &Exprs,
+        i: usize,
+        values: &[(String, bool)],
+        env: &Env,
+    ) -> String {
+        let closure = self.fn_arg(args, i, values.len(), env);
+        self.apply_closure(e, closure, values)
+    }
+
+    /// [`Exporter::apply_arg`] for the closure already resolved.
+    fn apply_closure(
+        &mut self,
+        e: &Expr,
+        closure: Option<(VarBinders<Typ>, Expr, Env, Vec<String>)>,
+        values: &[(String, bool)],
+    ) -> String {
+        let Some((params, body, mut env2, mut lets)) = closure else {
+            let what = "vstd operation given a function that does not reduce to a closure";
+            return self.refuse(what, &e.span);
+        };
+        for (p, (value, post)) in params.iter().zip(values) {
+            self.bind_param(&mut env2, &p.name, *post);
+            lets.push(format!("{} == {value}", env2.name(&p.name)));
+        }
+        let b = self.expr(&body, &env2);
+        format!("(LET {} IN {b})", lets.join(" "))
+    }
+
+    /// Bind a closure parameter in `env` under a fresh name, as an ordinary
+    /// value (not a state, nor a closure) that reads the post state when
+    /// `post` does.
+    fn bind_param(&mut self, env: &mut Env, v: &VarIdent, post: bool) -> String {
+        env.roles.remove(v);
+        env.values.remove(v);
+        env.domains.remove(v);
+        if post {
+            env.primed.insert(v.clone());
+        } else {
+            env.primed.remove(v);
+        }
+        self.bind_var(env, v)
+    }
+
+    /// The set `{x \in D : p(x)}` of the predicate argument `i`: `D` is the
+    /// bound the predicate's guard gives `x` (its conjuncts, as a
+    /// quantifier's guard bounds its binder), else the values of `x`'s type
+    /// when they are few, else a hole named after the type.
+    fn comprehension(&mut self, e: &Expr, args: &Exprs, i: usize, env: &Env) -> String {
+        let Some((params, body, mut env2, lets)) = self.fn_arg(args, i, 1, env) else {
+            let what = "vstd operation given a predicate that does not reduce to a closure";
+            return self.refuse(what, &e.span);
+        };
+        let p = &params[0];
+        // The binder ranges over what the guard bounds it by, which may read
+        // the post state (`post.t.contains(x)`).
+        let post = self.arg_reads_post(args, i, env);
+        let name = self.bind_param(&mut env2, &p.name, post);
+        let guard = conjuncts(&peel(&body));
+        let unbound = [p.name.clone()];
+        let domain = match self
+            .quiet(|x| x.bound_from_guard(&p.name, &p.a, &unbound, &guard, &env2))
+        {
+            Some(d) => d,
+            // A hole over a type parameter (vstd's `Set::complement`
+            // ranges over `A`) is one constant for every instantiation,
+            // so no `.cfg` can give it each one's values.
+            None if typ_mentions_param(&p.a) => {
+                let what = "set comprehension over a type parameter (no hole can stand for every instantiation)";
+                return self.refuse(what, &e.span);
+            }
+            None => self.type_domain(&name, &p.a, &e.span),
+        };
+        let b = self.expr(&body, &env2);
+        let set = format!("{{{name} \\in {domain} : {b}}}");
+        if lets.is_empty() { set } else { format!("(LET {} IN {set})", lets.join(" ")) }
+    }
+
     fn vstd_call(&mut self, e: &Expr, op: &str, args: &Exprs, env: &Env) -> String {
         // Arguments are printed only where an operation uses them, so a
         // closure argument (Seq::new's) is never printed as an expression.
@@ -2726,7 +3027,7 @@ impl Exporter {
             "seq_subrange" => format!("SubSeq({}, ({}) + 1, {})", g!(0), g!(1), g!(2)),
             "seq_add" => format!("({} \\o {})", g!(0), g!(1)),
             "seq_empty" => "<< >>".into(),
-            "array_view" => g!(0),
+            "array_view" | "identity" => g!(0),
             "seq_last" => {
                 let (v, s) = (g!(0), self.bind("s__"));
                 format!("(LET {s} == {v} IN {s}[Len({s})])")
@@ -2776,6 +3077,7 @@ impl Exporter {
             "set_finite" => format!("IsFiniteSet({})", g!(0)),
             "set_is_empty" => format!("({} = {{}})", g!(0)),
             "set_full" => self.refuse("Set::full (unbounded)", &e.span),
+            "set_complement" => self.refuse("Set::complement (unbounded)", &e.span),
             // Only integers: a `char` is a string here, with no range.
             "set_range" | "set_range_inclusive"
                 if args.len() == 2
@@ -2822,6 +3124,245 @@ impl Exporter {
                 let (m, x) = (self.bind("m__"), self.bind("k__"));
                 format!("(LET {m} == {v} IN {{{m}[{x}] : {x} \\in DOMAIN {m}}})")
             }
+            // ── sequences: comprehensions, folds and extrema ──
+            "seq_map" | "seq_map_values" => {
+                let (v, post) = (g!(0), self.arg_reads_post(args, 0, env));
+                let (s, i) = (self.bind("s__"), self.bind("i__"));
+                let elem = (format!("{s}[{i}]"), post);
+                let values = if op == "seq_map" {
+                    vec![(format!("{i} - 1"), false), elem]
+                } else {
+                    vec![elem]
+                };
+                let b = self.apply_arg(e, args, 1, &values, env);
+                format!("(LET {s} == {v} IN [{i} \\in 1..Len({s}) |-> {b}])")
+            }
+            "seq_filter" => {
+                let (v, post) = (g!(0), self.arg_reads_post(args, 0, env));
+                let x = self.bind("x__");
+                let b = self.apply_arg(e, args, 1, &[(x.clone(), post)], env);
+                format!("SelectSeq({v}, LAMBDA {x} : {b})")
+            }
+            // A fold is a RECURSIVE operator over the positions, local to the
+            // expression so its body reads whatever the closure reads.
+            "seq_fold_left" | "seq_fold_right" => {
+                let left = op == "seq_fold_left";
+                let (v, post) = (g!(0), self.arg_reads_post(args, 0, env));
+                // The accumulator is the seed or a value of `f`.
+                let acc_post = args.iter().any(|a| env.reads_post(a));
+                let (z, fi) = if left { (g!(1), 2) } else { (g!(2), 1) };
+                let (s, f, k) = (self.bind("s__"), self.bind("fold__"), self.bind("k__"));
+                let elem = (format!("{s}[{k}]"), post);
+                if left {
+                    // `f(fold(s[..k-1]), s[k])`, from the left.
+                    let acc = (format!("{f}({k} - 1)"), acc_post);
+                    let b = self.apply_arg(e, args, fi, &[acc, elem], env);
+                    format!(
+                        "(LET {s} == {v} RECURSIVE {f}(_) {f}({k}) == IF {k} = 0 THEN ({z}) ELSE {b} IN {f}(Len({s})))"
+                    )
+                } else {
+                    // `f(s[k], fold(s[k+1..]))`, from the right.
+                    let acc = (format!("{f}({k} + 1)"), acc_post);
+                    let b = self.apply_arg(e, args, fi, &[elem, acc], env);
+                    format!(
+                        "(LET {s} == {v} RECURSIVE {f}(_) {f}({k}) == IF {k} > Len({s}) THEN ({z}) ELSE {b} IN {f}(1))"
+                    )
+                }
+            }
+            "seq_to_set" => {
+                let (v, s, i) = (g!(0), self.bind("s__"), self.bind("i__"));
+                format!("(LET {s} == {v} IN {{{s}[{i}] : {i} \\in 1..Len({s})}})")
+            }
+            "seq_to_multiset" => {
+                let (v, s, i, x) = (g!(0), self.bind("s__"), self.bind("i__"), self.bind("x__"));
+                format!(
+                    "(LET {s} == {v} IN [{x} \\in {{{s}[{i}] : {i} \\in 1..Len({s})}} |-> Cardinality({{{i} \\in 1..Len({s}) : {s}[{i}] = {x}}})])"
+                )
+            }
+            "seq_flatten" => {
+                let (v, s, f, k) = (g!(0), self.bind("s__"), self.bind("flat__"), self.bind("k__"));
+                format!(
+                    "(LET {s} == {v} RECURSIVE {f}(_) {f}({k}) == IF {k} > Len({s}) THEN << >> ELSE {s}[{k}] \\o {f}({k} + 1) IN {f}(1))"
+                )
+            }
+            "seq_no_duplicates" => {
+                let (v, s) = (g!(0), self.bind("s__"));
+                let (i, j) = (self.bind("i__"), self.bind("j__"));
+                format!(
+                    "(LET {s} == {v} IN \\A {i}, {j} \\in 1..Len({s}) : {i} # {j} => {s}[{i}] # {s}[{j}])"
+                )
+            }
+            // vstd's `max` and `min` of the empty sequence are 0.
+            "seq_max" | "seq_min" => {
+                let (v, s, m, i) = (g!(0), self.bind("s__"), self.bind("m__"), self.bind("i__"));
+                let cmp = if op == "seq_max" { "<=" } else { ">=" };
+                format!(
+                    "(LET {s} == {v} IN IF Len({s}) = 0 THEN 0 ELSE CHOOSE {m} \\in {{{s}[{i}] : {i} \\in 1..Len({s})}} : \\A {i} \\in 1..Len({s}) : {s}[{i}] {cmp} {m})"
+                )
+            }
+            // ── sets ──
+            // `Set::new(p)` is `Some` of the set when it is finite; the
+            // elements range over the bound the predicate's guard gives (as
+            // a quantifier's do), else their type's values, else a hole,
+            // each finite.
+            "set_new" | "iset_new" => {
+                let set = self.comprehension(e, args, 0, env);
+                if op == "set_new" { format!("[tag |-> \"Some\", v0 |-> {set}]") } else { set }
+            }
+            "set_map" => {
+                let (v, post) = (g!(0), self.arg_reads_post(args, 0, env));
+                let x = self.bind("x__");
+                let b = self.apply_arg(e, args, 1, &[(x.clone(), post)], env);
+                format!("{{{b} : {x} \\in {v}}}")
+            }
+            "set_filter" | "multiset_filter" => {
+                let (v, post) = (g!(0), self.arg_reads_post(args, 0, env));
+                let x = self.bind("x__");
+                let b = self.apply_arg(e, args, 1, &[(x.clone(), post)], env);
+                if op == "set_filter" {
+                    format!("{{{x} \\in {v} : {b}}}")
+                } else {
+                    let (m, y) = (self.bind("m__"), self.bind("y__"));
+                    format!(
+                        "(LET {m} == {v} IN [{y} \\in {{{x} \\in DOMAIN {m} : {b}}} |-> {m}[{y}]])"
+                    )
+                }
+            }
+            // `f(fold(s \ {x}), x)` for some `x` of `s`. Verus's fold is
+            // a choice among the orders, as `choose` is, so `f` must be seen
+            // to be commutative, for which every order agrees (see
+            // [`commutative_fold_body`]).
+            "set_fold" => {
+                let closure = self.fn_arg(args, 2, 2, env);
+                if let Some((params, body, ..)) = &closure {
+                    if !commutative_fold_body(&params[0].name, body) {
+                        let what = "Set::fold of a function not seen to be commutative";
+                        return self.refuse(what, &e.span);
+                    }
+                }
+                let (v, post) = (g!(0), self.arg_reads_post(args, 0, env));
+                let acc_post = args.iter().any(|a| env.reads_post(a));
+                let z = g!(1);
+                let (f, t) = (self.bind("fold__"), self.bind("t__"));
+                let (x, c) = (self.bind("x__"), self.bind("c__"));
+                let acc = (format!("{f}({t} \\ {{{x}}})"), acc_post);
+                let b = self.apply_closure(e, closure, &[acc, (x.clone(), post)]);
+                format!(
+                    "(LET RECURSIVE {f}(_) {f}({t}) == IF {t} = {{}} THEN ({z}) ELSE LET {x} == CHOOSE {c} \\in {t} : TRUE IN {b} IN {f}({v}))"
+                )
+            }
+            "set_choose" => self.refuse("choose (TLC cannot evaluate it)", &e.span),
+            "iset_finite" => {
+                self.refuse("ISet::finite (the export builds only finite sets)", &e.span)
+            }
+            // ── maps ──
+            "map_new" => {
+                let (d, x) = (g!(0), self.bind("k__"));
+                let post = self.arg_reads_post(args, 0, env);
+                let b = self.apply_arg(e, args, 1, &[(x.clone(), post)], env);
+                format!("[{x} \\in {d} |-> {b}]")
+            }
+            "imap_new" => {
+                let d = self.comprehension(e, args, 0, env);
+                let (x, post) = (self.bind("k__"), self.arg_reads_post(args, 0, env));
+                let b = self.apply_arg(e, args, 1, &[(x.clone(), post)], env);
+                format!("[{x} \\in {d} |-> {b}]")
+            }
+            "map_map_values" | "map_map_entries" => {
+                let (v, post) = (g!(0), self.arg_reads_post(args, 0, env));
+                let (m, x) = (self.bind("m__"), self.bind("k__"));
+                let value = (format!("{m}[{x}]"), post);
+                let values = if op == "map_map_entries" {
+                    vec![(x.clone(), post), value]
+                } else {
+                    vec![value]
+                };
+                let b = self.apply_arg(e, args, 1, &values, env);
+                format!("(LET {m} == {v} IN [{x} \\in DOMAIN {m} |-> {b}])")
+            }
+            "map_filter_keys" => {
+                let (v, post) = (g!(0), self.arg_reads_post(args, 0, env));
+                let (m, x, y) = (self.bind("m__"), self.bind("k__"), self.bind("y__"));
+                let b = self.apply_arg(e, args, 1, &[(x.clone(), post)], env);
+                format!("(LET {m} == {v} IN [{y} \\in {{{x} \\in DOMAIN {m} : {b}}} |-> {m}[{y}]])")
+            }
+            "map_restrict" | "map_remove_keys" => {
+                let (v, keys) = (g!(0), g!(1));
+                let (m, x) = (self.bind("m__"), self.bind("k__"));
+                let set_op = if op == "map_restrict" { "\\cap" } else { "\\" };
+                format!(
+                    "(LET {m} == {v} IN [{x} \\in (DOMAIN {m}) {set_op} ({keys}) |-> {m}[{x}]])"
+                )
+            }
+            "map_kv_pairs" => {
+                let (v, m, k) = (g!(0), self.bind("m__"), self.bind("k__"));
+                format!("(LET {m} == {v} IN {{<<{k}, {m}[{k}]>> : {k} \\in DOMAIN {m}}})")
+            }
+            // `@@` prefers its left operand.
+            "map_union_prefer_right" => format!("({} @@ {})", g!(1), g!(0)),
+            // ── multisets: functions from the elements held to their counts ──
+            "multiset_count" => {
+                let (v, x, m) = (g!(0), g!(1), self.bind("m__"));
+                format!("(LET {m} == {v} IN IF ({x}) \\in DOMAIN {m} THEN {m}[{x}] ELSE 0)")
+            }
+            "multiset_len" => {
+                let (v, m) = (g!(0), self.bind("m__"));
+                let (f, t) = (self.bind("size__"), self.bind("t__"));
+                let (x, c) = (self.bind("x__"), self.bind("c__"));
+                format!(
+                    "(LET {m} == {v} RECURSIVE {f}(_) {f}({t}) == IF {t} = {{}} THEN 0 ELSE LET {x} == CHOOSE {c} \\in {t} : TRUE IN {m}[{x}] + {f}({t} \\ {{{x}}}) IN {f}(DOMAIN {m}))"
+                )
+            }
+            "multiset_singleton" => format!("(({}) :> 1)", g!(0)),
+            "multiset_insert" | "multiset_remove" | "multiset_add" | "multiset_sub" => {
+                let a = g!(0);
+                let b = match op {
+                    "multiset_insert" | "multiset_remove" => format!("(({}) :> 1)", g!(1)),
+                    _ => g!(1),
+                };
+                let (m1, m2, x) = (self.bind("m__"), self.bind("n__"), self.bind("x__"));
+                let count =
+                    |m: &str, x: &str| format!("(IF {x} \\in DOMAIN {m} THEN {m}[{x}] ELSE 0)");
+                let (c1, c2) = (count(&m1, &x), count(&m2, &x));
+                if matches!(op, "multiset_insert" | "multiset_add") {
+                    format!(
+                        "(LET {m1} == {a} {m2} == {b} IN [{x} \\in DOMAIN {m1} \\cup DOMAIN {m2} |-> {c1} + {c2}])"
+                    )
+                } else {
+                    // Counts below zero are clipped: the element is dropped.
+                    let y = self.bind("y__");
+                    let (d1, d2) = (count(&m1, &y), count(&m2, &y));
+                    format!(
+                        "(LET {m1} == {a} {m2} == {b} IN [{x} \\in {{{y} \\in DOMAIN {m1} : {d1} > {d2}}} |-> {c1} - {c2}])"
+                    )
+                }
+            }
+            "multiset_update" => {
+                let (v, k, n) = (g!(0), g!(1), g!(2));
+                let (m, y, c, x) =
+                    (self.bind("m__"), self.bind("y__"), self.bind("c__"), self.bind("x__"));
+                format!(
+                    "(LET {m} == {v} {y} == {k} {c} == {n} IN [{x} \\in (DOMAIN {m} \\ {{{y}}}) \\cup (IF {c} > 0 THEN {{{y}}} ELSE {{}}) |-> IF {x} = {y} THEN {c} ELSE {m}[{x}]])"
+                )
+            }
+            "multiset_from_map" => {
+                let (v, m, x, y) = (g!(0), self.bind("m__"), self.bind("x__"), self.bind("y__"));
+                format!(
+                    "(LET {m} == {v} IN [{y} \\in {{{x} \\in DOMAIN {m} : {m}[{x}] > 0}} |-> {m}[{y}]])"
+                )
+            }
+            "multiset_from_set" => {
+                let (v, x) = (g!(0), self.bind("x__"));
+                format!("[{x} \\in {v} |-> 1]")
+            }
+            "multiset_subset_of" => {
+                let (a, b) = (g!(0), g!(1));
+                let (m1, m2, x) = (self.bind("m__"), self.bind("n__"), self.bind("x__"));
+                format!(
+                    "(LET {m1} == {a} {m2} == {b} IN \\A {x} \\in DOMAIN {m1} : {x} \\in DOMAIN {m2} /\\ {m1}[{x}] <= {m2}[{x}])"
+                )
+            }
+            "multiset_is_empty" => format!("(DOMAIN {} = {{}})", g!(0)),
             _ => self.refuse(format!("vstd operation {op}"), &e.span),
         }
     }
@@ -3320,8 +3861,10 @@ impl Exporter {
                 // small and has no hole (`SUBSET BOOLEAN`), and a `Map` the
                 // functions from a subset of its keys' domain to its values'
                 // (`(|V| + 1)^|K|` of them) when both are, else a hole too.
-                match path_as_friendly_rust_name(p).as_str() {
-                    "vstd::seq::Seq" => return None,
+                // An `ISet` and an `IMap` are a `Set` and a `Map`; a
+                // `Multiset`'s counts are unbounded, so it is a hole.
+                match collection_name(p).as_str() {
+                    "vstd::seq::Seq" | "vstd::multiset::Multiset" => return None,
                     "vstd::map::Map" => {
                         let first_hole = self.holes.len();
                         let key = self.bound_from_type(args.first()?, span, seen);
@@ -3808,7 +4351,7 @@ impl Exporter {
                 }
                 conj(parts)
             }
-            TypX::Datatype(Dt::Path(p), args, _) => match path_as_friendly_rust_name(p).as_str() {
+            TypX::Datatype(Dt::Path(p), args, _) => match collection_name(p).as_str() {
                 "vstd::seq::Seq" => {
                     let i = self.bind("i__");
                     let inner = self.type_pred(&format!("{subject}[{i}]"), args.first()?, seen)?;
@@ -3818,6 +4361,15 @@ impl Exporter {
                     let x = self.bind("e__");
                     let inner = self.type_pred(&x, args.first()?, seen)?;
                     Some(format!("(\\A {x} \\in {subject} : {inner})"))
+                }
+                // A multiset is a function from its elements to their
+                // counts, never 0 (see [`vstd_op`]).
+                "vstd::multiset::Multiset" => {
+                    let x = self.bind("e__");
+                    let inner = self.type_pred(&x, args.first()?, seen);
+                    let count = Some(format!("{subject}[{x}] > 0"));
+                    let inner = conj(count.into_iter().chain(inner).collect())?;
+                    Some(format!("(\\A {x} \\in DOMAIN {subject} : {inner})"))
                 }
                 "vstd::map::Map" => {
                     let k = self.bind("k__");
@@ -4428,9 +4980,13 @@ impl Exporter {
             TypX::Datatype(Dt::Path(p), args, _) => {
                 let mut args: Vec<TypeRef> =
                     args.iter().map(|a| self.type_ref(a, pending)).collect();
-                match (path_as_friendly_rust_name(p).as_str(), args.len()) {
+                // An `ISet` and an `IMap` are a `Set` and a `Map` here.
+                match (collection_name(p).as_str(), args.len()) {
                     ("vstd::seq::Seq", 1) => TypeRef::Seq { elem: Box::new(args.remove(0)) },
                     ("vstd::set::Set", 1) => TypeRef::Set { elem: Box::new(args.remove(0)) },
+                    ("vstd::multiset::Multiset", 1) => {
+                        TypeRef::Multiset { elem: Box::new(args.remove(0)) }
+                    }
                     ("vstd::map::Map", 2) => {
                         let value = Box::new(args.remove(1));
                         TypeRef::Map { key: Box::new(args.remove(0)), value }
@@ -4730,6 +5286,7 @@ fn encodings() -> BTreeMap<String, String> {
         ("seq", "a 1-based sequence: Verus index i is TLA+ index i + 1"),
         ("set", "a set"),
         ("map", "a function whose DOMAIN is the map's domain"),
+        ("multiset", "a function from the elements it holds to their counts, each above 0"),
         ("tuple", "a tuple <<a, b>>: element i at index i + 1"),
         ("int", "an integer (every Verus integer type)"),
         ("bool", "a boolean"),
@@ -7929,8 +8486,12 @@ pub fn export_module(
     tla.push_str("`.\n\\* Mapping: structs are records; enum values are records with a `tag`;\n");
     tla.push_str("\\* Seq is a 1-based sequence (every index shifted once); Set is a set;\n");
     tla.push_str(
-        "\\* Map is a function (dom = DOMAIN, insert = :> @@); Option is a record tagged\n",
+        "\\* Map is a function (dom = DOMAIN, insert = :> @@); an ISet or IMap is a Set or\n",
     );
+    tla.push_str(
+        "\\* Map; Multiset is a function from the elements it holds to their counts (each\n",
+    );
+    tla.push_str("\\* above 0, count = the value or 0); Option is a record tagged\n");
     tla.push_str(
         "\\* None/Some with field v0; nat/int/uN are Int, and TypeOK keeps each variable\n",
     );
@@ -8464,7 +9025,7 @@ impl Exporter {
         let dec = self.trace_name(&format!("TraceDec_{key}"));
         let obs = self.trace_name(&format!("TraceObs_{key}"));
         memo.insert(key, (dec.clone(), obs.clone()));
-        let TraceNames { j, v, k, p, is_array, .. } = n;
+        let TraceNames { j, v, k, p, r, is_array, .. } = n;
         let tname = typ_name(typ);
         // A key of an observed object that names no field of the type stops
         // TLC, as a misspelled state field does, rather than diverging.
@@ -8481,8 +9042,9 @@ impl Exporter {
                 (format!("<<{}>>", items.join(", ")), checks.join(" /\\ "))
             }
             TypX::Datatype(Dt::Path(path), args, _) => {
-                match path_as_friendly_rust_name(path).as_str() {
-                    "vstd::seq::Seq" if !args.is_empty() => {
+                // An `ISet` and an `IMap` are logged as a `Set` and a `Map`.
+                match (collection_name(path).as_str(), args.len()) {
+                    ("vstd::seq::Seq", 1..) => {
                         let (d, o) = self.trace_codec(&args[0], n, memo, defs);
                         (
                             format!("[{p} \\in 1..Len({j}) |-> {d}({j}[{p}])]"),
@@ -8491,22 +9053,45 @@ impl Exporter {
                             ),
                         )
                     }
-                    "vstd::set::Set" if !args.is_empty() => {
+                    ("vstd::set::Set", 1..) => {
                         let (d, _) = self.trace_codec(&args[0], n, memo, defs);
                         (
                             format!("{{{d}({j}[{p}]) : {p} \\in 1..Len({j})}}"),
                             format!("{v} = {dec}({j})"),
                         )
                     }
-                    "vstd::map::Map" if args.len() == 2 => {
+                    // A multiset is logged as a map, from its elements to
+                    // their counts; an element logged with count 0 is not
+                    // held (see [`vstd_op`]), and no count is negative.
+                    ("vstd::map::Map", 2) | ("vstd::multiset::Multiset", 1) => {
+                        // A multiset's one type argument is its elements'.
+                        let counted = args.len() == 1;
+                        let nat = Arc::new(TypX::Int(IntRange::Nat));
+                        let vtyp = if counted { &nat } else { &args[1] };
                         let (dk, _) = self.trace_codec(&args[0], n, memo, defs);
-                        let (dv, ov) = self.trace_codec(&args[1], n, memo, defs);
+                        let (dv, ov) = self.trace_codec(vtyp, n, memo, defs);
+                        let held = if counted {
+                            // `r` is bound nowhere else in a decoder.
+                            format!("{{{r} \\in 1..Len({j}) : {dv}({j}[{r}][2]) > 0}}")
+                        } else {
+                            format!("1..Len({j})")
+                        };
+                        // Every count logged is one a multiset has, and one
+                        // logged as 0 is of an element the model does not
+                        // hold: `[[1, 1], [1, 0]]` and `[[2, -4]]` stop TLC.
+                        let unheld = if counted {
+                            format!(
+                                "(\\A {p} \\in 1..Len({j}) : {dv}({j}[{p}][2]) >= 0 /\\ ({dv}({j}[{p}][2]) = 0 => {dk}({j}[{p}][1]) \\notin DOMAIN {v})) /\\ "
+                            )
+                        } else {
+                            String::new()
+                        };
                         (
                             format!(
-                                "[{k} \\in {{{dk}({j}[{p}][1]) : {p} \\in 1..Len({j})}} |-> {dv}({j}[CHOOSE {p} \\in 1..Len({j}) : {dk}({j}[{p}][1]) = {k}][2])]"
+                                "[{k} \\in {{{dk}({j}[{p}][1]) : {p} \\in {held}}} |-> {dv}({j}[CHOOSE {p} \\in {held} : {dk}({j}[{p}][1]) = {k}][2])]"
                             ),
                             format!(
-                                "DOMAIN {v} = {{{dk}({j}[{p}][1]) : {p} \\in 1..Len({j})}} /\\ \\A {p} \\in 1..Len({j}) : {ov}({v}[{dk}({j}[{p}][1])], {j}[{p}][2])"
+                                "{unheld}DOMAIN {v} = {{{dk}({j}[{p}][1]) : {p} \\in {held}}} /\\ \\A {p} \\in {held} : {ov}({v}[{dk}({j}[{p}][1])], {j}[{p}][2])"
                             ),
                         )
                     }

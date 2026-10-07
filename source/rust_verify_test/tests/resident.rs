@@ -1210,7 +1210,9 @@ fn resident_twin_compares_a_query_with_its_edit() {
 #[test]
 fn resident_ablation_works_under_provenance_and_spinoff() {
     for mode in ["provenance", "spinoff-all"] {
-        let mut worker = Worker::start(ABLATE_SOURCE, &["--rlimit", "2", "-V", mode]);
+        // About 200k cvc5 units: at more, provenance's doubled budget lets
+        // the recheck after the ablation outrun the matching loop.
+        let mut worker = Worker::start(ABLATE_SOURCE, &["--rlimit", "0.6", "-V", mode]);
         let ready = worker.receive();
         let session = ready["session"].clone();
         let check = |name: &str| -> Value {
