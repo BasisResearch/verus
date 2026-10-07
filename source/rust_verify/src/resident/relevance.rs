@@ -494,8 +494,15 @@ enum Target {
 
 /// Every retained query's fingerprint, in journal order: the hash of the
 /// declarations it reads of the prelude and of the scopes below its prefix,
-/// and the hash of the query itself and its rlimit.
-pub(crate) fn fingerprints(journal: &QueryJournal, index: &mut Index) -> Vec<Fingerprint> {
+/// and the hash of the query itself and its rlimit. Alongside each, the items
+/// whose declarations it reads (their `BatchOwner::Item` keys, sorted): for a
+/// function, the callees, revealed definitions and lemmas whose contracts or
+/// definitions the query can use, which is what a caller asks after to tell
+/// whose failure a pass of this query rests on.
+pub(crate) fn fingerprints(
+    journal: &QueryJournal,
+    index: &mut Index,
+) -> Vec<(Fingerprint, Vec<String>)> {
     let prelude = journal.prelude.as_ref().map(|prelude| index.prelude(prelude)).unwrap_or(0);
 
     // The batches below the queries, and where each prefix ends among them.
@@ -520,10 +527,12 @@ pub(crate) fn fingerprints(journal: &QueryJournal, index: &mut Index) -> Vec<Fin
     let mut items: Vec<Vec<usize>> = Vec::new();
     let mut item_of_batch: Vec<Option<usize>> = vec![None; batches.len()];
     let mut item_of_key: HashMap<String, usize> = HashMap::new();
+    let mut item_keys: Vec<Arc<String>> = Vec::new();
     for at in 0..batches.len() {
         let BatchOwner::Item(key) = &batches[at].owner else { continue };
         let item = *item_of_key.entry((**key).clone()).or_insert_with(|| {
             items.push(Vec::new());
+            item_keys.push(key.clone());
             items.len() - 1
         });
         items[item].push(at);
@@ -689,7 +698,15 @@ pub(crate) fn fingerprints(journal: &QueryJournal, index: &mut Index) -> Vec<Fin
             }
         }
 
-        fingerprints.push(Fingerprint { prefix: hash.0, body: body.0 });
+        let mut reads: Vec<String> = read
+            .iter()
+            .filter_map(|target| match target {
+                Target::Item(item) => Some((*item_keys[*item]).clone()),
+                _ => None,
+            })
+            .collect();
+        reads.sort();
+        fingerprints.push((Fingerprint { prefix: hash.0, body: body.0 }, reads));
     }
     fingerprints
 }

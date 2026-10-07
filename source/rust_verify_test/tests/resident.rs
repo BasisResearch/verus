@@ -3315,7 +3315,9 @@ fn resident_ready_lists_the_requests_it_serves() {
             "ladder",
             "twin",
             "speculate",
-            "pin"
+            "pin",
+            "check_many",
+            "compiled"
         ],
         "{ready}"
     );
@@ -3323,7 +3325,7 @@ fn resident_ready_lists_the_requests_it_serves() {
     // not as an unknown request, so the list cannot drift from `Request`.
     for command in &commands {
         let request = match command.as_str() {
-            "list" | "close" => json!({"command": command, "session": "stale"}),
+            "list" | "close" | "compiled" => json!({"command": command, "session": "stale"}),
             "check" | "egraph" | "ladder" | "speculate" => {
                 json!({"command": command, "session": "stale", "bucket": 0, "query": 0})
             }
@@ -3344,6 +3346,9 @@ fn resident_ready_lists_the_requests_it_serves() {
             }
             "pin" => {
                 json!({"command": command, "session": "stale", "bucket": 0, "query": 0, "rung": "ematch", "rlimit": 1.0})
+            }
+            "check_many" => {
+                json!({"command": command, "session": "stale", "queries": [[0, 0]], "threads": 2})
             }
             _ => panic!("no request for {}", command),
         };
@@ -3709,6 +3714,40 @@ verus! {{
         assert_eq!(checked["pinned"]["rlimit"], 1.0, "{checked}");
         worker.finish(true);
     }
+}
+
+/// A retain-only session serves from the end of verification while the
+/// compiler goes on with its later passes; `compiled` waits for them and says
+/// whether the compilation succeeded, by which time what they report (here a
+/// lint of a later pass) is on stderr. A session served after its
+/// compilation answers `compiled` at once with the invocation's outcome.
+#[test]
+fn resident_retain_only_session_serves_before_the_compilation_ends() {
+    let source = "use vstd::prelude::*;\nverus! { proof fn passing() {} }\n\
+        pub fn ptr(a: usize) -> *mut u8 { unsafe { std::mem::transmute(a) } }\n";
+    let mut worker = Worker::start_with_env(source, &[], &[("VERUS_RESIDENT_RETAIN_ONLY", "1")]);
+    let ready = worker.receive();
+    let session = ready["session"].clone();
+    let compiled = worker.send(json!({"command": "compiled", "session": session}));
+    assert_eq!(compiled["event"], "compiled", "{compiled}");
+    assert_eq!(compiled["succeeded"], true, "{compiled}");
+    assert!(worker.stderr().contains("transmuting an integer to a pointer"), "{}", worker.stderr());
+    // Asked again, it answers the same.
+    let again = worker.send(json!({"command": "compiled", "session": session}));
+    assert_eq!(again["succeeded"], true, "{again}");
+    let closed = worker.send(json!({"command": "close", "session": session}));
+    assert_eq!(closed["event"], "closed", "{closed}");
+    worker.finish(true);
+
+    let mut worker = Worker::start(
+        "use vstd::prelude::*; verus! { proof fn failing() { assert(false); } }",
+        &[],
+    );
+    let ready = worker.receive();
+    let compiled = worker.send(json!({"command": "compiled", "session": ready["session"]}));
+    assert_eq!(compiled["succeeded"], ready["invocation_succeeded"], "{compiled}");
+    assert_eq!(compiled["succeeded"], false, "{compiled}");
+    worker.finish(false);
 }
 
 /// A retain-only session has checked nothing when its first request arrives,
@@ -5065,4 +5104,302 @@ fn resident_fingerprints_change_with_every_verdict() {
         }
     }
     assert!(missed.is_empty(), "verdict changed, fingerprint did not: {:#?}", missed);
+}
+
+const INITIAL_SOURCE: &str = r#"
+use vstd::prelude::*;
+verus! {
+    spec fn f(x: int) -> int { x + 1 }
+
+    proof fn helper(x: int) ensures f(x) > x {}
+
+    proof fn uses_helper(x: int) ensures f(x) > x { helper(x); }
+
+    proof fn failing(x: int) { assert(x > 0); }
+
+    #[verifier::spinoff_prover]
+    proof fn spun(x: int) ensures f(x) == x + 1 { helper(x); }
+
+    uninterp spec fn a(i: int) -> int;
+
+    #[verifier::rlimit(0.01)]
+    proof fn looping()
+        requires forall|i: int| #[trigger] a(i) < a(i + 1),
+        ensures a(0) > 100,
+    {
+    }
+}
+"#;
+
+/// The catalogue carries what the invocation itself answered for each query
+/// it checked, so a caller learns a failed run's per-query verdicts without
+/// checking every query again, and the items each query reads. A recheck of a
+/// query answers what the catalogue says it answered; a retain-only
+/// invocation, which checks nothing, carries no verdict.
+#[test]
+fn resident_catalogue_reports_initial_verdicts_and_reads() {
+    let mut worker = Worker::start(INITIAL_SOURCE, &[]);
+    let ready = worker.receive();
+    assert_eq!(ready["invocation_succeeded"], false, "{}", ready);
+    let session = ready["session"].clone();
+    let initial = |name: &str| query_of(&ready, name, "default")["initial"].clone();
+    assert_eq!(initial("::helper")["result"], "valid", "{}", ready);
+    assert_eq!(initial("::uses_helper")["result"], "valid", "{}", ready);
+    assert_eq!(initial("::spun")["result"], "valid", "{}", ready);
+    let failing = initial("::failing");
+    assert_eq!(failing["result"], "invalid", "{}", ready);
+    assert!(failing["assert_id"].is_array(), "{}", failing);
+    let diagnostics = failing["diagnostics"].as_array().unwrap();
+    assert_eq!(diagnostics[0]["level"], "error", "{}", failing);
+    assert!(diagnostics[0]["spans"][0].as_str().unwrap().contains("fixture.rs:"), "{}", failing);
+    let looping = initial("::looping");
+    assert!(looping["result"] == "resource_limit" || looping["result"] == "invalid", "{}", looping);
+    if looping["result"] == "resource_limit" {
+        let message = looping["diagnostics"][0]["message"].as_str().unwrap();
+        assert!(message.contains("Resource limit (rlimit) exceeded"), "{}", looping);
+    }
+    for bucket in ready["buckets"].as_array().unwrap() {
+        for query in bucket["queries"].as_array().unwrap() {
+            let initial = &query["initial"];
+            assert!(initial["elapsed_ms"].is_u64(), "{}", query);
+            let checked = worker.send(json!({"command": "check", "session": session,
+                "bucket": bucket["id"], "query": query["id"]}));
+            assert_eq!(checked["result"], initial["result"], "{} rechecked as {}", query, checked);
+        }
+    }
+
+    // What each query reads: its callees and the definitions it can use,
+    // not itself, and nothing it never mentions.
+    let reads = |name: &str| -> Vec<String> {
+        query_of(&ready, name, "default")["reads"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r.as_str().unwrap().rsplit("::").next().unwrap().to_owned())
+            .collect()
+    };
+    assert_eq!(reads("::uses_helper"), ["f", "helper"], "{}", ready);
+    assert_eq!(reads("::spun"), ["f", "helper"], "{}", ready);
+    assert_eq!(reads("::helper"), ["f"], "{}", ready);
+    assert!(!reads("::failing").contains(&"helper".to_owned()), "{}", ready);
+    assert_eq!(worker.send(json!({"command": "close", "session": session}))["event"], "closed");
+    worker.finish(false);
+
+    let mut retained =
+        Worker::start_with_env(INITIAL_SOURCE, &[], &[("VERUS_RESIDENT_RETAIN_ONLY", "1")]);
+    let ready = retained.receive();
+    assert_eq!(ready["retain_only"], true, "{}", ready);
+    for bucket in ready["buckets"].as_array().unwrap() {
+        for query in bucket["queries"].as_array().unwrap() {
+            assert!(query.get("initial").is_none(), "{}", query);
+            assert!(query["reads"].is_array(), "{}", query);
+        }
+    }
+    let session = ready["session"].clone();
+    assert_eq!(retained.send(json!({"command": "close", "session": session}))["event"], "closed");
+    retained.finish(true);
+}
+
+/// With `VERUS_RESIDENT_MAX_SOLVERS`, a session stops each retained solver
+/// once the invocation has checked its queries and keeps at most that many
+/// running; a request relaunches a stopped solver from what it was sent.
+/// Verdicts do not change: every recheck answers what the invocation did, in
+/// any order, over and over, though each recheck of another bucket's query
+/// launches a solver again.
+#[test]
+fn resident_capped_session_relaunches_stopped_solvers_with_the_same_verdicts() {
+    let mut worker = Worker::start_with_env(
+        INITIAL_SOURCE,
+        &["--multiple-errors", "2"],
+        &[("VERUS_RESIDENT_MAX_SOLVERS", "1")],
+    );
+    let ready = worker.receive();
+    let session = ready["session"].clone();
+    let log = worker.dir.path().join("launches");
+    let launches = || fs::read_to_string(&log).map(|l| l.lines().count()).unwrap_or(0);
+    let opened = launches();
+    let mut queries = Vec::new();
+    for bucket in ready["buckets"].as_array().unwrap() {
+        for query in bucket["queries"].as_array().unwrap() {
+            queries.push((bucket["id"].clone(), query["id"].clone(), query["initial"].clone()));
+        }
+    }
+    assert!(queries.len() >= 6, "{}", ready);
+    for round in 0..2 {
+        for (bucket, query, initial) in queries.iter().rev() {
+            let checked = worker.send(json!({"command": "check", "session": session,
+                "bucket": bucket, "query": query}));
+            assert_eq!(checked["result"], initial["result"], "round {}: {}", round, checked);
+            assert_eq!(
+                checked["diagnostics"].as_array().map(Vec::len),
+                initial["diagnostics"].as_array().map(Vec::len),
+                "round {}: {} against {}",
+                round,
+                checked,
+                initial
+            );
+        }
+    }
+    // The two buckets alternate, so at one live solver each recheck after
+    // the first relaunches one.
+    assert!(launches() > opened + 2, "{} launches after {}", launches(), opened);
+    assert_eq!(worker.send(json!({"command": "close", "session": session}))["event"], "closed");
+    worker.finish(false);
+}
+
+const OVERRIDE_SOURCE: &str = r#"
+use vstd::prelude::*;
+verus! {
+    spec fn f(x: int) -> int { x + 1 }
+
+    proof fn passing(x: int) ensures f(x) > x {}
+
+    proof fn three_failures(x: int) {
+        assert(x > 0);
+        assert(x > 1);
+        assert(x > 2);
+    }
+
+    uninterp spec fn a(i: int) -> int;
+
+    #[verifier::rlimit(0.01)]
+    proof fn own_budget()
+        requires forall|i: int| #[trigger] a(i) < a(i + 1),
+        ensures a(0) > 100,
+    {
+    }
+}
+"#;
+
+/// A check may run at another rlimit or look for another number of errors
+/// than the invocation did; a function's own `#[verifier::rlimit]` still
+/// wins over the requested rlimit, as it does over `--rlimit`. `ready`
+/// reports the invocation's own settings.
+#[test]
+fn resident_check_takes_an_rlimit_and_an_error_count() {
+    let mut worker = Worker::start(OVERRIDE_SOURCE, &["--rlimit", "7"]);
+    let ready = worker.receive();
+    assert_eq!(ready["rlimit"], 7.0, "{}", ready);
+    assert_eq!(ready["multiple_errors"], 2, "{}", ready);
+    let session = ready["session"].clone();
+    let check = |worker: &mut Worker<ChildStdin>, name: &str, extra: Value| {
+        let mut request = json!({"command": "check", "session": session, "bucket": 0,
+            "query": query_id(&ready, name)});
+        request.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        worker.send(request)
+    };
+    let plain = check(&mut worker, "::passing", json!({}));
+    assert_eq!(
+        (plain["result"].clone(), plain["rlimit"].clone()),
+        (json!("valid"), json!(7.0)),
+        "{}",
+        plain
+    );
+    // One resource unit is not enough for anything.
+    let starved = check(&mut worker, "::passing", json!({"rlimit": 0.000004}));
+    assert_eq!(starved["result"], "resource_limit", "{}", starved);
+    assert!((starved["rlimit"].as_f64().unwrap() - 0.000004).abs() < 1e-9, "{}", starved);
+    let again = check(&mut worker, "::passing", json!({}));
+    assert_eq!(again["result"], "valid", "the override lasts one check: {}", again);
+    // The function's own budget is kept.
+    let own = check(&mut worker, "::own_budget", json!({"rlimit": 100}));
+    assert!((own["rlimit"].as_f64().unwrap() - 0.01).abs() < 1e-6, "{}", own);
+    // A budget the solver would read as no limit at all is refused, by
+    // `check` and `check_many` alike, and the session goes on.
+    for rlimit in [json!(0), json!(-1.5)] {
+        let refused = check(&mut worker, "::passing", json!({"rlimit": rlimit}));
+        assert_eq!(refused["event"], "error", "{}", refused);
+        assert_eq!(refused["message"], "rlimit must be a positive number", "{}", refused);
+        let refused = worker.send(json!({"command": "check_many", "session": session,
+            "queries": [[0, query_id(&ready, "::passing")]], "rlimit": rlimit}));
+        assert_eq!(refused["event"], "error", "{}", refused);
+    }
+    // Errors: the first, then as many more as asked for.
+    let errors = |checked: &Value| {
+        checked["diagnostics"].as_array().unwrap().iter().filter(|d| d["level"] == "error").count()
+    };
+    let one = check(&mut worker, "::three_failures", json!({"multiple_errors": 0}));
+    assert_eq!(errors(&one), 1, "{}", one);
+    let all = check(&mut worker, "::three_failures", json!({"multiple_errors": 5}));
+    assert_eq!(errors(&all), 3, "{}", all);
+    assert_eq!(worker.send(json!({"command": "close", "session": session}))["event"], "closed");
+    worker.finish(false);
+}
+
+const MANY_SOURCE: &str = r#"
+use vstd::prelude::*;
+verus! {
+    spec fn f(x: int) -> int { x + 1 }
+
+    #[verifier::spinoff_prover]
+    proof fn a(x: int) ensures f(x) > x {}
+
+    #[verifier::spinoff_prover]
+    proof fn b(x: int) { assert(x > 0); }
+
+    #[verifier::spinoff_prover]
+    proof fn c(x: int) ensures f(x) == x + 1 {}
+
+    proof fn d(x: int) ensures f(x) > x - 1 {}
+
+    proof fn e(x: int) { assert(x > 1); assert(x > 2); }
+}
+"#;
+
+/// A batch of checks across buckets runs several at once and answers each as
+/// a single check would: one `checked` event per query, in any order, then a
+/// `checked_many` that counts them. Rerunning the batch, with an rlimit or an
+/// error count, keeps answering alike; under a cap on running solvers the
+/// batch leaves no more running than the cap.
+#[test]
+fn resident_check_many_checks_queries_concurrently() {
+    let mut worker =
+        Worker::start_with_env(MANY_SOURCE, &[], &[("VERUS_RESIDENT_MAX_SOLVERS", "2")]);
+    let ready = worker.receive();
+    let session = ready["session"].clone();
+    let mut expected = std::collections::BTreeMap::new();
+    let mut queries = Vec::new();
+    for bucket in ready["buckets"].as_array().unwrap() {
+        for query in bucket["queries"].as_array().unwrap() {
+            if query["kind"] != "body" {
+                continue;
+            }
+            let address = (bucket["id"].as_u64().unwrap(), query["id"].as_u64().unwrap());
+            expected.insert(address, query["initial"]["result"].clone());
+            queries.push(json!([address.0, address.1]));
+        }
+    }
+    assert!(ready["buckets"].as_array().unwrap().len() >= 4, "{}", ready);
+    for extra in [json!({"threads": 3}), json!({"threads": 8, "multiple_errors": 0, "rlimit": 20})]
+    {
+        let mut request = json!({"command": "check_many", "session": session, "queries": queries});
+        request.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        let first = worker.send(request);
+        let mut seen = std::collections::BTreeMap::new();
+        let mut reply = first;
+        while reply["event"] == "checked" {
+            let address = (reply["bucket"].as_u64().unwrap(), reply["query"].as_u64().unwrap());
+            assert!(seen.insert(address, reply["result"].clone()).is_none(), "{}", reply);
+            reply = worker.receive();
+        }
+        assert_eq!(reply["event"], "checked_many", "{}", reply);
+        assert_eq!(reply["count"], queries.len(), "{}", reply);
+        assert_eq!(seen, expected, "{}", extra);
+    }
+    let e = query_id(&ready, "::e");
+    let errors = worker.send(json!({"command": "check_many", "session": session,
+        "queries": [[0, e]], "multiple_errors": 0}));
+    assert_eq!(
+        errors["diagnostics"].as_array().unwrap().iter().filter(|d| d["level"] == "error").count(),
+        1,
+        "{}",
+        errors
+    );
+    assert_eq!(worker.receive()["event"], "checked_many");
+    // A bad address is refused before any check.
+    let refused =
+        worker.send(json!({"command": "check_many", "session": session, "queries": [[99, 0]]}));
+    assert_eq!(refused["event"], "error", "{}", refused);
+    assert_eq!(worker.send(json!({"command": "close", "session": session}))["event"], "closed");
+    worker.finish(false);
 }
