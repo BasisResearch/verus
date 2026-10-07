@@ -2011,6 +2011,8 @@ impl Exporter {
                         }
                         lets.extend(bound);
                     }
+                    // Defensive: Verus rejects a let-else in spec code
+                    // ("let-else in spec/proof"), so this is never reached.
                     _ => {
                         let r = self.refuse("let-else", &s.span);
                         // Each name the pattern binds is bound to the
@@ -2269,13 +2271,7 @@ impl Exporter {
                         let var = self.state_var(&field_name(&b.name));
                         let printed =
                             if role == Role::Post { format!("{var}'") } else { var.clone() };
-                        let (name, sub) = match &b.a.x {
-                            PatternX::Var(PatternBinding { name, .. }) => (Some(name), None),
-                            PatternX::Binding { binding: PatternBinding { name, .. }, sub_pat } => {
-                                (Some(name), Some(sub_pat))
-                            }
-                            _ => (None, Some(&b.a)),
-                        };
+                        let (name, sub) = state_field_binder(&b.a);
                         if let Some(name) = name {
                             env.names.insert(name.clone(), printed.clone());
                             let binder = FieldBinder { role, var, printed: printed.clone() };
@@ -4351,7 +4347,9 @@ impl Exporter {
 
     /// The names a pattern on a state in `states` binds to its fields, each
     /// to its state variable, in `e`'s `let`s and `match`es (`let State { x,
-    /// .. } = s`), as [`Exporter::pattern`] prints them.
+    /// .. } = s`), as [`Exporter::pattern`] prints them. A `let` that
+    /// [`Exporter::block`] refuses (a let-else, or one binding a closure)
+    /// binds its names to the refusal, so it binds none here.
     fn state_binders(&self, e: &Expr, states: &HashSet<VarIdent>) -> HashMap<VarIdent, String> {
         let mut out = HashMap::new();
         crate::ast_visitor::expr_visitor_walk(e, &mut |x: &Expr| {
@@ -4359,8 +4357,8 @@ impl Exporter {
             match &x.x {
                 ExprX::Block(stmts, _) => {
                     for s in stmts.iter() {
-                        if let StmtX::Decl { pattern, init: Some(init), .. } = &s.x {
-                            if on_state(init) {
+                        if let StmtX::Decl { pattern, init: Some(init), els: None, .. } = &s.x {
+                            if on_state(init) && !pattern_binds_closure(pattern, &self.datatypes) {
                                 out.extend(self.state_pattern_binders(pattern));
                             }
                         }
@@ -4380,18 +4378,16 @@ impl Exporter {
 
     /// The names a pattern on a whole state binds to its fields (see
     /// [`Exporter::state_binders`]): an or-pattern's, where both
-    /// alternatives bind them to the same field.
+    /// alternatives bind them to the same field. Each field's binder is
+    /// read by [`state_field_binder`], as [`Exporter::pattern`] reads it.
     fn state_pattern_binders(&self, p: &Pattern) -> HashMap<VarIdent, String> {
         match &p.x {
             PatternX::Constructor(Dt::Path(path), _, binders) if *path == self.state_path => {
                 binders
                     .iter()
-                    .filter_map(|b| match &b.a.x {
-                        PatternX::Var(PatternBinding { name, .. })
-                        | PatternX::Binding { binding: PatternBinding { name, .. }, .. } => {
-                            Some((name.clone(), self.state_var(&field_name(&b.name))))
-                        }
-                        _ => None,
+                    .filter_map(|b| {
+                        let (name, _) = state_field_binder(&b.a);
+                        Some((name?.clone(), self.state_var(&field_name(&b.name))))
                     })
                     .collect()
             }
@@ -5093,6 +5089,22 @@ fn pattern_could_match(p: &Pattern, variant: &Ident) -> bool {
         PatternX::Or(a, b) => pattern_could_match(a, variant) || pattern_could_match(b, variant),
         PatternX::MutRef(inner) | PatternX::ImmutRef(inner) => pattern_could_match(inner, variant),
         PatternX::Wildcard(_) | PatternX::Var(_) | PatternX::Expr(_) | PatternX::Range(..) => true,
+    }
+}
+
+/// A field's pattern in a pattern on a whole state (see
+/// [`Exporter::pattern`]): the name it binds to the field's state variable
+/// (`x`, or `n` in `x: n @ ..`), and the pattern the field must still match
+/// (`0..=255` in `x: n @ 0..=255`, or the whole pattern when it binds no
+/// name to the field). [`Exporter::state_pattern_binders`] reads it the same
+/// way, so Init's assignment count agrees with the print.
+fn state_field_binder(p: &Pattern) -> (Option<&VarIdent>, Option<&Pattern>) {
+    match &p.x {
+        PatternX::Var(PatternBinding { name, .. }) => (Some(name), None),
+        PatternX::Binding { binding: PatternBinding { name, .. }, sub_pat } => {
+            (Some(name), Some(sub_pat))
+        }
+        _ => (None, Some(p)),
     }
 }
 

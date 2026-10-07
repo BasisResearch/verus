@@ -3785,21 +3785,30 @@ pub open spec fn next(pre: State, post: State) -> bool {
 /// A pattern on the state in `init` binds each name to its variable, so
 /// `x == 0` and `!f` assign it, and the report and the .cfg agree with the
 /// print: Init assigns every variable, and none is drawn from its type
-/// (`f \in BOOLEAN`). A `match` on the state counts the same way.
+/// (`f \in BOOLEAN`). A `match` on the state counts the same way, as do
+/// `n` in `z: n @ 0..=255` and a name an or-pattern's alternatives both
+/// bind to the same field (`w`): without them Init would draw `z` and `w`
+/// from their types while the print assigns them.
 const INIT_PATTERN: &str = r#"
 verus! {
-pub struct State { pub x: int, pub y: int, pub f: bool }
+pub struct State { pub x: int, pub y: int, pub f: bool, pub z: u8, pub w: u8 }
 
 pub open spec fn init(s: State) -> bool {
     let State { x, f, .. } = s;
-    x == 0 && !f && match s { State { y, .. } => y == 0 }
+    x == 0 && !f && match s { State { y, .. } => y == 0 } && {
+        let State { z: n @ 0..=255, .. } = s;
+        n == 1
+    } && match s { State { w, z: 1, .. } | State { w, .. } => w == 3 }
 }
 
 pub open spec fn next(pre: State, post: State) -> bool {
     pre.x < 2 && post.x == pre.x + 1 && post.y == pre.y + 2 && post.f == !pre.f
+        && post.z == pre.z && post.w == pre.w
 }
 
-pub open spec fn paired(s: State) -> bool { s.y == 2 * s.x && s.f == (s.x % 2 == 1) }
+pub open spec fn paired(s: State) -> bool {
+    s.y == 2 * s.x && s.f == (s.x % 2 == 1) && s.z == 1 && s.w == 3
+}
 }
 "#;
 
@@ -3811,6 +3820,12 @@ fn tla_export_init_assigns_through_a_pattern_on_the_state() {
     assert!(!ex.cfg.contains("Init never assigns"), "{}", ex.cfg);
     assert!(!ex.tla.contains("\\in BOOLEAN"), "{}", ex.tla);
     assert!(ex.tla.contains("(f = FALSE)"), "{}", ex.tla);
+    // `n` in `z: n @ ..` is `z`, and `w`, which both alternatives bind to
+    // the same field, is `w`: each is assigned, not a LET.
+    // Counted unassigned, a small `u8` would be drawn from its type.
+    assert!(ex.tla.contains("(z = 1)"), "{}", ex.tla);
+    assert!(ex.tla.contains("(w = 3)"), "{}", ex.tla);
+    assert!(!ex.tla.contains("(z \\in ") && !ex.tla.contains("(w \\in "), "{}", ex.tla);
     let Some(jar) = tla_tools() else { return };
     sany(&jar, &ex.spec());
     let run = tlc(&jar, &ex.spec(), &ex.cfg);
