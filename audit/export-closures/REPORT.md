@@ -36,71 +36,143 @@ This lane extends `source/vir/src/tla.rs`; regression coverage lives in
   stops TLC; it is not replaced with a default value. Multiple-binder choices
   and unbounded generic choices remain explicit refusals.
 
-## Reproduction
 
-Run from this worktree, using the login-shell environment required by the task:
+## Cumulative campaign after rebase onto `64f1c6e3`
 
-```sh
-export PATH=$HOME/.cargo/bin:$PATH
-export TMPDIR=$HOME/tmp
-source tools/activate
-cd source
-TLA2TOOLS_JAR=$HOME/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar \
-  timeout 1800 vargo test --release --vstd-no-verify \
-  -p rust_verify_test --test tla_export -- --test-threads=4
-```
+The table measures all 33 requested export targets: Anvil’s five (including both API adapters), IronKV host, nrkernel’s six, NR’s three, and all 18 Splinter attempts. Five additional campaign adapters/controls follow separately. A compiler error or timeout is **not** a zero-refusal export. `Before` uses the original campaign binary; `L1–3` uses the clean lane-3 checkout at `64f1c6e3`; `After` uses the rebased lane-4 binary. Binary hashes and version strings are saved in `cumulative-results.json` (the parent binary embeds its pre-commit dirty version string).
 
-`build-deps.py` rebuilds the campaign's temporal library and Kubernetes stub
-inside this worktree. `campaign.py` reuses the exact six campaign sources,
-module selectors and adapter options, changing only the exporter and rebuilt
-library paths. Each export has a 90-second timeout. `regression.py` exports all
-six `examples/tla` fixtures and toydb's Raft safety model with both binaries.
-The requested `base/toydb/src/raft/safety.rs` is absent on this box; the existing
-`toydb-pr-30/src/raft/safety.rs` is used for both sides instead.
+- **before:** 9/33 zero-refusal exports; 9/33 also pass SANY; 3/9 saved-bound TLC runs complete; 3/9 explore without an evaluation error.
+- **parent:** 14/33 zero-refusal exports; 12/33 also pass SANY; 3/9 saved-bound TLC runs complete; 5/9 explore without an evaluation error.
+- **after:** 17/33 zero-refusal exports; 15/33 also pass SANY; 3/9 saved-bound TLC runs complete; 5/9 explore without an evaluation error.
 
-The campaign has no saved TLC bounds/configurations for these six refused
-machines. `network-smoke.py` supplies a separately reported supplemental bound:
-one valid message, optional receive, empty/singleton send, and multiplicity at
-most two, with a 30-second timeout. It reproduces the baseline refusal and
-checks the changed network export under exactly the same bound.
+Original `MC.tla`, `MC.cfg`, and TLC commands/timeouts were replayed unchanged, with their hashes recorded. The other 24 primary targets have no saved campaign bounds; no new constants, table interpretations, adapters, or bounds were invented. Reaching states before a TLC evaluation error does not count as exploration. Lane-3 restrictions and finite carriers remain explicitly reported approximations, so a completed bounded run is not a proof of the unrestricted source.
 
-## Results
+L1 = traits; L2 = nrkernel bit operations/partial Init; L3 = partial reads/finite carriers; L4 = closure reduction/bounded choose. Intermediate attribution also uses the committed lane reports (`artifacts/nrkernel/report.txt`, `audit/export-partial/REPORT.md`) and the trait lane’s recorded campaign results. More refusals can mean reduction reached previously hidden unsupported expressions.
 
-Final counts, base revision, regression hashes, and remaining refusals are
-recorded in `results.json` after validation. Generated modules, complete logs,
-and rebuilt dependencies remain in the ignored evidence directories beside
-this report; the scripts reproduce them without changing campaign inputs.
+### Requested campaign targets
 
-| Campaign machine | Refusals before | Refusals after | Contribution of this lane / remaining blocker |
-|---|---:|---:|---|
-| Anvil Cluster adapter | 22 | 62 | Reduces reachable action/helper records; reveals further callbacks from model maps and choices over closure records, which remain refused. |
-| Anvil API action | 14 | 64 | Reduces parameterized action and finite set choice; exposes callbacks selected from installed-type maps, uninterpreted functions and character ordering. |
-| Anvil API state machine | 16 | 8 | Reduces helper receivers; actions chosen from a set of closure records remain unresolved. |
-| Anvil controller | 9 | 8 | Reduces action records and ordinary model fields; trait/uninterpreted bodies and an unresolved model value remain. |
-| Anvil network | 2 | **0** | Lane 4 alone removes both action-field closure refusals. Supplemental TLC: **11 generated / 3 distinct states**, no errors. |
-| IronKV host protocol | 6 | 4 | Removes two closure-literal argument refusals. Infinite-map construction, a full infinite set, a trait comparator, and an unbounded generic comprehension remain. |
+| Target | Before | L1–3 | After | TLC before → after (campaign bounds) | Lane contribution |
+|---|---:|---:|---:|---|---|
+| anvil/Cluster-adapter | 22 | 22 | 62 | no saved bounds → no saved bounds | L1 trait tables; L4 reduces reachable records, exposing deeper callbacks/choices; still refused |
+| anvil/sub_api | 14 | 8 | 58 | no saved bounds → no saved bounds | L1 trait tables; L3 carriers/guards; L4 action/choice reduction exposes deeper callbacks; still refused |
+| anvil/sub_api_sm | 16 | 15 | 8 | no saved bounds → no saved bounds | L4 reduces helper receivers; choice over closure records remains |
+| anvil/sub_controller | 9 | 9 | 0 | no saved bounds → no saved bounds | L1 trait tables + L4 record/receiver reduction jointly remove all refusals |
+| anvil/sub_network | 2 | 2 | 0 | no saved bounds → no saved bounds | L4 removes both closure refusals |
+| ironkv/host_protocol_t | 6 | 0 | 0 | no saved bounds → no saved bounds | L1 trait tables + L3 total collections already remove all refusals; L4 unchanged |
+| nrkernel/hlspec | 4 | 1 | 0 | no saved bounds → no saved bounds | L1 trait table + L2 bit/Init + L3 carriers + L4 final bounded choose |
+| nrkernel/mmu_rl1 | 95 | 189 | 189 | no saved bounds → no saved bounds | L1/L2 remove trait/bit refusals; L3 definedness expansion limit remains |
+| nrkernel/mmu_rl2 | 108 | timeout | timeout | no saved bounds → no saved bounds | L1/L2 remove trait/bit refusals; L3/L4 export times out |
+| nrkernel/mmu_rl3 | 101 | timeout | timeout | no saved bounds → no saved bounds | L1/L2 remove trait/bit refusals; L3/L4 export times out |
+| nrkernel/os | 135 | timeout | timeout | no saved bounds → no saved bounds | L1/L2 remove trait/bit refusals; L3/L4 export times out |
+| nrkernel/os_ext | 1 | 0 | 0 | no saved bounds → no saved bounds | L2 bit/Init removes final refusal |
+| nr/AsynchronousSingleton | 3 | 0 | 0 | no saved bounds → no saved bounds | L1 concrete dispatch/typed tables |
+| nr/SimpleLog | 4 | 0 | 0 | no saved bounds → no saved bounds | L1 concrete dispatch/typed tables |
+| nr/UnboundedLog | 4 | 0 | 0 | no saved bounds → no saved bounds | L1 concrete dispatch/typed tables; L3 carriers |
+| splinter/AbstractJournal | 0 | 0 | 0 | evaluation/config error → complete (72 states) | L3 guarded partial reads/casts unblock evaluation; L4 unchanged |
+| splinter/AbstractMap | 0 | 0 | 0 | evaluation/config error → complete (3 states) | L3 guarded partial reads/casts unblock evaluation; L4 unchanged |
+| splinter/AllocationBetree | compile error | compile error | compile error | no saved bounds → no saved bounds | Campaign Rust input does not compile; no lane unblocks it |
+| splinter/AllocationBranchBetree | compile error | compile error | compile error | no saved bounds → no saved bounds | Campaign Rust input does not compile; no lane unblocks it |
+| splinter/AllocationCrashAwareJournal | compile error | compile error | compile error | no saved bounds → no saved bounds | Campaign Rust input does not compile; no lane unblocks it |
+| splinter/AllocationJournal | compile error | compile error | compile error | no saved bounds → no saved bounds | Campaign Rust input does not compile; no lane unblocks it |
+| splinter/CoordinationSystem | 0 | 0 | 0 | timeout before progress → evaluation/config error | L3 guards/carriers; unchanged config lacks Dom_Key |
+| splinter/CrashTolerantJournal | 0 | 0 | 0 | evaluation/config error → progress; timeout (56 states) | L3 guarded partial reads/casts unblock evaluation; L4 unchanged |
+| splinter/CrashTolerantMap | 0 | 0 | 0 | evaluation/config error → evaluation/config error | L3 guards/carriers; unchanged config lacks Dom_Key |
+| splinter/FilteredBetree | compile error | compile error | compile error | no saved bounds → no saved bounds | Campaign Rust input does not compile; no lane unblocks it |
+| splinter/LikesBetree | compile error | compile error | compile error | no saved bounds → no saved bounds | Campaign Rust input does not compile; no lane unblocks it |
+| splinter/LikesJournal | compile error | compile error | compile error | no saved bounds → no saved bounds | Campaign Rust input does not compile; no lane unblocks it |
+| splinter/LinkedBetreeVars | compile error | compile error | compile error | no saved bounds → no saved bounds | Campaign Rust input does not compile; no lane unblocks it |
+| splinter/LinkedJournal | 0 | 0 | 0 | evaluation/config error → invariant CTI (4 states) | L3 guarded partial reads/casts unblock evaluation; L4 unchanged |
+| splinter/PagedBetree | 0 | 0 | 0 | complete (25 states) → SANY error | L3 regression also present in parent: undefined Defined_substitute; SANY fails |
+| splinter/PagedJournal | 0 | 0 | 0 | complete (12 states) → complete (12 states) | Existing bounded completion preserved |
+| splinter/PivotBetree | 0 | 0 | 0 | complete (25 states) → SANY error | L3 regression also present in parent: undefined Defined_substitute; SANY fails |
+| splinter/UnifiedCrashAwareJournal | compile error | compile error | compile error | no saved bounds → no saved bounds | Campaign Rust input does not compile; no lane unblocks it |
+### Additional campaign adapters and controls
 
-Zero-refusal campaign exports: **0/6 → 1/6**. Completed supplemental bounded
-TLC explorations: **0 → 1**. There are no saved campaign TLC configurations for
-these machines, so an exploration count under the original campaign bounds
-cannot be claimed. Increased refusal counts in Cluster/API come from reaching
-bodies that used to stop at an outer closure refusal, not from deleting checks.
+| Target | Before | L1–3 | After | TLC before → after (campaign bounds) | Lane contribution |
+|---|---:|---:|---:|---|---|
+| anvil/sub_vrs_reconcile | 5 | 0 | 0 | no saved bounds → no saved bounds | L1 dispatch/tables removes refusals; L4 unchanged |
+| nr/UnboundedLog-mono | 1 | 0 | 0 | evaluation/config error → evaluation/config error | L1 table + L3 guarded reads; unchanged config lacks table assignment |
+| nr/CyclicBuffer | 6 | 6 | 6 | no saved bounds → no saved bounds | L1 dispatch/tables; see remaining located refusals |
+| nr/FlatCombiner | 1 | 0 | 0 | complete (418 states) → evaluation/config error | L1 replaces uninterpreted refusal with table; original config lacks Table_arbitrary__tla_closed |
+| nr/RwLockSpec | 0 | 0 | 0 | complete (207 states) → complete (207 states) | Existing bounded completion |
 
-Additional stack checks: nrkernel `hlspec` **4 → 3** refusals, `os` **135 → 134**;
-each now reports the bounded `choose` at `hlspec.rs:80–88`. Neither is counted
-as explored. The remaining constructs are outside this lane's reduction rules.
+### Validation and remaining blockers
 
-At measurement, `origin/kg/export-partial` was `9abf2c0e`, still the common
-starting commit. No new commits from lanes 1–3 had reached this base, so these
-are cumulative counts for the stack actually available, with lane 4's
-contribution identified above; no unlanded sibling work is credited. The base
-is fetched and rebased again before publishing the PR.
+**208 exporter tests passed**, with `TLA2TOOLS_JAR` set. All **28** example/Raft `.tla`/`.cfg` artifacts are byte-identical. The rebase preserves the lower lanes’ tests and both restriction and choice reporting; captured environments in partial-read analysis now use the same immutable `Arc<Env>` representation as closure reduction.
 
-All **28** generated `.tla`/`.cfg` artifacts for the six example fixtures and
-the located toydb safety model are byte-identical. Hashes are in `results.json`.
+Every remaining refusal, including its exact source location and multiplicity, is listed in [BLOCKERS.md](BLOCKERS.md). That file also records compiler, SANY, TLC configuration/evaluation, and timeout failures. The machine-readable report retains each individual refusal. Anvil sub_api_sm now fails SANY on an unbound `kind` in inserted definedness guards (generated APIServerState_tla.tla:33–34), while the parent passed SANY. This integration limitation is explicitly retained as an unresolved failure; its eight refusals also remain. PagedBetree and PivotBetree have a separate zero-refusal SANY failure (`Defined_substitute` is undefined), also reproduced on lane 3. These previously completed in the baseline; the cumulative table records the regressions.
 
-Final validation after rebasing: **177 tests passed, 0 failed**, with
-`TLA2TOOLS_JAR` set. SANY accepted all six campaign modules both before and
-after (12/12). `final-evidence.py` refreshes the campaign, supplemental network
-run, SANY checks and regression hashes after a build. The final base check
-remained at `9abf2c0e`.
+Reproduce with `python3 audit/export-closures/cumulative.py before --original-deps --verus ../base/verus/source/target-verus/release/verus`, then `parent` with the lane-3 binary and `after` with `source/target-verus/release/verus`; run `summarize-cumulative.py` after `regression.py regression-stacked source/target-verus/release/verus`. Raw commands/logs and modules are retained in ignored `cumulative-*` directories. Historical lane-4-only measurements in `results.json` are superseded by `cumulative-results.json`.
+
+## Cumulative campaign after rebase onto `64f1c6e3`
+
+The table measures all 33 requested export targets: Anvil’s five (including both API adapters), IronKV host, nrkernel’s six, NR’s three, and all 18 Splinter attempts. Five additional campaign adapters/controls follow separately. A compiler error or timeout is **not** a zero-refusal export. `Before` uses the original campaign binary; `L1–3` uses the clean lane-3 checkout at `64f1c6e3`; `After` uses the rebased lane-4 binary. Binary hashes and version strings are saved in `cumulative-results.json` (the parent binary embeds its pre-commit dirty version string).
+
+- **before:** 9/33 zero-refusal exports; 9/33 also pass SANY; 3/9 saved-bound TLC runs complete; 3/9 explore without an evaluation error.
+- **parent:** 14/33 zero-refusal exports; 12/33 also pass SANY; 3/9 saved-bound TLC runs complete; 5/9 explore without an evaluation error.
+- **after:** 17/33 zero-refusal exports; 15/33 also pass SANY; 3/9 saved-bound TLC runs complete; 5/9 explore without an evaluation error.
+
+The 5/9 current explorations comprise three completed runs, one invariant counterexample, and one run progressing until timeout. Lane 4 adds three zero-refusal targets over lane 3: Anvil controller, Anvil network, and nrkernel hlspec. Across all 38 primary plus supplemental targets, zero-refusal exports rise 10→21 (SANY-valid: 10→19), explorations 5→6, and completions 5→4.
+
+Original `MC.tla`, `MC.cfg`, and TLC commands/timeouts were replayed unchanged, with their hashes recorded. The other 24 primary targets have no saved campaign bounds; no new constants, table interpretations, adapters, or bounds were invented. Reaching states before a TLC evaluation error does not count as exploration. Lane-3 restrictions and finite carriers remain explicitly reported approximations, so a completed bounded run is not a proof of the unrestricted source.
+
+L1 = traits; L2 = nrkernel bit operations/partial Init; L3 = partial reads/finite carriers; L4 = closure reduction/bounded choose. Intermediate attribution also uses the committed lane reports (`artifacts/nrkernel/report.txt`, `audit/export-partial/REPORT.md`) and the trait lane’s recorded campaign results. More refusals can mean reduction reached previously hidden unsupported expressions.
+
+
+### Requested campaign targets
+
+| Target | Before | L1–3 | After | TLC before → after (campaign bounds) | Lane contribution |
+|---|---:|---:|---:|---|---|
+| anvil/Cluster-adapter | 22 | 22 | 62 | no saved bounds → no saved bounds | L1 trait tables; L4 reduces reachable records, exposing deeper callbacks/choices; still refused |
+| anvil/sub_api | 14 | 8 | 58 | no saved bounds → no saved bounds | L1 trait tables; L3 carriers/guards; L4 action/choice reduction exposes deeper callbacks; still refused |
+| anvil/sub_api_sm | 16 | 15 | 8 | no saved bounds → no saved bounds | L4 reduces helper receivers; choice over closure records remains |
+| anvil/sub_controller | 9 | 9 | 0 | no saved bounds → no saved bounds | L1 trait tables + L4 record/receiver reduction jointly remove all refusals |
+| anvil/sub_network | 2 | 2 | 0 | no saved bounds → no saved bounds | L4 removes both closure refusals |
+| ironkv/host_protocol_t | 6 | 0 | 0 | no saved bounds → no saved bounds | L1 trait tables + L3 total collections already remove all refusals; L4 unchanged |
+| nrkernel/hlspec | 4 | 1 | 0 | no saved bounds → no saved bounds | L1 trait table + L2 bit/Init + L3 carriers + L4 final bounded choose |
+| nrkernel/mmu_rl1 | 95 | 189 | 189 | no saved bounds → no saved bounds | L1/L2 remove trait/bit refusals; L3 definedness expansion limit remains |
+| nrkernel/mmu_rl2 | 108 | timeout | timeout | no saved bounds → no saved bounds | L1/L2 remove trait/bit refusals; L3/L4 export times out |
+| nrkernel/mmu_rl3 | 101 | timeout | timeout | no saved bounds → no saved bounds | L1/L2 remove trait/bit refusals; L3/L4 export times out |
+| nrkernel/os | 135 | timeout | timeout | no saved bounds → no saved bounds | L1/L2 remove trait/bit refusals; L3/L4 export times out |
+| nrkernel/os_ext | 1 | 0 | 0 | no saved bounds → no saved bounds | L2 bit/Init removes final refusal |
+| nr/AsynchronousSingleton | 3 | 0 | 0 | no saved bounds → no saved bounds | L1 concrete dispatch/typed tables |
+| nr/SimpleLog | 4 | 0 | 0 | no saved bounds → no saved bounds | L1 concrete dispatch/typed tables |
+| nr/UnboundedLog | 4 | 0 | 0 | no saved bounds → no saved bounds | L1 concrete dispatch/typed tables; L3 carriers |
+| splinter/AbstractJournal | 0 | 0 | 0 | evaluation/config error → complete (72 states) | L3 guarded partial reads/casts unblock evaluation; L4 unchanged |
+| splinter/AbstractMap | 0 | 0 | 0 | evaluation/config error → complete (3 states) | L3 guarded partial reads/casts unblock evaluation; L4 unchanged |
+| splinter/AllocationBetree | compile error | compile error | compile error | no saved bounds → no saved bounds | Campaign Rust input does not compile; no lane unblocks it |
+| splinter/AllocationBranchBetree | compile error | compile error | compile error | no saved bounds → no saved bounds | Campaign Rust input does not compile; no lane unblocks it |
+| splinter/AllocationCrashAwareJournal | compile error | compile error | compile error | no saved bounds → no saved bounds | Campaign Rust input does not compile; no lane unblocks it |
+| splinter/AllocationJournal | compile error | compile error | compile error | no saved bounds → no saved bounds | Campaign Rust input does not compile; no lane unblocks it |
+| splinter/CoordinationSystem | 0 | 0 | 0 | timeout before progress → evaluation/config error | L3 guards/carriers; unchanged config lacks Dom_Key |
+| splinter/CrashTolerantJournal | 0 | 0 | 0 | evaluation/config error → progress; timeout (56 states) | L3 guarded partial reads/casts unblock evaluation; L4 unchanged |
+| splinter/CrashTolerantMap | 0 | 0 | 0 | evaluation/config error → evaluation/config error | L3 guards/carriers; unchanged config lacks Dom_Key |
+| splinter/FilteredBetree | compile error | compile error | compile error | no saved bounds → no saved bounds | Campaign Rust input does not compile; no lane unblocks it |
+| splinter/LikesBetree | compile error | compile error | compile error | no saved bounds → no saved bounds | Campaign Rust input does not compile; no lane unblocks it |
+| splinter/LikesJournal | compile error | compile error | compile error | no saved bounds → no saved bounds | Campaign Rust input does not compile; no lane unblocks it |
+| splinter/LinkedBetreeVars | compile error | compile error | compile error | no saved bounds → no saved bounds | Campaign Rust input does not compile; no lane unblocks it |
+| splinter/LinkedJournal | 0 | 0 | 0 | evaluation/config error → invariant CTI (4 states) | L3 guarded partial reads/casts unblock evaluation; L4 unchanged |
+| splinter/PagedBetree | 0 | 0 | 0 | complete (25 states) → SANY error | L3 regression also present in parent: undefined Defined_substitute; SANY fails |
+| splinter/PagedJournal | 0 | 0 | 0 | complete (12 states) → complete (12 states) | Existing bounded completion preserved |
+| splinter/PivotBetree | 0 | 0 | 0 | complete (25 states) → SANY error | L3 regression also present in parent: undefined Defined_substitute; SANY fails |
+| splinter/UnifiedCrashAwareJournal | compile error | compile error | compile error | no saved bounds → no saved bounds | Campaign Rust input does not compile; no lane unblocks it |
+
+### Additional campaign adapters and controls
+
+| Target | Before | L1–3 | After | TLC before → after (campaign bounds) | Lane contribution |
+|---|---:|---:|---:|---|---|
+| anvil/sub_vrs_reconcile | 5 | 0 | 0 | no saved bounds → no saved bounds | L1 dispatch/tables removes refusals; L4 unchanged |
+| nr/UnboundedLog-mono | 1 | 0 | 0 | evaluation/config error → evaluation/config error | L1 table + L3 guarded reads; unchanged config lacks table assignment |
+| nr/CyclicBuffer | 6 | 6 | 6 | no saved bounds → no saved bounds | L1 dispatch/tables; see remaining located refusals |
+| nr/FlatCombiner | 1 | 0 | 0 | complete (418 states) → evaluation/config error | L1 replaces uninterpreted refusal with table; original config lacks Table_arbitrary__tla_closed |
+| nr/RwLockSpec | 0 | 0 | 0 | complete (207 states) → complete (207 states) | Existing bounded completion |
+
+### Validation and remaining blockers
+
+**208 exporter tests passed**, with `TLA2TOOLS_JAR` set. All **28** example/Raft `.tla`/`.cfg` artifacts are byte-identical. The rebase preserves the lower lanes’ tests and both restriction and choice reporting; captured environments in partial-read analysis now use the same immutable `Arc<Env>` representation as closure reduction.
+
+Every remaining refusal, including its exact source location and multiplicity, is listed in [BLOCKERS.md](BLOCKERS.md). That file also records compiler, SANY, TLC configuration/evaluation, and timeout failures. The machine-readable report retains each individual refusal. Anvil sub_api_sm now fails SANY on an unbound `kind` in inserted definedness guards (generated APIServerState_tla.tla:33–34), while the parent passed SANY. This integration limitation is explicitly retained as an unresolved failure; its eight refusals also remain. PagedBetree and PivotBetree have a separate zero-refusal SANY failure (`Defined_substitute` is undefined), also reproduced on lane 3. These previously completed in the baseline; the cumulative table records the regressions.
+
+Exporter suite: `export PATH=$HOME/.cargo/bin:$PATH; export TMPDIR=$HOME/tmp; source tools/activate; cd source; TLA2TOOLS_JAR=$HOME/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar timeout 1800 vargo test --release --vstd-no-verify -p rust_verify_test --test tla_export -- --test-threads=4`. Fixture comparison uses the existing `toydb-pr-30/src/raft/safety.rs` because `base/toydb/src/raft/safety.rs` is absent.
+
+Reproduce with `python3 audit/export-closures/cumulative.py before --original-deps --verus ../base/verus/source/target-verus/release/verus`, then `parent` with the lane-3 binary and `after` with `source/target-verus/release/verus`; run `summarize-cumulative.py` after `regression.py regression-stacked source/target-verus/release/verus`. Raw commands/logs and modules are retained in ignored `cumulative-*` directories. Historical lane-4-only measurements in `results.json` are superseded by `cumulative-results.json`.
