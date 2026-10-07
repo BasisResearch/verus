@@ -812,10 +812,11 @@ fn tla_export_checks_a_narrowing_cast_where_it_is_evaluated() {
     assert_eq!(names(&ex.report["skipped_invariants"]), ["wide"]);
     let Some(jar) = tla_tools() else { return };
     sany(&jar, &ex.spec());
-    // 254 and 255 are reached; the step from 255 stops TLC at the cast.
-    let out = tlc_output(&jar, &ex.spec(), &ex.cfg);
-    assert!(out.contains("tla-export: value out of range of u8 in a cast at"), "{}", out);
-    assert!(out.contains("x = 255"), "{}", out);
+    // 254 and 255 are reached; the undefined cast disables the next step.
+    assert!(ex.report["restrictions"].as_array().unwrap().len() > 0);
+    let run = tlc(&jar, &ex.spec(), &ex.cfg);
+    assert_eq!(run.distinct, 2);
+    assert!(run.violated.is_empty());
 }
 
 /// A narrowing cast behind the guard that keeps it in range, the usual
@@ -9908,4 +9909,135 @@ pub open spec fn bounded(s: State) -> bool { s.n <= 1 }
     let run = tlc(&jar, &ex.spec(), &ex.cfg);
     assert_eq!(run.distinct, 2);
     assert!(run.violated.is_empty(), "{:?}", run);
+}
+
+/// Exact parent exports, with only the checkout-dependent source path normalized.
+/// The source model is pinned too, so changes in the external toyDB checkout
+/// cannot silently change the expected exporter behavior.
+#[test]
+fn tla_export_partial_preserves_raft_and_all_example_bytes() {
+    let root = Path::new("tests/tla_export_fixtures/compat");
+    for (name, path) in
+        [("mutex_liveness", fixture("mutex_liveness.rs")), ("toydb", root.join("raft.rs"))]
+    {
+        let ex = export_with(&path, "test_crate", &["--no-verify"]);
+        for suffix in [".tla", ".cfg", "_trace.tla", "_trace.cfg"] {
+            let file = format!("{}{}", ex.module, suffix);
+            let actual = std::fs::read_to_string(ex.dir.path().join("log").join(&file)).unwrap();
+            let actual = actual.replace(path.to_str().unwrap(), "@SOURCE@");
+            let expected = std::fs::read_to_string(root.join(format!("{name}-{file}"))).unwrap();
+            assert_eq!(actual, expected, "{name}: {file}");
+        }
+    }
+}
+
+#[test]
+fn tla_export_partial_cast_before_recursive_definedness() {
+    let ex = export_code_with(
+        r#"
+verus! {
+pub struct State { pub n: nat }
+pub open spec fn history(start: nat, end: nat) -> nat
+    decreases end
+{
+    if start == end { 0 } else {
+        let last = (end - 1) as nat;
+        history(start, last) + 1
+    }
+}
+pub open spec fn init(s: State) -> bool { s.n == 0 }
+pub open spec fn next(pre: State, post: State) -> bool {
+    ||| post.n == history(1, 0)
+    ||| (pre.n == 0 && post.n == 1)
+}
+pub open spec fn bounded(s: State) -> bool { s.n <= 1 }
+}
+"#,
+        "test_crate",
+        &["--no-verify"],
+    );
+    assert!(ex.report["refusals"].as_array().unwrap().is_empty(), "{}", ex.report);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let run = tlc(&jar, &ex.spec(), &ex.cfg);
+    assert_eq!(run.distinct, 2);
+    assert!(run.violated.is_empty());
+}
+
+#[test]
+fn tla_export_partial_shape_fact_is_invalidated_by_a_write() {
+    let ex = export_code_with(
+        r#"
+use vstd::seq::*;
+verus! {
+pub struct State { pub n: nat, pub q: Seq<int>, pub done: bool }
+pub open spec fn init(s: State) -> bool {
+    s.n == 1 && s.q == seq![7int] && s.q.len() == s.n && !s.done
+}
+pub open spec fn next(pre: State, post: State) -> bool {
+    ||| (!pre.done && post == State { n: pre.n, q: Seq::empty(), done: true })
+    ||| (pre.done && 0 < pre.n && pre.q[0] == 7 && post == pre)
+}
+}
+"#,
+        "test_crate",
+        &["--no-verify"],
+    );
+    assert!(!ex.report["restrictions"].as_array().unwrap().is_empty());
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    assert_eq!(tlc(&jar, &ex.spec(), &ex.cfg).distinct, 2);
+}
+
+#[test]
+fn tla_export_partial_lazy_condition_is_checked_at_use() {
+    let ex = export_code_with(
+        r#"
+use vstd::seq::*;
+verus! {
+pub struct State { pub q: Seq<int>, pub n: nat }
+pub open spec fn init(s: State) -> bool { s.q == Seq::empty() && s.n == 0 }
+pub open spec fn next(pre: State, post: State) -> bool {
+    let value = if pre.q[0] == 7 { 1nat } else { 2nat };
+    ||| (pre.q.len() > 0 && post == State { n: value, ..pre })
+    ||| (post == State { n: value, ..pre })
+    ||| (pre.n == 0 && post == State { n: 1, ..pre })
+}
+pub open spec fn bounded(s: State) -> bool { s.n <= 1 }
+}
+"#,
+        "test_crate",
+        &["--no-verify"],
+    );
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let run = tlc(&jar, &ex.spec(), &ex.cfg);
+    assert_eq!(run.distinct, 2);
+    assert!(run.violated.is_empty());
+}
+
+#[test]
+fn tla_export_partial_redundant_later_guard_does_not_reorder() {
+    let ex = export_code(
+        r#"
+use vstd::map::*;
+verus! {
+pub struct State { pub m: Map<int, int> }
+pub open spec fn init(s: State) -> bool { s.m == Map::empty().insert(0, 7) }
+pub open spec fn next(pre: State, post: State) -> bool {
+    pre.m.contains_key(0) && pre.m[0] == 7 && pre.m.contains_key(0) && post == pre
+}
+}
+"#,
+        "test_crate",
+    );
+    assert!(
+        ex.tla.contains("(((0 \\in DOMAIN m) /\\ (m[0] = 7)) /\\ (0 \\in DOMAIN m))"),
+        "{}",
+        ex.tla
+    );
+    assert!(ex.report.get("restrictions").is_none(), "{}", ex.report);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    assert_eq!(tlc(&jar, &ex.spec(), &ex.cfg).distinct, 1);
 }

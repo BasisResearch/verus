@@ -120,13 +120,13 @@
   "partial_after": {
     "binary": "/data/home/kirancodes/Documents/code/verus-research/wt-export-partial/source/target-verus/release/verus",
     "group": "partial",
-    "phase": "final-after",
+    "phase": "acceptance-after",
     "export_seconds": 90,
     "tlc_seconds": 30,
     "jobs": 1,
     "sha256": {
       "verus": "5ffa1cb2b1e0df2bbed030d98414f20640f9c0613551a62be858ad320bf87a2a",
-      "rust_verify": "902d25042eb005d4c4bd3a39119d055055b8040c44b1eeb22cad3d6a46ec56a6"
+      "rust_verify": "00249f193739131885503cf8dead48ee0527cc09e5784c7108a69db95776d06c"
     },
     "rows": [
       {
@@ -135,7 +135,7 @@
         "status": "tlc_error",
         "refusals": 0,
         "holes": 42,
-        "restrictions": 31,
+        "restrictions": 13,
         "reasons": [],
         "tlc_rc": 151,
         "errors": [
@@ -158,19 +158,15 @@
       {
         "id": "splinter/AbstractMap",
         "export_rc": 0,
-        "status": "tlc_error",
+        "status": "complete",
         "refusals": 0,
         "holes": 10,
         "restrictions": 7,
         "reasons": [],
-        "tlc_rc": 14,
-        "generated": 15,
+        "tlc_rc": 0,
+        "generated": 33,
         "distinct": 3,
-        "errors": [
-          "Error: The first argument of Assert evaluated to FALSE; the second argument was:",
-          "Error: The behavior up to this point is:",
-          "Error: The error occurred when TLC was evaluating the nested"
-        ]
+        "errors": []
       },
       {
         "id": "splinter/CrashTolerantJournal",
@@ -181,8 +177,8 @@
         "restrictions": 24,
         "reasons": [],
         "tlc_rc": 124,
-        "generated": 303,
-        "distinct": 35,
+        "generated": 240,
+        "distinct": 29,
         "errors": []
       },
       {
@@ -328,13 +324,13 @@
   "collections_after": {
     "binary": "/data/home/kirancodes/Documents/code/verus-research/wt-export-partial/source/target-verus/release/verus",
     "group": "collections",
-    "phase": "final-collections-after",
+    "phase": "acceptance-collections",
     "export_seconds": 90,
     "tlc_seconds": 30,
     "jobs": 3,
     "sha256": {
       "verus": "5ffa1cb2b1e0df2bbed030d98414f20640f9c0613551a62be858ad320bf87a2a",
-      "rust_verify": "902d25042eb005d4c4bd3a39119d055055b8040c44b1eeb22cad3d6a46ec56a6"
+      "rust_verify": "00249f193739131885503cf8dead48ee0527cc09e5784c7108a69db95776d06c"
     },
     "rows": [
       {
@@ -343,7 +339,7 @@
         "status": "exported",
         "refusals": 0,
         "holes": 41,
-        "restrictions": 32,
+        "restrictions": 11,
         "reasons": []
       },
       {
@@ -357,7 +353,7 @@
         "status": "exported",
         "refusals": 0,
         "holes": 101,
-        "restrictions": 58,
+        "restrictions": 51,
         "reasons": []
       },
       {
@@ -484,13 +480,13 @@
   "fixture_after": {
     "binary": "/data/home/kirancodes/Documents/code/verus-research/wt-export-partial/source/target-verus/release/verus",
     "group": "fixtures",
-    "phase": "final-fixtures",
+    "phase": "acceptance-fixtures",
     "export_seconds": 90,
     "tlc_seconds": 30,
     "jobs": 1,
     "sha256": {
       "verus": "5ffa1cb2b1e0df2bbed030d98414f20640f9c0613551a62be858ad320bf87a2a",
-      "rust_verify": "902d25042eb005d4c4bd3a39119d055055b8040c44b1eeb22cad3d6a46ec56a6"
+      "rust_verify": "00249f193739131885503cf8dead48ee0527cc09e5784c7108a69db95776d06c"
     },
     "rows": [
       {
@@ -526,7 +522,7 @@
         "status": "exported",
         "refusals": 0,
         "holes": 0,
-        "restrictions": 2,
+        "restrictions": 0,
         "reasons": []
       },
       {
@@ -553,7 +549,7 @@
         "status": "exported",
         "refusals": 0,
         "holes": 3,
-        "restrictions": 75,
+        "restrictions": 0,
         "reasons": []
       }
     ]
@@ -653,9 +649,9 @@
     {
       "input": "mutex_liveness",
       "file": "ProgramState_tla.tla",
-      "equal": false,
+      "equal": true,
       "parent_sha256": "9e27c19574876bbd23c17b346401f9dee0f4afe39538338b4ecaafeb3e9eca46",
-      "after_sha256": "7db97c182b11cdd3422066662ce7f0be2277990fb2ce4642841172f15eb8517b"
+      "after_sha256": "9e27c19574876bbd23c17b346401f9dee0f4afe39538338b4ecaafeb3e9eca46"
     },
     {
       "input": "mutex_liveness",
@@ -737,9 +733,9 @@
     {
       "input": "toydb",
       "file": "GState_tla.tla",
-      "equal": false,
+      "equal": true,
       "parent_sha256": "c573df8522483f57f208d0bb3972e8b04249592620fc0f171a1a9b9d39ca6ee8",
-      "after_sha256": "e2739b543c6663313d0963052d6870c2f0d6f5c7daa68ce668db6f62b152496f"
+      "after_sha256": "c573df8522483f57f208d0bb3972e8b04249592620fc0f171a1a9b9d39ca6ee8"
     },
     {
       "input": "toydb",
@@ -831,8 +827,13 @@
     }
   ],
   "tests": {
-    "result": "test result: ok. 199 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 68.64s",
+    "result": "test result: ok. 204 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 83.81s",
     "TLA2TOOLS_JAR": "/Users/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar",
-    "log_sha256": "424b4d40cdd91c67f5998c5076afe94a602b2e1c0d24efc2b3dece19f6891ca3"
+    "log_sha256": "5b394f9c9de414a0df0353c57b653d51f0e1f0e29ec338b28b3dff82ee2216f4"
+  },
+  "regression_source_sha256": {
+    "source/vir/src/tla.rs": "7b81ac45a3b5f7e59521f282614c1d73bee3b7716c771f6376516317699461b0",
+    "source/rust_verify_test/tests/tla_export.rs": "c74c5c65dd2a83feac2ef2b3001b6b3ea503a946565e90a816ddcb4ab51f9f01",
+    "source/rust_verify_test/tests/tla_export_fixtures/compat/raft.rs": "2f0e5792394f381c78d94410d6a01a37ead06309e1abcec20e9e66b437e4f7cd"
   }
 }

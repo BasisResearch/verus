@@ -713,6 +713,196 @@ impl Env {
     }
 }
 
+/// Small, bounded linear-integer implication checker for sequence bounds.
+/// Atoms are the already hygienic printed values. Unsupported arithmetic is
+/// an uninterpreted atom; resource limits return unknown, never success.
+#[derive(Clone, Default)]
+struct BoundLinear {
+    terms: BTreeMap<String, i128>,
+    constant: i128,
+}
+
+fn unparen(mut s: &str) -> &str {
+    loop {
+        if !s.starts_with('(') || !s.ends_with(')') {
+            return s;
+        }
+        let mut depth = 0;
+        let mut whole = true;
+        for (i, c) in s.char_indices() {
+            if c == '(' {
+                depth += 1;
+            }
+            if c == ')' {
+                depth -= 1;
+            }
+            if depth == 0 && i + 1 != s.len() {
+                whole = false;
+                break;
+            }
+        }
+        if !whole {
+            return s;
+        }
+        s = &s[1..s.len() - 1];
+    }
+}
+
+fn split_bound<'a>(s: &'a str, needle: &str) -> Option<(&'a str, &'a str)> {
+    let mut depth = 0;
+    for (i, c) in s.char_indices() {
+        if depth == 0 && s[i..].starts_with(needle) {
+            return Some((&s[..i], &s[i + needle.len()..]));
+        }
+        match c {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth -= 1,
+            _ => {}
+        }
+    }
+    None
+}
+
+impl BoundLinear {
+    fn add(&self, b: &Self, factor: i128) -> Option<Self> {
+        let mut out = self.clone();
+        out.constant = out.constant.checked_add(b.constant.checked_mul(factor)?)?;
+        for (v, c) in &b.terms {
+            let x = out.terms.entry(v.clone()).or_default();
+            *x = x.checked_add(c.checked_mul(factor)?)?;
+        }
+        out.terms.retain(|_, c| *c != 0);
+        Some(out)
+    }
+    fn scale(&self, factor: i128) -> Option<Self> {
+        Self::default().add(self, factor)
+    }
+    fn parse(s: &str) -> Option<Self> {
+        let s = unparen(s.trim());
+        for (op, factor) in [(" + ", 1), (" - ", -1)] {
+            if let Some((a, b)) = split_bound(s, op) {
+                return Self::parse(a)?.add(&Self::parse(b)?, factor);
+            }
+        }
+        if let Ok(n) = s.parse::<i128>() {
+            return Some(Self { constant: n, ..Self::default() });
+        }
+        Some(Self { terms: BTreeMap::from([(s.to_owned(), 1)]), constant: 0 })
+    }
+    fn facts(s: &str, out: &mut Vec<Self>) -> Option<()> {
+        let s = unparen(s);
+        if let Some((a, b)) = split_bound(s, " /\\ ") {
+            Self::facts(a, out)?;
+            Self::facts(b, out)?;
+            return Some(());
+        }
+        // Lengths are nonnegative, so a nonzero length is strictly positive.
+        if let Some(s) = s.strip_prefix('~') {
+            if let Some((a, "0")) = split_bound(unparen(s), " = ") {
+                if a.starts_with("Len(") {
+                    out.push(Self::parse("1")?.add(&Self::parse(a)?, -1)?);
+                }
+            }
+            return Some(());
+        }
+        for op in [" <= ", " >= ", " < ", " > ", " = "] {
+            if let Some((a, b)) = split_bound(s, op) {
+                let (a, b) = if op == " >= " || op == " > " { (b, a) } else { (a, b) };
+                let mut difference = Self::parse(a)?.add(&Self::parse(b)?, -1)?;
+                if op == " < " || op == " > " {
+                    difference.constant = difference.constant.checked_add(1)?;
+                }
+                if op == " = " {
+                    out.push(difference.scale(-1)?);
+                }
+                out.push(difference);
+                return Some(());
+            }
+        }
+        Some(())
+    }
+    fn predicate_implied(facts: &[String], predicate: &str) -> bool {
+        let p = unparen(predicate);
+        if let Some((a, b)) = split_bound(p, " /\\ ") {
+            return Self::predicate_implied(facts, a) && Self::predicate_implied(facts, b);
+        }
+        for op in [" <= ", " >= "] {
+            if let Some((a, b)) = split_bound(p, op) {
+                return if op == " <= " {
+                    Self::implied(facts, a, b)
+                } else {
+                    Self::implied(facts, b, a)
+                };
+            }
+        }
+        false
+    }
+
+    fn implied(facts: &[String], a: &str, b: &str) -> bool {
+        Self::try_implied(facts, a, b).unwrap_or(false)
+    }
+    fn try_implied(facts: &[String], a: &str, b: &str) -> Option<bool> {
+        let mut rows = vec![];
+        for f in facts {
+            Self::facts(f, &mut rows)?;
+        }
+        for f in facts {
+            if let Some(f) = unparen(f).strip_prefix('~') {
+                if let Some((a, "0")) = split_bound(unparen(f), " = ") {
+                    let negative = Self::parse(a)?.scale(-1)?;
+                    if rows
+                        .iter()
+                        .any(|r| r.terms == negative.terms && r.constant == negative.constant)
+                    {
+                        let mut positive = negative;
+                        positive.constant = positive.constant.checked_add(1)?;
+                        rows.push(positive);
+                    }
+                }
+            }
+        }
+        // Negate a <= b over integers: b - a + 1 <= 0.
+        let mut neg = Self::parse(b)?.add(&Self::parse(a)?, -1)?;
+        neg.constant = neg.constant.checked_add(1)?;
+        rows.push(neg);
+        let lengths: BTreeSet<_> = rows
+            .iter()
+            .flat_map(|r| r.terms.keys())
+            .filter(|s| s.starts_with("Len("))
+            .cloned()
+            .collect();
+        for s in lengths {
+            rows.push(Self::parse(&s)?.scale(-1)?);
+        }
+        loop {
+            if rows.iter().any(|r| r.terms.is_empty() && r.constant > 0) {
+                return Some(true);
+            }
+            let vars: BTreeSet<_> = rows.iter().flat_map(|r| r.terms.keys().cloned()).collect();
+            let Some(v) = vars.into_iter().min_by_key(|v| {
+                rows.iter().filter(|r| r.terms.get(v).is_some_and(|c| *c > 0)).count()
+                    * rows.iter().filter(|r| r.terms.get(v).is_some_and(|c| *c < 0)).count()
+            }) else {
+                return Some(false);
+            };
+            let (pos, neg): (Vec<_>, Vec<_>) = rows
+                .iter()
+                .filter(|r| r.terms.contains_key(&v))
+                .cloned()
+                .partition(|r| r.terms[&v] > 0);
+            rows.retain(|r| !r.terms.contains_key(&v));
+            if rows.len() + pos.len() * neg.len() > 256 {
+                return None;
+            }
+            for p in &pos {
+                for n in &neg {
+                    rows.push(p.scale(n.terms[&v].checked_neg()?)?.add(&n.scale(p.terms[&v])?, 1)?);
+                }
+            }
+        }
+    }
+}
+
 #[derive(Clone)]
 struct Exporter {
     word_bits: ArchWordBits,
@@ -840,6 +1030,10 @@ struct Exporter {
     carrier_assumes: BTreeMap<String, String>,
     in_safety: bool,
     predicate_depth: usize,
+    partial_actions: bool,
+    init_lengths: Vec<(String, String)>,
+    shape_writes: BTreeMap<String, bool>,
+    stable_lengths: Vec<String>,
     safety_facts: Vec<String>,
     defined_functions: HashMap<Fun, String>,
     /// The 0-ary functions standing for the model's constants (see
@@ -1637,7 +1831,8 @@ impl Exporter {
         if !conjunctive(e) && !self.assert_implication(e) {
             self.conj_level = false;
         }
-        let atomic = !self.in_safety
+        let atomic = self.partial_actions
+            && !self.in_safety
             && self.predicate_depth == 0
             && matches!(&*e.typ, TypX::Bool)
             && !matches!(
@@ -1699,6 +1894,21 @@ impl Exporter {
                     out.push((format!("({b}.tag = \"{}\")", f.variant), e.clone()));
                 }
             }
+            ExprX::Unary(UnaryOp::Clip { range, .. }, a)
+                if !int_typ_within(&a.typ, range) && !matches!(range, IntRange::Int) =>
+            {
+                out.extend(self.read_requirements(a, env, depth + 1));
+                let value = self.safety_value(a, env);
+                if let Some(pred) = int_range_pred(&value, range) {
+                    let saved = self.safety_facts.len();
+                    self.numeric_facts(a, env);
+                    let total = BoundLinear::predicate_implied(&self.safety_facts, &pred);
+                    self.safety_facts.truncate(saved);
+                    if !total {
+                        out.push((pred, e.clone()));
+                    }
+                }
+            }
             ExprX::Unary(_, a) | ExprX::UnaryOpr(_, a) => {
                 out.extend(self.read_requirements(a, env, depth + 1))
             }
@@ -1723,6 +1933,11 @@ impl Exporter {
                 let op = vstd_op(&fun_as_friendly_rust_name(fun));
                 match op {
                     Some("map_index" | "seq_index") if args.len() == 2 => {
+                        if op == Some("seq_index")
+                            && self.sequence_read_is_total(&args[0], &args[1], env)
+                        {
+                            return out;
+                        }
                         let m = self.safety_value(&args[0], env);
                         let k = self.safety_value(&args[1], env);
                         let k = if op == Some("seq_index") { format!("({k}) + 1") } else { k };
@@ -1815,8 +2030,14 @@ impl Exporter {
             }
             ExprX::If(c, t, Some(f)) => {
                 out.extend(self.read_requirements(c, env, depth + 1));
+                let saved = self.safety_facts.len();
+                self.add_guard_fact(c, env);
                 let yes = self.read_requirements(t, env, depth + 1);
+                self.safety_facts.truncate(saved);
+                let cond = self.safety_value(c, env);
+                self.safety_facts.push(format!("~({cond})"));
                 let no = self.read_requirements(f, env, depth + 1);
+                self.safety_facts.truncate(saved);
                 if !yes.is_empty() || !no.is_empty() {
                     let c = self.safety_value(c, env);
                     out.push((
@@ -1992,6 +2213,58 @@ impl Exporter {
         value
     }
 
+    fn add_guard_fact(&mut self, e: &Expr, env: &Env) {
+        if let ExprX::Logical(LogicalOp::And, a, b) = &peel(e).x {
+            self.add_guard_fact(a, env);
+            self.add_guard_fact(b, env);
+            return;
+        }
+        let fact = self.guard_fact(e, env);
+        let numeric = matches!(
+            &peel(e).x,
+            ExprX::Binary(BinaryOp::Inequality(_), _, _) | ExprX::Multi(MultiOp::Chained(_), _)
+        );
+        // Opaque predicate/action calls do not add linear facts. Rendering
+        // them speculatively would repeatedly expand the entire call graph.
+        if fact.is_some() || numeric {
+            let printed = self.safety_value(e, env);
+            self.safety_facts.push(printed);
+            if let Some(fact) = fact {
+                self.safety_facts.push(fact);
+            }
+        }
+    }
+
+    fn numeric_facts(&mut self, e: &Expr, env: &Env) {
+        if int_typ_within(&e.typ, &IntRange::Nat) {
+            let s = self.safety_value(e, env);
+            self.safety_facts.push(format!("({s} >= 0)"));
+        }
+        match &peel(e).x {
+            ExprX::Binary(_, a, b) => {
+                self.numeric_facts(a, env);
+                self.numeric_facts(b, env);
+            }
+            ExprX::Unary(_, a) | ExprX::UnaryOpr(_, a) => self.numeric_facts(a, env),
+            _ => {}
+        }
+    }
+
+    fn sequence_read_is_total(&mut self, seq: &Expr, index: &Expr, env: &Env) -> bool {
+        let saved = self.safety_facts.len();
+        self.numeric_facts(index, env);
+        let seq = self.safety_value(seq, env);
+        let i = self.safety_value(index, env);
+        let total = BoundLinear::implied(&self.safety_facts, "0", &i)
+            && BoundLinear::implied(
+                &self.safety_facts,
+                &format!("({i}) + 1"),
+                &format!("Len({seq})"),
+            );
+        self.safety_facts.truncate(saved);
+        total
+    }
+
     fn guard_fact(&mut self, e: &Expr, env: &Env) -> Option<String> {
         let e = peel(e);
         // A zero-based sequence bound is the same domain check as the
@@ -2037,7 +2310,10 @@ impl Exporter {
             }
         }
         let simple = match &e.x {
-            ExprX::Binary(BinaryOp::Eq(_) | BinaryOp::Inequality(InequalityOp::Le), _, _) => true,
+            ExprX::Binary(BinaryOp::Eq(_), a, b) => {
+                matches!(&*a.typ, TypX::Int(_)) && matches!(&*b.typ, TypX::Int(_))
+            }
+            ExprX::Binary(BinaryOp::Inequality(InequalityOp::Le), _, _) => true,
             ExprX::UnaryOpr(UnaryOpr::IsVariant { .. }, _) => true,
             ExprX::Call { target: CallTarget::Fun(_, f, ..), args, .. } => {
                 matches!(
@@ -2059,25 +2335,32 @@ impl Exporter {
         if self.in_init {
             return None;
         }
+        let saved = self.safety_facts.len();
         for i in 0..cs.len() {
             if !(i + 1..cs.len())
                 .any(|j| !env.reads_post(&cs[j]) && self.guard_fact(&cs[j], env).is_some())
             {
+                self.add_guard_fact(&cs[i], env);
                 continue;
             }
             let requirements = self.clone().read_requirements(&cs[i], env, 0);
-            if let Some(j) = (i + 1..cs.len()).find(|&j| {
-                !env.reads_post(&cs[j])
-                    && !self.in_init
-                    && self
-                        .guard_fact(&cs[j], env)
-                        .is_some_and(|f| requirements.iter().any(|(g, _)| *g == f))
-            }) {
-                let guard = cs.remove(j);
-                cs.insert(i, guard);
-                changed = true;
+            let missing: Vec<_> =
+                requirements.into_iter().filter(|(g, _)| !self.safety_facts.contains(g)).collect();
+            if !missing.is_empty() {
+                if let Some(j) = (i + 1..cs.len()).find(|&j| {
+                    !env.reads_post(&cs[j])
+                        && self
+                            .guard_fact(&cs[j], env)
+                            .is_some_and(|f| missing.iter().any(|(g, _)| *g == f))
+                }) {
+                    let guard = cs.remove(j);
+                    cs.insert(i, guard);
+                    changed = true;
+                }
             }
+            self.add_guard_fact(&cs[i], env);
         }
+        self.safety_facts.truncate(saved);
         if !changed {
             return None;
         }
@@ -2085,9 +2368,7 @@ impl Exporter {
         let mut printed = Vec::new();
         for c in cs {
             printed.push(self.expr(&c, env));
-            if let Some(fact) = self.guard_fact(&c, env) {
-                self.safety_facts.push(fact);
-            }
+            self.add_guard_fact(&c, env);
         }
         self.safety_facts.truncate(old);
         Some(format!("({})", printed.join(" /\\ ")))
@@ -2300,10 +2581,63 @@ impl Exporter {
     /// At conjunct level, the variables `a = b` assigns: every variable when
     /// one side is the whole post state, else the primed field [`Exporter::orient`]
     /// puts on the left.
+    // A shape fact is usable in actions only if Init establishes it and every
+    // assignment in Next preserves both fields. Unknown writes invalidate it.
+    fn shape_origin(&self, e: &Expr, env: &Env) -> Option<String> {
+        if let Some(v) = self.role_field(e, env, Role::Pre) {
+            return Some(v);
+        }
+        if let Some((_, f, args)) = called(&peel(e)) {
+            if vstd_op(&fun_as_friendly_rust_name(&f)) == Some("seq_update") {
+                return self.shape_origin(&args[0], env);
+            }
+        }
+        None
+    }
+
+    fn record_shape_assignment(&mut self, a: &Expr, b: &Expr, env: &Env) {
+        if self.in_init && self.branch_depth == 0 {
+            if let Some((_, f, args)) = called(&peel(a)) {
+                if vstd_op(&fun_as_friendly_rust_name(&f)) == Some("seq_len") {
+                    if let (Some(seq), Some(len)) = (
+                        self.role_field(&args[0], env, Role::Pre),
+                        self.role_field(b, env, Role::Pre),
+                    ) {
+                        self.init_lengths.push((seq, len));
+                    }
+                }
+            }
+        }
+        if let Some(v) = self.role_field(a, env, Role::Post) {
+            let preserves = self.shape_origin(b, env).as_ref() == Some(&v);
+            *self.shape_writes.entry(v).or_insert(true) &= preserves;
+        }
+        if read_var(a).and_then(|v| env.roles.get(&v).copied()) == Some(Role::Post) {
+            if read_var(b).and_then(|v| env.roles.get(&v).copied()) == Some(Role::Pre) {
+                return;
+            }
+            // Whole-state constructors are checked field by field; unrecognized
+            // whole-state values conservatively invalidate every shape fact.
+            for (field, var) in self.state_pairs() {
+                let preserves = if let ExprX::Ctor(_, _, fields, _) = &peel(b).x {
+                    fields
+                        .iter()
+                        .find(|f| field_name(&f.name) == field)
+                        .is_some_and(|f| self.shape_origin(&f.a, env).as_ref() == Some(&var))
+                } else {
+                    false
+                };
+                *self.shape_writes.entry(var).or_insert(true) &= preserves;
+            }
+        }
+    }
+
     fn note_assignment(&mut self, a: &Expr, b: &Expr, env: &Env) {
         if !self.conj_level {
             return;
         }
+        self.record_shape_assignment(a, b, env);
+        self.record_shape_assignment(b, a, env);
         let whole = |x: &Expr, role: Role| {
             read_var(x).and_then(|v| env.roles.get(&v).copied()) == Some(role)
         };
@@ -2468,13 +2802,17 @@ impl Exporter {
                 if !self.in_init && !env.reads_post(a) && !env.reads_post(b) =>
             {
                 let sa = self.quiet(|x| x.expr(a, env));
+                let saved = self.safety_facts.len();
+                let guard = self.safety_value(a, env);
+                self.safety_facts.push(format!("~({guard})"));
                 let sb = self.quiet(|x| x.expr(b, env));
+                self.safety_facts.truncate(saved);
                 format!("(IF {sa} THEN TRUE ELSE {sb})")
             }
             ExprX::Logical(op, a, b) => {
                 let (sa, sb) = match op {
                     LogicalOp::And => {
-                        if !self.in_safety {
+                        if self.partial_actions && !self.in_safety {
                             if let Some(s) = self.ordered_conjunction(e, env) {
                                 return s;
                             }
@@ -2483,9 +2821,7 @@ impl Exporter {
                         let n = self.safety_facts.len();
                         if !self.in_safety {
                             for c in conjuncts(a) {
-                                if let Some(fact) = self.guard_fact(&c, env) {
-                                    self.safety_facts.push(fact);
-                                }
+                                self.add_guard_fact(&c, env);
                             }
                         }
                         let sb = self.expr(b, env);
@@ -2508,9 +2844,7 @@ impl Exporter {
                         let sa = self.quiet(|x| x.expr(a, env));
                         let n = self.safety_facts.len();
                         for c in conjuncts(a) {
-                            if let Some(fact) = self.guard_fact(&c, env) {
-                                self.safety_facts.push(fact);
-                            }
+                            self.add_guard_fact(&c, env);
                         }
                         let (sb, assigned) = self.branch_expr(b, env);
                         self.safety_facts.truncate(n);
@@ -2571,11 +2905,17 @@ impl Exporter {
             ExprX::WithTriggers { body, .. } => self.expr(body, env),
             ExprX::If(c, t, f) => {
                 let sc = self.quiet(|x| x.expr(c, env));
+                let saved = self.safety_facts.len();
+                self.add_guard_fact(c, env);
                 let (st, at) = self.branch_expr(t, env);
+                self.safety_facts.truncate(saved);
+                let guard = self.safety_value(c, env);
+                self.safety_facts.push(format!("~({guard})"));
                 let (sf, af) = match f {
                     Some(f) => self.branch_expr(f, env),
                     None => ("TRUE".into(), BTreeSet::new()),
                 };
+                self.safety_facts.truncate(saved);
                 self.meet(vec![at, af]);
                 format!("(IF {sc} THEN {st} ELSE {sf})")
             }
@@ -2983,7 +3323,12 @@ impl Exporter {
                         }
                         // The value is read in the scope before the binding,
                         // so `let x = x + 1` reads the outer `x`.
+                        // LET is lazy in TLC. Check definedness where the
+                        // binding is consumed, under that use site's guards;
+                        // a boolean inside its value is not an action conjunct.
+                        self.predicate_depth += 1;
                         let value = self.quiet(|x| x.place(init, &env2));
+                        self.predicate_depth -= 1;
                         let before = env2.clone();
                         let n = self.bind_var(&mut env2, name);
                         if symbolic.is_none() {
@@ -6001,7 +6346,10 @@ impl Exporter {
         let previous_key = std::mem::replace(&mut self.current_key, Some(key.clone()));
         let previous_predicate_depth = std::mem::replace(&mut self.predicate_depth, 0);
         let previous_safety = std::mem::replace(&mut self.in_safety, false);
-        let previous_facts = std::mem::take(&mut self.safety_facts);
+        let previous_facts = std::mem::replace(
+            &mut self.safety_facts,
+            if self.in_init { vec![] } else { self.stable_lengths.clone() },
+        );
         let previous_bound = std::mem::take(&mut self.bound);
         let previous_tainted = std::mem::replace(&mut self.current_tainted, false);
         let previous_depth = std::mem::replace(&mut self.branch_depth, 0);
@@ -7849,7 +8197,10 @@ impl Exporter {
         let previous_key = std::mem::replace(&mut self.current_key, Some(key.clone()));
         let previous_predicate_depth = std::mem::replace(&mut self.predicate_depth, 0);
         let previous_safety = std::mem::replace(&mut self.in_safety, false);
-        let previous_facts = std::mem::take(&mut self.safety_facts);
+        let previous_facts = std::mem::replace(
+            &mut self.safety_facts,
+            if self.in_init { vec![] } else { self.stable_lengths.clone() },
+        );
         let previous_bound = std::mem::take(&mut self.bound);
         let previous_tainted = std::mem::replace(&mut self.current_tainted, false);
         let previous_depth = std::mem::replace(&mut self.branch_depth, 0);
@@ -9714,6 +10065,10 @@ pub fn export_module(
         carrier_assumes: BTreeMap::new(),
         in_safety: false,
         predicate_depth: 0,
+        partial_actions: true,
+        init_lengths: Vec::new(),
+        shape_writes: BTreeMap::new(),
+        stable_lengths: Vec::new(),
         safety_facts: Vec::new(),
         defined_functions: HashMap::new(),
         constant_ops: HashMap::new(),
@@ -9809,6 +10164,7 @@ pub fn export_module(
             ex.pre_assigned.clear();
             ex.conj_level = true;
             ex.in_init = i == 0;
+            ex.partial_actions = i < 2;
             let body = match &f.x.body {
                 Some(b) => match &peel(b).x {
                     ExprX::Closure(params, body) => {
@@ -9847,11 +10203,28 @@ pub fn export_module(
         ex.in_init = true;
         init_name = ex.ensure_function(&(triple.init.clone(), Variant::Plain, false));
         ex.in_init = false;
+        if !ex.init_lengths.is_empty() {
+            let mut probe = ex.clone();
+            probe.partial_actions = false;
+            probe.shape_writes.clear();
+            let key = (triple.next.clone(), Variant::Plain, false);
+            probe.ensure_function(&key);
+            if let Some(assigned) = probe.assigned.get(&key) {
+                for (seq, len) in &ex.init_lengths {
+                    if [seq, len].iter().all(|v| {
+                        assigned.contains(*v) && probe.shape_writes.get(*v).copied().unwrap_or(true)
+                    }) {
+                        ex.stable_lengths.push(format!("({len} = Len({seq}))"));
+                    }
+                }
+            }
+        }
         next_name = ex.ensure_function(&(triple.next.clone(), Variant::Plain, false));
         // A predicate init or next reads, unprimed or primed, is a guard or helper of
         // the transition, not an invariant, unless the command line names
         // it; it is reported as excluded, never dropped silently.
         transition_keys = ex.emitted.clone();
+        ex.partial_actions = false;
         for r in &selected {
             // Read primed (`p(post)` in next), or given a state value, is a
             // guard too.
@@ -9867,6 +10240,7 @@ pub fn export_module(
             invs.push((r.clone(), name, ex.tainted.contains(&key)));
         }
     }
+    ex.partial_actions = false;
     let transitions = ex.transitions(&(triple.next.clone(), Variant::Plain, false));
     let (init_unassigned, mut init_fields_unassigned) =
         match ex.functions.get(&triple.init).and_then(|f| f.x.body.clone()) {

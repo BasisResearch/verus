@@ -1,6 +1,6 @@
 # Partial reads and finite carriers — lane 3
 
-**Draft: the full acceptance contract is not met.** The exporter tests pass and the six-machine replay improves, but the main TLA modules for `mutex_liveness.rs` and toyDB's `safety.rs` are not byte-identical to the parent branch. Their configurations and trace modules are unchanged. These differences are added definedness checks, not merely formatting. The PR must remain a draft until this compatibility requirement is resolved.
+The six examples and toyDB Raft safety model re-export **byte-identically in all 28 `.tla`/`.cfg` files** against the parent lane. AbstractMap completes its unchanged bounded TLC run without the former cast assertion. The implementation is ready for review.
 
 The branch is stacked on `kg/export-nrkernel`, currently `6fc818cad8e20a29dc50432c8b8a7b0a49b91253`. Both that lane's implementation and tests were retained during the rebase. No campaign source, adapter, constraint, or constant assignment was changed.
 
@@ -34,6 +34,18 @@ Carrier-relative finiteness and totality are approximations, not statements abou
 
 Analysis rendering uses an isolated exporter snapshot so it cannot duplicate holes/refusals or alter assignment bookkeeping. Returned local expressions reserve their bound names before an enclosing destructuring binding is named. Recursive helper checks and captured `let` values preserve their lexical scopes. Unresolved type parameters and analysis expansion limits remain source-located refusals.
 
+## Compatibility and cast fixes
+
+The byte differences were inserted definedness wrappers, not finite carriers or a necessary change in conjunct order. The first implementation confused any boolean subexpression with an action predicate, including a boolean condition inside a lazy `LET` value and a predicate used only by an invariant/temporal property. It also forgot sufficient source bounds when analyzing a helper or a captured binding.
+
+The action-disabling transformation is now scoped to Init/Next and their helpers. It does not rewrite separately exported assertions or temporal properties. LET initializers are rendered as values; their partial reads are analyzed when the binding is consumed, under the guards at that use. Conditional branches retain their conditions during definedness analysis. A bounded linear-integer implication check recognizes chained/transitive sequence bounds, shifted indices, and nonempty last-element reads; unsupported arithmetic and resource limits yield unknown. A model-wide length fact is used only when Init establishes it and every Next assignment preserves both participating fields. Unknown writes invalidate the fact. The analysis does not assume user invariants to prove those facts.
+
+Conjunction ordering now tracks preceding source guards and moves a later guard only for a still-undefined read. A regression pins the original grouping when an earlier guard already protects a read and a redundant guard appears later.
+
+AbstractMap's recursive helper formed `(seq_end - 1) as nat` before reading its map. The original partial-read analyzer recursed through the cast without recording its range requirement, so its own `Defined_...` operator could trigger the legacy cast assertion. Narrowing casts now contribute a range requirement before any dependent projection or recursive call. Proven in-range casts require no new wrapper; undefined casts disable the enclosing action and are reported with the other restrictions.
+
+The compatibility test pins the complete Raft source and all four parent artifacts for all seven inputs. The parent binary generated these portable golden files under the same crate name as the test harness; only checkout-dependent source paths are normalized; the external before/after re-export comparison uses identical paths and compares raw bytes.
+
 ## Six-machine acceptance replay
 
 The committed `measurements.json` records the final counts and binary hashes. `replay.py` reconstructs each export from the saved campaign command and copies the original `MC.tla` and `MC.cfg` without changing their bounds. Every export is bounded by 90 seconds; every TLC invocation uses the campaign's one worker, 1 GiB heap, and 30-second limit.
@@ -44,20 +56,20 @@ Here “usable TLC run” means completion, an invariant counterexample, or cont
 | --- | --- | --- | --- |
 | nr/UnboundedLog-mono | 1 → 0 | evaluation/configuration error → evaluation/configuration error | 70 → — |
 | splinter/AbstractJournal | 0 → 0 | evaluation/configuration error → complete | 27 → 72 |
-| splinter/AbstractMap | 0 → 0 | evaluation/configuration error → evaluation/configuration error | 3 → 3 |
-| splinter/CrashTolerantJournal | 0 → 0 | evaluation/configuration error → exploring at 30 s | 26 → 35 |
+| splinter/AbstractMap | 0 → 0 | evaluation/configuration error → complete | 3 → 3 |
+| splinter/CrashTolerantJournal | 0 → 0 | evaluation/configuration error → exploring at 30 s | 26 → 29 |
 | splinter/CrashTolerantMap | 0 → 0 | evaluation/configuration error → evaluation/configuration error | 2 → — |
 | splinter/LinkedJournal | 0 → 0 | evaluation/configuration error → invariant violation | 1 → 4 |
 
 Timeout state counts are the last progress sample, not a completed search.
 
-Zero-refusal exports improve **5/6 → 6/6** across the current stack. Usable bounded TLC runs improve **0/6 → 3/6**: one completes, one stops at an invariant violation, and one reaches the time limit while exploring. These counterexamples have not been promoted to source-system findings. They arise in the campaign's existing finite abstractions/adapters and now additionally carry the reported partial-read restrictions.
+Zero-refusal exports improve **5/6 → 6/6** across the current stack. Usable bounded TLC runs improve **0/6 → 4/6**: two complete, one stops at an invariant violation, and one reaches the time limit while exploring. These counterexamples have not been promoted to source-system findings. They arise in the campaign's existing finite abstractions/adapters and now additionally carry the reported partial-read restrictions.
 
-The NR replay uses the campaign's existing `UnboundedLog-mono` adapter on both sides. The lower trait lane now renders its former `vstd::pervasive::arbitrary` refusal as a typed table hole. The unchanged campaign configuration does not assign `Table_arbitrary__tla_closed2`, so NR does not start TLC on the final stack. The earlier pre-rebase result (an invariant violation after 754 distinct states) is superseded and is not counted. The unspecialized `nr/UnboundedLog` export is measured separately; the adapter's result is not represented as a successful generic-trait export.
+The NR replay uses the campaign's existing `UnboundedLog-mono` adapter on both sides. The lower trait lane now renders its former `vstd::pervasive::arbitrary` refusal as a typed table hole. The unchanged campaign configuration does not assign `Table_arbitrary__tla_closed2`, so NR does not start TLC on the final stack. The unspecialized `nr/UnboundedLog` export is measured separately; the adapter's result is not represented as a successful generic-trait export.
 
 CrashTolerantMap now exposes the explicit `Dom_Key` carrier for `TotalKMMap::empty` at `TotalKMMap_t.rs:25`. The saved configuration supplies structural field domains but not this new carrier, so its unchanged TLC configuration cannot start. No carrier assignment was invented to count it as an exploration success.
 
-AbstractMap gets past its map-domain failures but still stops at the existing checked cast `(seq_end - 1) as nat` in `MsgHistory_v.rs:189` for an invalid history admitted by the saved bounds. No source guard or campaign bound was added to hide that failure.
+AbstractMap now completes with **33 generated / 3 distinct states**, using the original sources, adapter, and bounds. The undefined cast at `MsgHistory_v.rs:189` disables the affected predicate instead of crashing TLC. A dedicated recursive-cast regression reproduces this boundary.
 
 ## Total-collection campaign exports
 
@@ -81,16 +93,16 @@ The nine supplemental modules have no saved `MC-command.json` in this campaign, 
 
 ## Validation and remaining work
 
-Exporter suite with `TLA2TOOLS_JAR` set: **199 passed, 0 failed** after the final rebase. The vstd rebuild verified 2,045 functions with no errors. All 12 replay bounds/configuration files are byte-identical to the saved campaign. Compatibility: 26/28 generated `.tla`/`.cfg` files match the clean parent, with only the two main-module differences called out above.
+**204 exporter tests passed, 0 failed**, with `TLA2TOOLS_JAR` set. The vstd rebuild verified 2,045 functions with no errors. All 28 generated fixture files and all 12 saved campaign bound/configuration files compare byte-identically. The full golden regression and the separate raw re-export check both pass.
 
-Seven new TLC-backed regression tests cover reordered membership/variant/sequence guards, unguarded reads including direct negation, recursive value helpers, partial map constructors, destructuring-local hygiene, total/infinite collection operations, and carrier type assumptions. The former `ISet::finite` refusal test now checks its explicit finite carrier.
+Eleven new TLC-backed tests cover partial reads, carriers, recursive helpers and casts, lazy conditional values, invalidation of inferred shape facts, and redundant guards. A separate golden regression pins Raft and every example's four generated files.
 
-Priority order for remaining work:
+Remaining campaign limitations (not hidden as successful exploration):
 
-1. Restore byte-identical main-module output for toyDB and `mutex_liveness.rs`. The analysis adds checks wherever it does not establish safety from the surrounding guards; proving which are redundant requires additional invariant/caller reasoning. Five of the six example main modules are identical, and every compared `.cfg` and trace module is identical.
-2. Resolve AbstractMap's remaining checked-cast boundary without changing the campaign's transition relation or bounds.
-3. Supply and document interpretations for the new trait/function table holes in a separate campaign configuration update. The unchanged NR configuration cannot run with the new table, and CrashTolerantMap needs an explicit `Dom_Key` carrier assignment. Preserve the distinction between generic NR and its existing monomorphic adapter.
-4. Address the large-model analysis limits/timeouts recorded in the collection table before claiming broad nrkernel coverage.
+1. NR needs a function-table interpretation and CrashTolerantMap needs its explicit `Dom_Key` carrier assignment. Neither was invented or added to the campaign configuration.
+2. The broad nrkernel models still encounter the analysis limits/timeouts shown above; `hlspec` retains its `choose` refusal.
+3. Zero refusals in the supplemental exports still requires assigning their explicit holes before meaningful TLC exploration.
+
 
 The documented `base/toydb` checkout does not contain `src/raft/safety.rs` on this box. The byte comparison therefore uses the existing `trace-arm-eval/toydb/src/raft/safety.rs`, with the same input path and source on both sides. The parent comparison binary was built in the clean sibling worktree at `6fc818ca`.
 
@@ -104,11 +116,11 @@ export TMPDIR=$HOME/tmp
 export TLA2TOOLS_JAR=$HOME/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar
 (cd source && timeout 900 ../tools/vargo/target/release/vargo test --release -p rust_verify_test --test tla_export -- --test-threads=4)
 python3 audit/export-partial/replay.py partial final-before --verus ../base/verus/source/target-verus/release/verus
-python3 audit/export-partial/replay.py partial final-after --verus source/target-verus/release/verus
+python3 audit/export-partial/replay.py partial acceptance-after --verus source/target-verus/release/verus
 python3 audit/export-partial/replay.py collections collections-before --verus ../base/verus/source/target-verus/release/verus
-python3 audit/export-partial/replay.py collections final-collections-after --verus source/target-verus/release/verus
+python3 audit/export-partial/replay.py collections acceptance-collections --verus source/target-verus/release/verus
 python3 audit/export-partial/replay.py fixtures final-parent --verus ../wt-export-nrkernel/source/target-verus/release/verus
-python3 audit/export-partial/replay.py fixtures final-fixtures --verus source/target-verus/release/verus
+python3 audit/export-partial/replay.py fixtures acceptance-fixtures --verus source/target-verus/release/verus
 ```
 
 The helper requires the existing `../campaign-real` sources/results tree. Raw commands, exports, reports, and logs are retained locally in its output directories; compact measurements are committed here. No Cove `report` tool was available.
