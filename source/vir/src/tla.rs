@@ -706,8 +706,9 @@ struct TraceVariant {
 #[derive(Clone)]
 struct TraceAction {
     fun: Fun,
-    params: Vec<(String, Typ, String, String)>,
+    params: Vec<(String, Typ, Option<String>, String)>,
     body: String,
+    selected: bool,
 }
 
 struct Exporter {
@@ -3928,6 +3929,16 @@ impl Exporter {
                 names.iter().zip(&domains).map(|(n, d)| format!("{n} \\in {d}")).collect();
             sets.push(if binds.is_empty() {
                 format!("{{{record}}}")
+            } else if domains.iter().enumerate().any(|(i, d)| {
+                names[..i]
+                    .iter()
+                    .any(|n| d.split(|c: char| !c.is_alphanumeric() && c != '_').any(|t| t == n))
+            }) {
+                let mut set = format!("{{{record}}}");
+                for (name, domain) in names.iter().zip(&domains).rev() {
+                    set = format!("UNION {{{set} : {name} \\in {domain}}}");
+                }
+                set
             } else {
                 format!("{{{record} : {}}}", binds.join(", "))
             });
@@ -6558,14 +6569,29 @@ impl Exporter {
         })
     }
 
-    /// Independent action-record disjuncts in a closure-valued Next. The
-    /// template is the entire disjunct, including its guards, not just the
-    /// record's transition closure. Only direct binder arguments are narrowed.
+    /// Collect every action occurrence. Selection is allowed only for a
+    /// conjunctive application, or a path to one with its condition retained.
+    /// Unsupported occurrences are kept as general relations; dropping one
+    /// would make the other occurrences of the same name an incomplete dispatch.
     fn trace_action_branches(&mut self, body: &Expr, env: &Env) -> Vec<TraceAction> {
         let body = peel(body);
         if let ExprX::Logical(LogicalOp::Or, a, b) = &body.x {
             let mut out = self.trace_action_branches(a, env);
             out.extend(self.trace_action_branches(b, env));
+            return out;
+        }
+        if let ExprX::If(cond, a, Some(b)) = &body.x {
+            let guard = self.quiet(|x| x.expr(cond, env));
+            let mut out = Vec::new();
+            for (branch, positive) in [(a, true), (b, false)] {
+                for mut action in self.trace_action_branches(branch, env) {
+                    if action.selected {
+                        let g = if positive { guard.clone() } else { format!("~({guard})") };
+                        action.body = format!("IF {g} THEN ({}) ELSE FALSE", action.body);
+                    }
+                    out.push(action);
+                }
+            }
             return out;
         }
         let mut builders = Vec::new();
@@ -6579,19 +6605,47 @@ impl Exporter {
             }
             crate::visitor::VisitorControlFlow::Recurse
         });
-        let [(fun, args)] = &builders[..] else { return Vec::new() };
-        let f = self.functions[fun].clone();
-        let mut forward_input = None;
-        crate::ast_visitor::expr_visitor_walk(&body, &mut |e: &Expr| {
-            if let ExprX::Call { target: CallTarget::FnSpec(c), .. } = &e.x {
-                if let Some((builder, forward, _, input)) = self.forward_parts(c) {
-                    if &builder == fun && !is_unit(&input.typ) {
-                        let p = &self.functions[&forward].x.params[1];
-                        forward_input = Some((input, ident_name(&p.x.name)));
-                    }
-                }
+        if let [(fun, args)] = &builders[..] {
+            if let Some(action) = self.trace_action_branch(&body, env, fun, args) {
+                return vec![action];
             }
-            crate::visitor::VisitorControlFlow::Recurse
+        }
+        builders.into_iter().map(|(fun, _)| self.trace_general_action(&fun, &body)).collect()
+    }
+
+    fn trace_action_branch(
+        &mut self,
+        body: &Expr,
+        env: &Env,
+        fun: &Fun,
+        args: &Exprs,
+    ) -> Option<TraceAction> {
+        let f = self.functions[fun].clone();
+        let site = match &body.x {
+            ExprX::Quant(q, _, inner) if matches!(q.quant, air::ast::Quant::Exists) => peel(inner),
+            _ => body.clone(),
+        };
+        // A builder somewhere under a conditional, negation, or nested
+        // disjunction does not mean that taking this relation executes it.
+        let application = conjuncts(&site).into_iter().find(|e| {
+            matches!(&e.x, ExprX::Call { target: CallTarget::FnSpec(_), args, .. }
+                if args.len() == 2
+                && read_var(&args[0]).and_then(|v| env.roles.get(&v).copied()) == Some(Role::Pre)
+                && read_var(&args[1]).and_then(|v| env.roles.get(&v).copied()) == Some(Role::Post))
+        })?;
+        let ExprX::Call { target: CallTarget::FnSpec(c), .. } = &application.x else { return None };
+        let forward = self.forward_parts(c);
+        if forward.is_none() {
+            let (_, _, wrapper_args) = called(c)?;
+            if !wrapper_args.iter().any(|a| called(a).is_some_and(|(_, f, _)| &f == fun)) {
+                return None;
+            }
+        }
+        let forward_input = forward.and_then(|(builder, forward, _, input)| {
+            (builder == *fun && !is_unit(&input.typ)).then(|| {
+                let p = &self.functions[&forward].x.params[1];
+                (input, ident_name(&p.x.name))
+            })
         });
         let (params, text) = match &body.x {
             ExprX::Quant(q, binders, _)
@@ -6602,34 +6656,122 @@ impl Exporter {
                 } else if args.len() == 1 {
                     (&args[0], ident_name(&f.x.params[0].x.name), f.x.params[0].x.typ.clone())
                 } else {
-                    return Vec::new();
+                    return None;
                 };
                 if read_var(arg).as_ref() != Some(&binders[0].name) {
-                    return Vec::new();
+                    return None;
                 }
-                let Some((name, domain, text)) =
-                    self.exists_printed.get(&(Arc::as_ptr(&body) as usize)).cloned()
-                else {
-                    return Vec::new();
-                };
-                (vec![(log_name, typ, domain, name)], text)
+                let (name, domain, text) =
+                    self.exists_printed.get(&(Arc::as_ptr(body) as usize)).cloned()?;
+                (vec![(log_name, typ, Some(domain), name)], text)
             }
-            _ if args.is_empty() => {
-                let text = self.expr(&body, env);
-                if let Some((input, log_name)) = forward_input {
-                    let value = self.quiet(|x| x.expr(&input, env));
+            ExprX::Quant(..) => return None,
+            _ => {
+                let mut text = self.expr(body, env);
+                let mut params = Vec::new();
+                let mut inputs: Vec<_> =
+                    f.x.params
+                        .iter()
+                        .zip(args.iter())
+                        .map(|(p, a)| (ident_name(&p.x.name), a))
+                        .collect();
+                if let Some((input, name)) = &forward_input {
+                    inputs.push((name.clone(), input));
+                }
+                for (log_name, input) in inputs {
+                    let value = self.quiet(|x| x.expr(input, env));
                     let binder = self.bind("trace_input");
-                    (
-                        vec![(log_name, input.typ.clone(), format!("{{{value}}}"), binder.clone())],
-                        format!("({binder} = {value}) /\\ ({text})"),
-                    )
-                } else {
-                    (Vec::new(), text)
+                    params.push((
+                        log_name,
+                        input.typ.clone(),
+                        Some(format!("{{{value}}}")),
+                        binder.clone(),
+                    ));
+                    text = format!("({binder} = {value}) /\\ ({text})");
+                }
+                (params, text)
+            }
+        };
+        Some(TraceAction { fun: fun.clone(), params, body: text, selected: true })
+    }
+
+    /// A builder that cannot be selected still checks its precondition and
+    /// transition, conjoined with Next. No call-site parameters are discarded.
+    fn trace_general_action(&mut self, fun: &Fun, site: &Expr) -> TraceAction {
+        let mut forward = None;
+        crate::ast_visitor::expr_visitor_walk(site, &mut |e: &Expr| {
+            if let ExprX::Call { target: CallTarget::FnSpec(c), .. } = &e.x {
+                if let Some((builder, fwd, _, input)) = self.forward_parts(c) {
+                    if &builder == fun {
+                        forward = Some((fwd, input));
+                    }
                 }
             }
-            _ => return Vec::new(),
+            crate::visitor::VisitorControlFlow::Recurse
+        });
+        if let Some((fwd, input)) = forward {
+            if let Some(op) = self.op_names.get(&(fun.clone(), Variant::Forward, false)).cloned() {
+                let mut params = Vec::new();
+                let body = if is_unit(&input.typ) {
+                    op
+                } else {
+                    let log_name = ident_name(&self.functions[&fwd].x.params[1].x.name);
+                    let name = self.bind("trace_input");
+                    let domain = self.trace_domain(&input.typ, &input.span, None);
+                    params.push((log_name, input.typ.clone(), domain, name.clone()));
+                    format!("{op}({name})")
+                };
+                return TraceAction { fun: fun.clone(), params, body, selected: false };
+            }
+        }
+        let f = self.functions[fun].clone();
+        let mut env = Env::new();
+        let mut params = Vec::new();
+        for p in f.x.params.iter() {
+            let name = self.bind_var(&mut env, &p.x.name);
+            let domain = self.trace_domain(&p.x.typ, &p.span, None);
+            params.push((ident_name(&p.x.name), p.x.typ.clone(), domain, name));
+        }
+        let mut parts = Vec::new();
+        if let Some((record, renv, lets)) =
+            f.x.body.as_ref().and_then(|b| self.resolve_record(b, &env, 0))
+        {
+            for (field, arity) in [("precondition", 1), ("transition", 2)] {
+                if let Some((ps, body, mut cenv, clets)) = self.closure_of_field(
+                    &record,
+                    &Arc::new(field.to_string()),
+                    renv.clone(),
+                    &mut lets.clone(),
+                    0,
+                ) {
+                    if ps.len() == arity {
+                        for (i, p) in ps.iter().enumerate() {
+                            cenv.roles.insert(
+                                p.name.clone(),
+                                if i == 0 { Role::Pre } else { Role::Post },
+                            );
+                        }
+                        let text = self.expr(&body, &cenv);
+                        parts.push(if clets.is_empty() {
+                            text
+                        } else {
+                            format!("LET {} IN {text}", clets.join(" "))
+                        });
+                    }
+                }
+            }
+        }
+        let body = if parts.len() == 2 {
+            format!("({}) /\\ ({})", parts[0], parts[1])
+        } else {
+            // Other Action APIs may not expose these two closures. Keep the
+            // name known and fail explicitly rather than taking OTHER -> Next.
+            format!(
+                "Assert(FALSE, \"trace: {} has no independently checkable action relation\")",
+                fun_as_friendly_rust_name(fun)
+            )
         };
-        vec![TraceAction { fun: fun.clone(), params, body: text }]
+        TraceAction { fun: fun.clone(), params, body, selected: false }
     }
 
     /// The operator of a spec fn of no parameters returning a closure over
@@ -9778,10 +9920,14 @@ impl Exporter {
             return hole;
         }
         let first = self.holes.len();
+        let owners = self.hole_owners.len();
+        let hole_typs = self.hole_typs.clone();
         let constants = self.constants.clone();
         let domain = self.quiet(|x| x.bound_from_type(typ, span, &mut Vec::new()));
         if self.holes.len() > first {
             self.holes.truncate(first);
+            self.hole_owners.truncate(owners);
+            self.hole_typs = hole_typs;
             self.constants = constants;
             return None;
         }
@@ -10058,11 +10204,21 @@ impl Exporter {
         let mut actions: Vec<TraceAction> = Vec::new();
         for action in self.trace_actions.get(next_key).cloned().unwrap_or_default() {
             if let Some(prior) = actions.iter_mut().find(|a| a.fun == action.fun) {
+                if !prior.selected {
+                    continue;
+                }
+                if !action.selected {
+                    *prior = action;
+                    continue;
+                }
                 let mut aliases = Vec::new();
                 for ((_, _, domain, name), (_, _, other_domain, other_name)) in
                     prior.params.iter_mut().zip(&action.params)
                 {
-                    *domain = format!("({domain} \\cup {other_domain})");
+                    *domain = match (domain.as_ref(), other_domain.as_ref()) {
+                        (Some(d), Some(other)) => Some(format!("({d} \\cup {other})")),
+                        _ => None,
+                    };
                     if name != other_name {
                         aliases.push(format!("{other_name} == {name}"));
                     }
@@ -10092,7 +10248,10 @@ impl Exporter {
                 operator.clone(),
                 action.params.iter().map(|(_, t, _, _)| t.clone()).collect::<Vec<_>>(),
             );
-            action_operators.insert(operator.clone());
+            if action.selected {
+                action_operators.insert(operator.clone());
+            }
+            let enumerated = action.params.iter().all(|(_, _, d, _)| d.is_some());
             steps.push(TraceStep {
                 step: short,
                 function: friendly,
@@ -10104,10 +10263,10 @@ impl Exporter {
                     .map(|(name, typ, domain, _)| TraceParam {
                         name: name.clone(),
                         typ: typ_name(typ),
-                        domain: Some(domain.clone()),
+                        domain: domain.clone(),
                     })
                     .collect(),
-                enumerated: true,
+                enumerated,
             });
         }
         // A last segment two steps share names neither: those steps are

@@ -913,11 +913,18 @@ impl Verifier {
         // export it extends, so TLC finds the export from the trace spec's
         // directory.
         let trace = &export.trace_module_name;
+        // Carry the policy with the trace spec itself: MCP may copy only the
+        // TLA files, or the caller may select a different trace spec explicitly.
+        let trace_tla = format!(
+            "{}\n\\* VERUS_TRACE_POLICY {}\n",
+            export.trace_tla,
+            serde_json::to_string(&export.report.trace).expect("trace report serializes"),
+        );
         for (name, ext, text) in [
             (&export.module_name, "tla", &export.tla),
             (&export.module_name, "cfg", &export.cfg),
             (&export.module_name, "tla.json", &json),
-            (trace, "tla", &export.trace_tla),
+            (trace, "tla", &trace_tla),
             (trace, "cfg", &export.trace_cfg),
         ] {
             let path = dir.join(format!("{name}.{ext}"));

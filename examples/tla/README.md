@@ -469,7 +469,11 @@ For an existential step-enum dispatcher (including VerusSync's `next_by`),
 its field binders to singleton values in the original domains. Unlogged fields
 keep their original domains, including dependent bounds. The original dispatcher,
 its guards, and `TypeOK'` are retained. Action-record branches likewise retain
-both their preconditions and transitions. The observed successor comparison is
+both their preconditions and transitions, including the path conditions of
+`if` branches. Fixed and quantified call sites of the same action are combined.
+If any occurrence cannot be selected, the whole action name uses the reported
+general-relation check so that other call sites are not silently dropped.
+The observed successor comparison is
 unchanged. TLC run on it
 (`INIT TraceInit`, `NEXT TraceNext`, `CONSTANT TraceLog = "<log path>"`)
 ends without error on a well-formed log either way (the export's hole
@@ -491,7 +495,11 @@ names. Its state-sequence semantics are unchanged.
 
 An unknown step name falls back to `Next` and the observed-state comparison;
 its name and parameters are not checked. The JSON report advertises this weaker
-policy in `trace.unknown_step`. Ambiguous short names and misspelled parameters
+policy in `trace.unknown_step`. The same metadata is embedded in the trace
+module as a `VERUS_TRACE_POLICY` comment for MCP previews, including when the
+trace module is copied without its JSON report. Updated MCP previews display
+the policy and identify unknown names and general relations used by a log.
+Ambiguous short names and misspelled parameters
 of known steps still stop TLC.
 
 **The `Dom_` constants must cover every value the log carries.** Selected arms

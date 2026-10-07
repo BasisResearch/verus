@@ -9146,3 +9146,164 @@ pub open spec fn next() -> ActionPred<State> {{
     assert_eq!(steps.iter().filter(|s| s["step"] == "a").count(), 1);
     assert_trace_arm_selection(&ex, "test_crate", "a", "b", r#", "params": {"input": 1}"#, "");
 }
+
+fn trace_action_model(next: &str) -> Exported {
+    export_code(
+        &format!(
+            r#"
+use vstd::prelude::*;
+verus! {{
+#[verifier::reject_recursive_types(S)]
+pub struct Action<S> {{
+    pub precondition: spec_fn(S) -> bool,
+    pub transition: spec_fn(S, S) -> bool,
+}}
+pub open spec fn step<S>(a: Action<S>) -> spec_fn(S, S) -> bool {{
+    |pre: S, post: S| (a.precondition)(pre) && (a.transition)(pre, post)
+}}
+pub struct State {{ pub x: u8 }}
+pub open spec fn a(n: u8) -> Action<State> {{
+    Action {{ precondition: |s: State| s.x == 0,
+              transition: |pre: State, post: State| post.x == n }}
+}}
+pub open spec fn init() -> spec_fn(State) -> bool {{ |s: State| s.x == 0 }}
+pub open spec fn next() -> spec_fn(State, State) -> bool {{
+    |pre: State, post: State| {next}
+}}
+}}
+"#
+        ),
+        "test_crate",
+    )
+}
+
+fn trace_action_log(ex: &Exported, lines: &[(&str, u64)]) {
+    let (spec, tla, cfg) = trace_spec(ex);
+    let metadata = tla.lines().find_map(|l| l.strip_prefix("\\* VERUS_TRACE_POLICY ")).unwrap();
+    assert_eq!(serde_json::from_str::<serde_json::Value>(metadata).unwrap(), ex.report["trace"]);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &spec);
+    let log = ex.dir.path().join("selection.ndjson");
+    for (lines, expected) in lines {
+        std::fs::write(&log, format!("{{\"module\":\"State_tla\",\"export\":\"test_crate\",\"state\":{{\"x\":0}}}}\n{lines}\n")).unwrap();
+        let (depth, out) = follow(&jar, &spec, &cfg, &log, "");
+        assert_eq!(depth, *expected, "{out}");
+    }
+}
+
+#[test]
+fn tla_export_trace_action_keeps_conditional_path_guards() {
+    let ex = trace_action_model("if pre.x == 0 { step(a(1))(pre, post) } else { post.x == 1 }");
+    assert_eq!(ex.report["trace"]["general_relation_steps"], serde_json::json!(["next"]));
+    trace_action_log(
+        &ex,
+        &[
+            (r#"{"step":"a","params":{"n":1},"state":{"x":1}}"#, 2),
+            (
+                "{\"step\":\"a\",\"params\":{\"n\":1},\"state\":{\"x\":1}}\n{\"step\":\"a\",\"params\":{\"n\":1},\"state\":{\"x\":1}}",
+                2,
+            ),
+        ],
+    );
+}
+
+#[test]
+fn tla_export_trace_action_keeps_fixed_and_quantified_call_sites() {
+    let ex = trace_action_model(
+        "(exists|n: u8| n < 1 && step(a(n))(pre, post)) || step(a(1))(pre, post)",
+    );
+    trace_action_log(
+        &ex,
+        &[
+            (r#"{"step":"a","params":{"n":1},"state":{"x":1}}"#, 2),
+            (r#"{"step":"a","state":{"x":1}}"#, 2),
+            (r#"{"step":"a","params":{"n":0},"state":{"x":1}}"#, 1),
+            (r#"{"step":"a","params":{"n":2},"state":{}}"#, 1),
+        ],
+    );
+}
+
+#[test]
+fn tla_export_trace_action_reports_every_unsupported_occurrence() {
+    for next in [
+        "(exists|n: u8, m: u8| n < 2 && m < 2 && #[trigger] step(a((n + m) as u8))(pre, post)) || post.x == 1",
+        "step(a(0))(pre, post) || (exists|n: u8, m: u8| n < 2 && m < 2 && #[trigger] step(a((n + m) as u8))(pre, post)) || post.x == 1",
+    ] {
+        let ex = trace_action_model(next);
+        assert!(
+            ex.report["trace"]["general_relation_steps"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!("a"))
+        );
+        trace_action_log(
+            &ex,
+            &[
+                (r#"{"step":"a","params":{"n":2},"state":{"x":2}}"#, 2),
+                (
+                    "{\"step\":\"a\",\"params\":{\"n\":1},\"state\":{\"x\":1}}\n{\"step\":\"a\",\"params\":{\"n\":1},\"state\":{\"x\":1}}",
+                    2,
+                ),
+            ],
+        );
+    }
+}
+
+#[test]
+fn tla_export_trace_arm_keeps_dependent_omitted_parameters() {
+    let ex = export_code(
+        r#"
+use vstd::prelude::*;
+verus! {
+pub struct State { pub x: u8 }
+pub enum Step { A(u8, u8), B }
+pub open spec fn init(s: State) -> bool { s.x == 0 }
+pub open spec fn t_a(pre: State, post: State, n: u8, m: u8) -> bool { post.x == m }
+pub open spec fn t_b(pre: State, post: State) -> bool { post.x == 1 }
+pub open spec fn next_step(pre: State, post: State, s: Step) -> bool {
+    match s { Step::A(n, m) => n < 3 && m < n && t_a(pre, post, n, m), Step::B => t_b(pre, post) }
+}
+pub open spec fn next(pre: State, post: State) -> bool { exists|s: Step| next_step(pre, post, s) }
+}
+"#,
+        "test_crate",
+    );
+    trace_action_log(
+        &ex,
+        &[
+            (r#"{"step":"t_a","params":{"n":2},"state":{"x":1}}"#, 2),
+            (r#"{"step":"t_a","state":{"x":1}}"#, 2),
+            (r#"{"step":"t_a","params":{"n":1},"state":{"x":1}}"#, 1),
+            (r#"{"step":"t_a","params":{"n":3},"state":{"x":1}}"#, 1),
+            (r#"{"step":"next_step","params":{"s":{"tag":"A","v0":2,"v1":1}},"state":{"x":1}}"#, 2),
+        ],
+    );
+}
+
+#[test]
+fn tla_export_trace_arm_keeps_type_ok() {
+    let ex = export_code(
+        r#"
+use vstd::prelude::*;
+verus! {
+pub struct State { pub x: u8 }
+pub enum Step { A(u8), B }
+pub open spec fn init(s: State) -> bool { s.x == 0 }
+pub open spec fn t_a(pre: State, post: State, n: u8) -> bool { post.x == n + 254 }
+pub open spec fn t_b(pre: State, post: State) -> bool { post.x == 0 }
+pub open spec fn next_step(pre: State, post: State, s: Step) -> bool {
+    match s { Step::A(n) => n < 3 && t_a(pre, post, n), Step::B => t_b(pre, post) }
+}
+pub open spec fn next(pre: State, post: State) -> bool { exists|s: Step| next_step(pre, post, s) }
+}
+"#,
+        "test_crate",
+    );
+    trace_action_log(
+        &ex,
+        &[
+            (r#"{"step":"t_a","params":{"n":1},"state":{"x":255}}"#, 2),
+            (r#"{"step":"t_a","params":{"n":2},"state":{}}"#, 1),
+        ],
+    );
+}
