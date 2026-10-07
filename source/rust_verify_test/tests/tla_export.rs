@@ -9448,6 +9448,196 @@ proof fn check_dispatch() { assert(helper::<Outer<Outer<Inner>>>()); }
     assert_eq!(run.distinct, 1);
 }
 
+/// A projection left unresolved by conservative impl matching is not an
+/// abstract type parameter, even inside a collection or a datatype field.
+#[test]
+fn tla_export_refuses_concrete_projection_table_carriers() {
+    for (signature, call) in [
+        ("() -> T::V", "value::<Concrete>()"),
+        ("() -> Seq<T::V>", "value::<Concrete>()[0]"),
+        ("(v: T::V) -> bool", "value::<Concrete>(false)"),
+        ("(v: Seq<T::V>) -> bool", "value::<Concrete>(seq![false])"),
+        ("() -> Wrapped<T>", "value::<Concrete>().v"),
+    ] {
+        let code = format!(
+            r#"
+use vstd::prelude::*;
+verus! {{
+pub trait Marker {{}}
+pub trait Has {{ type V; }}
+pub struct Concrete;
+impl<T: Marker> Has for T {{ type V = int; }}
+impl Has for Concrete {{ type V = bool; }}
+pub struct Wrapped<T: Has> {{ pub v: T::V }}
+pub uninterp spec fn value<T: Has>{signature};
+pub struct State {{ pub x: bool }}
+pub open spec fn init(s: State) -> bool {{ s.x == {call} }}
+pub open spec fn next(pre: State, post: State) -> bool {{ post.x == pre.x }}
+}}
+"#
+        );
+        let ex = export_code(&code, "test_crate");
+        assert!(
+            ex.report["refusals"].as_array().unwrap().iter().any(|r| {
+                r["what"].as_str().unwrap().contains("cannot be constrained")
+                    && r["location"].as_str().unwrap().contains("test.rs:")
+            }),
+            "{}",
+            ex.report
+        );
+        assert!(
+            !ex.report["holes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|h| h["kind"] == "uninterpreted_function"),
+            "{}",
+            ex.report
+        );
+        // Even an arbitrary ill-typed carrier cannot make the refused call pass.
+        let mut cfg = ex.cfg.clone();
+        let mut seen = std::collections::HashSet::new();
+        for h in ex.report["holes"].as_array().unwrap() {
+            let c = h["constant"].as_str().unwrap();
+            if seen.insert(c) {
+                cfg.push_str(&format!("CONSTANT {c} = {{7}}\n"));
+            }
+        }
+        let Some(jar) = tla_tools() else { continue };
+        sany(&jar, &ex.spec());
+        let out = tlc_output(&jar, &ex.spec(), &cfg);
+        assert!(
+            out.contains("Assert evaluated to FALSE") && out.contains("cannot be constrained"),
+            "{}",
+            out
+        );
+    }
+}
+
+#[test]
+fn tla_export_normalized_projection_tables_are_typed() {
+    let ex = export_code(
+        r#"
+verus! {
+pub trait Has { type V; }
+pub struct Inner;
+impl Has for Inner { type V = bool; }
+pub struct Outer<T> { pub v: T }
+impl<T: Has> Has for Outer<T> { type V = T::V; }
+pub uninterp spec fn value<T: Has>(v: T::V) -> T::V;
+pub struct State { pub x: bool }
+pub open spec fn init(s: State) -> bool { s.x == value::<Outer<Inner>>(false) }
+pub open spec fn next(pre: State, post: State) -> bool { post.x == pre.x }
+pub open spec fn inv(s: State) -> bool { s.x }
+}
+"#,
+        "test_crate",
+    );
+    assert_eq!(ex.report["refusals"], serde_json::json!([]), "{}", ex.tla);
+    let holes = ex.report["holes"].as_array().unwrap();
+    assert_eq!(holes.len(), 1, "{}", ex.report);
+    assert_eq!(holes[0]["kind"], "uninterpreted_function");
+    let table = holes[0]["constant"].as_str().unwrap();
+    let cfg = format!("{}\nCONSTANT {table} <- Chosen\n", ex.cfg);
+    let Some(jar) = tla_tools() else { return };
+    for (value, accepts) in [("TRUE", true), ("IF k[1] THEN 7 ELSE TRUE", false)] {
+        std::fs::write(ex.spec(), ex.tla.replace("=============================",
+            &format!("Chosen == [k \\in {{<<FALSE>>, <<TRUE>>}} |-> {value}]\n============================="))).unwrap();
+        sany(&jar, &ex.spec());
+        if accepts {
+            let run = tlc(&jar, &ex.spec(), &cfg);
+            assert!(run.violated.is_empty(), "{:?}", run);
+            assert_eq!(run.distinct, 1);
+        } else {
+            let out = tlc_output(&jar, &ex.spec(), &cfg);
+            assert!(out.contains("Evaluating assumption") && out.contains("failed"), "{}", out);
+            assert!(!out.contains("Computing initial states"), "{}", out);
+        }
+    }
+}
+
+/// Both helper reducers must substitute types before inspecting their bodies.
+/// Opposite impl results detect accidentally sharing either instantiation.
+#[test]
+fn tla_export_specializes_closure_and_record_helpers() {
+    for (result, body, apply) in [
+        ("spec_fn() -> bool", "|| <T::V as Pick>::choose::<A>()", ""),
+        ("Action", "Action { run: || <T::V as Pick>::choose::<A>() }", ".run"),
+    ] {
+        let code = format!(
+            r#"
+verus! {{
+pub trait Has {{ type V; }}
+pub struct Inner;
+impl Has for Inner {{ type V = bool; }}
+pub struct Outer<T> {{ pub v: T }}
+impl<T: Has> Has for Outer<T> {{ type V = T::V; }}
+pub trait Value {{ spec fn value() -> bool; }}
+impl Value for bool {{ open spec fn value() -> bool {{ false }} }}
+impl Value for int {{ open spec fn value() -> bool {{ true }} }}
+pub trait Pick {{ spec fn choose<A: Value>() -> bool; }}
+impl Pick for bool {{ open spec fn choose<A: Value>() -> bool {{ A::value() }} }}
+pub struct Action {{ pub run: spec_fn() -> bool }}
+pub open spec fn make<T: Has, A: Value>() -> {result} where T::V: Pick {{ {body} }}
+pub struct State {{ pub x: bool }}
+pub open spec fn init(s: State) -> bool {{ s.x == (make::<Outer<Inner>, bool>(){apply})() }}
+pub open spec fn next(pre: State, post: State) -> bool {{ post.x == (make::<Outer<Inner>, int>(){apply})() }}
+pub open spec fn inv(s: State) -> bool {{
+    !(make::<Outer<Inner>, bool>(){apply})() && (make::<Outer<Inner>, int>(){apply})()
+}}
+}}
+"#
+        );
+        let ex = export_code(&code, "test_crate");
+        assert_eq!(ex.report["refusals"], serde_json::json!([]), "{}", ex.tla);
+        assert_eq!(ex.report["holes"], serde_json::json!([]), "{}", ex.tla);
+        let Some(jar) = tla_tools() else { continue };
+        sany(&jar, &ex.spec());
+        let run = tlc(&jar, &ex.spec(), &ex.cfg);
+        assert!(run.violated.is_empty(), "{:?}", run);
+        assert_eq!(run.distinct, 2);
+    }
+}
+
+#[test]
+fn tla_export_refuses_ambiguous_closure_and_record_helpers() {
+    for (result, body, field) in
+        [("spec_fn() -> bool", "|| true", ""), ("Action", "Action { run: || true }", ".run")]
+    {
+        let code = format!(
+            r#"
+verus! {{
+pub trait Marker {{}}
+pub struct Action {{ pub run: spec_fn() -> bool }}
+pub trait Make {{ spec fn make() -> {result}; }}
+pub struct Concrete;
+impl<T: Marker> Make for T {{ open spec fn make() -> {result} {{ {body} }} }}
+impl Make for Concrete {{ open spec fn make() -> {result} {{ {body} }} }}
+pub open spec fn helper<T: Make>() -> bool {{ (T::make(){field})() }}
+pub struct State {{ pub x: bool }}
+pub open spec fn init(s: State) -> bool {{ s.x == helper::<Concrete>() }}
+pub open spec fn next(pre: State, post: State) -> bool {{ post.x == pre.x }}
+}}
+"#
+        );
+        let ex = export_code(&code, "test_crate");
+        assert!(
+            ex.report["refusals"].as_array().unwrap().iter().any(|r| r["what"]
+                .as_str()
+                .unwrap()
+                .contains("ambiguous concrete trait implementation")
+                && r["location"].as_str().unwrap().contains("test.rs:")),
+            "{}",
+            ex.report
+        );
+        assert_eq!(ex.report["holes"], serde_json::json!([]), "{}", ex.tla);
+        let Some(jar) = tla_tools() else { continue };
+        sany(&jar, &ex.spec());
+        let out = tlc_output(&jar, &ex.spec(), &ex.cfg);
+        assert!(out.contains("Assert evaluated to FALSE"), "{}", out);
+    }
+}
+
 /// Wrong values on unused keys and extra/missing keys must be caught by the
 /// table's signature assumption, before any model expression reads the table.
 #[test]

@@ -3333,7 +3333,7 @@ impl Exporter {
                 Some(format!("({})", parts.join(" /\\ ")))
             }
             TypX::Primitive(Primitive::StrSlice, _) => Some(format!("{v} \\in STRING")),
-            TypX::TypParam(_) | TypX::Projection { .. } => {
+            TypX::TypParam(_) | TypX::Projection { .. } if typ_mentions_param(typ) => {
                 let (fun, _, _) = self.current_key.as_ref()?;
                 let span = self.functions.get(fun)?.span.clone();
                 let dom = self.type_domain("abstract carrier", typ, &span);
@@ -3413,7 +3413,11 @@ impl Exporter {
                     continue;
                 }
                 let v = self.bind("element__");
-                if matches!(&*t, TypX::TypParam(_) | TypX::Projection { .. }) {
+                // Only genuinely abstract types may use an unconstrained carrier.
+                // An unresolved concrete projection must fail table_type_pred below.
+                if matches!(&*t, TypX::TypParam(_) | TypX::Projection { .. })
+                    && typ_mentions_param(&t)
+                {
                     let carrier = self.type_domain("abstract carrier", &t, &f.span);
                     assumptions
                         .push(format!("IsFiniteSet({carrier}) /\\ {c} \\subseteq {carrier}"));
@@ -3506,9 +3510,15 @@ impl Exporter {
                 let (record, renv, mut lets) = self.resolve_record(inner, env, depth + 1)?;
                 self.closure_of_field(&record, field, renv, &mut lets, depth)
             }
-            ExprX::Call { target: CallTarget::Fun(kind, fun, ..), args, .. } => {
-                let fun = &self.resolved_fun(kind, fun);
-                let (body, env2, mut lets) = self.inline_call(fun, args, env)?;
+            ExprX::Call { target: CallTarget::Fun(kind, fun, typs, ..), args, .. } => {
+                let fun = match self.instantiate_call(kind, fun, typs) {
+                    Ok(fun) => fun,
+                    Err(reason) => {
+                        self.refuse(reason, &f.span);
+                        return None;
+                    }
+                };
+                let (body, env2, mut lets) = self.inline_call(&fun, args, env)?;
                 let (params, cbody, cenv, mut clets) =
                     self.resolve_closure(&body, &env2, depth + 1)?;
                 lets.append(&mut clets);
@@ -3599,9 +3609,15 @@ impl Exporter {
                 self.resolve_record(&value, &venv, depth + 1)
             }
             ExprX::ReadPlace(p, _) => self.resolve_record_place(p, env, depth + 1),
-            ExprX::Call { target: CallTarget::Fun(kind, fun, ..), args, .. } => {
-                let fun = &self.resolved_fun(kind, fun);
-                let (body, env2, mut lets) = self.inline_call(fun, args, env)?;
+            ExprX::Call { target: CallTarget::Fun(kind, fun, typs, ..), args, .. } => {
+                let fun = match self.instantiate_call(kind, fun, typs) {
+                    Ok(fun) => fun,
+                    Err(reason) => {
+                        self.refuse(reason, &e.span);
+                        return None;
+                    }
+                };
+                let (body, env2, mut lets) = self.inline_call(&fun, args, env)?;
                 let (record, renv, mut rlets) = self.resolve_record(&body, &env2, depth + 1)?;
                 lets.append(&mut rlets);
                 Some((record, renv, lets))
