@@ -10389,3 +10389,74 @@ pub open spec fn candidate(s: State) -> bool { s.x == unknown::<int>() }
     sany(&jar, &ex.spec());
     assert_eq!(tlc(&jar, &ex.spec(), &ex.cfg).distinct, 1);
 }
+
+#[test]
+fn tla_export_closure_record_definedness_keeps_bound_parameters() {
+    let ex = export_code_with(
+        r#"
+verus! {
+pub struct State { pub x: int }
+pub enum Kind { Custom(int), Other }
+pub struct Action { pub f: spec_fn(State, State) -> bool, pub amount: int }
+pub open spec fn kind() -> Kind { Kind::Custom(1) }
+pub open spec fn make(kind: Kind) -> Action {
+    Action { f: |pre: State, post: State|
+        pre.x < 2 && post.x == pre.x + kind->Custom_0, amount: kind->Custom_0 }
+}
+pub open spec fn apply(a: Action, pre: State, post: State) -> bool {
+    (a.f)(pre, post) && a.amount == 1
+}
+pub open spec fn init(s: State) -> bool { s.x == 0 }
+pub open spec fn next(pre: State, post: State) -> bool {
+    exists |n: int| 0 <= n <= 1 && {
+        let kind = if n == 0 { Kind::Other } else { Kind::Custom(n) };
+        let a = make(kind);
+        a.amount == 1 && make(self::kind()).amount == 1 && apply(a, pre, post)
+    }
+}
+pub open spec fn inv(s: State) -> bool { 0 <= s.x <= 2 }
+}
+"#,
+        "test_crate",
+        &["--no-verify"],
+    );
+    assert_eq!(ex.report["refusals"], serde_json::json!([]), "{}", ex.tla);
+    assert!(!ex.report["restrictions"].as_array().unwrap().is_empty());
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let run = tlc(&jar, &ex.spec(), &ex.cfg);
+    assert_eq!(run.distinct, 3, "{run:?}\n{}", ex.tla);
+    assert!(run.violated.is_empty(), "{:?}", run);
+}
+
+#[test]
+fn tla_export_symbolic_record_does_not_hoist_unused_field_guards() {
+    let ex = export_code_with(
+        r#"
+verus! {
+pub struct State { pub x: int }
+pub enum Kind { Custom(int), Other }
+pub struct Action { pub f: spec_fn(State, State) -> bool, pub unused: int }
+pub open spec fn kind() -> Kind { Kind::Other }
+pub open spec fn make() -> Action {
+    Action { f: |pre: State, post: State| pre.x < 2 && post.x == pre.x + 1,
+        unused: kind()->Custom_0 }
+}
+pub open spec fn apply(a: Action, pre: State, post: State) -> bool { (a.f)(pre, post) }
+pub open spec fn init(s: State) -> bool { s.x == 0 }
+pub open spec fn next(pre: State, post: State) -> bool {
+    apply(make(), pre, post)
+}
+pub open spec fn inv(s: State) -> bool { 0 <= s.x <= 2 }
+}
+"#,
+        "test_crate",
+        &["--no-verify"],
+    );
+    assert_eq!(ex.report["refusals"], serde_json::json!([]), "{}", ex.tla);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let run = tlc(&jar, &ex.spec(), &ex.cfg);
+    assert_eq!(run.distinct, 3, "{run:?}\n{}", ex.tla);
+    assert!(run.violated.is_empty(), "{:?}", run);
+}

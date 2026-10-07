@@ -1930,6 +1930,12 @@ impl Exporter {
             )];
         }
         let e = peel(e);
+        // Closure-valued records are symbolic, not eagerly evaluated TLA values.
+        // Inspect only the field or closure body actually consumed below. Walking
+        // unused constructor arguments can leak guards out of their lexical scope.
+        if typ_has_specfn(&e.typ, &self.datatypes, &mut HashSet::new()) {
+            return vec![];
+        }
         let mut out = Vec::new();
         match &e.x {
             ExprX::Var(v) => {
@@ -1941,6 +1947,9 @@ impl Exporter {
             }
             ExprX::ReadPlace(p, _) => out.extend(self.place_requirements(p, env, depth + 1)),
             ExprX::UnaryOpr(UnaryOpr::Field(f), base) => {
+                if let Some(rs) = self.symbolic_field_requirements(base, &f.field, env, depth) {
+                    return rs;
+                }
                 out.extend(self.read_requirements(base, env, depth + 1));
                 if !self.single_variant(&f.datatype) {
                     let b = self.safety_value(base, env);
@@ -2359,6 +2368,10 @@ impl Exporter {
                 self.read_requirements(e, env, depth + 1)
             }
             PlaceX::Field(f, inner) => {
+                let value = crate::ast_util::place_to_spec_expr(inner);
+                if let Some(rs) = self.symbolic_field_requirements(&value, &f.field, env, depth) {
+                    return rs;
+                }
                 let mut out = self.place_requirements(inner, env, depth + 1);
                 if !self.single_variant(&f.datatype) {
                     let b = self.safety_place(inner, env);
@@ -4729,6 +4742,38 @@ impl Exporter {
         let value = &fields.iter().find(|b| &b.name == field)?.a;
         let body = self.expr(value, &scope);
         Some(if lets.is_empty() { body } else { format!("(LET {} IN {body})", lets.join(" ")) })
+    }
+
+    /// Keep a reduced field's guards under the same LETs as its value.
+    fn symbolic_field_requirements(
+        &mut self,
+        inner: &Expr,
+        field: &Ident,
+        env: &Env,
+        depth: usize,
+    ) -> Option<Vec<(String, Expr)>> {
+        if !typ_has_specfn(&inner.typ, &self.datatypes, &mut HashSet::new()) {
+            return None;
+        }
+        let saved_bound = self.bound.clone();
+        let result = (|| {
+            let (record, scope, lets) = self.quiet(|x| x.resolve_record(inner, env, 0))?;
+            let ExprX::Ctor(_, _, fields, _) = &record.x else { return None };
+            let value = &fields.iter().find(|b| &b.name == field)?.a;
+            let mut rs = self.read_requirements(value, &scope, depth + 1);
+            Self::scope_requirements(&mut rs, &lets);
+            Some(rs)
+        })();
+        self.bound = saved_bound;
+        result
+    }
+
+    fn scope_requirements(rs: &mut [(String, Expr)], lets: &[String]) {
+        if !lets.is_empty() {
+            for (guard, _) in rs {
+                *guard = format!("(LET {} IN {guard})", lets.join(" "));
+            }
+        }
     }
 
     /// The closure in a field of a record constructor.
