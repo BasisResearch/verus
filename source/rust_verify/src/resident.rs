@@ -2300,23 +2300,71 @@ struct SourceDiagnostic {
     message: String,
     spans: Vec<String>,
     labels: Vec<SourceLabel>,
+    /// The help line the batch run prints under the diagnostic.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    help: Option<String>,
 }
 
 impl SourceDiagnostic {
+    /// The diagnostic as the batch run's reporter emits it
+    /// (`verifier::Reporter::report_as`): a custom-error label replaces an
+    /// error's message and is not shown, a proof note's label reads
+    /// `note: ...`, and a primary span that contains another primary span
+    /// gives way to it.
     fn of(message: &MessageX, level: MessageLevel) -> Self {
+        let mut spans: Vec<String> = message.spans.iter().map(|span| span.as_string.clone()).collect();
+        while let Some(i) = spans
+            .iter()
+            .position(|a| spans.iter().any(|b| a != b && span_contains(a, b)))
+        {
+            spans.remove(i);
+        }
+        let custom = message.labels.iter().find(|label| label.is_custom_err);
+        let text = match (level, custom) {
+            (MessageLevel::Error, Some(label)) => label.note.clone(),
+            _ => message.note.clone(),
+        };
         SourceDiagnostic {
             level: level.into(),
-            message: message.note.clone(),
-            spans: message.spans.iter().map(|span| span.as_string.clone()).collect(),
+            message: text,
+            spans,
             labels: message
                 .labels
                 .iter()
+                .filter(|label| !label.is_custom_err)
                 .map(|label| SourceLabel {
-                    message: label.note.clone(),
+                    message: if label.is_proof_note {
+                        format!("note: {}", label.note)
+                    } else {
+                        label.note.clone()
+                    },
                     span: label.span.as_string.clone(),
                 })
                 .collect(),
+            help: message.help.clone(),
         }
+    }
+}
+
+/// Whether span `a` contains span `b`, both as Verus prints them
+/// (`path:line:col: line:col (#n)`); spans in different files, or that do not
+/// read, contain nothing.
+fn span_contains(a: &str, b: &str) -> bool {
+    fn read(span: &str) -> Option<(&str, (u64, u64), (u64, u64))> {
+        let (head, rest) = span.split_once(": ")?;
+        let (head, start_col) = head.rsplit_once(':')?;
+        let (path, start_line) = head.rsplit_once(':')?;
+        let end = rest.split_whitespace().next()?;
+        let (end_line, end_col) = end.split_once(':')?;
+        Some((
+            path,
+            (start_line.parse().ok()?, start_col.parse().ok()?),
+            (end_line.parse().ok()?, end_col.parse().ok()?),
+        ))
+    }
+    match (read(a), read(b)) {
+        (Some((pa, sa, ea)), Some((pb, sb, eb))) => pa == pb && sa <= sb && eb <= ea,
+        _ => false,
     }
 }
 
@@ -2343,6 +2391,7 @@ impl QueryDiagnostics {
             message,
             spans: vec![span.to_owned()],
             labels: Vec::new(),
+            help: None,
         });
     }
 }
