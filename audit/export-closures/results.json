@@ -348,6 +348,7 @@
           "variable": "choice__",
           "domain": "self",
           "location": "vstd/set_lib.rs:169:21: 169:34 (#0)",
+          "holes": [],
           "bounded_by_hole": false,
           "warning": null
         }
@@ -972,6 +973,20 @@
       "byte_identical": true
     }
   ],
+  "sany": {
+    "before/anvil/Cluster-adapter/export/ClusterState_tla.tla": true,
+    "before/anvil/sub_api/export/APIServerState_tla.tla": true,
+    "before/anvil/sub_api_sm/export/APIServerState_tla.tla": true,
+    "before/anvil/sub_controller/export/ControllerState_tla.tla": true,
+    "before/anvil/sub_network/export/NetworkState_tla.tla": true,
+    "before/ironkv/host_protocol_t/export/AbstractHostState_tla.tla": true,
+    "after/anvil/Cluster-adapter/export/ClusterState_tla.tla": true,
+    "after/anvil/sub_api/export/APIServerState_tla.tla": true,
+    "after/anvil/sub_api_sm/export/APIServerState_tla.tla": true,
+    "after/anvil/sub_controller/export/ControllerState_tla.tla": true,
+    "after/anvil/sub_network/export/NetworkState_tla.tla": true,
+    "after/ironkv/host_protocol_t/export/AbstractHostState_tla.tla": true
+  },
   "nrkernel_before": [
     {
       "machine": "nrkernel/hlspec",
@@ -1003,5 +1018,13 @@
       "holes": 320,
       "choices": 1
     }
-  ]
+  ],
+  "validation": {
+    "source_commit": "bd1d971478d8d8efecb09a191f6998d4a8946fcf",
+    "exporter_tests_passed": 177,
+    "exporter_tests_failed": 0,
+    "tla2tools_enabled": true,
+    "campaign_sany_passed": 12,
+    "regression_artifacts_byte_identical": 28
+  }
 }

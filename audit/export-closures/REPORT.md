@@ -98,3 +98,9 @@ is fetched and rebased again before publishing the PR.
 
 All **28** generated `.tla`/`.cfg` artifacts for the six example fixtures and
 the located toydb safety model are byte-identical. Hashes are in `results.json`.
+
+Final validation after rebasing: **177 tests passed, 0 failed**, with
+`TLA2TOOLS_JAR` set. SANY accepted all six campaign modules both before and
+after (12/12). `final-evidence.py` refreshes the campaign, supplemental network
+run, SANY checks and regression hashes after a build. The final base check
+remained at `9abf2c0e`.
