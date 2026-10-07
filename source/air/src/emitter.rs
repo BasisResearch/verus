@@ -521,7 +521,10 @@ mod replay_tests {
         let mut replay = Replay::new();
         replay.stage(b"(declare-fun f () Int)(push)");
         replay.stage(b"(assert (= f 1))(pop)");
-        assert_eq!(String::from_utf8(replay.commands()).unwrap(), "(declare-fun f () Int)\n(push 1)\n");
+        assert_eq!(
+            String::from_utf8(replay.commands()).unwrap(),
+            "(declare-fun f () Int)\n(push 1)\n"
+        );
         replay.commit();
         assert_eq!(String::from_utf8(replay.commands()).unwrap(), "(declare-fun f () Int)\n");
     }

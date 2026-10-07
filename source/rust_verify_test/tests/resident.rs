@@ -5118,10 +5118,7 @@ fn resident_catalogue_reports_initial_verdicts_and_reads() {
     assert_eq!(diagnostics[0]["level"], "error", "{}", failing);
     assert!(diagnostics[0]["spans"][0].as_str().unwrap().contains("fixture.rs:"), "{}", failing);
     let looping = initial("::looping");
-    assert!(
-        looping["result"] == "resource_limit" || looping["result"] == "invalid",
-        "{looping}"
-    );
+    assert!(looping["result"] == "resource_limit" || looping["result"] == "invalid", "{}", looping);
     if looping["result"] == "resource_limit" {
         let message = looping["diagnostics"][0]["message"].as_str().unwrap();
         assert!(message.contains("Resource limit (rlimit) exceeded"), "{}", looping);
@@ -5257,7 +5254,12 @@ fn resident_check_takes_an_rlimit_and_an_error_count() {
         worker.send(request)
     };
     let plain = check(&mut worker, "::passing", json!({}));
-    assert_eq!((plain["result"].clone(), plain["rlimit"].clone()), (json!("valid"), json!(7.0)), "{}", plain);
+    assert_eq!(
+        (plain["result"].clone(), plain["rlimit"].clone()),
+        (json!("valid"), json!(7.0)),
+        "{}",
+        plain
+    );
     // One resource unit is not enough for anything.
     let starved = check(&mut worker, "::passing", json!({"rlimit": 0.000004}));
     assert_eq!(starved["result"], "resource_limit", "{}", starved);
@@ -5306,7 +5308,8 @@ verus! {
 /// batch leaves no more running than the cap.
 #[test]
 fn resident_check_many_checks_queries_concurrently() {
-    let mut worker = Worker::start_with_env(MANY_SOURCE, &[], &[("VERUS_RESIDENT_MAX_SOLVERS", "2")]);
+    let mut worker =
+        Worker::start_with_env(MANY_SOURCE, &[], &[("VERUS_RESIDENT_MAX_SOLVERS", "2")]);
     let ready = worker.receive();
     let session = ready["session"].clone();
     let mut expected = std::collections::BTreeMap::new();
@@ -5322,7 +5325,8 @@ fn resident_check_many_checks_queries_concurrently() {
         }
     }
     assert!(ready["buckets"].as_array().unwrap().len() >= 4, "{}", ready);
-    for extra in [json!({"threads": 3}), json!({"threads": 8, "multiple_errors": 0, "rlimit": 20})] {
+    for extra in [json!({"threads": 3}), json!({"threads": 8, "multiple_errors": 0, "rlimit": 20})]
+    {
         let mut request = json!({"command": "check_many", "session": session, "queries": queries});
         request.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
         let first = worker.send(request);
@@ -5348,7 +5352,8 @@ fn resident_check_many_checks_queries_concurrently() {
     );
     assert_eq!(worker.receive()["event"], "checked_many");
     // A bad address is refused before any check.
-    let refused = worker.send(json!({"command": "check_many", "session": session, "queries": [[99, 0]]}));
+    let refused =
+        worker.send(json!({"command": "check_many", "session": session, "queries": [[99, 0]]}));
     assert_eq!(refused["event"], "error", "{}", refused);
     assert_eq!(worker.send(json!({"command": "close", "session": session}))["event"], "closed");
     worker.finish(false);

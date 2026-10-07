@@ -884,7 +884,9 @@ impl Verifier {
                 strategy_ladder: self.strategy_ladder(),
                 retain_only: self.resident_retain_only,
                 input_files: std::mem::take(&mut self.resident_inputs),
-                max_live_solvers: self.resident_max_solvers.filter(|_| self.resident_max_solvers_apply()),
+                max_live_solvers: self
+                    .resident_max_solvers
+                    .filter(|_| self.resident_max_solvers_apply()),
                 rlimit: self.args.rlimit,
             },
         )
