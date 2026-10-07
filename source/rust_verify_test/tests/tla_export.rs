@@ -3357,8 +3357,8 @@ fn tla_export_disables_a_require_let_that_does_not_match() {
 }
 
 /// An `_ => arbitrary()` arm outside VerusSync's `require let` may be
-/// reached, where Verus gives it some value: `arbitrary()` is refused
-/// there, as any function without a body is, so the report says so.
+/// reached, where Verus gives it some value: `arbitrary()` is a nullary
+/// table hole whose interpretation the model author must supply.
 const ARBITRARY_ARM: &str = r#"
 verus! {
 pub struct State { pub o: Option<int>, pub x: int }
@@ -3378,7 +3378,7 @@ pub open spec fn small(s: State) -> bool { s.x <= 2 }
 "#;
 
 #[test]
-fn tla_export_refuses_an_arbitrary_arm_outside_verussync() {
+fn tla_export_tables_an_arbitrary_arm_outside_verussync() {
     let ex = export_code(ARBITRARY_ARM, "test_crate");
     let refusals: Vec<&str> = ex.report["refusals"]
         .as_array()
@@ -3386,15 +3386,19 @@ fn tla_export_refuses_an_arbitrary_arm_outside_verussync() {
         .iter()
         .map(|r| r["what"].as_str().unwrap())
         .collect();
-    assert_eq!(refusals, ["uninterpreted function"], "{}", ex.tla);
+    assert!(refusals.is_empty(), "{}", ex.tla);
     assert!(!ex.tla.contains("arbitrary() (an unspecified value)"), "{}", ex.tla);
     let Some(jar) = tla_tools() else { return };
     sany(&jar, &ex.spec());
+    let cfg = supply_arbitrary_int(&ex, &ex.cfg);
+    let run = tlc(&jar, &ex.spec(), &cfg);
+    assert!(run.violated.is_empty(), "{:?}", run);
+    assert_eq!(run.distinct, 3);
 }
 
 /// In a VerusSync model too, only the `_ => arbitrary()` arms of the
 /// macro's own matches are exempt: `user_arb`'s `match` on a field may
-/// reach its arm, so `arbitrary()` is refused there. `have m >= [k => let
+/// reach its arm, so `arbitrary()` is a table hole there. `have m >= [k => let
 /// Some(x)]` is guarded like `remove`: on key 2, which holds None, `peek`
 /// is disabled. An `assert let` that does not match (`check` after `kill`)
 /// stops TLC at the VerusSync assert, before the `let` reads the fields.
@@ -3455,7 +3459,7 @@ fn main() {}
 "#;
 
 #[test]
-fn tla_export_refuses_a_user_arbitrary_arm_in_verussync() {
+fn tla_export_tables_a_user_arbitrary_arm_in_verussync() {
     let src = TempDir::new().expect("temp dir");
     let entry = src.path().join("sync_arbitrary.rs");
     std::fs::write(&entry, SYNC_ARBITRARY).unwrap();
@@ -3467,12 +3471,13 @@ fn tla_export_refuses_a_user_arbitrary_arm_in_verussync() {
         .iter()
         .map(|r| r["what"].as_str().unwrap())
         .collect();
-    assert_eq!(refusals, ["uninterpreted function"], "{}", ex.tla);
+    assert!(refusals.is_empty(), "{}", ex.tla);
     // `peek`'s and `check`'s arms are exempt; `user_arb`'s is not.
     assert_eq!(ex.tla.matches("arbitrary() (an unspecified value)").count(), 2, "{}", ex.tla);
     let Some(jar) = tla_tools() else { return };
     sany(&jar, &ex.spec());
     let cfg = format!("{}CONSTANTS\n  Dom_Step_peek_v0 = {{1, 2}}\n", ex.cfg);
+    let cfg = supply_arbitrary_int(&ex, &cfg);
     let out = tlc_output(&jar, &ex.spec(), &cfg);
     // TLC evaluates `peek(2)` and `user_arb` on the initial state, and
     // `check` after `kill` two steps on: only the assert stops it.
@@ -9001,4 +9006,335 @@ pub open spec fn some(s: State) -> bool { exists|c: Multiset<int>| c.len() == s.
     assert!(ex.tla.contains("\\E c \\in Dom_Multiset_int :"), "{}", ex.tla);
     let Some(jar) = tla_tools() else { return };
     sany(&jar, &ex.spec());
+}
+
+/// Concrete type arguments must reach trait calls nested in generic helpers.
+/// Two instantiations exercise operator and table identity, including Self::V.
+#[test]
+fn tla_export_generic_dispatch_instances() {
+    let ex = export_code(
+        r#"
+verus! {
+pub trait Dispatch { type V; spec fn init_spec() -> Self::V; spec fn step(v: Self::V) -> Self::V; }
+pub struct Toggle;
+pub struct Stay;
+impl Dispatch for Toggle {
+    type V = bool;
+    open spec fn init_spec() -> bool { false }
+    open spec fn step(v: bool) -> bool { !v }
+}
+impl Dispatch for Stay {
+    type V = bool;
+    open spec fn init_spec() -> bool { true }
+    open spec fn step(v: bool) -> bool { v }
+}
+pub open spec fn start<D: Dispatch>() -> D::V { D::init_spec() }
+pub open spec fn step<D: Dispatch>(v: D::V) -> D::V { D::step(v) }
+pub struct State { pub x: bool, pub y: bool }
+pub open spec fn init(s: State) -> bool { s.x == start::<Toggle>() && s.y == start::<Stay>() }
+pub open spec fn next(pre: State, post: State) -> bool { post.x == step::<Toggle>(pre.x) && post.y == step::<Stay>(pre.y) }
+pub open spec fn inv(s: State) -> bool { s.y }
+}
+"#,
+        "test_crate",
+    );
+    assert_eq!(ex.report["refusals"], serde_json::json!([]), "{}", ex.tla);
+    assert_eq!(ex.report["holes"], serde_json::json!([]), "{}", ex.tla);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let run = tlc(&jar, &ex.spec(), &ex.cfg);
+    assert!(run.violated.is_empty(), "{:?}", run);
+    assert_eq!(run.distinct, 2);
+}
+
+#[test]
+fn tla_export_uninterpreted_tables() {
+    let ex = export_code(
+        r#"
+verus! {
+pub uninterp spec fn initial() -> bool;
+pub uninterp spec fn change(a: bool, b: bool) -> bool;
+pub struct State { pub x: bool }
+pub open spec fn init(s: State) -> bool { s.x == initial() }
+pub open spec fn next(pre: State, post: State) -> bool { post.x == change(pre.x, true) }
+pub open spec fn inv(s: State) -> bool { change(s.x, false) == s.x }
+}
+"#,
+        "test_crate",
+    );
+    assert_eq!(ex.report["refusals"], serde_json::json!([]), "{}", ex.tla);
+    let tables: Vec<_> = ex.report["holes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|h| h["kind"] == "uninterpreted_function")
+        .collect();
+    assert_eq!(tables.len(), 2, "{}", ex.tla);
+    let initial = tables
+        .iter()
+        .find(|h| h["variable"].as_str().unwrap().ends_with("initial"))
+        .unwrap()["constant"]
+        .as_str()
+        .unwrap();
+    let change = tables
+        .iter()
+        .find(|h| h["variable"].as_str().unwrap().ends_with("change"))
+        .unwrap()["constant"]
+        .as_str()
+        .unwrap();
+    let text = ex.tla.replace("=============================", "InitialTable == [k \\in {<<>>} |-> FALSE]\nChangeTable == [k \\in {<<a,b>> : a \\in BOOLEAN, b \\in BOOLEAN} |-> IF k[2] THEN ~k[1] ELSE k[1]]\n====");
+    std::fs::write(ex.spec(), text).unwrap();
+    let cfg = format!(
+        "{}\nCONSTANT {initial} <- InitialTable\nCONSTANT {change} <- ChangeTable\n",
+        ex.cfg
+    );
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let run = tlc(&jar, &ex.spec(), &cfg);
+    assert!(run.violated.is_empty(), "{:?}", run);
+    assert_eq!(run.distinct, 2);
+}
+
+#[test]
+fn tla_export_uninterpreted_nat_carrier_is_typed() {
+    let ex = export_code(
+        r#"
+verus! {
+pub uninterp spec fn value(b: bool) -> nat;
+pub struct State { pub x: nat }
+pub open spec fn init(s: State) -> bool { s.x == value(false) }
+pub open spec fn next(pre: State, post: State) -> bool { post.x == value(true) }
+pub open spec fn inv(s: State) -> bool { s.x <= 1 }
+}
+"#,
+        "test_crate",
+    );
+    assert_eq!(ex.report["refusals"], serde_json::json!([]), "{}", ex.tla);
+    let table = ex.report["holes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|h| h["kind"] == "uninterpreted_function")
+        .unwrap()["constant"]
+        .as_str()
+        .unwrap();
+    std::fs::write(
+        ex.spec(),
+        ex.tla.replace(
+            "=============================",
+            "TableValue == [k \\in {<<b>> : b \\in BOOLEAN} |-> IF k[1] THEN 1 ELSE 0]\n====",
+        ),
+    )
+    .unwrap();
+    let cfg = format!("{}\nCONSTANT {table} <- TableValue\nCONSTANT Dom_nat = {{0, 1}}\n", ex.cfg);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let run = tlc(&jar, &ex.spec(), &cfg);
+    assert!(run.violated.is_empty(), "{:?}", run);
+    assert_eq!(run.distinct, 2);
+    let text = std::fs::read_to_string(ex.spec()).unwrap();
+    std::fs::write(ex.spec(), text.replace("\n====", "\nBadCarrier == {-1, 0, 1}\n====")).unwrap();
+    let bad =
+        tlc_output(&jar, &ex.spec(), &cfg.replace("Dom_nat = {0, 1}", "Dom_nat <- BadCarrier"));
+    assert!(bad.contains("Assumption") && bad.contains("false"), "{}", bad);
+}
+
+/// A model author supplies this interpretation; the exporter never picks it.
+fn supply_arbitrary_int(ex: &Exported, cfg: &str) -> String {
+    let table = ex.report["holes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|h| h["kind"] == "uninterpreted_function")
+        .unwrap()["constant"]
+        .as_str()
+        .unwrap();
+    std::fs::write(
+        ex.spec(),
+        ex.tla.replace(
+            "=============================",
+            "ArbitraryTable == [k \\in {<<>>} |-> 0]\n=============================",
+        ),
+    )
+    .unwrap();
+    format!("{cfg}\nCONSTANT {table} <- ArbitraryTable\nCONSTANT Dom_int = {{0}}\n")
+}
+
+#[test]
+fn tla_export_concrete_generic_machine_dispatch() {
+    let ex = export_code_with(
+        r#"
+use verus_state_machines_macros::*;
+verus! {
+pub trait Dispatch { type V; spec fn initial() -> Self::V; spec fn step(v: Self::V) -> Self::V; }
+pub struct Toggle;
+impl Dispatch for Toggle {
+    type V = bool;
+    open spec fn initial() -> bool { false }
+    open spec fn step(v: bool) -> bool { !v }
+}
+state_machine! { Machine<D: Dispatch> {
+    fields { pub value: D::V }
+    init! { initialize() { init value = D::initial(); } }
+    transition! { flip() { update value = D::step(pre.value); } }
+}}
+pub mod concrete {
+    use super::*;
+    pub open spec fn init(s: Machine::State<Toggle>) -> bool { Machine::State::init(s) }
+    pub open spec fn next(pre: Machine::State<Toggle>, post: Machine::State<Toggle>) -> bool { Machine::State::next(pre, post) }
+}
+}
+"#,
+        "test_crate::concrete",
+        &["--no-verify"],
+    );
+    assert_eq!(ex.report["refusals"], serde_json::json!([]), "{}", ex.tla);
+    assert_eq!(ex.report["holes"], serde_json::json!([]), "{}", ex.tla);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let run = tlc(&jar, &ex.spec(), &ex.cfg);
+    assert_eq!(run.distinct, 2, "{:?}", run);
+}
+
+#[test]
+fn tla_export_trait_without_impl_has_abstract_typed_table() {
+    let ex = export_code(
+        r#"
+verus! {
+pub trait Dispatch { type V; spec fn initial() -> Self::V; spec fn step(v: Self::V) -> Self::V; }
+pub struct State<D: Dispatch> { pub value: D::V }
+pub open spec fn init<D: Dispatch>(s: State<D>) -> bool { s.value == D::initial() }
+pub open spec fn next<D: Dispatch>(pre: State<D>, post: State<D>) -> bool { post.value == D::step(pre.value) }
+}
+"#,
+        "test_crate",
+    );
+    assert_eq!(ex.report["refusals"], serde_json::json!([]), "{}", ex.tla);
+    let holes = ex.report["holes"].as_array().unwrap();
+    let mut cfg = ex.cfg.clone();
+    let mut supplied = std::collections::BTreeSet::new();
+    for h in holes {
+        let c = h["constant"].as_str().unwrap();
+        if !supplied.insert(c) {
+            continue;
+        }
+        if h["kind"] == "uninterpreted_function" {
+            let op = if h["variable"].as_str().unwrap().contains("initial") {
+                "InitialTable"
+            } else {
+                "StepTable"
+            };
+            cfg.push_str(&format!("CONSTANT {c} <- {op}\n"));
+        } else {
+            cfg.push_str(&format!("CONSTANT {c} = {{TRUE, FALSE}}\n"));
+        }
+    }
+    std::fs::write(ex.spec(), ex.tla.replace("=============================", "InitialTable == [k \\in {<<>>} |-> FALSE]\nStepTable == [k \\in {<<b>> : b \\in BOOLEAN} |-> ~k[1]]\n=============================")).unwrap();
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let run = tlc(&jar, &ex.spec(), &cfg);
+    assert_eq!(run.distinct, 2, "{:?}", run);
+}
+
+#[test]
+fn tla_export_dispatch_through_generic_impl() {
+    let ex = export_code(
+        r#"
+verus! {
+pub trait Measure { spec fn measure(&self) -> bool; }
+pub struct Wrapped<T> { pub value: T }
+impl<T> Measure for Wrapped<T> { open spec fn measure(&self) -> bool { true } }
+pub open spec fn generic<M: Measure>(v: M) -> bool { v.measure() }
+pub struct State { pub x: bool }
+pub open spec fn init(s: State) -> bool { s.x == false }
+pub open spec fn next(pre: State, post: State) -> bool { post.x == generic(Wrapped { value: pre.x }) }
+pub open spec fn inv(s: State) -> bool { generic(Wrapped { value: s.x }) }
+}
+"#,
+        "test_crate",
+    );
+    assert_eq!(ex.report["refusals"], serde_json::json!([]), "{}", ex.tla);
+    assert_eq!(ex.report["holes"], serde_json::json!([]), "{}", ex.tla);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let run = tlc(&jar, &ex.spec(), &ex.cfg);
+    assert_eq!(run.distinct, 2, "{:?}", run);
+    assert!(run.violated.is_empty(), "{:?}", run);
+}
+
+#[test]
+fn tla_export_one_table_for_pre_and_post_state_calls() {
+    let ex = export_code(
+        r#"
+verus! {
+pub struct State { pub x: bool }
+pub uninterp spec fn value(s: State) -> bool;
+pub open spec fn init(s: State) -> bool { s.x == false }
+pub open spec fn next(pre: State, post: State) -> bool {
+    post.x == !pre.x && value(pre) != value(post)
+}
+pub open spec fn inv(s: State) -> bool { value(s) == s.x }
+}
+"#,
+        "test_crate:inv",
+    );
+    assert_eq!(ex.report["refusals"], serde_json::json!([]), "{}", ex.tla);
+    let names: std::collections::BTreeSet<_> = ex.report["holes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|h| h["kind"] == "uninterpreted_function")
+        .map(|h| h["constant"].as_str().unwrap())
+        .collect();
+    assert_eq!(names.len(), 1, "{}", ex.tla);
+    let table = names.iter().next().unwrap();
+    std::fs::write(ex.spec(), ex.tla.replace("=============================", "Chosen == [k \\in {<<[x |-> b]>> : b \\in BOOLEAN} |-> k[1].x]\n=============================")).unwrap();
+    let cfg = format!("{}CONSTANT {table} <- Chosen\n", ex.cfg);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let run = tlc(&jar, &ex.spec(), &cfg);
+    assert!(run.violated.is_empty(), "{:?}", run);
+    assert_eq!(run.distinct, 2, "{:?}", run);
+}
+
+#[test]
+fn tla_export_typed_collection_table_carriers() {
+    let ex = export_code(
+        r#"
+verus! {
+pub struct State { pub x: Seq<nat> }
+pub uninterp spec fn value(s: Seq<nat>) -> Option<Seq<nat>>;
+pub open spec fn init(s: State) -> bool { s.x == Seq::<nat>::empty() }
+pub open spec fn next(pre: State, post: State) -> bool {
+    post.x == if pre.x.len() == 0 { Seq::<nat>::empty().push(0) } else { Seq::<nat>::empty() }
+}
+pub open spec fn inv(s: State) -> bool { value(s.x) == Some(s.x) }
+}
+"#,
+        "test_crate",
+    );
+    assert_eq!(ex.report["refusals"], serde_json::json!([]), "{}", ex.tla);
+    let mut cfg = ex.cfg.clone();
+    let mut seen = std::collections::BTreeSet::new();
+    for h in ex.report["holes"].as_array().unwrap() {
+        let c = h["constant"].as_str().unwrap();
+        if !seen.insert(c) {
+            continue;
+        }
+        let interpretation =
+            if h["kind"] == "uninterpreted_function" { "Chosen" } else { "Carrier" };
+        cfg.push_str(&format!("CONSTANT {c} <- {interpretation}\n"));
+    }
+    std::fs::write(ex.spec(), ex.tla.replace("=============================", "Carrier == {<<>>, <<0>>}\nChosen == [k \\in {<<s>> : s \\in Carrier} |-> [tag |-> \"Some\", v0 |-> k[1]]]\n=============================")).unwrap();
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let run = tlc(&jar, &ex.spec(), &cfg);
+    assert!(run.violated.is_empty(), "{:?}", run);
+    assert_eq!(run.distinct, 2, "{:?}", run);
+    let text = std::fs::read_to_string(ex.spec())
+        .unwrap()
+        .replace("Carrier == {<<>>, <<0>>}", "Carrier == {<<>>, <<-1>>}");
+    std::fs::write(ex.spec(), text).unwrap();
+    let bad = tlc_output(&jar, &ex.spec(), &cfg);
+    assert!(bad.contains("Assumption") && bad.contains("false"), "{}", bad);
 }

@@ -166,6 +166,11 @@ pub struct Refusal {
 /// `CONSTANT` for it.
 #[derive(Debug, Clone, Serialize)]
 pub struct Hole {
+    /// Absent for legacy domain/value holes, preserving existing reports.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
     pub variable: String,
     pub typ: String,
     pub constant: String,
@@ -813,6 +818,10 @@ struct Exporter {
     /// The 0-ary functions standing for the model's constants (see
     /// [`Exporter::close_extras`]), and the operator each is.
     constant_ops: HashMap<Fun, String>,
+    instances: Vec<(Fun, Typs, Fun)>,
+    assoc_types: Vec<AssocTypeImpl>,
+    tables: BTreeMap<String, (String, Vec<String>)>,
+    table_names: HashMap<Fun, String>,
 }
 
 fn ident_name(v: &VarIdent) -> String {
@@ -993,6 +1002,12 @@ fn typ_name_with(typ: &Typ, datatype: &mut dyn FnMut(&Path) -> String) -> String
         }
         TypX::Decorate(_, _, t) | TypX::Boxed(t) => typ_name_with(t, datatype),
         TypX::TypParam(x) => x.to_string(),
+        TypX::Projection { trait_typ_args, trait_path, name } => format!(
+            "{}_{}_{}",
+            datatype(trait_path),
+            name,
+            trait_typ_args.iter().map(|t| typ_name_with(t, datatype)).collect::<Vec<_>>().join("_")
+        ),
         _ => "T".into(),
     }
 }
@@ -2818,7 +2833,7 @@ impl Exporter {
 
     fn call(&mut self, e: &Expr, target: &CallTarget, args: &Exprs, env: &Env) -> String {
         match target {
-            CallTarget::Fun(kind, fun, _typs, _, _) => {
+            CallTarget::Fun(kind, fun, typs, _, _) => {
                 // The arguments are operands; only the call itself is at the
                 // caller's level (restored for `ensure_function` below).
                 let level = std::mem::replace(&mut self.conj_level, false);
@@ -2853,7 +2868,7 @@ impl Exporter {
                         _ => {}
                     }
                 }
-                let fun = &self.resolved_fun(kind, fun);
+                let fun = &self.instantiate_call(kind, fun, typs);
                 // `<_ as View>::view(&[a, b])` (`seq![a, b]`) resolves to the
                 // array's `View` impl.
                 if vstd_op(&fun_as_friendly_rust_name(fun)) == Some("array_view") {
@@ -2984,6 +2999,385 @@ impl Exporter {
             }
         }
         fun.clone()
+    }
+
+    /// Match an impl's type pattern against an already checked call. Never
+    /// select by method name or receiver alone: every trait argument matters.
+    fn match_impl_type(pattern: &Typ, actual: &Typ, subst: &mut HashMap<Ident, Typ>) -> bool {
+        match (&**pattern, &**actual) {
+            (TypX::TypParam(p), _) => match subst.get(p) {
+                Some(t) => crate::ast_util::types_equal(t, actual),
+                None => {
+                    subst.insert(p.clone(), actual.clone());
+                    true
+                }
+            },
+            (TypX::Datatype(p, ps, _), TypX::Datatype(a, ts, _))
+                if p == a && ps.len() == ts.len() =>
+            {
+                ps.iter().zip(ts.iter()).all(|(p, a)| Self::match_impl_type(p, a, subst))
+            }
+            (TypX::Decorate(pd, pa, p), TypX::Decorate(ad, aa, a)) if pd == ad => {
+                let allocator = match (pa, aa) {
+                    (None, None) => true,
+                    (Some(p), Some(a)) => {
+                        Self::match_impl_type(&p.allocator_typ, &a.allocator_typ, subst)
+                    }
+                    _ => false,
+                };
+                allocator && Self::match_impl_type(p, a, subst)
+            }
+            (TypX::Boxed(p), TypX::Boxed(a)) => Self::match_impl_type(p, a, subst),
+            _ => crate::ast_util::types_equal(pattern, actual),
+        }
+    }
+
+    fn normalize_type(&self, typ: &Typ) -> Typ {
+        crate::ast_visitor::map_typ_visitor_env(typ, &mut (), &|_, t| {
+            if let TypX::Projection { trait_typ_args, trait_path, name } = &**t {
+                let candidates: Vec<_> = self
+                    .assoc_types
+                    .iter()
+                    .filter_map(|a| {
+                        if a.x.trait_path != *trait_path
+                            || a.x.name != *name
+                            || a.x.trait_typ_args.len() != trait_typ_args.len()
+                        {
+                            return None;
+                        }
+                        let mut subst = HashMap::new();
+                        a.x.trait_typ_args
+                            .iter()
+                            .zip(trait_typ_args.iter())
+                            .all(|(p, t)| Self::match_impl_type(p, t, &mut subst))
+                            .then(|| crate::sst_util::subst_typ(&subst, &a.x.typ))
+                    })
+                    .collect();
+                if let [typ] = candidates.as_slice() {
+                    return Ok(typ.clone());
+                }
+            }
+            Ok(t.clone())
+        })
+        .expect("associated type normalization")
+    }
+
+    /// Preserve existing polymorphic operators when no dispatch or opaque
+    /// function depends on their type arguments.
+    fn needs_instance(&self, fun: &Fun, seen: &mut HashSet<Fun>) -> bool {
+        if !seen.insert(fun.clone()) {
+            return false;
+        }
+        let Some(f) = self.functions.get(fun) else { return false };
+        let Some(body) = &f.x.body else { return true };
+        crate::ast_visitor::expr_visitor_check(body, &mut |_, e| {
+            if let ExprX::Call { target: CallTarget::Fun(kind, callee, ..), .. } = &e.x {
+                if vstd_op(&fun_as_friendly_rust_name(callee)).is_some() {
+                    return Ok(());
+                }
+                if matches!(kind, CallTargetKind::Dynamic)
+                    || self.needs_instance(&self.resolved_fun(kind, callee), seen)
+                {
+                    return Err(());
+                }
+            }
+            Ok(())
+        })
+        .is_err()
+    }
+
+    /// Specialize before rendering: type arguments on calls inside a generic
+    /// body must be substituted too, including associated type projections.
+    fn instantiate_call(&mut self, kind: &CallTargetKind, fun: &Fun, typs: &Typs) -> Fun {
+        let resolved = self.resolved_fun(kind, fun);
+        let mut ts = match kind {
+            CallTargetKind::DynamicResolved { typs, .. } if resolved != *fun => typs.clone(),
+            _ => typs.clone(),
+        };
+        if vstd_op(&fun_as_friendly_rust_name(&resolved)).is_some() {
+            return resolved;
+        }
+        let mut target = resolved;
+        if matches!(kind, CallTargetKind::Dynamic) && !ts.iter().any(typ_mentions_param) {
+            let matches: Vec<_> = self
+                .functions
+                .values()
+                .filter_map(|f| {
+                    let FunctionKind::TraitMethodImpl {
+                        method,
+                        trait_typ_args,
+                        inherit_body_from,
+                        ..
+                    } = &f.x.kind
+                    else {
+                        return None;
+                    };
+                    if method != fun || trait_typ_args.len() > ts.len() {
+                        return None;
+                    }
+                    let mut subst = HashMap::new();
+                    if !trait_typ_args
+                        .iter()
+                        .zip(ts.iter())
+                        .all(|(p, a)| Self::match_impl_type(p, a, &mut subst))
+                    {
+                        return None;
+                    }
+                    if let Some(default) = inherit_body_from {
+                        return Some((default.clone(), ts.clone()));
+                    }
+                    let args: Option<Vec<_>> =
+                        f.x.typ_params.iter().map(|p| subst.get(p).cloned()).collect();
+                    Some((f.x.name.clone(), Arc::new(args?)))
+                })
+                .collect();
+            if let [(only, args)] = matches.as_slice() {
+                target = only.clone();
+                ts = args.clone();
+            }
+        }
+        let Some(f) = self.functions.get(&target).cloned() else { return target };
+        if f.x.typ_params.is_empty()
+            || f.x.typ_params.len() != ts.len()
+            || !self.needs_instance(&target, &mut HashSet::new())
+        {
+            return target;
+        }
+        if let Some((_, _, instance)) = self
+            .instances
+            .iter()
+            .find(|(base, args, _)| base == &target && crate::ast_util::n_types_equal(args, &ts))
+        {
+            return instance.clone();
+        }
+        let subst: HashMap<Ident, Typ> =
+            f.x.typ_params.iter().cloned().zip(ts.iter().cloned()).collect();
+        let specialized = crate::ast_visitor::map_function_visitor_env(
+            &f,
+            &mut crate::ast_visitor::VisitorScopeMap::new(),
+            &mut (),
+            &|_, _, e| Ok(e.clone()),
+            &|_, _, s| Ok(vec![s.clone()]),
+            &|_, t| {
+                let t = crate::sst_util::subst_typ(&subst, t);
+                Ok(self.normalize_type(&t))
+            },
+            &|_, _, p| Ok(p.clone()),
+        )
+        .expect("function type substitution");
+        let instance = self.synthetic(
+            &specialized,
+            specialized.x.params.as_ref().clone(),
+            specialized.x.body.clone(),
+            &specialized.x.ret.x.typ,
+        );
+        // synthetic is also used for wrappers, which drop preconditions. An
+        // instantiation preserves the complete contract instead.
+        let mut x = specialized.x.clone();
+        x.name = instance.clone();
+        x.typ_params = Arc::new(vec![]);
+        self.functions.insert(instance.clone(), specialized.new_x(x));
+        self.instances.push((target, ts.clone(), instance.clone()));
+        instance
+    }
+
+    /// Unlike TypeOK (whose values come from the source), user-supplied
+    /// carriers need membership checks even for booleans and signed integers.
+    fn table_type_pred(&mut self, v: &str, typ: &Typ, seen: &mut Vec<Typ>) -> Option<String> {
+        let normalized = self.normalize_type(typ);
+        let typ = &normalized;
+        match &**typ {
+            TypX::Bool => Some(format!("{v} \\in BOOLEAN")),
+            TypX::Int(IntRange::Char) => Some(format!("({v} \\in STRING /\\ Len({v}) = 1)")),
+            TypX::Int(r) => Some(match int_range_pred(v, r) {
+                Some(p) => format!("({v} \\in Int /\\ {p})"),
+                None => format!("{v} \\in Int"),
+            }),
+            TypX::Decorate(_, _, t) | TypX::Boxed(t) => self.table_type_pred(v, t, seen),
+            TypX::Datatype(Dt::Path(p), args, _) => {
+                let n = collection_name(p);
+                if matches!(
+                    n.as_str(),
+                    "vstd::seq::Seq"
+                        | "vstd::set::Set"
+                        | "vstd::map::Map"
+                        | "vstd::multiset::Multiset"
+                ) {
+                    let x = self.bind("item__");
+                    return match n.as_str() {
+                        "vstd::seq::Seq" => {
+                            let pred =
+                                self.table_type_pred(&format!("{v}[{x}]"), args.first()?, seen)?;
+                            Some(format!(
+                                "(DOMAIN {v} = 1..Len({v}) /\\ (\\A {x} \\in 1..Len({v}) : {pred}))"
+                            ))
+                        }
+                        "vstd::set::Set" => {
+                            let pred = self.table_type_pred(&x, args.first()?, seen)?;
+                            Some(format!("\\A {x} \\in {v} : {pred}"))
+                        }
+                        _ => {
+                            let k = self.table_type_pred(&x, args.first()?, seen)?;
+                            let value = format!("{v}[{x}]");
+                            let p = if n == "vstd::map::Map" {
+                                self.table_type_pred(&value, args.get(1)?, seen)?
+                            } else {
+                                format!("({value} \\in Nat /\\ {value} > 0)")
+                            };
+                            Some(format!("\\A {x} \\in DOMAIN {v} : ({k}) /\\ ({p})"))
+                        }
+                    };
+                }
+                if seen.iter().any(|t| crate::ast_util::types_equal(t, typ)) {
+                    return None;
+                }
+                let d = self.datatypes.get(p)?.clone();
+                if matches!(d.x.transparency, DatatypeTransparency::Never)
+                    || d.x.typ_params.len() != args.len()
+                {
+                    return None;
+                }
+                seen.push(typ.clone());
+                let mut variants = Vec::new();
+                for variant in d.x.variants.iter() {
+                    let tagged = d.x.variants.len() > 1;
+                    let mut preds = Vec::new();
+                    let mut fields = Vec::new();
+                    if tagged {
+                        fields.push("\"tag\"".into());
+                        preds.push(format!("{v}.tag = \"{}\"", variant.name));
+                    }
+                    if !tagged && variant.fields.is_empty() {
+                        fields.push("\"tag\"".into());
+                        preds.push(format!("{v}.tag = \"unit\""));
+                    }
+                    for f in variant.fields.iter() {
+                        let field = field_name(&f.name);
+                        fields.push(format!("\"{field}\""));
+                        let t =
+                            crate::sst_util::subst_typ_for_datatype(&d.x.typ_params, args, &f.a.0);
+                        preds.push(self.table_type_pred(&format!("{v}.{field}"), &t, seen)?);
+                    }
+                    preds.insert(0, format!("DOMAIN {v} = {{{}}}", fields.join(", ")));
+                    variants.push(format!("({})", preds.join(" /\\ ")));
+                }
+                seen.pop();
+                Some(format!("({})", variants.join(" \\/ ")))
+            }
+            TypX::Datatype(Dt::Tuple(_), args, _) => {
+                let mut parts = vec![format!("DOMAIN {v} = 1..{}", args.len())];
+                for (i, t) in args.iter().enumerate() {
+                    parts.push(self.table_type_pred(&format!("{v}[{}]", i + 1), t, seen)?);
+                }
+                Some(format!("({})", parts.join(" /\\ ")))
+            }
+            TypX::Primitive(Primitive::StrSlice, _) => Some(format!("{v} \\in STRING")),
+            TypX::TypParam(_) | TypX::Projection { .. } => {
+                let (fun, _, _) = self.current_key.as_ref()?;
+                let span = self.functions.get(fun)?.span.clone();
+                let dom = self.type_domain("abstract carrier", typ, &span);
+                Some(format!("{v} \\in {dom}"))
+            }
+            _ => None,
+        }
+    }
+
+    /// One mathematical function value per concrete function, shared by all
+    /// state variants. Tuple keys also cover nullary and multi-argument calls.
+    fn uninterpreted(&mut self, f: &Function, env: &Env) -> String {
+        if f.x.mode != Mode::Spec {
+            return self.refuse("uninterpreted non-spec function", &f.span);
+        }
+        let constant = if let Some(c) = self.table_names.get(&f.x.name) {
+            c.clone()
+        } else {
+            let c = self.bind(&format!("Table_{}", last_segment(&f.x.name.path)));
+            self.used_names.insert(c.clone());
+            self.table_names.insert(f.x.name.clone(), c.clone());
+            c
+        };
+        let args: Vec<_> =
+            f.x.params
+                .iter()
+                .map(|p| match env.roles.get(&p.x.name) {
+                    Some(r) => self.state_record(*r),
+                    None => env.name(&p.x.name),
+                })
+                .collect();
+        if !self.tables.contains_key(&constant) {
+            let mut domains = Vec::new();
+            let mut assumptions = Vec::new();
+            let mut table_env = Env::new();
+            let mut binders = Vec::new();
+            let mut names = Vec::new();
+            for p in f.x.params.iter() {
+                let d = self.type_domain(&ident_name(&p.x.name), &p.x.typ, &p.span);
+                let n = self.bind_var(&mut table_env, &p.x.name);
+                binders.push(format!("{n} \\in {d}"));
+                names.push(n);
+                domains.push(d);
+            }
+            let result = self.type_domain("result", &f.x.ret.x.typ, &f.span);
+            let domain = if binders.is_empty() {
+                "{<<>>}".to_string()
+            } else {
+                format!("{{<<{}>> : {}}}", names.join(", "), binders.join(", "))
+            };
+            let signature = format!("[{domain} -> {result}]");
+            assumptions.push(format!("{constant} \\in {signature}"));
+            table_env
+                .names
+                .insert(f.x.ret.x.name.clone(), format!("{constant}[<<{}>>]", names.join(", ")));
+            if !(f.x.ensure.0.is_empty() && f.x.ensure.1.is_empty()) {
+                let requires: Vec<_> =
+                    f.x.require.iter().map(|e| self.expr(e, &table_env)).collect();
+                let ensures: Vec<_> =
+                    f.x.ensure
+                        .0
+                        .iter()
+                        .chain(f.x.ensure.1.iter())
+                        .map(|e| self.expr(e, &table_env))
+                        .collect();
+                if let Some(contract) = table_contract(&binders, &requires, &ensures) {
+                    assumptions.push(contract);
+                }
+            }
+            let mut holes: Vec<_> =
+                self.hole_typs.iter().map(|(c, t)| (c.clone(), t.clone())).collect();
+            holes.sort_by(|a, b| a.0.cmp(&b.0));
+            for (c, t) in holes {
+                if !domains.iter().chain(std::iter::once(&result)).any(|d| {
+                    d.split(|ch: char| !ch.is_alphanumeric() && ch != '_').any(|word| word == c)
+                }) {
+                    continue;
+                }
+                let v = self.bind("element__");
+                if matches!(&*t, TypX::TypParam(_) | TypX::Projection { .. }) {
+                    let carrier = self.type_domain("abstract carrier", &t, &f.span);
+                    assumptions
+                        .push(format!("IsFiniteSet({carrier}) /\\ {c} \\subseteq {carrier}"));
+                } else if let Some(p) = self.table_type_pred(&v, &t, &mut Vec::new()) {
+                    assumptions.push(format!("\\A {v} \\in {c} : {p}"));
+                } else {
+                    return self.refuse(
+                        format!(
+                            "uninterpreted function carrier type {} cannot be constrained",
+                            typ_name(&t)
+                        ),
+                        &f.span,
+                    );
+                }
+            }
+            self.tables.insert(constant.clone(), (signature, assumptions));
+        }
+        self.constants.insert(constant.clone());
+        self.hole_owners.push(self.current_key.clone());
+        self.holes.push(Hole { kind: Some("uninterpreted_function".into()),
+            warning: Some("Supply a finite function table. Finite carriers restrict the source model; a TLC verdict covers only this interpretation and these carriers.".into()),
+            variable: fun_as_friendly_rust_name(&f.x.name),
+            typ: self.tables[&constant].0.clone(), constant: constant.clone(),
+            location: span_string(&f.span), in_function: self.current.clone() });
+        format!("{constant}[<<{}>>]", args.join(", "))
     }
 
     /// Bind parameters to the arguments of an application that is reduced
@@ -3890,6 +4284,8 @@ impl Exporter {
                         self.hole_typs.insert(constant.clone(), ftyp.clone());
                         self.hole_owners.push(self.current_key.clone());
                         self.holes.push(Hole {
+                            kind: None,
+                            warning: None,
                             variable: format!("{vname}.{}", field_name(f)),
                             typ: typ_name(ftyp),
                             constant: constant.clone(),
@@ -4118,6 +4514,8 @@ impl Exporter {
         span: &crate::messages::Span,
         seen: &mut Vec<Path>,
     ) -> Option<(String, u128)> {
+        let normalized = self.normalize_type(typ);
+        let typ = &normalized;
         match &**typ {
             TypX::Bool => Some(("BOOLEAN".into(), 2)),
             TypX::Int(range @ (IntRange::U(_) | IntRange::I(_))) => match int_type_bounds(range) {
@@ -4321,6 +4719,8 @@ impl Exporter {
                         self.hole_typs.insert(constant.clone(), ftyp.clone());
                         self.hole_owners.push(self.current_key.clone());
                         self.holes.push(Hole {
+                            kind: None,
+                            warning: None,
                             variable,
                             typ: typ_name(ftyp),
                             constant: constant.clone(),
@@ -4977,7 +5377,7 @@ impl Exporter {
         } else {
             match &f.x.body {
                 Some(b) => self.expr(b, &env),
-                None => self.refuse("uninterpreted function", &f.span),
+                None => self.uninterpreted(&f, &env),
             }
         };
         let head =
@@ -5745,6 +6145,18 @@ fn is_char_typ(typ: &Typ) -> bool {
     matches!(&*crate::ast_util::undecorate_typ(typ), TypX::Int(IntRange::Char))
 }
 
+/// Contract clauses constrain a table only where its precondition holds.
+/// Spec-function `require` clauses are recommends, not partiality: without
+/// ensures they impose no restriction on an otherwise total spec function.
+fn table_contract(binders: &[String], requires: &[String], ensures: &[String]) -> Option<String> {
+    if ensures.is_empty() {
+        return None;
+    }
+    let pre = if requires.is_empty() { "TRUE".into() } else { requires.join(" /\\ ") };
+    let body = format!("({pre}) => ({})", ensures.join(" /\\ "));
+    Some(if binders.is_empty() { body } else { format!("\\A {} : {body}", binders.join(", ")) })
+}
+
 /// A field's record label. A positional field `0` is `v0`. An enum value's
 /// record carries its variant in the label `tag`, so a field named `tag`, or
 /// `tag` followed by underscores, takes one more underscore: labels stay
@@ -6351,6 +6763,8 @@ impl Exporter {
     /// the type's own when it is small (see [`Exporter::bound_from_type`]),
     /// else a hole constant.
     fn type_domain(&mut self, name: &str, typ: &Typ, span: &crate::messages::Span) -> String {
+        let normalized = self.normalize_type(typ);
+        let typ = &normalized;
         match self.bound_from_type(typ, span, &mut Vec::new()) {
             Some((d, _)) => d,
             None => {
@@ -6359,6 +6773,8 @@ impl Exporter {
                 self.hole_typs.insert(constant.clone(), typ.clone());
                 self.hole_owners.push(self.current_key.clone());
                 self.holes.push(Hole {
+                    kind: None,
+                    warning: None,
                     variable: name.to_string(),
                     typ: typ_name(typ),
                     constant: constant.clone(),
@@ -7948,6 +8364,8 @@ impl Exporter {
                 this.values.insert(constant.clone(), rust_typ_name(t));
                 this.hole_owners.push(None);
                 this.holes.push(Hole {
+                    kind: None,
+                    warning: None,
                     variable,
                     typ: typ_name(t),
                     constant,
@@ -8254,6 +8672,10 @@ pub fn export_module(
         values: BTreeMap::new(),
         hole_typs: HashMap::new(),
         constant_ops: HashMap::new(),
+        instances: Vec::new(),
+        assoc_types: krate.assoc_type_impls.clone(),
+        tables: BTreeMap::new(),
+        table_names: HashMap::new(),
     };
     for v in &state_vars {
         ex.used_names.insert(v.clone());
@@ -8768,6 +9190,7 @@ pub fn export_module(
         .collect();
     // Everything above is the model; what the named expressions add after
     // it is reported with them and kept out of the module.
+    let model_tables = ex.tables.clone();
     let model_defs = ex.defs.len();
     let model_constants = ex.constants.clone();
     let model_holes = ex.holes.len();
@@ -8981,6 +9404,9 @@ pub fn export_module(
             short_names(&triple.unclosed)
         ));
     }
+    for (constant, _) in &model_tables {
+        tla.push_str(&format!("\\* WARNING: {constant} is an uninterpreted function hole; supply a typed finite table. Finite carriers restrict the model.\n"));
+    }
     tla.push_str("EXTENDS Integers, Sequences, FiniteSets, TLC\n\n");
     if !model_constants.is_empty() {
         tla.push_str(&format!(
@@ -9086,6 +9512,17 @@ pub fn export_module(
     }
     tla.push_str(&format!("{}\n", "=".repeat(module_name.len() + 20)));
 
+    // Contracts can call emitted operators, so assumptions follow definitions.
+    if !model_tables.is_empty() {
+        let end = tla.rfind("\n====").expect("module terminator") + 1;
+        let mut assumes = String::new();
+        for (_, (_, constraints)) in &model_tables {
+            for a in constraints {
+                assumes.push_str(&format!("ASSUME {a}\n"));
+            }
+        }
+        tla.insert_str(end, &assumes);
+    }
     let mut cfg = String::new();
     cfg.push_str("SPECIFICATION Spec\n");
     // Verus has no notion of deadlock: a state with no enabled step is not
@@ -9146,8 +9583,10 @@ pub fn export_module(
             }
         }
     }
-    let domains: Vec<&String> =
-        model_constants.iter().filter(|c| !ex.values.contains_key(*c)).collect();
+    let domains: Vec<&String> = model_constants
+        .iter()
+        .filter(|c| !ex.values.contains_key(*c) && !model_tables.contains_key(*c))
+        .collect();
     if !domains.is_empty() {
         // Left unassigned on purpose: TLC stops until each is given a finite
         // set, rather than quantifying over an empty one.
@@ -9157,6 +9596,9 @@ pub fn export_module(
         for c in &domains {
             cfg.push_str(&format!("\\*   {c} = {{ ... }}\n"));
         }
+    }
+    for (c, (signature, _)) in &model_tables {
+        cfg.push_str(&format!("\\* Uninterpreted function hole: {c} \\in {signature}\n\\* CONSTANT {c} <- SupplyFiniteTable\n"));
     }
     if !ex.values.is_empty() {
         cfg.push_str(
@@ -10019,5 +10461,68 @@ impl Exporter {
         let report =
             TraceReport { module: trace_module.clone(), index_variable: index, observables, steps };
         (trace_module, tla, cfg, report)
+    }
+}
+
+#[cfg(test)]
+mod table_contract_tests {
+    /// Source spec functions currently cannot declare ensures. Exercise the
+    /// VIR contract renderer directly, with TLC checking both interpretations.
+    #[test]
+    fn tla_table_contract_accepts_and_rejects_interpretations() {
+        let Ok(jar) = std::env::var("TLA2TOOLS_JAR") else { return };
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("tla-contract-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let contract = super::table_contract(
+            &["a \\in BOOLEAN".into()],
+            &["a".into()],
+            &["Table[<<a>>] = FALSE".into()],
+        )
+        .unwrap();
+        assert!(super::table_contract(&[], &["FALSE".into()], &[]).is_none());
+        let zero = super::table_contract(&[], &[], &["Table[<<TRUE>>] = FALSE".into()]).unwrap();
+        for (value, accepts) in [("FALSE", true), ("TRUE", false)] {
+            std::fs::write(dir.join("Contract.tla"), format!(
+                "---- MODULE Contract ----\nEXTENDS TLC\nTable == [k \\in {{<<a>> : a \\in BOOLEAN}} |-> {value}]\nASSUME {contract}\nASSUME {zero}\nVARIABLE x\nInit == x = FALSE\nNext == x' = x\n====\n"
+            )).unwrap();
+            std::fs::write(
+                dir.join("Contract.cfg"),
+                "INIT Init\nNEXT Next\nCHECK_DEADLOCK FALSE\n",
+            )
+            .unwrap();
+            let output = std::process::Command::new("timeout")
+                .args([
+                    "30",
+                    "java",
+                    "-Xmx256m",
+                    "-cp",
+                    &jar,
+                    "tlc2.TLC",
+                    "-workers",
+                    "1",
+                    "Contract.tla",
+                ])
+                .current_dir(&dir)
+                .output()
+                .unwrap();
+            let text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            if accepts {
+                assert!(output.status.success() && text.contains("1 distinct states"), "{text}");
+            } else {
+                assert!(
+                    !output.status.success()
+                        && text.contains("Assumption")
+                        && text.contains("false"),
+                    "{text}"
+                );
+            }
+        }
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }
