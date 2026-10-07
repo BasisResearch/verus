@@ -13,8 +13,8 @@ pub enum UserFilter {
     None,
     /// Verify modules
     Modules(Vec<ModuleId>),
-    /// Verify function
-    Function(ModuleId, String, HashSet<Fun>),
+    /// Verify the functions matched by any of the patterns
+    Function(ModuleId, Vec<String>, HashSet<Fun>),
 }
 
 type ModuleId = vir::ast::Idents;
@@ -58,7 +58,7 @@ impl UserFilter {
             Ok(segments)
         };
 
-        if let Some(func_name) = &args.verify_function {
+        if !args.verify_function.is_empty() {
             assert!(!(args.verify_only_module.is_empty() && !args.verify_root));
             assert!(!(args.verify_module.len() + (if args.verify_root { 1 } else { 0 }) > 1));
             assert!(args.verify_module.is_empty());
@@ -69,8 +69,11 @@ impl UserFilter {
                 let s = &args.verify_only_module[0];
                 validate_module_name(s)?
             };
-            let matches = Self::get_matches(&module, func_name, &local_krate.functions)?;
-            return Ok(UserFilter::Function(module, func_name.clone(), matches));
+            let mut matches = HashSet::new();
+            for func_name in &args.verify_function {
+                matches.extend(Self::get_matches(&module, func_name, &local_krate.functions)?);
+            }
+            return Ok(UserFilter::Function(module, args.verify_function.clone(), matches));
         }
 
         if args.verify_module.is_empty() && args.verify_only_module.is_empty() && !args.verify_root

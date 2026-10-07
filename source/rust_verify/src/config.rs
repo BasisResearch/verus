@@ -94,7 +94,7 @@ pub struct ArgsX {
     pub verify_root: bool,
     pub verify_module: Vec<String>,
     pub verify_only_module: Vec<String>,
-    pub verify_function: Option<String>,
+    pub verify_function: Vec<String>,
     pub no_external_by_default: bool,
     pub no_verify: bool,
     pub no_lifetime: bool,
@@ -573,10 +573,10 @@ pub fn parse_args_with_imports(
         "Verify just one submodule (excluding its descendants) within the crate (e.g. 'foo' or 'foo::bar'), can be repeated to verify only certain modules",
         "MODULE",
     );
-    opts.optopt(
+    opts.optmulti(
         "",
         OPT_VERIFY_FUNCTION,
-        "Verify just one function within the one module specified by verify-module or verify-root, \nmatches on unique substring (foo) or wildcards at ends of the argument (*foo, foo*, *foo*)",
+        "Verify just one function within the one module specified by verify-module or verify-root, \nmatches on unique substring (foo) or wildcards at ends of the argument (*foo, foo*, *foo*), \ncan be repeated to verify the functions matched by any of the arguments",
         "MODULE",
     );
     opts.optflag("", OPT_NO_EXTERNAL_BY_DEFAULT, "(deprecated) Verify all items, even those declared outside the verus! macro, and even if they aren't marked #[verifier::verify]");
@@ -842,7 +842,7 @@ pub fn parse_args_with_imports(
                     error("Must pass at most one --verify-only-module or --verify-root when using --verify-function".to_string())
                 }
             }
-            matches.opt_str(OPT_VERIFY_FUNCTION)
+            matches.opt_strs(OPT_VERIFY_FUNCTION)
         },
         no_external_by_default: matches.opt_present(OPT_NO_EXTERNAL_BY_DEFAULT),
         no_verify: matches.opt_present(OPT_NO_VERIFY),

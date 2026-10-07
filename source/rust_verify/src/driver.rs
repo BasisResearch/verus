@@ -33,7 +33,7 @@ fn run_compiler<'a, 'b>(
 }
 
 pub fn is_verifying_entire_crate(verifier: &Verifier) -> bool {
-    verifier.args.verify_function.is_none()
+    verifier.args.verify_function.is_empty()
         && verifier.args.verify_module.is_empty()
         && !verifier.args.verify_root
 }
