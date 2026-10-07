@@ -17,6 +17,165 @@ pub(crate) struct Emitter {
     log: Option<Box<dyn std::io::Write + Send>>,
     /// string of space characters representing current indentation level
     current_indent: String,
+    /// What a relaunched solver needs to reach the state this one is in
+    /// (`Context::suspend`), when the context keeps it.
+    pub(crate) replay: Option<Replay>,
+}
+
+/// The commands that built a solver's current state, kept so that the solver
+/// can be stopped and a new one brought to the same state: every declaration,
+/// definition, assertion and option sent to it, by assertion level. A `pop`
+/// drops what its level added, so what is kept is what the solver holds now,
+/// not its history. Checks and queries (`check-sat`, `get-*`, `eval`, `echo`
+/// and the Basis extensions) change no assertion and are not kept. Options
+/// are global rather than scoped, so they stay at the base level whichever
+/// level set them.
+#[derive(Default)]
+pub(crate) struct Replay {
+    levels: Vec<Vec<u8>>,
+    /// The commands taken from the pipe last, which the solver may not have
+    /// been sent yet: a context whose solver is stopped takes its next
+    /// commands and only then relaunches, and the relaunched solver must get
+    /// the state from before them, then them.
+    staged: Vec<u8>,
+}
+
+impl Replay {
+    pub(crate) fn new() -> Self {
+        Replay { levels: vec![Vec::new()], staged: Vec::new() }
+    }
+
+    /// Commands taken from the pipe, about to be sent. The ones taken before
+    /// them have reached a solver by now.
+    pub(crate) fn stage(&mut self, data: &[u8]) {
+        self.commit();
+        self.staged = data.to_vec();
+    }
+
+    /// Fold the staged commands into the record: they reached the solver.
+    pub(crate) fn commit(&mut self) {
+        let staged = std::mem::take(&mut self.staged);
+        self.record(&staged);
+    }
+
+    /// Fold commands that were sent to the solver into the record.
+    pub(crate) fn record(&mut self, data: &[u8]) {
+        for form in top_level_forms(data) {
+            let head = form_head(form);
+            match head {
+                "push" | "pop" => {
+                    let n = form_count(form);
+                    for _ in 0..n {
+                        if head == "push" {
+                            self.levels.push(b"(push 1)\n".to_vec());
+                        } else if self.levels.len() > 1 {
+                            self.levels.pop();
+                        }
+                    }
+                }
+                "set-option" | "set-logic" | "set-info" => {
+                    self.levels[0].extend_from_slice(form);
+                    self.levels[0].push(b'\n');
+                }
+                "declare-fun" | "declare-const" | "declare-sort" | "declare-datatype"
+                | "declare-datatypes" | "define-fun" | "define-fun-rec" | "define-funs-rec"
+                | "define-sort" | "define-const" | "assert" => {
+                    let level = self.levels.last_mut().expect("the base level");
+                    level.extend_from_slice(form);
+                    level.push(b'\n');
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// The commands, in order, that bring a fresh solver to the recorded
+    /// state, not counting the staged ones.
+    pub(crate) fn commands(&self) -> Vec<u8> {
+        self.levels.concat()
+    }
+
+    /// How many assertion levels the recorded state has above the base.
+    #[cfg(test)]
+    pub(crate) fn depth(&self) -> usize {
+        self.levels.len() - 1
+    }
+
+    pub(crate) fn bytes(&self) -> usize {
+        self.levels.iter().map(Vec::len).sum()
+    }
+}
+
+/// The top-level s-expressions of SMT-LIB text, skipping comments and
+/// whitespace; strings (`"..."`, with `""` inside) and quoted symbols
+/// (`|...|`) are read whole.
+fn top_level_forms(data: &[u8]) -> Vec<&[u8]> {
+    let mut forms = Vec::new();
+    let (mut depth, mut start, mut i) = (0usize, 0usize, 0usize);
+    while i < data.len() {
+        match data[i] {
+            b';' => {
+                while i < data.len() && data[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'"' => {
+                i += 1;
+                while i < data.len() {
+                    if data[i] == b'"' {
+                        if data.get(i + 1) == Some(&b'"') {
+                            i += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    i += 1;
+                }
+            }
+            b'|' => {
+                i += 1;
+                while i < data.len() && data[i] != b'|' {
+                    i += 1;
+                }
+            }
+            b'(' => {
+                if depth == 0 {
+                    start = i;
+                }
+                depth += 1;
+            }
+            b')' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    forms.push(&data[start..=i]);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    forms
+}
+
+/// The command name of a top-level form: `assert` in `(assert ...)`.
+fn form_head(form: &[u8]) -> &str {
+    let inner = &form[1..];
+    let start = inner.iter().position(|b| !b.is_ascii_whitespace()).unwrap_or(0);
+    let end = inner[start..]
+        .iter()
+        .position(|b| b.is_ascii_whitespace() || *b == b'(' || *b == b')')
+        .map_or(inner.len(), |n| start + n);
+    std::str::from_utf8(&inner[start..end]).unwrap_or("")
+}
+
+/// The level count of `(push n)` / `(pop n)`, 1 when absent.
+fn form_count(form: &[u8]) -> usize {
+    let text = std::str::from_utf8(form).unwrap_or("");
+    text.trim_matches(|c| c == '(' || c == ')')
+        .split_whitespace()
+        .nth(1)
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(1)
 }
 
 impl Emitter {
@@ -34,6 +193,7 @@ impl Emitter {
             pipe_buffer,
             log: writer,
             current_indent: "".to_string(),
+            replay: None,
         }
     }
 
@@ -49,6 +209,10 @@ impl Emitter {
     pub fn take_pipe_data(&mut self) -> Vec<u8> {
         let data = self.pipe_buffer.take().expect("use_pipe must be set to true to take pipe");
         self.pipe_buffer = Some(Vec::new());
+        // Everything taken is sent to the solver right away.
+        if let Some(replay) = &mut self.replay {
+            replay.stage(&data);
+        }
         data
     }
 
@@ -272,5 +436,53 @@ impl Emitter {
         if !self.is_none() {
             self.log_node(&nodes!(eval { expr }));
         }
+    }
+}
+
+#[cfg(test)]
+mod replay_tests {
+    use super::Replay;
+
+    #[test]
+    fn a_replay_keeps_what_the_solver_holds_now() {
+        let mut replay = Replay::new();
+        replay.record(
+            b"(set-logic ALL)\n; a comment (with parens\n(declare-fun f (Int) Int)\n(push 1)\n\
+              (assert (= (f 0) 1))\n(check-sat)\n(get-info :reason-unknown)\n",
+        );
+        replay.record(b"(push 2)\n(declare-const |a b)| Int)(assert (> x \"y)\"\"\"))(set-option :rlimit 7)\n");
+        assert_eq!(replay.depth(), 3);
+        assert_eq!(
+            String::from_utf8(replay.commands()).unwrap(),
+            "(set-logic ALL)\n(declare-fun f (Int) Int)\n(set-option :rlimit 7)\n(push 1)\n\
+             (assert (= (f 0) 1))\n(push 1)\n(push 1)\n(declare-const |a b)| Int)\n\
+             (assert (> x \"y)\"\"\"))\n"
+        );
+        // A pop drops what its level added; options stay, since they are global.
+        replay.record(b"(pop 1)(echo \"<<DONE>>\")");
+        assert_eq!(replay.depth(), 2);
+        assert_eq!(
+            String::from_utf8(replay.commands()).unwrap(),
+            "(set-logic ALL)\n(declare-fun f (Int) Int)\n(set-option :rlimit 7)\n(push 1)\n\
+             (assert (= (f 0) 1))\n(push 1)\n"
+        );
+        replay.record(b"(pop 2)");
+        assert_eq!(replay.depth(), 0);
+        assert_eq!(
+            String::from_utf8(replay.commands()).unwrap(),
+            "(set-logic ALL)\n(declare-fun f (Int) Int)\n(set-option :rlimit 7)\n"
+        );
+    }
+
+    /// What was taken from the pipe last may not have reached a solver yet:
+    /// it is left out of the replay until the next take or a stop commits it.
+    #[test]
+    fn staged_commands_are_left_out_until_committed() {
+        let mut replay = Replay::new();
+        replay.stage(b"(declare-fun f () Int)(push)");
+        replay.stage(b"(assert (= f 1))(pop)");
+        assert_eq!(String::from_utf8(replay.commands()).unwrap(), "(declare-fun f () Int)\n(push 1)\n");
+        replay.commit();
+        assert_eq!(String::from_utf8(replay.commands()).unwrap(), "(declare-fun f () Int)\n");
     }
 }

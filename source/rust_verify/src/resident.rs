@@ -921,6 +921,10 @@ pub(crate) struct Server {
     /// The instantiation strategies a solver of this session has a module
     /// for, as the first probe of one of them found (`SessionRungs`).
     rungs: SessionRungs,
+    /// (bucket, solver) -> when a request last used it, for stopping the
+    /// least recently used past `SessionInfo::max_live_solvers`.
+    used: HashMap<(usize, usize), u64>,
+    clock: u64,
 }
 
 /// What the solvers of a session can run one strategy of, which is a
@@ -973,6 +977,12 @@ pub(crate) struct SessionInfo {
     /// them (`VERUS_RESIDENT_RETAIN_ONLY`): its `invocation_succeeded` says
     /// nothing about them, and no verdict is on record.
     pub(crate) retain_only: bool,
+    /// How many retained solvers may run at once
+    /// (`VERUS_RESIDENT_MAX_SOLVERS`). Past it, the least recently checked
+    /// are stopped after each request and relaunched from what they were
+    /// sent when next needed (`air::context::Context::suspend`). `None`:
+    /// every solver keeps running.
+    pub(crate) max_live_solvers: Option<usize>,
 }
 
 #[derive(Serialize)]
@@ -5411,6 +5421,33 @@ impl Server {
             graphs: KeptGraphs::new(MAX_KEPT_INSTANTIATIONS),
             pins: HashMap::new(),
             rungs: SessionRungs::Unknown,
+            used: HashMap::new(),
+            clock: 0,
+        }
+    }
+
+    /// Stop the least recently used solvers past the session's cap; each
+    /// keeps what it was sent and is relaunched when a request needs it.
+    fn enforce_live_solvers(&mut self) {
+        let Some(cap) = self.info.max_live_solvers else { return };
+        let mut live = Vec::new();
+        for (b, bucket) in self.buckets.iter().enumerate() {
+            let Ok(state) = bucket.state.lock() else { continue };
+            for (s, solver) in state.iter().enumerate() {
+                if solver.air.is_live() {
+                    live.push((self.used.get(&(b, s)).copied().unwrap_or(0), b, s));
+                }
+            }
+        }
+        if live.len() <= cap {
+            return;
+        }
+        live.sort();
+        let excess = live.len() - cap;
+        for &(_, b, s) in &live[..excess] {
+            if let Ok(mut state) = self.buckets[b].state.lock() {
+                state[s].air.suspend();
+            }
         }
     }
 
@@ -5494,6 +5531,7 @@ impl Server {
         // Where certificates outlive this session, if replay is on.
         let cert_dir = std::env::var_os("VERUS_RESIDENT_INST_DIR").map(std::path::PathBuf::from);
         loop {
+            self.enforce_live_solvers();
             // A framing failure closes the session. Never interpret a suffix of
             // an oversized request as a second request. Say so before closing:
             // a caller cannot tell a silent close apart from an orderly one.
@@ -6037,6 +6075,8 @@ impl Server {
                         }
                     };
                     let (solver, local) = bucket.addresses[id.0];
+                    self.clock += 1;
+                    self.used.insert((bucket_id.0, solver), self.clock);
                     let SolverState { air, journal } = &mut state[solver];
                     let prefix = journal.queries[local].prefix;
                     // Restoration replays declarations through AIR and the
@@ -7126,6 +7166,7 @@ mod tests {
                 inst_graph: false,
                 strategy_ladder: false,
                 retain_only: false,
+                max_live_solvers: None,
             },
         );
         let input = format!("{}\n{{\"command\":\"list\"}}\n", " ".repeat(65537));

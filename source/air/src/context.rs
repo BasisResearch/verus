@@ -524,6 +524,8 @@ struct NameCounters {
 pub struct Context {
     pub(crate) message_interface: Arc<dyn crate::messages::MessageInterface>,
     smt_process: Option<SmtProcess>,
+    /// The solver was stopped by `suspend`: the next launch replays its state.
+    relaunch_from_replay: bool,
     pub(crate) axiom_infos: ScopeMap<Ident, Arc<AxiomInfo>>,
     pub(crate) axiom_infos_count: u64,
     pub(crate) array_map: ScopeMap<ClosureTerm, Ident>,
@@ -667,6 +669,7 @@ impl Context {
         let mut context = Context {
             message_interface: message_interface.clone(),
             smt_process: None,
+            relaunch_from_replay: false,
             axiom_infos: ScopeMap::new(),
             axiom_infos_count: 0,
             array_map: ScopeMap::new(),
@@ -785,8 +788,61 @@ impl Context {
                 self.inst_max_rounds,
                 self.strategy_ladder,
             ));
+            // A relaunch after `suspend`: bring the new solver to the state
+            // the old one was stopped in, before anything else reaches it.
+            if std::mem::take(&mut self.relaunch_from_replay) {
+                let commands = self.smt_log.replay.as_ref().map(|r| r.commands());
+                if let Some(commands) = commands {
+                    let started = std::time::Instant::now();
+                    let output = self.smt_process.as_mut().unwrap().send_commands(commands);
+                    self.time_smt_init += started.elapsed();
+                    if let Some(error) = output.iter().find(|line| line.starts_with("(error")) {
+                        panic!("relaunched solver refused its replayed state: {}", error);
+                    }
+                }
+            }
         }
         self.smt_process.as_mut().unwrap()
+    }
+
+    /// Keep what this context sends to its solver, so that the solver can be
+    /// stopped (`suspend`) and a new one brought to the same state when it
+    /// is next needed. Call before anything is sent.
+    pub fn enable_replay(&mut self) {
+        if self.smt_log.replay.is_none() {
+            self.smt_log.replay = Some(crate::emitter::Replay::new());
+        }
+    }
+
+    /// Whether a solver process is running for this context.
+    pub fn is_live(&self) -> bool {
+        self.smt_process.is_some()
+    }
+
+    /// The bytes kept to relaunch this context's solver, when it keeps them.
+    pub fn replay_bytes(&self) -> Option<usize> {
+        self.smt_log.replay.as_ref().map(|r| r.bytes())
+    }
+
+    /// Stop this context's solver, keeping what it was sent: the next
+    /// command that needs a solver launches a new one and first sends it
+    /// every declaration, assertion and option the old one held, at the same
+    /// assertion levels. What the solver learned while checking (its caches,
+    /// saved instantiations, instantiation graphs) goes with it. Returns
+    /// whether a solver was stopped: not without `enable_replay`, nor when
+    /// none is running.
+    pub fn suspend(&mut self) -> bool {
+        if self.smt_log.replay.is_none() || self.smt_process.is_none() {
+            return false;
+        }
+        // What was taken last reached the solver being stopped.
+        if let Some(replay) = &mut self.smt_log.replay {
+            replay.commit();
+        }
+        // Dropping the process sends EOF and waits for it to exit.
+        self.smt_process = None;
+        self.relaunch_from_replay = true;
+        true
     }
 
     /// Send everything buffered since the last solver interaction and wait for
@@ -965,6 +1021,10 @@ impl Context {
     /// started, between a query and `finish_query`, or when the reply does
     /// not parse. Only reads: the solver is unchanged.
     pub fn solver_stack_levels(&mut self) -> Option<u64> {
+        // A stopped solver is relaunched to answer: it had started.
+        if self.smt_process.is_none() && self.relaunch_from_replay {
+            self.get_smt_process();
+        }
         if self.smt_process.is_none()
             || !matches!(self.solver, SmtSolver::Cvc5)
             || !matches!(self.state, ContextState::ReadyForQuery)

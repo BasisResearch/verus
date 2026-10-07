@@ -383,6 +383,12 @@ pub struct Verifier {
     /// answers to go by, it retains every recommends query a check could
     /// have added (`retain_unchecked_recommends`).
     resident_retain_only: bool,
+    /// Under `--resident`, how many solvers may stay running
+    /// (`VERUS_RESIDENT_MAX_SOLVERS`): every retained solver keeps what it
+    /// was sent, is stopped once its queries have been checked, and is
+    /// relaunched from that record when a request needs it. Unset: every
+    /// retained solver keeps running for the session.
+    resident_max_solvers: Option<usize>,
     /// this is the actual number of threads used for verification. This will be set to the
     /// minimum of the requested threads and the number of buckets to verify
     pub num_threads: usize,
@@ -681,6 +687,11 @@ impl Verifier {
         let compile = args.compile || via_cargo_compile;
         let resident_retain_only =
             args.resident && std::env::var_os("VERUS_RESIDENT_RETAIN_ONLY").is_some();
+        let resident_max_solvers = args
+            .resident
+            .then(|| std::env::var("VERUS_RESIDENT_MAX_SOLVERS").ok())
+            .flatten()
+            .and_then(|n| n.trim().parse::<usize>().ok());
 
         Verifier {
             num_threads: 1,
@@ -689,6 +700,7 @@ impl Verifier {
             resident_prepared: false,
             resident_inputs: Vec::new(),
             resident_retain_only,
+            resident_max_solvers,
             encountered_vir_error: false,
             count_verified: 0,
             count_errors: 0,
@@ -752,6 +764,7 @@ impl Verifier {
             resident_prepared: false,
             resident_inputs: Vec::new(),
             resident_retain_only: self.resident_retain_only,
+            resident_max_solvers: self.resident_max_solvers,
             encountered_vir_error: false,
             count_verified: 0,
             count_errors: 0,
@@ -871,6 +884,7 @@ impl Verifier {
                 strategy_ladder: self.strategy_ladder(),
                 retain_only: self.resident_retain_only,
                 input_files: std::mem::take(&mut self.resident_inputs),
+                max_live_solvers: self.resident_max_solvers.filter(|_| self.resident_max_solvers_apply()),
             },
         )
         .serve(invocation_succeeded, |context, rlimit| {
@@ -1676,6 +1690,20 @@ impl Verifier {
         format!("{}{}{}{}", rerun_msg, count_msg, expand_msg, suffix,)
     }
 
+    /// Whether this session stops and relaunches its solvers
+    /// (`resident_max_solvers`). Only an ordinary session does: what the
+    /// diagnostic modes read lives in the solver (saved instantiations,
+    /// instantiation graphs, preprocessing proofs and difficulty), and a
+    /// relaunched solver starts them over.
+    fn resident_max_solvers_apply(&self) -> bool {
+        self.resident_max_solvers.is_some()
+            && !self.instantiation_replay()
+            && !self.inst_graph()
+            && !self.args.provenance
+            && !self.args.difficulty
+            && !self.args.matching_loops
+    }
+
     /// Resolve batch replies with the same owned metadata used by resident checks.
     fn resolve_provenance(&mut self, symbols: &crate::provenance::Symbols) {
         for (fun, queries) in std::mem::take(&mut self.func_provenance) {
@@ -1815,6 +1843,11 @@ impl Verifier {
     ) -> Result<air::context::Context, VirErr> {
         let mut air_context =
             air::context::Context::new(message_interface.clone(), self.args.solver);
+        // A capped resident session stops solvers it is not using and
+        // relaunches them from what they were sent.
+        if self.resident_max_solvers_apply() {
+            air_context.enable_replay();
+        }
         if self.args.no_assert_ids {
             air_context.set_emit_assert_ids(false);
         }
@@ -2574,12 +2607,15 @@ impl Verifier {
                                 }
                             }
                             if let Some(journal) = spinoff_journal {
-                                resident_spinoffs.push(crate::resident::SolverState::new(
-                                    spinoff_z3_context
-                                        .take()
-                                        .expect("spinoff journal has a solver"),
-                                    journal,
-                                ));
+                                let mut retained = spinoff_z3_context
+                                    .take()
+                                    .expect("spinoff journal has a solver");
+                                // Checked: stop it until a request needs it.
+                                if self.resident_max_solvers_apply() {
+                                    retained.suspend();
+                                }
+                                resident_spinoffs
+                                    .push(crate::resident::SolverState::new(retained, journal));
                             }
                         }
 
@@ -2733,6 +2769,10 @@ impl Verifier {
         let rlimit_count = air_context.get_rlimit_count();
 
         if let Some(journal) = resident {
+            let mut air_context = air_context;
+            if self.resident_max_solvers_apply() {
+                air_context.suspend();
+            }
             self.resident_buckets.push(crate::resident::RetainedBucket::new(
                 bucket_id.clone(),
                 air_context,

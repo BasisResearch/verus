@@ -5163,3 +5163,50 @@ fn resident_catalogue_reports_initial_verdicts_and_reads() {
     assert_eq!(retained.send(json!({"command": "close", "session": session}))["event"], "closed");
     retained.finish(true);
 }
+
+/// With `VERUS_RESIDENT_MAX_SOLVERS`, a session stops each retained solver
+/// once the invocation has checked its queries and keeps at most that many
+/// running; a request relaunches a stopped solver from what it was sent.
+/// Verdicts do not change: every recheck answers what the invocation did, in
+/// any order, over and over, though each recheck of another bucket's query
+/// launches a solver again.
+#[test]
+fn resident_capped_session_relaunches_stopped_solvers_with_the_same_verdicts() {
+    let mut worker = Worker::start_with_env(
+        INITIAL_SOURCE,
+        &["--multiple-errors", "2"],
+        &[("VERUS_RESIDENT_MAX_SOLVERS", "1")],
+    );
+    let ready = worker.receive();
+    let session = ready["session"].clone();
+    let log = worker.dir.path().join("launches");
+    let launches = || fs::read_to_string(&log).map(|l| l.lines().count()).unwrap_or(0);
+    let opened = launches();
+    let mut queries = Vec::new();
+    for bucket in ready["buckets"].as_array().unwrap() {
+        for query in bucket["queries"].as_array().unwrap() {
+            queries.push((bucket["id"].clone(), query["id"].clone(), query["initial"].clone()));
+        }
+    }
+    assert!(queries.len() >= 6, "{}", ready);
+    for round in 0..2 {
+        for (bucket, query, initial) in queries.iter().rev() {
+            let checked = worker.send(json!({"command": "check", "session": session,
+                "bucket": bucket, "query": query}));
+            assert_eq!(checked["result"], initial["result"], "round {}: {}", round, checked);
+            assert_eq!(
+                checked["diagnostics"].as_array().map(Vec::len),
+                initial["diagnostics"].as_array().map(Vec::len),
+                "round {}: {} against {}",
+                round,
+                checked,
+                initial
+            );
+        }
+    }
+    // The two buckets alternate, so at one live solver each recheck after
+    // the first relaunches one.
+    assert!(launches() > opened + 2, "{} launches after {}", launches(), opened);
+    assert_eq!(worker.send(json!({"command": "close", "session": session}))["event"], "closed");
+    worker.finish(false);
+}
