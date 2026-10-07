@@ -1,0 +1,132 @@
+Exporter lane 1: concrete traits and opaque spec functions
+========================================================
+
+Base: origin/main (1304e1e0), branch kg/export-traits.
+
+Campaign result: refusal-free exports 0/7 -> 4/7. Completed bounded TLC
+checks 0/7 -> 2/7. Models reaching any states: 1/7 -> 3/7. One after model
+starts exploration but fails a partial
+sequence read after 4 distinct states. These counts do not claim that
+finite-table interpretations prove the original unbounded systems.
+
+Machine                                Refusals before -> after    TLC after
+anvil/sub_api                            14 -> 8      blocked: closures/choose/char ordering
+anvil/sub_vrs_reconcile                   5 -> 0      not configured: finite marshaling tables needed
+ironkv/host_protocol_t                    6 -> 5      blocked: higher-order/total-collection constructs
+nr/AsynchronousSingleton                  3 -> 0      completed: 378 distinct, 1963 generated, depth 11
+nr/SimpleLog                              4 -> 0      completed: 72 distinct, 311 generated, depth 9
+nr/UnboundedLog                           4 -> 0      partial read: 4 distinct, 5 generated, depth 4
+nrkernel/os                             135 -> 134    blocked: bit operations/choose/infinite sets
+
+Bounds and comparison integrity
+-------------------------------
+The seven original campaign command.json files were replayed, with only
+the verifier binary and output directory changed. SANY accepts all seven
+outputs. The before run used the supplied baseline verifier; the after
+run used the rebased worktree build. Baseline TLC runs for all three NR
+machines stop on the old uninterpreted-function Assert.
+
+The campaign did not save TLC configurations for these seven refused
+exports. The new NR interpretations therefore reuse its existing knobs
+from tools/mc.py and tools/more_mc.py: IDs {0,1}, Dom_nat 0..2, one node
+(initialization carrier {1}), UnboundedLog tail <= 2. AsynchronousSingleton
+is finite with two request IDs; SimpleLog additionally uses Len(log) <= 2.
+The new tables implement the campaign nrspec.rs Ctr toggle: initial FALSE,
+read returns the state, write returns <<~state,state>>. Each run has a
+30-second timeout, one TLC worker and a 1 GiB heap. These are explicitly
+new table interpretations and new configurations for previously refused
+exports, not a claim that identical archived configurations existed.
+
+No table interpretation was invented for Anvil reconciliation: it now
+exports without refusal but still requires finite marshaling/unmarshaling
+tables and carriers before a meaningful TLC exploration. The other three
+machines retain source-located refusals; no lane-2/3/4 construct was
+worked around. IronKV mk_map takes a spec_fn argument; its higher-order
+carrier remains refused. Nrkernel still refuses its bit/choose rules.
+
+Design and TLA+ constructs
+-------------------------
+1. Generic calls whose bodies depend on dispatch or opaque functions are
+   specialized by full VIR type arguments. Substitution visits parameters,
+   return types, expression types and nested call type arguments. Concrete
+   associated types are normalized through matching impls. The impl matcher
+   compares all trait arguments, supports generic receiver patterns, and
+   only selects a unique match. Existing resolved/default-method paths
+   remain supported. Type-independent polymorphic helpers keep their
+   original names and output. The two concrete Dispatch implementations
+   in the regression test yield distinct operators, one toggling and one
+   preserving the state.
+
+2. A bodyless spec function becomes a mathematical function constant:
+     CONSTANT Table_f
+     f(a, b) == Table_f[<<a,b>>]
+     ASSUME Table_f \in [{<<a,b>> : a \in A, b \in B} -> R]
+   Nullary functions use the singleton key domain {<<>>}. All pre/post
+   operator variants share the same table. Full state arguments become
+   records, rather than being lost when the wrapper drops state parameters.
+   The cfg gives the entire signature and CONSTANT Table_f <- SupplyFiniteTable.
+   It never supplies a guessed truth value or an empty default carrier.
+
+3. A table hole has kind=uninterpreted_function, its signature, source
+   location and a warning explaining the finite interpretation. The TLA+
+   header also warns. Existing hole JSON retains its previous shape.
+   Dom_<T> carriers have ASSUME constraints, including integer membership
+   and bounds, nested collection/record/tuple types, and explicit finite
+   carriers for unresolved associated sorts. Subcarriers of the same
+   abstract sort are constrained to its shared carrier. Unsupported
+   higher-order or recursive carrier encodings remain refusals.
+
+4. Expressible VIR requires/ensures constrain the table as:
+     ASSUME \A a \in A : Requires(a) => Ensures(a, Table_f[<<a>>])
+   Both regular and inherited ensures are retained during specialization.
+   Contracts follow operator definitions but precede the module terminator.
+   Current source spec functions cannot declare ensures; their requires
+   field represents recommends and must not restrict a total spec function
+   by itself. A direct VIR-renderer test uses TLC to accept a satisfying
+   interpretation and reject an inconsistent one, including nullary
+   contracts and the no-ensures case.
+
+Validation
+----------
+181 exporter tests and the direct contract test pass with TLA2TOOLS_JAR set.
+The full exporter suite uses a 600-second
+outer timeout; the direct contract test uses a 30-second TLC timeout.
+New tests cover two concrete implementations, generic receiver impls,
+a generic state_machine instantiated at a concrete Dispatch, a trait
+without an impl, nullary/binary tables, shared pre/post-state tables,
+integer and nested collection carriers, and rejection of invalid carriers.
+Existing arbitrary() tests now supply explicit interpretations; reached
+VerusSync assertions still fail at the original source assertion.
+
+All six examples/tla Rust examples and the available toyDB Raft safety
+model re-export byte-identically in .tla/.cfg/report/trace artifacts.
+The prompt's base/toydb/src/raft/safety.rs and yl/raft-safety-refine ref
+are absent on this checkout. The retained toydb-pr-30/src/raft/safety.rs
+and its tla/EXPORT.md were used for the Raft regression instead.
+
+Additional concrete adapters for the actual campaign nrspec.rs machines
+instantiate State<Ctr> without rewriting the generic source modules.
+All three export with zero refusals and no Dispatch table holes; any
+remaining tables are explicitly reported arbitrary() values.
+
+Reproduction evidence (local worktree lane-traits/)
+-------------------------------------------------
+before.json, after.json; before/ and after/ command.json/export.log/reports;
+sany-final.log; modelcheck-final.log and before-tlc.log; MC.tla/MC.cfg/MC.log;
+regression-final.log; concrete.log; tests-final.log; contracts-test.log.
+campaign.py replays the seven archived commands; modelcheck.py writes the
+documented finite NR interpretations; before_tlc.py applies the same
+carriers to baseline output; regression.py compares the fixed fixtures;
+concrete.py creates the three concrete adapters.
+
+Remaining work, ranked by overlap among these seven machines
+-----------------------------------------------------------
+1. Higher-order closures / infinite-collection operations: Anvil sub_api
+   and IronKV, plus infinite-set operations in nrkernel/os (lanes 2/4).
+2. Partial reads: nr/UnboundedLog reaches the known empty queued_ops access
+   after four states (lane 3). No guard reordering was added in this lane.
+3. Bit operations / choose / char ordering: nrkernel/os and Anvil sub_api
+   retain their independent source-located refusals (lane 2 and follow-up).
+Separately, Anvil sub_vrs_reconcile has no refusals but needs user-authored
+finite marshaling tables; no arbitrary serialization interpretation was
+counted as a successful campaign model check.

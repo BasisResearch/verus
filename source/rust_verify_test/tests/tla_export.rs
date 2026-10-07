@@ -9301,6 +9301,7 @@ pub open spec fn inv(s: State) -> bool { value(s) == s.x }
 fn tla_export_typed_collection_table_carriers() {
     let ex = export_code(
         r#"
+use vstd::seq::Seq;
 verus! {
 pub struct State { pub x: Seq<nat> }
 pub uninterp spec fn value(s: Seq<nat>) -> Option<Seq<nat>>;
