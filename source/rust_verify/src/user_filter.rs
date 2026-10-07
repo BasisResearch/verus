@@ -13,8 +13,8 @@ pub enum UserFilter {
     None,
     /// Verify modules
     Modules(Vec<ModuleId>),
-    /// Verify the functions matched by any of the patterns
-    Function(ModuleId, Vec<String>, HashSet<Fun>),
+    /// Verify the functions matched by any of the patterns, within these modules
+    Function(Vec<ModuleId>, HashSet<Fun>),
 }
 
 type ModuleId = vir::ast::Idents;
@@ -60,20 +60,48 @@ impl UserFilter {
 
         if !args.verify_function.is_empty() {
             assert!(!(args.verify_only_module.is_empty() && !args.verify_root));
-            assert!(!(args.verify_module.len() + (if args.verify_root { 1 } else { 0 }) > 1));
             assert!(args.verify_module.is_empty());
 
-            let module = if args.verify_root {
-                root_module_id()
-            } else {
-                let s = &args.verify_only_module[0];
-                validate_module_name(s)?
-            };
-            let mut matches = HashSet::new();
-            for func_name in &args.verify_function {
-                matches.extend(Self::get_matches(&module, func_name, &local_krate.functions)?);
+            let mut modules: Vec<ModuleId> = Vec::new();
+            for s in &args.verify_only_module {
+                let module = validate_module_name(s)?;
+                if !modules.contains(&module) {
+                    modules.push(module);
+                }
             }
-            return Ok(UserFilter::Function(module, args.verify_function.clone(), matches));
+            if args.verify_root && !modules.contains(&root_module_id()) {
+                modules.push(root_module_id());
+            }
+
+            // Name each module's functions once, rather than once per pattern
+            let module_fun_names: Vec<Vec<(Fun, String)>> = modules
+                .iter()
+                .map(|module| Self::module_fun_names(module, &local_krate.functions))
+                .collect();
+            let qualifiers: Vec<String> = modules
+                .iter()
+                .map(|m| {
+                    if m.is_empty() {
+                        "crate".to_string()
+                    } else {
+                        m.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::")
+                    }
+                })
+                .collect();
+
+            // Resolve every pattern before failing, so that one run reports all the bad ones
+            let mut matches = HashSet::new();
+            let mut errors = Vec::new();
+            for func_name in &args.verify_function {
+                match Self::get_matches(&qualifiers, &module_fun_names, func_name) {
+                    Ok(m) => matches.extend(m),
+                    Err(msg) => errors.push(msg),
+                }
+            }
+            if !errors.is_empty() {
+                return Err(error(errors.join("\n\n")));
+            }
+            return Ok(UserFilter::Function(modules, matches));
         }
 
         if args.verify_module.is_empty() && args.verify_only_module.is_empty() && !args.verify_root
@@ -124,7 +152,7 @@ impl UserFilter {
                 return Ok(modules.clone());
             }
             UserFilter::Modules(m) => m.iter().collect(),
-            UserFilter::Function(m, _, _) => std::iter::once(m).collect(),
+            UserFilter::Function(m, _) => m.iter().collect(),
         };
 
         let module_ids_to_verify = modules
@@ -165,22 +193,9 @@ impl UserFilter {
         }
     }
 
-    /// Get the functions that match the given string.
-    ///
-    /// The first part of this process is to
-    /// infer whether this is an "exact match" filter.
-    /// (If the user doesn't supply any * in the pattern, then it is usuall
-    /// exact - however, if there is no exact match, but there is _exactly one_
-    /// partial match, then we upgrade to a partial match, i.e., return false)
-    ///
-    /// Errors if there is no match.
-    fn get_matches(
-        module_id: &ModuleId,
-        function_pattern: &String,
-        funs: &Vec<Function>,
-    ) -> Result<HashSet<Fun>, VirErr> {
-        let module_fun_names: Vec<(Fun, String)> = funs
-            .iter()
+    /// The functions owned by the module, each with its name relative to the module.
+    fn module_fun_names(module_id: &ModuleId, funs: &Vec<Function>) -> Vec<(Fun, String)> {
+        funs.iter()
             .filter(|f| match &f.x.owning_module {
                 None => false,
                 Some(m) => module_id == &m.segments,
@@ -192,90 +207,135 @@ impl UserFilter {
                 );
                 (f.x.name.clone(), name)
             })
-            .collect();
+            .collect()
+    }
+
+    /// Get the functions that match the given string.
+    ///
+    /// The first part of this process is to
+    /// infer whether this is an "exact match" filter.
+    /// (If the user doesn't supply any * in the pattern, then it is usuall
+    /// exact - however, if there is no exact match, but there is _exactly one_
+    /// partial match, then we upgrade to a partial match, i.e., return false)
+    ///
+    /// With more than one module, the pattern is matched in all of them,
+    /// and must not match in two of them unless it is qualified by its module
+    /// (`foo::bar::f`, or `crate::f` for the root module).
+    ///
+    /// Errors (with the message) if there is no match.
+    fn get_matches(
+        qualifiers: &[String],
+        module_fun_names: &[Vec<(Fun, String)>],
+        pattern: &String,
+    ) -> Result<HashSet<Fun>, String> {
+        let several_modules = module_fun_names.len() > 1;
+        let qualified = qualifiers
+            .iter()
+            .enumerate()
+            .filter(|(_, q)| several_modules && pattern.starts_with(&format!("{q}::")))
+            .max_by_key(|(_, q)| q.len());
+        let (modules, prefix, function_pattern): (Vec<usize>, String, &str) = match qualified {
+            Some((i, q)) => (vec![i], format!("{q}::"), &pattern[q.len() + 2..]),
+            None => ((0..module_fun_names.len()).collect(), String::new(), pattern.as_str()),
+        };
+        let funs: Vec<(usize, &(Fun, String))> =
+            modules.iter().flat_map(|&i| module_fun_names[i].iter().map(move |f| (i, f))).collect();
+        // With several modules, show each function qualified by its module
+        let display = |(i, (_, name)): &(usize, &(Fun, String))| {
+            if several_modules { format!("{}::{name}", qualifiers[*i]) } else { name.clone() }
+        };
+        let display_sorted = |funs: &Vec<(usize, &(Fun, String))>| {
+            let mut names = funs.iter().map(display).collect::<Vec<String>>();
+            names.sort();
+            names
+        };
 
         // First, get the matches without doing anything fancy:
         // If the user provides a * pattern, then we filter according to the * pattern;
         // if the user provides an exact match (no *), then filter as an exact match.
         // If we find anything this way, we're done.
-        let matches = Self::get_matches_strictly_by_pattern(function_pattern, &module_fun_names);
+        let matches = Self::get_matches_strictly_by_pattern(function_pattern, &funs);
         if matches.len() > 0 {
-            return Ok(matches.into_iter().map(|(f, _)| f.clone()).collect());
+            let first_module = matches[0].0;
+            if matches.iter().any(|(i, _)| *i != first_module) {
+                let msg = vec![
+                    format!(
+                        "--verify-function {pattern} matches functions in more than one module, qualify it with the module (e.g. {}::{function_pattern}),",
+                        qualifiers[first_module]
+                    ),
+                    format!("matched results are:"),
+                ]
+                .into_iter()
+                .chain(display_sorted(&matches).iter().map(|f| format!("  - {f}")))
+                .collect::<Vec<String>>()
+                .join("\n");
+                return Err(msg);
+            }
+            return Ok(matches.into_iter().map(|(_, f)| f.0.clone()).collect());
         }
 
         // Get all substring matches, even if the user didn't use any * in their pattern.
         // We might use of these automatically, or if not, this list will at least help us
         // print an informative error message.
-        let substring_matches =
-            Self::get_all_substring_matches(function_pattern, &module_fun_names);
+        let substring_matches = Self::get_all_substring_matches(function_pattern, &funs);
 
         let clean = function_pattern.trim_matches('*');
         if clean == function_pattern {
             // If there's no exact match, but there is *exactly one* substring match,
             // then we go ahead and use that function.
             if substring_matches.len() == 1 {
-                return Ok(substring_matches.iter().map(|f| f.0.clone()).collect());
+                return Ok(substring_matches.iter().map(|f| f.1.0.clone()).collect());
             } else if substring_matches.len() > 1 {
-                let mut filtered_functions =
-                    substring_matches.iter().map(|f| f.1.clone()).collect::<Vec<String>>();
-                filtered_functions.sort();
                 let msg = vec![
                     format!(
-                        "more than one match found for --verify-function {function_pattern}, consider using wildcard *{function_pattern}* to verify all matched results,"
+                        "more than one match found for --verify-function {pattern}, consider using wildcard {prefix}*{function_pattern}* to verify all matched results,"
                     ),
                     format!(
                         "or specify a unique substring for the desired function, matched results are:"
                     ),
                 ].into_iter()
-                .chain(filtered_functions.iter().map(|f| format!("  - {f}")))
+                .chain(display_sorted(&substring_matches).iter().map(|f| format!("  - {f}")))
                 .collect::<Vec<String>>()
                 .join("\n");
-                return Err(error(msg));
+                return Err(msg);
             }
         } else {
             if substring_matches.len() >= 1 {
-                let mut filtered_functions =
-                    substring_matches.iter().map(|f| f.1.clone()).collect::<Vec<String>>();
-                filtered_functions.sort();
                 let msg = vec![
-                    format!(
-                        "could not find function {function_pattern} specified by --verify-function,"
-                    ),
-                    format!("consider *{clean}* if you want to verify similar functions:"),
+                    format!("could not find function {pattern} specified by --verify-function,"),
+                    format!("consider {prefix}*{clean}* if you want to verify similar functions:"),
                 ]
                 .into_iter()
-                .chain(filtered_functions.iter().map(|f| format!("  - {f}")))
+                .chain(display_sorted(&substring_matches).iter().map(|f| format!("  - {f}")))
                 .collect::<Vec<String>>()
                 .join("\n");
-                return Err(error(msg));
+                return Err(msg);
             }
         }
 
         // If there were absolutely no substring matches, then we fail by printing
         // out every possible function in the module.
-        let mut all_functions = module_fun_names.into_iter().map(|f| f.1).collect::<Vec<String>>();
-        all_functions.sort();
         let msg = vec![
-            format!("could not find function {function_pattern} specified by --verify-function"),
+            format!("could not find function {pattern} specified by --verify-function"),
             format!("available functions are:"),
         ]
         .into_iter()
-        .chain(all_functions.iter().map(|f| format!("  - {f}")))
+        .chain(display_sorted(&funs).iter().map(|f| format!("  - {f}")))
         .collect::<Vec<String>>()
         .join("\n");
-        return Err(error(msg));
+        return Err(msg);
     }
 
     fn get_matches_strictly_by_pattern<'a>(
-        function_pattern: &String,
-        funs: &'a Vec<(Fun, String)>,
-    ) -> Vec<&'a (Fun, String)> {
+        function_pattern: &str,
+        funs: &Vec<(usize, &'a (Fun, String))>,
+    ) -> Vec<(usize, &'a (Fun, String))> {
         let clean = function_pattern.trim_matches('*');
         let left_wildcard = function_pattern.starts_with('*');
         let right_wildcard = function_pattern.ends_with('*');
 
         funs.iter()
-            .filter(|(_, name)| {
+            .filter(|(_, (_, name))| {
                 if left_wildcard && !right_wildcard {
                     name.ends_with(clean)
                 } else if !left_wildcard && right_wildcard {
@@ -286,22 +346,23 @@ impl UserFilter {
                     name == clean
                 }
             })
+            .cloned()
             .collect()
     }
 
     fn get_all_substring_matches<'a>(
-        function_pattern: &String,
-        funs: &'a Vec<(Fun, String)>,
-    ) -> Vec<&'a (Fun, String)> {
+        function_pattern: &str,
+        funs: &Vec<(usize, &'a (Fun, String))>,
+    ) -> Vec<(usize, &'a (Fun, String))> {
         let clean = function_pattern.trim_matches('*');
-        funs.iter().filter(|(_, name)| name.contains(clean)).collect()
+        funs.iter().filter(|(_, (_, name))| name.contains(clean)).cloned().collect()
     }
 
     /// Check if the function is included in the filter.
     /// This assumes the function is already in the correct module
     /// (i.e., it only checks the function name).
     pub fn includes_function(&self, function_name: &Fun) -> bool {
-        if let UserFilter::Function(_module_id, _function, matches) = self {
+        if let UserFilter::Function(_modules, matches) = self {
             matches.contains(function_name)
         } else {
             true

@@ -576,8 +576,8 @@ pub fn parse_args_with_imports(
     opts.optmulti(
         "",
         OPT_VERIFY_FUNCTION,
-        "Verify just one function within the one module specified by verify-module or verify-root, \nmatches on unique substring (foo) or wildcards at ends of the argument (*foo, foo*, *foo*), \ncan be repeated to verify the functions matched by any of the arguments",
-        "MODULE",
+        "Verify just the functions matched by this pattern, within the modules given by verify-only-module and verify-root, \nmatches on unique substring (foo) or wildcards at ends of the argument (*foo, foo*, *foo*), \ncan be repeated to verify the union of the functions matched by each pattern; \nwith several modules, a pattern matching in two of them must be qualified by its module (foo::bar::f, or crate::f for the root)",
+        "PATTERN",
     );
     opts.optflag("", OPT_NO_EXTERNAL_BY_DEFAULT, "(deprecated) Verify all items, even those declared outside the verus! macro, and even if they aren't marked #[verifier::verify]");
     opts.optflag("", OPT_NO_VERIFY, "Do not run verification");
@@ -834,12 +834,6 @@ pub fn parse_args_with_imports(
                         "--verify-function option requires --verify-only-module or --verify-root"
                             .to_owned(),
                     )
-                }
-                if matches.opt_count(OPT_VERIFY_ONLY_MODULE)
-                    + (if matches.opt_present(OPT_VERIFY_ROOT) { 1 } else { 0 })
-                    > 1
-                {
-                    error("Must pass at most one --verify-only-module or --verify-root when using --verify-function".to_string())
                 }
             }
             matches.opt_strs(OPT_VERIFY_FUNCTION)
