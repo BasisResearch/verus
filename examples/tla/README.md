@@ -500,9 +500,16 @@ that permits skipping the action uses the reported general-relation check.
 Enum selection must account for every call site; an unsupported nested or
 indirect occurrence also makes the name a general relation. Conditional paths
 guard parameter domains as well as the selected bodies.
+Coverage includes source-level calls inside helpers and returned closures,
+even when inlining removes their operator-call edges. Action occurrences in
+helpers likewise make the whole action name general. Inputs that read the post
+state retain the general-relation check so `Next` assigns the successor before
+the logged action reads it.
 
 Trace-only helpers are emitted in the trace module. Generating the trace spec
 does not change the base model's definitions or export report metadata.
+Requesting named expressions with `tla-export-expr` does not change the trace
+module or remove its helper definitions.
 
 An unknown step name falls back to `Next` and the observed-state comparison;
 its name and parameters are not checked. The JSON report advertises this weaker

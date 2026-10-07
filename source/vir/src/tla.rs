@@ -6641,6 +6641,38 @@ impl Exporter {
         builders.into_iter().map(|(fun, _)| self.trace_general_action(&fun, &body)).collect()
     }
 
+    /// Calls hidden inside helpers (including closure-returning helpers) have
+    /// no independently lowered call-site template. Find them in the source
+    /// bodies, not just the emitted operator graph: inlining removes edges.
+    /// Their general relations override any selected occurrences of the name.
+    fn trace_indirect_actions(&mut self, body: &Expr) -> Vec<TraceAction> {
+        let mut pending = vec![(body.clone(), false)];
+        let mut seen = HashSet::new();
+        let mut sites = Vec::new();
+        while let Some((body, indirect)) = pending.pop() {
+            crate::ast_visitor::expr_visitor_walk(&body, &mut |e: &Expr| {
+                if let ExprX::Call { target: CallTarget::Fun(kind, fun, ..), .. } = &e.x {
+                    let fun = self.resolved_fun(kind, fun);
+                    if let Some(f) = self.functions.get(&fun) {
+                        if indirect
+                            && typ_datatype(&f.x.ret.x.typ)
+                                .is_some_and(|p| last_segment(&p) == "Action")
+                        {
+                            sites.push((fun.clone(), body.clone()));
+                        }
+                        if seen.insert(fun) {
+                            if let Some(callee) = &f.x.body {
+                                pending.push((callee.clone(), true));
+                            }
+                        }
+                    }
+                }
+                crate::visitor::VisitorControlFlow::Recurse
+            });
+        }
+        sites.into_iter().map(|(fun, site)| self.trace_general_action(&fun, &site)).collect()
+    }
+
     fn trace_action_branch(
         &mut self,
         body: &Expr,
@@ -6722,7 +6754,6 @@ impl Exporter {
             }
             ExprX::Quant(..) => return None,
             _ => {
-                let mut text = self.expr(body, env);
                 let mut params = Vec::new();
                 let mut inputs: Vec<_> =
                     f.x.params
@@ -6733,6 +6764,13 @@ impl Exporter {
                 if let Some((input, name)) = &forward_input {
                     inputs.push((name.clone(), input));
                 }
+                // A domain is evaluated before the selected action assigns
+                // successor variables. Keep post-dependent arguments in the
+                // original Next evaluation order via the general relation.
+                if inputs.iter().any(|(_, input)| env.reads_post(input)) {
+                    return None;
+                }
+                let mut text = self.expr(body, env);
                 for (log_name, input) in inputs {
                     let value = self.quiet(|x| x.expr(input, env));
                     let binder = self.bind("trace_input");
@@ -9125,6 +9163,10 @@ pub fn export_module(
         euclid: model_euclid,
         recursive: model_recursive.clone(),
     };
+    // Named-expression helpers are not emitted in the base module. Start
+    // trace lowering from the actual model, before those helpers can mark a
+    // trace dependency as already emitted (or claim its constants/names).
+    let mut trace_ex = ex.clone();
     let expr_exports: Vec<ExprExport> =
         exprs.iter().map(|name| ex.export_expr(name, &model, &mut pending)).collect();
     let variables = state_vars
@@ -9511,7 +9553,6 @@ pub fn export_module(
     let next_key = (triple.next.clone(), Variant::Plain, false);
     // Trace-only lowering must never change model definitions, names, holes,
     // assignment analysis, or the report's model metadata.
-    let mut trace_ex = ex.clone();
     let (trace_module_name, trace_tla, trace_cfg, trace) = trace_ex.trace_spec(
         module,
         &module_name,
@@ -10037,7 +10078,9 @@ impl Exporter {
                     let key = (self.resolved_fun(kind, fun), Variant::Plain, false);
                     if &key == target {
                         occurrences += 1;
-                    } else if self.reachable_from(&key).contains(target) {
+                    } else if self.reachable_from(&key).contains(target)
+                        || reached_functions(&self.functions, &key.0).contains(&target.0)
+                    {
                         indirect = true;
                     }
                 }
@@ -10125,7 +10168,8 @@ impl Exporter {
         let model_recursive = self.recursive();
         let model_euclid = self.uses_euclid;
         if let Some((body, env)) = self.trace_roots.get(next_key).cloned() {
-            let actions = self.trace_action_branches(&body, &env);
+            let mut actions = self.trace_action_branches(&body, &env);
+            actions.extend(self.trace_indirect_actions(&body));
             self.trace_actions.insert(next_key.clone(), actions);
         }
         let trace_helpers = self.defs[model_defs..].to_vec();

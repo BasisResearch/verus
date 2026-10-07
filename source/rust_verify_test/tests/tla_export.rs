@@ -9572,3 +9572,156 @@ pub open spec fn next(pre: State, post: State) -> bool {
     );
     assert_eq!(depth, 2, "{out}");
 }
+
+#[test]
+fn tla_export_trace_enum_covers_closure_returning_helpers() {
+    let ex = export_code(
+        r#"use vstd::prelude::*;
+verus! {
+pub struct State { pub x:u8 }
+pub enum Step { A(u8), B(u8) }
+pub open spec fn init(s:State)->bool { s.x==0 }
+pub open spec fn t_a(pre:State,post:State,n:u8)->bool { post.x==n }
+pub open spec fn nested(n:u8) -> spec_fn(State,State)->bool { |pre:State,post:State| pre.x==1 && t_a(pre,post,n) }
+pub open spec fn next_step(pre:State,post:State,s:Step)->bool {
+ match s { Step::A(n)=>pre.x==0 && t_a(pre,post,n),
+ Step::B(n)=> nested(n)(pre,post) }
+}
+pub open spec fn next(pre:State,post:State)->bool { exists|s:Step| next_step(pre,post,s) }
+
+}
+"#,
+        "test_crate",
+    );
+    assert!(names(&ex.report["trace"]["general_relation_steps"]).contains(&"t_a".to_string()));
+    trace_action_log(
+        &ex,
+        &[
+            (
+                concat!(
+                    r#"{"step":"t_a","params":{"n":1},"state":{"x":1}}"#,
+                    "\n",
+                    r#"{"step":"t_a","params":{"n":1},"state":{"x":1}}"#
+                ),
+                3,
+            ),
+            (r#"{"step":"t_a","params":{"n":0},"state":{"x":1}}"#, 1),
+        ],
+    );
+}
+
+#[test]
+fn tla_export_trace_action_covers_transitive_occurrences() {
+    let ex = export_code(
+        r#"use vstd::prelude::*;
+verus! {
+#[verifier::reject_recursive_types(S)]
+pub struct Action<S> { pub precondition: spec_fn(S) -> bool, pub transition: spec_fn(S,S) -> bool }
+pub open spec fn step<S>(a: Action<S>) -> spec_fn(S,S) -> bool { |pre:S,post:S| (a.precondition)(pre) && (a.transition)(pre,post) }
+pub struct State { pub x:u8 }
+pub open spec fn a(n:u8) -> Action<State> { Action { precondition: |s:State| true, transition: |pre:State,post:State| post.x==n } }
+pub open spec fn init() -> spec_fn(State) -> bool { |s:State| s.x==0 }
+pub open spec fn helper(pre:State,post:State)->bool { step(a(1))(pre,post) }
+pub open spec fn next() -> spec_fn(State,State) -> bool {
+ |pre:State,post:State| step(a(0))(pre,post) || helper(pre,post)
+}
+
+}
+"#,
+        "test_crate",
+    );
+    assert!(names(&ex.report["trace"]["general_relation_steps"]).contains(&"a".to_string()));
+    trace_action_log(
+        &ex,
+        &[
+            (r#"{"step":"a","params":{"n":1},"state":{"x":1}}"#, 2),
+            (r#"{"step":"a","params":{"n":0},"state":{"x":0}}"#, 2),
+            (r#"{"step":"a","state":{"x":1}}"#, 2),
+            (r#"{"step":"a","params":{"n":0},"state":{"x":1}}"#, 1),
+            (r#"{"step":"a","params":{"n":2},"state":{"x":2}}"#, 1),
+        ],
+    );
+}
+
+#[test]
+fn tla_export_trace_helpers_are_independent_of_named_expressions() {
+    let src = TempDir::new().unwrap();
+    let entry = src.path().join("test.rs");
+    std::fs::write(&entry, r#"use vstd::prelude::*;
+verus! {
+#[verifier::reject_recursive_types(S)]
+pub struct Action<S> { pub precondition: spec_fn(S) -> bool, pub transition: spec_fn(S,S) -> bool }
+pub open spec fn step<S>(a: Action<S>) -> spec_fn(S,S) -> bool { |pre:S,post:S| (a.precondition)(pre) && (a.transition)(pre,post) }
+pub struct State { pub x:u8 }
+pub open spec fn ready(s:State)->bool { s.x==0 }
+pub open spec fn a(saved:State) -> Action<State> { Action { precondition: |s:State| ready(saved), transition: |pre:State,post:State| post.x==1 } }
+pub open spec fn init() -> spec_fn(State) -> bool { |s:State| s.x==0 }
+pub open spec fn next() -> spec_fn(State,State) -> bool { |pre:State,post:State| (exists|k:u8| k < 1 && #[trigger] step(a(pre))(pre,post)) }
+pub mod exprs { use super::*; pub open spec fn probe(s:State)->bool { ready(State{x:s.x}) } }
+
+}
+"#).unwrap();
+    let plain = export_with(&entry, "test_crate", &["--no-verify"]);
+    let ex = export_with(
+        &entry,
+        "test_crate",
+        &["--no-verify", "-V tla-export-expr=test_crate::exprs::probe"],
+    );
+    assert_eq!(plain.tla.as_bytes(), ex.tla.as_bytes());
+    assert_eq!(plain.cfg.as_bytes(), ex.cfg.as_bytes());
+    assert_eq!(trace_spec(&plain).1.as_bytes(), trace_spec(&ex).1.as_bytes());
+    assert!(
+        ex.report["exprs"][0]["definitions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|d| d.as_str().unwrap().contains("ready_rec"))
+    );
+    trace_action_log(
+        &ex,
+        &[
+            (r#"{"step":"a","params":{"saved":{"x":0}},"state":{"x":1}}"#, 2),
+            (r#"{"step":"a","params":{"saved":{"x":1}},"state":{"x":1}}"#, 1),
+        ],
+    );
+}
+
+#[test]
+fn tla_export_trace_post_dependent_inputs_keep_assignment_order() {
+    let ex = export_code(
+        r#"use vstd::prelude::*;
+verus! {
+#[verifier::reject_recursive_types(S)]
+pub struct Action<S> { pub precondition: spec_fn(S) -> bool, pub transition: spec_fn(S,S) -> bool }
+pub open spec fn step<S>(a: Action<S>) -> spec_fn(S,S) -> bool { |pre:S,post:S| (a.precondition)(pre) && (a.transition)(pre,post) }
+pub struct State { pub x:u8 }
+pub open spec fn a(n:u8) -> Action<State> { Action { precondition: |s:State| true, transition: |pre:State,post:State| post.x==n } }
+pub open spec fn init() -> spec_fn(State) -> bool { |s:State| s.x==0 }
+pub open spec fn next() -> spec_fn(State,State) -> bool {
+ |pre:State,post:State| post.x == 1 && step(a(post.x))(pre,post)
+}
+
+}
+"#,
+        "test_crate",
+    );
+    assert!(names(&ex.report["trace"]["general_relation_steps"]).contains(&"a".to_string()));
+    trace_action_log(
+        &ex,
+        &[
+            (r#"{"step":"a","params":{"n":1},"state":{"x":1}}"#, 2),
+            (r#"{"step":"a","state":{"x":1}}"#, 2),
+            (r#"{"step":"a","params":{"n":2},"state":{"x":1}}"#, 1),
+        ],
+    );
+    let Some(jar) = tla_tools() else { return };
+    let (spec, tla, cfg) = trace_spec(&ex);
+    let probe = spec.with_file_name("Probe_trace.tla");
+    std::fs::write(&probe, tla.replace("MODULE State_tla_trace", "MODULE Probe_trace").replace(
+        "\n=====",
+        "\nProbe == [step |-> \"a\", params |-> [n |-> 1]] \\in TraceEnabled /\\ ~TraceDiagnosis.step_enabled\n=====",
+    )).unwrap();
+    let (depth, out) =
+        follow(&jar, &probe, &cfg, &ex.dir.path().join("selection.ndjson"), "INVARIANT Probe\n");
+    assert_eq!(depth, 1, "{out}");
+}
