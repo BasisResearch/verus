@@ -618,6 +618,9 @@ struct Env {
     /// rustc gives every binding its own `VarIdent`, so a binder that
     /// shadows a name (`let k = k + 1`) never inherits the domain it had.
     domains: HashMap<VarIdent, Dom>,
+    /// Conditions preceding a domain's evaluation. None means a condition
+    /// depends on locals or the successor and cannot escape this scope.
+    domain_guards: Vec<Option<String>>,
     /// Names a pattern bound to a field of a whole state (`let State { x,
     /// .. } = post`), so `x == e` assigns it as `post.x == e` does.
     field_binders: HashMap<VarIdent, FieldBinder>,
@@ -644,6 +647,7 @@ impl Env {
             values: HashMap::new(),
             primed: HashSet::new(),
             domains: HashMap::new(),
+            domain_guards: Vec::new(),
             field_binders: HashMap::new(),
         }
     }
@@ -816,6 +820,10 @@ struct Exporter {
     temporal_top_action: bool,
     /// Independently selectable action-record branches of closure roots.
     trace_actions: HashMap<OpKey, Vec<TraceAction>>,
+    /// Action-builder arguments seen while lowering the model, by enclosing
+    /// function. Keep the original quantifier/caller domains before inlining
+    /// erases the call sites used by general trace relations.
+    action_domains: HashMap<String, Vec<(Fun, Vec<Option<Dom>>)>>,
     /// Closure roots to lower after the model is complete, in a private copy.
     trace_roots: HashMap<OpKey, (Expr, Env)>,
     /// Enum-arm templates keyed by their existential expression.
@@ -1974,7 +1982,14 @@ impl Exporter {
             }
             ExprX::Logical(op, a, b) => {
                 let (sa, sb) = match op {
-                    LogicalOp::And => (self.expr(a, env), self.expr(b, env)),
+                    LogicalOp::And => {
+                        let sa = self.expr(a, env);
+                        let mut guarded = env.clone();
+                        guarded
+                            .domain_guards
+                            .push(self.closed_domain(&sa, env, false).map(|_| sa.clone()));
+                        (sa, self.expr(b, &guarded))
+                    }
                     LogicalOp::Or => {
                         let (sa, aa) = self.branch_expr(a, env);
                         let (sb, ab) = self.branch_expr(b, env);
@@ -2047,9 +2062,14 @@ impl Exporter {
             ExprX::WithTriggers { body, .. } => self.expr(body, env),
             ExprX::If(c, t, f) => {
                 let sc = self.quiet(|x| x.expr(c, env));
-                let (st, at) = self.branch_expr(t, env);
+                let mut guarded = env.clone();
+                let guard = self.closed_domain(&sc, env, false).map(|_| sc.clone());
+                guarded.domain_guards.push(guard.clone());
+                let (st, at) = self.branch_expr(t, &guarded);
+                guarded.domain_guards.pop();
+                guarded.domain_guards.push(guard.map(|g| format!("~({g})")));
                 let (sf, af) = match f {
-                    Some(f) => self.branch_expr(f, env),
+                    Some(f) => self.branch_expr(f, &guarded),
                     None => ("TRUE".into(), BTreeSet::new()),
                 };
                 self.meet(vec![at, af]);
@@ -3174,6 +3194,15 @@ impl Exporter {
             ExprX::ReadPlace(p, _) => self.resolve_record_place(p, env, depth + 1),
             ExprX::Call { target: CallTarget::Fun(kind, fun, ..), args, .. } => {
                 let fun = &self.resolved_fun(kind, fun);
+                if self.functions.get(fun).is_some_and(|f| {
+                    typ_datatype(&f.x.ret.x.typ).is_some_and(|p| last_segment(&p) == "Action")
+                }) {
+                    let domains = args.iter().map(|a| self.action_arg_domain(a, env, 0)).collect();
+                    self.action_domains
+                        .entry(self.current.clone())
+                        .or_default()
+                        .push((fun.clone(), domains));
+                }
                 let (body, env2, mut lets) = self.inline_call(fun, args, env)?;
                 let (record, renv, mut rlets) = self.resolve_record(&body, &env2, depth + 1)?;
                 lets.append(&mut rlets);
@@ -3181,6 +3210,25 @@ impl Exporter {
             }
             _ => None,
         }
+    }
+
+    /// Only reuse domains already established in the model or literal
+    /// singleton values. Computing a new argument value here could hoist a
+    /// partial expression above its guard or read an unassigned post state.
+    fn action_arg_domain(&mut self, e: &Expr, env: &Env, depth: usize) -> Option<Dom> {
+        if depth > 16 {
+            return None;
+        }
+        let e = peel(e);
+        if matches!(e.x, ExprX::Const(_)) {
+            return Some(Dom::Closed(format!("{{{}}}", self.quiet(|x| x.expr(&e, env))), false));
+        }
+        let v = read_var(&e)?;
+        if let Some(d) = env.domains.get(&v) {
+            return Some(d.clone());
+        }
+        let (value, scope) = env.values.get(&v)?;
+        self.action_arg_domain(value, scope, depth + 1)
     }
 
     fn resolve_record_place(
@@ -3717,8 +3765,20 @@ impl Exporter {
                     None => self.type_domain(&name, &b.a, &e.span),
                 },
             };
-            if let Some(d) = self.closed_domain(&domain, &env2, from_type) {
-                env2.domains.insert(b.name.clone(), d);
+            if let Some(Dom::Closed(mut d, from_type)) =
+                self.closed_domain(&domain, &env2, from_type)
+            {
+                // Trace parameter domains escape the operator. Preserve the
+                // short-circuit conditions that made evaluating a bound safe.
+                // A local condition cannot be lifted, so retain the type
+                // fallback instead of exporting an unsafe domain.
+                if let Some(guards) = env.domain_guards.iter().cloned().collect::<Option<Vec<_>>>()
+                {
+                    for g in guards.iter().rev() {
+                        d = format!("(IF {g} THEN {d} ELSE {{}})");
+                    }
+                    env2.domains.insert(b.name.clone(), Dom::Closed(d, from_type));
+                }
             }
             bounds.push(format!("{name} \\in {domain}"));
         }
@@ -6525,6 +6585,9 @@ impl Exporter {
     fn forward_call(&mut self, e: &Expr, env: &Env) -> Option<String> {
         let (f, forward, recv, input) = self.forward_parts(e)?;
         let has_input = !is_unit(&input.typ);
+        let domains =
+            if has_input { vec![self.action_arg_domain(&input, env, 0)] } else { Vec::new() };
+        self.action_domains.entry(self.current.clone()).or_default().push((f.clone(), domains));
         let arg = if has_input { Some(self.quiet(|x| x.expr(&input, env))) } else { None };
         let name = self.ensure_forward(&f, &forward, &recv, has_input);
         Some(match arg {
@@ -6767,7 +6830,17 @@ impl Exporter {
                 // A domain is evaluated before the selected action assigns
                 // successor variables. Keep post-dependent arguments in the
                 // original Next evaluation order via the general relation.
-                if inputs.iter().any(|(_, input)| env.reads_post(input)) {
+                // A preceding conjunct may make evaluating the argument safe
+                // (division, indexing, casts, ...). Hoisting it into a domain
+                // or a binder equality would run it before that guard.
+                let guarded =
+                    conjuncts(&site).first().is_some_and(|e| !Arc::ptr_eq(e, &application));
+                if inputs.iter().any(|(_, input)| env.reads_post(input))
+                    || (guarded
+                        && inputs
+                            .iter()
+                            .any(|(_, input)| !matches!(peel(input).x, ExprX::Const(_))))
+                {
                     return None;
                 }
                 let mut text = self.expr(body, env);
@@ -8602,6 +8675,7 @@ pub fn export_module(
         temporal_unchecked: Vec::new(),
         temporal_top_action: false,
         trace_actions: HashMap::new(),
+        action_domains: HashMap::new(),
         trace_roots: HashMap::new(),
         trace_variants: HashMap::new(),
         exists_printed: HashMap::new(),
@@ -10167,9 +10241,49 @@ impl Exporter {
         let model_constants = self.constants.clone();
         let model_recursive = self.recursive();
         let model_euclid = self.uses_euclid;
+        let reachable = self.reachable_from(next_key);
+        let owners: HashSet<_> =
+            reachable.iter().map(|k| fun_as_friendly_rust_name(&k.0)).collect();
+        let action_domains: Vec<_> = self
+            .action_domains
+            .iter()
+            .filter(|(owner, _)| owners.contains(*owner))
+            .flat_map(|(_, calls)| calls.clone())
+            .collect();
         if let Some((body, env)) = self.trace_roots.get(next_key).cloned() {
             let mut actions = self.trace_action_branches(&body, &env);
             actions.extend(self.trace_indirect_actions(&body));
+            for action in &mut actions {
+                if action.selected {
+                    continue;
+                }
+                let calls: Vec<_> = action_domains
+                    .iter()
+                    .filter(|(fun, args)| fun == &action.fun && args.len() == action.params.len())
+                    .collect();
+                if calls.is_empty() {
+                    continue;
+                }
+                for (i, (_, _, domain, _)) in action.params.iter_mut().enumerate() {
+                    let mut parts = Vec::new();
+                    let mut complete = true;
+                    for (_, args) in &calls {
+                        let d = args[i].as_ref().and_then(|d| {
+                            self.resolve_dom(d, &reachable, &mut Vec::new()).map(|(d, _)| d)
+                        });
+                        if let Some(d) = d.or_else(|| domain.clone()) {
+                            if !parts.contains(&d) {
+                                parts.push(d);
+                            }
+                        } else {
+                            complete = false;
+                        }
+                    }
+                    parts.sort();
+                    *domain =
+                        if complete { Some(format!("({})", parts.join(" \\cup "))) } else { None };
+                }
+            }
             self.trace_actions.insert(next_key.clone(), actions);
         }
         let trace_helpers = self.defs[model_defs..].to_vec();

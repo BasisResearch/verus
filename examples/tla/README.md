@@ -473,6 +473,10 @@ both their preconditions and transitions, including the path conditions of
 `if` branches. Fixed and quantified call sites of the same action are combined.
 If any occurrence cannot be selected, the whole action name uses the reported
 general-relation check so that other call sites are not silently dropped.
+Inputs whose evaluation needs an earlier conjunctive guard or an assigned
+successor also use that fallback. General action relations retain the union
+of finite argument domains established at call sites, including calls inside
+helpers, so falling back does not require logging a previously bounded input.
 The observed successor comparison is
 unchanged. TLC run on it
 (`INIT TraceInit`, `NEXT TraceNext`, `CONSTANT TraceLog = "<log path>"`)

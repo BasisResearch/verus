@@ -9725,3 +9725,96 @@ pub open spec fn next() -> spec_fn(State,State) -> bool {
         follow(&jar, &probe, &cfg, &ex.dir.path().join("selection.ndjson"), "INVARIANT Probe\n");
     assert_eq!(depth, 1, "{out}");
 }
+
+#[test]
+fn tla_export_trace_guarded_inputs_keep_evaluation_order() {
+    let ex = export_code(
+        r#"use vstd::prelude::*;
+verus! {
+#[verifier::reject_recursive_types(S)]
+pub struct Action<S> { pub precondition: spec_fn(S) -> bool, pub transition: spec_fn(S,S) -> bool }
+pub open spec fn step<S>(a: Action<S>) -> spec_fn(S,S) -> bool { |pre:S,post:S| (a.precondition)(pre) && (a.transition)(pre,post) }
+pub struct State { pub x:u8 }
+pub open spec fn a(n:u8) -> Action<State> { Action { precondition: |s:State| true, transition: |pre:State,post:State| post.x==n } }
+pub open spec fn init() -> spec_fn(State) -> bool { |s:State| s.x==0 }
+pub open spec fn next() -> spec_fn(State,State) -> bool {
+ |pre:State,post:State| (pre.x != 0 && step(a((10int / (pre.x as int)) as u8))(pre,post)) || step(a(1))(pre,post)
+}
+
+}
+"#,
+        "test_crate",
+    );
+    assert!(names(&ex.report["trace"]["general_relation_steps"]).contains(&"a".to_string()));
+    trace_action_log(
+        &ex,
+        &[
+            (r#"{"step":"a","params":{"n":1},"state":{"x":1}}"#, 2),
+            (r#"{"step":"a","state":{"x":1}}"#, 2),
+            (r#"{"step":"a","params":{"n":2},"state":{"x":1}}"#, 1),
+            (r#"{"step":"next","state":{"x":1}}"#, 2),
+        ],
+    );
+}
+
+#[test]
+fn tla_export_trace_transitive_actions_keep_call_site_domains() {
+    let code = r#"use vstd::prelude::*;
+verus! {
+#[verifier::reject_recursive_types(S)]
+pub struct Action<S> { pub precondition: spec_fn(S) -> bool, pub transition: spec_fn(S,S) -> bool }
+pub open spec fn step<S>(a: Action<S>) -> spec_fn(S,S) -> bool { |pre:S,post:S| (a.precondition)(pre) && (a.transition)(pre,post) }
+pub struct State { pub x:u8 }
+pub open spec fn a(n:int) -> Action<State> { Action { precondition: |s:State| true, transition: |pre:State,post:State| post.x==n } }
+pub open spec fn init() -> spec_fn(State) -> bool { |s:State| s.x==0 }
+pub open spec fn helper(pre:State,post:State)->bool { exists|n:int| 0 <= n && n < 2 && #[trigger] step(a(n))(pre,post) }
+pub open spec fn next() -> spec_fn(State,State) -> bool {
+ |pre:State,post:State| step(a(0))(pre,post) || helper(pre,post)
+}
+
+}
+"#;
+    let ex = export_code(code, "test_crate");
+    assert!(names(&ex.report["trace"]["general_relation_steps"]).contains(&"a".to_string()));
+    assert!(
+        ex.report["trace"]["steps"].as_array().unwrap().iter().find(|s| s["step"] == "a").unwrap()
+            ["enumerated"]
+            .as_bool()
+            .unwrap()
+    );
+    trace_action_log(
+        &ex,
+        &[
+            (r#"{"step":"a","state":{"x":1}}"#, 2),
+            (r#"{"step":"a","state":{"x":0}}"#, 2),
+            (r#"{"step":"a","params":{"n":1},"state":{"x":1}}"#, 2),
+            (r#"{"step":"a","params":{"n":0},"state":{"x":1}}"#, 1),
+            (r#"{"step":"a","params":{"n":2},"state":{"x":2}}"#, 1),
+        ],
+    );
+    // Bounds inherited from a helper must keep their own evaluation guards.
+    let guarded = code.replace("step(a(0))", "step(a(1))").replace(
+        "exists|n:int| 0 <= n && n < 2 && #[trigger] step(a(n))(pre,post)",
+        "pre.x != 0 && (exists|n:int| 0 <= n && n < 10int / (pre.x as int) && #[trigger] step(a(n))(pre,post))",
+    );
+    let guarded = export_code(&guarded, "test_crate");
+    trace_action_log(
+        &guarded,
+        &[
+            (r#"{"step":"a","params":{"n":1},"state":{"x":1}}"#, 2),
+            (r#"{"step":"a","state":{"x":1}}"#, 2),
+        ],
+    );
+    // Neither the direct site's singleton nor the helper's quantified range
+    // may replace the other when the general relation wins.
+    let ex = export_code(&code.replace("step(a(0))", "step(a(3))"), "test_crate");
+    trace_action_log(
+        &ex,
+        &[
+            (r#"{"step":"a","state":{"x":3}}"#, 2),
+            (r#"{"step":"a","state":{"x":1}}"#, 2),
+            (r#"{"step":"a","params":{"n":3},"state":{"x":3}}"#, 2),
+            (r#"{"step":"a","params":{"n":2},"state":{"x":2}}"#, 1),
+        ],
+    );
+}
