@@ -486,27 +486,21 @@ pub fn crate_to_vir<'a, 'tcx>(
             vir::ast::ModuleX { path: root_module_path.clone(), reveals: None },
         ));
     }
-    for owner_opt in crate::util::iter_crate_owners(ctxt.krate, tcx) {
-        if let MaybeOwner::Owner(owner) = owner_opt {
-            match owner.node() {
-                OwnerNode::Item(
-                    item @ Item { kind: ItemKind::Mod(_ident, _module), owner_id, .. },
-                ) => {
-                    let path = def_id_to_vir_path_option(
-                        ctxt.tcx,
-                        Some(&ctxt.verus_items),
-                        owner_id.to_def_id(),
-                    );
-                    if let Some(path) = path {
-                        if used_modules.contains(&path) {
-                            vir.modules.push(ctxt.spanned_new(
-                                item.span,
-                                vir::ast::ModuleX { path: path.clone(), reveals: None },
-                            ));
-                        }
-                    }
+    // Match upstream's HIR module order. Definition IDs follow macro expansion order,
+    // which can move sibling modules and change SMT declaration/axiom ordering (and
+    // therefore bounded solver verdicts) even when their formulas are unchanged.
+    for item_id in tcx.hir_crate_items(()).free_items() {
+        let item = tcx.hir_item(item_id);
+        if let Item { kind: ItemKind::Mod(_ident, _module), owner_id, .. } = item {
+            let path =
+                def_id_to_vir_path_option(ctxt.tcx, Some(&ctxt.verus_items), owner_id.to_def_id());
+            if let Some(path) = path {
+                if used_modules.contains(&path) {
+                    vir.modules.push(ctxt.spanned_new(
+                        item.span,
+                        vir::ast::ModuleX { path: path.clone(), reveals: None },
+                    ));
                 }
-                _ => {}
             }
         }
     }
