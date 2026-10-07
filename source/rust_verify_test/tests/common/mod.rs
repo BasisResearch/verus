@@ -342,6 +342,10 @@ pub fn run_verus(
             verus_args.extend(["--reach".to_string(), dir.to_string()]);
         } else if let Some(names) = option.strip_prefix("-V tla-export-expr=") {
             verus_args.extend(["-V".to_string(), format!("tla-export-expr={names}")]);
+        } else if let Some(names) = option.strip_prefix("-V tla-export-constant=") {
+            verus_args.extend(["-V".to_string(), format!("tla-export-constant={names}")]);
+        } else if let Some(names) = option.strip_prefix("-V tla-export-label=") {
+            verus_args.extend(["-V".to_string(), format!("tla-export-label={names}")]);
         } else if let Some(module) = option.strip_prefix("-V tla-export=") {
             verus_args.extend(["-V".to_string(), format!("tla-export={module}")]);
         } else if let Some(dir) = option.strip_prefix("--log-dir ") {

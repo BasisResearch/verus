@@ -901,7 +901,11 @@ impl Verifier {
     /// spec `<State>_tla_trace.tla` with its `.cfg`), since TLC only loads a
     /// module from a file of the same name.
     fn export_tla(&mut self, krate: &Krate, arg: &str) -> Result<(), VirErr> {
-        let export = vir::tla::export_module(krate, arg, &self.args.tla_export_exprs)
+        let overrides = vir::tla::ParamOverrides {
+            constants: self.args.tla_export_constants.clone(),
+            labels: self.args.tla_export_labels.clone(),
+        };
+        let export = vir::tla::export_module(krate, arg, &self.args.tla_export_exprs, &overrides)
             .map_err(|e| crate::util::error(format!("tla-export: {e}")))?;
         let dir = self.log_dir()?;
         let json = serde_json::to_string_pretty(&export.report).unwrap_or_else(|_| "{}".into());
@@ -932,6 +936,54 @@ impl Verifier {
             export.report.init_unassigned.len(),
             dir.join(format!("{}.tla", export.module_name)).display()
         );
+        if !export.report.parameters.is_empty() {
+            // Each kind named, init's constant (next's) once: a constant is
+            // fixed for the whole behaviour, so one the model chooses per
+            // step should show here.
+            let params = &export.report.parameters;
+            let named = |kind: &str, function: &str| -> Vec<String> {
+                params
+                    .iter()
+                    .filter(|p| p.kind == kind && p.function == function)
+                    .map(|p| p.param.clone())
+                    .collect()
+            };
+            let parts: Vec<String> = [
+                ("constant", "next", "fixed for the whole behaviour, CONSTANTs the .cfg gives"),
+                ("label", "next", "\\E per step in Next"),
+                ("init_label", "init", "\\E once in Init"),
+            ]
+            .iter()
+            .filter_map(|(kind, function, what)| {
+                let names = named(kind, function);
+                let kind = kind.replace('_', " ");
+                match names.len() {
+                    0 => None,
+                    1 => Some(format!("{kind} {} ({what})", names[0])),
+                    _ => Some(format!("{kind}s {} ({what})", names.join(", "))),
+                }
+            })
+            .collect();
+            eprintln!(
+                "tla-export: beside the state, init/next take {} (see the .tla.json parameters)",
+                parts.join("; ")
+            );
+        }
+        for warning in [
+            vir::tla::scalar_constant_warning(&export.report.scalar_constants),
+            vir::tla::choice_label_warning(&export.report.choice_labels),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            eprintln!("tla-export: warning: {warning}");
+        }
+        if !export.report.unchecked.is_empty() {
+            eprintln!(
+                "tla-export: NOT CHECKED, predicates over the state and a label or a non-constant value: {}",
+                export.report.unchecked.join(", ")
+            );
+        }
         Ok(())
     }
 
