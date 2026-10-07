@@ -212,6 +212,65 @@ b'], [a |-> a', b |-> b'])`.
 A sequence literal `seq![a, b]` (an array literal viewed as a `Seq`) is the
 tuple `<<a, b>>`.
 
+The vstd operations that take a function take a closure, which is applied
+where the operation is printed: its parameters are LET-bound to the values
+the operation gives them, so its body reads whatever it reads in Verus,
+the post state included (`s.map(|i, x| x + i)` is `[i__ \in 1..Len(s) |->
+LET i == i__ - 1 x == s[i__] IN x + i]`, the index shifted once as
+everywhere). An argument that reduces to no closure (a `spec_fn` parameter
+of a helper) is refused. `Seq::map` and `map_values` are functions over the
+positions; `Seq::filter` is `SelectSeq(s, LAMBDA x : p)`; `fold_left`,
+`fold_left_alt`, `fold_right` and `fold_right_alt` are a RECURSIVE operator
+over the positions in a LET (`f(fold(k - 1), s[k])` from the left, `f(s[k],
+fold(k + 1))` from the right), and `flatten` the same with `\o`; `to_set` is
+`{s[i] : i \in 1..Len(s)}`, `no_duplicates` compares every two positions, and
+`max` and `min` CHOOSE the extremum of the elements (0 for the empty
+sequence, as vstd defines them). `Set::new(|x| p)` is `Some` of `{x \in D :
+p}` and `ISet::new(|x| p)` that set, where `D` is what a quantifier's binder
+would range over: the bound `p`'s conjuncts give `x` (`0 <= x < n` is
+`0..n-1`, `t.contains(x)` is `t`), else the values of `x`'s type when they
+are few (`BOOLEAN`), else a hole (`Dom_int`). Over a hole the set is taken
+to be finite: `Set::new` is `Some` of the elements the hole's values give,
+where Verus's is `None` when `p` holds for infinitely many values, so the
+`.cfg`'s `Dom_int` must hold every element. For the same reason
+`ISet::finite` is refused: every set TLC builds is finite, and so are
+`Set::full` and `Set::complement`, `None` for an infinite type. A
+comprehension over a hole of a type parameter (`ISet::new(|b: A| b != a)`
+in a generic function, or vstd's own generic bodies) is refused: one hole
+would stand for every instantiation. An `ISet` and an
+`IMap` are otherwise a `Set` and a `Map`, in TypeOK, the trace and
+`type_map` as in expressions. `Set::map` is `{f(x) : x \in s}`,
+`Set::filter` `{x \in s : p}`, and `Set::fold` a RECURSIVE operator
+removing a CHOOSEn element each time. That agrees with Verus only for a
+commutative `f` (Verus's fold is otherwise a choice among the orders, as
+`choose` is), so a fold is refused unless `f` is a chain of one operator
+`op` with `acc` one operand and no other reading it (`acc + x + 1`, `g(x)
+|| acc`), `op` one of `+`, `*`, `&&`, `||`, set union or intersection (also
+as `+` and `*`) or multiset addition, or else `acc.insert(g(x))`. A cast around it
+must be the identity, or a checked cast of a sum of operands never negative
+(`(acc + 1) as nat`), which grows in every order; any other checked cast can
+leave its type in one order and not in another (`(acc + x) as nat` over
+`{-1, 1}`), so that fold is refused. `Map::new(keys, f)` is `[k \in keys |->
+f(k)]`, `IMap::new(|k| p, f)` the same over `p`'s comprehension,
+`map_values` and `map_entries` map over `DOMAIN m`, `kv_pairs` is
+`{<<k, m[k]>> : k \in DOMAIN m}`, `filter_keys`,
+`restrict` and `remove_keys` shrink it, and `m1.union_prefer_right(m2)` is
+`m2 @@ m1`. A `Multiset` is the function from the elements it holds (a
+count above 0) to their counts, so `=` is its equality: `count` is the
+value or 0, `insert`, `add` and `singleton` add counts, `remove` and `sub`
+subtract them and drop what reaches 0, `update` sets one count (dropping
+the element at 0), `from_map` keeps a map's positive counts, `from_set`
+counts each element once, `filter` keeps the counts of the elements it
+passes, `subset_of` (`<=`) compares counts, `len` sums the counts with a
+RECURSIVE operator, `contains` (`has`) is `\in DOMAIN`, `dom` is the
+`DOMAIN` and `is_empty` its emptiness, `to_multiset` counts a sequence's
+positions holding each element, TypeOK checks every count is above 0, and
+a trace logs a multiset as a map (an element logged with count 0 is not
+held, and a negative count, or a count of 0 for an element the model
+holds, stops the trace). `Set::choose` and `Multiset::choose` are refused, as
+`choose` is: TLC's CHOOSE is one fixed value, where Verus's may be any
+value satisfying the predicate.
+
 A literal match pattern is an equality with the scrutinee (`0 => ...` is
 `IF m = 0 THEN ...`) and a range pattern its comparisons (`1..=3` is `1 <=
 m /\ m <= 3`). An or-pattern binding nothing is the disjunction of its
@@ -371,15 +430,15 @@ Verus values. `type_map` gives each variable's state field (its Rust
 name and its record label) and lays out every datatype the state holds
 (whether it is a struct or an enum, field labels in declaration order, the
 `tag` value of each enum variant, which fields are positional), with each
-field's type as a tree over `seq`, `set`,
-`map`, `tuple`, `int`, `bool`, `char` and named datatypes, so that a TLC
-state `[x |-> 4, y |-> 0]` renders as `State { x: 4, y: 0 }` by table, not
-by guess. When `next` is `exists|step: T| body` over a datatype, `steps`
-gives the binder, its printed domain and body, and, when the body calls a
-function matching on the step, each arm's transition with the step field
-passed for each parameter: evaluating `{step \in domain : body}` over a
-pair of states names the step TLC took (TLC itself labels every step
-`Next`).
+field's type as a tree over `seq`, `set` (also an `ISet`), `map` (also an
+`IMap`), `multiset`, `tuple`, `int`, `bool`, `char` and named datatypes,
+so that a TLC state `[x |-> 4, y |-> 0]` renders as `State { x: 4, y: 0 }`
+by table, not by guess. When `next` is `exists|step: T| body` over a
+datatype, `steps` gives the binder, its printed domain and body, and, when
+the body calls a function matching on the step, each arm's transition with
+the step field passed for each parameter: evaluating `{step \in domain :
+body}` over a pair of states names the step TLC took (TLC itself labels
+every step `Next`).
 
 `-V tla-export-expr=crate::m::f,crate::m::g` exports the named spec fns (each
 over the state, or a pre and a post state) after the model, in the model's
