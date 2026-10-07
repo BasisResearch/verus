@@ -606,7 +606,9 @@ struct QueryDescription {
     span: String,
     fingerprint: Fingerprint,
     /// The items whose declarations the query reads (see
-    /// `relevance::fingerprints`), its own function among them.
+    /// `relevance::fingerprints`): its callees' contracts and the definitions
+    /// it can unfold. A query does not read its own function's declarations
+    /// unless it mentions them.
     reads: Vec<String>,
     /// The invocation's own verdict on the query, when it checked it.
     #[serde(skip_serializing_if = "Option::is_none")]
