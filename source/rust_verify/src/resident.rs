@@ -304,6 +304,7 @@ const COMMANDS: &[&str] = &[
     "twin",
     "speculate",
     "pin",
+    "check_many",
 ];
 
 #[derive(Deserialize)]
@@ -325,6 +326,21 @@ enum Request {
         /// invocation's `--multiple-errors`.
         #[serde(default)]
         multiple_errors: Option<u32>,
+    },
+    /// Check several retained queries, up to `threads` at once: queries of
+    /// different buckets run in their own solvers concurrently, queries of
+    /// one bucket take turns. Each answer is a `checked` event, sent as it is
+    /// ready (in no particular order), and a `checked_many` event ends the
+    /// batch. `rlimit` and `multiple_errors` are as for `check`.
+    CheckMany {
+        session: String,
+        queries: Vec<(BucketIndex, QueryId)>,
+        #[serde(default)]
+        rlimit: Option<f32>,
+        #[serde(default)]
+        multiple_errors: Option<u32>,
+        #[serde(default)]
+        threads: Option<usize>,
     },
     /// Probe the query with parts of it switched off (see `air::bisect`).
     Bisect {
@@ -1046,6 +1062,10 @@ enum Response<'a> {
     Queries {
         session: &'a str,
         buckets: &'a [BucketDescription],
+    },
+    CheckedMany {
+        session: &'a str,
+        count: usize,
     },
     Pinned {
         session: &'a str,
@@ -5527,35 +5547,30 @@ impl Server {
         }
     }
 
+    /// Account a check's answer to the session (the solver it used, the
+    /// graph it kept) and send it.
+    fn answered(
+        &mut self,
+        bucket: BucketIndex,
+        query: QueryId,
+        mut answer: CheckAnswer,
+        session: &str,
+        output: &mut impl Write,
+    ) -> io::Result<()> {
+        account(&mut self.clock, &mut self.used, &mut self.graphs, bucket, query, &mut answer);
+        send_answer(output, session, bucket, query, answer)
+    }
+
     /// Stop the least recently used solvers past the session's cap; each
     /// keeps what it was sent and is relaunched when a request needs it.
     fn enforce_live_solvers(&mut self) {
-        let Some(cap) = self.info.max_live_solvers else { return };
-        let mut live = Vec::new();
-        for (b, bucket) in self.buckets.iter().enumerate() {
-            let Ok(state) = bucket.state.lock() else { continue };
-            for (s, solver) in state.iter().enumerate() {
-                if solver.air.is_live() {
-                    live.push((self.used.get(&(b, s)).copied().unwrap_or(0), b, s));
-                }
-            }
-        }
-        if live.len() <= cap {
-            return;
-        }
-        live.sort();
-        let excess = live.len() - cap;
-        for &(_, b, s) in &live[..excess] {
-            if let Ok(mut state) = self.buckets[b].state.lock() {
-                state[s].air.suspend();
-            }
-        }
+        enforce_live_solvers(&self.buckets, &self.used, self.info.max_live_solvers, true);
     }
 
     pub(crate) fn serve(
         mut self,
         invocation_succeeded: bool,
-        set_rlimit: impl Fn(&mut Context, f32),
+        set_rlimit: impl Fn(&mut Context, f32) + Sync,
     ) -> io::Result<()> {
         let stamp = SystemTime::now().duration_since(UNIX_EPOCH).map_err(io::Error::other)?;
         let session = format!("{}-{}", std::process::id(), stamp.as_nanos());
@@ -5595,7 +5610,7 @@ impl Server {
         invocation_succeeded: bool,
         mut input: impl BufRead,
         mut output: impl Write,
-        set_rlimit: impl Fn(&mut Context, f32),
+        set_rlimit: impl Fn(&mut Context, f32) + Sync,
     ) -> io::Result<()> {
         let buckets: Vec<_> = self
             .buckets
@@ -5666,6 +5681,7 @@ impl Server {
             match request {
                 Request::List { session: Some(requested) }
                 | Request::Check { session: requested, .. }
+                | Request::CheckMany { session: requested, .. }
                 | Request::Bisect { session: requested, .. }
                 | Request::Ablate { session: requested, .. }
                 | Request::Egraph { session: requested, .. }
@@ -6175,429 +6191,96 @@ impl Server {
                         send(&mut output, &Response::Error { message: "unknown query" })?;
                         continue;
                     }
-                    let mut state = match bucket.state.lock() {
-                        Ok(state) => state,
-                        Err(_) => {
-                            return fatal(
-                                &mut output,
-                                io::Error::other("resident bucket poisoned"),
-                            );
-                        }
+                    let pinned_rung = self.pins.get(&(bucket_id.0, id.0)).copied();
+                    let answer = match check_query(
+                        bucket,
+                        id,
+                        pinned_rung,
+                        cert_dir.as_deref(),
+                        rlimit_override,
+                        multiple_errors,
+                        &set_rlimit,
+                    ) {
+                        Ok(answer) => answer,
+                        Err(error) => return fatal(&mut output, error),
                     };
-                    let (solver, local) = bucket.addresses[id.0];
-                    self.clock += 1;
-                    self.used.insert((bucket_id.0, solver), self.clock);
-                    let SolverState { air, journal } = &mut state[solver];
-                    let prefix = journal.queries[local].prefix;
-                    // Restoration replays declarations through AIR and the
-                    // solver, so it is timed apart from the check itself.
-                    let restore_start = Instant::now();
-                    if let Err(error) = journal.restore_prefix(air, prefix) {
+                    self.answered(bucket_id, id, answer, session, &mut output)?;
+                }
+                Request::CheckMany {
+                    queries,
+                    rlimit: rlimit_override,
+                    multiple_errors: errors_override,
+                    threads,
+                    ..
+                } => {
+                    if queries.iter().any(|(b, q)| {
+                        self.buckets.get(b.0).is_none_or(|bucket| bucket.queries.get(q.0).is_none())
+                    }) {
+                        send(&mut output, &Response::Error { message: "unknown bucket or query" })?;
+                        continue;
+                    }
+                    let multiple_errors = errors_override.unwrap_or(multiple_errors);
+                    let threads = threads.unwrap_or(1).clamp(1, 64).min(queries.len().max(1));
+                    let next = AtomicUsize::new(0);
+                    let failed = std::sync::atomic::AtomicBool::new(false);
+                    let (buckets, pins, cap) = (&self.buckets, &self.pins, self.info.max_live_solvers);
+                    let (clock, used, graphs) = (&mut self.clock, &mut self.used, &mut self.graphs);
+                    let cert_dir = cert_dir.as_deref();
+                    let set_rlimit = &set_rlimit;
+                    let queries = &queries;
+                    let mut fatal_error: Option<io::Error> = None;
+                    std::thread::scope(|scope| {
+                        let (sender, answers) = std::sync::mpsc::channel();
+                        for _ in 0..threads {
+                            let sender = sender.clone();
+                            let (next, failed) = (&next, &failed);
+                            scope.spawn(move || {
+                                loop {
+                                    if failed.load(Ordering::SeqCst) {
+                                        break;
+                                    }
+                                    let i = next.fetch_add(1, Ordering::SeqCst);
+                                    let Some(&(b, q)) = queries.get(i) else { break };
+                                    let answer = check_query(
+                                        &buckets[b.0],
+                                        q,
+                                        pins.get(&(b.0, q.0)).copied(),
+                                        cert_dir,
+                                        rlimit_override,
+                                        multiple_errors,
+                                        set_rlimit,
+                                    );
+                                    if answer.is_err() {
+                                        failed.store(true, Ordering::SeqCst);
+                                    }
+                                    if sender.send((b, q, answer)).is_err() {
+                                        break;
+                                    }
+                                }
+                            });
+                        }
+                        drop(sender);
+                        for (b, q, answer) in answers {
+                            match answer {
+                                Ok(mut answer) => {
+                                    account(clock, used, graphs, b, q, &mut answer);
+                                    if let Err(error) = send_answer(&mut output, session, b, q, answer) {
+                                        fatal_error.get_or_insert(error);
+                                        failed.store(true, Ordering::SeqCst);
+                                    }
+                                    // Solvers this batch is done with stop as it goes.
+                                    enforce_live_solvers(buckets, used, cap, false);
+                                }
+                                Err(error) => {
+                                    fatal_error.get_or_insert(error);
+                                }
+                            }
+                        }
+                    });
+                    if let Some(error) = fatal_error {
                         return fatal(&mut output, error);
                     }
-                    let restore_ms = restore_start.elapsed().as_millis();
-                    let query = &journal.queries[local];
-                    // The budget this check runs at: the request's, unless
-                    // the function names its own.
-                    let budget = match rlimit_override {
-                        Some(rlimit) if !query.rlimit_attribute => rlimit,
-                        _ => query.rlimit,
-                    };
-                    // The severity the original invocation would have reported
-                    // this failure at, so a recommends recheck stays a warning.
-                    let level = query.level;
-                    set_rlimit(air, budget);
-                    // With replay on, each check saves its instantiations
-                    // under the query's certificate key.
-                    let replay_key =
-                        air.instantiation_replay().then(|| bucket.cert_keys[id.0].clone());
-                    let diagnostics = QueryDiagnostics::default();
-                    let start = Instant::now();
-                    // Certificate first: once this query has saved
-                    // instantiations, here or in an earlier session's
-                    // exported certificate, check with them alone. `:only`
-                    // lets no strategy run, so the solver answers from the
-                    // replayed instances, each an instance of a formula this
-                    // scope asserts, and a valid answer is sound. Any other
-                    // answer is discarded, with its diagnostics, before the
-                    // ordinary check.
-                    let mut certified = None;
-                    let mut attempted = None;
-                    let certificate = replay_key.as_ref().and_then(|key| {
-                        if air.has_saved_instantiations(key) {
-                            return Some((key.clone(), None));
-                        }
-                        // A file that is not exactly a certificate for this
-                        // key is never sent: it could assert anything.
-                        let path = cert_dir.as_ref()?.join(format!("{key}.smt2"));
-                        let text = read_certificate(&path)?;
-                        let import = ImportInstantiations::parse(&text, key)?;
-                        Some((key.clone(), Some(import)))
-                    });
-                    if let Some((key, import)) = certificate {
-                        let source = match import {
-                            Some(_) => CertificateSource::Imported,
-                            None => CertificateSource::Session,
-                        };
-                        air.set_restore_instantiations(Some(key), true);
-                        air.set_import_instantiations(import);
-                        let attempt = air.check_valid(
-                            &VirMessageInterface {},
-                            &QueryDiagnostics::default(),
-                            &query.query,
-                            QueryContext::default(),
-                        );
-                        air.set_restore_instantiations(None, false);
-                        air.set_import_instantiations(None);
-                        drop(air.take_provenance());
-                        drop(air.take_unknown_reason());
-                        drop(air.take_matching_loops());
-                        drop(air.take_difficulty());
-                        drop(air.take_inst_pressure());
-                        match attempt {
-                            ValidityResult::Valid(usage) => {
-                                certified = Some(ValidityResult::Valid(usage))
-                            }
-                            ValidityResult::TypeError(error) => {
-                                return fatal(&mut output, io::Error::other(error.to_string()));
-                            }
-                            ValidityResult::UnexpectedOutput(error) => {
-                                return fatal(&mut output, io::Error::other(error));
-                            }
-                            _ => air.finish_query(),
-                        }
-                        attempted = Some(CertificateAttempt {
-                            source,
-                            closed: certified.is_some(),
-                            elapsed_ms: start.elapsed().as_millis(),
-                        });
-                    }
-                    // Then the pinned rung, when a ladder or pin request set
-                    // one: its strategy, alone or alongside as pinned, at the
-                    // budget it was pinned at or the query's own, whichever
-                    // is smaller, so it is bounded even for a
-                    // query without an rlimit. It changes which instances
-                    // are tried, never what is asserted, so a valid answer
-                    // is sound, and that answer's diagnostics (provenance,
-                    // difficulty) describe the check that decided, so the
-                    // reply keeps them, as it keeps its graph. Any other
-                    // answer is discarded, with its diagnostics, before the
-                    // ordinary check, which runs the full schedule.
-                    let mut pinned = None;
-                    if let Some(&pin) =
-                        self.pins.get(&(bucket_id.0, id.0)).filter(|_| certified.is_none())
-                    {
-                        let attempt_start = Instant::now();
-                        let rlimit = pin.rlimit.min(budget);
-                        set_rlimit(air, rlimit);
-                        air.set_quant_strategy(Some(pin.rung.name()), !pin.alongside);
-                        let attempt = air.check_valid(
-                            &VirMessageInterface {},
-                            &QueryDiagnostics::default(),
-                            &query.query,
-                            QueryContext::default(),
-                        );
-                        set_rlimit(air, budget);
-                        let resource_units =
-                            air.take_strategy_rung().map(|info| info.resource_units);
-                        match attempt {
-                            ValidityResult::Valid(usage) => {
-                                certified = Some(ValidityResult::Valid(usage))
-                            }
-                            ValidityResult::TypeError(error) => {
-                                return fatal(&mut output, io::Error::other(error.to_string()));
-                            }
-                            ValidityResult::UnexpectedOutput(error) => {
-                                return fatal(&mut output, io::Error::other(error));
-                            }
-                            _ => {
-                                drop(air.take_provenance());
-                                drop(air.take_unknown_reason());
-                                drop(air.take_matching_loops());
-                                drop(air.take_difficulty());
-                                drop(air.take_inst_pressure());
-                                air.finish_query();
-                            }
-                        }
-                        pinned = Some(PinnedAttempt {
-                            rung: pin.rung,
-                            alongside: pin.alongside,
-                            rlimit,
-                            closed: certified.is_some(),
-                            elapsed_ms: attempt_start.elapsed().as_millis(),
-                            resource_units,
-                        });
-                    }
-                    let mut outcome = match certified {
-                        Some(outcome) => outcome,
-                        None => air.check_valid(
-                            &VirMessageInterface {},
-                            &diagnostics,
-                            &query.query,
-                            QueryContext::default(),
-                        ),
-                    };
-                    // The response describes round zero. Later error searches
-                    // replace AIR's provenance, even when their verdict differs.
-                    let first_provenance = air.take_provenance();
-                    // The graph of the check that decided the verdict: the
-                    // certificate attempt's when it closed the query, else
-                    // the search's. Later error rounds search again, which
-                    // replaces the solver's record, so it is read now. A
-                    // query with nothing to instantiate (bit-vector,
-                    // nonlinear) gets an empty graph; an error comes only
-                    // when cvc5 cannot answer.
-                    let graph = air
-                        .inst_graph()
-                        .then(|| InstantiationGraph::from_live(&air.instantiation_graph()));
-                    let (graph_summary, graph_error) = match graph {
-                        Some(Ok(graph)) => {
-                            let mut summary = graph.summary();
-                            summary.check = Some(if attempted.as_ref().is_some_and(|a| a.closed) {
-                                "certificate"
-                            } else if pinned.as_ref().is_some_and(|a| a.closed) {
-                                "pinned"
-                            } else {
-                                "search"
-                            });
-                            self.graphs.insert((bucket_id.0, id.0), graph);
-                            (Some(summary), None)
-                        }
-                        Some(Err(error)) => {
-                            self.graphs.remove(&(bucket_id.0, id.0));
-                            (None, Some(error))
-                        }
-                        None => (None, None),
-                    };
-                    let first_unknown_reason = air.take_unknown_reason();
-                    let first_matching_loops = air.take_matching_loops();
-                    let first_difficulty = air.take_difficulty();
-                    // Sessions do not report instantiation pressure yet.
-                    drop(air.take_inst_pressure());
-                    // Ask for further errors exactly as far as the original
-                    // invocation did, so rechecking a function with several
-                    // failing assertions reports the same ones rather than
-                    // only the first. Mirrors `check_result_validity`.
-                    let mut checks_remaining = multiple_errors;
-                    let mut only_check_earlier = false;
-                    let mut verdict = None;
-                    let mut assert_id = None;
-                    loop {
-                        match outcome {
-                            ValidityResult::Valid(_) => {
-                                verdict.get_or_insert(QueryResult::Valid);
-                                break;
-                            }
-                            ValidityResult::Canceled => {
-                                // On the first round the verdict carries this.
-                                // On a later one the verdict is already
-                                // `invalid`, so without the diagnostic the
-                                // caller cannot tell a complete error list from
-                                // one the rlimit cut short. The batch run
-                                // reports it on every round, and so does this.
-                                // It omits the batch's `--profile` hint, which
-                                // is a rerun the caller of a session does not
-                                // make.
-                                diagnostics.bare(
-                                    level.into(),
-                                    format!(
-                                        "{}: Resource limit (rlimit) exceeded",
-                                        query.context.desc
-                                    ),
-                                    &query.context.span.as_string,
-                                );
-                                verdict.get_or_insert(QueryResult::ResourceLimit);
-                                break;
-                            }
-                            // A failure the solver gave no model for cannot be
-                            // localised any further: `check_valid_again` panics
-                            // on it rather than reporting it, so this must stop
-                            // where `check_result_validity` stops.
-                            ValidityResult::Invalid(None, error, id)
-                            | ValidityResult::Invalid(_, error @ None, id) => {
-                                match error {
-                                    Some(error) => diagnostics.record(&error, level),
-                                    // Nothing came back to describe the
-                                    // failure. Name the obligation, as the
-                                    // batch run does.
-                                    None => diagnostics.bare(
-                                        level.into(),
-                                        query.context.desc.clone(),
-                                        &query.context.span.as_string,
-                                    ),
-                                }
-                                if verdict.is_none() {
-                                    verdict = Some(QueryResult::Invalid);
-                                    assert_id = id.map(|id| (*id).clone());
-                                }
-                                break;
-                            }
-                            ValidityResult::Invalid(_, error, id) => {
-                                if let Some(error) = error {
-                                    diagnostics.record(&error, level);
-                                }
-                                // Later rounds only add diagnostics: the
-                                // verdict and the reported assertion stay
-                                // those of the first failure.
-                                if verdict.is_none() {
-                                    verdict = Some(QueryResult::Invalid);
-                                    assert_id = id.map(|id| (*id).clone());
-                                }
-                                if multiple_errors == 0 {
-                                    break;
-                                }
-                                if !only_check_earlier {
-                                    checks_remaining -= 1;
-                                    only_check_earlier = checks_remaining == 0;
-                                }
-                                outcome = air.check_valid_again(
-                                    &diagnostics,
-                                    only_check_earlier,
-                                    QueryContext::default(),
-                                );
-                                drop(air.take_provenance());
-                                drop(air.take_matching_loops());
-                                drop(air.take_difficulty());
-                                drop(air.take_inst_pressure());
-                            }
-                            ValidityResult::TypeError(error) => {
-                                return fatal(&mut output, io::Error::other(error.to_string()));
-                            }
-                            ValidityResult::UnexpectedOutput(error) => {
-                                return fatal(&mut output, io::Error::other(error));
-                            }
-                        }
-                    }
-                    let result = verdict.expect("every path out of the loop sets a verdict");
-                    // The batch run guards this on the level and the counter
-                    // alone, so at `--multiple-errors 0`, where the counter
-                    // starts spent, it says the search was cut short even for a
-                    // query that passed. Requiring a failure is a deliberate
-                    // departure: a caller diffing a session against that run
-                    // sees the note only where errors were actually withheld.
-                    if matches!(result, QueryResult::Invalid)
-                        && level == MessageLevel::Error
-                        && checks_remaining == 0
-                    {
-                        diagnostics.bare(
-                            DiagnosticLevel::Note,
-                            format!(
-                                "{}: not all errors may have been reported; rerun with a higher value for --multiple-errors to find other potential errors in this function",
-                                query.context.desc
-                            ),
-                            &query.context.span.as_string,
-                        );
-                    }
-                    let provenance = first_provenance.and_then(|info| {
-                        bucket.symbols.as_ref().map(|symbols| {
-                            symbols.resolve(
-                                &query.context.fun,
-                                crate::provenance::QueryProvenance {
-                                    desc: query.context.desc.clone(),
-                                    span: query.context.span.as_string.clone(),
-                                    // resident rechecks never expand an error
-                                    focus: None,
-                                    round: 0,
-                                    result: match result {
-                                        QueryResult::Valid => "valid",
-                                        QueryResult::Invalid => "invalid",
-                                        QueryResult::ResourceLimit => "canceled",
-                                    }
-                                    .to_owned(),
-                                    sources: info.sources,
-                                    instantiations: info.instantiations,
-                                    variable_versions: info.variable_versions,
-                                    unparsed: info.unparsed,
-                                },
-                            )
-                        })
-                    });
-                    let unknown_reason = first_unknown_reason.map(|reason| {
-                        bucket.quantifiers.resolve_unknown(
-                            &query.context.desc,
-                            &query.context.span.as_string,
-                            reason,
-                        )
-                    });
-                    let matching_loops = first_matching_loops.and_then(|info| {
-                        bucket.symbols.as_ref().map(|symbols| {
-                            symbols.resolve_matching_loops(
-                                &query.context.fun,
-                                crate::provenance::QueryMatchingLoops {
-                                    desc: query.context.desc.clone(),
-                                    span: query.context.span.as_string.clone(),
-                                    // resident rechecks never expand an error
-                                    focus: None,
-                                    round: 0,
-                                    result: match result {
-                                        QueryResult::Valid => "valid",
-                                        QueryResult::Invalid => "invalid",
-                                        QueryResult::ResourceLimit => "canceled",
-                                    }
-                                    .to_owned(),
-                                    info,
-                                },
-                            )
-                        })
-                    });
-                    let difficulty = first_difficulty.and_then(|gradient| {
-                        bucket.symbols.as_ref().map(|symbols| {
-                            symbols.resolve_difficulty(
-                                &query.context.fun,
-                                crate::provenance::QueryDifficulty {
-                                    desc: query.context.desc.clone(),
-                                    span: query.context.span.as_string.clone(),
-                                    kind: query.kind.name(),
-                                    // resident rechecks never expand an error
-                                    focus: None,
-                                    round: 0,
-                                    result: match result {
-                                        QueryResult::Valid => "valid",
-                                        QueryResult::Invalid => "invalid",
-                                        QueryResult::ResourceLimit => "canceled",
-                                    }
-                                    .to_owned(),
-                                    gradient,
-                                },
-                            )
-                        })
-                    });
-                    // Only a proof is worth keeping. A failed check's instances
-                    // are no certificate, and saving them would replace one
-                    // that still closes the query once the failing edit is
-                    // undone. Every path here came from a solver answer, so
-                    // the save has a result to read from.
-                    if let Some(key) =
-                        replay_key.as_ref().filter(|_| matches!(result, QueryResult::Valid))
-                    {
-                        air.save_instantiations(key);
-                        if let Some(dir) = &cert_dir {
-                            write_certificate(air, dir, key);
-                        }
-                    }
-                    air.finish_query();
-                    send(
-                        &mut output,
-                        &Response::Checked {
-                            session,
-                            bucket: bucket_id,
-                            query: id,
-                            result,
-                            assert_id,
-                            diagnostics: diagnostics.0.into_inner(),
-                            elapsed_ms: start.elapsed().as_millis(),
-                            restore_ms,
-                            provenance: provenance.as_ref(),
-                            unknown_reason: unknown_reason.as_ref(),
-                            matching_loops: matching_loops.as_ref(),
-                            difficulty: difficulty.as_ref(),
-                            certificate: attempted,
-                            pinned,
-                            inst_graph: graph_summary,
-                            inst_graph_error: graph_error,
-                            rlimit: budget,
-                        },
-                    )?;
+                    send(&mut output, &Response::CheckedMany { session, count: queries.len() })?;
                 }
                 Request::InstGraph {
                     bucket: bucket_id,
@@ -7779,4 +7462,547 @@ mod tests {
         assert_ne!(reaches_b(&wider_a("A"), &ab_decls), reaches_b(&a_and_b("A"), &ab_decls));
         assert_eq!(reaches_b(&wider_a("Int"), &ab_decls), reaches_b(&a_and_b("Int"), &ab_decls));
     }
+}
+#[allow(dead_code)]
+fn _assert_retained_bucket_sync() {
+    fn sync<T: Sync>() {}
+    sync::<RetainedBucket>();
+}
+
+/// A check's answer, owned: what `Response::Checked` reports, which solver
+/// answered, and what the caller should do with the query's kept graph
+/// (`Some(Some(graph))` keep it, `Some(None)` drop the one kept, `None`
+/// leave it).
+struct CheckAnswer {
+    solver: usize,
+    result: QueryResult,
+    assert_id: Option<Vec<u64>>,
+    diagnostics: Vec<SourceDiagnostic>,
+    elapsed_ms: u128,
+    restore_ms: u128,
+    provenance: Option<crate::provenance::ResolvedQueryProvenance>,
+    unknown_reason: Option<crate::provenance::ResolvedUnknownReason>,
+    matching_loops: Option<crate::provenance::ResolvedQueryMatchingLoops>,
+    difficulty: Option<crate::provenance::ResolvedQueryDifficulty>,
+    certificate: Option<CertificateAttempt>,
+    pinned: Option<PinnedAttempt>,
+    inst_graph: Option<GraphSummary>,
+    inst_graph_error: Option<String>,
+    rlimit: f32,
+    kept_graph: Option<Option<InstantiationGraph>>,
+}
+
+/// Check one retained query in its solver, as a `check` request does: the
+/// certificate first and the pinned rung next when there are any, then the
+/// search, with as many further error rounds as `multiple_errors` asks. The
+/// bucket's lock is held throughout, so checks of different buckets can run
+/// at once. An error is fatal to the session.
+fn check_query(
+    bucket: &RetainedBucket,
+    id: QueryId,
+    pinned_rung: Option<Pin>,
+    cert_dir: Option<&std::path::Path>,
+    rlimit_override: Option<f32>,
+    multiple_errors: u32,
+    set_rlimit: &impl Fn(&mut Context, f32),
+) -> io::Result<CheckAnswer> {
+    let mut kept_graph: Option<Option<InstantiationGraph>> = None;
+    let mut state =
+        bucket.state.lock().map_err(|_| io::Error::other("resident bucket poisoned"))?;
+    let (solver, local) = bucket.addresses[id.0];
+    let SolverState { air, journal } = &mut state[solver];
+    let prefix = journal.queries[local].prefix;
+    // Restoration replays declarations through AIR and the
+    // solver, so it is timed apart from the check itself.
+    let restore_start = Instant::now();
+    if let Err(error) = journal.restore_prefix(air, prefix) {
+        return Err(error);
+    }
+    let restore_ms = restore_start.elapsed().as_millis();
+    let query = &journal.queries[local];
+    // The budget this check runs at: the request's, unless
+    // the function names its own.
+    let budget = match rlimit_override {
+        Some(rlimit) if !query.rlimit_attribute => rlimit,
+        _ => query.rlimit,
+    };
+    // The severity the original invocation would have reported
+    // this failure at, so a recommends recheck stays a warning.
+    let level = query.level;
+    set_rlimit(air, budget);
+    // With replay on, each check saves its instantiations
+    // under the query's certificate key.
+    let replay_key =
+        air.instantiation_replay().then(|| bucket.cert_keys[id.0].clone());
+    let diagnostics = QueryDiagnostics::default();
+    let start = Instant::now();
+    // Certificate first: once this query has saved
+    // instantiations, here or in an earlier session's
+    // exported certificate, check with them alone. `:only`
+    // lets no strategy run, so the solver answers from the
+    // replayed instances, each an instance of a formula this
+    // scope asserts, and a valid answer is sound. Any other
+    // answer is discarded, with its diagnostics, before the
+    // ordinary check.
+    let mut certified = None;
+    let mut attempted = None;
+    let certificate = replay_key.as_ref().and_then(|key| {
+        if air.has_saved_instantiations(key) {
+            return Some((key.clone(), None));
+        }
+        // A file that is not exactly a certificate for this
+        // key is never sent: it could assert anything.
+        let path = cert_dir?.join(format!("{key}.smt2"));
+        let text = read_certificate(&path)?;
+        let import = ImportInstantiations::parse(&text, key)?;
+        Some((key.clone(), Some(import)))
+    });
+    if let Some((key, import)) = certificate {
+        let source = match import {
+            Some(_) => CertificateSource::Imported,
+            None => CertificateSource::Session,
+        };
+        air.set_restore_instantiations(Some(key), true);
+        air.set_import_instantiations(import);
+        let attempt = air.check_valid(
+            &VirMessageInterface {},
+            &QueryDiagnostics::default(),
+            &query.query,
+            QueryContext::default(),
+        );
+        air.set_restore_instantiations(None, false);
+        air.set_import_instantiations(None);
+        drop(air.take_provenance());
+        drop(air.take_unknown_reason());
+        drop(air.take_matching_loops());
+        drop(air.take_difficulty());
+        drop(air.take_inst_pressure());
+        match attempt {
+            ValidityResult::Valid(usage) => {
+                certified = Some(ValidityResult::Valid(usage))
+            }
+            ValidityResult::TypeError(error) => {
+                return Err(io::Error::other(error.to_string()));
+            }
+            ValidityResult::UnexpectedOutput(error) => {
+                return Err(io::Error::other(error));
+            }
+            _ => air.finish_query(),
+        }
+        attempted = Some(CertificateAttempt {
+            source,
+            closed: certified.is_some(),
+            elapsed_ms: start.elapsed().as_millis(),
+        });
+    }
+    // Then the pinned rung, when a ladder or pin request set
+    // one: its strategy, alone or alongside as pinned, at the
+    // budget it was pinned at or the query's own, whichever
+    // is smaller, so it is bounded even for a
+    // query without an rlimit. It changes which instances
+    // are tried, never what is asserted, so a valid answer
+    // is sound, and that answer's diagnostics (provenance,
+    // difficulty) describe the check that decided, so the
+    // reply keeps them, as it keeps its graph. Any other
+    // answer is discarded, with its diagnostics, before the
+    // ordinary check, which runs the full schedule.
+    let mut pinned = None;
+    if let Some(&pin) =
+        pinned_rung.as_ref().filter(|_| certified.is_none())
+    {
+        let attempt_start = Instant::now();
+        let rlimit = pin.rlimit.min(budget);
+        set_rlimit(air, rlimit);
+        air.set_quant_strategy(Some(pin.rung.name()), !pin.alongside);
+        let attempt = air.check_valid(
+            &VirMessageInterface {},
+            &QueryDiagnostics::default(),
+            &query.query,
+            QueryContext::default(),
+        );
+        set_rlimit(air, budget);
+        let resource_units =
+            air.take_strategy_rung().map(|info| info.resource_units);
+        match attempt {
+            ValidityResult::Valid(usage) => {
+                certified = Some(ValidityResult::Valid(usage))
+            }
+            ValidityResult::TypeError(error) => {
+                return Err(io::Error::other(error.to_string()));
+            }
+            ValidityResult::UnexpectedOutput(error) => {
+                return Err(io::Error::other(error));
+            }
+            _ => {
+                drop(air.take_provenance());
+                drop(air.take_unknown_reason());
+                drop(air.take_matching_loops());
+                drop(air.take_difficulty());
+                drop(air.take_inst_pressure());
+                air.finish_query();
+            }
+        }
+        pinned = Some(PinnedAttempt {
+            rung: pin.rung,
+            alongside: pin.alongside,
+            rlimit,
+            closed: certified.is_some(),
+            elapsed_ms: attempt_start.elapsed().as_millis(),
+            resource_units,
+        });
+    }
+    let mut outcome = match certified {
+        Some(outcome) => outcome,
+        None => air.check_valid(
+            &VirMessageInterface {},
+            &diagnostics,
+            &query.query,
+            QueryContext::default(),
+        ),
+    };
+    // The response describes round zero. Later error searches
+    // replace AIR's provenance, even when their verdict differs.
+    let first_provenance = air.take_provenance();
+    // The graph of the check that decided the verdict: the
+    // certificate attempt's when it closed the query, else
+    // the search's. Later error rounds search again, which
+    // replaces the solver's record, so it is read now. A
+    // query with nothing to instantiate (bit-vector,
+    // nonlinear) gets an empty graph; an error comes only
+    // when cvc5 cannot answer.
+    let graph = air
+        .inst_graph()
+        .then(|| InstantiationGraph::from_live(&air.instantiation_graph()));
+    let (graph_summary, graph_error) = match graph {
+        Some(Ok(graph)) => {
+            let mut summary = graph.summary();
+            summary.check = Some(if attempted.as_ref().is_some_and(|a| a.closed) {
+                "certificate"
+            } else if pinned.as_ref().is_some_and(|a| a.closed) {
+                "pinned"
+            } else {
+                "search"
+            });
+            kept_graph = Some(Some(graph));
+            (Some(summary), None)
+        }
+        Some(Err(error)) => {
+            kept_graph = Some(None);
+            (None, Some(error))
+        }
+        None => (None, None),
+    };
+    let first_unknown_reason = air.take_unknown_reason();
+    let first_matching_loops = air.take_matching_loops();
+    let first_difficulty = air.take_difficulty();
+    // Sessions do not report instantiation pressure yet.
+    drop(air.take_inst_pressure());
+    // Ask for further errors exactly as far as the original
+    // invocation did, so rechecking a function with several
+    // failing assertions reports the same ones rather than
+    // only the first. Mirrors `check_result_validity`.
+    let mut checks_remaining = multiple_errors;
+    let mut only_check_earlier = false;
+    let mut verdict = None;
+    let mut assert_id = None;
+    loop {
+        match outcome {
+            ValidityResult::Valid(_) => {
+                verdict.get_or_insert(QueryResult::Valid);
+                break;
+            }
+            ValidityResult::Canceled => {
+                // On the first round the verdict carries this.
+                // On a later one the verdict is already
+                // `invalid`, so without the diagnostic the
+                // caller cannot tell a complete error list from
+                // one the rlimit cut short. The batch run
+                // reports it on every round, and so does this.
+                // It omits the batch's `--profile` hint, which
+                // is a rerun the caller of a session does not
+                // make.
+                diagnostics.bare(
+                    level.into(),
+                    format!(
+                        "{}: Resource limit (rlimit) exceeded",
+                        query.context.desc
+                    ),
+                    &query.context.span.as_string,
+                );
+                verdict.get_or_insert(QueryResult::ResourceLimit);
+                break;
+            }
+            // A failure the solver gave no model for cannot be
+            // localised any further: `check_valid_again` panics
+            // on it rather than reporting it, so this must stop
+            // where `check_result_validity` stops.
+            ValidityResult::Invalid(None, error, id)
+            | ValidityResult::Invalid(_, error @ None, id) => {
+                match error {
+                    Some(error) => diagnostics.record(&error, level),
+                    // Nothing came back to describe the
+                    // failure. Name the obligation, as the
+                    // batch run does.
+                    None => diagnostics.bare(
+                        level.into(),
+                        query.context.desc.clone(),
+                        &query.context.span.as_string,
+                    ),
+                }
+                if verdict.is_none() {
+                    verdict = Some(QueryResult::Invalid);
+                    assert_id = id.map(|id| (*id).clone());
+                }
+                break;
+            }
+            ValidityResult::Invalid(_, error, id) => {
+                if let Some(error) = error {
+                    diagnostics.record(&error, level);
+                }
+                // Later rounds only add diagnostics: the
+                // verdict and the reported assertion stay
+                // those of the first failure.
+                if verdict.is_none() {
+                    verdict = Some(QueryResult::Invalid);
+                    assert_id = id.map(|id| (*id).clone());
+                }
+                if multiple_errors == 0 {
+                    break;
+                }
+                if !only_check_earlier {
+                    checks_remaining -= 1;
+                    only_check_earlier = checks_remaining == 0;
+                }
+                outcome = air.check_valid_again(
+                    &diagnostics,
+                    only_check_earlier,
+                    QueryContext::default(),
+                );
+                drop(air.take_provenance());
+                drop(air.take_matching_loops());
+                drop(air.take_difficulty());
+                drop(air.take_inst_pressure());
+            }
+            ValidityResult::TypeError(error) => {
+                return Err(io::Error::other(error.to_string()));
+            }
+            ValidityResult::UnexpectedOutput(error) => {
+                return Err(io::Error::other(error));
+            }
+        }
+    }
+    let result = verdict.expect("every path out of the loop sets a verdict");
+    // The batch run guards this on the level and the counter
+    // alone, so at `--multiple-errors 0`, where the counter
+    // starts spent, it says the search was cut short even for a
+    // query that passed. Requiring a failure is a deliberate
+    // departure: a caller diffing a session against that run
+    // sees the note only where errors were actually withheld.
+    if matches!(result, QueryResult::Invalid)
+        && level == MessageLevel::Error
+        && checks_remaining == 0
+    {
+        diagnostics.bare(
+            DiagnosticLevel::Note,
+            format!(
+                "{}: not all errors may have been reported; rerun with a higher value for --multiple-errors to find other potential errors in this function",
+                query.context.desc
+            ),
+            &query.context.span.as_string,
+        );
+    }
+    let provenance = first_provenance.and_then(|info| {
+        bucket.symbols.as_ref().map(|symbols| {
+            symbols.resolve(
+                &query.context.fun,
+                crate::provenance::QueryProvenance {
+                    desc: query.context.desc.clone(),
+                    span: query.context.span.as_string.clone(),
+                    // resident rechecks never expand an error
+                    focus: None,
+                    round: 0,
+                    result: match result {
+                        QueryResult::Valid => "valid",
+                        QueryResult::Invalid => "invalid",
+                        QueryResult::ResourceLimit => "canceled",
+                    }
+                    .to_owned(),
+                    sources: info.sources,
+                    instantiations: info.instantiations,
+                    variable_versions: info.variable_versions,
+                    unparsed: info.unparsed,
+                },
+            )
+        })
+    });
+    let unknown_reason = first_unknown_reason.map(|reason| {
+        bucket.quantifiers.resolve_unknown(
+            &query.context.desc,
+            &query.context.span.as_string,
+            reason,
+        )
+    });
+    let matching_loops = first_matching_loops.and_then(|info| {
+        bucket.symbols.as_ref().map(|symbols| {
+            symbols.resolve_matching_loops(
+                &query.context.fun,
+                crate::provenance::QueryMatchingLoops {
+                    desc: query.context.desc.clone(),
+                    span: query.context.span.as_string.clone(),
+                    // resident rechecks never expand an error
+                    focus: None,
+                    round: 0,
+                    result: match result {
+                        QueryResult::Valid => "valid",
+                        QueryResult::Invalid => "invalid",
+                        QueryResult::ResourceLimit => "canceled",
+                    }
+                    .to_owned(),
+                    info,
+                },
+            )
+        })
+    });
+    let difficulty = first_difficulty.and_then(|gradient| {
+        bucket.symbols.as_ref().map(|symbols| {
+            symbols.resolve_difficulty(
+                &query.context.fun,
+                crate::provenance::QueryDifficulty {
+                    desc: query.context.desc.clone(),
+                    span: query.context.span.as_string.clone(),
+                    kind: query.kind.name(),
+                    // resident rechecks never expand an error
+                    focus: None,
+                    round: 0,
+                    result: match result {
+                        QueryResult::Valid => "valid",
+                        QueryResult::Invalid => "invalid",
+                        QueryResult::ResourceLimit => "canceled",
+                    }
+                    .to_owned(),
+                    gradient,
+                },
+            )
+        })
+    });
+    // Only a proof is worth keeping. A failed check's instances
+    // are no certificate, and saving them would replace one
+    // that still closes the query once the failing edit is
+    // undone. Every path here came from a solver answer, so
+    // the save has a result to read from.
+    if let Some(key) =
+        replay_key.as_ref().filter(|_| matches!(result, QueryResult::Valid))
+    {
+        air.save_instantiations(key);
+        if let Some(dir) = cert_dir {
+            write_certificate(air, dir, key);
+        }
+    }
+    air.finish_query();
+    Ok(CheckAnswer {
+        solver,
+        result,
+        assert_id,
+        diagnostics: diagnostics.0.into_inner(),
+        elapsed_ms: start.elapsed().as_millis(),
+        restore_ms,
+        provenance,
+        unknown_reason,
+        matching_loops,
+        difficulty,
+        certificate: attempted,
+        pinned,
+        inst_graph: graph_summary,
+        inst_graph_error: graph_error,
+        rlimit: budget,
+        kept_graph,
+    })
+}
+
+/// Stop the least recently used solvers of `buckets` past `cap`. With
+/// `wait` false, a bucket another thread is checking is passed over rather
+/// than waited for: its solvers are in use.
+fn enforce_live_solvers(
+    buckets: &[RetainedBucket],
+    used: &HashMap<(usize, usize), u64>,
+    cap: Option<usize>,
+    wait: bool,
+) {
+    let Some(cap) = cap else { return };
+    fn lock(bucket: &RetainedBucket, wait: bool) -> Option<std::sync::MutexGuard<'_, Vec<SolverState>>> {
+        if wait { bucket.state.lock().ok() } else { bucket.state.try_lock().ok() }
+    }
+    let mut live = Vec::new();
+    for (b, bucket) in buckets.iter().enumerate() {
+        let Some(state) = lock(bucket, wait) else { continue };
+        for (s, solver) in state.iter().enumerate() {
+            if solver.air.is_live() {
+                live.push((used.get(&(b, s)).copied().unwrap_or(0), b, s));
+            }
+        }
+    }
+    if live.len() <= cap {
+        return;
+    }
+    live.sort();
+    let excess = live.len() - cap;
+    for &(_, b, s) in &live[..excess] {
+        if let Some(mut state) = lock(&buckets[b], wait) {
+            state[s].air.suspend();
+        }
+    }
+}
+
+/// Note which solver a check used and what became of its graph.
+fn account(
+    clock: &mut u64,
+    used: &mut HashMap<(usize, usize), u64>,
+    graphs: &mut KeptGraphs,
+    bucket: BucketIndex,
+    query: QueryId,
+    answer: &mut CheckAnswer,
+) {
+    *clock += 1;
+    used.insert((bucket.0, answer.solver), *clock);
+    match answer.kept_graph.take() {
+        Some(Some(graph)) => {
+            graphs.insert((bucket.0, query.0), graph);
+        }
+        Some(None) => {
+            graphs.remove(&(bucket.0, query.0));
+        }
+        None => {}
+    }
+}
+
+/// Send a check's answer.
+fn send_answer(
+    output: &mut impl Write,
+    session: &str,
+    bucket: BucketIndex,
+    query: QueryId,
+    answer: CheckAnswer,
+) -> io::Result<()> {
+    send(
+        output,
+        &Response::Checked {
+            session,
+            bucket,
+            query,
+            result: answer.result,
+            assert_id: answer.assert_id,
+            diagnostics: answer.diagnostics,
+            elapsed_ms: answer.elapsed_ms,
+            restore_ms: answer.restore_ms,
+            provenance: answer.provenance.as_ref(),
+            unknown_reason: answer.unknown_reason.as_ref(),
+            matching_loops: answer.matching_loops.as_ref(),
+            difficulty: answer.difficulty.as_ref(),
+            certificate: answer.certificate,
+            pinned: answer.pinned,
+            inst_graph: answer.inst_graph,
+            inst_graph_error: answer.inst_graph_error,
+            rlimit: answer.rlimit,
+        },
+    )
 }

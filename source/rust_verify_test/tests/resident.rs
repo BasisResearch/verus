@@ -3315,7 +3315,8 @@ fn resident_ready_lists_the_requests_it_serves() {
             "ladder",
             "twin",
             "speculate",
-            "pin"
+            "pin",
+            "check_many"
         ],
         "{ready}"
     );
@@ -3344,6 +3345,9 @@ fn resident_ready_lists_the_requests_it_serves() {
             }
             "pin" => {
                 json!({"command": command, "session": "stale", "bucket": 0, "query": 0, "rung": "ematch", "rlimit": 1.0})
+            }
+            "check_many" => {
+                json!({"command": command, "session": "stale", "queries": [[0, 0]], "threads": 2})
             }
             _ => panic!("no request for {}", command),
         };
@@ -5271,6 +5275,81 @@ fn resident_check_takes_an_rlimit_and_an_error_count() {
     assert_eq!(errors(&one), 1, "{}", one);
     let all = check(&mut worker, "::three_failures", json!({"multiple_errors": 5}));
     assert_eq!(errors(&all), 3, "{}", all);
+    assert_eq!(worker.send(json!({"command": "close", "session": session}))["event"], "closed");
+    worker.finish(false);
+}
+
+const MANY_SOURCE: &str = r#"
+use vstd::prelude::*;
+verus! {
+    spec fn f(x: int) -> int { x + 1 }
+
+    #[verifier::spinoff_prover]
+    proof fn a(x: int) ensures f(x) > x {}
+
+    #[verifier::spinoff_prover]
+    proof fn b(x: int) { assert(x > 0); }
+
+    #[verifier::spinoff_prover]
+    proof fn c(x: int) ensures f(x) == x + 1 {}
+
+    proof fn d(x: int) ensures f(x) > x - 1 {}
+
+    proof fn e(x: int) { assert(x > 1); assert(x > 2); }
+}
+"#;
+
+/// A batch of checks across buckets runs several at once and answers each as
+/// a single check would: one `checked` event per query, in any order, then a
+/// `checked_many` that counts them. Rerunning the batch, with an rlimit or an
+/// error count, keeps answering alike; under a cap on running solvers the
+/// batch leaves no more running than the cap.
+#[test]
+fn resident_check_many_checks_queries_concurrently() {
+    let mut worker = Worker::start_with_env(MANY_SOURCE, &[], &[("VERUS_RESIDENT_MAX_SOLVERS", "2")]);
+    let ready = worker.receive();
+    let session = ready["session"].clone();
+    let mut expected = std::collections::BTreeMap::new();
+    let mut queries = Vec::new();
+    for bucket in ready["buckets"].as_array().unwrap() {
+        for query in bucket["queries"].as_array().unwrap() {
+            if query["kind"] != "body" {
+                continue;
+            }
+            let address = (bucket["id"].as_u64().unwrap(), query["id"].as_u64().unwrap());
+            expected.insert(address, query["initial"]["result"].clone());
+            queries.push(json!([address.0, address.1]));
+        }
+    }
+    assert!(ready["buckets"].as_array().unwrap().len() >= 4, "{}", ready);
+    for extra in [json!({"threads": 3}), json!({"threads": 8, "multiple_errors": 0, "rlimit": 20})] {
+        let mut request = json!({"command": "check_many", "session": session, "queries": queries});
+        request.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        let first = worker.send(request);
+        let mut seen = std::collections::BTreeMap::new();
+        let mut reply = first;
+        while reply["event"] == "checked" {
+            let address = (reply["bucket"].as_u64().unwrap(), reply["query"].as_u64().unwrap());
+            assert!(seen.insert(address, reply["result"].clone()).is_none(), "{}", reply);
+            reply = worker.receive();
+        }
+        assert_eq!(reply["event"], "checked_many", "{}", reply);
+        assert_eq!(reply["count"], queries.len(), "{}", reply);
+        assert_eq!(seen, expected, "{}", extra);
+    }
+    let e = query_id(&ready, "::e");
+    let errors = worker.send(json!({"command": "check_many", "session": session,
+        "queries": [[0, e]], "multiple_errors": 0}));
+    assert_eq!(
+        errors["diagnostics"].as_array().unwrap().iter().filter(|d| d["level"] == "error").count(),
+        1,
+        "{}",
+        errors
+    );
+    assert_eq!(worker.receive()["event"], "checked_many");
+    // A bad address is refused before any check.
+    let refused = worker.send(json!({"command": "check_many", "session": session, "queries": [[99, 0]]}));
+    assert_eq!(refused["event"], "error", "{}", refused);
     assert_eq!(worker.send(json!({"command": "close", "session": session}))["event"], "closed");
     worker.finish(false);
 }
