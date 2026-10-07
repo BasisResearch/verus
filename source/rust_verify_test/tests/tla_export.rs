@@ -4416,9 +4416,9 @@ fn tla_export_trace_spec_follows_a_counter_log() {
     let (spec, tla, cfg) = trace_spec(&ex);
     assert!(tla.starts_with("---- MODULE State_tla_trace ----\n"), "{}", tla);
     assert!(tla.contains("EXTENDS State_tla, Json, TLC, Integers, Sequences\n"), "{}", tla);
-    // Only ever narrows Next: the logged step is conjoined with it, after
-    // it, so the step reads the successor Next assigns.
-    assert!(tla.contains("           /\\ Next\n           /\\ TraceStep(e)\n"), "{}", tla);
+    // Every known counter step has a selected relation, including next_step.
+    assert!(tla.contains("           /\\ TraceStep(e)\n"), "{}", tla);
+    assert_eq!(ex.report["trace"]["general_relation_steps"], serde_json::json!([]));
     assert!(cfg.contains("INIT TraceInit\nNEXT TraceNext\n"), "{}", cfg);
     let Some(jar) = tla_tools() else { return };
     sany(&jar, &spec);
@@ -4575,11 +4575,12 @@ fn tla_export_trace_spec_stops_at_a_malformed_log() {
     std::fs::write(&log, format!("{header}\n{line}\n")).unwrap();
     let out = stops(&jar, &spec, &cfg, &log, "");
     assert!(out.contains("trace: t_inc has no parameter n"), "{}", out);
-    // Nor is a step the model does not have, or a field the state lacks.
+    // Unknown names use state-only conformance, as advertised in the report.
     let line = r#"{"step": "t_dec", "params": {}, "state": {}}"#;
     std::fs::write(&log, format!("{header}\n{line}\n")).unwrap();
-    let out = stops(&jar, &spec, &cfg, &log, "");
-    assert!(out.contains("trace: the model has no step t_dec"), "{}", out);
+    let (depth, out) = follow(&jar, &spec, &cfg, &log, "");
+    assert_eq!(depth, 2, "{out}");
+    assert!(ex.report["trace"]["unknown_step"].as_str().unwrap().starts_with("Next"));
     let line = r#"{"step": "t_inc", "params": {}, "state": {"z": 1}}"#;
     std::fs::write(&log, format!("{header}\n{line}\n")).unwrap();
     let out = stops(&jar, &spec, &cfg, &log, "");
@@ -4945,7 +4946,7 @@ fn tla_export_trace_spec_follows_a_verus_tla_log() {
     assert_eq!(ex.report["shape"], "verus-tla");
     let steps = ex.report["trace"]["steps"].as_array().unwrap();
     let named: Vec<&str> = steps.iter().map(|s| s["step"].as_str().unwrap()).collect();
-    assert_eq!(named, ["next"]);
+    assert_eq!(named, ["next", "acquire", "release"]);
     let (spec, _, cfg) = trace_spec(&ex);
     let Some(jar) = tla_tools() else { return };
     sany(&jar, &spec);
@@ -9001,4 +9002,147 @@ pub open spec fn some(s: State) -> bool { exists|c: Multiset<int>| c.len() == s.
     assert!(ex.tla.contains("\\E c \\in Dom_Multiset_int :"), "{}", ex.tla);
     let Some(jar) = tla_tools() else { return };
     sany(&jar, &ex.spec());
+}
+
+/// A name selects the dispatch arm, even when another arm has the same
+/// successor. The guard deliberately lives in the dispatcher, not t_a.
+#[test]
+fn tla_export_trace_spec_selects_enum_arm() {
+    let ex = export_code(
+        r#"
+use vstd::prelude::*;
+verus! {
+pub struct State { pub x: u8 }
+pub enum Step { A(u8), B }
+pub open spec fn init(s: State) -> bool { s.x == 0 }
+pub open spec fn t_a(pre: State, post: State, n: u8) -> bool { post.x == n }
+pub open spec fn t_b(pre: State, post: State) -> bool { post.x == 1 }
+pub open spec fn next_step(pre: State, post: State, step: Step) -> bool {
+    match step {
+        Step::A(n) => pre.x == 0 && t_a(pre, post, n),
+        Step::B => pre.x == 1 && t_b(pre, post),
+    }
+}
+pub open spec fn next(pre: State, post: State) -> bool { exists|s: Step| next_step(pre, post, s) }
+}
+"#,
+        "test_crate",
+    );
+    assert_trace_arm_selection(&ex, "test_crate", "t_a", "t_b", r#", "params": {"n": 1}"#, "");
+}
+
+#[test]
+fn tla_export_trace_spec_selects_verussync_arm() {
+    let ex = export_code(
+        r#"
+use vstd::prelude::*;
+use verus_state_machines_macros::state_machine;
+verus! {
+state_machine! { Machine {
+    fields { pub x: u8, }
+    init! { initialize() { init x = 0; } }
+    transition! { a() { require pre.x == 0; update x = 1; } }
+    transition! { b() { require pre.x == 1; update x = 1; } }
+}}
+}
+"#,
+        "test_crate::Machine",
+    );
+    assert_trace_arm_selection(&ex, "test_crate::Machine", "a", "b", "", "");
+}
+
+#[test]
+fn tla_export_trace_spec_selects_action_record_arm() {
+    let ex = export_code(
+        r#"
+use vstd::prelude::*;
+verus! {
+#[verifier::reject_recursive_types(S)]
+pub struct Action<S> {
+    pub precondition: spec_fn(S) -> bool,
+    pub transition: spec_fn(S, S) -> bool,
+}
+pub open spec fn step<S>(a: Action<S>) -> spec_fn(S, S) -> bool {
+    |pre: S, post: S| (a.precondition)(pre) && (a.transition)(pre, post)
+}
+pub struct State { pub x: u8 }
+pub open spec fn a(n: u8) -> Action<State> {
+    Action { precondition: |s: State| s.x == 0,
+             transition: |pre: State, post: State| post.x == n }
+}
+pub open spec fn b() -> Action<State> {
+    Action { precondition: |s: State| s.x == 1,
+             transition: |pre: State, post: State| post.x == 1 }
+}
+pub open spec fn init() -> spec_fn(State) -> bool { |s: State| s.x == 0 }
+pub open spec fn next() -> spec_fn(State, State) -> bool {
+    |pre: State, post: State| (exists|n: u8| n < 2 && step(a(n))(pre, post)) || step(b())(pre, post)
+}
+}
+"#,
+        "test_crate",
+    );
+    assert_trace_arm_selection(&ex, "test_crate", "a", "b", r#", "params": {"n": 1}"#, "");
+}
+
+fn assert_trace_arm_selection(
+    ex: &Exported,
+    module: &str,
+    a: &str,
+    b: &str,
+    params: &str,
+    constants: &str,
+) {
+    let (spec, tla, cfg) = trace_spec(ex);
+    assert!(tla.contains("TraceArm_") || tla.contains("TraceAction_"), "{}", tla);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &spec);
+    let log = ex.dir.path().join("selected.ndjson");
+    let prefix = format!(
+        "{{\"module\": \"State_tla\", \"export\": \"{module}\", \"state\": {{\"x\": 0}}}}\n{{\"step\": \"{a}\"{params}, \"state\": {{\"x\": 1}}}}\n"
+    );
+    for (name, p, expected) in [(b, "", 3), (a, params, 2)] {
+        std::fs::write(
+            &log,
+            format!("{prefix}{{\"step\": \"{name}\"{p}, \"state\": {{\"x\": 1}}}}\n"),
+        )
+        .unwrap();
+        let (depth, out) = follow(&jar, &spec, &cfg, &log, constants);
+        assert_eq!(depth, expected, "{out}");
+    }
+}
+
+#[test]
+fn tla_export_trace_spec_selects_forward_action_call_sites() {
+    let ex = export_code(
+        &format!(
+            r#"
+verus! {{
+{defs}
+use action::*;
+use defs::*;
+pub struct State {{ pub x: u8 }}
+pub open spec fn init() -> StatePred<State> {{ |s: State| s.x == 0 }}
+pub open spec fn a() -> Action<State, u8, ()> {{
+    Action {{ precondition: |input: u8, s: State| s.x == 0,
+              transition: |input: u8, s: State| (State {{ x: input }}, ()) }}
+}}
+pub open spec fn b() -> Action<State, u8, ()> {{
+    Action {{ precondition: |input: u8, s: State| s.x == 1,
+              transition: |input: u8, s: State| (State {{ x: 1 }}, ()) }}
+}}
+pub open spec fn next() -> ActionPred<State> {{
+    |pre: State, post: State|
+        a().forward(0)(pre, post) || a().forward(1)(pre, post)
+        || (exists|v: u8| v < 2 && b().forward(v)(pre, post))
+}}
+}}
+"#,
+            defs = verus_tla_defs()
+        ),
+        "test_crate",
+    );
+    let steps = ex.report["trace"]["steps"].as_array().unwrap();
+    assert_eq!(steps.iter().filter(|s| s["step"] == "a").count(), 1);
+    assert_trace_arm_selection(&ex, "test_crate", "a", "b", r#", "params": {"input": 1}"#, "");
 }

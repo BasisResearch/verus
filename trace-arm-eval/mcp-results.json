@@ -1,0 +1,119 @@
+[
+  {
+    "crate": "raft-rs",
+    "seconds": 8.117,
+    "result": {
+      "jsonrpc": "2.0",
+      "id": 3,
+      "result": {
+        "content": [
+          {
+            "type": "text",
+            "text": "conforms: all 33661 logged steps are a behaviour of State_tla (33662 states explored)\n\nfile: /Users/kirancodes/.verus-trace/data/1791391776282-173fbf97bff9-tlc-conform.json"
+          }
+        ],
+        "structuredContent": {
+          "schema_version": 1,
+          "tool": "tlc_conform",
+          "status": "done",
+          "summary": {
+            "success": true,
+            "crate_name": null,
+            "scope": null,
+            "verified": null,
+            "errors": 0,
+            "warnings": null,
+            "total": 33661,
+            "shown": 0,
+            "duration_ms": null
+          },
+          "text": "conforms: all 33661 logged steps are a behaviour of State_tla (33662 states explored)",
+          "file": "/Users/kirancodes/.verus-trace/data/1791391776282-173fbf97bff9-tlc-conform.json",
+          "file_error": null,
+          "job_id": null,
+          "data": null,
+          "error": null
+        },
+        "isError": false
+      }
+    }
+  },
+  {
+    "crate": "lru-rs",
+    "seconds": 0.866,
+    "result": {
+      "jsonrpc": "2.0",
+      "id": 6,
+      "result": {
+        "content": [
+          {
+            "type": "text",
+            "text": "conforms: all 551 logged steps are a behaviour of State_tla (552 states explored)\n\nfile: /Users/kirancodes/.verus-trace/data/1791391777645-57a33addab0c-tlc-conform.json"
+          }
+        ],
+        "structuredContent": {
+          "schema_version": 1,
+          "tool": "tlc_conform",
+          "status": "done",
+          "summary": {
+            "success": true,
+            "crate_name": null,
+            "scope": null,
+            "verified": null,
+            "errors": 0,
+            "warnings": null,
+            "total": 551,
+            "shown": 0,
+            "duration_ms": null
+          },
+          "text": "conforms: all 551 logged steps are a behaviour of State_tla (552 states explored)",
+          "file": "/Users/kirancodes/.verus-trace/data/1791391777645-57a33addab0c-tlc-conform.json",
+          "file_error": null,
+          "job_id": null,
+          "data": null,
+          "error": null
+        },
+        "isError": false
+      }
+    }
+  },
+  {
+    "crate": "rust-circular-buffer",
+    "seconds": 1.26,
+    "result": {
+      "jsonrpc": "2.0",
+      "id": 9,
+      "result": {
+        "content": [
+          {
+            "type": "text",
+            "text": "conforms: all 1026 logged steps are a behaviour of State_tla (1027 states explored)\n\nfile: /Users/kirancodes/.verus-trace/data/1791391779406-fe81db0e162c-tlc-conform.json"
+          }
+        ],
+        "structuredContent": {
+          "schema_version": 1,
+          "tool": "tlc_conform",
+          "status": "done",
+          "summary": {
+            "success": true,
+            "crate_name": null,
+            "scope": null,
+            "verified": null,
+            "errors": 0,
+            "warnings": null,
+            "total": 1026,
+            "shown": 0,
+            "duration_ms": null
+          },
+          "text": "conforms: all 1026 logged steps are a behaviour of State_tla (1027 states explored)",
+          "file": "/Users/kirancodes/.verus-trace/data/1791391779406-fe81db0e162c-tlc-conform.json",
+          "file_error": null,
+          "job_id": null,
+          "data": null,
+          "error": null
+        },
+        "isError": false
+      }
+    }
+  }
+]

@@ -1,0 +1,9 @@
+*
+!.gitignore
+!REPORT.md
+!bench.py
+!before-timings.json
+!after-timings.json
+!toydb-conform.log
+!mcp_check.py
+!mcp-results.json

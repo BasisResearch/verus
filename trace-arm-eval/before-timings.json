@@ -1,0 +1,29 @@
+[
+  {
+    "crate": "raft-rs",
+    "steps": 33661,
+    "seconds": 120.076,
+    "exit": 124,
+    "depth": null,
+    "log": "raft-rs/traces/fixed/harness/integration_cases__test_raft_flow_control__test_msg_app_flow_control_move_forward/1504.ndjson",
+    "limit": 120
+  },
+  {
+    "crate": "lru-rs",
+    "steps": 551,
+    "seconds": 120.13,
+    "exit": 124,
+    "depth": null,
+    "log": "lru-rs/traces/fixed/tests__test_pop_lru__0.ndjson",
+    "limit": 120
+  },
+  {
+    "crate": "rust-circular-buffer",
+    "steps": 1026,
+    "seconds": 120.192,
+    "exit": 124,
+    "depth": null,
+    "log": "rust-circular-buffer/traces/fixed/rust_out/main-3884610/1.ndjson",
+    "limit": 120
+  }
+]

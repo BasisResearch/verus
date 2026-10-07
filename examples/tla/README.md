@@ -461,11 +461,16 @@ quantifier binds, not a value a call computes. With neither (a call passes
 `pre.x + 5` to an `int`) it must be logged, and `TraceEnabled` leaves the
 step out: the report's trace step has `"enumerated": false`. A logged
 parameter is narrowed to its domain, so a value outside it is a step the
-model cannot take. The verus-tla shape has one step, `next`, since its `Next` is not
-split into named transitions.
+model cannot take. The verus-tla shape also exposes independently named action-record branches
+(`acquire` and `release` in `mutex_tla.rs`); `next` remains accepted for old logs.
 
-`TraceNext` conjoins `Next` and then the logged step (so it only ever
-narrows the model, and the step reads the successor `Next` has assigned) and compares the observed fields in the successor. TLC run on it
+For an existential step-enum dispatcher (including VerusSync's `next_by`),
+`TraceNext` selects the logged constructor's relation. Logged parameters narrow
+its field binders to singleton values in the original domains. Unlogged fields
+keep their original domains, including dependent bounds. The original dispatcher,
+its guards, and `TypeOK'` are retained. Action-record branches likewise retain
+both their preconditions and transitions. The observed successor comparison is
+unchanged. TLC run on it
 (`INIT TraceInit`, `NEXT TraceNext`, `CONSTANT TraceLog = "<log path>"`)
 ends without error on a well-formed log either way (the export's hole
 constants, such as `Dom_Step_add_v0`, go in its `.cfg` too): the log conforms when the depth of the search
@@ -477,25 +482,23 @@ before its first step. At a diverging step, `TraceEnabled` is the set of the mod
 with their parameters, and `TraceDiagnosis` says whether the logged step is
 enabled at all and which observed fields no successor by it matches.
 
-**A pass means the observed state sequence is a behaviour of the model.**
-The logged step's name and parameters count only through their effect on
-the observed state: `TraceNext` requires a successor that both `Next` and the
-logged step allow, not that `Next` took it by that step. So a step another
-of `Next`'s steps explains is accepted. With `next` either
-`exists|n: int| t_set(pre, post, n)` or `pre.x < 10 && t_jump(pre, post, pre.x + 5)`,
-logging `t_jump` with `to` 0 from `x` 0, `y` 0 is followed, since `t_set(0)`
-reaches the same state, though the model's `t_jump` only ever passes
-`pre.x + 5`. Restricting `Next` to the logged step's call sites is future
-work.
+**A selected arm must be enabled under the logged name.** A different arm
+with the same observed successor cannot explain a disabled selected arm.
+For general relations that cannot be independently selected (for example,
+helpers that only assign part of the state, or computed call arguments), the
+existing `Next` conjunction remains; `trace.general_relation_steps` lists these
+names. Its state-sequence semantics are unchanged.
 
-**The `Dom_` constants must cover every value the log carries.** Since
-`TraceNext` conjoins `Next`, and `Next` takes a step's arguments only from
-the export's holes (a VerusSync step's `Dom_Step_<t>_v<i>`, a `Dom_<Type>`
-bound), a logged parameter or observed value outside the hole the `.cfg`
-gives is a divergence, not a malformed log: TLC stops there, and
-`TraceDiagnosis` only says the step is not enabled. Give each hole in the
-trace `.cfg` at least the values the log carries (the generated header and
-`.cfg` say so too).
+An unknown step name falls back to `Next` and the observed-state comparison;
+its name and parameters are not checked. The JSON report advertises this weaker
+policy in `trace.unknown_step`. Ambiguous short names and misspelled parameters
+of known steps still stop TLC.
+
+**The `Dom_` constants must cover every value the log carries.** Selected arms
+retain their parameter domains. A logged value outside its domain diverges;
+leaving a parameter out still ranges over the original hole. Give each hole in
+the trace `.cfg` at least the values the log carries.
+
 `counter_trace_ok.ndjson` and `counter_trace_bad.ndjson` name the export
 `test_crate`, as the tests export `counter.rs`. The first is followed to its
 end (depth 6);
