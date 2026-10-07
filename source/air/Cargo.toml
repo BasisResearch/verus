@@ -14,6 +14,8 @@ petgraph = { workspace = true }
 serde = { workspace = true }
 indexmap = { workspace = true }
 yansi = { workspace = true }
+# The replay a stopped solver is relaunched from is kept deflated (emitter::Replay).
+flate2 = "1.1"
 
 [target.'cfg(windows)'.dependencies]
 win32job = "1"

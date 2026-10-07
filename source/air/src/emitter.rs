@@ -38,11 +38,46 @@ pub(crate) struct Replay {
     /// commands and only then relaunches, and the relaunched solver must get
     /// the state from before them, then them.
     staged: Vec<u8>,
+    /// The levels are deflated: the solver is stopped, and a module of
+    /// hundreds of stopped solvers would otherwise hold each one's whole
+    /// context as text.
+    frozen: bool,
 }
 
 impl Replay {
     pub(crate) fn new() -> Self {
-        Replay { levels: vec![Vec::new()], staged: Vec::new() }
+        Replay { levels: vec![Vec::new()], staged: Vec::new(), frozen: false }
+    }
+
+    /// Deflate the record while its solver is stopped.
+    pub(crate) fn freeze(&mut self) {
+        if self.frozen {
+            return;
+        }
+        for level in &mut self.levels {
+            let mut encoder =
+                flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::fast());
+            encoder.write_all(level).expect("deflating into memory");
+            *level = encoder.finish().expect("deflating into memory");
+        }
+        self.frozen = true;
+    }
+
+    /// Inflate a frozen record, to extend it or send it.
+    pub(crate) fn thaw(&mut self) {
+        if !self.frozen {
+            return;
+        }
+        for level in &mut self.levels {
+            let mut text = Vec::new();
+            std::io::Read::read_to_end(
+                &mut flate2::read::DeflateDecoder::new(&level[..]),
+                &mut text,
+            )
+            .expect("inflating a record this process deflated");
+            *level = text;
+        }
+        self.frozen = false;
     }
 
     /// Commands taken from the pipe, about to be sent. The ones taken before
@@ -60,6 +95,10 @@ impl Replay {
 
     /// Fold commands that were sent to the solver into the record.
     pub(crate) fn record(&mut self, data: &[u8]) {
+        if data.is_empty() {
+            return;
+        }
+        self.thaw();
         for form in top_level_forms(data) {
             let head = form_head(form);
             match head {
@@ -91,7 +130,8 @@ impl Replay {
 
     /// The commands, in order, that bring a fresh solver to the recorded
     /// state, not counting the staged ones.
-    pub(crate) fn commands(&self) -> Vec<u8> {
+    pub(crate) fn commands(&mut self) -> Vec<u8> {
+        self.thaw();
         self.levels.concat()
     }
 
@@ -484,5 +524,21 @@ mod replay_tests {
         assert_eq!(String::from_utf8(replay.commands()).unwrap(), "(declare-fun f () Int)\n(push 1)\n");
         replay.commit();
         assert_eq!(String::from_utf8(replay.commands()).unwrap(), "(declare-fun f () Int)\n");
+    }
+
+    /// A stopped solver's record is kept deflated and reads back the same.
+    #[test]
+    fn a_frozen_replay_reads_back_the_same() {
+        let mut replay = Replay::new();
+        replay.record(b"(declare-fun f () Int)(push 1)(assert (= f 1))");
+        let before = replay.commands();
+        let size = replay.bytes();
+        replay.freeze();
+        assert!(replay.bytes() > 0);
+        assert_eq!(replay.commands(), before);
+        replay.freeze();
+        replay.record(b"(pop 1)");
+        assert_eq!(String::from_utf8(replay.commands()).unwrap(), "(declare-fun f () Int)\n");
+        assert!(replay.bytes() < size);
     }
 }

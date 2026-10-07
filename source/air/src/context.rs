@@ -791,7 +791,7 @@ impl Context {
             // A relaunch after `suspend`: bring the new solver to the state
             // the old one was stopped in, before anything else reaches it.
             if std::mem::take(&mut self.relaunch_from_replay) {
-                let commands = self.smt_log.replay.as_ref().map(|r| r.commands());
+                let commands = self.smt_log.replay.as_mut().map(|r| r.commands());
                 if let Some(commands) = commands {
                     let started = std::time::Instant::now();
                     let output = self.smt_process.as_mut().unwrap().send_commands(commands);
@@ -838,6 +838,7 @@ impl Context {
         // What was taken last reached the solver being stopped.
         if let Some(replay) = &mut self.smt_log.replay {
             replay.commit();
+            replay.freeze();
         }
         // Dropping the process sends EOF and waits for it to exit.
         self.smt_process = None;

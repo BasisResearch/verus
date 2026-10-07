@@ -72,6 +72,24 @@
 //! checks pass (a caller checks a follow-up when its function's body fails,
 //! as the batch run does), and none of the `--expand-errors` queries, which
 //! only a failed check can name.
+//!
+//! Each catalogue query also names what the invocation itself answered when
+//! it checked the query (`initial`: verdict, failed assertion, diagnostics
+//! and time, absent under `VERUS_RESIDENT_RETAIN_ONLY`), since a run reports
+//! its verdicts per run and not per query, and the items it `reads`: the
+//! `BatchOwner::Item` keys of the declarations its fingerprint covers, its
+//! callees' contracts and the definitions it can unfold. A caller that
+//! scores a function by whether everything it rests on verified takes the
+//! closure over those.
+//!
+//! `VERUS_RESIDENT_MAX_SOLVERS` caps how many retained solvers run at once,
+//! for modules whose every function is spun off into a bucket and a solver
+//! of its own. An ordinary session's contexts then keep what they send their
+//! solver (`air::context::Context::enable_replay`); each retained solver is
+//! stopped once the invocation has checked its queries, the server stops the
+//! least recently checked past the cap after each request, and a stopped
+//! solver is relaunched from its record when a request needs it. Diagnostic
+//! modes, whose readings live in the solver, are not capped.
 
 mod relevance;
 mod twin;
