@@ -820,6 +820,9 @@ struct Exporter {
     constant_ops: HashMap<Fun, String>,
     instances: Vec<(Fun, Typs, Fun)>,
     assoc_types: Vec<AssocTypeImpl>,
+    trait_impls: Vec<TraitImpl>,
+    trait_methods: HashMap<(Path, Fun), Fun>,
+    trait_arities: HashMap<Path, usize>,
     tables: BTreeMap<String, (String, Vec<String>)>,
     table_names: HashMap<Fun, String>,
 }
@@ -2868,7 +2871,14 @@ impl Exporter {
                         _ => {}
                     }
                 }
-                let fun = &self.instantiate_call(kind, fun, typs);
+                let fun = match self.instantiate_call(kind, fun, typs) {
+                    Ok(fun) => fun,
+                    Err(reason) => {
+                        self.conj_level = level;
+                        return self.refuse(format!("{reason}: {friendly}"), &e.span);
+                    }
+                };
+                let fun = &fun;
                 // `<_ as View>::view(&[a, b])` (`seq![a, b]`) resolves to the
                 // array's `View` impl.
                 if vstd_op(&fun_as_friendly_rust_name(fun)) == Some("array_view") {
@@ -2994,9 +3004,9 @@ impl Exporter {
     /// the trait's declaration lacks.
     fn resolved_fun(&self, kind: &CallTargetKind, fun: &Fun) -> Fun {
         if let CallTargetKind::DynamicResolved { resolved, .. } = kind {
-            if self.functions.get(resolved).is_some_and(|f| f.x.body.is_some()) {
-                return resolved.clone();
-            }
+            // An external-body impl is still the compiler's selected impl.
+            // Its table must not be replaced by the trait's default body.
+            return resolved.clone();
         }
         fun.clone()
     }
@@ -3032,34 +3042,72 @@ impl Exporter {
         }
     }
 
+    /// Select only when the complete impl inventory has one matching pattern.
+    /// Bounds can make overlapping patterns disjoint, but this exporter does
+    /// not solve Rust obligations. Keep all such candidates and refuse rather
+    /// than guessing which bounds hold. Count impls even if their method or
+    /// associated-type definition is unavailable in VIR.
+    fn unique_impl(
+        &self,
+        trait_path: &Path,
+        args: &[Typ],
+    ) -> Result<(TraitImpl, HashMap<Ident, Typ>), String> {
+        if args.iter().any(|t| {
+            crate::ast_visitor::typ_visitor_check(t, &mut |t| match &**t {
+                TypX::TypParam(_) | TypX::Projection { .. } => Err(()),
+                _ => Ok(()),
+            })
+            .is_err()
+        }) {
+            return Err("unresolved trait type arguments".into());
+        }
+        let mut matches = self.trait_impls.iter().filter_map(|i| {
+            if i.x.trait_path != *trait_path || i.x.trait_typ_args.len() != args.len() {
+                return None;
+            }
+            let mut subst = HashMap::new();
+            i.x.trait_typ_args
+                .iter()
+                .zip(args)
+                .all(|(p, a)| Self::match_impl_type(p, a, &mut subst))
+                .then(|| (i.clone(), subst))
+        });
+        match (matches.next(), matches.next()) {
+            (Some(only), None) => Ok(only),
+            (None, _) => Err("no matching concrete trait implementation".into()),
+            _ => Err("ambiguous concrete trait implementation (impl bounds not resolved)".into()),
+        }
+    }
+
     fn normalize_type(&self, typ: &Typ) -> Typ {
-        crate::ast_visitor::map_typ_visitor_env(typ, &mut (), &|_, t| {
+        self.normalize_type_at(typ, &mut Vec::new())
+    }
+
+    fn normalize_type_at(&self, typ: &Typ, seen: &mut Vec<Typ>) -> Typ {
+        // Leave a cyclic or excessively deep projection unresolved. Concrete
+        // dispatch then refuses it; it must never select an arbitrary impl.
+        if seen.len() >= 64 || seen.iter().any(|t| crate::ast_util::types_equal(t, typ)) {
+            return typ.clone();
+        }
+        seen.push(typ.clone());
+        let normalized = crate::ast_visitor::map_typ_visitor_env(typ, seen, &|seen, t| {
             if let TypX::Projection { trait_typ_args, trait_path, name } = &**t {
-                let candidates: Vec<_> = self
-                    .assoc_types
-                    .iter()
-                    .filter_map(|a| {
-                        if a.x.trait_path != *trait_path
-                            || a.x.name != *name
-                            || a.x.trait_typ_args.len() != trait_typ_args.len()
-                        {
-                            return None;
-                        }
-                        let mut subst = HashMap::new();
-                        a.x.trait_typ_args
-                            .iter()
-                            .zip(trait_typ_args.iter())
-                            .all(|(p, t)| Self::match_impl_type(p, t, &mut subst))
-                            .then(|| crate::sst_util::subst_typ(&subst, &a.x.typ))
-                    })
-                    .collect();
-                if let [typ] = candidates.as_slice() {
-                    return Ok(typ.clone());
+                if let Ok((implementation, subst)) = self.unique_impl(trait_path, trait_typ_args) {
+                    if let Some(a) = self
+                        .assoc_types
+                        .iter()
+                        .find(|a| a.x.impl_path == implementation.x.impl_path && a.x.name == *name)
+                    {
+                        let replacement = crate::sst_util::subst_typ(&subst, &a.x.typ);
+                        return Ok(self.normalize_type_at(&replacement, seen));
+                    }
                 }
             }
             Ok(t.clone())
         })
-        .expect("associated type normalization")
+        .expect("associated type normalization");
+        seen.pop();
+        normalized
     }
 
     /// Preserve existing polymorphic operators when no dispatch or opaque
@@ -3088,67 +3136,80 @@ impl Exporter {
 
     /// Specialize before rendering: type arguments on calls inside a generic
     /// body must be substituted too, including associated type projections.
-    fn instantiate_call(&mut self, kind: &CallTargetKind, fun: &Fun, typs: &Typs) -> Fun {
+    fn instantiate_call(
+        &mut self,
+        kind: &CallTargetKind,
+        fun: &Fun,
+        typs: &Typs,
+    ) -> Result<Fun, String> {
         let resolved = self.resolved_fun(kind, fun);
-        let mut ts = match kind {
-            CallTargetKind::DynamicResolved { typs, .. } if resolved != *fun => typs.clone(),
-            _ => typs.clone(),
+        let ts = match kind {
+            CallTargetKind::DynamicResolved { typs, .. } if resolved != *fun => typs,
+            _ => typs,
         };
+        let mut ts: Typs = Arc::new(ts.iter().map(|t| self.normalize_type(t)).collect());
         if vstd_op(&fun_as_friendly_rust_name(&resolved)).is_some() {
-            return resolved;
+            return Ok(resolved);
         }
         let mut target = resolved;
-        if matches!(kind, CallTargetKind::Dynamic) && !ts.iter().any(typ_mentions_param) {
-            let matches: Vec<_> = self
-                .functions
-                .values()
-                .filter_map(|f| {
-                    let FunctionKind::TraitMethodImpl {
-                        method,
-                        trait_typ_args,
-                        inherit_body_from,
-                        ..
-                    } = &f.x.kind
-                    else {
-                        return None;
-                    };
-                    if method != fun || trait_typ_args.len() > ts.len() {
-                        return None;
+        if matches!(kind, CallTargetKind::Dynamic) {
+            let declaration = self.functions.get(fun).ok_or("trait declaration unavailable")?;
+            let FunctionKind::TraitMethodDecl { trait_path, .. } = &declaration.x.kind else {
+                return Err("trait declaration unavailable".into());
+            };
+            // Only Self and the trait arguments select the impl. A method's
+            // own type parameters can remain abstract after that selection.
+            let trait_arity =
+                *self.trait_arities.get(trait_path).ok_or("trait type parameters unavailable")?;
+            let trait_args = ts.get(..trait_arity).ok_or("incomplete trait type arguments")?;
+            if trait_args.iter().any(typ_mentions_param) {
+                if declaration.x.body.is_some() {
+                    return Err("unresolved abstract trait dispatch with a default body".into());
+                }
+                // A genuinely abstract trait declaration remains a reported table.
+            } else {
+                let (implementation, mut subst) = self.unique_impl(trait_path, trait_args)?;
+                // Synthetic specializations retain FunctionKind. Look up the
+                // original declaration, never a previously specialized body.
+                let method = self
+                    .trait_methods
+                    .get(&(implementation.x.impl_path.clone(), fun.clone()))
+                    .ok_or("selected trait method unavailable")?;
+                let f = self.functions.get(method).ok_or("selected trait method unavailable")?;
+                if let FunctionKind::TraitMethodImpl { inherit_body_from: Some(default), .. } =
+                    &f.x.kind
+                {
+                    target = default.clone();
+                } else {
+                    let method_args = &ts[trait_arity..];
+                    let method_params =
+                        f.x.typ_params
+                            .get(implementation.x.typ_params.len()..)
+                            .ok_or("incomplete impl type parameters")?;
+                    if method_args.len() != method_params.len() {
+                        return Err("incomplete method type arguments".into());
                     }
-                    let mut subst = HashMap::new();
-                    if !trait_typ_args
-                        .iter()
-                        .zip(ts.iter())
-                        .all(|(p, a)| Self::match_impl_type(p, a, &mut subst))
-                    {
-                        return None;
-                    }
-                    if let Some(default) = inherit_body_from {
-                        return Some((default.clone(), ts.clone()));
-                    }
+                    subst.extend(method_params.iter().cloned().zip(method_args.iter().cloned()));
                     let args: Option<Vec<_>> =
                         f.x.typ_params.iter().map(|p| subst.get(p).cloned()).collect();
-                    Some((f.x.name.clone(), Arc::new(args?)))
-                })
-                .collect();
-            if let [(only, args)] = matches.as_slice() {
-                target = only.clone();
-                ts = args.clone();
+                    ts = Arc::new(args.ok_or("incomplete concrete impl substitution")?);
+                    target = f.x.name.clone();
+                }
             }
         }
-        let Some(f) = self.functions.get(&target).cloned() else { return target };
-        if f.x.typ_params.is_empty()
-            || f.x.typ_params.len() != ts.len()
-            || !self.needs_instance(&target, &mut HashSet::new())
-        {
-            return target;
+        let Some(f) = self.functions.get(&target).cloned() else { return Ok(target) };
+        if f.x.typ_params.is_empty() || !self.needs_instance(&target, &mut HashSet::new()) {
+            return Ok(target);
+        }
+        if f.x.typ_params.len() != ts.len() {
+            return Err("incomplete function type arguments".into());
         }
         if let Some((_, _, instance)) = self
             .instances
             .iter()
             .find(|(base, args, _)| base == &target && crate::ast_util::n_types_equal(args, &ts))
         {
-            return instance.clone();
+            return Ok(instance.clone());
         }
         let subst: HashMap<Ident, Typ> =
             f.x.typ_params.iter().cloned().zip(ts.iter().cloned()).collect();
@@ -3178,7 +3239,7 @@ impl Exporter {
         x.typ_params = Arc::new(vec![]);
         self.functions.insert(instance.clone(), specialized.new_x(x));
         self.instances.push((target, ts.clone(), instance.clone()));
-        instance
+        Ok(instance)
     }
 
     /// Unlike TypeOK (whose values come from the source), user-supplied
@@ -8674,6 +8735,22 @@ pub fn export_module(
         constant_ops: HashMap::new(),
         instances: Vec::new(),
         assoc_types: krate.assoc_type_impls.clone(),
+        trait_impls: krate.trait_impls.clone(),
+        trait_arities: krate
+            .traits
+            .iter()
+            .map(|t| (t.x.name.clone(), t.x.typ_params.len() + 1))
+            .collect(),
+        trait_methods: krate
+            .functions
+            .iter()
+            .filter_map(|f| match &f.x.kind {
+                FunctionKind::TraitMethodImpl { impl_path, method, .. } => {
+                    Some(((impl_path.clone(), method.clone()), f.x.name.clone()))
+                }
+                _ => None,
+            })
+            .collect(),
         tables: BTreeMap::new(),
         table_names: HashMap::new(),
     };

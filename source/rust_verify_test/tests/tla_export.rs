@@ -9339,3 +9339,537 @@ pub open spec fn inv(s: State) -> bool { value(s.x) == Some(s.x) }
     let bad = tlc_output(&jar, &ex.spec(), &cfg);
     assert!(bad.contains("Assumption") && bad.contains("false"), "{}", bad);
 }
+
+/// Rust knows the blanket bound is false for Concrete. The exporter does not
+/// solve that obligation, so it must refuse both with and without a default.
+#[test]
+fn tla_export_refuses_ambiguous_impl_patterns() {
+    for declaration in ["spec fn choose() -> bool;", "open spec fn choose() -> bool { false }"] {
+        let code = format!(
+            r#"
+verus! {{
+pub trait Marker {{}}
+pub trait Choose {{ {declaration} }}
+pub struct Concrete;
+impl<T: Marker> Choose for T {{ open spec fn choose() -> bool {{ false }} }}
+impl Choose for Concrete {{ open spec fn choose() -> bool {{ true }} }}
+pub open spec fn helper<T: Choose>() -> bool {{ T::choose() }}
+pub struct State {{ pub x: bool }}
+pub open spec fn init(s: State) -> bool {{ s.x == helper::<Concrete>() }}
+pub open spec fn next(pre: State, post: State) -> bool {{ post.x == pre.x }}
+pub open spec fn inv(s: State) -> bool {{ s.x }}
+proof fn check_dispatch() {{ assert(helper::<Concrete>()); }}
+}}
+"#
+        );
+        let ex = export_code(&code, "test_crate");
+        assert!(
+            ex.report["refusals"].as_array().unwrap().iter().any(|r| {
+                r["what"].as_str().unwrap().contains("ambiguous concrete trait implementation")
+                    && !r["location"].as_str().unwrap().is_empty()
+            }),
+            "{}",
+            ex.report
+        );
+        assert_eq!(ex.report["holes"], serde_json::json!([]));
+        let Some(jar) = tla_tools() else { continue };
+        sany(&jar, &ex.spec());
+        let out = tlc_output(&jar, &ex.spec(), &ex.cfg);
+        assert!(
+            out.contains("Assert evaluated to FALSE")
+                && out.contains("ambiguous concrete trait implementation"),
+            "{}",
+            out
+        );
+    }
+}
+
+#[test]
+fn tla_export_dispatch_preserves_method_type_arguments() {
+    let ex = export_code(
+        r#"
+verus! {
+pub trait Value { spec fn value() -> bool; }
+impl Value for bool { open spec fn value() -> bool { false } }
+impl Value for int { open spec fn value() -> bool { true } }
+pub trait Choose<R> { spec fn choose<A: Value>() -> bool; }
+pub struct Wrapped<T> { pub value: T }
+impl<T> Choose<T> for Wrapped<T> {
+    open spec fn choose<A: Value>() -> bool { A::value() }
+}
+pub open spec fn helper<D: Choose<bool>, A: Value>() -> bool { D::choose::<A>() }
+pub struct State { pub x: bool }
+pub open spec fn init(s: State) -> bool { s.x == helper::<Wrapped<bool>, bool>() }
+pub open spec fn next(pre: State, post: State) -> bool { post.x == helper::<Wrapped<bool>, int>() }
+pub open spec fn inv(s: State) -> bool {
+    !helper::<Wrapped<bool>, bool>() && helper::<Wrapped<bool>, int>()
+}
+}
+"#,
+        "test_crate",
+    );
+    assert_eq!(ex.report["refusals"], serde_json::json!([]), "{}", ex.tla);
+    assert_eq!(ex.report["holes"], serde_json::json!([]), "{}", ex.tla);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let run = tlc(&jar, &ex.spec(), &ex.cfg);
+    assert!(run.violated.is_empty(), "{:?}", run);
+    assert_eq!(run.distinct, 2);
+}
+
+#[test]
+fn tla_export_normalizes_nested_associated_types_for_dispatch() {
+    let ex = export_code(
+        r#"
+verus! {
+pub trait Has { type V; }
+pub struct Inner;
+impl Has for Inner { type V = bool; }
+pub struct Outer<T> { pub v: T }
+impl<T: Has> Has for Outer<T> { type V = T::V; }
+pub trait Choose { spec fn choose() -> bool; }
+impl Choose for bool { open spec fn choose() -> bool { true } }
+pub open spec fn helper<T: Has>() -> bool where T::V: Choose { <T::V as Choose>::choose() }
+pub struct State { pub x: bool }
+pub open spec fn init(s: State) -> bool { s.x == helper::<Outer<Outer<Inner>>>() }
+pub open spec fn next(pre: State, post: State) -> bool { post.x == pre.x }
+pub open spec fn inv(s: State) -> bool { s.x }
+proof fn check_dispatch() { assert(helper::<Outer<Outer<Inner>>>()); }
+}
+"#,
+        "test_crate",
+    );
+    assert_eq!(ex.report["refusals"], serde_json::json!([]), "{}", ex.tla);
+    assert_eq!(ex.report["holes"], serde_json::json!([]), "{}", ex.tla);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let run = tlc(&jar, &ex.spec(), &ex.cfg);
+    assert!(run.violated.is_empty(), "{:?}", run);
+    assert_eq!(run.distinct, 1);
+}
+
+/// Wrong values on unused keys and extra/missing keys must be caught by the
+/// table's signature assumption, before any model expression reads the table.
+#[test]
+fn tla_export_rejects_tables_outside_their_exact_signature() {
+    let ex = export_code(
+        r#"
+verus! {
+pub uninterp spec fn value(b: bool) -> bool;
+pub uninterp spec fn initial() -> bool;
+pub struct State { pub x: bool }
+pub open spec fn init(s: State) -> bool { s.x == (initial() && value(false)) }
+pub open spec fn next(pre: State, post: State) -> bool { post.x == pre.x }
+}
+"#,
+        "test_crate",
+    );
+    assert_eq!(ex.report["refusals"], serde_json::json!([]));
+    let mut cfg = ex.cfg.clone();
+    for h in ex.report["holes"].as_array().unwrap() {
+        let c = h["constant"].as_str().unwrap();
+        let op =
+            if h["variable"].as_str().unwrap().ends_with("initial") { "Nullary" } else { "Unary" };
+        cfg.push_str(&format!("CONSTANT {c} <- {op}\n"));
+        assert!(ex.tla.contains(&format!("WARNING: {c}")));
+        assert!(ex.cfg.contains(&format!("CONSTANT {c} <- SupplyFiniteTable")));
+    }
+    let good_unary = "[k \\in {<<FALSE>>, <<TRUE>>} |-> TRUE]";
+    let good_nullary = "[k \\in {<<>>} |-> TRUE]";
+    let cases = [
+        (good_unary, good_nullary, true),
+        ("[k \\in {<<FALSE>>} |-> TRUE]", good_nullary, false),
+        ("[k \\in {<<FALSE>>, <<TRUE>>, <<>>} |-> TRUE]", good_nullary, false),
+        ("[k \\in {<<FALSE>>, <<TRUE>>} |-> IF k[1] THEN 7 ELSE TRUE]", good_nullary, false),
+        (good_unary, "[k \\in {} |-> TRUE]", false),
+        (good_unary, "[k \\in {<<>>, <<FALSE>>} |-> TRUE]", false),
+    ];
+    let Some(jar) = tla_tools() else { return };
+    for (unary, nullary, accepts) in cases {
+        let text = ex.tla.replace(
+            "=============================",
+            &format!("Unary == {unary}\nNullary == {nullary}\n============================="),
+        );
+        std::fs::write(ex.spec(), text).unwrap();
+        sany(&jar, &ex.spec());
+        if accepts {
+            assert_eq!(tlc(&jar, &ex.spec(), &cfg).distinct, 1);
+        } else {
+            let out = tlc_output(&jar, &ex.spec(), &cfg);
+            // TLC rejects a wrong value kind while evaluating membership,
+            // rather than returning FALSE for comparisons across value kinds.
+            let rejected = (out.contains("Assumption") && out.contains("false"))
+                || (out.contains("Evaluating assumption") && out.contains("failed"));
+            assert!(rejected, "{}", out);
+            assert!(!out.contains("Computing initial states"), "{}", out);
+        }
+    }
+}
+
+#[test]
+fn tla_export_does_not_assume_recommends_over_table_carriers() {
+    let ex = export_code(
+        r#"
+verus! {
+#[verifier::external_body]
+pub closed spec fn value(n: nat) -> bool recommends n > 10 { false }
+pub struct State { pub x: bool }
+pub open spec fn init(s: State) -> bool { s.x == value(0) }
+pub open spec fn next(pre: State, post: State) -> bool { post.x == pre.x }
+}
+"#,
+        "test_crate",
+    );
+    assert_eq!(ex.report["refusals"], serde_json::json!([]));
+    let table = ex.report["holes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|h| h["kind"] == "uninterpreted_function")
+        .unwrap()["constant"]
+        .as_str()
+        .unwrap();
+    std::fs::write(
+        ex.spec(),
+        ex.tla.replace(
+            "=============================",
+            "Chosen == [k \\in {<<0>>} |-> TRUE]\n=============================",
+        ),
+    )
+    .unwrap();
+    let cfg = format!("{}\nCONSTANT Dom_nat = {{0}}\nCONSTANT {table} <- Chosen\n", ex.cfg);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    assert_eq!(tlc(&jar, &ex.spec(), &cfg).distinct, 1);
+}
+
+/// Spec ensures cannot currently be written in source. Build a small VIR crate
+/// to test the actual exporter, including specialization and inherited ensures.
+#[test]
+fn tla_export_vir_contracts_constrain_tables() {
+    use air::ast::BinderX;
+    use std::sync::Arc;
+    use vir::ast::*;
+    use vir::ast_util::{air_unique_var, mk_bool, mk_eq, mk_implies};
+    use vir::def::Spanned;
+
+    let span = vir::messages::Span {
+        raw_span: Arc::new(()),
+        id: 0,
+        data: vec![],
+        as_string: "contract fixture".into(),
+    };
+    let path = |name: &str| {
+        Arc::new(PathX {
+            krate: CrateId::Internal,
+            segments: Arc::new(name.split("::").map(|s| Arc::new(s.to_string())).collect()),
+        })
+    };
+    let module = path("contract");
+    let state_path = path("contract::State");
+    let bool_typ = Arc::new(TypX::Bool);
+    let state_typ =
+        Arc::new(TypX::Datatype(Dt::Path(state_path.clone()), Arc::new(vec![]), Arc::new(vec![])));
+    let visibility = Visibility { restricted_to: None };
+    let param = |name: &str, typ: &Typ| {
+        Spanned::new(
+            span.clone(),
+            ParamX {
+                name: air_unique_var(name),
+                typ: typ.clone(),
+                mode: Mode::Spec,
+                unwrapped_info: None,
+                user_mut: false,
+            },
+        )
+    };
+    let expr = |typ: &Typ, x| SpannedTyped::new(&span, typ, x);
+    let var = |p: &Param| expr(&p.x.typ, ExprX::Var(p.x.name.clone()));
+    let make_fn = |name: &str, params: Vec<Param>, body: Option<Expr>| {
+        Spanned::new(
+            span.clone(),
+            FunctionX {
+                name: Arc::new(FunX { path: path(&format!("contract::{name}")) }),
+                proxy: None,
+                kind: FunctionKind::Static,
+                visibility: visibility.clone(),
+                body_visibility: BodyVisibility::Visibility(visibility.clone()),
+                opaqueness: Opaqueness::Revealed { visibility: visibility.clone() },
+                owning_module: Some(module.clone()),
+                mode: Mode::Spec,
+                typ_params: Arc::new(vec![]),
+                typ_bounds: Arc::new(vec![]),
+                params: Arc::new(params),
+                ret: param("ret", &bool_typ),
+                ens_has_return: true,
+                require: Arc::new(vec![]),
+                ensure: (Arc::new(vec![]), Arc::new(vec![])),
+                returns: None,
+                decrease: Arc::new(vec![]),
+                decrease_when: None,
+                decrease_by: None,
+                fndef_axioms: None,
+                mask_spec: None,
+                atomic_update: None,
+                unwind_spec: None,
+                item_kind: ItemKind::Function,
+                attrs: Arc::new(FunctionAttrsX::default()),
+                body,
+                extra_dependencies: vec![],
+                async_ret: None,
+            },
+        )
+    };
+    let a = param("a", &bool_typ);
+    let mut unary = make_fn("unary", vec![a.clone()], None);
+    let mut ux = unary.x.clone();
+    ux.typ_params = Arc::new(vec![Arc::new("T".into())]);
+    let not = |e: Expr| expr(&bool_typ, ExprX::Unary(UnaryOp::Not, e));
+    ux.ensure = (
+        Arc::new(vec![mk_implies(&span, &var(&a), &not(var(&ux.ret)))]),
+        Arc::new(vec![mk_implies(&span, &not(var(&a)), &var(&ux.ret))]),
+    );
+    unary = unary.new_x(ux);
+    let mut zero = make_fn("zero", vec![], None);
+    let mut zx = zero.x.clone();
+    zx.ensure.0 = Arc::new(vec![var(&zx.ret)]);
+    zero = zero.new_x(zx);
+    let mut exempt = make_fn("exempt", vec![], None);
+    let mut ex = exempt.x.clone();
+    ex.require = Arc::new(vec![mk_bool(&span, false)]);
+    ex.ensure.0 = Arc::new(vec![mk_bool(&span, false)]);
+    exempt = exempt.new_x(ex);
+    let call = |f: &Function, args: Vec<Expr>| {
+        expr(
+            &bool_typ,
+            ExprX::Call {
+                target: CallTarget::Fun(
+                    CallTargetKind::Static,
+                    f.x.name.clone(),
+                    Arc::new(f.x.typ_params.iter().map(|_| bool_typ.clone()).collect()),
+                    Arc::new(vec![]),
+                    CallTargetAttrs {
+                        autospec: AutospecUsage::Final,
+                        const_var: false,
+                        assume_external_allowed: false,
+                    },
+                ),
+                args: Arc::new(args),
+                post_args: None,
+                body: None,
+            },
+        )
+    };
+    let s = param("s", &state_typ);
+    let pre = param("pre", &state_typ);
+    let post = param("post", &state_typ);
+    let value = mk_eq(&span, &call(&unary, vec![mk_bool(&span, false)]), &call(&zero, vec![]));
+    let record = expr(
+        &state_typ,
+        ExprX::Ctor(
+            Dt::Path(state_path.clone()),
+            Arc::new("State".into()),
+            Arc::new(vec![Arc::new(BinderX { name: Arc::new("x".into()), a: value })]),
+            None,
+        ),
+    );
+    let init_body = expr(
+        &bool_typ,
+        ExprX::Logical(LogicalOp::And, mk_eq(&span, &var(&s), &record), call(&exempt, vec![])),
+    );
+    let init = make_fn("init", vec![s], Some(init_body));
+    let next = make_fn(
+        "next",
+        vec![pre.clone(), post.clone()],
+        Some(mk_eq(&span, &var(&post), &var(&pre))),
+    );
+    let datatype = Spanned::new(
+        span.clone(),
+        DatatypeX {
+            name: Dt::Path(state_path),
+            proxy: None,
+            owning_module: Some(module),
+            visibility: visibility.clone(),
+            transparency: DatatypeTransparency::WhenVisible(visibility.clone()),
+            typ_params: Arc::new(vec![]),
+            typ_bounds: Arc::new(vec![]),
+            variants: Arc::new(vec![Variant {
+                name: Arc::new("State".into()),
+                ctor_style: CtorPrintStyle::Braces,
+                fields: Arc::new(vec![Arc::new(BinderX {
+                    name: Arc::new("x".into()),
+                    a: (bool_typ, Mode::Spec, visibility),
+                })]),
+            }]),
+            mode: Mode::Spec,
+            ext_equal: false,
+            user_defined_invariant_fn: None,
+            sized_constraint: None,
+            destructor: false,
+        },
+    );
+    let krate = Arc::new(KrateX {
+        functions: vec![unary, zero, exempt, init, next],
+        datatypes: vec![datatype],
+        reveal_groups: vec![],
+        traits: vec![],
+        trait_impls: vec![],
+        assoc_type_impls: vec![],
+        modules: vec![],
+        external_fns: vec![],
+        external_types: vec![],
+        path_as_rust_names: vec![],
+        arch: Arch { word_bits: ArchWordBits::Exactly(64) },
+        opaque_types: vec![],
+    });
+    let exported =
+        vir::tla::export_module(&krate, "crate::contract", &[], &Default::default()).unwrap();
+    assert!(exported.report.refusals.is_empty(), "{}", exported.tla);
+    let dir = TempDir::new().unwrap();
+    let spec = dir.path().join(format!("{}.tla", exported.module_name));
+    let mut cfg = exported.cfg.clone();
+    for h in &exported.report.holes {
+        assert_eq!(h.kind.as_deref(), Some("uninterpreted_function"));
+        let op = if h.variable.contains("unary") {
+            "UnaryTable"
+        } else if h.variable.contains("zero") {
+            "ZeroTable"
+        } else {
+            "ExemptTable"
+        };
+        cfg.push_str(&format!("CONSTANT {} <- {op}\n", h.constant));
+    }
+    let Some(jar) = tla_tools() else { return };
+    // Each bad interpretation violates a different clause. Removing either
+    // ensures list, the nullary contract, or the requires guard breaks this test.
+    for (unary, zero, accepts) in [
+        ("~k[1]", "TRUE", true),
+        ("TRUE", "TRUE", false),
+        ("FALSE", "TRUE", false),
+        ("~k[1]", "FALSE", false),
+    ] {
+        let text = exported.tla.replace("=============================", &format!(
+            "UnaryTable == [k \\in {{<<b>> : b \\in BOOLEAN}} |-> {unary}]\nZeroTable == [k \\in {{<<>>}} |-> {zero}]\nExemptTable == [k \\in {{<<>>}} |-> TRUE]\n============================="));
+        std::fs::write(&spec, text).unwrap();
+        sany(&jar, &spec);
+        if accepts {
+            assert_eq!(tlc(&jar, &spec, &cfg).distinct, 1);
+        } else {
+            let out = tlc_output(&jar, &spec, &cfg);
+            assert!(out.contains("Assumption") && out.contains("false"), "{}", out);
+            assert!(!out.contains("Computing initial states"), "{}", out);
+        }
+    }
+}
+
+#[test]
+fn tla_export_dispatch_specializes_a_selected_default_method() {
+    let ex = export_code(
+        r#"
+verus! {
+pub trait Value { spec fn value() -> bool; }
+impl Value for bool { open spec fn value() -> bool { false } }
+impl Value for int { open spec fn value() -> bool { true } }
+pub trait Choose { open spec fn choose<A: Value>() -> bool { A::value() } }
+pub struct Wrapped<T> { pub value: T }
+impl<T> Choose for Wrapped<T> {}
+pub open spec fn helper<D: Choose, A: Value>() -> bool { D::choose::<A>() }
+pub struct State { pub x: bool }
+pub open spec fn init(s: State) -> bool { s.x == helper::<Wrapped<bool>, bool>() }
+pub open spec fn next(pre: State, post: State) -> bool { post.x == helper::<Wrapped<bool>, int>() }
+pub open spec fn inv(s: State) -> bool { !helper::<Wrapped<bool>, bool>() && helper::<Wrapped<bool>, int>() }
+}
+"#,
+        "test_crate",
+    );
+    assert_eq!(ex.report["refusals"], serde_json::json!([]), "{}", ex.tla);
+    assert_eq!(ex.report["holes"], serde_json::json!([]), "{}", ex.tla);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let run = tlc(&jar, &ex.spec(), &ex.cfg);
+    assert!(run.violated.is_empty(), "{:?}", run);
+    assert_eq!(run.distinct, 2);
+}
+
+#[test]
+fn tla_export_refuses_dispatch_through_an_ambiguous_associated_type() {
+    let ex = export_code(
+        r#"
+verus! {
+pub trait Marker {}
+pub trait Has { type V; }
+pub struct Concrete;
+impl<T: Marker> Has for T { type V = int; }
+impl Has for Concrete { type V = bool; }
+pub trait Choose { spec fn choose() -> bool; }
+impl Choose for bool { open spec fn choose() -> bool { true } }
+impl Choose for int { open spec fn choose() -> bool { false } }
+pub open spec fn helper<T: Has>() -> bool where T::V: Choose { <T::V as Choose>::choose() }
+pub struct State { pub x: bool }
+pub open spec fn init(s: State) -> bool { s.x == helper::<Concrete>() }
+pub open spec fn next(pre: State, post: State) -> bool { post.x == pre.x }
+proof fn check_dispatch() { assert(helper::<Concrete>()); }
+}
+"#,
+        "test_crate",
+    );
+    assert!(
+        ex.report["refusals"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| { r["what"].as_str().unwrap().contains("unresolved trait type arguments") }),
+        "{}",
+        ex.report
+    );
+    assert_eq!(ex.report["holes"], serde_json::json!([]));
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let out = tlc_output(&jar, &ex.spec(), &ex.cfg);
+    assert!(
+        out.contains("Assert evaluated to FALSE")
+            && out.contains("unresolved trait type arguments"),
+        "{}",
+        out
+    );
+}
+
+#[test]
+fn tla_export_uses_the_resolved_bodyless_impl_instead_of_a_default() {
+    let ex = export_code(
+        r#"
+verus! {
+pub trait Choose { open spec fn choose() -> bool { false } }
+pub struct Concrete;
+impl Choose for Concrete {
+    #[verifier::external_body]
+    open spec fn choose() -> bool { true }
+}
+pub struct State { pub x: bool }
+pub open spec fn init(s: State) -> bool { s.x == Concrete::choose() }
+pub open spec fn next(pre: State, post: State) -> bool { post.x == pre.x }
+pub open spec fn inv(s: State) -> bool { s.x }
+}
+"#,
+        "test_crate",
+    );
+    assert_eq!(ex.report["refusals"], serde_json::json!([]));
+    let holes = ex.report["holes"].as_array().unwrap();
+    assert_eq!(holes.len(), 1, "{}", ex.tla);
+    assert_eq!(holes[0]["kind"], "uninterpreted_function");
+    let table = holes[0]["constant"].as_str().unwrap();
+    std::fs::write(
+        ex.spec(),
+        ex.tla.replace(
+            "=============================",
+            "Chosen == [k \\in {<<>>} |-> TRUE]\n=============================",
+        ),
+    )
+    .unwrap();
+    let cfg = format!("{}\nCONSTANT {table} <- Chosen\n", ex.cfg);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let run = tlc(&jar, &ex.spec(), &cfg);
+    assert!(run.violated.is_empty(), "{:?}", run);
+    assert_eq!(run.distinct, 1);
+}
