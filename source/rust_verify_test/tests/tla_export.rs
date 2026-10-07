@@ -409,24 +409,14 @@ pub open spec fn small(s: State) -> bool { s.x <= 3 }
 "#;
 
 #[test]
-fn tla_export_refuses_a_closure_passed_as_a_value() {
-    // `f` is held only symbolically; passing it on is a refusal (an
-    // Assert), never its bare name, which SANY would reject.
+fn tla_export_reduces_a_closure_passed_as_a_value() {
     let ex = export_code(SYMBOLIC_ARGUMENT, "test_crate");
-    let refusals: Vec<String> = ex.report["refusals"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|r| r["what"].as_str().unwrap().to_string())
-        .collect();
-    assert!(
-        refusals.iter().any(|w| w.contains("closure value `f` used other than in an application")),
-        "{:?}",
-        refusals
-    );
-    assert!(!ex.tla.contains("apply(f, x)"), "{}", ex.tla);
+    assert_eq!(ex.report["refusals"], serde_json::json!([]), "{}", ex.tla);
     let Some(jar) = tla_tools() else { return };
     sany(&jar, &ex.spec());
+    let run = tlc(&jar, &ex.spec(), &ex.cfg);
+    assert_eq!(run.distinct, 4, "{run:?}");
+    assert!(run.violated.is_empty(), "{:?}", run);
 }
 
 const REFUSED: &str = r#"
@@ -447,7 +437,7 @@ pub open spec fn small(s: State) -> bool { s.x <= 2 }
 
 pub open spec fn same(y: int) -> int { y }
 
-pub open spec fn picked(s: State) -> bool { (choose|y: int| #[trigger] same(y) == s.x) == s.x }
+pub open spec fn picked(s: State) -> bool { (choose|y: int, z: int| #[trigger] same(y) == s.x && #[trigger] same(z) == y).0 == s.x }
 
 pub open spec fn lists(s: State) -> bool { forall|l: List| #![trigger len(l)] len(l) >= 0 }
 }
@@ -2642,7 +2632,7 @@ pub open spec fn small(s: State) -> bool { s.x < 3 }
 
 pub open spec fn id(y: u8) -> u8 { y }
 
-pub open spec fn weird(s: State) -> bool { s.x == choose|y: u8| #[trigger] id(y) == s.x }
+pub open spec fn weird(s: State) -> bool { s.x == (choose|y: u8, z: u8| #[trigger] id(y) == s.x && #[trigger] id(z) == y).0 }
 
 pub open spec fn inv(s: State) -> bool { small(s) && weird(s) }
 }
@@ -6045,13 +6035,14 @@ fn tla_export_exports_named_expressions_in_the_models_names() {
     assert!(defs[1].starts_with("cand =="), "{:?}", defs);
     assert!(!defs.iter().any(|d| d.contains("\\*")), "{:?}", defs);
     // An unbounded quantifier is a hole whose constant the model does not
-    // declare; a `choose` is refused.
+    // declare; a singleton-bounded `choose` needs no hole.
     let unbounded = entry("unbounded");
     assert_eq!(names_of(&unbounded["undeclared"]), ["Dom_int"]);
     assert_eq!(unbounded["holes"].as_array().unwrap().len(), 1);
     let picked = entry("picked");
-    assert_eq!(picked["tainted"], true);
-    assert_eq!(picked["refusals"].as_array().unwrap().len(), 1);
+    assert_eq!(picked["tainted"], false);
+    assert_eq!(picked["choices"].as_array().unwrap().len(), 1);
+    assert_eq!(picked["refusals"].as_array().unwrap().len(), 0);
     assert_eq!(picked["ret"], serde_json::json!({"kind": "int", "rust": "int"}));
     // A pair of states reads the second primed.
     let grew = entry("grew");
@@ -8803,25 +8794,9 @@ pub open spec fn small(s: State) -> bool { s.n <= 2 }
 "#;
 
 #[test]
-fn tla_export_refuses_set_choose_and_a_function_parameter() {
-    // `Set::choose` and `Multiset::choose` stay refused, as `choose` is:
-    // TLC's CHOOSE is one fixed value, and Verus's choice is any value
-    // satisfying the predicate, so TLC's verdict would hold for one choice
-    // only. So is a `Set::fold` of a function not seen to be commutative
-    // (`push`, a checked cast that `-1` leaves in one order and not in the
-    // other, and `acc + (acc - x)`, whose right operand reads `acc`: over
-    // `{1, 2}` it is -4 in one order and -5 in the other): Verus's fold is
-    // a choice among the orders, and TLC would hold `ordered`, `clipped`
-    // and `mixed` for the one it takes; `acc * 2 + x` chains `+` over an
-    // operand reading `acc`, so `scaled` is refused too. `ISet::finite` is
-    // checked relative to its explicit finite carrier. `Set::complement`
-    // and `Set::full` remain refused: they are `None` for an infinite type. A comprehension
-    // whose binder only a hole bounds is refused when the binder's type is a
-    // type parameter (`others`, and vstd's generic bodies): one hole would
-    // stand for every instantiation. A fold or `Set::new`
-    // given a `spec_fn` parameter has no closure to apply (`total` and
-    // `members` are operators of their own); every refusal names its
-    // location, and the invariants reaching them are left out of the .cfg.
+fn tla_export_collection_choose_and_literal_function_parameters() {
+    // Finite collection choices and literal functions passed through helpers
+    // are checked by TLC. Noncommutative folds retain their refusals.
     let ex = export_code(CHOOSE_AND_PARAMETER, "test_crate");
     let refusals: Vec<(String, String)> = ex.report["refusals"]
         .as_array()
@@ -8833,9 +8808,6 @@ fn tla_export_refuses_set_choose_and_a_function_parameter() {
         refusals.iter().filter(|r| r.0 == what).map(|r| r.1.clone()).collect()
     };
     for (what, count) in [
-        ("choose (TLC cannot evaluate it)", 2),
-        ("vstd operation given a function that does not reduce to a closure", 1),
-        ("vstd operation given a predicate that does not reduce to a closure", 1),
         ("Set::fold of a function not seen to be commutative", 4),
         ("Set::complement (unbounded)", 1),
         ("set comprehension over a type parameter (no hole can stand for every instantiation)", 1),
@@ -8844,7 +8816,12 @@ fn tla_export_refuses_set_choose_and_a_function_parameter() {
         assert_eq!(at.len(), count, "{what}: {:?}", refusals);
         assert!(at.iter().all(|l| l.contains("test.rs:")), "{what}: {:?}", at);
     }
-    assert_eq!(names(&ex.report["invariants"]), ["finite", "small"], "{}", ex.cfg);
+    assert_eq!(
+        names(&ex.report["invariants"]),
+        ["picked", "summed", "built", "finite", "picked_count", "small"],
+        "{}",
+        ex.cfg
+    );
     let Some(jar) = tla_tools() else { return };
     sany(&jar, &ex.spec());
     let run = tlc(&jar, &ex.spec(), &(ex.cfg.clone() + "\nCONSTANT Dom_int = {0, 1}\n"));
@@ -10284,4 +10261,131 @@ pub open spec fn bounded(s: State) -> bool { s.phase <= 1 && s.n == 0 }
     let run = tlc(&jar, &ex.spec(), &ex.cfg);
     assert_eq!(run.distinct, 2);
     assert!(run.violated.is_empty());
+}
+
+#[test]
+fn tla_export_closure_records_through_helpers_and_lets() {
+    let ex = export_code(
+        r#"
+verus! {
+pub struct State { pub x: int }
+pub struct Action { pub f: spec_fn(int, State, State) -> bool }
+pub struct Outer { pub action: Action, pub tag: int }
+impl Action {
+    pub open spec fn forward(self, input: int) -> spec_fn(State, State) -> bool {
+        let n = input + 1;
+        |pre: State, post: State| (self.f)(n, pre, post)
+    }
+}
+pub open spec fn make(offset: int) -> Outer {
+    let k = offset + 1;
+    let action = Action { f: |n: int, pre: State, post: State|
+        pre.x < 3 && post.x == pre.x + n + k };
+    Outer { action, tag: k }
+}
+pub open spec fn apply(f: spec_fn(State, State) -> bool, pre: State, post: State) -> bool {
+    f(pre, post)
+}
+pub open spec fn init(s: State) -> bool { s.x == 0 }
+pub open spec fn next(pre: State, post: State) -> bool {
+    let outer = make(-1);
+    let a = outer.action;
+    let f = a.forward(0);
+    outer.tag == 0 && apply(f, pre, post)
+}
+pub open spec fn inv(s: State) -> bool { 0 <= s.x <= 3 }
+}
+"#,
+        "test_crate",
+    );
+    assert_eq!(ex.report["refusals"], serde_json::json!([]), "{}", ex.tla);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let run = tlc(&jar, &ex.spec(), &ex.cfg);
+    assert_eq!(run.distinct, 4, "{run:?}\n{}", ex.tla);
+    assert!(run.violated.is_empty(), "{:?}", run);
+}
+
+#[test]
+fn tla_export_bounded_choose_domains() {
+    let ex = export_code_with(
+        r#"
+verus! {
+pub struct State { pub x: int }
+pub open spec fn init(s: State) -> bool { s.x == 0 }
+pub open spec fn next(pre: State, post: State) -> bool { pre.x < 3 && post.x == pre.x + 1 }
+pub open spec fn guarded(s: State) -> bool {
+    (choose|n: int| 0 <= n && n <= 3 && n == s.x) == s.x
+}
+pub open spec fn finite(s: State) -> bool { (choose|b: bool| b) }
+pub open spec fn holed(s: State) -> bool { (choose|n: nat| n >= 0) >= 0 }
+}
+"#,
+        "test_crate",
+        &["--no-verify"],
+    );
+    assert_eq!(ex.report["refusals"], serde_json::json!([]), "{}", ex.tla);
+    let choices = ex.report["choices"].as_array().unwrap();
+    assert!(choices.iter().any(|c| c["domain"] == "BOOLEAN"), "{:?}", choices);
+    assert!(choices.iter().any(|c| c["domain"] == "Dom_nat"), "{:?}", choices);
+    assert!(choices.iter().all(|c| c["location"].as_str().unwrap().contains("test.rs")));
+    assert!(ex.tla.contains("CHOOSE"), "{}", ex.tla);
+    assert!(ex.tla.contains("ASSUME Dom_nat \\subseteq Int"), "{}", ex.tla);
+    assert!(ex.tla.contains("WARNING: choose domains"), "{}", ex.tla);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let cfg = format!("{}\nCONSTANT Dom_nat = {{0, 1, 2, 3}}\n", ex.cfg);
+    let run = tlc(&jar, &ex.spec(), &cfg);
+    assert_eq!(run.distinct, 4, "{run:?}");
+    assert!(run.violated.is_empty(), "{:?}", run);
+}
+
+#[test]
+fn tla_export_choose_keeps_predicate_and_rejects_an_empty_witness_set() {
+    let code = r#"
+verus! {
+pub struct State { pub x: int }
+pub open spec fn init(s: State) -> bool { s.x == 0 }
+pub open spec fn next(pre: State, post: State) -> bool { false }
+pub open spec fn chosen(s: State) -> bool {
+    (choose|n: int| 0 <= n && n < 4 && n > 1) > 1
+}
+}
+"#;
+    let ex = export_code_with(code, "test_crate", &["--no-verify"]);
+    assert_eq!(ex.report["refusals"], serde_json::json!([]));
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let run = tlc(&jar, &ex.spec(), &ex.cfg);
+    assert_eq!(run.distinct, 1);
+    assert!(run.violated.is_empty());
+    let empty = export_code_with(&code.replace("n > 1", "n > 9"), "test_crate", &["--no-verify"]);
+    sany(&jar, &empty.spec());
+    let out = tlc_output(&jar, &empty.spec(), &empty.cfg);
+    assert!(out.contains("CHOOSE") && out.contains("Error:"), "{}", out);
+}
+
+#[test]
+fn tla_export_choose_without_a_domain_stays_a_located_refusal() {
+    let ex = export_code_with(
+        r#"
+verus! {
+pub struct State { pub x: int }
+pub open spec fn unknown<A>() -> A { choose|a: A| true }
+pub open spec fn init(s: State) -> bool { s.x == 0 }
+pub open spec fn next(pre: State, post: State) -> bool { false }
+pub open spec fn candidate(s: State) -> bool { s.x == unknown::<int>() }
+}
+"#,
+        "test_crate",
+        &["--no-verify"],
+    );
+    let refused = ex.report["refusals"].as_array().unwrap();
+    assert_eq!(refused.len(), 1, "{:?}", refused);
+    assert_eq!(refused[0]["what"], "choose without a representable domain");
+    assert!(refused[0]["location"].as_str().unwrap().contains("test.rs:"));
+    assert_eq!(names(&ex.report["skipped_invariants"]), ["candidate"]);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    assert_eq!(tlc(&jar, &ex.spec(), &ex.cfg).distinct, 1);
 }

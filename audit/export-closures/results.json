@@ -1,0 +1,1007 @@
+{
+  "base_branch": "kg/export-partial",
+  "base_commit": "9abf2c0ea2f2035bfad0509b5b1d637aea8c3662",
+  "before_zero_refusal": 0,
+  "after_zero_refusal": 1,
+  "machine_count": 6,
+  "campaign_tlc_bounds_available": false,
+  "supplemental_tlc": {
+    "machine": "anvil/sub_network",
+    "before": "refusal at first transition",
+    "after": "completed",
+    "timeout_seconds": 30,
+    "generated": 11,
+    "distinct": 3
+  },
+  "machines": [
+    {
+      "machine": "anvil/Cluster-adapter",
+      "before_refusals": 22,
+      "after_refusals": 62,
+      "after_holes": 48,
+      "choices": [],
+      "remaining_by_kind": {
+        "closure value `model` used other than in an application": 1,
+        "application of a spec_fn value that does not reduce to a closure": 46,
+        "choose without a representable domain": 15
+      },
+      "remaining_refusals": [
+        {
+          "what": "closure value `model` used other than in an application",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/kubernetes_cluster/spec/cluster.rs:133:25: 133:30 (#0)",
+          "in_function": "cluster_adapter::adapter::init"
+        },
+        {
+          "what": "application of a spec_fn value that does not reduce to a closure",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/kubernetes_cluster/spec/external/state_machine.rs:41:24: 41:38 (#0)",
+          "in_function": "cluster_adapter::adapter::init"
+        },
+        {
+          "what": "application of a spec_fn value that does not reduce to a closure",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/state_machine/state_machine.rs:44:26: 44:116 (#0)",
+          "in_function": "cluster_adapter::adapter::next"
+        },
+        {
+          "what": "choose without a representable domain",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/state_machine/state_machine.rs:45:32: 45:136 (#0)",
+          "in_function": "cluster_adapter::adapter::next"
+        },
+        {
+          "what": "application of a spec_fn value that does not reduce to a closure",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/state_machine/state_machine.rs:48:35: 48:71 (#0)",
+          "in_function": "cluster_adapter::adapter::next"
+        },
+        {
+          "what": "application of a spec_fn value that does not reduce to a closure",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/state_machine/state_machine.rs:48:75: 48:111 (#0)",
+          "in_function": "cluster_adapter::adapter::next"
+        },
+        {
+          "what": "application of a spec_fn value that does not reduce to a closure",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/state_machine/state_machine.rs:44:26: 44:116 (#0)",
+          "in_function": "cluster_adapter::adapter::next"
+        },
+        {
+          "what": "choose without a representable domain",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/state_machine/state_machine.rs:45:32: 45:136 (#0)",
+          "in_function": "cluster_adapter::adapter::next"
+        },
+        {
+          "what": "application of a spec_fn value that does not reduce to a closure",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/state_machine/state_machine.rs:48:35: 48:71 (#0)",
+          "in_function": "cluster_adapter::adapter::next"
+        },
+        {
+          "what": "application of a spec_fn value that does not reduce to a closure",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/state_machine/state_machine.rs:48:75: 48:111 (#0)",
+          "in_function": "cluster_adapter::adapter::next"
+        },
+        {
+          "what": "application of a spec_fn value that does not reduce to a closure",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/state_machine/state_machine.rs:44:26: 44:116 (#0)",
+          "in_function": "cluster_adapter::adapter::next"
+        },
+        {
+          "what": "choose without a representable domain",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/state_machine/state_machine.rs:45:32: 45:136 (#0)",
+          "in_function": "cluster_adapter::adapter::next"
+        },
+        {
+          "what": "application of a spec_fn value that does not reduce to a closure",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/state_machine/state_machine.rs:48:35: 48:71 (#0)",
+          "in_function": "cluster_adapter::adapter::next"
+        },
+        {
+          "what": "application of a spec_fn value that does not reduce to a closure",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/state_machine/state_machine.rs:48:75: 48:111 (#0)",
+          "in_function": "cluster_adapter::adapter::next"
+        },
+        {
+          "what": "application of a spec_fn value that does not reduce to a closure",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/state_machine/state_machine.rs:44:26: 44:116 (#0)",
+          "in_function": "cluster_adapter::adapter::next"
+        },
+        {
+          "what": "choose without a representable domain",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/state_machine/state_machine.rs:45:32: 45:136 (#0)",
+          "in_function": "cluster_adapter::adapter::next"
+        },
+        {
+          "what": "application of a spec_fn value that does not reduce to a closure",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/state_machine/state_machine.rs:48:35: 48:71 (#0)",
+          "in_function": "cluster_adapter::adapter::next"
+        },
+        {
+          "what": "application of a spec_fn value that does not reduce to a closure",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/state_machine/state_machine.rs:48:75: 48:111 (#0)",
+          "in_function": "cluster_adapter::adapter::next"
+        },
+        {
+          "what": "application of a spec_fn value that does not reduce to a closure",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/state_machine/state_machine.rs:44:26: 44:116 (#0)",
+          "in_function": "cluster_adapter::adapter::next"
+        },
+        {
+          "what": "choose without a representable domain",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/state_machine/state_machine.rs:45:32: 45:136 (#0)",
+          "in_function": "cluster_adapter::adapter::next"
+        },
+        {
+          "what": "application of a spec_fn value that does not reduce to a closure",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/state_machine/state_machine.rs:48:35: 48:71 (#0)",
+          "in_function": "cluster_adapter::adapter::next"
+        },
+        {
+          "what": "application of a spec_fn value that does not reduce to a closure",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/state_machine/state_machine.rs:48:75: 48:111 (#0)",
+          "in_function": "cluster_adapter::adapter::next"
+        },
+        {
+          "what": "application of a spec_fn value that does not reduce to a closure",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/state_machine/state_machine.rs:44:26: 44:116 (#0)",
+          "in_function": "cluster_adapter::adapter::next"
+        },
+        {
+          "what": "choose without a representable domain",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/state_machine/state_machine.rs:45:32: 45:136 (#0)",
+          "in_function": "cluster_adapter::adapter::next"
+        },
+        {
+          "what": "application of a spec_fn value that does not reduce to a closure",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/state_machine/state_machine.rs:48:35: 48:71 (#0)",
+          "in_function": "cluster_adapter::adapter::next"
+        },
+        {
+          "what": "application of a spec_fn value that does not reduce to a closure",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/state_machine/state_machine.rs:48:75: 48:111 (#0)",
+          "in_function": "cluster_adapter::adapter::next"
+        },
+        {
+          "what": "application of a spec_fn value that does not reduce to a closure",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/state_machine/state_machine.rs:44:26: 44:116 (#0)",
+          "in_function": "cluster_adapter::adapter::next"
+        },
+        {
+          "what": "choose without a representable domain",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/state_machine/state_machine.rs:45:32: 45:136 (#0)",
+          "in_function": "cluster_adapter::adapter::next"
+        },
+        {
+          "what": "application of a spec_fn value that does not reduce to a closure",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/state_machine/state_machine.rs:48:35: 48:71 (#0)",
+          "in_function": "cluster_adapter::adapter::next"
+        },
+        {
+          "what": "application of a spec_fn value that does not reduce to a closure",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/state_machine/state_machine.rs:48:75: 48:111 (#0)",
+          "in_function": "cluster_adapter::adapter::next"
+        },
+        {
+          "what": "application of a spec_fn value that does not reduce to a closure",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/state_machine/state_machine.rs:44:26: 44:116 (#0)",
+          "in_function": "cluster_adapter::adapter::next"
+        },
+        {
+          "what": "choose without a representable domain",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/state_machine/state_machine.rs:45:32: 45:136 (#0)",
+          "in_function": "cluster_adapter::adapter::next"
+        },
+        {
+          "what": "application of a spec_fn value that does not reduce to a closure",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/state_machine/state_machine.rs:48:35: 48:71 (#0)",
+          "in_function": "cluster_adapter::adapter::next"
+        },
+        {
+          "what": "application of a spec_fn value that does not reduce to a closure",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/state_machine/state_machine.rs:48:75: 48:111 (#0)",
+          "in_function": "cluster_adapter::adapter::next"
+        },
+        {
+          "what": "application of a spec_fn value that does not reduce to a closure",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/state_machine/state_machine.rs:44:26: 44:116 (#0)",
+          "in_function": "cluster_adapter::adapter::next"
+        },
+        {
+          "what": "choose without a representable domain",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/state_machine/state_machine.rs:45:32: 45:136 (#0)",
+          "in_function": "cluster_adapter::adapter::next"
+        },
+        {
+          "what": "application of a spec_fn value that does not reduce to a closure",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/state_machine/state_machine.rs:48:35: 48:71 (#0)",
+          "in_function": "cluster_adapter::adapter::next"
+        },
+        {
+          "what": "application of a spec_fn value that does not reduce to a closure",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/state_machine/state_machine.rs:48:75: 48:111 (#0)",
+          "in_function": "cluster_adapter::adapter::next"
+        },
+        {
+          "what": "application of a spec_fn value that does not reduce to a closure",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/state_machine/state_machine.rs:44:26: 44:116 (#0)",
+          "in_function": "cluster_adapter::adapter::next"
+        },
+        {
+          "what": "choose without a representable domain",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/state_machine/state_machine.rs:45:32: 45:136 (#0)",
+          "in_function": "cluster_adapter::adapter::next"
+        },
+        {
+          "what": "application of a spec_fn value that does not reduce to a closure",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/state_machine/state_machine.rs:48:35: 48:71 (#0)",
+          "in_function": "cluster_adapter::adapter::next"
+        },
+        {
+          "what": "application of a spec_fn value that does not reduce to a closure",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/state_machine/state_machine.rs:48:75: 48:111 (#0)",
+          "in_function": "cluster_adapter::adapter::next"
+        },
+        {
+          "what": "application of a spec_fn value that does not reduce to a closure",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/state_machine/state_machine.rs:44:26: 44:116 (#0)",
+          "in_function": "cluster_adapter::adapter::next"
+        },
+        {
+          "what": "choose without a representable domain",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/state_machine/state_machine.rs:45:32: 45:136 (#0)",
+          "in_function": "cluster_adapter::adapter::next"
+        },
+        {
+          "what": "application of a spec_fn value that does not reduce to a closure",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/state_machine/state_machine.rs:48:35: 48:71 (#0)",
+          "in_function": "cluster_adapter::adapter::next"
+        },
+        {
+          "what": "application of a spec_fn value that does not reduce to a closure",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/state_machine/state_machine.rs:48:75: 48:111 (#0)",
+          "in_function": "cluster_adapter::adapter::next"
+        },
+        {
+          "what": "application of a spec_fn value that does not reduce to a closure",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/state_machine/state_machine.rs:44:26: 44:116 (#0)",
+          "in_function": "cluster_adapter::adapter::next"
+        },
+        {
+          "what": "choose without a representable domain",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/state_machine/state_machine.rs:45:32: 45:136 (#0)",
+          "in_function": "cluster_adapter::adapter::next"
+        },
+        {
+          "what": "application of a spec_fn value that does not reduce to a closure",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/state_machine/state_machine.rs:48:35: 48:71 (#0)",
+          "in_function": "cluster_adapter::adapter::next"
+        },
+        {
+          "what": "application of a spec_fn value that does not reduce to a closure",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/state_machine/state_machine.rs:48:75: 48:111 (#0)",
+          "in_function": "cluster_adapter::adapter::next"
+        },
+        {
+          "what": "application of a spec_fn value that does not reduce to a closure",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/state_machine/state_machine.rs:44:26: 44:116 (#0)",
+          "in_function": "cluster_adapter::adapter::next"
+        },
+        {
+          "what": "choose without a representable domain",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/state_machine/state_machine.rs:45:32: 45:136 (#0)",
+          "in_function": "cluster_adapter::adapter::next"
+        },
+        {
+          "what": "application of a spec_fn value that does not reduce to a closure",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/state_machine/state_machine.rs:48:35: 48:71 (#0)",
+          "in_function": "cluster_adapter::adapter::next"
+        },
+        {
+          "what": "application of a spec_fn value that does not reduce to a closure",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/state_machine/state_machine.rs:48:75: 48:111 (#0)",
+          "in_function": "cluster_adapter::adapter::next"
+        },
+        {
+          "what": "application of a spec_fn value that does not reduce to a closure",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/state_machine/state_machine.rs:44:26: 44:116 (#0)",
+          "in_function": "cluster_adapter::adapter::next"
+        },
+        {
+          "what": "choose without a representable domain",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/state_machine/state_machine.rs:45:32: 45:136 (#0)",
+          "in_function": "cluster_adapter::adapter::next"
+        },
+        {
+          "what": "application of a spec_fn value that does not reduce to a closure",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/state_machine/state_machine.rs:48:35: 48:71 (#0)",
+          "in_function": "cluster_adapter::adapter::next"
+        },
+        {
+          "what": "application of a spec_fn value that does not reduce to a closure",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/state_machine/state_machine.rs:48:75: 48:111 (#0)",
+          "in_function": "cluster_adapter::adapter::next"
+        },
+        {
+          "what": "application of a spec_fn value that does not reduce to a closure",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/state_machine/state_machine.rs:44:26: 44:116 (#0)",
+          "in_function": "cluster_adapter::adapter::next"
+        },
+        {
+          "what": "choose without a representable domain",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/state_machine/state_machine.rs:45:32: 45:136 (#0)",
+          "in_function": "cluster_adapter::adapter::next"
+        },
+        {
+          "what": "application of a spec_fn value that does not reduce to a closure",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/state_machine/state_machine.rs:48:35: 48:71 (#0)",
+          "in_function": "cluster_adapter::adapter::next"
+        },
+        {
+          "what": "application of a spec_fn value that does not reduce to a closure",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/state_machine/state_machine.rs:48:75: 48:111 (#0)",
+          "in_function": "cluster_adapter::adapter::next"
+        }
+      ]
+    },
+    {
+      "machine": "anvil/sub_api",
+      "before_refusals": 14,
+      "after_refusals": 64,
+      "after_holes": 4,
+      "choices": [
+        {
+          "variable": "choice__",
+          "domain": "self",
+          "location": "vstd/set_lib.rs:169:21: 169:34 (#0)",
+          "bounded_by_hole": false,
+          "warning": null
+        }
+      ],
+      "remaining_by_kind": {
+        "uninterpreted function": 6,
+        "application of a spec_fn value that does not reduce to a closure": 57,
+        "ordering comparison of chars": 1
+      },
+      "remaining_refusals": [
+        {
+          "what": "uninterpreted function",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/kubernetes_api_objects/spec/resource.rs:85:10: 85:76 (#0)",
+          "in_function": "sub_adapters2::kubernetes_api_objects::spec::resource::ResourceView::unmarshal_spec"
+        },
+        {
+          "what": "application of a spec_fn value that does not reduce to a closure",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/kubernetes_cluster/spec/api_server/state_machine.rs:88:45: 88:100 (#0)",
+          "in_function": "sub_adapters2::sub_api::next"
+        },
+        {
+          "what": "uninterpreted function",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/kubernetes_api_objects/spec/resource.rs:89:10: 89:80 (#0)",
+          "in_function": "sub_adapters2::kubernetes_api_objects::spec::resource::ResourceView::unmarshal_status"
+        },
+        {
+          "what": "application of a spec_fn value that does not reduce to a closure",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/kubernetes_cluster/spec/api_server/state_machine.rs:105:45: 105:104 (#0)",
+          "in_function": "sub_adapters2::sub_api::next"
+        },
+        {
+          "what": "application of a spec_fn value that does not reduce to a closure",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/kubernetes_cluster/spec/api_server/state_machine.rs:88:45: 88:100 (#0)",
+          "in_function": "sub_adapters2::sub_api::next"
+        },
+        {
+          "what": "application of a spec_fn value that does not reduce to a closure",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/kubernetes_cluster/spec/api_server/state_machine.rs:105:45: 105:104 (#0)",
+          "in_function": "sub_adapters2::sub_api::next"
+        },
+        {
+          "what": "uninterpreted function",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/kubernetes_cluster/spec/api_server/state_machine.rs:250:1: 250:96 (#0)",
+          "in_function": "sub_adapters2::kubernetes_cluster::spec::api_server::state_machine::generated_name"
+        },
+        {
+          "what": "uninterpreted function",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/kubernetes_api_objects/spec/resource.rs:87:10: 87:54 (#0)",
+          "in_function": "sub_adapters2::kubernetes_api_objects::spec::resource::ResourceView::marshal_status"
+        },
+        {
+          "what": "uninterpreted function",
+          "location": "vstd/view.rs:13:10: 13:36 (#0)",
+          "in_function": "vstd::view::View::view"
+        },
+        {
+          "what": "application of a spec_fn value that does not reduce to a closure",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/kubernetes_cluster/spec/api_server/state_machine.rs:196:45: 196:98 (#0)",
+          "in_function": "sub_adapters2::sub_api::next"
+        },
+        {
+          "what": "ordering comparison of chars",
+          "location": "vstd/utf8.rs:1103:40: 1103:79 (#0)",
+          "in_function": "vstd::utf8::is_ascii_chars"
+        },
+        {
+          "what": "application of a spec_fn value that does not reduce to a closure",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/kubernetes_cluster/spec/api_server/state_machine.rs:148:45: 148:88 (#0)",
+          "in_function": "sub_adapters2::sub_api::next"
+        },
+        {
+          "what": "application of a spec_fn value that does not reduce to a closure",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/kubernetes_cluster/spec/api_server/state_machine.rs:148:45: 148:88 (#0)",
+          "in_function": "sub_adapters2::sub_api::next"
+        },
+        {
+          "what": "application of a spec_fn value that does not reduce to a closure",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/kubernetes_cluster/spec/api_server/state_machine.rs:148:45: 148:88 (#0)",
+          "in_function": "sub_adapters2::sub_api::next"
+        },
+        {
+          "what": "application of a spec_fn value that does not reduce to a closure",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/kubernetes_cluster/spec/api_server/state_machine.rs:148:45: 148:88 (#0)",
+          "in_function": "sub_adapters2::sub_api::next"
+        },
+        {
+          "what": "uninterpreted function",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/kubernetes_cluster/spec/api_server/state_machine.rs:358:1: 358:56 (#0)",
+          "in_function": "sub_adapters2::kubernetes_cluster::spec::api_server::state_machine::deletion_timestamp"
+        },
+        {
+          "what": "application of a spec_fn value that does not reduce to a closure",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/kubernetes_cluster/spec/api_server/state_machine.rs:88:45: 88:100 (#0)",
+          "in_function": "sub_adapters2::sub_api::next"
+        },
+        {
+          "what": "application of a spec_fn value that does not reduce to a closure",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/kubernetes_cluster/spec/api_server/state_machine.rs:105:45: 105:104 (#0)",
+          "in_function": "sub_adapters2::sub_api::next"
+        },
+        {
+          "what": "application of a spec_fn value that does not reduce to a closure",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/kubernetes_cluster/spec/api_server/state_machine.rs:88:45: 88:100 (#0)",
+          "in_function": "sub_adapters2::sub_api::next"
+        },
+        {
+          "what": "application of a spec_fn value that does not reduce to a closure",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/kubernetes_cluster/spec/api_server/state_machine.rs:105:45: 105:104 (#0)",
+          "in_function": "sub_adapters2::sub_api::next"
+        },
+        {
+          "what": "application of a spec_fn value that does not reduce to a closure",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/kubernetes_cluster/spec/api_server/state_machine.rs:148:45: 148:88 (#0)",
+          "in_function": "sub_adapters2::sub_api::next"
+        },
+        {
+          "what": "application of a spec_fn value that does not reduce to a closure",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/kubernetes_cluster/spec/api_server/state_machine.rs:148:45: 148:88 (#0)",
+          "in_function": "sub_adapters2::sub_api::next"
+        },
+        {
+          "what": "application of a spec_fn value that does not reduce to a closure",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/kubernetes_cluster/spec/api_server/state_machine.rs:172:45: 172:101 (#0)",
+          "in_function": "sub_adapters2::sub_api::next"
+        },
+        {
+          "what": "application of a spec_fn value that does not reduce to a closure",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/kubernetes_cluster/spec/api_server/state_machine.rs:172:45: 172:101 (#0)",
+          "in_function": "sub_adapters2::sub_api::next"
+        },
+        {
+          "what": "application of a spec_fn value that does not reduce to a closure",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/kubernetes_cluster/spec/api_server/state_machine.rs:148:45: 148:88 (#0)",
+          "in_function": "sub_adapters2::sub_api::next"
+        },
+        {
+          "what": "application of a spec_fn value that does not reduce to a closure",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/kubernetes_cluster/spec/api_server/state_machine.rs:148:45: 148:88 (#0)",
+          "in_function": "sub_adapters2::sub_api::next"
+        },
+        {
+          "what": "application of a spec_fn value that does not reduce to a closure",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/kubernetes_cluster/spec/api_server/state_machine.rs:172:45: 172:101 (#0)",
+          "in_function": "sub_adapters2::sub_api::next"
+        },
+        {
+          "what": "application of a spec_fn value that does not reduce to a closure",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/kubernetes_cluster/spec/api_server/state_machine.rs:172:45: 172:101 (#0)",
+          "in_function": "sub_adapters2::sub_api::next"
+        },
+        {
+          "what": "application of a spec_fn value that does not reduce to a closure",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/kubernetes_cluster/spec/api_server/state_machine.rs:88:45: 88:100 (#0)",
+          "in_function": "sub_adapters2::sub_api::next"
+        },
+        {
+          "what": "application of a spec_fn value that does not reduce to a closure",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/kubernetes_cluster/spec/api_server/state_machine.rs:105:45: 105:104 (#0)",
+          "in_function": "sub_adapters2::sub_api::next"
+        },
+        {
+          "what": "application of a spec_fn value that does not reduce to a closure",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/kubernetes_cluster/spec/api_server/state_machine.rs:88:45: 88:100 (#0)",
+          "in_function": "sub_adapters2::sub_api::next"
+        },
+        {
+          "what": "application of a spec_fn value that does not reduce to a closure",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/kubernetes_cluster/spec/api_server/state_machine.rs:105:45: 105:104 (#0)",
+          "in_function": "sub_adapters2::sub_api::next"
+        },
+        {
+          "what": "application of a spec_fn value that does not reduce to a closure",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/kubernetes_cluster/spec/api_server/state_machine.rs:148:45: 148:88 (#0)",
+          "in_function": "sub_adapters2::sub_api::next"
+        },
+        {
+          "what": "application of a spec_fn value that does not reduce to a closure",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/kubernetes_cluster/spec/api_server/state_machine.rs:148:45: 148:88 (#0)",
+          "in_function": "sub_adapters2::sub_api::next"
+        },
+        {
+          "what": "application of a spec_fn value that does not reduce to a closure",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/kubernetes_cluster/spec/api_server/state_machine.rs:172:45: 172:101 (#0)",
+          "in_function": "sub_adapters2::sub_api::next"
+        },
+        {
+          "what": "application of a spec_fn value that does not reduce to a closure",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/kubernetes_cluster/spec/api_server/state_machine.rs:172:45: 172:101 (#0)",
+          "in_function": "sub_adapters2::sub_api::next"
+        },
+        {
+          "what": "application of a spec_fn value that does not reduce to a closure",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/kubernetes_cluster/spec/api_server/state_machine.rs:148:45: 148:88 (#0)",
+          "in_function": "sub_adapters2::sub_api::next"
+        },
+        {
+          "what": "application of a spec_fn value that does not reduce to a closure",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/kubernetes_cluster/spec/api_server/state_machine.rs:148:45: 148:88 (#0)",
+          "in_function": "sub_adapters2::sub_api::next"
+        },
+        {
+          "what": "application of a spec_fn value that does not reduce to a closure",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/kubernetes_cluster/spec/api_server/state_machine.rs:172:45: 172:101 (#0)",
+          "in_function": "sub_adapters2::sub_api::next"
+        },
+        {
+          "what": "application of a spec_fn value that does not reduce to a closure",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/kubernetes_cluster/spec/api_server/state_machine.rs:172:45: 172:101 (#0)",
+          "in_function": "sub_adapters2::sub_api::next"
+        },
+        {
+          "what": "application of a spec_fn value that does not reduce to a closure",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/kubernetes_cluster/spec/api_server/state_machine.rs:88:45: 88:100 (#0)",
+          "in_function": "sub_adapters2::sub_api::next"
+        },
+        {
+          "what": "application of a spec_fn value that does not reduce to a closure",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/kubernetes_cluster/spec/api_server/state_machine.rs:105:45: 105:104 (#0)",
+          "in_function": "sub_adapters2::sub_api::next"
+        },
+        {
+          "what": "application of a spec_fn value that does not reduce to a closure",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/kubernetes_cluster/spec/api_server/state_machine.rs:88:45: 88:100 (#0)",
+          "in_function": "sub_adapters2::sub_api::next"
+        },
+        {
+          "what": "application of a spec_fn value that does not reduce to a closure",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/kubernetes_cluster/spec/api_server/state_machine.rs:105:45: 105:104 (#0)",
+          "in_function": "sub_adapters2::sub_api::next"
+        },
+        {
+          "what": "application of a spec_fn value that does not reduce to a closure",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/kubernetes_cluster/spec/api_server/state_machine.rs:148:45: 148:88 (#0)",
+          "in_function": "sub_adapters2::sub_api::next"
+        },
+        {
+          "what": "application of a spec_fn value that does not reduce to a closure",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/kubernetes_cluster/spec/api_server/state_machine.rs:148:45: 148:88 (#0)",
+          "in_function": "sub_adapters2::sub_api::next"
+        },
+        {
+          "what": "application of a spec_fn value that does not reduce to a closure",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/kubernetes_cluster/spec/api_server/state_machine.rs:172:45: 172:101 (#0)",
+          "in_function": "sub_adapters2::sub_api::next"
+        },
+        {
+          "what": "application of a spec_fn value that does not reduce to a closure",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/kubernetes_cluster/spec/api_server/state_machine.rs:172:45: 172:101 (#0)",
+          "in_function": "sub_adapters2::sub_api::next"
+        },
+        {
+          "what": "application of a spec_fn value that does not reduce to a closure",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/kubernetes_cluster/spec/api_server/state_machine.rs:148:45: 148:88 (#0)",
+          "in_function": "sub_adapters2::sub_api::next"
+        },
+        {
+          "what": "application of a spec_fn value that does not reduce to a closure",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/kubernetes_cluster/spec/api_server/state_machine.rs:148:45: 148:88 (#0)",
+          "in_function": "sub_adapters2::sub_api::next"
+        },
+        {
+          "what": "application of a spec_fn value that does not reduce to a closure",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/kubernetes_cluster/spec/api_server/state_machine.rs:172:45: 172:101 (#0)",
+          "in_function": "sub_adapters2::sub_api::next"
+        },
+        {
+          "what": "application of a spec_fn value that does not reduce to a closure",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/kubernetes_cluster/spec/api_server/state_machine.rs:172:45: 172:101 (#0)",
+          "in_function": "sub_adapters2::sub_api::next"
+        },
+        {
+          "what": "application of a spec_fn value that does not reduce to a closure",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/kubernetes_cluster/spec/api_server/state_machine.rs:88:45: 88:100 (#0)",
+          "in_function": "sub_adapters2::sub_api::next"
+        },
+        {
+          "what": "application of a spec_fn value that does not reduce to a closure",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/kubernetes_cluster/spec/api_server/state_machine.rs:105:45: 105:104 (#0)",
+          "in_function": "sub_adapters2::sub_api::next"
+        },
+        {
+          "what": "application of a spec_fn value that does not reduce to a closure",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/kubernetes_cluster/spec/api_server/state_machine.rs:88:45: 88:100 (#0)",
+          "in_function": "sub_adapters2::sub_api::next"
+        },
+        {
+          "what": "application of a spec_fn value that does not reduce to a closure",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/kubernetes_cluster/spec/api_server/state_machine.rs:105:45: 105:104 (#0)",
+          "in_function": "sub_adapters2::sub_api::next"
+        },
+        {
+          "what": "application of a spec_fn value that does not reduce to a closure",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/kubernetes_cluster/spec/api_server/state_machine.rs:148:45: 148:88 (#0)",
+          "in_function": "sub_adapters2::sub_api::next"
+        },
+        {
+          "what": "application of a spec_fn value that does not reduce to a closure",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/kubernetes_cluster/spec/api_server/state_machine.rs:148:45: 148:88 (#0)",
+          "in_function": "sub_adapters2::sub_api::next"
+        },
+        {
+          "what": "application of a spec_fn value that does not reduce to a closure",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/kubernetes_cluster/spec/api_server/state_machine.rs:172:45: 172:101 (#0)",
+          "in_function": "sub_adapters2::sub_api::next"
+        },
+        {
+          "what": "application of a spec_fn value that does not reduce to a closure",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/kubernetes_cluster/spec/api_server/state_machine.rs:172:45: 172:101 (#0)",
+          "in_function": "sub_adapters2::sub_api::next"
+        },
+        {
+          "what": "application of a spec_fn value that does not reduce to a closure",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/kubernetes_cluster/spec/api_server/state_machine.rs:148:45: 148:88 (#0)",
+          "in_function": "sub_adapters2::sub_api::next"
+        },
+        {
+          "what": "application of a spec_fn value that does not reduce to a closure",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/kubernetes_cluster/spec/api_server/state_machine.rs:148:45: 148:88 (#0)",
+          "in_function": "sub_adapters2::sub_api::next"
+        },
+        {
+          "what": "application of a spec_fn value that does not reduce to a closure",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/kubernetes_cluster/spec/api_server/state_machine.rs:172:45: 172:101 (#0)",
+          "in_function": "sub_adapters2::sub_api::next"
+        },
+        {
+          "what": "application of a spec_fn value that does not reduce to a closure",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/kubernetes_cluster/spec/api_server/state_machine.rs:172:45: 172:101 (#0)",
+          "in_function": "sub_adapters2::sub_api::next"
+        }
+      ]
+    },
+    {
+      "machine": "anvil/sub_api_sm",
+      "before_refusals": 16,
+      "after_refusals": 8,
+      "after_holes": 6,
+      "choices": [],
+      "remaining_by_kind": {
+        "application of a spec_fn value that does not reduce to a closure": 6,
+        "choose without a representable domain": 2
+      },
+      "remaining_refusals": [
+        {
+          "what": "application of a spec_fn value that does not reduce to a closure",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/state_machine/state_machine.rs:44:26: 44:116 (#0)",
+          "in_function": "sub_adapters2::sub_api_sm::next"
+        },
+        {
+          "what": "choose without a representable domain",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/state_machine/state_machine.rs:45:32: 45:136 (#0)",
+          "in_function": "sub_adapters2::sub_api_sm::next"
+        },
+        {
+          "what": "application of a spec_fn value that does not reduce to a closure",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/state_machine/state_machine.rs:48:35: 48:71 (#0)",
+          "in_function": "sub_adapters2::sub_api_sm::next"
+        },
+        {
+          "what": "application of a spec_fn value that does not reduce to a closure",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/state_machine/state_machine.rs:48:75: 48:111 (#0)",
+          "in_function": "sub_adapters2::sub_api_sm::next"
+        },
+        {
+          "what": "application of a spec_fn value that does not reduce to a closure",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/state_machine/state_machine.rs:44:26: 44:116 (#0)",
+          "in_function": "sub_adapters2::sub_api_sm::next"
+        },
+        {
+          "what": "choose without a representable domain",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/state_machine/state_machine.rs:45:32: 45:136 (#0)",
+          "in_function": "sub_adapters2::sub_api_sm::next"
+        },
+        {
+          "what": "application of a spec_fn value that does not reduce to a closure",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/state_machine/state_machine.rs:48:35: 48:71 (#0)",
+          "in_function": "sub_adapters2::sub_api_sm::next"
+        },
+        {
+          "what": "application of a spec_fn value that does not reduce to a closure",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/state_machine/state_machine.rs:48:75: 48:111 (#0)",
+          "in_function": "sub_adapters2::sub_api_sm::next"
+        }
+      ]
+    },
+    {
+      "machine": "anvil/sub_controller",
+      "before_refusals": 9,
+      "after_refusals": 8,
+      "after_holes": 8,
+      "choices": [],
+      "remaining_by_kind": {
+        "uninterpreted function": 8
+      },
+      "remaining_refusals": [
+        {
+          "what": "uninterpreted function",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/kubernetes_api_objects/spec/resource.rs:39:10: 39:28 (#0)",
+          "in_function": "sub_adapters2::kubernetes_api_objects::spec::resource::ResourceView::kind"
+        },
+        {
+          "what": "uninterpreted function",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/reconciler/spec/reconciler.rs:25:10: 25:41 (#0)",
+          "in_function": "sub_adapters2::reconciler::spec::reconciler::Reconciler::reconcile_init_state"
+        },
+        {
+          "what": "uninterpreted function",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/kubernetes_api_objects/spec/resource.rs:18:10: 18:36 (#0)",
+          "in_function": "sub_adapters2::kubernetes_api_objects::spec::resource::Marshallable::marshal"
+        },
+        {
+          "what": "uninterpreted function",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/kubernetes_api_objects/spec/resource.rs:20:10: 20:65 (#0)",
+          "in_function": "sub_adapters2::kubernetes_api_objects::spec::resource::Marshallable::unmarshal"
+        },
+        {
+          "what": "uninterpreted function",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/reconciler/spec/reconciler.rs:34:10: 34:46 (#0)",
+          "in_function": "sub_adapters2::reconciler::spec::reconciler::Reconciler::reconcile_done"
+        },
+        {
+          "what": "uninterpreted function",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/reconciler/spec/reconciler.rs:38:10: 38:47 (#0)",
+          "in_function": "sub_adapters2::reconciler::spec::reconciler::Reconciler::reconcile_error"
+        },
+        {
+          "what": "uninterpreted function",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/kubernetes_api_objects/spec/resource.rs:70:10: 70:79 (#0)",
+          "in_function": "sub_adapters2::kubernetes_api_objects::spec::resource::ResourceView::unmarshal"
+        },
+        {
+          "what": "uninterpreted function",
+          "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/reconciler/spec/reconciler.rs:30:10: 30:116 (#0)",
+          "in_function": "sub_adapters2::reconciler::spec::reconciler::Reconciler::reconcile_core"
+        }
+      ]
+    },
+    {
+      "machine": "anvil/sub_network",
+      "before_refusals": 2,
+      "after_refusals": 0,
+      "after_holes": 5,
+      "choices": [],
+      "remaining_by_kind": {},
+      "remaining_refusals": []
+    },
+    {
+      "machine": "ironkv/host_protocol_t",
+      "before_refusals": 6,
+      "after_refusals": 4,
+      "after_holes": 116,
+      "choices": [],
+      "remaining_by_kind": {
+        "closure-valued helper without a body": 1,
+        "Set::full (unbounded)": 1,
+        "uninterpreted function": 1,
+        "set comprehension over a type parameter (no hole can stand for every instantiation)": 1
+      },
+      "remaining_refusals": [
+        {
+          "what": "closure-valued helper without a body",
+          "location": "vstd/imap.rs:44:9: 44:32 (#0)",
+          "in_function": "ironsht::delegation_map_t::AbstractDelegationMap::init"
+        },
+        {
+          "what": "Set::full (unbounded)",
+          "location": "vstd/iset_lib.rs:22:17: 22:34 (#0)",
+          "in_function": "vstd::iset_lib::impl&%0::is_full"
+        },
+        {
+          "what": "uninterpreted function",
+          "location": "/data/home/kirancodes/Documents/code/verus-research/survey/repos/verus-lang_verified-ironkv/ironsht/src/keys_t.rs:24:10: 24:53 (#0)",
+          "in_function": "ironsht::keys_t::KeyTrait::cmp_spec"
+        },
+        {
+          "what": "set comprehension over a type parameter (no hole can stand for every instantiation)",
+          "location": "vstd/iset_lib.rs:844:9: 847:10 (#0)",
+          "in_function": "vstd::iset_lib::impl&%1::flatten"
+        }
+      ]
+    }
+  ],
+  "regression": [
+    {
+      "file": "adder_sync/State_tla.cfg",
+      "sha256": "dc42f4ac7c164de76a1e973997e5ae2260509e35a94e5630e465dc8c72e68ae0",
+      "byte_identical": true
+    },
+    {
+      "file": "adder_sync/State_tla.tla",
+      "sha256": "7d001063b93e1ed7f6c64a4994e24d361b62095c75339a68d5a616acc09694b2",
+      "byte_identical": true
+    },
+    {
+      "file": "adder_sync/State_tla_trace.cfg",
+      "sha256": "4c0dda1fee2484b902db6b6975cb40855f3c30e9ee28849bb5873db06d8fd6ba",
+      "byte_identical": true
+    },
+    {
+      "file": "adder_sync/State_tla_trace.tla",
+      "sha256": "7c8c811f987d40daaaba2fe7766975a8ddfc1c2137dffe4b4205d40f5a002cfe",
+      "byte_identical": true
+    },
+    {
+      "file": "assert_sync/State_tla.cfg",
+      "sha256": "1d76b7c9bb7d8ce49c4b93bf801cfb6d424f3e8c34743eb59f32dcb52b42dc8f",
+      "byte_identical": true
+    },
+    {
+      "file": "assert_sync/State_tla.tla",
+      "sha256": "13267efcc6dcecbfd777d66e32a492d4a1345c48a8670c62d4010a8da70a4944",
+      "byte_identical": true
+    },
+    {
+      "file": "assert_sync/State_tla_trace.cfg",
+      "sha256": "4c0dda1fee2484b902db6b6975cb40855f3c30e9ee28849bb5873db06d8fd6ba",
+      "byte_identical": true
+    },
+    {
+      "file": "assert_sync/State_tla_trace.tla",
+      "sha256": "f911283a6bc434202484b66403ec1162f9e7da85a7cfc4a72d81410652f36cb7",
+      "byte_identical": true
+    },
+    {
+      "file": "counter/State_tla.cfg",
+      "sha256": "07ea3953075a098d96c20f1553408b68a4c2ceb221a9ce5c468fd3bbd73fa2d7",
+      "byte_identical": true
+    },
+    {
+      "file": "counter/State_tla.tla",
+      "sha256": "f8b6d1fc9ba796f5647cb6d91967c6644683f07195d1884459ece4f8a1df18ef",
+      "byte_identical": true
+    },
+    {
+      "file": "counter/State_tla_trace.cfg",
+      "sha256": "4c0dda1fee2484b902db6b6975cb40855f3c30e9ee28849bb5873db06d8fd6ba",
+      "byte_identical": true
+    },
+    {
+      "file": "counter/State_tla_trace.tla",
+      "sha256": "159795c1491bc0b122b10f65d8f2e984071de4d9244fd349fd3f8205fad7b2ad",
+      "byte_identical": true
+    },
+    {
+      "file": "mutex_liveness/ProgramState_tla.cfg",
+      "sha256": "772f66be32d513ff76f9eebad5fbfbcfc4bef43429fd46d707f92aecf022e289",
+      "byte_identical": true
+    },
+    {
+      "file": "mutex_liveness/ProgramState_tla.tla",
+      "sha256": "600532382b8e746592f9ebe03de066614877f36a4e6608784bb5285c3f27ec92",
+      "byte_identical": true
+    },
+    {
+      "file": "mutex_liveness/ProgramState_tla_trace.cfg",
+      "sha256": "4c0dda1fee2484b902db6b6975cb40855f3c30e9ee28849bb5873db06d8fd6ba",
+      "byte_identical": true
+    },
+    {
+      "file": "mutex_liveness/ProgramState_tla_trace.tla",
+      "sha256": "32e0ccfe8b360d360fc6cae5abf3b979e33e8f7ef9b57cc8604cd364ccf64b16",
+      "byte_identical": true
+    },
+    {
+      "file": "mutex_tla/State_tla.cfg",
+      "sha256": "87833bc818627b60e0318620066a059bd45598a501e7acc4eca96e73c253b234",
+      "byte_identical": true
+    },
+    {
+      "file": "mutex_tla/State_tla.tla",
+      "sha256": "2319ca86aae30e97011c3573ff98d96d01ae84b4628d0583d1310326f8918715",
+      "byte_identical": true
+    },
+    {
+      "file": "mutex_tla/State_tla_trace.cfg",
+      "sha256": "4c0dda1fee2484b902db6b6975cb40855f3c30e9ee28849bb5873db06d8fd6ba",
+      "byte_identical": true
+    },
+    {
+      "file": "mutex_tla/State_tla_trace.tla",
+      "sha256": "14a2f613e1b1ea798f16d634098573257cc348fc702df053ad0f6c91198bd82e",
+      "byte_identical": true
+    },
+    {
+      "file": "safety/GState_tla.cfg",
+      "sha256": "74fc85cd361b307cbbf947ed4878ce4ac72a545ffd9c32db6d32481c7a2851bc",
+      "byte_identical": true
+    },
+    {
+      "file": "safety/GState_tla.tla",
+      "sha256": "6c27fb1845049bb9b3c8b1477796123915d703d3b715f64534fae3e010978e70",
+      "byte_identical": true
+    },
+    {
+      "file": "safety/GState_tla_trace.cfg",
+      "sha256": "4c0dda1fee2484b902db6b6975cb40855f3c30e9ee28849bb5873db06d8fd6ba",
+      "byte_identical": true
+    },
+    {
+      "file": "safety/GState_tla_trace.tla",
+      "sha256": "d5453e1974335f65659bc9a3d978a620c73c9c2e2ba9eca973743b4ba0f458e2",
+      "byte_identical": true
+    },
+    {
+      "file": "toggle_sync/State_tla.cfg",
+      "sha256": "e34239e8f50d92f3290b25f157ce0cbae93e05596b46d8be30531cc66a6c2be9",
+      "byte_identical": true
+    },
+    {
+      "file": "toggle_sync/State_tla.tla",
+      "sha256": "9689246ad42fd1980b43d4519108967cd1549d5f1bd78a597b4571aef656ae92",
+      "byte_identical": true
+    },
+    {
+      "file": "toggle_sync/State_tla_trace.cfg",
+      "sha256": "4c0dda1fee2484b902db6b6975cb40855f3c30e9ee28849bb5873db06d8fd6ba",
+      "byte_identical": true
+    },
+    {
+      "file": "toggle_sync/State_tla_trace.tla",
+      "sha256": "3f5e835d59fa409dbb407f510828856cd78970b5aac1f12c5ee83b91e75ba177",
+      "byte_identical": true
+    }
+  ],
+  "nrkernel_before": [
+    {
+      "machine": "nrkernel/hlspec",
+      "rc": 0,
+      "refusals": 4,
+      "holes": 36,
+      "choices": 0
+    },
+    {
+      "machine": "nrkernel/os",
+      "rc": 0,
+      "refusals": 135,
+      "holes": 318,
+      "choices": 0
+    }
+  ],
+  "nrkernel_after": [
+    {
+      "machine": "nrkernel/hlspec",
+      "rc": 0,
+      "refusals": 3,
+      "holes": 37,
+      "choices": 1
+    },
+    {
+      "machine": "nrkernel/os",
+      "rc": 0,
+      "refusals": 134,
+      "holes": 320,
+      "choices": 1
+    }
+  ]
+}

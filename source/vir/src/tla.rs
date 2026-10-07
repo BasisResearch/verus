@@ -283,6 +283,8 @@ pub struct Report {
     /// Explicit restrictions introduced by finite carriers or partial reads.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub restrictions: Vec<Refusal>,
+    /// Bounded choices, including their source location and carrier.
+    pub choices: Vec<Choice>,
     /// The trace spec written beside the export (see [`TraceReport`]).
     pub trace: TraceReport,
     /// The temporal properties, checked as `PROPERTY`s.
@@ -326,6 +328,18 @@ pub struct Report {
     /// warning; not in the .tla.json.
     #[serde(skip)]
     pub choice_labels: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct Choice {
+    #[serde(skip)]
+    owner: Option<OpKey>,
+    pub variable: String,
+    pub domain: String,
+    pub location: String,
+    pub holes: Vec<String>,
+    pub bounded_by_hole: bool,
+    pub warning: Option<String>,
 }
 
 /// A Verus type, as the reverse rendering reads it. Datatypes are named by
@@ -488,6 +502,7 @@ pub struct ExprExport {
     /// The constants of `holes` the model's module does not declare.
     pub undeclared: Vec<String>,
     pub refusals: Vec<Refusal>,
+    pub choices: Vec<Choice>,
     /// Whether the operator reaches a refusal (its own or one the model's
     /// operators already had).
     pub tainted: bool,
@@ -628,7 +643,9 @@ struct Env {
     /// Every other variable in scope, by its printed name.
     names: HashMap<VarIdent, String>,
     /// Variables bound to a closure or record value, kept symbolically so a
-    /// later application or field selection can be reduced.
+    /// later application or field selection can be reduced. Captured scopes
+    /// are immutable and shared: deep copies grow exponentially through
+    /// helpers taking several records of closures.
     values: HashMap<VarIdent, (Expr, Arc<Env>)>,
     /// Locals bound (by `let` or a pattern) to a value that reads the post
     /// state, so reading them reads primed variables.
@@ -928,6 +945,8 @@ struct Exporter {
     /// function and whether it is the primed variant (see [`OpKey`]).
     emitted: HashSet<OpKey>,
     emitting: HashSet<OpKey>,
+    reducing: HashSet<Fun>,
+    choices: Vec<Choice>,
     /// Every emitted operator's arity, for the `RECURSIVE` declarations of
     /// those in a call cycle (see [`Exporter::recursive`]).
     arity: HashMap<String, usize>,
@@ -1639,7 +1658,7 @@ fn vstd_op(name: &str) -> Option<&'static str> {
         ("multiset", "subset_of") | ("multiset", "spec_le") => "multiset_subset_of",
         ("multiset", "is_empty") => "multiset_is_empty",
         ("multiset", "ext_equal") => "ext_equal",
-        ("multiset", "choose") => "set_choose",
+        ("multiset", "choose") => "multiset_choose",
         // An array is a sequence here (`seq![a, b]` is `[a, b].view()`), so
         // its view is the identity.
         ("array", "array_view") | ("array", "view") => "array_view",
@@ -2976,6 +2995,9 @@ impl Exporter {
                             }
                         }
                     }
+                    if let Some(value) = self.symbolic_field(inner, field, env) {
+                        return value;
+                    }
                     let inner_s = self.expr(inner, env);
                     self.field_access(&inner_s, datatype, field)
                 }
@@ -3107,7 +3129,7 @@ impl Exporter {
                 format!("<<{}>>", items.join(", "))
             }
             ExprX::Closure(..) => self.refuse("closure outside a known call", &e.span),
-            ExprX::Choose { .. } => self.refuse("choose (TLC cannot evaluate it)", &e.span),
+            ExprX::Choose { params, cond, body } => self.choose(e, params, cond, body, env),
             ExprX::WithTriggers { body, .. } => self.expr(body, env),
             ExprX::If(c, t, f) => {
                 let sc = self.quiet(|x| x.expr(c, env));
@@ -3489,6 +3511,10 @@ impl Exporter {
                         }
                     }
                 }
+                let value = crate::ast_util::place_to_spec_expr(inner);
+                if let Some(value) = self.symbolic_field(&value, field, env) {
+                    return value;
+                }
                 let base = self.place(inner, env);
                 self.field_access(&base, datatype, field)
             }
@@ -3521,11 +3547,12 @@ impl Exporter {
                         let closure_valued =
                             typ_has_specfn(&pattern.typ, &self.datatypes, &mut HashSet::new());
                         if closure_valued {
-                            if let Some(v) = symbolic {
-                                env2.names.remove(name);
-                                env2.values.insert(name.clone(), (v, Arc::new(env2.clone())));
-                                continue;
-                            }
+                            let value = symbolic
+                                .unwrap_or_else(|| crate::ast_util::place_to_spec_expr(init));
+                            let before = env2.clone();
+                            env2.names.remove(name);
+                            env2.values.insert(name.clone(), (value, Arc::new(before)));
+                            continue;
                         }
                         // The value is read in the scope before the binding,
                         // so `let x = x + 1` reads the outer `x`.
@@ -4046,6 +4073,31 @@ impl Exporter {
                     let what = format!("call to {friendly} (no definition in the crate)");
                     return self.refuse(what, &e.span);
                 };
+                if callee.x.params.iter().zip(args.iter()).any(|(p, a)| {
+                    typ_has_specfn(&p.x.typ, &self.datatypes, &mut HashSet::new())
+                        || typ_has_specfn(&a.typ, &self.datatypes, &mut HashSet::new())
+                }) {
+                    if !self.reducing.insert(fun.clone()) {
+                        return self.refuse("recursive closure-valued helper", &e.span);
+                    }
+                    // Arguments are operands; only the reduced body inherits
+                    // the caller's assignment level.
+                    let reduced = self.quiet(|x| x.inline_call(fun, args, env));
+                    self.conj_level = level;
+                    let out = match reduced {
+                        Some((body, scope, lets)) => {
+                            let body = self.expr(&body, &scope);
+                            if lets.is_empty() {
+                                body
+                            } else {
+                                format!("(LET {} IN {body})", lets.join(" "))
+                            }
+                        }
+                        None => self.refuse("closure-valued helper without a body", &e.span),
+                    };
+                    self.reducing.remove(fun);
+                    return out;
+                }
                 // A state-typed argument passed to a state-role parameter of
                 // the callee is dropped. When the callee's single state
                 // parameter receives `post`, the call is to the callee's
@@ -4577,12 +4629,46 @@ impl Exporter {
                 env2.primed.remove(&name);
             }
             env2.values.insert(name.clone(), (peel(a), Arc::new(env.clone())));
-            if !typ_has_specfn(&typ, &self.datatypes, &mut HashSet::new()) {
+            if !typ_has_specfn(&typ, &self.datatypes, &mut HashSet::new())
+                && !typ_has_specfn(&a.typ, &self.datatypes, &mut HashSet::new())
+            {
                 let value = self.expr(a, env);
                 let n = self.bind_var(env2, &name);
                 lets.push(format!("{n} == {value}"));
             }
         }
+    }
+
+    /// Resolve simple let bindings without printing closure values. Ordinary
+    /// captures keep fresh LET names and their original lexical environment.
+    fn symbolic_block(
+        &mut self,
+        stmts: &Stmts,
+        tail: &Option<Expr>,
+        env: &Env,
+    ) -> Option<(Expr, Env, Vec<String>)> {
+        let mut scope = env.clone();
+        let mut lets = Vec::new();
+        for stmt in stmts.iter() {
+            match &stmt.x {
+                StmtX::Decl { pattern, init: Some(init), els: None, .. } => {
+                    let PatternX::Var(PatternBinding { name, .. }) = &pattern.x else {
+                        return None;
+                    };
+                    let value = crate::ast_util::place_to_spec_expr(init);
+                    let before = scope.clone();
+                    self.bind_args(
+                        std::iter::once((name.clone(), pattern.typ.clone())),
+                        &Arc::new(vec![value]),
+                        &before,
+                        &mut scope,
+                        &mut lets,
+                    );
+                }
+                _ => return None,
+            }
+        }
+        Some((tail.clone()?, scope, lets))
     }
 
     /// Reduce an expression to a closure literal: a literal, a variable bound
@@ -4596,7 +4682,7 @@ impl Exporter {
         env: &Env,
         depth: usize,
     ) -> Option<(VarBinders<Typ>, Expr, Env, Vec<String>)> {
-        if depth > 16 {
+        if depth > 64 {
             return None;
         }
         let f = peel(f);
@@ -4621,8 +4707,28 @@ impl Exporter {
                 lets.append(&mut clets);
                 Some((params, cbody, cenv, lets))
             }
+            ExprX::Block(stmts, tail) => {
+                let (body, scope, mut lets) = self.symbolic_block(stmts, tail, env)?;
+                let (params, body, scope, mut rest) =
+                    self.resolve_closure(&body, &scope, depth + 1)?;
+                lets.append(&mut rest);
+                Some((params, body, scope, lets))
+            }
             _ => None,
         }
+    }
+
+    /// Project an ordinary field without attempting to print the other,
+    /// closure-valued fields of its record.
+    fn symbolic_field(&mut self, inner: &Expr, field: &Ident, env: &Env) -> Option<String> {
+        if !typ_has_specfn(&inner.typ, &self.datatypes, &mut HashSet::new()) {
+            return None;
+        }
+        let (record, scope, lets) = self.quiet(|x| x.resolve_record(inner, env, 0))?;
+        let ExprX::Ctor(_, _, fields, _) = &record.x else { return None };
+        let value = &fields.iter().find(|b| &b.name == field)?.a;
+        let body = self.expr(value, &scope);
+        Some(if lets.is_empty() { body } else { format!("(LET {} IN {body})", lets.join(" ")) })
     }
 
     /// The closure in a field of a record constructor.
@@ -4695,7 +4801,7 @@ impl Exporter {
         env: &Env,
         depth: usize,
     ) -> Option<(Expr, Env, Vec<String>)> {
-        if depth > 16 {
+        if depth > 64 {
             return None;
         }
         let e = peel(e);
@@ -4706,12 +4812,26 @@ impl Exporter {
                 self.resolve_record(&value, &venv, depth + 1)
             }
             ExprX::ReadPlace(p, _) => self.resolve_record_place(p, env, depth + 1),
+            ExprX::UnaryOpr(UnaryOpr::Field(FieldOpr { field, .. }), inner) => {
+                let (record, scope, mut lets) = self.resolve_record(inner, env, depth + 1)?;
+                let ExprX::Ctor(_, _, fields, _) = &record.x else { return None };
+                let value = &fields.iter().find(|b| &b.name == field)?.a;
+                let (record, scope, mut rest) = self.resolve_record(value, &scope, depth + 1)?;
+                lets.append(&mut rest);
+                Some((record, scope, lets))
+            }
             ExprX::Call { target: CallTarget::Fun(kind, fun, ..), args, .. } => {
                 let fun = &self.resolved_fun(kind, fun);
                 let (body, env2, mut lets) = self.inline_call(fun, args, env)?;
                 let (record, renv, mut rlets) = self.resolve_record(&body, &env2, depth + 1)?;
                 lets.append(&mut rlets);
                 Some((record, renv, lets))
+            }
+            ExprX::Block(stmts, tail) => {
+                let (body, scope, mut lets) = self.symbolic_block(stmts, tail, env)?;
+                let (body, scope, mut rest) = self.resolve_record(&body, &scope, depth + 1)?;
+                lets.append(&mut rest);
+                Some((body, scope, lets))
             }
             _ => None,
         }
@@ -4727,6 +4847,14 @@ impl Exporter {
             PlaceX::Local(v) => {
                 let (value, venv) = env.values.get(v)?.clone();
                 self.resolve_record(&value, &venv, depth + 1)
+            }
+            PlaceX::Field(FieldOpr { field, .. }, inner) => {
+                let (record, scope, mut lets) = self.resolve_record_place(inner, env, depth + 1)?;
+                let ExprX::Ctor(_, _, fields, _) = &record.x else { return None };
+                let value = &fields.iter().find(|b| &b.name == field)?.a;
+                let (record, scope, mut rest) = self.resolve_record(value, &scope, depth + 1)?;
+                lets.append(&mut rest);
+                Some((record, scope, lets))
             }
             PlaceX::Temporary(e) | PlaceX::WithExpr(e, _) => self.resolve_record(e, env, depth + 1),
             PlaceX::DerefMut(inner) | PlaceX::ModeUnwrap(inner, _) => {
@@ -5103,7 +5231,22 @@ impl Exporter {
                     "(LET RECURSIVE {f}(_) {f}({t}) == IF {t} = {{}} THEN ({z}) ELSE LET {x} == CHOOSE {c} \\in {t} : TRUE IN {b} IN {f}({v}))"
                 )
             }
-            "set_choose" => self.refuse("choose (TLC cannot evaluate it)", &e.span),
+            "set_choose" | "multiset_choose" => {
+                let value = g!(0);
+                let domain =
+                    if op == "multiset_choose" { format!("DOMAIN {value}") } else { value };
+                let name = self.bind("choice__");
+                self.choices.push(Choice {
+                    owner: self.current_key.clone(),
+                    variable: name.clone(),
+                    domain: domain.clone(),
+                    location: span_string(&e.span),
+                    holes: Vec::new(),
+                    bounded_by_hole: false,
+                    warning: None,
+                });
+                format!("(CHOOSE {name} \\in {domain} : TRUE)")
+            }
             "iset_finite" => {
                 let Some(t) = args.first().and_then(|a| collection_element(&a.typ)) else {
                     return self.refuse("ISet::finite without an element type", &e.span);
@@ -5248,6 +5391,57 @@ impl Exporter {
     }
 
     // ─── quantifiers ────────────────────────────────────────────────────
+
+    fn choose(
+        &mut self,
+        e: &Expr,
+        params: &VarBinders<Typ>,
+        cond: &Expr,
+        body: &Expr,
+        env: &Env,
+    ) -> String {
+        // A multi-binder choice is a simultaneous choice of a tuple, not
+        // independent nested choices. Keep it refused until encoded as such.
+        if params.len() != 1 {
+            return self.refuse("choose with multiple binders", &e.span);
+        }
+        let b = &params[0];
+        if typ_has_specfn(&b.a, &self.datatypes, &mut HashSet::new()) {
+            return self.refuse("choose without a representable domain", &e.span);
+        }
+        let mut scope = env.clone();
+        let name = self.bind_var(&mut scope, &b.name);
+        let guards = conjuncts(&peel(cond));
+        let holes_before = self.holes.len();
+        let domain = match self
+            .quiet(|x| x.bound_from_guard(&b.name, &b.a, &[b.name.clone()], &guards, &scope))
+        {
+            Some(domain) => domain,
+            None if matches!(&*crate::ast_util::undecorate_typ(&b.a), TypX::TypParam(_)) => {
+                return self.refuse("choose without a representable domain", &e.span);
+            }
+            None => self.type_domain(&name, &b.a, &e.span),
+        };
+        self.choices.push(Choice {
+            owner: self.current_key.clone(),
+            variable: name.clone(),
+            domain: domain.clone(),
+            location: span_string(&e.span),
+            holes: self.holes[holes_before..].iter().map(|h| h.constant.clone()).collect(),
+            bounded_by_hole: self.holes.len() > holes_before,
+            warning: (self.holes.len() > holes_before).then(|| {
+                "finite choice carrier: results cover only the supplied Dom_<Type> values".into()
+            }),
+        });
+        let predicate = self.quiet(|x| x.expr(cond, &scope));
+        let choice = format!("(CHOOSE {name} \\in {domain} : {predicate})");
+        if read_var(body).as_ref() == Some(&b.name) {
+            choice
+        } else {
+            let result = self.quiet(|x| x.expr(body, &scope));
+            format!("(LET {name} == {choice} IN {result})")
+        }
+    }
 
     fn quant(
         &mut self,
@@ -7402,6 +7596,7 @@ impl Exporter {
             holes: Vec::new(),
             undeclared: Vec::new(),
             refusals: Vec::new(),
+            choices: Vec::new(),
             tainted: false,
             error: None,
         };
@@ -7439,6 +7634,7 @@ impl Exporter {
         // calls them, so its holes and refusals never leak into this entry.
         let reached = self.reached_from(&key);
         let own = |owner: &Option<OpKey>| owner.as_ref().is_some_and(|k| reached.contains(k));
+        out.choices = self.choices.iter().filter(|c| own(&c.owner)).cloned().collect();
         out.holes = (model.holes..self.holes.len())
             .filter(|&i| own(&self.hole_owners[i]))
             .map(|i| self.holes[i].clone())
@@ -10234,6 +10430,8 @@ pub fn export_module(
         defs: Vec::new(),
         emitted: HashSet::new(),
         emitting: HashSet::new(),
+        reducing: HashSet::new(),
+        choices: Vec::new(),
         arity: HashMap::new(),
         op_names: HashMap::new(),
         used_names: HashSet::new(),
@@ -10850,6 +11048,7 @@ pub fn export_module(
     let model_constants = ex.constants.clone();
     let model_holes = ex.holes.len();
     let model_refusals = ex.refusals.len();
+    let model_choices = ex.choices.len();
     let model_euclid = ex.uses_euclid;
     let model_recursive = ex.recursive();
     let mut pending: Vec<Path> = vec![triple.state.clone()];
@@ -10942,6 +11141,25 @@ pub fn export_module(
             .push(format!("IsFiniteSet({constant}) /\\ (\\A {v} \\in {constant} : {pred})"));
     }
     ex.strict_types = false;
+    // Choice carriers, including holes in a composite domain, preserve
+    // their source ranges. TypeOK only constrains state fields.
+    let choice_domains: BTreeSet<String> =
+        ex.choices[..model_choices].iter().flat_map(|c| c.holes.iter().cloned()).collect();
+    for domain in choice_domains {
+        if let Some(typ) = ex.hole_typs.get(&domain).cloned() {
+            if let TypX::Int(range) = &*crate::ast_util::undecorate_typ(&typ) {
+                if !matches!(range, IntRange::Char) {
+                    label_assumes.push(format!("{domain} \\subseteq Int"));
+                }
+            }
+            ex.bound.clear();
+            let witness = ex.bind("choice__");
+            if let Some(p) = ex.type_pred(&witness, &typ, &mut Vec::new()) {
+                label_assumes.push(format!("\\A {witness} \\in {domain} : {p}"));
+            }
+            ex.bound.clear();
+        }
+    }
     let parameters: Vec<ModelParam> = match &closed {
         None => Vec::new(),
         Some(c) => triple
@@ -11013,6 +11231,12 @@ pub fn export_module(
         let warning = format!("WARNING: {what} at {} in {}.", r.location, r.in_function);
         for line in warning.lines() {
             tla.push_str(&format!("\\* {line}\n"));
+        }
+    }
+    if model_choices > 0 {
+        tla.push_str("\\* CHOOSE uses TLC's fixed witness for each predicate; an empty witness set stops TLC.\n");
+        if ex.choices[..model_choices].iter().any(|c| c.bounded_by_hole) {
+            tla.push_str("\\* WARNING: choose domains include finite Dom_<Type> holes; results cover only the supplied carriers.\n");
         }
     }
     if !properties.is_empty() {
@@ -11331,6 +11555,7 @@ pub fn export_module(
         holes: ex.holes[..model_holes].to_vec(),
         refusals: ex.refusals[..model_refusals].to_vec(),
         restrictions: model_restrictions,
+        choices: ex.choices[..model_choices].to_vec(),
         properties,
         fairness_in_spec,
         temporal_notes,
