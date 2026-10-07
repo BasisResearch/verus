@@ -1,0 +1,3 @@
+# Raw replays and scratch files stay local; compact measurements are committed.
+/*/
+/*.log

@@ -1716,7 +1716,7 @@ impl Exporter {
                     out.extend(self.read_requirements(&f.a, env, depth + 1));
                 }
             }
-            ExprX::Call { target: CallTarget::Fun(kind, fun, ..), args, .. } => {
+            ExprX::Call { target: CallTarget::Fun(kind, fun, typs, ..), args, .. } => {
                 for a in args.iter() {
                     out.extend(self.read_requirements(a, env, depth + 1));
                 }
@@ -1782,7 +1782,7 @@ impl Exporter {
                                 out.push((format!("({m}.tag = \"Some\")"), e.clone()));
                             }
                         } else if !matches!(&*e.typ, TypX::Bool) {
-                            let fun = self.resolved_fun(kind, fun);
+                            let fun = self.instantiate_call(kind, fun, typs);
                             if let Some(f) = self.functions.get(&fun).cloned() {
                                 if !f.x.decrease.is_empty() {
                                     let name = self.ensure_defined(&fun);
@@ -2007,7 +2007,10 @@ impl Exporter {
                 Some((&args[1], &args[2]))
             }
             ExprX::Binary(BinaryOp::Inequality(InequalityOp::Lt), a, b)
-                if int_typ_within(&a.typ, &IntRange::Nat) =>
+                if int_typ_within(&a.typ, &IntRange::Nat) || {
+                    let i = self.safety_value(a, env);
+                    self.safety_facts.contains(&format!("(0 <= {i})"))
+                } =>
             {
                 Some((a, b))
             }
@@ -2022,7 +2025,19 @@ impl Exporter {
                 }
             }
         }
+        if let Some((index, len)) = upper {
+            let length = self.safety_value(len, env);
+            let prefix = format!("({length} = Len(");
+            let seq = self.safety_facts.iter().find_map(|fact| {
+                fact.strip_prefix(&prefix).and_then(|s| s.strip_suffix("))")).map(str::to_owned)
+            });
+            if let Some(seq) = seq {
+                let i = self.safety_value(index, env);
+                return Some(format!("(({i}) + 1 \\in DOMAIN {seq})"));
+            }
+        }
         let simple = match &e.x {
+            ExprX::Binary(BinaryOp::Eq(_) | BinaryOp::Inequality(InequalityOp::Le), _, _) => true,
             ExprX::UnaryOpr(UnaryOpr::IsVariant { .. }, _) => true,
             ExprX::Call { target: CallTarget::Fun(_, f, ..), args, .. } => {
                 matches!(
@@ -7762,6 +7777,8 @@ impl Exporter {
         self.hole_typs.insert(constant.clone(), typ.clone());
         self.hole_owners.push(self.current_key.clone());
         self.holes.push(Hole {
+            kind: Some("finite_carrier".into()),
+            warning: Some(format!("{construct}: model restricted to finite carrier {constant}")),
             variable: "finite carrier".into(),
             typ: typ_name(typ),
             constant: constant.clone(),

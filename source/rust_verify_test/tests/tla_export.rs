@@ -9019,7 +9019,7 @@ use vstd::seq::*;
 verus! {
 pub struct State { pub n: nat, pub m: Map<nat, nat>, pub o: Option<nat>, pub q: Seq<nat> }
 pub open spec fn init(s: State) -> bool { s.n == 0 && s.m == Map::empty() && s.o == None && s.q == Seq::empty() }
-pub open spec fn payload(o: Option<nat>) -> nat { o.unwrap() }
+pub open spec fn payload<T>(o: Option<T>) -> T { o.unwrap() }
 pub open spec fn next(pre: State, post: State) -> bool {
     ||| (pre.m[0] == 3 && pre.m.contains_key(0) && post == pre)
     ||| (payload(pre.o) == 3 && pre.o is Some && post == pre)
