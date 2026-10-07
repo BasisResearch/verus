@@ -885,6 +885,7 @@ impl Verifier {
                 retain_only: self.resident_retain_only,
                 input_files: std::mem::take(&mut self.resident_inputs),
                 max_live_solvers: self.resident_max_solvers.filter(|_| self.resident_max_solvers_apply()),
+                rlimit: self.args.rlimit,
             },
         )
         .serve(invocation_succeeded, |context, rlimit| {
@@ -2438,10 +2439,11 @@ impl Verifier {
                                 .filter(|_| includes_function)
                             {
                                 session
-                                    .record_query(
+                                    .record_query_budget(
                                         cmds.clone(),
                                         query_op,
                                         function.x.attrs.rlimit.unwrap_or(self.args.rlimit),
+                                        function.x.attrs.rlimit.is_some(),
                                     )
                                     .map_err(&resident_error)?;
                             }

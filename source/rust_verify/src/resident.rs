@@ -141,6 +141,9 @@ struct RetainedQuery {
     /// What the invocation's own check of this query answered, when it
     /// checked it (see `InitialVerdict`).
     initial: Option<InitialVerdict>,
+    /// `rlimit` is the function's own `#[verifier::rlimit]`, which a check's
+    /// rlimit override does not replace, as `--rlimit` does not.
+    rlimit_attribute: bool,
 }
 
 /// What the invocation that retained a query answered when it checked it:
@@ -313,6 +316,15 @@ enum Request {
         session: String,
         bucket: BucketIndex,
         query: QueryId,
+        /// Check at this rlimit instead of the invocation's `--rlimit` (a
+        /// function's own `#[verifier::rlimit]` still wins, as it does over
+        /// `--rlimit`).
+        #[serde(default)]
+        rlimit: Option<f32>,
+        /// Look for this many further errors after the first, instead of the
+        /// invocation's `--multiple-errors`.
+        #[serde(default)]
+        multiple_errors: Option<u32>,
     },
     /// Probe the query with parts of it switched off (see `air::bisect`).
     Bisect {
@@ -1001,6 +1013,8 @@ pub(crate) struct SessionInfo {
     /// sent when next needed (`air::context::Context::suspend`). `None`:
     /// every solver keeps running.
     pub(crate) max_live_solvers: Option<usize>,
+    /// The invocation's `--rlimit`: what a check runs at without an override.
+    pub(crate) rlimit: f32,
 }
 
 #[derive(Serialize)]
@@ -1022,6 +1036,10 @@ enum Response<'a> {
         inst_graph: bool,
         strategy_ladder: bool,
         retain_only: bool,
+        /// What a check runs at without overrides: the invocation's
+        /// `--rlimit` and `--multiple-errors`.
+        rlimit: f32,
+        multiple_errors: u32,
         input_files: &'a [String],
         buckets: &'a [BucketDescription],
     },
@@ -1063,6 +1081,8 @@ enum Response<'a> {
         inst_graph: Option<GraphSummary>,
         /// Why a session that records graphs kept none for this check.
         inst_graph_error: Option<String>,
+        /// The rlimit the check ran at.
+        rlimit: f32,
     },
     InstGraph {
         session: &'a str,
@@ -5324,11 +5344,24 @@ impl QueryJournal {
     }
 
     /// Retain the lowered query and the declaration prefix that precedes it.
+    #[cfg(test)]
     pub(crate) fn record_query(
         &mut self,
         commands: CommandsWithContext,
         op: &QueryOp,
         rlimit: f32,
+    ) -> Result<(), &'static str> {
+        self.record_query_budget(commands, op, rlimit, false)
+    }
+
+    /// `record_query`, saying whether `rlimit` is the function's own
+    /// `#[verifier::rlimit]` rather than the invocation's `--rlimit`.
+    pub(crate) fn record_query_budget(
+        &mut self,
+        commands: CommandsWithContext,
+        op: &QueryOp,
+        rlimit: f32,
+        rlimit_attribute: bool,
     ) -> Result<(), &'static str> {
         if commands.commands.iter().any(|command| !matches!(**command, CommandX::CheckValid(_))) {
             return Err("resident query batches must contain only check-valid commands");
@@ -5344,6 +5377,7 @@ impl QueryJournal {
                     prover: commands.prover_choice,
                     level: op.message_level(),
                     initial: None,
+                    rlimit_attribute,
                 });
                 // The next declaration batch must start a scope: this query
                 // can ask to return to the prefix that ends here.
@@ -5541,6 +5575,8 @@ impl Server {
                 inst_graph: self.info.inst_graph,
                 strategy_ladder: self.info.strategy_ladder,
                 retain_only: self.info.retain_only,
+                rlimit: self.info.rlimit,
+                multiple_errors: self.info.multiple_errors,
                 input_files: &self.info.input_files,
                 buckets: &buckets,
             },
@@ -6073,7 +6109,14 @@ impl Server {
                         Err(error) => return fatal(&mut output, error),
                     }
                 }
-                Request::Check { bucket: bucket_id, query: id, .. } => {
+                Request::Check {
+                    bucket: bucket_id,
+                    query: id,
+                    rlimit: rlimit_override,
+                    multiple_errors: errors_override,
+                    ..
+                } => {
+                    let multiple_errors = errors_override.unwrap_or(multiple_errors);
                     let Some(bucket) = self.buckets.get(bucket_id.0) else {
                         send(&mut output, &Response::Error { message: "unknown bucket" })?;
                         continue;
@@ -6105,10 +6148,16 @@ impl Server {
                     }
                     let restore_ms = restore_start.elapsed().as_millis();
                     let query = &journal.queries[local];
+                    // The budget this check runs at: the request's, unless
+                    // the function names its own.
+                    let budget = match rlimit_override {
+                        Some(rlimit) if !query.rlimit_attribute => rlimit,
+                        _ => query.rlimit,
+                    };
                     // The severity the original invocation would have reported
                     // this failure at, so a recommends recheck stays a warning.
                     let level = query.level;
-                    set_rlimit(air, query.rlimit);
+                    set_rlimit(air, budget);
                     // With replay on, each check saves its instantiations
                     // under the query's certificate key.
                     let replay_key =
@@ -6190,7 +6239,7 @@ impl Server {
                         self.pins.get(&(bucket_id.0, id.0)).filter(|_| certified.is_none())
                     {
                         let attempt_start = Instant::now();
-                        let rlimit = pin.rlimit.min(query.rlimit);
+                        let rlimit = pin.rlimit.min(budget);
                         set_rlimit(air, rlimit);
                         air.set_quant_strategy(Some(pin.rung.name()), !pin.alongside);
                         let attempt = air.check_valid(
@@ -6199,7 +6248,7 @@ impl Server {
                             &query.query,
                             QueryContext::default(),
                         );
-                        set_rlimit(air, query.rlimit);
+                        set_rlimit(air, budget);
                         let resource_units =
                             air.take_strategy_rung().map(|info| info.resource_units);
                         match attempt {
@@ -6497,6 +6546,7 @@ impl Server {
                             pinned,
                             inst_graph: graph_summary,
                             inst_graph_error: graph_error,
+                            rlimit: budget,
                         },
                     )?;
                 }
@@ -7185,6 +7235,7 @@ mod tests {
                 strategy_ladder: false,
                 retain_only: false,
                 max_live_solvers: None,
+                rlimit: 10.0,
             },
         );
         let input = format!("{}\n{{\"command\":\"list\"}}\n", " ".repeat(65537));

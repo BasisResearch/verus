@@ -5210,3 +5210,67 @@ fn resident_capped_session_relaunches_stopped_solvers_with_the_same_verdicts() {
     assert_eq!(worker.send(json!({"command": "close", "session": session}))["event"], "closed");
     worker.finish(false);
 }
+
+const OVERRIDE_SOURCE: &str = r#"
+use vstd::prelude::*;
+verus! {
+    spec fn f(x: int) -> int { x + 1 }
+
+    proof fn passing(x: int) ensures f(x) > x {}
+
+    proof fn three_failures(x: int) {
+        assert(x > 0);
+        assert(x > 1);
+        assert(x > 2);
+    }
+
+    uninterp spec fn a(i: int) -> int;
+
+    #[verifier::rlimit(0.01)]
+    proof fn own_budget()
+        requires forall|i: int| #[trigger] a(i) < a(i + 1),
+        ensures a(0) > 100,
+    {
+    }
+}
+"#;
+
+/// A check may run at another rlimit or look for another number of errors
+/// than the invocation did; a function's own `#[verifier::rlimit]` still
+/// wins over the requested rlimit, as it does over `--rlimit`. `ready`
+/// reports the invocation's own settings.
+#[test]
+fn resident_check_takes_an_rlimit_and_an_error_count() {
+    let mut worker = Worker::start(OVERRIDE_SOURCE, &["--rlimit", "7"]);
+    let ready = worker.receive();
+    assert_eq!(ready["rlimit"], 7.0, "{}", ready);
+    assert_eq!(ready["multiple_errors"], 2, "{}", ready);
+    let session = ready["session"].clone();
+    let check = |worker: &mut Worker<ChildStdin>, name: &str, extra: Value| {
+        let mut request = json!({"command": "check", "session": session, "bucket": 0,
+            "query": query_id(&ready, name)});
+        request.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        worker.send(request)
+    };
+    let plain = check(&mut worker, "::passing", json!({}));
+    assert_eq!((plain["result"].clone(), plain["rlimit"].clone()), (json!("valid"), json!(7.0)), "{}", plain);
+    // One resource unit is not enough for anything.
+    let starved = check(&mut worker, "::passing", json!({"rlimit": 0.000004}));
+    assert_eq!(starved["result"], "resource_limit", "{}", starved);
+    assert!((starved["rlimit"].as_f64().unwrap() - 0.000004).abs() < 1e-9, "{}", starved);
+    let again = check(&mut worker, "::passing", json!({}));
+    assert_eq!(again["result"], "valid", "the override lasts one check: {}", again);
+    // The function's own budget is kept.
+    let own = check(&mut worker, "::own_budget", json!({"rlimit": 100}));
+    assert!((own["rlimit"].as_f64().unwrap() - 0.01).abs() < 1e-6, "{}", own);
+    // Errors: the first, then as many more as asked for.
+    let errors = |checked: &Value| {
+        checked["diagnostics"].as_array().unwrap().iter().filter(|d| d["level"] == "error").count()
+    };
+    let one = check(&mut worker, "::three_failures", json!({"multiple_errors": 0}));
+    assert_eq!(errors(&one), 1, "{}", one);
+    let all = check(&mut worker, "::three_failures", json!({"multiple_errors": 5}));
+    assert_eq!(errors(&all), 3, "{}", all);
+    assert_eq!(worker.send(json!({"command": "close", "session": session}))["event"], "closed");
+    worker.finish(false);
+}
