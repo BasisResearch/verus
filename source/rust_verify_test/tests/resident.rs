@@ -3316,7 +3316,8 @@ fn resident_ready_lists_the_requests_it_serves() {
             "twin",
             "speculate",
             "pin",
-            "check_many"
+            "check_many",
+            "compiled"
         ],
         "{ready}"
     );
@@ -3324,7 +3325,7 @@ fn resident_ready_lists_the_requests_it_serves() {
     // not as an unknown request, so the list cannot drift from `Request`.
     for command in &commands {
         let request = match command.as_str() {
-            "list" | "close" => json!({"command": command, "session": "stale"}),
+            "list" | "close" | "compiled" => json!({"command": command, "session": "stale"}),
             "check" | "egraph" | "ladder" | "speculate" => {
                 json!({"command": command, "session": "stale", "bucket": 0, "query": 0})
             }
@@ -3713,6 +3714,40 @@ verus! {{
         assert_eq!(checked["pinned"]["rlimit"], 1.0, "{checked}");
         worker.finish(true);
     }
+}
+
+/// A retain-only session serves from the end of verification while the
+/// compiler goes on with its later passes; `compiled` waits for them and says
+/// whether the compilation succeeded, by which time what they report (here a
+/// lint of a later pass) is on stderr. A session served after its
+/// compilation answers `compiled` at once with the invocation's outcome.
+#[test]
+fn resident_retain_only_session_serves_before_the_compilation_ends() {
+    let source = "use vstd::prelude::*;\nverus! { proof fn passing() {} }\n\
+        pub fn ptr(a: usize) -> *mut u8 { unsafe { std::mem::transmute(a) } }\n";
+    let mut worker = Worker::start_with_env(source, &[], &[("VERUS_RESIDENT_RETAIN_ONLY", "1")]);
+    let ready = worker.receive();
+    let session = ready["session"].clone();
+    let compiled = worker.send(json!({"command": "compiled", "session": session}));
+    assert_eq!(compiled["event"], "compiled", "{compiled}");
+    assert_eq!(compiled["succeeded"], true, "{compiled}");
+    assert!(worker.stderr().contains("transmuting an integer to a pointer"), "{}", worker.stderr());
+    // Asked again, it answers the same.
+    let again = worker.send(json!({"command": "compiled", "session": session}));
+    assert_eq!(again["succeeded"], true, "{again}");
+    let closed = worker.send(json!({"command": "close", "session": session}));
+    assert_eq!(closed["event"], "closed", "{closed}");
+    worker.finish(true);
+
+    let mut worker = Worker::start(
+        "use vstd::prelude::*; verus! { proof fn failing() { assert(false); } }",
+        &[],
+    );
+    let ready = worker.receive();
+    let compiled = worker.send(json!({"command": "compiled", "session": ready["session"]}));
+    assert_eq!(compiled["succeeded"], ready["invocation_succeeded"], "{compiled}");
+    assert_eq!(compiled["succeeded"], false, "{compiled}");
+    worker.finish(false);
 }
 
 /// A retain-only session has checked nothing when its first request arrives,

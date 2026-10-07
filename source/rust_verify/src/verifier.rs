@@ -376,6 +376,15 @@ pub struct Verifier {
     resident_buckets: Vec<crate::resident::RetainedBucket>,
     resident_prepared: bool,
     resident_inputs: Vec<String>,
+    /// A retain-only session already serving while the compilation goes on
+    /// (`serve_resident_early`), and where to send how it ended. Only the
+    /// main thread touches it, after the driver returns.
+    resident_early: Option<
+        std::panic::AssertUnwindSafe<(
+            std::thread::JoinHandle<std::io::Result<()>>,
+            std::sync::mpsc::Sender<bool>,
+        )>,
+    >,
     /// Retain every selected query without checking any
     /// (`VERUS_RESIDENT_RETAIN_ONLY`): a resident session opened on edited
     /// source, whose caller carries over what it knew about the unchanged
@@ -699,6 +708,7 @@ impl Verifier {
             resident_buckets: Vec::new(),
             resident_prepared: false,
             resident_inputs: Vec::new(),
+            resident_early: None,
             resident_retain_only,
             resident_max_solvers,
             encountered_vir_error: false,
@@ -763,6 +773,7 @@ impl Verifier {
             resident_buckets: Vec::new(),
             resident_prepared: false,
             resident_inputs: Vec::new(),
+            resident_early: None,
             resident_retain_only: self.resident_retain_only,
             resident_max_solvers: self.resident_max_solvers,
             encountered_vir_error: false,
@@ -857,6 +868,14 @@ impl Verifier {
     /// selected buckets have finished lowering. Even failed/partial invocations
     /// relinquish their children here, before main can call process::exit.
     pub fn serve_resident(&mut self, invocation_succeeded: bool) -> std::io::Result<()> {
+        if let Some(std::panic::AssertUnwindSafe((server, compiled))) = self.resident_early.take() {
+            // The session has been serving since verification ended; it
+            // answers `compiled` with this once it is sent.
+            let _ = compiled.send(invocation_succeeded);
+            return server
+                .join()
+                .unwrap_or_else(|_| Err(std::io::Error::other("resident server panicked")));
+        }
         let buckets = std::mem::take(&mut self.resident_buckets);
         if !self.resident_prepared {
             // Dropping the buckets releases every solver. Tell a waiting
@@ -870,29 +889,61 @@ impl Verifier {
             return Ok(());
         }
         self.resident_prepared = false;
-        crate::resident::Server::new(
-            buckets,
-            crate::resident::SessionInfo {
-                provenance: self.args.provenance,
-                matching_loops: self.args.matching_loops,
-                difficulty: self.args.difficulty,
-                spinoff_all: self.args.spinoff_all,
-                multiple_errors: self.args.multiple_errors,
-                smt_options: self.args.smt_options.clone(),
-                instantiation_replay: self.instantiation_replay(),
-                inst_graph: self.inst_graph(),
-                strategy_ladder: self.strategy_ladder(),
-                retain_only: self.resident_retain_only,
-                input_files: std::mem::take(&mut self.resident_inputs),
-                max_live_solvers: self
-                    .resident_max_solvers
-                    .filter(|_| self.resident_max_solvers_apply()),
-                rlimit: self.args.rlimit,
+        crate::resident::Server::new(buckets, self.resident_session_info()).serve(
+            invocation_succeeded,
+            |context, rlimit| {
+                Self::set_rlimit(SmtSolver::Cvc5, context, rlimit);
             },
         )
-        .serve(invocation_succeeded, |context, rlimit| {
-            Self::set_rlimit(SmtSolver::Cvc5, context, rlimit);
-        })
+    }
+
+    /// Start serving a retain-only session as soon as verification has
+    /// lowered its queries, on a thread of its own, while the compiler goes
+    /// on with what follows verification (the borrow checker and the lints of
+    /// later passes). A batch run that fails stops before those passes, and
+    /// one that passes prints what they report, so a caller that answers
+    /// checks itself need not wait for them before checking: it asks
+    /// `compiled` only when it needs how the compilation ended and what it
+    /// printed. `serve_resident` then sends the outcome and waits for the
+    /// session to close.
+    pub(crate) fn serve_resident_early(&mut self) {
+        if !self.resident_prepared || !self.resident_retain_only {
+            return;
+        }
+        self.resident_prepared = false;
+        let buckets = std::mem::take(&mut self.resident_buckets);
+        let info = self.resident_session_info();
+        let lowered = !self.encountered_error && !self.encountered_vir_error;
+        let (compiled, outcome) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            crate::resident::Server::new(buckets, info).with_compilation(outcome).serve(
+                lowered,
+                |context, rlimit| {
+                    Self::set_rlimit(SmtSolver::Cvc5, context, rlimit);
+                },
+            )
+        });
+        self.resident_early = Some(std::panic::AssertUnwindSafe((server, compiled)));
+    }
+
+    fn resident_session_info(&mut self) -> crate::resident::SessionInfo {
+        crate::resident::SessionInfo {
+            provenance: self.args.provenance,
+            matching_loops: self.args.matching_loops,
+            difficulty: self.args.difficulty,
+            spinoff_all: self.args.spinoff_all,
+            multiple_errors: self.args.multiple_errors,
+            smt_options: self.args.smt_options.clone(),
+            instantiation_replay: self.instantiation_replay(),
+            inst_graph: self.inst_graph(),
+            strategy_ladder: self.strategy_ladder(),
+            retain_only: self.resident_retain_only,
+            input_files: std::mem::take(&mut self.resident_inputs),
+            max_live_solvers: self
+                .resident_max_solvers
+                .filter(|_| self.resident_max_solvers_apply()),
+            rlimit: self.args.rlimit,
+        }
     }
 
     fn get_bucket<'a>(&'a self, bucket_id: &BucketId) -> &'a Bucket {
@@ -4456,6 +4507,7 @@ impl VerifierCallbacksEraseMacro {
                     std::path::absolute(&path).unwrap_or(path).to_string_lossy().into_owned()
                 })
                 .collect();
+            self.verifier.serve_resident_early();
         }
         if !self.verifier.args.output_json
             && !self.verifier.args.resident

@@ -71,7 +71,12 @@
 //! every one a check could have added, including those for functions whose
 //! checks pass (a caller checks a follow-up when its function's body fails,
 //! as the batch run does), and none of the `--expand-errors` queries, which
-//! only a failed check can name.
+//! only a failed check can name. Such a session is served as soon as
+//! verification has lowered its queries, on a thread of its own, while the
+//! compiler goes on with the passes after verification (borrow checking, later
+//! lints): a batch run that fails stops before them, so a caller answering
+//! for one need not wait. `compiled` waits for them and says whether the
+//! compilation succeeded; what they report is on stderr by then.
 //!
 //! Each catalogue query also names what the invocation itself answered when
 //! it checked the query (`initial`: verdict, failed assertion, diagnostics
@@ -305,6 +310,7 @@ const COMMANDS: &[&str] = &[
     "speculate",
     "pin",
     "check_many",
+    "compiled",
 ];
 
 #[derive(Deserialize)]
@@ -445,6 +451,13 @@ enum Request {
         goal_only: bool,
     },
     Close {
+        session: String,
+    },
+    /// Wait for the compilation that opened the session to end, and say
+    /// whether it succeeded. A retain-only session serves from the end of
+    /// verification while the compiler goes on (`Verifier::serve_resident_early`);
+    /// what those later passes report reaches stderr before the answer.
+    Compiled {
         session: String,
     },
     /// Query the instantiation graph the last check of this query recorded.
@@ -971,6 +984,14 @@ pub(crate) struct Server {
     /// least recently used past `SessionInfo::max_live_solvers`.
     used: HashMap<(usize, usize), u64>,
     clock: u64,
+    /// How the compilation that opened the session ended, once known; until
+    /// then, where it will be sent (`with_compilation`).
+    compilation: Compilation,
+}
+
+enum Compilation {
+    Pending(std::sync::mpsc::Receiver<bool>),
+    Ended(bool),
 }
 
 /// What the solvers of a session can run one strategy of, which is a
@@ -1164,6 +1185,10 @@ enum Response<'a> {
     },
     Closed {
         session: &'a str,
+    },
+    Compiled {
+        session: &'a str,
+        succeeded: bool,
     },
 }
 
@@ -5547,7 +5572,15 @@ impl Server {
             rungs: SessionRungs::Unknown,
             used: HashMap::new(),
             clock: 0,
+            compilation: Compilation::Ended(true),
         }
+    }
+
+    /// Serve before the compilation has ended: `compiled` waits for its
+    /// outcome on `outcome`.
+    pub(crate) fn with_compilation(mut self, outcome: std::sync::mpsc::Receiver<bool>) -> Self {
+        self.compilation = Compilation::Pending(outcome);
+        self
     }
 
     /// Account a check's answer to the session (the solver it used, the
@@ -5615,6 +5648,10 @@ impl Server {
         mut output: impl Write,
         set_rlimit: impl Fn(&mut Context, f32) + Sync,
     ) -> io::Result<()> {
+        // A session served after its compilation ended knows how it ended.
+        if let Compilation::Ended(_) = self.compilation {
+            self.compilation = Compilation::Ended(invocation_succeeded);
+        }
         let buckets: Vec<_> = self
             .buckets
             .iter()
@@ -5691,6 +5728,7 @@ impl Server {
                 | Request::Speculate { session: requested, .. }
                 | Request::Scaffold { session: requested, .. }
                 | Request::Close { session: requested }
+                | Request::Compiled { session: requested }
                 | Request::InstGraph { session: requested, .. }
                 | Request::Twin { session: requested, .. }
                 | Request::Ladder { session: requested, .. }
@@ -5738,6 +5776,15 @@ impl Server {
                         &mut output,
                         &Response::Pinned { session, bucket: bucket_id, query: id, pin },
                     )?;
+                }
+                Request::Compiled { .. } => {
+                    let succeeded = match &self.compilation {
+                        Compilation::Ended(succeeded) => *succeeded,
+                        // A compiler that ended without saying so failed.
+                        Compilation::Pending(outcome) => outcome.recv().unwrap_or(false),
+                    };
+                    self.compilation = Compilation::Ended(succeeded);
+                    send(&mut output, &Response::Compiled { session, succeeded })?;
                 }
                 Request::Close { .. } => {
                     if let Err(error) = self.shutdown() {
