@@ -139,6 +139,16 @@
 //! variable is kept only symbolically; used other than in an application it
 //! is refused.
 //!
+//! Partial map/sequence/variant reads in predicates carry definedness
+//! conditions. A later source membership, variant, or direct sequence-range
+//! guard is moved before the read when it does not read the post state.
+//! Otherwise the predicate is FALSE outside the read's domain, an explicit
+//! restriction of unspecified source values listed with its source site in
+//! `restrictions` and warned of in the module header. Recursive value helpers
+//! have recursive definedness operators, rather than a finite unrolling.
+//! Total maps and infinite sets use explicit finite `Dom_<Type>` carriers,
+//! constrained by ASSUME; their finiteness and totality are carrier-relative.
+//!
 //! verus-tla temporal properties (`TempPred`s: `always`, `eventually`,
 //! `leads_to`, `lift_state`, `weak_fairness`, ...) stated by a proof fn's
 //! `ensures` over the spec its `requires` give, or beside a spec fn `spec()`,
@@ -270,6 +280,9 @@ pub struct Report {
     pub operators: usize,
     pub holes: Vec<Hole>,
     pub refusals: Vec<Refusal>,
+    /// Explicit restrictions introduced by finite carriers or partial reads.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub restrictions: Vec<Refusal>,
     /// The trace spec written beside the export (see [`TraceReport`]).
     pub trace: TraceReport,
     /// The temporal properties, checked as `PROPERTY`s.
@@ -531,6 +544,7 @@ enum Reach {
 /// A call recorded for [`Exporter::transitions`]: the callee, how it is
 /// reached, and what the branches enclosing the call (within the caller)
 /// assign, which TLC has assigned too on any step through the call.
+#[derive(Clone)]
 struct Call {
     callee: OpKey,
     reach: Reach,
@@ -626,6 +640,7 @@ struct Env {
     /// Names a pattern bound to a field of a whole state (`let State { x,
     /// .. } = post`), so `x == e` assigns it as `post.x == e` does.
     field_binders: HashMap<VarIdent, FieldBinder>,
+    partial_values: HashMap<VarIdent, (Place, Arc<Env>)>,
 }
 
 /// A name a pattern bound to a field of a whole state (see
@@ -650,6 +665,7 @@ impl Env {
             primed: HashSet::new(),
             domains: HashMap::new(),
             field_binders: HashMap::new(),
+            partial_values: HashMap::new(),
         }
     }
     fn name(&self, v: &VarIdent) -> String {
@@ -697,6 +713,7 @@ impl Env {
     }
 }
 
+#[derive(Clone)]
 struct Exporter {
     word_bits: ArchWordBits,
     init_domains: bool,
@@ -819,6 +836,12 @@ struct Exporter {
     values: BTreeMap<String, String>,
     /// Each `Dom_` hole's Rust type, for the `ASSUME` a label's hole gets.
     hole_typs: HashMap<String, Typ>,
+    restrictions: Vec<Refusal>,
+    carrier_assumes: BTreeMap<String, String>,
+    in_safety: bool,
+    predicate_depth: usize,
+    safety_facts: Vec<String>,
+    defined_functions: HashMap<Fun, String>,
     /// The 0-ary functions standing for the model's constants (see
     /// [`Exporter::close_extras`]), and the operator each is.
     constant_ops: HashMap<Fun, String>,
@@ -946,6 +969,23 @@ fn typ_datatype(typ: &Typ) -> Option<Path> {
         TypX::Datatype(Dt::Path(p), _, _) => Some(p.clone()),
         TypX::Decorate(_, _, t) => typ_datatype(t),
         TypX::Boxed(t) => typ_datatype(t),
+        _ => None,
+    }
+}
+
+fn requirements_and(rs: &[(String, Expr)]) -> String {
+    if rs.is_empty() {
+        "TRUE".into()
+    } else {
+        format!("({})", rs.iter().map(|(g, _)| g.as_str()).collect::<Vec<_>>().join(" /\\ "))
+    }
+}
+
+/// First parameter of a collection, through VIR's type wrappers.
+fn collection_element(typ: &Typ) -> Option<Typ> {
+    match &**typ {
+        TypX::Datatype(_, args, _) => args.first().cloned(),
+        TypX::Decorate(_, _, t) | TypX::Boxed(t) => collection_element(t),
         _ => None,
     }
 }
@@ -1271,9 +1311,14 @@ fn vstd_op(name: &str) -> Option<&'static str> {
     // predicates, `Set::new` returns an `Option`, `Map::new` takes a set).
     let module = match (module, method) {
         ("iset", "new") => return Some("iset_new"),
+        ("iset", "full") => return Some("iset_full"),
+        ("iset", "is_full") => return Some("iset_is_full"),
+        ("iset", "mk_map") => return Some("map_new"),
+        ("iset", "flatten") => return Some("set_flatten"),
+        ("imap", "total") => return Some("imap_total"),
         ("imap", "new") => return Some("imap_new"),
-        // TLC builds only finite sets, where Verus's `ISet` may be infinite
-        // (one over a hole is), so its finiteness is not the export's.
+        // Finiteness of an ISet is relative to an explicitly reported
+        // finite carrier, never claimed as the source set's finiteness.
         ("iset", "finite") => return Some("iset_finite"),
         ("iset", _) => "set",
         ("imap", _) => "map",
@@ -1592,9 +1637,445 @@ impl Exporter {
         if !conjunctive(e) && !self.assert_implication(e) {
             self.conj_level = false;
         }
+        let atomic = !self.in_safety
+            && self.predicate_depth == 0
+            && matches!(&*e.typ, TypX::Bool)
+            && !matches!(
+                &peel(e).x,
+                ExprX::Logical(..)
+                    | ExprX::If(..)
+                    | ExprX::Match(..)
+                    | ExprX::Block(..)
+                    | ExprX::Quant(..)
+                    | ExprX::WithTriggers { .. }
+            );
+        if atomic {
+            self.predicate_depth += 1;
+        }
         let s = self.expr_at(e, env);
+        if atomic {
+            self.predicate_depth -= 1;
+        }
         self.conj_level = level;
-        s
+        let requirements = if atomic { self.read_requirements(e, env, 0) } else { vec![] };
+        let requirements: Vec<_> =
+            requirements.into_iter().filter(|(g, _)| !self.safety_facts.contains(g)).collect();
+        if requirements.is_empty() {
+            s
+        } else {
+            for (g, site) in &requirements {
+                self.restriction(format!("partial read: enclosing predicate is FALSE outside {g}; this restricts unspecified source values"), site);
+            }
+            format!("(IF {} THEN {s} ELSE FALSE)", requirements_and(&requirements))
+        }
+    }
+
+    /// Conditions under which a value's partial projections are defined.
+    /// Boolean callees guard their own bodies; value callees are inspected
+    /// with their arguments substituted, so a projection helper cannot hide
+    /// an off-domain read from the enclosing predicate.
+    fn read_requirements(&mut self, e: &Expr, env: &Env, depth: usize) -> Vec<(String, Expr)> {
+        if depth > 64 {
+            return vec![(
+                self.refuse("partial-read analysis exceeds its expansion limit", &e.span),
+                e.clone(),
+            )];
+        }
+        let e = peel(e);
+        let mut out = Vec::new();
+        match &e.x {
+            ExprX::Var(v) => {
+                if let Some((value, scope)) = env.partial_values.get(v) {
+                    out.extend(self.place_requirements(value, scope, depth + 1));
+                } else if let Some((value, scope)) = env.values.get(v) {
+                    out.extend(self.read_requirements(value, scope, depth + 1));
+                }
+            }
+            ExprX::ReadPlace(p, _) => out.extend(self.place_requirements(p, env, depth + 1)),
+            ExprX::UnaryOpr(UnaryOpr::Field(f), base) => {
+                out.extend(self.read_requirements(base, env, depth + 1));
+                if !self.single_variant(&f.datatype) {
+                    let b = self.safety_value(base, env);
+                    out.push((format!("({b}.tag = \"{}\")", f.variant), e.clone()));
+                }
+            }
+            ExprX::Unary(_, a) | ExprX::UnaryOpr(_, a) => {
+                out.extend(self.read_requirements(a, env, depth + 1))
+            }
+            ExprX::Binary(_, a, b) | ExprX::BinaryOpr(_, a, b) | ExprX::Logical(_, a, b) => {
+                out.extend(self.read_requirements(a, env, depth + 1));
+                out.extend(self.read_requirements(b, env, depth + 1));
+            }
+            ExprX::Multi(_, args) => {
+                for a in args.iter() {
+                    out.extend(self.read_requirements(a, env, depth + 1));
+                }
+            }
+            ExprX::Ctor(_, _, fields, _) => {
+                for f in fields.iter() {
+                    out.extend(self.read_requirements(&f.a, env, depth + 1));
+                }
+            }
+            ExprX::Call { target: CallTarget::Fun(kind, fun, ..), args, .. } => {
+                for a in args.iter() {
+                    out.extend(self.read_requirements(a, env, depth + 1));
+                }
+                let op = vstd_op(&fun_as_friendly_rust_name(fun));
+                match op {
+                    Some("map_index" | "seq_index") if args.len() == 2 => {
+                        let m = self.safety_value(&args[0], env);
+                        let k = self.safety_value(&args[1], env);
+                        let k = if op == Some("seq_index") { format!("({k}) + 1") } else { k };
+                        out.push((format!("({k} \\in DOMAIN {m})"), e.clone()));
+                    }
+                    Some("seq_first" | "seq_last") => {
+                        let m = self.safety_value(&args[0], env);
+                        out.push((format!("(Len({m}) > 0)"), e.clone()));
+                    }
+                    Some("map_new" | "imap_new" | "imap_total") => {
+                        let callback = if op == Some("imap_total") { 0 } else { 1 };
+                        if let Some((params, body, mut scope, lets)) =
+                            self.fn_arg(args, callback, 1, env)
+                        {
+                            let bound = self.bound.clone();
+                            let k = self.bind("defined_key__");
+                            scope.names.insert(params[0].name.clone(), k.clone());
+                            scope.values.remove(&params[0].name);
+                            scope.partial_values.remove(&params[0].name);
+                            let rs = self.read_requirements(&body, &scope, depth + 1);
+                            if !rs.is_empty() {
+                                let domain = if op == Some("imap_new") {
+                                    self.clone().comprehension(&e, args, 0, env)
+                                } else if op == Some("imap_total") {
+                                    collection_element(&e.typ)
+                                        .map(|t| format!("Dom_{}", self.constant_typ_name(&t)))
+                                        .unwrap_or_else(|| "{}".into())
+                                } else {
+                                    self.safety_value(&args[0], env)
+                                };
+                                let body = requirements_and(&rs);
+                                let body = if lets.is_empty() {
+                                    body
+                                } else {
+                                    format!("(LET {} IN {body})", lets.join(" "))
+                                };
+                                out.push((format!("(\\A {k} \\in {domain} : {body})"), e.clone()));
+                            }
+                            self.bound = bound;
+                        }
+                    }
+                    Some(_) => {}
+                    None => {
+                        if option_method(fun, args).is_some_and(|m| {
+                            matches!(
+                                m.as_str(),
+                                "unwrap"
+                                    | "get_Some_0"
+                                    | "arrow_Some_0"
+                                    | "arrow_0"
+                                    | "spec_unwrap"
+                                    | "spec_expect"
+                            )
+                        }) {
+                            let m = self.safety_value(&args[0], env);
+                            if !m.starts_with("[tag |-> \"Some\",") {
+                                out.push((format!("({m}.tag = \"Some\")"), e.clone()));
+                            }
+                        } else if !matches!(&*e.typ, TypX::Bool) {
+                            let fun = self.resolved_fun(kind, fun);
+                            if let Some(f) = self.functions.get(&fun).cloned() {
+                                if !f.x.decrease.is_empty() {
+                                    let name = self.ensure_defined(&fun);
+                                    let arguments: Vec<_> =
+                                        args.iter().map(|a| self.safety_value(a, env)).collect();
+                                    out.push((
+                                        format!("{name}({})", arguments.join(", ")),
+                                        e.clone(),
+                                    ));
+                                } else {
+                                    if let Some(body) = &f.x.body {
+                                        let mut scope = Env::new();
+                                        for (p, a) in f.x.params.iter().zip(args.iter()) {
+                                            scope.names.insert(
+                                                p.x.name.clone(),
+                                                self.safety_value(a, env),
+                                            );
+                                            scope.values.insert(
+                                                p.x.name.clone(),
+                                                (a.clone(), Box::new(env.clone())),
+                                            );
+                                        }
+                                        out.extend(self.read_requirements(body, &scope, depth + 1));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            ExprX::If(c, t, Some(f)) => {
+                out.extend(self.read_requirements(c, env, depth + 1));
+                let yes = self.read_requirements(t, env, depth + 1);
+                let no = self.read_requirements(f, env, depth + 1);
+                if !yes.is_empty() || !no.is_empty() {
+                    let c = self.safety_value(c, env);
+                    out.push((
+                        format!(
+                            "(IF {c} THEN {} ELSE {})",
+                            requirements_and(&yes),
+                            requirements_and(&no)
+                        ),
+                        e.clone(),
+                    ));
+                }
+            }
+            ExprX::Block(stmts, Some(tail)) => {
+                let saved_bound = self.bound.clone();
+                let mut scope = env.clone();
+                let mut lets = Vec::new();
+                for s in stmts.iter() {
+                    if let StmtX::Decl { pattern, init: Some(init), .. } = &s.x {
+                        let value = self.safety_place(init, &scope);
+                        if let PatternX::Var(PatternBinding { name, .. }) = &pattern.x {
+                            let before = scope.clone();
+                            let n = self.bind_var(&mut scope, name);
+                            if before.place_reads_post(init) {
+                                scope.primed.insert(name.clone());
+                            } else {
+                                scope.primed.remove(name);
+                            }
+                            scope
+                                .partial_values
+                                .insert(name.clone(), (init.clone(), Arc::new(before)));
+                            lets.push(format!("{n} == {value}"));
+                        } else {
+                            out.extend(self.place_requirements(init, &scope, depth + 1));
+                            let primed = scope.place_reads_post(init);
+                            let (_, bindings) =
+                                self.pattern(&value, pattern, &mut scope, None, None);
+                            for v in unique_pattern_names(pattern) {
+                                if primed {
+                                    scope.primed.insert(v);
+                                } else {
+                                    scope.primed.remove(&v);
+                                }
+                            }
+                            lets.extend(bindings.into_iter().map(|(n, v)| format!("{n} == {v}")));
+                        }
+                    }
+                }
+                out.extend(self.read_requirements(tail, &scope, depth + 1));
+                if !lets.is_empty() {
+                    for (guard, _) in &mut out {
+                        let mut needed = guard.clone();
+                        let mut used = Vec::new();
+                        for binding in lets.iter().rev() {
+                            let (name, value) = binding.split_once(" == ").expect("LET binding");
+                            if needed
+                                .split(|c: char| !c.is_alphanumeric() && c != '_')
+                                .any(|word| word == name)
+                            {
+                                used.push(binding.clone());
+                                needed.push(' ');
+                                needed.push_str(value);
+                            }
+                        }
+                        if !used.is_empty() {
+                            used.reverse();
+                            *guard = format!("(LET {} IN {guard})", used.join(" "));
+                        }
+                    }
+                }
+                self.bound = saved_bound;
+            }
+            _ => {}
+        }
+        let mut seen = HashSet::new();
+        out.retain(|(g, _)| seen.insert(g.clone()));
+        out
+    }
+
+    /// Definedness of a recursive value helper is recursive too, rather
+    /// than a bounded unrolling that would silently miss deeper reads.
+    fn ensure_defined(&mut self, fun: &Fun) -> String {
+        if let Some(name) = self.defined_functions.get(fun) {
+            return name.clone();
+        }
+        let f = self.functions[fun].clone();
+        let name = self.bind(&format!("Defined_{}", last_segment(&fun.path)));
+        self.used_names.insert(name.clone());
+        self.defined_functions.insert(fun.clone(), name.clone());
+        let previous_bound = std::mem::take(&mut self.bound);
+        let previous_facts = std::mem::take(&mut self.safety_facts);
+        let mut scope = Env::new();
+        let params: Vec<_> =
+            f.x.params
+                .iter()
+                .map(|p| {
+                    scope.primed.insert(p.x.name.clone());
+                    self.bind_var(&mut scope, &p.x.name)
+                })
+                .collect();
+        let rs =
+            f.x.body
+                .as_ref()
+                .map(|body| self.read_requirements(body, &scope, 0))
+                .unwrap_or_default();
+        self.bound = previous_bound;
+        self.safety_facts = previous_facts;
+        for (g, site) in &rs {
+            self.restriction(format!("partial read in value helper {}: enclosing predicate is FALSE outside {g}; this restricts unspecified source values", fun_as_friendly_rust_name(fun)), site);
+        }
+        self.defs.push(format!(
+            "RECURSIVE {name}({})\n{name}({}) ==\n    {}\n",
+            vec!["_"; params.len()].join(", "),
+            params.join(", "),
+            requirements_and(&rs)
+        ));
+        self.def_owners.push(self.current_key.clone());
+        name
+    }
+
+    fn place_requirements(&mut self, p: &Place, env: &Env, depth: usize) -> Vec<(String, Expr)> {
+        match &p.x {
+            PlaceX::Local(v) => {
+                if let Some((value, scope)) = env.partial_values.get(v) {
+                    self.place_requirements(value, scope, depth + 1)
+                } else {
+                    env.values
+                        .get(v)
+                        .map(|(v, s)| self.read_requirements(v, s, depth + 1))
+                        .unwrap_or_default()
+                }
+            }
+            PlaceX::Temporary(e) | PlaceX::WithExpr(e, _) => {
+                self.read_requirements(e, env, depth + 1)
+            }
+            PlaceX::Field(f, inner) => {
+                let mut out = self.place_requirements(inner, env, depth + 1);
+                if !self.single_variant(&f.datatype) {
+                    let b = self.safety_place(inner, env);
+                    let e = Arc::new(SpannedTyped {
+                        span: p.span.clone(),
+                        typ: p.typ.clone(),
+                        x: ExprX::ReadPlace(
+                            p.clone(),
+                            UnfinalizedReadKind { preliminary_kind: ReadKind::Spec, id: 0 },
+                        ),
+                    });
+                    out.push((format!("({b}.tag = \"{}\")", f.variant), e));
+                }
+                out
+            }
+            PlaceX::DerefMut(p)
+            | PlaceX::ModeUnwrap(p, _)
+            | PlaceX::UserDefinedTypInvariantObligation(p, _) => {
+                self.place_requirements(p, env, depth + 1)
+            }
+            _ => vec![],
+        }
+    }
+
+    fn safety_value(&mut self, e: &Expr, env: &Env) -> String {
+        let mut probe = self.clone();
+        probe.in_safety = true;
+        probe.quiet(|x| x.expr(e, env))
+    }
+    fn safety_place(&mut self, p: &Place, env: &Env) -> String {
+        let mut probe = self.clone();
+        probe.in_safety = true;
+        let value = probe.quiet(|x| x.place(p, env));
+        // A returned LET/match expression binds names inside its value.
+        // Reserve those before naming an enclosing destructuring binding.
+        self.bound.extend(probe.bound);
+        self.locals_ever.extend(probe.locals_ever);
+        value
+    }
+
+    fn guard_fact(&mut self, e: &Expr, env: &Env) -> Option<String> {
+        let e = peel(e);
+        // A zero-based sequence bound is the same domain check as the
+        // shifted TLA+ index. Keep the original source guard when ordering.
+        let upper = match &e.x {
+            ExprX::Multi(MultiOp::Chained(ops), args)
+                if args.len() == 3
+                    && ops.len() == 2
+                    && matches!(ops[0], ChainedOp::Inequality(InequalityOp::Le))
+                    && matches!(ops[1], ChainedOp::Inequality(InequalityOp::Lt))
+                    && self.safety_value(&args[0], env) == "0" =>
+            {
+                Some((&args[1], &args[2]))
+            }
+            ExprX::Binary(BinaryOp::Inequality(InequalityOp::Lt), a, b)
+                if int_typ_within(&a.typ, &IntRange::Nat) =>
+            {
+                Some((a, b))
+            }
+            _ => None,
+        };
+        if let Some((index, len)) = upper {
+            if let Some((_, f, args)) = called(&peel(len)) {
+                if vstd_op(&fun_as_friendly_rust_name(&f)) == Some("seq_len") {
+                    let i = self.safety_value(index, env);
+                    let seq = self.safety_value(&args[0], env);
+                    return Some(format!("(({i}) + 1 \\in DOMAIN {seq})"));
+                }
+            }
+        }
+        let simple = match &e.x {
+            ExprX::UnaryOpr(UnaryOpr::IsVariant { .. }, _) => true,
+            ExprX::Call { target: CallTarget::Fun(_, f, ..), args, .. } => {
+                matches!(
+                    vstd_op(&fun_as_friendly_rust_name(f)),
+                    Some("map_contains_key" | "set_contains")
+                ) || option_method(f, args)
+                    .is_some_and(|m| matches!(m.as_str(), "is_some" | "is_Some"))
+            }
+            _ => false,
+        };
+        simple.then(|| self.safety_value(&e, env))
+    }
+
+    /// A stable ordering: move a later source guard only when it protects
+    /// an earlier projection, never ahead of a state assignment it reads.
+    fn ordered_conjunction(&mut self, e: &Expr, env: &Env) -> Option<String> {
+        let mut cs = conjuncts(e);
+        let mut changed = false;
+        if self.in_init {
+            return None;
+        }
+        for i in 0..cs.len() {
+            if !(i + 1..cs.len())
+                .any(|j| !env.reads_post(&cs[j]) && self.guard_fact(&cs[j], env).is_some())
+            {
+                continue;
+            }
+            let requirements = self.clone().read_requirements(&cs[i], env, 0);
+            if let Some(j) = (i + 1..cs.len()).find(|&j| {
+                !env.reads_post(&cs[j])
+                    && !self.in_init
+                    && self
+                        .guard_fact(&cs[j], env)
+                        .is_some_and(|f| requirements.iter().any(|(g, _)| *g == f))
+            }) {
+                let guard = cs.remove(j);
+                cs.insert(i, guard);
+                changed = true;
+            }
+        }
+        if !changed {
+            return None;
+        }
+        let old = self.safety_facts.len();
+        let mut printed = Vec::new();
+        for c in cs {
+            printed.push(self.expr(&c, env));
+            if let Some(fact) = self.guard_fact(&c, env) {
+                self.safety_facts.push(fact);
+            }
+        }
+        self.safety_facts.truncate(old);
+        Some(format!("({})", printed.join(" /\\ ")))
     }
 
     /// A conjunct-level bool field of the state, read bare or negated
@@ -1977,7 +2458,25 @@ impl Exporter {
             }
             ExprX::Logical(op, a, b) => {
                 let (sa, sb) = match op {
-                    LogicalOp::And => (self.expr(a, env), self.expr(b, env)),
+                    LogicalOp::And => {
+                        if !self.in_safety {
+                            if let Some(s) = self.ordered_conjunction(e, env) {
+                                return s;
+                            }
+                        }
+                        let sa = self.expr(a, env);
+                        let n = self.safety_facts.len();
+                        if !self.in_safety {
+                            for c in conjuncts(a) {
+                                if let Some(fact) = self.guard_fact(&c, env) {
+                                    self.safety_facts.push(fact);
+                                }
+                            }
+                        }
+                        let sb = self.expr(b, env);
+                        self.safety_facts.truncate(n);
+                        (sa, sb)
+                    }
                     LogicalOp::Or => {
                         let (sa, aa) = self.branch_expr(a, env);
                         let (sb, ab) = self.branch_expr(b, env);
@@ -1992,7 +2491,14 @@ impl Exporter {
                     // is assigned on every path.
                     LogicalOp::Implies => {
                         let sa = self.quiet(|x| x.expr(a, env));
+                        let n = self.safety_facts.len();
+                        for c in conjuncts(a) {
+                            if let Some(fact) = self.guard_fact(&c, env) {
+                                self.safety_facts.push(fact);
+                            }
+                        }
                         let (sb, assigned) = self.branch_expr(b, env);
+                        self.safety_facts.truncate(n);
                         if self.conj_level {
                             self.note_implication(a, assigned);
                         }
@@ -2465,6 +2971,10 @@ impl Exporter {
                         let value = self.quiet(|x| x.place(init, &env2));
                         let before = env2.clone();
                         let n = self.bind_var(&mut env2, name);
+                        if symbolic.is_none() {
+                            env2.partial_values
+                                .insert(name.clone(), (init.clone(), Arc::new(before.clone())));
+                        }
                         if before.place_reads_post(init) {
                             env2.primed.insert(name.clone());
                         } else {
@@ -3764,7 +4274,23 @@ impl Exporter {
                 let what = "set comprehension over a type parameter (no hole can stand for every instantiation)";
                 return self.refuse(what, &e.span);
             }
-            None => self.type_domain(&name, &p.a, &e.span),
+            None => {
+                let infinite = typ_datatype(&e.typ).is_some_and(|p| {
+                    matches!(
+                        path_as_friendly_rust_name(&p).as_str(),
+                        "vstd::iset::ISet" | "vstd::imap::IMap"
+                    )
+                });
+                let mut probe = self.clone();
+                let finite_without_holes =
+                    probe.bound_from_type(&p.a, &e.span, &mut Vec::new()).is_some()
+                        && probe.holes.len() == self.holes.len();
+                if infinite && !finite_without_holes {
+                    self.finite_carrier(&p.a, e, "infinite collection comprehension")
+                } else {
+                    self.type_domain(&name, &p.a, &e.span)
+                }
+            }
         };
         let b = self.expr(&body, &env2);
         let set = format!("{{{name} \\in {domain} : {b}}}");
@@ -4013,7 +4539,35 @@ impl Exporter {
             }
             "set_choose" => self.refuse("choose (TLC cannot evaluate it)", &e.span),
             "iset_finite" => {
-                self.refuse("ISet::finite (the export builds only finite sets)", &e.span)
+                let Some(t) = args.first().and_then(|a| collection_element(&a.typ)) else {
+                    return self.refuse("ISet::finite without an element type", &e.span);
+                };
+                let carrier = self.finite_carrier(&t, e, "ISet::finite");
+                let set = g!(0);
+                format!("(({set}) \\subseteq {carrier} /\\ IsFiniteSet({set}))")
+            }
+            "iset_is_full" => {
+                let Some(t) = args.first().and_then(|a| collection_element(&a.typ)) else {
+                    return self.refuse("ISet::is_full without an element type", &e.span);
+                };
+                let carrier = self.finite_carrier(&t, e, "ISet::is_full");
+                format!("({} = {carrier})", g!(0))
+            }
+            "iset_full" => {
+                let Some(t) = collection_element(&e.typ) else {
+                    return self.refuse("ISet::full without an element type", &e.span);
+                };
+                self.finite_carrier(&t, e, "ISet::full")
+            }
+            "set_flatten" => format!("UNION ({})", g!(0)),
+            "imap_total" => {
+                let Some(t) = collection_element(&e.typ) else {
+                    return self.refuse("IMap::total without a key type", &e.span);
+                };
+                let d = self.finite_carrier(&t, e, "IMap::total");
+                let x = self.bind("k__");
+                let b = self.apply_arg(e, args, 0, &[(x.clone(), false)], env);
+                format!("[{x} \\in {d} |-> {b}]")
             }
             // ── maps ──
             "map_new" => {
@@ -5430,6 +5984,9 @@ impl Exporter {
         self.emitting.insert(key.clone());
         let previous = std::mem::replace(&mut self.current, fun_as_friendly_rust_name(fun));
         let previous_key = std::mem::replace(&mut self.current_key, Some(key.clone()));
+        let previous_predicate_depth = std::mem::replace(&mut self.predicate_depth, 0);
+        let previous_safety = std::mem::replace(&mut self.in_safety, false);
+        let previous_facts = std::mem::take(&mut self.safety_facts);
         let previous_bound = std::mem::take(&mut self.bound);
         let previous_tainted = std::mem::replace(&mut self.current_tainted, false);
         let previous_depth = std::mem::replace(&mut self.branch_depth, 0);
@@ -5524,6 +6081,9 @@ impl Exporter {
         self.current = previous;
         self.current_key = previous_key;
         self.bound = previous_bound;
+        self.in_safety = previous_safety;
+        self.predicate_depth = previous_predicate_depth;
+        self.safety_facts = previous_facts;
         self.current_tainted = previous_tainted || self.tainted.contains(key);
         self.emitting.remove(key);
         self.emitted.insert(key.clone());
@@ -7091,6 +7651,127 @@ fn temporal_sources(
 }
 
 impl Exporter {
+    fn restriction(&mut self, what: String, e: &Expr) {
+        let location = span_string(&e.span);
+        if !self
+            .restrictions
+            .iter()
+            .any(|r| r.what == what && r.location == location && r.in_function == self.current)
+        {
+            self.restrictions.push(Refusal { what, location, in_function: self.current.clone() });
+        }
+    }
+
+    /// A carrier assumption checks the whole encoding, not just integer
+    /// bounds: a label-like constant has no state TypeOK to constrain it.
+    fn carrier_pred(&mut self, v: &str, typ: &Typ, seen: &mut Vec<Path>) -> Option<String> {
+        match &**typ {
+            TypX::Decorate(_, _, t) | TypX::Boxed(t) => self.carrier_pred(v, t, seen),
+            TypX::Bool => Some(format!("{v} \\in BOOLEAN")),
+            TypX::Int(range) => {
+                let member = format!("{v} \\in Int");
+                Some(match int_range_pred(v, range) {
+                    Some(p) => format!("({member} /\\ {p})"),
+                    None => member,
+                })
+            }
+            TypX::Datatype(Dt::Tuple(_), args, _) => {
+                let mut parts = vec![format!("DOMAIN {v} = 1..{}", args.len())];
+                for (i, t) in args.iter().enumerate() {
+                    parts.push(self.carrier_pred(&format!("{v}[{}]", i + 1), t, seen)?);
+                }
+                Some(format!("({})", parts.join(" /\\ ")))
+            }
+            TypX::Datatype(Dt::Path(p), args, _) => {
+                match collection_name(p).as_str() {
+                    "vstd::seq::Seq" => {
+                        let i = self.bind("i__");
+                        let pred = self.carrier_pred(&format!("{v}[{i}]"), args.first()?, seen)?;
+                        return Some(format!(
+                            "(DOMAIN {v} = 1..Len({v}) /\\ (\\A {i} \\in DOMAIN {v} : {pred}))"
+                        ));
+                    }
+                    "vstd::set::Set" => {
+                        let x = self.bind("e__");
+                        let pred = self.carrier_pred(&x, args.first()?, seen)?;
+                        return Some(format!("(IsFiniteSet({v}) /\\ (\\A {x} \\in {v} : {pred}))"));
+                    }
+                    "vstd::map::Map" => {
+                        let k = self.bind("k__");
+                        let key = self.carrier_pred(&k, args.first()?, seen)?;
+                        let value = self.carrier_pred(&format!("{v}[{k}]"), args.get(1)?, seen)?;
+                        return Some(format!("(\\A {k} \\in DOMAIN {v} : ({key} /\\ {value}))"));
+                    }
+                    _ => {}
+                }
+                if seen.contains(p) {
+                    return None;
+                }
+                let dt = self.datatypes.get(p)?.clone();
+                if dt.x.typ_params.len() != args.len() {
+                    return None;
+                }
+                seen.push(p.clone());
+                let tagged = dt.x.variants.len() > 1;
+                let mut variants = Vec::new();
+                for variant in dt.x.variants.iter() {
+                    let mut labels: Vec<_> =
+                        variant.fields.iter().map(|f| tla_string(&field_name(&f.name))).collect();
+                    if tagged {
+                        labels.push("\"tag\"".into());
+                    }
+                    let mut parts = vec![format!("DOMAIN {v} = {{{}}}", labels.join(", "))];
+                    if tagged {
+                        parts.push(format!("{v}.tag = \"{}\"", variant.name));
+                    }
+                    for f in variant.fields.iter() {
+                        let t =
+                            crate::sst_util::subst_typ_for_datatype(&dt.x.typ_params, args, &f.a.0);
+                        parts.push(self.carrier_pred(
+                            &format!("{v}.{}", field_name(&f.name)),
+                            &t,
+                            seen,
+                        )?);
+                    }
+                    variants.push(format!("({})", parts.join(" /\\ ")));
+                }
+                seen.pop();
+                Some(format!("({})", variants.join(" \\/ ")))
+            }
+            _ => None,
+        }
+    }
+
+    /// Explicit finite-model approximation, including a type assumption.
+    /// Unlike a quantifier bound, this is a carrier even for small types.
+    fn finite_carrier(&mut self, typ: &Typ, e: &Expr, construct: &str) -> String {
+        if typ_mentions_param(typ) {
+            return self.refuse("finite carrier over an unresolved type parameter", &e.span);
+        }
+        let constant = format!("Dom_{}", self.constant_typ_name(typ));
+        let v = self.bind("carrier__");
+        let predicate = self.carrier_pred(&v, typ, &mut Vec::new());
+        let Some(pred) = predicate else {
+            return self.refuse("finite carrier whose element type cannot be constrained", &e.span);
+        };
+        self.carrier_assumes.insert(
+            constant.clone(),
+            format!("IsFiniteSet({constant}) /\\ (\\A {v} \\in {constant} : {pred})"),
+        );
+        self.constants.insert(constant.clone());
+        self.hole_typs.insert(constant.clone(), typ.clone());
+        self.hole_owners.push(self.current_key.clone());
+        self.holes.push(Hole {
+            variable: "finite carrier".into(),
+            typ: typ_name(typ),
+            constant: constant.clone(),
+            location: span_string(&e.span),
+            in_function: self.current.clone(),
+        });
+        self.restriction(format!("{construct}: model restricted to finite carrier {constant}; finiteness and totality are relative to this carrier"), e);
+        constant
+    }
+
     /// The domain of a binder of type `typ` named `name` (for the report):
     /// the type's own when it is small (see [`Exporter::bound_from_type`]),
     /// else a hole constant.
@@ -7149,6 +7830,9 @@ impl Exporter {
         self.emitting.insert(key.clone());
         let previous = std::mem::replace(&mut self.current, fun_as_friendly_rust_name(&key.0));
         let previous_key = std::mem::replace(&mut self.current_key, Some(key.clone()));
+        let previous_predicate_depth = std::mem::replace(&mut self.predicate_depth, 0);
+        let previous_safety = std::mem::replace(&mut self.in_safety, false);
+        let previous_facts = std::mem::take(&mut self.safety_facts);
         let previous_bound = std::mem::take(&mut self.bound);
         let previous_tainted = std::mem::replace(&mut self.current_tainted, false);
         let previous_depth = std::mem::replace(&mut self.branch_depth, 0);
@@ -7178,6 +7862,9 @@ impl Exporter {
         self.current = previous;
         self.current_key = previous_key;
         self.bound = previous_bound;
+        self.in_safety = previous_safety;
+        self.predicate_depth = previous_predicate_depth;
+        self.safety_facts = previous_facts;
         self.current_tainted = previous_tainted || self.tainted.contains(key);
         self.emitting.remove(key);
         self.emitted.insert(key.clone());
@@ -9006,6 +9693,12 @@ pub fn export_module(
         euclid_users: HashSet::new(),
         values: BTreeMap::new(),
         hole_typs: HashMap::new(),
+        restrictions: Vec::new(),
+        carrier_assumes: BTreeMap::new(),
+        in_safety: false,
+        predicate_depth: 0,
+        safety_facts: Vec::new(),
+        defined_functions: HashMap::new(),
         constant_ops: HashMap::new(),
         instances: Vec::new(),
         assoc_types: krate.assoc_type_impls.clone(),
@@ -9548,6 +10241,8 @@ pub fn export_module(
     // Everything above is the model; what the named expressions add after
     // it is reported with them and kept out of the module.
     let model_tables = ex.tables.clone();
+    let model_restrictions = ex.restrictions.clone();
+    let model_carrier_assumes = ex.carrier_assumes.clone();
     let model_defs = ex.defs.len();
     let model_constants = ex.constants.clone();
     let model_holes = ex.holes.len();
@@ -9706,6 +10401,17 @@ pub fn export_module(
     tla.push_str(
         "\\* What the export could not express is an Assert(FALSE, ...) that stops TLC\n\\* wherever it is evaluated.\n",
     );
+    for r in &model_restrictions {
+        let what = if r.what.starts_with("partial read") {
+            "partial read: an off-domain value makes its enclosing predicate FALSE; this restricts unspecified source values (see report restrictions)"
+        } else {
+            &r.what
+        };
+        let warning = format!("WARNING: {what} at {} in {}.", r.location, r.in_function);
+        for line in warning.lines() {
+            tla.push_str(&format!("\\* {line}\n"));
+        }
+    }
     if !properties.is_empty() {
         tla.push_str(
             "\\* Temporal (verus-tla): always is [], eventually <>, leads_to ~>, lift_state(p)\n\\* the state formula p, always(lift_action(a)) [][A]_vars, weak_fairness WF_vars(A)\n\\* of the action's forward step, tla_forall/tla_exists bounded quantifiers. Shared\n\\* WF_vars fairness is in Spec; other spec assumptions are a property's premises.\n",
@@ -9791,6 +10497,9 @@ pub fn export_module(
             tla.push_str(&format!("ASSUME {a}\n"));
         }
         tla.push('\n');
+    }
+    for assume in model_carrier_assumes.values() {
+        tla.push_str(&format!("ASSUME {assume}\n"));
     }
     if !label_assumes.is_empty() {
         tla.push_str("\\* The labels' holes hold only values of their Rust types.\n");
@@ -10018,6 +10727,7 @@ pub fn export_module(
         operators: model_defs,
         holes: ex.holes[..model_holes].to_vec(),
         refusals: ex.refusals[..model_refusals].to_vec(),
+        restrictions: model_restrictions,
         properties,
         fairness_in_spec,
         temporal_notes,
