@@ -1,0 +1,450 @@
+{
+  "base_branch": "kg/export-traits",
+  "base_commit": "9abf2c0ea2f2035bfad0509b5b1d637aea8c3662",
+  "tla2tools": "basis-11305b4a05",
+  "before_refusal_free": 0,
+  "after_refusal_free": 0,
+  "before_completed_tlc": 0,
+  "after_completed_tlc": 0,
+  "campaign_bounds": "No nrkernel MC configuration was saved: these machines were blocked at export/SANY. The OS-external TLC probe is supplementary, not an original campaign bound.",
+  "before_checks": [
+    {
+      "machine": "hlspec",
+      "sany_ok": true
+    },
+    {
+      "machine": "mmu_rl1",
+      "sany_ok": true
+    },
+    {
+      "machine": "mmu_rl2",
+      "sany_ok": true
+    },
+    {
+      "machine": "mmu_rl3",
+      "sany_ok": true
+    },
+    {
+      "machine": "os",
+      "sany_ok": true
+    },
+    {
+      "machine": "os_ext",
+      "sany_ok": true,
+      "tlc_exit": 75,
+      "tlc_finished": false,
+      "tlc_distinct": [
+        "0"
+      ],
+      "tlc_error": [
+        "Error: In evaluation, the identifier shootdown_vec is either undefined or not an operator.",
+        "Error: The error occurred when TLC was evaluating the nested"
+      ]
+    }
+  ],
+  "after_checks": [
+    {
+      "machine": "hlspec",
+      "sany_ok": true
+    },
+    {
+      "machine": "mmu_rl1",
+      "sany_ok": true
+    },
+    {
+      "machine": "mmu_rl2",
+      "sany_ok": true
+    },
+    {
+      "machine": "mmu_rl3",
+      "sany_ok": true
+    },
+    {
+      "machine": "os",
+      "sany_ok": true
+    },
+    {
+      "machine": "os_ext",
+      "sany_ok": true,
+      "tlc_exit": 75,
+      "tlc_finished": false,
+      "tlc_distinct": [
+        "0"
+      ],
+      "tlc_error": [
+        "Error: The first argument of Assert evaluated to FALSE; the second argument was:",
+        "Error: The error occurred when TLC was evaluating the nested"
+      ]
+    }
+  ],
+  "machines": [
+    {
+      "machine": "hlspec",
+      "before_refusals": 4,
+      "after_refusals": 4,
+      "before_bit_refusals": 1,
+      "after_bit_refusals": 0,
+      "before_init_unassigned": [
+        "mem",
+        "thread_state"
+      ],
+      "after_init_unassigned": [],
+      "init_fields_unassigned": [
+        "mem",
+        "thread_state"
+      ],
+      "init_enumerated": [
+        {
+          "variable": "mem",
+          "domain": "Dom_Seq_u8"
+        },
+        {
+          "variable": "thread_state",
+          "domain": "Dom_IMap_nat_ThreadState"
+        }
+      ],
+      "remaining_refusals": [
+        {
+          "what": "ISet::finite (the export builds only finite sets)",
+          "location": "/data/home/kirancodes/Documents/code/verus-research/survey/repos/matthias-brun_verified-nrkernel/page-table/src/spec_t/hlspec.rs:107:9: 107:34 (#0)",
+          "in_function": "lib::spec_t::hlspec::wf"
+        },
+        {
+          "what": "choose (TLC cannot evaluate it)",
+          "location": "/data/home/kirancodes/Documents/code/verus-research/survey/repos/matthias-brun_verified-nrkernel/page-table/src/spec_t/hlspec.rs:80:9: 88:10 (#0)",
+          "in_function": "lib::spec_t::hlspec::State::vaddr_mapping_is_being_modified_choose_thread"
+        },
+        {
+          "what": "uninterpreted function",
+          "location": "vstd/pervasive.rs:181:1: 181:41 (#0)",
+          "in_function": "vstd::pervasive::arbitrary"
+        },
+        {
+          "what": "uninterpreted function",
+          "location": "/data/home/kirancodes/Documents/code/verus-research/survey/repos/matthias-brun_verified-nrkernel/page-table/src/spec_t/mmu/defs.rs:35:1: 35:35 (#0)",
+          "in_function": "lib::spec_t::mmu::defs::MAX_PHYADDR_WIDTH"
+        }
+      ]
+    },
+    {
+      "machine": "mmu_rl1",
+      "before_refusals": 95,
+      "after_refusals": 2,
+      "before_bit_refusals": 94,
+      "after_bit_refusals": 0,
+      "before_init_unassigned": [
+        "phys_mem",
+        "pt_mem",
+        "writes"
+      ],
+      "after_init_unassigned": [],
+      "init_fields_unassigned": [
+        "phys_mem",
+        "pt_mem.pml4",
+        "writes.core.node_id",
+        "writes.core.core_id"
+      ],
+      "init_enumerated": [
+        {
+          "variable": "phys_mem",
+          "domain": "Dom_Seq_u8"
+        },
+        {
+          "variable": "pt_mem",
+          "domain": "({[mem |-> mem__, pml4 |-> pml4__] : mem__ \\in Dom_PTMem_PTMem_mem, pml4__ \\in Dom_PTMem_PTMem_pml4})"
+        },
+        {
+          "variable": "writes",
+          "domain": "({[core |-> core__, tso |-> tso__, nonpos |-> nonpos__] : core__ \\in ({[node_id |-> node_id__, core_id |-> core_id__] : node_id__ \\in Dom_Core_Core_node_id, core_id__ \\in Dom_Core_Core_core_id}), tso__ \\in Dom_Writes_Writes_tso, nonpos__ \\in Dom_Writes_Writes_nonpos})"
+        }
+      ],
+      "remaining_refusals": [
+        {
+          "what": "uninterpreted function",
+          "location": "/data/home/kirancodes/Documents/code/verus-research/survey/repos/matthias-brun_verified-nrkernel/page-table/src/spec_t/mmu/defs.rs:35:1: 35:35 (#0)",
+          "in_function": "lib::spec_t::mmu::defs::MAX_PHYADDR_WIDTH"
+        },
+        {
+          "what": "uninterpreted function",
+          "location": "vstd/pervasive.rs:181:1: 181:41 (#0)",
+          "in_function": "vstd::pervasive::arbitrary"
+        }
+      ]
+    },
+    {
+      "machine": "mmu_rl2",
+      "before_refusals": 108,
+      "after_refusals": 4,
+      "before_bit_refusals": 105,
+      "after_bit_refusals": 0,
+      "before_init_unassigned": [
+        "phys_mem",
+        "pt_mem",
+        "writes",
+        "hist"
+      ],
+      "after_init_unassigned": [],
+      "init_fields_unassigned": [
+        "phys_mem",
+        "pt_mem.pml4",
+        "writes.core.node_id",
+        "writes.core.core_id"
+      ],
+      "init_enumerated": [
+        {
+          "variable": "phys_mem",
+          "domain": "Dom_Seq_u8"
+        },
+        {
+          "variable": "pt_mem",
+          "domain": "({[mem |-> mem__, pml4 |-> pml4__] : mem__ \\in Dom_PTMem_PTMem_mem, pml4__ \\in Dom_PTMem_PTMem_pml4})"
+        },
+        {
+          "variable": "writes",
+          "domain": "({[core |-> core__, tso |-> tso__, nonpos |-> nonpos__] : core__ \\in ({[node_id |-> node_id__, core_id |-> core_id__] : node_id__ \\in Dom_Core_Core_node_id, core_id__ \\in Dom_Core_Core_core_id}), tso__ \\in Dom_Writes_Writes_tso, nonpos__ \\in Dom_Writes_Writes_nonpos})"
+        },
+        {
+          "variable": "hist",
+          "domain": "({[pending_maps |-> pending_maps__, pending_unmaps |-> pending_unmaps__, pending_protects |-> pending_protects__] : pending_maps__ \\in Dom_History_History_pending_maps, pending_unmaps__ \\in Dom_History_History_pending_unmaps, pending_protects__ \\in Dom_History_History_pending_protects})"
+        }
+      ],
+      "remaining_refusals": [
+        {
+          "what": "uninterpreted function",
+          "location": "/data/home/kirancodes/Documents/code/verus-research/survey/repos/matthias-brun_verified-nrkernel/page-table/src/spec_t/mmu/defs.rs:35:1: 35:35 (#0)",
+          "in_function": "lib::spec_t::mmu::defs::MAX_PHYADDR_WIDTH"
+        },
+        {
+          "what": "uninterpreted function",
+          "location": "vstd/pervasive.rs:181:1: 181:41 (#0)",
+          "in_function": "vstd::pervasive::arbitrary"
+        },
+        {
+          "what": "ISet::finite (the export builds only finite sets)",
+          "location": "/data/home/kirancodes/Documents/code/verus-research/survey/repos/matthias-brun_verified-nrkernel/page-table/src/spec_t/mmu/rl2.rs:554:13: 554:37 (#0)",
+          "in_function": "lib::spec_t::mmu::rl2::State::wf"
+        },
+        {
+          "what": "ISet::finite (the export builds only finite sets)",
+          "location": "/data/home/kirancodes/Documents/code/verus-research/survey/repos/matthias-brun_verified-nrkernel/page-table/src/spec_t/mmu/rl2.rs:557:71: 557:96 (#0)",
+          "in_function": "lib::spec_t::mmu::rl2::State::wf"
+        }
+      ]
+    },
+    {
+      "machine": "mmu_rl3",
+      "before_refusals": 101,
+      "after_refusals": 5,
+      "before_bit_refusals": 97,
+      "after_bit_refusals": 0,
+      "before_init_unassigned": [
+        "phys_mem",
+        "pt_mem",
+        "hist"
+      ],
+      "after_init_unassigned": [],
+      "init_fields_unassigned": [
+        "phys_mem",
+        "pt_mem.pml4",
+        "hist.writes.core.node_id",
+        "hist.writes.core.core_id"
+      ],
+      "init_enumerated": [
+        {
+          "variable": "phys_mem",
+          "domain": "Dom_Seq_u8"
+        },
+        {
+          "variable": "pt_mem",
+          "domain": "({[mem |-> mem__, pml4 |-> pml4__] : mem__ \\in Dom_PTMem_PTMem_mem, pml4__ \\in Dom_PTMem_PTMem_pml4})"
+        },
+        {
+          "variable": "hist",
+          "domain": "({[happy |-> happy__, walks |-> walks__, writes |-> writes__, pending_maps |-> pending_maps__, pending_unmaps |-> pending_unmaps__, pending_protects |-> pending_protects__, polarity |-> polarity__] : happy__ \\in BOOLEAN, walks__ \\in Dom_History_History_walks, writes__ \\in ({[core |-> core__, tso |-> tso__, nonpos |-> nonpos__] : core__ \\in ({[node_id |-> node_id__2, core_id |-> core_id__2] : node_id__2 \\in Dom_Core_Core_node_id, core_id__2 \\in Dom_Core_Core_core_id}), tso__ \\in Dom_Writes_Writes_tso, nonpos__ \\in Dom_Writes_Writes_nonpos}), pending_maps__ \\in Dom_History_History_pending_maps, pending_unmaps__ \\in Dom_History_History_pending_unmaps, pending_protects__ \\in Dom_History_History_pending_protects, polarity__ \\in ({[tag |-> \"Mapping\"]} \\cup {[tag |-> \"Unmapping\"]} \\cup {[tag |-> \"Protect\"]})})"
+        }
+      ],
+      "remaining_refusals": [
+        {
+          "what": "uninterpreted function",
+          "location": "/data/home/kirancodes/Documents/code/verus-research/survey/repos/matthias-brun_verified-nrkernel/page-table/src/spec_t/mmu/defs.rs:35:1: 35:35 (#0)",
+          "in_function": "lib::spec_t::mmu::defs::MAX_PHYADDR_WIDTH"
+        },
+        {
+          "what": "uninterpreted function",
+          "location": "vstd/pervasive.rs:181:1: 181:41 (#0)",
+          "in_function": "vstd::pervasive::arbitrary"
+        },
+        {
+          "what": "ISet::finite (the export builds only finite sets)",
+          "location": "/data/home/kirancodes/Documents/code/verus-research/survey/repos/matthias-brun_verified-nrkernel/page-table/src/spec_t/mmu/rl3.rs:588:60: 588:85 (#0)",
+          "in_function": "lib::spec_t::mmu::rl3::State::wf"
+        },
+        {
+          "what": "ISet::finite (the export builds only finite sets)",
+          "location": "/data/home/kirancodes/Documents/code/verus-research/survey/repos/matthias-brun_verified-nrkernel/page-table/src/spec_t/mmu/rl3.rs:589:60: 589:85 (#0)",
+          "in_function": "lib::spec_t::mmu::rl3::State::wf"
+        },
+        {
+          "what": "ISet::finite (the export builds only finite sets)",
+          "location": "/data/home/kirancodes/Documents/code/verus-research/survey/repos/matthias-brun_verified-nrkernel/page-table/src/spec_t/mmu/rl3.rs:590:60: 590:90 (#0)",
+          "in_function": "lib::spec_t::mmu::rl3::State::wf"
+        }
+      ]
+    },
+    {
+      "machine": "os",
+      "before_refusals": 135,
+      "after_refusals": 14,
+      "before_bit_refusals": 122,
+      "after_bit_refusals": 0,
+      "before_init_unassigned": [
+        "mmu",
+        "os_ext",
+        "core_states"
+      ],
+      "after_init_unassigned": [],
+      "init_fields_unassigned": [
+        "mmu.phys_mem",
+        "mmu.pt_mem.mem",
+        "mmu.pt_mem.pml4",
+        "mmu.tlbs",
+        "mmu.walks",
+        "mmu.cache",
+        "mmu.sbuf",
+        "mmu.hist.happy",
+        "mmu.hist.walks",
+        "mmu.hist.writes.core.node_id",
+        "mmu.hist.writes.core.core_id",
+        "mmu.hist.writes.tso",
+        "mmu.hist.writes.nonpos",
+        "mmu.hist.pending_maps",
+        "mmu.hist.pending_unmaps",
+        "mmu.hist.pending_protects",
+        "mmu.hist.polarity",
+        "os_ext.lock",
+        "os_ext.shootdown_vec.vaddr",
+        "os_ext.shootdown_vec.open_requests",
+        "core_states"
+      ],
+      "init_enumerated": [
+        {
+          "variable": "mmu",
+          "domain": "({[phys_mem |-> phys_mem__, pt_mem |-> pt_mem__, tlbs |-> tlbs__, walks |-> walks__2, cache |-> cache__, sbuf |-> sbuf__, hist |-> hist__] : phys_mem__ \\in Dom_State_2_State_phys_mem, pt_mem__ \\in ({[mem |-> mem__, pml4 |-> pml4__] : mem__ \\in Dom_PTMem_PTMem_mem, pml4__ \\in Dom_PTMem_PTMem_pml4}), tlbs__ \\in Dom_State_2_State_tlbs, walks__2 \\in Dom_State_2_State_walks, cache__ \\in Dom_State_2_State_cache, sbuf__ \\in Dom_State_2_State_sbuf, hist__ \\in ({[happy |-> happy__, walks |-> walks__, writes |-> writes__, pending_maps |-> pending_maps__, pending_unmaps |-> pending_unmaps__, pending_protects |-> pending_protects__, polarity |-> polarity__] : happy__ \\in BOOLEAN, walks__ \\in Dom_History_History_walks, writes__ \\in ({[core |-> core__, tso |-> tso__, nonpos |-> nonpos__] : core__ \\in ({[node_id |-> node_id__6, core_id |-> core_id__6] : node_id__6 \\in Dom_Core_Core_node_id, core_id__6 \\in Dom_Core_Core_core_id}), tso__ \\in Dom_Writes_Writes_tso, nonpos__ \\in Dom_Writes_Writes_nonpos}), pending_maps__ \\in Dom_History_History_pending_maps, pending_unmaps__ \\in Dom_History_History_pending_unmaps, pending_protects__ \\in Dom_History_History_pending_protects, polarity__ \\in ({[tag |-> \"Mapping\"]} \\cup {[tag |-> \"Unmapping\"]} \\cup {[tag |-> \"Protect\"]})})})"
+        },
+        {
+          "variable": "os_ext",
+          "domain": "({[lock |-> lock__, shootdown_vec |-> shootdown_vec__, allocated |-> allocated__] : lock__ \\in ({[tag |-> \"None\"]} \\cup {[tag |-> \"Some\", v0 |-> v0__] : v0__ \\in ({[node_id |-> node_id__8, core_id |-> core_id__8] : node_id__8 \\in Dom_Core_Core_node_id, core_id__8 \\in Dom_Core_Core_core_id})}), shootdown_vec__ \\in ({[vaddr |-> vaddr__4, open_requests |-> open_requests__] : vaddr__4 \\in Dom_ShootdownVector_ShootdownVector_vaddr, open_requests__ \\in Dom_ShootdownVector_ShootdownVector_open_requests}), allocated__ \\in Dom_State_3_State_allocated})"
+        },
+        {
+          "variable": "core_states",
+          "domain": "Dom_IMap_Core_CoreState"
+        }
+      ],
+      "remaining_refusals": [
+        {
+          "what": "uninterpreted function",
+          "location": "/data/home/kirancodes/Documents/code/verus-research/survey/repos/matthias-brun_verified-nrkernel/page-table/src/spec_t/mmu/defs.rs:35:1: 35:35 (#0)",
+          "in_function": "lib::spec_t::mmu::defs::MAX_PHYADDR_WIDTH"
+        },
+        {
+          "what": "uninterpreted function",
+          "location": "vstd/pervasive.rs:181:1: 181:41 (#0)",
+          "in_function": "vstd::pervasive::arbitrary"
+        },
+        {
+          "what": "integer type bound",
+          "location": "/data/home/kirancodes/Documents/code/verus-research/survey/repos/matthias-brun_verified-nrkernel/page-table/src/spec_t/os.rs:242:18: 242:28 (#0)",
+          "in_function": "lib::spec_t::os::step_MemOp"
+        },
+        {
+          "what": "integer type bound",
+          "location": "/data/home/kirancodes/Documents/code/verus-research/survey/repos/matthias-brun_verified-nrkernel/page-table/src/spec_t/os.rs:249:18: 249:28 (#0)",
+          "in_function": "lib::spec_t::os::step_MemOp"
+        },
+        {
+          "what": "integer type bound",
+          "location": "/data/home/kirancodes/Documents/code/verus-research/survey/repos/matthias-brun_verified-nrkernel/page-table/src/spec_t/mmu/defs.rs:434:29: 434:39 (#0)",
+          "in_function": "lib::spec_t::mmu::defs::nat_keys"
+        },
+        {
+          "what": "integer type bound",
+          "location": "/data/home/kirancodes/Documents/code/verus-research/survey/repos/matthias-brun_verified-nrkernel/page-table/src/spec_t/mmu/defs.rs:434:29: 434:39 (#0)",
+          "in_function": "lib::spec_t::mmu::defs::nat_keys"
+        },
+        {
+          "what": "integer type bound",
+          "location": "/data/home/kirancodes/Documents/code/verus-research/survey/repos/matthias-brun_verified-nrkernel/page-table/src/spec_t/mmu/defs.rs:434:29: 434:39 (#0)",
+          "in_function": "lib::spec_t::mmu::defs::nat_keys"
+        },
+        {
+          "what": "integer type bound",
+          "location": "/data/home/kirancodes/Documents/code/verus-research/survey/repos/matthias-brun_verified-nrkernel/page-table/src/spec_t/mmu/defs.rs:434:29: 434:39 (#0)",
+          "in_function": "lib::spec_t::mmu::defs::nat_keys"
+        },
+        {
+          "what": "ISet::finite (the export builds only finite sets)",
+          "location": "/data/home/kirancodes/Documents/code/verus-research/survey/repos/matthias-brun_verified-nrkernel/page-table/src/spec_t/mmu/rl3.rs:588:60: 588:85 (#0)",
+          "in_function": "lib::spec_t::mmu::rl3::State::wf"
+        },
+        {
+          "what": "ISet::finite (the export builds only finite sets)",
+          "location": "/data/home/kirancodes/Documents/code/verus-research/survey/repos/matthias-brun_verified-nrkernel/page-table/src/spec_t/mmu/rl3.rs:589:60: 589:85 (#0)",
+          "in_function": "lib::spec_t::mmu::rl3::State::wf"
+        },
+        {
+          "what": "ISet::finite (the export builds only finite sets)",
+          "location": "/data/home/kirancodes/Documents/code/verus-research/survey/repos/matthias-brun_verified-nrkernel/page-table/src/spec_t/mmu/rl3.rs:590:60: 590:90 (#0)",
+          "in_function": "lib::spec_t::mmu::rl3::State::wf"
+        },
+        {
+          "what": "ISet::finite (the export builds only finite sets)",
+          "location": "/data/home/kirancodes/Documents/code/verus-research/survey/repos/matthias-brun_verified-nrkernel/page-table/src/spec_t/mmu/rl2.rs:554:13: 554:37 (#0)",
+          "in_function": "lib::spec_t::mmu::rl2::State::wf"
+        },
+        {
+          "what": "ISet::finite (the export builds only finite sets)",
+          "location": "/data/home/kirancodes/Documents/code/verus-research/survey/repos/matthias-brun_verified-nrkernel/page-table/src/spec_t/mmu/rl2.rs:557:71: 557:96 (#0)",
+          "in_function": "lib::spec_t::mmu::rl2::State::wf"
+        },
+        {
+          "what": "choose (TLC cannot evaluate it)",
+          "location": "/data/home/kirancodes/Documents/code/verus-research/survey/repos/matthias-brun_verified-nrkernel/page-table/src/spec_t/os.rs:1111:9: 1111:73 (#0)",
+          "in_function": "lib::spec_t::os::State::choose_inflight_protect_vaddr_core"
+        }
+      ]
+    },
+    {
+      "machine": "os_ext",
+      "before_refusals": 1,
+      "after_refusals": 1,
+      "before_bit_refusals": 1,
+      "after_bit_refusals": 0,
+      "before_init_unassigned": [
+        "shootdown_vec",
+        "allocated"
+      ],
+      "after_init_unassigned": [],
+      "init_fields_unassigned": [
+        "shootdown_vec.vaddr",
+        "allocated"
+      ],
+      "init_enumerated": [
+        {
+          "variable": "shootdown_vec",
+          "domain": "({[vaddr |-> vaddr__, open_requests |-> open_requests__] : vaddr__ \\in Dom_ShootdownVector_ShootdownVector_vaddr, open_requests__ \\in Dom_ShootdownVector_ShootdownVector_open_requests})"
+        },
+        {
+          "variable": "allocated",
+          "domain": "Dom_ISet_MemRegion"
+        }
+      ],
+      "remaining_refusals": [
+        {
+          "what": "uninterpreted function",
+          "location": "/data/home/kirancodes/Documents/code/verus-research/survey/repos/matthias-brun_verified-nrkernel/page-table/src/spec_t/mmu/defs.rs:35:1: 35:35 (#0)",
+          "in_function": "lib::spec_t::mmu::defs::MAX_PHYADDR_WIDTH"
+        }
+      ]
+    }
+  ]
+}

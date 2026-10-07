@@ -94,7 +94,8 @@ fn tla_tools() -> Option<String> {
 /// Run a class from the TLA+ tools: whether java exited successfully, and
 /// its stdout and stderr.
 fn java(jar: &str, dir: &Path, args: &[&str]) -> (bool, String) {
-    let out = std::process::Command::new("java")
+    let out = std::process::Command::new("timeout")
+        .args(["60", "java"])
         .arg(format!("-Djava.io.tmpdir={}", dir.display()))
         .args(["-cp", jar])
         .args(args)
@@ -1494,8 +1495,9 @@ pub open spec fn small(s: State) -> bool { s.x <= 2 }
 #[test]
 fn tla_export_reports_what_init_leaves_unassigned() {
     let ex = export_code(INIT_GAP, "test_crate");
-    assert_eq!(ex.report["init_unassigned"], serde_json::json!(["y"]));
-    assert!(ex.cfg.contains("\\* Init never assigns y: TLC cannot compute"), "{}", ex.cfg);
+    assert_eq!(ex.report["init_unassigned"], serde_json::json!([]));
+    assert_eq!(ex.report["init_enumerated"][0]["domain"], "Dom_int");
+    assert!(ex.tla.contains("WARNING: Init uses finite domain holes"), "{}", ex.tla);
     assert!(ex.tla.contains("(x = 0)"), "{}", ex.tla);
     // `is_zero(pre)` in next is a guard: Next assigns both variables.
     assert!(!ex.cfg.contains("Transition next never assigns"), "{}", ex.cfg);
@@ -2491,7 +2493,8 @@ fn tla_export_assigns_an_init_equality_of_two_fields() {
     assert!(ex.tla.contains("(z = y)"), "{}", ex.tla);
     // With nothing assigned before it, the equality assigns neither.
     let gap = export_code(&INIT_FIELD_EQUALITY.replace("s.x == 1", "true"), "test_crate");
-    assert_eq!(gap.report["init_unassigned"], serde_json::json!(["x", "y", "z"]), "{}", gap.tla);
+    assert_eq!(gap.report["init_unassigned"], serde_json::json!([]), "{}", gap.tla);
+    assert_eq!(gap.report["init_enumerated"].as_array().unwrap().len(), 3);
     let Some(jar) = tla_tools() else { return };
     sany(&jar, &ex.spec());
     let run = tlc(&jar, &ex.spec(), &ex.cfg);
@@ -3357,8 +3360,8 @@ fn tla_export_disables_a_require_let_that_does_not_match() {
 }
 
 /// An `_ => arbitrary()` arm outside VerusSync's `require let` may be
-/// reached, where Verus gives it some value: `arbitrary()` is a nullary
-/// table hole whose interpretation the model author must supply.
+/// reached, where Verus gives it some value: `arbitrary()` is refused
+/// there, as any function without a body is, so the report says so.
 const ARBITRARY_ARM: &str = r#"
 verus! {
 pub struct State { pub o: Option<int>, pub x: int }
@@ -3378,7 +3381,7 @@ pub open spec fn small(s: State) -> bool { s.x <= 2 }
 "#;
 
 #[test]
-fn tla_export_tables_an_arbitrary_arm_outside_verussync() {
+fn tla_export_refuses_an_arbitrary_arm_outside_verussync() {
     let ex = export_code(ARBITRARY_ARM, "test_crate");
     let refusals: Vec<&str> = ex.report["refusals"]
         .as_array()
@@ -3386,19 +3389,15 @@ fn tla_export_tables_an_arbitrary_arm_outside_verussync() {
         .iter()
         .map(|r| r["what"].as_str().unwrap())
         .collect();
-    assert!(refusals.is_empty(), "{}", ex.tla);
+    assert_eq!(refusals, ["uninterpreted function"], "{}", ex.tla);
     assert!(!ex.tla.contains("arbitrary() (an unspecified value)"), "{}", ex.tla);
     let Some(jar) = tla_tools() else { return };
     sany(&jar, &ex.spec());
-    let cfg = supply_arbitrary_int(&ex, &ex.cfg);
-    let run = tlc(&jar, &ex.spec(), &cfg);
-    assert!(run.violated.is_empty(), "{:?}", run);
-    assert_eq!(run.distinct, 3);
 }
 
 /// In a VerusSync model too, only the `_ => arbitrary()` arms of the
 /// macro's own matches are exempt: `user_arb`'s `match` on a field may
-/// reach its arm, so `arbitrary()` is a table hole there. `have m >= [k => let
+/// reach its arm, so `arbitrary()` is refused there. `have m >= [k => let
 /// Some(x)]` is guarded like `remove`: on key 2, which holds None, `peek`
 /// is disabled. An `assert let` that does not match (`check` after `kill`)
 /// stops TLC at the VerusSync assert, before the `let` reads the fields.
@@ -3459,7 +3458,7 @@ fn main() {}
 "#;
 
 #[test]
-fn tla_export_tables_a_user_arbitrary_arm_in_verussync() {
+fn tla_export_refuses_a_user_arbitrary_arm_in_verussync() {
     let src = TempDir::new().expect("temp dir");
     let entry = src.path().join("sync_arbitrary.rs");
     std::fs::write(&entry, SYNC_ARBITRARY).unwrap();
@@ -3471,13 +3470,12 @@ fn tla_export_tables_a_user_arbitrary_arm_in_verussync() {
         .iter()
         .map(|r| r["what"].as_str().unwrap())
         .collect();
-    assert!(refusals.is_empty(), "{}", ex.tla);
+    assert_eq!(refusals, ["uninterpreted function"], "{}", ex.tla);
     // `peek`'s and `check`'s arms are exempt; `user_arb`'s is not.
     assert_eq!(ex.tla.matches("arbitrary() (an unspecified value)").count(), 2, "{}", ex.tla);
     let Some(jar) = tla_tools() else { return };
     sany(&jar, &ex.spec());
     let cfg = format!("{}CONSTANTS\n  Dom_Step_peek_v0 = {{1, 2}}\n", ex.cfg);
-    let cfg = supply_arbitrary_int(&ex, &cfg);
     let out = tlc_output(&jar, &ex.spec(), &cfg);
     // TLC evaluates `peek(2)` and `user_arb` on the initial state, and
     // `check` after `kill` two steps on: only the assert stops it.
@@ -9006,6 +9004,207 @@ pub open spec fn some(s: State) -> bool { exists|c: Multiset<int>| c.len() == s.
     assert!(ex.tla.contains("\\E c \\in Dom_Multiset_int :"), "{}", ex.tla);
     let Some(jar) = tla_tools() else { return };
     sany(&jar, &ex.spec());
+}
+
+#[test]
+fn tla_export_unsigned_bits() {
+    let ex = export_code(
+        r#"
+verus! {
+pub struct State { pub x: u8 }
+pub open spec fn init(s: State) -> bool { s.x == 0 }
+pub open spec fn next(pre: State, post: State) -> bool {
+    pre.x < 255 && post.x == pre.x + 1
+}
+pub open spec fn bits(s: State) -> bool {
+    &&& (s.x & 15u8) == s.x % 16
+    &&& (s.x | 15u8) == (s.x / 16) * 16 + 15
+    &&& (s.x ^ 255u8) == 255 - s.x
+    &&& !s.x == 255 - s.x
+    &&& (s.x >> 2u8) == s.x / 4
+    &&& (s.x << 2u8) == (s.x % 64) * 4
+    &&& (s.x >> (s.x % 8)) <= s.x
+    &&& (s.x << 8u8) == 0
+    &&& (s.x >> 8u8) == 0
+}
+}
+"#,
+        "test_crate",
+    );
+    assert_eq!(ex.report["refusals"], serde_json::json!([]), "{}", ex.report);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let run = tlc(&jar, &ex.spec(), &ex.cfg);
+    assert_eq!(run.distinct, 256);
+    assert!(run.violated.is_empty(), "{:?}", run);
+}
+
+#[test]
+fn tla_export_partial_nested_init() {
+    let ex = export_code(
+        r#"
+verus! {
+pub struct Inner { pub fixed: bool, pub free: bool }
+pub struct State { pub nested: Inner, pub free: u8, pub n: nat }
+pub open spec fn init(s: State) -> bool { s.nested.fixed && s.free < 2 }
+pub open spec fn next(pre: State, post: State) -> bool { post == pre }
+pub open spec fn preserved(s: State) -> bool { s.nested.fixed && s.free < 2 }
+}
+"#,
+        "test_crate",
+    );
+    assert_eq!(ex.report["refusals"], serde_json::json!([]));
+    assert_eq!(ex.report["init_unassigned"], serde_json::json!([]));
+    assert_eq!(ex.report["init_enumerated"].as_array().unwrap().len(), 3);
+    assert_eq!(
+        ex.report["init_fields_unassigned"],
+        serde_json::json!(["nested.free", "free", "n"])
+    );
+    assert!(ex.tla.contains("IsFiniteSet(Dom_nat)"), "{}", ex.tla);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let cfg = format!("{}\nCONSTANT Dom_nat <- Nats\n", ex.cfg);
+    // Supply a finite carrier as an operator, as in campaign configurations.
+    let tla = ex.tla.replace("====", "Nats == 0..2\n====");
+    std::fs::write(ex.spec(), tla).unwrap();
+    let run = tlc(&jar, &ex.spec(), &cfg);
+    assert_eq!(run.distinct, 12);
+    assert!(run.violated.is_empty(), "{:?}", run);
+}
+
+#[test]
+fn tla_export_wide_unsigned_bits_and_pointer_width() {
+    let ex = export_code(
+        r#"
+verus! {
+global size_of usize == 8;
+pub struct State { pub x: u64 }
+pub open spec fn init(s: State) -> bool { s.x == 3 }
+pub open spec fn next(pre: State, post: State) -> bool { post == pre }
+pub open spec fn bits(s: State) -> bool {
+    &&& (s.x << 2u64) == 12
+    &&& (s.x >> 52u64) == 0
+    &&& (s.x & 1u64) == 1
+    &&& (s.x ^ 1u64) == 2
+    &&& ((s.x as usize) << 1usize) == 6
+    &&& (0u64 << 63u64) == 0
+    &&& (s.x << 64u64) == 0
+}
+}
+"#,
+        "test_crate",
+    );
+    assert_eq!(ex.report["refusals"], serde_json::json!([]));
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let run = tlc(&jar, &ex.spec(), &ex.cfg);
+    assert_eq!(run.distinct, 1);
+    assert!(run.violated.is_empty(), "{:?}", run);
+}
+
+#[test]
+fn tla_export_refuses_signed_and_unknown_width_bits() {
+    for typ in ["i8", "usize"] {
+        let code = format!(
+            r#"
+verus! {{
+pub struct State {{ pub x: {typ} }}
+pub open spec fn init(s: State) -> bool {{ s.x == 0 }}
+pub open spec fn next(pre: State, post: State) -> bool {{ post.x == (pre.x << 1) }}
+}}
+"#
+        );
+        let ex = export_code(&code, "test_crate");
+        assert!(!ex.report["refusals"].as_array().unwrap().is_empty());
+        assert!(ex.report["refusals"][0]["location"].as_str().unwrap().contains("test.rs"));
+        let Some(jar) = tla_tools() else { continue };
+        sany(&jar, &ex.spec());
+        assert!(tlc_output(&jar, &ex.spec(), &ex.cfg).contains("Assert"));
+    }
+}
+
+#[test]
+fn tla_export_partial_init_enum_and_large_finite_record() {
+    let ex = export_code(
+        r#"
+verus! {
+pub enum E { A, B }
+pub struct Pair { pub x: u8, pub y: u8 }
+pub struct State { pub e: E, pub pair: Pair }
+pub open spec fn init(s: State) -> bool { s.pair.x == 0 && s.pair.y < 2 }
+pub open spec fn next(pre: State, post: State) -> bool { post == pre }
+}
+"#,
+        "test_crate",
+    );
+    assert_eq!(ex.report["holes"], serde_json::json!([]));
+    assert_eq!(ex.report["init_fields_unassigned"], serde_json::json!(["e", "pair.y"]));
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let run = tlc(&jar, &ex.spec(), &ex.cfg);
+    assert_eq!(run.distinct, 4);
+}
+
+#[test]
+fn tla_export_partial_init_rejects_an_ill_typed_carrier() {
+    let ex = export_code(
+        r#"
+verus! {
+pub struct State { pub x: nat }
+pub open spec fn init(s: State) -> bool { true }
+pub open spec fn next(pre: State, post: State) -> bool { post == pre }
+}
+"#,
+        "test_crate",
+    );
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let cfg = format!("{}\nCONSTANT Dom_nat <- Values\n", ex.cfg);
+    std::fs::write(ex.spec(), ex.tla.replace("====", "Values == {-1, 0}\n====")).unwrap();
+    let out = tlc_output(&jar, &ex.spec(), &cfg);
+    assert!(out.contains("Assumption") && out.contains("is false"), "{}", out);
+}
+
+#[test]
+fn tla_export_bit_shift_in_an_exec_constant() {
+    let ex = export_code(
+        r#"
+verus! {
+pub const MASK: u8 = 1u8 << 3u8;
+pub struct State { pub x: u8 }
+pub open spec fn init(s: State) -> bool { s.x == MASK }
+pub open spec fn next(pre: State, post: State) -> bool { post == pre }
+pub open spec fn value(s: State) -> bool { s.x == 8 }
+}
+"#,
+        "test_crate",
+    );
+    assert_eq!(ex.report["refusals"], serde_json::json!([]));
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let run = tlc(&jar, &ex.spec(), &ex.cfg);
+    assert_eq!(run.distinct, 1);
+    assert!(run.violated.is_empty(), "{:?}", run);
+}
+
+#[test]
+fn tla_export_partial_init_char_carrier() {
+    let ex = export_code(
+        r#"
+verus! {
+pub struct State { pub c: char }
+pub open spec fn init(s: State) -> bool { true }
+pub open spec fn next(pre: State, post: State) -> bool { post == pre }
+}
+"#,
+        "test_crate",
+    );
+    assert!(ex.report["init_domain_warning"].as_str().unwrap().contains("finite domain holes"));
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let cfg = format!("{}\nCONSTANT Dom_char <- Chars\n", ex.cfg);
+    std::fs::write(ex.spec(), ex.tla.replace("====", "Chars == {\"a\", \"b\"}\n====")).unwrap();
+    assert_eq!(tlc(&jar, &ex.spec(), &cfg).distinct, 2);
 }
 
 /// Concrete type arguments must reach trait calls nested in generic helpers.

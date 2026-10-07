@@ -1,0 +1,54 @@
+TLC2 Version 2026.09.24.190251 (rev: 11305b4)
+Warning: Please run the Java VM, which executes TLC with a throughput optimized garbage collector, by passing the "-XX:+UseParallelGC" property.
+(Use the -nowarning option to disable this warning.)
+Running breadth-first search Model-Checking with fp 78 and seed -6143155806916443410 with 1 worker on 32 cores with 1024MB heap and 64MB offheap memory [pid: 1692855] (Linux 7.0.0-1012-aws amd64, Ubuntu 25.0.4.1 64bit, MSBDiskFPSet, DiskStateQueue).
+Parsing file /data/home/kirancodes/Documents/code/verus-research/wt-export-nrkernel/artifacts/nrkernel/after/os_ext/MC.tla
+Parsing file /data/home/kirancodes/Documents/code/verus-research/wt-export-nrkernel/artifacts/nrkernel/after/os_ext/State_tla.tla
+Parsing file /tmp/tlc-15511200387076223601/Integers.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/Integers.tla)
+Parsing file /tmp/tlc-15511200387076223601/Sequences.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/Sequences.tla)
+Parsing file /tmp/tlc-15511200387076223601/FiniteSets.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/FiniteSets.tla)
+Parsing file /tmp/tlc-15511200387076223601/TLC.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/TLC.tla)
+Parsing file /tmp/tlc-15511200387076223601/Naturals.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/Naturals.tla)
+Semantic processing of module Naturals
+Semantic processing of module Integers
+Semantic processing of module Sequences
+Semantic processing of module FiniteSets
+Semantic processing of module TLC
+Semantic processing of module State_tla
+Semantic processing of module MC
+Linting of module State_tla
+Linting of module MC
+Starting... (2026-10-07 20:05:52)
+Computing initial states...
+Error: The first argument of Assert evaluated to FALSE; the second argument was:
+"tla-export refused: uninterpreted function at /data/home/kirancodes/Documents/code/verus-research/survey/repos/matthias-brun_verified-nrkernel/page-table/src/spec_t/mmu/defs.rs:35:1: 35:35 (#0)"
+Error: The error occurred when TLC was evaluating the nested
+expressions at the following positions:
+0. Line 133, column 9 to line 133, column 276 in State_tla
+1. Line 133, column 9 to line 133, column 266 in State_tla
+2. Line 133, column 9 to line 133, column 251 in State_tla
+3. Line 133, column 10 to line 133, column 212 in State_tla
+4. Line 133, column 219 to line 133, column 250 in State_tla
+5. Line 133, column 256 to line 133, column 266 in State_tla
+6. Line 66, column 5 to line 66, column 17 in State_tla
+7. Line 62, column 6 to line 62, column 94 in State_tla
+8. Line 62, column 7 to line 62, column 69 in State_tla
+9. Line 62, column 8 to line 62, column 30 in State_tla
+10. Line 62, column 75 to line 62, column 94 in State_tla
+11. Line 58, column 6 to line 58, column 183 in State_tla
+12. Line 58, column 144 to line 58, column 182 in State_tla
+13. Line 58, column 167 to line 58, column 182 in State_tla
+14. Line 54, column 6 to line 54, column 929 in State_tla
+15. Line 54, column 684 to line 54, column 929 in State_tla
+16. Line 54, column 688 to line 54, column 695 in State_tla
+17. Line 54, column 688 to line 54, column 690 in State_tla
+18. Line 54, column 18 to line 54, column 678 in State_tla
+19. Line 54, column 19 to line 54, column 673 in State_tla
+20. Line 54, column 22 to line 54, column 44 in State_tla
+21. Line 54, column 23 to line 54, column 39 in State_tla
+22. Line 50, column 5 to line 50, column 214 in State_tla
+
+
+0 states generated, 0 distinct states found, 0 states left on queue.
+The depth of the complete state graph search is 0.
+Finished in 00s at (2026-10-07 20:05:52)
