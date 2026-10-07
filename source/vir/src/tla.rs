@@ -525,6 +525,7 @@ enum Reach {
 /// A call recorded for [`Exporter::transitions`]: the callee, how it is
 /// reached, and what the branches enclosing the call (within the caller)
 /// assign, which TLC has assigned too on any step through the call.
+#[derive(Clone)]
 struct Call {
     callee: OpKey,
     reach: Reach,
@@ -711,6 +712,7 @@ struct TraceAction {
     selected: bool,
 }
 
+#[derive(Clone)]
 struct Exporter {
     datatypes: HashMap<Path, Datatype>,
     functions: HashMap<Fun, Function>,
@@ -814,6 +816,8 @@ struct Exporter {
     temporal_top_action: bool,
     /// Independently selectable action-record branches of closure roots.
     trace_actions: HashMap<OpKey, Vec<TraceAction>>,
+    /// Closure roots to lower after the model is complete, in a private copy.
+    trace_roots: HashMap<OpKey, (Expr, Env)>,
     /// Enum-arm templates keyed by their existential expression.
     trace_variants: HashMap<usize, Vec<TraceVariant>>,
     /// Every one-binder `exists` printed, by the address of its expression:
@@ -6569,6 +6573,25 @@ impl Exporter {
         })
     }
 
+    /// Each independently evaluated trace relation starts with no assigned
+    /// successor variables, just like a freshly emitted model operator.
+    fn reset_trace_context(&mut self) {
+        // Cached quantified templates may become siblings of freshly lowered
+        // branches. Reserve their locals so a LET cannot shadow a template's
+        // parameter when the branches are merged into one trace operator.
+        self.bound = self.locals_ever.clone();
+        self.current_tainted = false;
+        self.branch_depth = 0;
+        self.conj_level = true;
+        self.current_calls.clear();
+        self.current_assigned.clear();
+        self.enclosing_assigned.clear();
+        self.implications.clear();
+        self.pre_assigned.clear();
+        self.current_key = None;
+        self.in_init = false;
+    }
+
     /// Collect every action occurrence. Selection is allowed only for a
     /// conjunctive application, or a path to one with its condition retained.
     /// Unsupported occurrences are kept as general relations; dropping one
@@ -6588,6 +6611,11 @@ impl Exporter {
                     if action.selected {
                         let g = if positive { guard.clone() } else { format!("~({guard})") };
                         action.body = format!("IF {g} THEN ({}) ELSE FALSE", action.body);
+                        for (_, _, domain, _) in &mut action.params {
+                            if let Some(d) = domain {
+                                *d = format!("(IF {g} THEN {d} ELSE {{}})");
+                            }
+                        }
                     }
                     out.push(action);
                 }
@@ -6620,6 +6648,7 @@ impl Exporter {
         fun: &Fun,
         args: &Exprs,
     ) -> Option<TraceAction> {
+        self.reset_trace_context();
         let f = self.functions[fun].clone();
         let site = match &body.x {
             ExprX::Quant(q, _, inner) if matches!(q.quant, air::ast::Quant::Exists) => peel(inner),
@@ -6636,9 +6665,35 @@ impl Exporter {
         let ExprX::Call { target: CallTarget::FnSpec(c), .. } = &application.x else { return None };
         let forward = self.forward_parts(c);
         if forward.is_none() {
-            let (_, _, wrapper_args) = called(c)?;
-            if !wrapper_args.iter().any(|a| called(a).is_some_and(|(_, f, _)| &f == fun)) {
+            let (kind, wrapper, wrapper_args) = called(c)?;
+            let wrapper = self.functions.get(&self.resolved_fun(&kind, &wrapper))?;
+            let index =
+                wrapper_args.iter().position(|a| called(a).is_some_and(|(_, f, _)| &f == fun))?;
+            // Merely passing the builder to a wrapper does not imply that
+            // the wrapper executes it (it might allow stuttering instead).
+            // Recognize a faithful wrapper by both field applications as
+            // unconditional conjuncts on the closure's pre/post parameters.
+            let wrapper_body = peel(wrapper.x.body.as_ref()?);
+            let ExprX::Closure(ps, cb) = &wrapper_body.x else { return None };
+            if ps.len() != 2 {
                 return None;
+            }
+            let receiver = &wrapper.x.params.get(index)?.x.name;
+            for (field, arity) in [("precondition", 1), ("transition", 2)] {
+                if !conjuncts(cb).iter().any(|e| {
+                    let ExprX::Call { target: CallTarget::FnSpec(c), args, .. } = &e.x else {
+                        return false;
+                    };
+                    access_path(c).is_some_and(|(v, fields)| {
+                        &v == receiver && fields.len() == 1 && fields[0].as_str() == field
+                    }) && args.len() == arity
+                        && args
+                            .iter()
+                            .zip(ps.iter())
+                            .all(|(a, p)| read_var(a).as_ref() == Some(&p.name))
+                }) {
+                    return None;
+                }
             }
         }
         let forward_input = forward.and_then(|(builder, forward, _, input)| {
@@ -6698,6 +6753,7 @@ impl Exporter {
     /// A builder that cannot be selected still checks its precondition and
     /// transition, conjoined with Next. No call-site parameters are discarded.
     fn trace_general_action(&mut self, fun: &Fun, site: &Expr) -> TraceAction {
+        self.reset_trace_context();
         let mut forward = None;
         crate::ast_visitor::expr_visitor_walk(site, &mut |e: &Expr| {
             if let ExprX::Call { target: CallTarget::FnSpec(c), .. } = &e.x {
@@ -6796,8 +6852,7 @@ impl Exporter {
             }
             let body = x.expr(&cbody, &env);
             if params.len() == 2 {
-                let actions = x.trace_action_branches(&cbody, &env);
-                x.trace_actions.insert((f.clone(), Variant::Plain, false), actions);
+                x.trace_roots.insert((f.clone(), Variant::Plain, false), (cbody.clone(), env));
             }
             (vec![], body, format!("{}, {}", fun_as_friendly_rust_name(f), span_string(&func.span)))
         }))
@@ -8509,6 +8564,7 @@ pub fn export_module(
         temporal_unchecked: Vec::new(),
         temporal_top_action: false,
         trace_actions: HashMap::new(),
+        trace_roots: HashMap::new(),
         trace_variants: HashMap::new(),
         exists_printed: HashMap::new(),
         current_key: None,
@@ -8619,8 +8675,7 @@ pub fn export_module(
                         }
                         let printed = ex.expr(body, &env);
                         if i == 1 {
-                            let actions = ex.trace_action_branches(body, &env);
-                            ex.trace_actions.insert(key.clone(), actions);
+                            ex.trace_roots.insert(key.clone(), (body.clone(), env));
                         }
                         printed
                     }
@@ -9454,7 +9509,10 @@ pub fn export_module(
     );
     cfg.push_str("\\* CONSTRAINT <a state predicate bounding the model>\n");
     let next_key = (triple.next.clone(), Variant::Plain, false);
-    let (trace_module_name, trace_tla, trace_cfg, trace) = ex.trace_spec(
+    // Trace-only lowering must never change model definitions, names, holes,
+    // assignment analysis, or the report's model metadata.
+    let mut trace_ex = ex.clone();
+    let (trace_module_name, trace_tla, trace_cfg, trace) = trace_ex.trace_spec(
         module,
         &module_name,
         &next_key,
@@ -9967,6 +10025,29 @@ impl Exporter {
             }
         }
         let arms = self.step_arms(qbody, &binders[0].name)?;
+        // A summary only recognizes a direct conjunctive call. Account for
+        // every occurrence, including those under an IF or in a helper:
+        // selecting only the known sites would discard valid calls.
+        let target = self.op_names.iter().find(|(_, name)| *name == &step.operator)?.0;
+        for (summary, arm) in arms.iter().zip(match_arms.iter()) {
+            let mut occurrences = 0;
+            let mut indirect = false;
+            crate::ast_visitor::expr_visitor_walk(&arm.x.body, &mut |e: &Expr| {
+                if let ExprX::Call { target: CallTarget::Fun(kind, fun, ..), .. } = &e.x {
+                    let key = (self.resolved_fun(kind, fun), Variant::Plain, false);
+                    if &key == target {
+                        occurrences += 1;
+                    } else if self.reachable_from(&key).contains(target) {
+                        indirect = true;
+                    }
+                }
+                crate::visitor::VisitorControlFlow::Recurse
+            });
+            let selected = summary.operator.as_ref() == Some(&step.operator);
+            if indirect || occurrences != usize::from(selected) {
+                return None;
+            }
+        }
         let mut out = Vec::new();
         for arm in arms.iter().filter(|a| a.operator.as_ref() == Some(&step.operator)) {
             let variant = variants.iter().find(|v| Some(&v.tag) == arm.variant.as_ref())?;
@@ -10039,6 +10120,17 @@ impl Exporter {
         operators: &[OpKey],
         has_type_ok: bool,
     ) -> (String, String, String, TraceReport) {
+        let model_defs = self.defs.len();
+        let model_constants = self.constants.clone();
+        let model_recursive = self.recursive();
+        let model_euclid = self.uses_euclid;
+        if let Some((body, env)) = self.trace_roots.get(next_key).cloned() {
+            let actions = self.trace_action_branches(&body, &env);
+            self.trace_actions.insert(next_key.clone(), actions);
+        }
+        let trace_helpers = self.defs[model_defs..].to_vec();
+        let trace_constants: Vec<_> =
+            self.constants.difference(&model_constants).cloned().collect();
         let trace_module = format!("{module_name}_trace");
         let reachable = self.reachable_from(next_key);
         let log = self.trace_name("TraceLog");
@@ -10290,6 +10382,8 @@ impl Exporter {
         let mut enabled_parts = Vec::new();
         let mut arm_defs = Vec::new();
         let mut general_relation_steps = Vec::new();
+        let identity = self.trace_name("TraceIdentity");
+        arm_defs.push(format!("{identity}({j}) == {j}\n"));
         for s in &steps {
             let typs = if let Some(typs) = action_typs.get(&s.operator) {
                 typs.clone()
@@ -10319,8 +10413,16 @@ impl Exporter {
                 action_operators.contains(&s.operator) || self.trace_is_dispatcher(next_key, s);
             let variants = self.trace_variant_arms(next_key, s);
             let specialized = variants.is_some();
+            let mut selected_enabled = None;
             if let Some(variants) = variants {
                 let name = self.trace_name(&format!("TraceArm_{}", s.operator));
+                let decoders: Vec<_> = typs
+                    .iter()
+                    .map(|typ| self.trace_codec(typ, &n, &mut memo, &mut defs).0)
+                    .collect();
+                let formals: Vec<_> = (0..typs.len())
+                    .map(|i| self.trace_name(&format!("trace_decode_{i}")))
+                    .collect();
                 let mut parts = Vec::new();
                 for (variant, mapping) in variants {
                     let mut body = variant.body;
@@ -10328,7 +10430,7 @@ impl Exporter {
                         variant.names.iter().zip(&variant.domains).zip(mapping).rev()
                     {
                         let domain = if let Some(i) = mapped {
-                            let (decoder, _) = self.trace_codec(&typs[i], &n, &mut memo, &mut defs);
+                            let decoder = &formals[i];
                             format!("{param}({e}, \"{}\", {decoder}, {dom})", s.params[i].name)
                         } else {
                             dom.clone()
@@ -10338,12 +10440,18 @@ impl Exporter {
                     parts.push(body);
                 }
                 let type_ok = if has_type_ok { " /\\ TypeOK'" } else { "" };
+                let formal_args = formals.iter().map(|d| format!(", {d}(_)")).collect::<String>();
+                let logged_args = decoders.iter().map(|d| format!(", {d}")).collect::<String>();
+                let typed_args =
+                    formals.iter().map(|_| format!(", {identity}")).collect::<String>();
                 arm_defs.push(format!(
-                    "{name}({e}) == {declared} /\\ ({}){type_ok}\n",
+                    "{name}({e}{formal_args}) == {declared} /\\ ({}){type_ok}\n",
                     parts.join(" \\/ ")
                 ));
-                step_arms.push(format!("{guard} -> {name}({e})"));
-                // Diagnostics remain the original relation, evaluated only on request.
+                step_arms.push(format!("{guard} -> {name}({e}{logged_args})"));
+                // TraceEnabled enumerates model values, not JSON encodings.
+                // Share the selected body with identity parameter decoders.
+                selected_enabled = Some(format!("{name}({r}{typed_args})"));
             } else if !direct {
                 general_relation_steps.push(s.step.clone());
             }
@@ -10356,9 +10464,12 @@ impl Exporter {
                         s.operator
                     ));
                 }
+                let relation = selected_enabled
+                    .map(|body| format!("LET {r} == [step |-> \"{}\"] IN {body}", s.step))
+                    .unwrap_or_else(|| format!("{prefix}{}{suffix}", s.operator));
                 enabled_parts.push(format!(
-                    "(IF ENABLED (Next /\\ {}) THEN {{[step |-> \"{}\"]}} ELSE {{}})",
-                    s.operator, s.step
+                    "(IF ENABLED ({relation}) THEN {{[step |-> \"{}\"]}} ELSE {{}})",
+                    s.step
                 ));
                 continue;
             }
@@ -10410,11 +10521,12 @@ impl Exporter {
                     .map(|p| format!("{r}.params.{}", p.name))
                     .collect::<Vec<_>>()
                     .join(", ");
+                let relation = selected_enabled
+                    .unwrap_or_else(|| format!("{prefix}{}({from_record}){suffix}", s.operator));
                 enabled_parts.push(format!(
-                    "{{{r} \\in {{[step |-> \"{}\", params |-> [{record}]] : {}}} :\n        ENABLED (Next /\\ {}({from_record}))}}",
+                    "{{{r} \\in {{[step |-> \"{}\", params |-> [{record}]] : {}}} :\n        ENABLED ({relation})}}",
                     s.step,
                     enum_binds.join(", "),
-                    s.operator,
                 ));
             }
         }
@@ -10439,6 +10551,26 @@ impl Exporter {
             "\\* TraceNext selects the logged existential arm and its logged parameters.\n\\* Missing parameters retain their original domains; dispatch guards and\n\\* TypeOK are preserved. General relations retain their enclosing Next check\n\\* (listed in trace.general_relation_steps). Unknown names fall back to Next,\n\\* checking only the observed state sequence (trace.unknown_step).\n\\* A trace conforms when it reaches {accepted}; otherwise the deepest {index}\n\\* is the first unexplained step; when TLC finds no initial state (0 states generated, depth 0),\n\\* the header is rejected.\n\\* A pass means the observed state sequence is a behaviour of the model.\n"
         ));
         tla.push_str(&format!("EXTENDS {module_name}, Json, TLC, Integers, Sequences\n\n"));
+        if !trace_constants.is_empty() {
+            tla.push_str(&format!("CONSTANTS {}\n", trace_constants.join(", ")));
+        }
+        if self.uses_euclid && !model_euclid {
+            tla.push_str(&euclid_defs());
+        }
+        for (name, arity) in self.recursive() {
+            if !model_recursive.contains_key(&name) {
+                let params = if arity == 0 {
+                    String::new()
+                } else {
+                    format!("({})", vec!["_"; arity].join(", "))
+                };
+                tla.push_str(&format!("RECURSIVE {name}{params}\n"));
+            }
+        }
+        for helper in &trace_helpers {
+            tla.push_str(helper);
+            tla.push('\n');
+        }
         tla.push_str(&format!("CONSTANT {log}  \\* the log's path\n"));
         tla.push_str(&format!("VARIABLE {index}  \\* the next logged step to take\n\n"));
         tla.push_str(&format!("{lines} == ndJsonDeserialize({log})\n"));

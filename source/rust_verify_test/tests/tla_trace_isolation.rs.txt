@@ -1,0 +1,12 @@
+use vstd::prelude::*;
+verus! {
+#[verifier::reject_recursive_types(S)]
+pub struct Action<S> { pub precondition: spec_fn(S) -> bool, pub transition: spec_fn(S,S) -> bool }
+pub open spec fn step<S>(a: Action<S>) -> spec_fn(S,S) -> bool { |pre:S,post:S| (a.precondition)(pre) && (a.transition)(pre,post) }
+pub struct State { pub x:u8 }
+pub open spec fn ready(s:State)->bool { s.x==0 }
+pub open spec fn a(saved:State) -> Action<State> { Action { precondition: |s:State| ready(saved), transition: |pre:State,post:State| post.x==1 } }
+pub open spec fn init() -> spec_fn(State) -> bool { |s:State| s.x==0 }
+pub open spec fn next() -> spec_fn(State,State) -> bool { |pre:State,post:State| (exists|k:u8| k < 1 && #[trigger] step(a(pre))(pre,post)) }
+fn main() {}
+}

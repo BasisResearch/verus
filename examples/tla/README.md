@@ -485,6 +485,8 @@ observed state is not an initial state of the model: the log diverges
 before its first step. At a diverging step, `TraceEnabled` is the set of the model's enabled steps
 with their parameters, and `TraceDiagnosis` says whether the logged step is
 enabled at all and which observed fields no successor by it matches.
+`TraceEnabled` uses the same selected relations as trace validation, with
+parameters in their model types rather than their JSON encodings.
 
 **A selected arm must be enabled under the logged name.** A different arm
 with the same observed successor cannot explain a disabled selected arm.
@@ -492,6 +494,15 @@ For general relations that cannot be independently selected (for example,
 helpers that only assign part of the state, or computed call arguments), the
 existing `Next` conjunction remains; `trace.general_relation_steps` lists these
 names. Its state-sequence semantics are unchanged.
+Action wrappers are selected only when they unconditionally apply the action's
+precondition and transition (or use verus-tla's `forward` relation). A wrapper
+that permits skipping the action uses the reported general-relation check.
+Enum selection must account for every call site; an unsupported nested or
+indirect occurrence also makes the name a general relation. Conditional paths
+guard parameter domains as well as the selected bodies.
+
+Trace-only helpers are emitted in the trace module. Generating the trace spec
+does not change the base model's definitions or export report metadata.
 
 An unknown step name falls back to `Next` and the observed-state comparison;
 its name and parameters are not checked. The JSON report advertises this weaker
