@@ -323,9 +323,9 @@ enum Request {
         session: String,
         bucket: BucketIndex,
         query: QueryId,
-        /// Check at this rlimit instead of the invocation's `--rlimit` (a
-        /// function's own `#[verifier::rlimit]` still wins, as it does over
-        /// `--rlimit`).
+        /// Check at this rlimit, a positive number, instead of the
+        /// invocation's `--rlimit` (a function's own `#[verifier::rlimit]`
+        /// still wins, as it does over `--rlimit`).
         #[serde(default)]
         rlimit: Option<f32>,
         /// Look for this many further errors after the first, instead of the
@@ -6241,6 +6241,10 @@ impl Server {
                         send(&mut output, &Response::Error { message: "unknown query" })?;
                         continue;
                     }
+                    if !check_rlimit_is_valid(rlimit_override) {
+                        send(&mut output, &Response::Error { message: CHECK_RLIMIT_ERROR })?;
+                        continue;
+                    }
                     let pinned_rung = self.pins.get(&(bucket_id.0, id.0)).copied();
                     let answer = match check_query(
                         bucket,
@@ -6267,6 +6271,10 @@ impl Server {
                         self.buckets.get(b.0).is_none_or(|bucket| bucket.queries.get(q.0).is_none())
                     }) {
                         send(&mut output, &Response::Error { message: "unknown bucket or query" })?;
+                        continue;
+                    }
+                    if !check_rlimit_is_valid(rlimit_override) {
+                        send(&mut output, &Response::Error { message: CHECK_RLIMIT_ERROR })?;
                         continue;
                     }
                     let multiple_errors = errors_override.unwrap_or(multiple_errors);
@@ -6874,6 +6882,16 @@ fn check_query(
         kept_graph,
     })
 }
+
+/// Whether a `check` or `check_many` rlimit override can be run at: a
+/// positive, finite budget. The solver reads a zero budget as no limit at all,
+/// which is what a zero or negative override would become, and `--rlimit 0`
+/// is refused for the same reason.
+fn check_rlimit_is_valid(rlimit: Option<f32>) -> bool {
+    rlimit.is_none_or(|rlimit| rlimit.is_finite() && rlimit > 0.0)
+}
+
+const CHECK_RLIMIT_ERROR: &str = "rlimit must be a positive number";
 
 /// Stop the least recently used solvers of `buckets` past `cap`. With
 /// `wait` false, a bucket another thread is checking is passed over rather

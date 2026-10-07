@@ -5304,6 +5304,16 @@ fn resident_check_takes_an_rlimit_and_an_error_count() {
     // The function's own budget is kept.
     let own = check(&mut worker, "::own_budget", json!({"rlimit": 100}));
     assert!((own["rlimit"].as_f64().unwrap() - 0.01).abs() < 1e-6, "{}", own);
+    // A budget the solver would read as no limit at all is refused, by
+    // `check` and `check_many` alike, and the session goes on.
+    for rlimit in [json!(0), json!(-1.5)] {
+        let refused = check(&mut worker, "::passing", json!({"rlimit": rlimit}));
+        assert_eq!(refused["event"], "error", "{}", refused);
+        assert_eq!(refused["message"], "rlimit must be a positive number", "{}", refused);
+        let refused = worker.send(json!({"command": "check_many", "session": session,
+            "queries": [[0, query_id(&ready, "::passing")]], "rlimit": rlimit}));
+        assert_eq!(refused["event"], "error", "{}", refused);
+    }
     // Errors: the first, then as many more as asked for.
     let errors = |checked: &Value| {
         checked["diagnostics"].as_array().unwrap().iter().filter(|d| d["level"] == "error").count()
