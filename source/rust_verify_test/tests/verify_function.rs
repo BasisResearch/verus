@@ -19,11 +19,13 @@ mod first {
     verus! {
     proof fn shared() { assert(4int + 4 == 8); }
     proof fn only_first() { assert(5int + 5 == 10); }
+    impl crate::second::Item { proof fn moved() { assert(10int == 10); } }
     }
 }
 mod second {
     use vstd::prelude::*;
     verus! {
+    pub struct Item {}
     proof fn shared() { assert(6int + 6 == 12); }
     proof fn only_second() { assert(7int + 7 == 14); }
     }
@@ -40,6 +42,36 @@ mod third {
     #[allow(non_camel_case_types)]
     pub struct point {}
     impl point { proof fn f() { assert(8int == 8); } }
+    }
+}
+mod a {
+    use vstd::prelude::*;
+    verus! {
+    proof fn f() { assert(9int == 9); }
+    pub struct Data {}
+    impl Data { proof fn f() { assert(false); } }
+    }
+}
+mod cell {
+    use vstd::prelude::*;
+    verus! {
+    proof fn f() { assert(11int == 11); }
+    }
+}
+mod fifth {
+    use vstd::prelude::*;
+    verus! {
+    #[allow(non_camel_case_types)]
+    pub struct cell {}
+    impl cell { proof fn f() { assert(12int == 12); } }
+    }
+}
+mod sixth {
+    use vstd::prelude::*;
+    verus! {
+    #[allow(non_camel_case_types)]
+    pub struct cell {}
+    impl cell { proof fn f() { assert(13int == 13); } }
     }
 }
 "#;
@@ -69,6 +101,13 @@ fn run_in(modules: &[&str], functions: &[&str]) -> (Output, String, String) {
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
     (output, stdout, stderr)
+}
+
+// The lines of the error message, without rustc's indentation
+fn error_lines(stderr: &str) -> Vec<String> {
+    let start = stderr.find("error: ").unwrap() + "error: ".len();
+    let end = stderr.find("\nerror: aborting").unwrap();
+    stderr[start..end].trim_end().lines().map(|line| line.trim().to_string()).collect()
 }
 
 fn results(n: usize) -> String {
@@ -145,16 +184,11 @@ fn verify_function_reports_every_bad_pattern() {
     assert!(!output.status.success());
     assert!(!stdout.contains("verified"), "{}", stdout);
     // One error, holding each pattern's message as a single flag words it,
-    // separated by a blank line (compared line by line, without the indentation)
-    let message = |s: &str| -> Vec<String> {
-        let start = s.find("error: ").unwrap() + "error: ".len();
-        let end = s.find("\nerror: aborting").unwrap();
-        s[start..end].trim_end().lines().map(|line| line.trim().to_string()).collect()
-    };
-    let mut expected = message(&delta_stderr);
+    // separated by a blank line
+    let mut expected = error_lines(&delta_stderr);
     expected.push(String::new());
-    expected.extend(message(&zeta_stderr));
-    assert_eq!(message(&stderr), expected);
+    expected.extend(error_lines(&zeta_stderr));
+    assert_eq!(error_lines(&stderr), expected);
     assert!(stderr.contains("error: aborting due to 1 previous error"), "{}", stderr);
 }
 
@@ -182,12 +216,14 @@ fn verify_function_in_two_modules_requires_qualifying_a_shared_name() {
     let (output, stdout, stderr) = run_in(&["first", "second"], &["shared"]);
     assert!(!output.status.success());
     assert!(!stdout.contains("verified"), "{}", stdout);
-    assert!(
-        stderr.contains(
-            "error: --verify-function shared matches functions in more than one module, qualify it with the module (e.g. first::shared),\n       matched results are:\n         - first::shared\n         - second::shared\n"
-        ),
-        "{}",
-        stderr
+    assert_eq!(
+        error_lines(&stderr),
+        [
+            "--verify-function shared matches functions in more than one module, qualify it with the module (e.g. first::shared),",
+            "matched results are:",
+            "- first::shared",
+            "- second::shared",
+        ]
     );
 }
 
@@ -276,4 +312,67 @@ fn verify_function_name_that_starts_with_a_module_name() {
     assert_eq!(stdout, results(1));
     assert_eq!(stderr.matches("note: verifying module third (selected functions)").count(), 1);
     assert_eq!(stderr.matches("note: verifying module point").count(), 0, "{}", stderr);
+}
+
+// The qualified reading `f` in module `a` is an exact match,
+// so it wins over `Data::f`, whose name merely contains `a::f`.
+#[test]
+fn verify_function_qualified_name_is_not_read_as_a_substring() {
+    let (output, stdout, stderr) = run_in(&["a", "first"], &["a::f"]);
+    assert!(output.status.success(), "{}", stderr);
+    assert_eq!(stdout, results(1));
+}
+
+// With one module, a pattern that works on main selects what it selects on main:
+// `a::f` is the unique substring match `Data::f`, which fails.
+// The path from `crate` names `f` in module `a`.
+#[test]
+fn verify_function_qualified_with_one_module_as_on_main() {
+    let (output, stdout, stderr) = run_in(&["a"], &["a::f"]);
+    assert!(!output.status.success());
+    assert_eq!(stderr.matches("error: assertion failed").count(), 1, "{}", stderr);
+    assert!(stdout.contains("0 verified, 1 errors"), "{}", stdout);
+
+    let (output, stdout, stderr) = run_in(&["a"], &["crate::a::f"]);
+    assert!(output.status.success(), "{}", stderr);
+    assert_eq!(stdout, results(1));
+}
+
+// `cell::f` names `f` in module `cell` and the methods `cell::f` in `fifth` and `sixth`.
+#[test]
+fn verify_function_qualified_and_unqualified_readings_are_ambiguous() {
+    let (output, stdout, stderr) = run_in(&["cell", "fifth", "sixth"], &["cell::f"]);
+    assert!(!output.status.success());
+    assert!(!stdout.contains("verified"), "{}", stdout);
+    assert_eq!(
+        error_lines(&stderr),
+        [
+            "--verify-function cell::f matches functions in more than one module, qualify it with the module (e.g. crate::cell::f),",
+            "matched results are:",
+            "- cell::f",
+            "- fifth::cell::f",
+            "- sixth::cell::f",
+        ]
+    );
+
+    let (output, stdout, stderr) =
+        run_in(&["cell", "fifth", "sixth"], &["crate::cell::f", "fifth::cell::f"]);
+    assert!(output.status.success(), "{}", stderr);
+    assert_eq!(stdout, results(2));
+    assert_eq!(stderr.matches("note: verifying module sixth").count(), 0, "{}", stderr);
+}
+
+// `moved` is owned by `first` but named by the path of `second::Item`, from the crate's name,
+// so it is listed (and matched) by that name, without `first::` before it.
+#[test]
+fn verify_function_lists_a_name_from_another_module_as_is() {
+    let (output, _, stderr) = run_in(&["first", "second"], &["zzz"]);
+    assert!(!output.status.success());
+    let lines = error_lines(&stderr);
+    assert!(lines.contains(&"- fixture::second::Item::moved".to_string()), "{}", stderr);
+    assert!(!stderr.contains("first::fixture"), "{}", stderr);
+
+    let (output, stdout, stderr) = run_in(&["first", "second"], &["fixture::second::Item::moved"]);
+    assert!(output.status.success(), "{}", stderr);
+    assert_eq!(stdout, results(1));
 }

@@ -1,11 +1,14 @@
 use crate::buckets::{Bucket, BucketId};
 use crate::config::Args;
 use crate::util::error;
-use crate::verifier::{module_name, module_name_of_segments};
+use crate::verifier::module_name;
 use std::collections::HashSet;
 use std::sync::Arc;
 use vir::ast::{Fun, Function, Krate, VirErr};
-use vir::ast_util::{friendly_fun_name_crate_relative, parse_path_segments_from_user_str};
+use vir::ast_util::{
+    friendly_fun_name_crate_relative, fun_as_friendly_rust_name, parse_path_segments_from_user_str,
+    path_as_friendly_rust_name,
+};
 
 #[derive(Clone, Debug)]
 pub enum UserFilter {
@@ -18,6 +21,44 @@ pub enum UserFilter {
 }
 
 type ModuleId = vir::ast::Idents;
+
+/// A function in one of the selected modules, with the names a pattern can match it by
+struct FunName {
+    fun: Fun,
+    /// Index of the function's module among the selected modules
+    module: usize,
+    /// The name relative to the module, which an unqualified pattern matches
+    name: String,
+    /// The module qualifiers that a pattern can put before `name`
+    /// (`foo::bar::` and `crate::foo::bar::`, or `crate::` for the root module);
+    /// empty if `name` is not relative to the module
+    qualifiers: Vec<String>,
+}
+
+impl FunName {
+    /// The name qualified by its module, shown when several modules are selected
+    fn qualified(&self) -> String {
+        format!("{}{}", self.qualifiers.first().map_or("", |q| q.as_str()), self.name)
+    }
+
+    /// The name qualified by the path of its module from the crate root
+    fn absolute(&self) -> String {
+        format!("{}{}", self.qualifiers.last().map_or("", |q| q.as_str()), self.name)
+    }
+
+    /// The ways to read `pattern` for this function:
+    /// as written (with qualifier ""), and without each qualifier it starts with.
+    /// Each reading is (qualifier, pattern without the qualifier).
+    fn readings<'p>(&self, pattern: &'p str, qualify: bool) -> Vec<(&str, &'p str)> {
+        let qualified = self
+            .qualifiers
+            .iter()
+            .filter(|q| qualify && pattern.len() > q.len() && pattern.starts_with(q.as_str()));
+        std::iter::once(("", pattern))
+            .chain(qualified.map(|q| (q.as_str(), &pattern[q.len()..])))
+            .collect()
+    }
+}
 
 fn root_module_id() -> ModuleId {
     Arc::new(vec![])
@@ -74,23 +115,13 @@ impl UserFilter {
             }
 
             // Name each module's functions once, rather than once per pattern
-            let module_fun_names: Vec<Vec<(Fun, String)>> = modules
-                .iter()
-                .map(|module| Self::module_fun_names(module, &local_krate.functions))
-                .collect();
-            // How a pattern names each module: `crate` for the root, else its path
-            let qualifiers: Vec<String> = modules
-                .iter()
-                .map(
-                    |m| if m.is_empty() { "crate".to_string() } else { module_name_of_segments(m) },
-                )
-                .collect();
+            let funs = Self::fun_names(&modules, &local_krate.functions);
 
             // Resolve every pattern before failing, so that one run reports all the bad ones
             let mut matches = HashSet::new();
             let mut errors = Vec::new();
             for func_name in &args.verify_function {
-                match Self::get_matches(&qualifiers, &module_fun_names, func_name) {
+                match Self::get_matches(&funs, modules.len() > 1, func_name) {
                     Ok(m) => matches.extend(m),
                     Err(msg) => errors.push(msg),
                 }
@@ -190,75 +221,57 @@ impl UserFilter {
         }
     }
 
-    /// The functions owned by the module, each with its name relative to the module.
-    fn module_fun_names(module_id: &ModuleId, funs: &Vec<Function>) -> Vec<(Fun, String)> {
+    /// The functions owned by the modules, each with the names a pattern can match it by.
+    fn fun_names(modules: &[ModuleId], funs: &Vec<Function>) -> Vec<FunName> {
         funs.iter()
-            .filter(|f| match &f.x.owning_module {
-                None => false,
-                Some(m) => module_id == &m.segments,
-            })
-            .map(|f| {
-                let name = friendly_fun_name_crate_relative(
-                    f.x.owning_module.as_ref().unwrap(),
-                    &f.x.name,
-                );
-                (f.x.name.clone(), name)
+            .filter_map(|f| {
+                let owning_module = f.x.owning_module.as_ref()?;
+                let module = modules.iter().position(|m| m == &owning_module.segments)?;
+                let name = friendly_fun_name_crate_relative(owning_module, &f.x.name);
+                // Qualify with the module name that `name` was made relative to,
+                // which starts with the crate's name, written `crate` in a pattern
+                let qualifiers = if name == fun_as_friendly_rust_name(&f.x.name) {
+                    vec![]
+                } else {
+                    match path_as_friendly_rust_name(owning_module).split_once("::") {
+                        Some((_, relative)) => {
+                            vec![format!("{relative}::"), format!("crate::{relative}::")]
+                        }
+                        None => vec!["crate::".to_string()],
+                    }
+                };
+                Some(FunName { fun: f.x.name.clone(), module, name, qualifiers })
             })
             .collect()
     }
 
     /// Get the functions that match the given pattern.
     ///
-    /// The pattern is first matched as written, in all the selected modules.
-    /// If that fails and the pattern starts with the name of a selected module
-    /// (`foo::bar::f` or `crate::foo::bar::f`, or `crate::f` for the root module),
-    /// the rest of the pattern is matched in that module only,
-    /// trying the longest such module name first.
+    /// A pattern can be qualified by the module of the functions it names
+    /// (`foo::bar::f` or `crate::foo::bar::f`, or `crate::f` for the root module).
+    /// A function matches if the pattern, either as written or without its module qualifier,
+    /// matches the function's name relative to its module; every reading takes part
+    /// in each step of the search.
+    ///
+    /// With one module, the pattern is first matched only as written,
+    /// as it was before qualifiers existed, so that such a pattern selects the same functions.
     ///
     /// Errors (with the message) if there is no match.
     fn get_matches(
-        qualifiers: &[String],
-        module_fun_names: &[Vec<(Fun, String)>],
-        pattern: &String,
+        funs: &[FunName],
+        several_modules: bool,
+        pattern: &str,
     ) -> Result<HashSet<Fun>, String> {
-        let all_modules: Vec<usize> = (0..module_fun_names.len()).collect();
-        let unqualified =
-            Self::get_matches_in(qualifiers, module_fun_names, &all_modules, "", pattern, pattern);
-        if unqualified.is_ok() {
-            return unqualified;
-        }
-        let mut prefixes: Vec<(usize, String)> = qualifiers
-            .iter()
-            .enumerate()
-            .flat_map(|(i, q)| {
-                let absolute = (q != "crate").then(|| format!("crate::{q}::"));
-                std::iter::once(format!("{q}::")).chain(absolute).map(move |p| (i, p))
-            })
-            .filter(|(_, p)| pattern.len() > p.len() && pattern.starts_with(p.as_str()))
-            .collect();
-        prefixes.sort_by_key(|(_, p)| std::cmp::Reverse(p.len()));
-        let mut qualified_err = None;
-        for (i, prefix) in prefixes {
-            let function_pattern = &pattern[prefix.len()..];
-            match Self::get_matches_in(
-                qualifiers,
-                module_fun_names,
-                &[i],
-                &prefix,
-                pattern,
-                function_pattern,
-            ) {
-                Ok(m) => return Ok(m),
-                Err(msg) => {
-                    qualified_err.get_or_insert(msg);
-                }
+        if !several_modules {
+            if let Ok(matches) = Self::get_matches_in(funs, false, pattern, false) {
+                return Ok(matches);
             }
         }
-        Err(qualified_err.unwrap_or_else(|| unqualified.unwrap_err()))
+        Self::get_matches_in(funs, several_modules, pattern, true)
     }
 
-    /// Get the functions in the given modules that match `function_pattern`,
-    /// which is `pattern` without the module qualifier `prefix`.
+    /// Get the functions that match `pattern`, read without a module qualifier
+    /// unless `qualify` is set.
     ///
     /// The first part of this process is to
     /// infer whether this is an "exact match" filter.
@@ -271,132 +284,140 @@ impl UserFilter {
     ///
     /// Errors (with the message) if there is no match.
     fn get_matches_in(
-        qualifiers: &[String],
-        module_fun_names: &[Vec<(Fun, String)>],
-        modules: &[usize],
-        prefix: &str,
+        funs: &[FunName],
+        several_modules: bool,
         pattern: &str,
-        function_pattern: &str,
+        qualify: bool,
     ) -> Result<HashSet<Fun>, String> {
-        let several_modules = module_fun_names.len() > 1;
-        let funs: Vec<(usize, &(Fun, String))> =
-            modules.iter().flat_map(|&i| module_fun_names[i].iter().map(move |f| (i, f))).collect();
         // With several modules, show each function qualified by its module
-        let display = |(i, (_, name)): &(usize, &(Fun, String))| {
-            if several_modules { format!("{}::{name}", qualifiers[*i]) } else { name.clone() }
-        };
-        let display_sorted = |funs: &Vec<(usize, &(Fun, String))>| {
-            let mut names = funs.iter().map(display).collect::<Vec<String>>();
+        let display = |f: &FunName| if several_modules { f.qualified() } else { f.name.clone() };
+        let display_sorted = |funs: &Vec<&FunName>| {
+            let mut names = funs.iter().map(|f| display(f)).collect::<Vec<String>>();
             names.sort();
             names
         };
+        let exact = !pattern.contains('*');
 
         // First, get the matches without doing anything fancy:
         // If the user provides a * pattern, then we filter according to the * pattern;
         // if the user provides an exact match (no *), then filter as an exact match.
         // If we find anything this way, we're done.
-        let matches = Self::get_matches_strictly_by_pattern(function_pattern, &funs);
-        let clean = function_pattern.trim_matches('*');
+        let matches: Vec<&FunName> = funs
+            .iter()
+            .filter(|f| {
+                let readings = f.readings(pattern, qualify);
+                readings.iter().any(|(_, p)| Self::matches_strictly_by_pattern(p, &f.name))
+            })
+            .collect();
         if matches.len() > 0 {
-            let first_module = matches[0].0;
-            if clean == function_pattern && matches.iter().any(|(i, _)| *i != first_module) {
-                let msg = vec![
-                    format!(
-                        "--verify-function {pattern} matches functions in more than one module, qualify it with the module (e.g. {}::{function_pattern}),",
-                        qualifiers[first_module]
-                    ),
-                    format!("matched results are:"),
-                ]
-                .into_iter()
-                .chain(display_sorted(&matches).iter().map(|f| format!("  - {f}")))
-                .collect::<Vec<String>>()
-                .join("\n");
-                return Err(msg);
+            if exact && matches.iter().any(|f| f.module != matches[0].module) {
+                let first = matches.iter().min_by_key(|f| display(f)).unwrap();
+                let example =
+                    if display(first) == pattern { first.absolute() } else { display(first) };
+                return Err(Self::listing(
+                    vec![
+                        format!(
+                            "--verify-function {pattern} matches functions in more than one module, qualify it with the module (e.g. {example}),"
+                        ),
+                        format!("matched results are:"),
+                    ],
+                    display_sorted(&matches),
+                ));
             }
-            return Ok(matches.into_iter().map(|(_, f)| f.0.clone()).collect());
+            return Ok(matches.into_iter().map(|f| f.fun.clone()).collect());
         }
 
         // Get all substring matches, even if the user didn't use any * in their pattern.
         // We might use of these automatically, or if not, this list will at least help us
         // print an informative error message.
-        let substring_matches = Self::get_all_substring_matches(function_pattern, &funs);
+        // Each reading that matches suggests a wildcard pattern selecting its matches.
+        let mut substring_matches: Vec<&FunName> = Vec::new();
+        let mut wildcards: Vec<String> = Vec::new();
+        for f in funs {
+            let mut matched = false;
+            for (qualifier, p) in f.readings(pattern, qualify) {
+                let clean = p.trim_matches('*');
+                if f.name.contains(clean) {
+                    matched = true;
+                    let wildcard = format!("{qualifier}*{clean}*");
+                    if !wildcards.contains(&wildcard) {
+                        wildcards.push(wildcard);
+                    }
+                }
+            }
+            if matched {
+                substring_matches.push(f);
+            }
+        }
+        let wildcards = wildcards.join(" and ");
 
-        if clean == function_pattern {
+        if exact {
             // If there's no exact match, but there is *exactly one* substring match,
             // then we go ahead and use that function.
             if substring_matches.len() == 1 {
-                return Ok(substring_matches.iter().map(|f| f.1.0.clone()).collect());
+                return Ok(substring_matches.iter().map(|f| f.fun.clone()).collect());
             } else if substring_matches.len() > 1 {
-                let msg = vec![
-                    format!(
-                        "more than one match found for --verify-function {pattern}, consider using wildcard {prefix}*{function_pattern}* to verify all matched results,"
-                    ),
-                    format!(
-                        "or specify a unique substring for the desired function, matched results are:"
-                    ),
-                ].into_iter()
-                .chain(display_sorted(&substring_matches).iter().map(|f| format!("  - {f}")))
-                .collect::<Vec<String>>()
-                .join("\n");
-                return Err(msg);
+                let wildcard = if wildcards.contains(" and ") { "wildcards" } else { "wildcard" };
+                return Err(Self::listing(
+                    vec![
+                        format!(
+                            "more than one match found for --verify-function {pattern}, consider using {wildcard} {wildcards} to verify all matched results,"
+                        ),
+                        format!(
+                            "or specify a unique substring for the desired function, matched results are:"
+                        ),
+                    ],
+                    display_sorted(&substring_matches),
+                ));
             }
         } else {
             if substring_matches.len() >= 1 {
-                let msg = vec![
-                    format!("could not find function {pattern} specified by --verify-function,"),
-                    format!("consider {prefix}*{clean}* if you want to verify similar functions:"),
-                ]
-                .into_iter()
-                .chain(display_sorted(&substring_matches).iter().map(|f| format!("  - {f}")))
-                .collect::<Vec<String>>()
-                .join("\n");
-                return Err(msg);
+                return Err(Self::listing(
+                    vec![
+                        format!(
+                            "could not find function {pattern} specified by --verify-function,"
+                        ),
+                        format!("consider {wildcards} if you want to verify similar functions:"),
+                    ],
+                    display_sorted(&substring_matches),
+                ));
             }
         }
 
         // If there were absolutely no substring matches, then we fail by printing
         // out every possible function in the module.
-        let msg = vec![
-            format!("could not find function {pattern} specified by --verify-function"),
-            format!("available functions are:"),
-        ]
-        .into_iter()
-        .chain(display_sorted(&funs).iter().map(|f| format!("  - {f}")))
-        .collect::<Vec<String>>()
-        .join("\n");
-        return Err(msg);
+        Err(Self::listing(
+            vec![
+                format!("could not find function {pattern} specified by --verify-function"),
+                format!("available functions are:"),
+            ],
+            display_sorted(&funs.iter().collect()),
+        ))
     }
 
-    fn get_matches_strictly_by_pattern<'a>(
-        function_pattern: &str,
-        funs: &Vec<(usize, &'a (Fun, String))>,
-    ) -> Vec<(usize, &'a (Fun, String))> {
+    /// An error message: the header lines, then one line per name
+    fn listing(header: Vec<String>, names: Vec<String>) -> String {
+        header
+            .into_iter()
+            .chain(names.iter().map(|f| format!("  - {f}")))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn matches_strictly_by_pattern(function_pattern: &str, name: &str) -> bool {
         let clean = function_pattern.trim_matches('*');
         let left_wildcard = function_pattern.starts_with('*');
         let right_wildcard = function_pattern.ends_with('*');
 
-        funs.iter()
-            .filter(|(_, (_, name))| {
-                if left_wildcard && !right_wildcard {
-                    name.ends_with(clean)
-                } else if !left_wildcard && right_wildcard {
-                    name.starts_with(clean)
-                } else if left_wildcard && right_wildcard {
-                    name.contains(clean)
-                } else {
-                    name == clean
-                }
-            })
-            .cloned()
-            .collect()
-    }
-
-    fn get_all_substring_matches<'a>(
-        function_pattern: &str,
-        funs: &Vec<(usize, &'a (Fun, String))>,
-    ) -> Vec<(usize, &'a (Fun, String))> {
-        let clean = function_pattern.trim_matches('*');
-        funs.iter().filter(|(_, (_, name))| name.contains(clean)).cloned().collect()
+        if left_wildcard && !right_wildcard {
+            name.ends_with(clean)
+        } else if !left_wildcard && right_wildcard {
+            name.starts_with(clean)
+        } else if left_wildcard && right_wildcard {
+            name.contains(clean)
+        } else {
+            name == clean
+        }
     }
 
     /// Check if the function is included in the filter.
