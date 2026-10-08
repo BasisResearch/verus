@@ -406,18 +406,18 @@ fn verify_function_qualified_name_is_not_read_as_a_substring_with_one_module() {
     assert!(stdout.contains("0 verified, 1 errors"), "{}", stdout);
 }
 
-// `cell::f` names `f` in module `cell` and the methods `cell::f` in `fifth` and `sixth`.
+// `cell::f` is the relative name of the methods `f` of `cell` in `fifth` and `sixth`,
+// which wins over the path of `f` in module `cell`, and is ambiguous.
 #[test]
-fn verify_function_qualified_and_unqualified_readings_are_ambiguous() {
+fn verify_function_relative_names_win_over_paths_and_are_ambiguous() {
     let (output, stdout, stderr) = run_in(&["cell", "fifth", "sixth"], &["cell::f"]);
     assert!(!output.status.success());
     assert!(!stdout.contains("verified"), "{}", stdout);
     assert_eq!(
         error_lines(&stderr),
         [
-            "--verify-function cell::f matches more than one function, use a name that matches only one (e.g. crate::cell::f),",
+            "--verify-function cell::f matches more than one function, use a name that matches only one (e.g. fifth::cell::f),",
             "matched results are:",
-            "- cell::f",
             "- fifth::cell::f",
             "- sixth::cell::f",
         ]
@@ -455,12 +455,16 @@ fn verify_function_names_a_function_by_its_path_from_the_crate_root() {
     }
 }
 
-// Functions of one module that match a pattern exactly are all selected:
-// `line::f` is the path of `f` in module `line`, and the name of the method `f` of `line::line`
+// `line::f` is the name of the method `f` of `line::line` relative to module `line`,
+// and the path of `f` in module `line`: the relative name wins, with one module or several.
 #[test]
-fn verify_function_exact_matches_within_one_module() {
+fn verify_function_relative_name_wins_over_a_path() {
     for modules in [&["line", "first"][..], &["line"][..]] {
-        let (output, stdout, stderr) = run_in(modules, &["line::f"]);
+        // The method is the one function selected by both patterns
+        let (output, stdout, stderr) = run_in(modules, &["line::f", "line::line::f"]);
+        assert!(output.status.success(), "{}", stderr);
+        assert_eq!(stdout, results(1));
+        let (output, stdout, stderr) = run_in(modules, &["line::f", "crate::line::f"]);
         assert!(output.status.success(), "{}", stderr);
         assert_eq!(stdout, results(2));
         for pattern in ["crate::line::f", "line::line::f"] {

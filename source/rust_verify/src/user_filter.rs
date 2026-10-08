@@ -281,8 +281,9 @@ impl UserFilter {
     /// A pattern is matched against each function's name relative to its module,
     /// and, if the pattern contains `::`, against its qualified names too.
     /// A pattern with `*` at either end selects every function with a name that it matches.
-    /// A pattern without (an exact pattern) selects every function with a name equal to it,
-    /// as long as these functions are all in one module (otherwise it is ambiguous).
+    /// A pattern without (an exact pattern) selects the functions whose relative name equals it;
+    /// if there are none, the functions with a qualified name equal to it.
+    /// These must all be in one module (otherwise the pattern is ambiguous).
     /// An exact pattern that equals no name selects the one function with a name that contains it,
     /// and is an error if several do.
     fn resolve<'a>(funs: &'a [FunName], pattern: &str) -> Resolution<'a> {
@@ -292,12 +293,23 @@ impl UserFilter {
 
         // First, get the matches without doing anything fancy:
         // If the user provides a * pattern, then we filter according to the * pattern;
-        // if the user provides an exact match (no *), then filter as an exact match.
+        // if the user provides an exact match (no *), then filter as an exact match,
+        // by relative name first and then by qualified name.
         // If we find anything this way, we're done.
-        let matches: Vec<&FunName> = funs
-            .iter()
-            .filter(|f| f.names(qualified).any(|n| Self::matches_strictly_by_pattern(pattern, n)))
-            .collect();
+        let matches: Vec<&FunName> = if exact {
+            let by_name: Vec<&FunName> = funs.iter().filter(|f| f.name == pattern).collect();
+            if by_name.is_empty() && qualified {
+                funs.iter().filter(|f| f.qualified.iter().any(|n| n == pattern)).collect()
+            } else {
+                by_name
+            }
+        } else {
+            funs.iter()
+                .filter(|f| {
+                    f.names(qualified).any(|n| Self::matches_strictly_by_pattern(pattern, n))
+                })
+                .collect()
+        };
         if exact && matches.iter().any(|f| f.module != matches[0].module) {
             return Resolution::Ambiguous(matches);
         } else if matches.len() > 0 {
