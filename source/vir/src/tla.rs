@@ -596,8 +596,9 @@ enum Variant {
     /// A verus-tla action: `f().forward(input)` for a spec fn `f` of no
     /// parameters building an `Action { precondition, transition }`, as the
     /// operator `f(input)` over the pre and post states, so TLC names its
-    /// steps (and `WF_vars` its fairness) after `f`.
-    Forward,
+    /// steps (and `WF_vars` its fairness) after `f`. The index identifies
+    /// the specialized forward method in `forward_methods`.
+    Forward(usize),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -825,6 +826,8 @@ struct Exporter {
     trait_arities: HashMap<Path, usize>,
     tables: BTreeMap<String, (String, Vec<String>)>,
     table_names: HashMap<Fun, String>,
+    /// Interned specialized forward methods, the discriminator in Variant::Forward.
+    forward_methods: Vec<Fun>,
 }
 
 fn ident_name(v: &VarIdent) -> String {
@@ -1539,7 +1542,7 @@ impl Exporter {
             Variant::Plain => {}
             Variant::Primed => candidate = format!("{candidate}_post"),
             Variant::Record => candidate = format!("{candidate}_rec"),
-            Variant::Forward => {}
+            Variant::Forward(_) => {}
         }
         if *post_args {
             candidate = format!("{candidate}_postarg");
@@ -5407,7 +5410,7 @@ impl Exporter {
         let previous_level = std::mem::replace(&mut self.conj_level, true);
         let mut env = Env::new();
         let roles = match variant {
-            Variant::Record | Variant::Forward => vec![None; f.x.params.len()],
+            Variant::Record | Variant::Forward(_) => vec![None; f.x.params.len()],
             Variant::Plain | Variant::Primed => self.param_roles(&f),
         };
         let mut params = Vec::new();
@@ -5467,7 +5470,7 @@ impl Exporter {
                 Variant::Plain if !f.x.decrease.is_empty() => " (applies the record variant)",
                 Variant::Plain => "",
                 Variant::Primed => " (read in the post state)",
-                Variant::Record | Variant::Forward => " (the state passed as a record)",
+                Variant::Record | Variant::Forward(_) => " (the state passed as a record)",
             },
             if *post_args { " (given an argument read in the post state)" } else { "" },
             span_string(&f.span)
@@ -6401,7 +6404,7 @@ fn sync_guarded_scrutinee(place: &Place) -> bool {
         return true;
     }
     let PlaceX::Temporary(e) = &place.x else { return false };
-    called(e).is_some_and(|(_, fun, args)| {
+    called(e).is_some_and(|(_, fun, _, args)| {
         let f = fun_as_friendly_rust_name(&fun);
         ["::index", "::spec_index", "::arrow_0"].iter().any(|m| f.ends_with(m))
             && args.first().and_then(read_var).is_some_and(|v| v.0.starts_with("update_tmp_"))
@@ -6410,8 +6413,9 @@ fn sync_guarded_scrutinee(place: &Place) -> bool {
 
 /// Whether `e` is vstd's `arbitrary()`.
 fn is_arbitrary(e: &Expr) -> bool {
-    called(e)
-        .is_some_and(|(_, fun, _)| fun_as_friendly_rust_name(&fun) == "vstd::pervasive::arbitrary")
+    called(e).is_some_and(|(_, fun, _, _)| {
+        fun_as_friendly_rust_name(&fun) == "vstd::pervasive::arbitrary"
+    })
 }
 
 /// Where the assertion `cond` of VerusSync's `tmp_assert && cond` (`init`)
@@ -6610,11 +6614,11 @@ fn is_unit(typ: &Typ) -> bool {
 }
 
 /// A call `e` to a crate function: the function (resolved, see
-/// [`Exporter::resolved_fun`]) and the arguments.
-fn called(e: &Expr) -> Option<(CallTargetKind, Fun, Exprs)> {
+/// [`Exporter::resolved_fun`]), complete type arguments, and value arguments.
+fn called(e: &Expr) -> Option<(CallTargetKind, Fun, Typs, Exprs)> {
     match &peel(e).x {
-        ExprX::Call { target: CallTarget::Fun(kind, fun, ..), args, .. } => {
-            Some((kind.clone(), fun.clone(), args.clone()))
+        ExprX::Call { target: CallTarget::Fun(kind, fun, typs, ..), args, .. } => {
+            Some((kind.clone(), fun.clone(), typs.clone(), args.clone()))
         }
         _ => None,
     }
@@ -6647,7 +6651,17 @@ fn same_receiver(a: &Expr, b: &Expr) -> bool {
         return x == y;
     }
     match (called(&a), called(&b)) {
-        (Some((_, f, fa)), Some((_, g, ga))) => f == g && fa.is_empty() && ga.is_empty(),
+        (Some((fk, f, ft, fa)), Some((gk, g, gt, ga))) => {
+            let (f, ft) = match &fk {
+                CallTargetKind::DynamicResolved { resolved, typs, .. } => (resolved, typs),
+                _ => (&f, &ft),
+            };
+            let (g, gt) = match &gk {
+                CallTargetKind::DynamicResolved { resolved, typs, .. } => (resolved, typs),
+                _ => (&g, &gt),
+            };
+            f == g && crate::ast_util::n_types_equal(ft, gt) && fa.is_empty() && ga.is_empty()
+        }
         _ => false,
     }
 }
@@ -6677,7 +6691,7 @@ fn temporal_sources(
     let mut out: Vec<TemporalSource> = Vec::new();
     let mut notes = Vec::new();
     let entails = |e: &Expr| -> Option<(Expr, Expr)> {
-        let (_, fun, args) = called(e)?;
+        let (_, fun, _, args) = called(e)?;
         (last_segment(&fun.path) == "entails" && args.len() == 2 && is_temp_pred(&args[0].typ))
             .then(|| (args[0].clone(), args[1].clone()))
     };
@@ -6820,6 +6834,25 @@ fn temporal_sources(
             {
                 continue;
             }
+            // A generic helper is meaningful at its call sites. Rendering its
+            // unspecialized declaration as well would introduce abstract tables
+            // even when every checked caller has concrete type arguments.
+            if !f.x.typ_params.is_empty()
+                && in_module.iter().any(|caller| {
+                    caller.x.name != f.x.name
+                        && caller.x.mode == Mode::Spec
+                        && caller.x.params.is_empty()
+                        && is_temp_pred(&caller.x.ret.x.typ)
+                        && reached_functions(functions, &caller.x.name).contains(&f.x.name)
+                        && !reached_functions(functions, &f.x.name).contains(&caller.x.name)
+                })
+            {
+                notes.push(format!(
+                    "{}: generic temporal helper exported at its instantiated call sites",
+                    fun_as_friendly_rust_name(&f.x.name)
+                ));
+                continue;
+            }
             out.push(TemporalSource {
                 function: f.x.name.clone(),
                 span: f.span.clone(),
@@ -6933,8 +6966,8 @@ impl Exporter {
     /// `f().forward(input)`, verus-tla's `Action::forward` on the record a
     /// crate spec fn `f` of no parameters builds: `f`, `forward`, the
     /// receiver `f()` and `input`.
-    fn forward_parts(&self, e: &Expr) -> Option<(Fun, Fun, Expr, Expr)> {
-        let (kind, fun, args) = called(e)?;
+    fn forward_parts(&mut self, e: &Expr) -> Option<(Fun, Fun, Expr, Expr)> {
+        let (kind, fun, typs, args) = called(e)?;
         let forward = self.resolved_fun(&kind, &fun);
         if last_segment(&forward.path) != "forward" || args.len() != 2 {
             return None;
@@ -6945,9 +6978,20 @@ impl Exporter {
         if !typ_datatype(recv_typ).is_some_and(|p| last_segment(&p) == "Action") {
             return None;
         }
+        let forward = self
+            .instantiate_call(&kind, &fun, &typs)
+            .map_err(|reason| {
+                self.refuse(reason, &e.span);
+            })
+            .ok()?;
         let recv = peel(&args[0]);
-        let (k2, f2, a2) = called(&recv)?;
-        let f2 = self.resolved_fun(&k2, &f2);
+        let (k2, f2, t2, a2) = called(&recv)?;
+        let f2 = self
+            .instantiate_call(&k2, &f2, &t2)
+            .map_err(|reason| {
+                self.refuse(reason, &recv.span);
+            })
+            .ok()?;
         let builder = self.functions.get(&f2)?;
         if !a2.is_empty() || !builder.x.params.is_empty() || builder.x.body.is_none() {
             return None;
@@ -6972,7 +7016,16 @@ impl Exporter {
     /// over `(s, s_prime)` printed with `self` bound to `recv` (`f()`), and
     /// `input` its one parameter (none for `()`).
     fn ensure_forward(&mut self, f: &Fun, forward: &Fun, recv: &Expr, has_input: bool) -> String {
-        let key = (f.clone(), Variant::Forward, false);
+        // Both the builder and forward method may depend on type arguments.
+        // Fairness and transition calls must refer to this same specialization.
+        let method = match self.forward_methods.iter().position(|m| m == forward) {
+            Some(i) => i,
+            None => {
+                self.forward_methods.push(forward.clone());
+                self.forward_methods.len() - 1
+            }
+        };
+        let key = (f.clone(), Variant::Forward(method), false);
         let fwd = self.functions[forward].clone();
         let span = self.functions.get(f).map(|b| b.span.clone()).unwrap_or(fwd.span.clone());
         let recv = recv.clone();
@@ -7037,13 +7090,17 @@ impl Exporter {
     /// closure by its operator, `enabled(a)` as `ENABLED`, anything else
     /// reduced to a closure over one state and printed in place.
     fn state_formula(&mut self, p: &Expr, env: &Env) -> String {
-        if let Some((kind, fun, args)) = called(p) {
-            let fun = self.resolved_fun(&kind, &fun);
-            if last_segment(&fun.path) == "enabled" && args.len() == 1 {
+        if let Some((kind, fun, typs, args)) = called(p) {
+            let resolved = self.resolved_fun(&kind, &fun);
+            if last_segment(&resolved.path) == "enabled" && args.len() == 1 {
                 let a = self.action_formula(&args[0], env);
                 return format!("ENABLED ({a})");
             }
             if args.is_empty() {
+                let fun = match self.instantiate_call(&kind, &fun, &typs) {
+                    Ok(fun) => fun,
+                    Err(reason) => return self.refuse(reason, &p.span),
+                };
                 if let Some(name) = self.ensure_closure_root(&fun) {
                     return name;
                 }
@@ -7067,9 +7124,12 @@ impl Exporter {
         if let Some(call) = self.quiet(|x| x.forward_call(a, env)) {
             return call;
         }
-        if let Some((kind, fun, args)) = called(a) {
-            let fun = self.resolved_fun(&kind, &fun);
+        if let Some((kind, fun, typs, args)) = called(a) {
             if args.is_empty() {
+                let fun = match self.instantiate_call(&kind, &fun, &typs) {
+                    Ok(fun) => fun,
+                    Err(reason) => return self.refuse(reason, &a.span),
+                };
                 if let Some(name) = self.quiet(|x| x.ensure_closure_root(&fun)) {
                     return name;
                 }
@@ -7090,7 +7150,7 @@ impl Exporter {
 
     /// `lift_action(a)`'s argument when `e` is one.
     fn lifted_action(&self, e: &Expr) -> Option<Expr> {
-        let (kind, fun, args) = called(e)?;
+        let (kind, fun, _, args) = called(e)?;
         let fun = self.resolved_fun(&kind, &fun);
         (last_segment(&fun.path) == "lift_action" && args.len() == 1).then(|| args[0].clone())
     }
@@ -7114,12 +7174,12 @@ impl Exporter {
                 return self.temporal(&value, &venv, depth + 1, pos);
             }
         }
-        let Some((kind, fun, args)) = called(&e).filter(|_| is_temp_pred(&e.typ)) else {
+        let Some((kind, fun, typs, args)) = called(&e).filter(|_| is_temp_pred(&e.typ)) else {
             let what = format!("temporal formula of kind {}", expr_kind(&e.x));
             return self.refuse(what, &e.span);
         };
-        let fun = self.resolved_fun(&kind, &fun);
-        let name = last_segment(&fun.path);
+        let resolved = self.resolved_fun(&kind, &fun);
+        let name = last_segment(&resolved.path);
         let t = |x: &mut Self, i: usize| x.temporal(&args[i], env, depth + 1, TempPos::Nested);
         match (name.as_str(), args.len()) {
             ("always", 1) => match self.lifted_action(&args[0]) {
@@ -7184,11 +7244,14 @@ impl Exporter {
                         target: CallTarget::Fun(
                             CallTargetKind::Static,
                             Arc::new(FunX {
-                                path: fun.path.pop_segment().push_segment(Arc::new(
+                                path: resolved.path.pop_segment().push_segment(Arc::new(
                                     "forward".to_string(),
                                 )),
                             }),
-                            Arc::new(vec![]),
+                            match &kind {
+                                CallTargetKind::DynamicResolved { typs, .. } => typs.clone(),
+                                _ => typs.clone(),
+                            },
                             Arc::new(vec![]),
                             CallTargetAttrs {
                                 autospec: AutospecUsage::Final,
@@ -7232,17 +7295,23 @@ impl Exporter {
                 "a TempPred built from a closure over the execution (only verus-tla's operators are exported)",
                 &e.span,
             ),
-            _ => match self.inline_call(&fun, &args, env) {
-                Some((body, env2, lets)) => {
-                    let b = self.temporal(&body, &env2, depth + 1, pos);
-                    if lets.is_empty() { b } else { format!("(LET {} IN {b})", lets.join(" ")) }
-                }
-                None => {
-                    let what = format!(
-                        "call to {} (a TempPred with no definition in the crate)",
-                        fun_as_friendly_rust_name(&fun)
-                    );
-                    self.refuse(what, &e.span)
+            _ => {
+                let fun = match self.instantiate_call(&kind, &fun, &typs) {
+                    Ok(fun) => fun,
+                    Err(reason) => return self.refuse(reason, &e.span),
+                };
+                match self.inline_call(&fun, &args, env) {
+                    Some((body, env2, lets)) => {
+                        let b = self.temporal(&body, &env2, depth + 1, pos);
+                        if lets.is_empty() { b } else { format!("(LET {} IN {b})", lets.join(" ")) }
+                    }
+                    None => {
+                        let what = format!(
+                            "call to {} (a TempPred with no definition in the crate)",
+                            fun_as_friendly_rust_name(&fun)
+                        );
+                        self.refuse(what, &e.span)
+                    }
                 }
             },
         }
@@ -7250,12 +7319,12 @@ impl Exporter {
 
     /// A spec's conjuncts: `.and` chains split, and a crate spec fn of no
     /// parameters returning a `TempPred` (`spec()`, `fairness()`) opened.
-    fn spec_conjuncts(&self, e: &Expr, depth: usize) -> Vec<Expr> {
+    fn spec_conjuncts(&mut self, e: &Expr, depth: usize) -> Vec<Expr> {
         let e = peel(e);
         if depth < 16 {
-            if let Some((kind, fun, args)) = called(&e) {
-                let fun = self.resolved_fun(&kind, &fun);
-                let name = last_segment(&fun.path);
+            if let Some((kind, fun, typs, args)) = called(&e) {
+                let resolved = self.resolved_fun(&kind, &fun);
+                let name = last_segment(&resolved.path);
                 if name == "and" && args.len() == 2 && is_temp_pred(&e.typ) {
                     let mut out = self.spec_conjuncts(&args[0], depth + 1);
                     out.extend(self.spec_conjuncts(&args[1], depth + 1));
@@ -7265,6 +7334,9 @@ impl Exporter {
                     && is_temp_pred(&e.typ)
                     && !TEMPORAL_PRIMITIVES.contains(&name.as_str())
                 {
+                    let Ok(fun) = self.instantiate_call(&kind, &fun, &typs) else {
+                        return vec![e];
+                    };
                     if let Some(body) = self.functions.get(&fun).and_then(|f| f.x.body.clone()) {
                         return self.spec_conjuncts(&body, depth + 1);
                     }
@@ -7277,16 +7349,16 @@ impl Exporter {
     /// Whether the spec conjunct `e` is fairness TLC takes in a `Spec`:
     /// `weak_fairness` (`WF_vars`), under `tla_forall` and `and`; nothing
     /// else (`always`, a disjunction of fairness, ...) goes into `Spec`.
-    fn is_fairness(&self, e: &Expr, depth: usize) -> bool {
+    fn is_fairness(&mut self, e: &Expr, depth: usize) -> bool {
         if depth > 16 {
             return false;
         }
         let e = peel(e);
-        let Some((kind, fun, args)) = called(&e).filter(|_| is_temp_pred(&e.typ)) else {
+        let Some((kind, fun, typs, args)) = called(&e).filter(|_| is_temp_pred(&e.typ)) else {
             return false;
         };
-        let fun = self.resolved_fun(&kind, &fun);
-        match (last_segment(&fun.path).as_str(), args.len()) {
+        let resolved = self.resolved_fun(&kind, &fun);
+        match (last_segment(&resolved.path).as_str(), args.len()) {
             ("weak_fairness", 1 | 2) => true,
             ("and", 2) => args.iter().all(|a| self.is_fairness(a, depth + 1)),
             ("tla_forall", 1) => match &peel(&args[0]).x {
@@ -7295,11 +7367,11 @@ impl Exporter {
                 }
                 _ => false,
             },
-            (name, 0) if !TEMPORAL_PRIMITIVES.contains(&name) => self
-                .functions
-                .get(&fun)
-                .and_then(|f| f.x.body.clone())
-                .is_some_and(|b| self.is_fairness(&b, depth + 1)),
+            (name, 0) if !TEMPORAL_PRIMITIVES.contains(&name) => {
+                let Ok(fun) = self.instantiate_call(&kind, &fun, &typs) else { return false };
+                let body = self.functions.get(&fun).and_then(|f| f.x.body.clone());
+                body.is_some_and(|b| self.is_fairness(&b, depth + 1))
+            }
             _ => false,
         }
     }
@@ -7324,8 +7396,8 @@ impl Exporter {
 
     /// Whether the spec conjunct `c` is `lift_state(init())` (`is_init`) or
     /// `always(lift_action(next()))`, for the recognised `init`/`next`.
-    fn names_root(&self, c: &Expr, root: &Fun, is_init: bool) -> bool {
-        let Some((kind, fun, args)) = called(c) else { return false };
+    fn names_root(&mut self, c: &Expr, root: &Fun, is_init: bool) -> bool {
+        let Some((kind, fun, _, args)) = called(c) else { return false };
         let fun = self.resolved_fun(&kind, &fun);
         let inner = match (last_segment(&fun.path).as_str(), args.len(), is_init) {
             ("lift_state", 1, true) => args[0].clone(),
@@ -7335,7 +7407,9 @@ impl Exporter {
             },
             _ => return false,
         };
-        called(&inner).is_some_and(|(k, f, a)| a.is_empty() && self.resolved_fun(&k, &f) == *root)
+        called(&inner).is_some_and(|(k, f, ts, a)| {
+            a.is_empty() && self.instantiate_call(&k, &f, &ts).is_ok_and(|f| f == *root)
+        })
     }
 }
 
@@ -8769,6 +8843,7 @@ pub fn export_module(
             .collect(),
         tables: BTreeMap::new(),
         table_names: HashMap::new(),
+        forward_methods: Vec::new(),
     };
     for v in &state_vars {
         ex.used_names.insert(v.clone());

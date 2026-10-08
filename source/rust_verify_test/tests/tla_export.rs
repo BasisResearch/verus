@@ -10063,3 +10063,275 @@ pub open spec fn inv(s: State) -> bool { s.x }
     assert!(run.violated.is_empty(), "{:?}", run);
     assert_eq!(run.distinct, 1);
 }
+
+/// A shared verus-tla model with two deliberately opposite dispatch instances.
+fn generic_temporal_model(body: &str) -> String {
+    format!(
+        r#"
+use vstd::prelude::*;
+verus! {{
+{defs}
+use defs::*;
+use action::*;
+pub trait Pick {{ spec fn choose() -> bool; }}
+impl Pick for bool {{ open spec fn choose() -> bool {{ true }} }}
+impl Pick for int {{ open spec fn choose() -> bool {{ false }} }}
+pub struct State {{ pub x: bool }}
+pub open spec fn init() -> StatePred<State> {{ |s: State| s.x }}
+{body}
+}}
+"#,
+        defs = verus_tla_defs()
+    )
+}
+
+#[test]
+fn tla_export_generic_forward_instances_and_fairness() {
+    for (fairness, property, accepts) in [
+        ("", "always(lift_state(|s: State| s.x))", false),
+        (".and(fair::<int>())", "eventually(lift_state(|s: State| !s.x))", true),
+    ] {
+        let fair_helper = if accepts {
+            "pub open spec fn fair<T: Pick>() -> TempPred<State> { make::<T>().weak_fairness(()) }"
+        } else {
+            ""
+        };
+        let code = generic_temporal_model(&format!(
+            r#"
+pub open spec fn make<T: Pick>() -> Action<State, (), ()> {{
+    Action {{ precondition: |i: (), s: State| true,
+        transition: |i: (), s: State| (State {{ x: T::choose() }}, ()) }}
+}}
+{fair_helper}
+pub open spec fn next() -> ActionPred<State> {{
+    |s: State, post: State| make::<bool>().forward(())(s, post) || make::<int>().forward(())(s, post)
+}}
+pub open spec fn spec() -> TempPred<State> {{
+    lift_state(init()).and(always(lift_action(next()))){fairness}
+}}
+pub open spec fn property() -> TempPred<State> {{ {property} }}
+proof fn both_transitions(s: State) {{
+    assert(make::<bool>().forward(())(s, State {{ x: true }}));
+    assert(make::<int>().forward(())(s, State {{ x: false }}));
+}}
+"#
+        ));
+        let ex = export_code(&code, "test_crate");
+        assert_eq!(ex.report["holes"], serde_json::json!([]), "{}", ex.tla);
+        assert_eq!(ex.report["refusals"], serde_json::json!([]), "{}", ex.tla);
+        if accepts {
+            assert_eq!(ex.report["fairness_in_spec"], true, "{}", ex.report);
+        }
+        let Some(jar) = tla_tools() else { continue };
+        sany(&jar, &ex.spec());
+        let out = tlc_output_with(&jar, &ex.spec(), &ex.cfg, &[]);
+        assert!(out.contains("2 distinct states found"), "{}", out);
+        if accepts {
+            assert!(out.contains("No error has been found"), "{}", out);
+        } else {
+            assert!(out.contains("is violated") && out.contains("x = FALSE"), "{}", out);
+        }
+    }
+}
+
+#[test]
+fn tla_export_specializes_named_temporal_helpers() {
+    for (helper, expression) in [
+        (
+            "pub open spec fn pred<T: Pick>() -> StatePred<State> { |s: State| T::choose() }",
+            "always(lift_state(pred::<ARG>()))",
+        ),
+        (
+            "pub open spec fn pred<T: Pick>() -> ActionPred<State> { |s: State, post: State| T::choose() }",
+            "always(lift_action(pred::<ARG>()))",
+        ),
+        (
+            "pub open spec fn pred<T: Pick>() -> TempPred<State> { always(lift_state(|s: State| T::choose())) }",
+            "pred::<ARG>()",
+        ),
+    ] {
+        for (argument, accepts) in [("bool", true), ("int", false)] {
+            let property = expression.replace("ARG", argument);
+            let code = generic_temporal_model(&format!(
+                r#"
+{helper}
+pub open spec fn next() -> ActionPred<State> {{ |s: State, post: State| post.x == !s.x }}
+pub open spec fn spec() -> TempPred<State> {{ lift_state(init()).and(always(lift_action(next()))) }}
+pub open spec fn property() -> TempPred<State> {{ {property} }}
+"#
+            ));
+            let ex = export_code(&code, "test_crate");
+            assert_eq!(ex.report["holes"], serde_json::json!([]), "{}", ex.tla);
+            assert_eq!(ex.report["refusals"], serde_json::json!([]), "{}", ex.tla);
+            let property = ex.report["properties"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|p| p["function"].as_str().unwrap().ends_with("::property"))
+                .unwrap();
+            assert_eq!(property["included"], true, "{}", ex.report);
+            let Some(jar) = tla_tools() else { continue };
+            sany(&jar, &ex.spec());
+            let out = tlc_output_with(&jar, &ex.spec(), &ex.cfg, &[]);
+            if accepts {
+                assert!(
+                    out.contains("No error has been found")
+                        && out.contains("2 distinct states found"),
+                    "{}",
+                    out
+                );
+            } else {
+                assert!(out.contains("violated"), "{}", out);
+            }
+        }
+    }
+}
+
+#[test]
+fn tla_export_keeps_temporal_predicate_instances_distinct() {
+    let code = generic_temporal_model(
+        r#"
+pub open spec fn pred<T: Pick>() -> StatePred<State> { |s: State| T::choose() }
+pub open spec fn both() -> TempPred<State> {
+    lift_state(pred::<bool>()).and(not(lift_state(pred::<int>())))
+}
+pub open spec fn next() -> ActionPred<State> { |s: State, post: State| post.x == !s.x }
+pub open spec fn spec() -> TempPred<State> { lift_state(init()).and(always(lift_action(next()))) }
+pub open spec fn property() -> TempPred<State> { always(both()) }
+"#,
+    );
+    let ex = export_code(&code, "test_crate");
+    assert_eq!(ex.report["holes"], serde_json::json!([]), "{}", ex.tla);
+    assert_eq!(ex.report["refusals"], serde_json::json!([]), "{}", ex.tla);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let out = tlc_output_with(&jar, &ex.spec(), &ex.cfg, &[]);
+    assert!(
+        out.contains("No error has been found") && out.contains("2 distinct states found"),
+        "{}",
+        out
+    );
+}
+
+/// The builder can be type-independent even when its forward method is not.
+#[test]
+fn tla_export_specializes_forward_methods_with_shared_builder() {
+    let code = generic_temporal_model(
+        r#"
+pub mod custom {
+    use super::*;
+    #[verifier::reject_recursive_types(T)]
+    pub struct Action<T> { pub marker: spec_fn(T) -> bool }
+    impl<T: Pick> Action<T> {
+        pub open spec fn forward(self, input: ()) -> ActionPred<State> {
+            |s: State, post: State| post.x == T::choose()
+        }
+    }
+}
+pub open spec fn make<T: Pick>() -> custom::Action<T> { custom::Action { marker: |v: T| true } }
+pub open spec fn next() -> ActionPred<State> {
+    |s: State, post: State| make::<bool>().forward(())(s, post) || make::<int>().forward(())(s, post)
+}
+pub open spec fn spec() -> TempPred<State> { lift_state(init()).and(always(lift_action(next()))) }
+pub open spec fn property() -> TempPred<State> { always(lift_state(|s: State| s.x)) }
+"#,
+    );
+    let ex = export_code(&code, "test_crate");
+    assert_eq!(ex.report["holes"], serde_json::json!([]), "{}", ex.tla);
+    assert_eq!(ex.report["refusals"], serde_json::json!([]), "{}", ex.tla);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let out = tlc_output_with(&jar, &ex.spec(), &ex.cfg, &[]);
+    assert!(
+        out.contains("2 distinct states found")
+            && out.contains("is violated")
+            && out.contains("x = FALSE"),
+        "{}",
+        out
+    );
+}
+
+#[test]
+fn tla_export_does_not_merge_different_temporal_spec_receivers() {
+    let code = generic_temporal_model(
+        r#"
+pub open spec fn next() -> ActionPred<State> { |s: State, post: State| post.x == s.x }
+pub open spec fn model<T: Pick>() -> TempPred<State> {
+    lift_state(init()).and(always(lift_action(next()))).and(lift_state(|s: State| T::choose()))
+}
+pub proof fn bad()
+    requires model::<int>().entails(lift_state(|s: State| false)),
+    ensures model::<bool>().entails(eventually(lift_state(|s: State| false))),
+{ admit(); }
+"#,
+    );
+    let ex = export_code(&code, "test_crate");
+    assert_eq!(ex.report["holes"], serde_json::json!([]), "{}", ex.tla);
+    assert_eq!(ex.report["refusals"], serde_json::json!([]), "{}", ex.tla);
+    // The deliberately admitted property is false. A requirement on another
+    // spec instance must not be imported as FALSE and make this check vacuous.
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let out = tlc_output_with(&jar, &ex.spec(), &ex.cfg, &[]);
+    assert!(out.contains("violated") && out.contains("1 distinct states found"), "{}", out);
+}
+
+#[test]
+fn tla_export_refuses_ambiguous_temporal_dispatch() {
+    for expression in ["lift_state(pred::<Concrete>())", "wrapped::<Concrete>()"] {
+        let code = generic_temporal_model(&format!(
+            r#"
+pub trait Marker {{}}
+pub struct Concrete;
+impl<T: Marker> Pick for T {{ open spec fn choose() -> bool {{ false }} }}
+impl Pick for Concrete {{ open spec fn choose() -> bool {{ true }} }}
+pub mod helpers {{
+use super::*;
+pub open spec fn pred<T: Pick>() -> StatePred<State> {{ |s: State| T::choose() }}
+pub open spec fn wrapped<T: Pick>() -> TempPred<State> {{ lift_state(pred::<T>()) }}
+}}
+use helpers::*;
+pub open spec fn next() -> ActionPred<State> {{ |s: State, post: State| post.x == s.x }}
+pub open spec fn spec() -> TempPred<State> {{ lift_state(init()).and(always(lift_action(next()))) }}
+pub open spec fn property() -> TempPred<State> {{ {expression} }}
+"#
+        ));
+        let ex = export_code(&code, "test_crate");
+        assert!(
+            ex.report["refusals"].as_array().unwrap().iter().any(|r| r["what"]
+                .as_str()
+                .unwrap()
+                .contains("ambiguous concrete trait implementation")
+                && r["location"].as_str().unwrap().contains("test.rs:")),
+            "{}",
+            ex.report
+        );
+        assert!(
+            !ex.report["holes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|h| h["kind"] == "uninterpreted_function"),
+            "{}",
+            ex.report
+        );
+        let property = ex.report["properties"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["function"].as_str().unwrap().ends_with("::property"))
+            .unwrap();
+        assert_eq!(property["included"], false, "{}", ex.report);
+        let Some(jar) = tla_tools() else { continue };
+        sany(&jar, &ex.spec());
+        // Explicitly asking TLC to evaluate the refused property must stop it.
+        let cfg = format!("{}\nPROPERTY {}\n", ex.cfg, property["operator"].as_str().unwrap());
+        let out = tlc_output_with(&jar, &ex.spec(), &cfg, &[]);
+        assert!(
+            out.contains("Assert evaluated to FALSE")
+                && out.contains("ambiguous concrete trait implementation"),
+            "{}",
+            out
+        );
+    }
+}
