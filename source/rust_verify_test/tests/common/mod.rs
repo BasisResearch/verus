@@ -291,9 +291,13 @@ pub fn run_verus(
     let mut no_external_by_default = false;
     let mut is_core = false;
     let mut use_internal_test_mode = true;
+    let mut incremental_cache = None;
 
     for option in options.iter() {
-        if *option == "--expand-errors" {
+        if let Some(dir) = option.strip_prefix("--incremental-cache=") {
+            // the per-query verdict cache (rust_verify/src/incremental.rs), set through the environment
+            incremental_cache = Some(dir.to_string());
+        } else if *option == "--expand-errors" {
             verus_args.push("--expand-errors".to_string());
             verus_args.push("--multiple-errors".to_string());
             verus_args.push("2".to_string());
@@ -433,6 +437,9 @@ pub fn run_verus(
                 }
             }),
     );
+    if let Some(dir) = incremental_cache {
+        child.env("VERUS_INCREMENTAL_CACHE", dir);
+    }
     let child = child
         .args(&verus_args[..])
         .stdout(std::process::Stdio::piped())

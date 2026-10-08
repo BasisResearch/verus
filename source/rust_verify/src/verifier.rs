@@ -1,10 +1,11 @@
 use crate::boundary_suggestions::build_boundary_suggestion;
-use crate::commands::{OpGenerator, OpKind, QueryOp, Style};
+use crate::commands::{ContextOp, OpGenerator, OpKind, QueryOp, Style};
 use crate::config::{Args, CargoVerusArgs, ShowTriggers};
 use crate::context::{ContextX, ErasureInfo};
 use crate::debugger::Debugger;
 use crate::external::VerifOrExternal;
 use crate::externs::VerusExterns;
+use crate::incremental::{self, BatchOwner};
 use crate::rust_to_vir_base::mk_crate_id;
 use crate::spans::{SpanContext, SpanContextX, from_raw_span};
 use crate::user_filter::UserFilter;
@@ -353,6 +354,9 @@ pub struct Verifier {
     expand_flag: bool,
 
     error_format: Option<ErrorOutputType>,
+
+    /// The per-query verdict cache `VERUS_INCREMENTAL_CACHE` names, if any.
+    incremental: Option<Arc<incremental::Cache>>,
 }
 
 #[derive(serde::Serialize)]
@@ -480,14 +484,20 @@ impl From<VirErr> for VerifyErr {
 }
 
 /// A titled group of AIR commands.
-struct CommandBatch {
+pub(crate) struct CommandBatch {
     title: String,
-    commands: Commands,
+    pub(crate) commands: Commands,
+    /// What the batch is about, for the incremental cache's fingerprints.
+    pub(crate) owner: BatchOwner,
 }
 
 impl CommandBatch {
     fn new(title: impl Into<String>, commands: Commands) -> Self {
-        CommandBatch { title: title.into(), commands }
+        CommandBatch { title: title.into(), commands, owner: BatchOwner::Module }
+    }
+
+    fn owned(title: impl Into<String>, commands: Commands, owner: BatchOwner) -> Self {
+        CommandBatch { title: title.into(), commands, owner }
     }
 }
 
@@ -499,6 +509,7 @@ impl Verifier {
         dep_tracker: crate::cargo_verus_dep_tracker::DepTracker,
     ) -> Verifier {
         let compile = args.compile || via_cargo_compile;
+        let incremental = incremental::Cache::from_env(&args);
 
         Verifier {
             num_threads: 1,
@@ -542,6 +553,7 @@ impl Verifier {
 
             expand_flag: false,
             error_format: None,
+            incremental,
         }
     }
 
@@ -591,6 +603,7 @@ impl Verifier {
 
             expand_flag: self.expand_flag,
             error_format: self.error_format,
+            incremental: self.incremental.clone(),
         }
     }
 
@@ -759,9 +772,19 @@ impl Verifier {
         context: &CommandContext,
         prover_choice: vir::def::ProverChoice,
         default_prover_failed_assert_ids: &mut Vec<AssertId>,
+        inc: Option<&incremental::BucketCache>,
+        plan: &mut Option<incremental::Plan>,
     ) -> RunCommandQueriesResult {
         let is_singular = prover_choice == vir::def::ProverChoice::Singular;
         let message_interface = Arc::new(vir::messages::VirMessageInterface {});
+
+        // The incremental cache: a hit replays the recorded rounds in place of the solver's
+        // answers; a miss records the solver's answers round by round.
+        let mut replay =
+            plan.as_mut().and_then(|plan| plan.replay.take()).map(|rounds| rounds.into_iter());
+        let replayed = replay.is_some();
+        let mut recording = plan.is_some() && inc.is_some() && !replayed;
+        let mut rounds: Vec<incremental::Round> = Vec::new();
 
         let do_report_long_running = self.args.report_long_running;
         let report_long_running = || {
@@ -811,7 +834,9 @@ impl Verifier {
         let is_check_valid = matches!(**command, CommandX::CheckValid(_));
         let time0 = Instant::now();
         #[cfg(feature = "singular")]
-        let mut result = if !is_singular {
+        let mut result = if let Some(rounds) = &mut replay {
+            rounds.next().expect("internal error: an empty cache record").into_result()
+        } else if !is_singular {
             air_context.command(
                 &*message_interface,
                 reporter,
@@ -829,16 +854,26 @@ impl Verifier {
         };
 
         #[cfg(not(feature = "singular"))]
-        let mut result = air_context.command(
-            &*message_interface,
-            reporter,
-            &command,
-            QueryContext { report_long_running: Some(&mut report_long_running()) },
-        );
+        let mut result = if let Some(rounds) = &mut replay {
+            rounds.next().expect("internal error: an empty cache record").into_result()
+        } else {
+            air_context.command(
+                &*message_interface,
+                reporter,
+                &command,
+                QueryContext { report_long_running: Some(&mut report_long_running()) },
+            )
+        };
 
         let time1 = Instant::now();
         let bucket_time = self.bucket_stats.get_mut(bucket_id).expect("bucket time not found");
         bucket_time.time_air += time1 - time0;
+        if recording {
+            match inc.and_then(|inc| inc.round(&result, air_context.last_failure())) {
+                Some(round) => rounds.push(round),
+                None => recording = false,
+            }
+        }
 
         let mut is_first_check = true;
         let mut checks_remaining = self.args.multiple_errors;
@@ -975,16 +1010,29 @@ impl Verifier {
                     }
 
                     let time0 = Instant::now();
-                    result = air_context.check_valid_again(
-                        reporter,
-                        only_check_earlier,
-                        QueryContext { report_long_running: Some(&mut report_long_running()) },
-                    );
+                    result = if let Some(rounds) = &mut replay {
+                        rounds
+                            .next()
+                            .expect("internal error: a cache record cut short")
+                            .into_result()
+                    } else {
+                        air_context.check_valid_again(
+                            reporter,
+                            only_check_earlier,
+                            QueryContext { report_long_running: Some(&mut report_long_running()) },
+                        )
+                    };
                     let time1 = Instant::now();
 
                     let bucket_time =
                         self.bucket_stats.get_mut(bucket_id).expect("bucket time not found");
                     bucket_time.time_air += time1 - time0;
+                    if recording {
+                        match inc.and_then(|inc| inc.round(&result, air_context.last_failure())) {
+                            Some(round) => rounds.push(round),
+                            None => recording = false,
+                        }
+                    }
                 }
                 ValidityResult::UnexpectedOutput(err) => {
                     util::PANIC_ON_DROP_VEC.store(false, std::sync::atomic::Ordering::SeqCst);
@@ -1001,8 +1049,13 @@ impl Verifier {
             reporter.report(&note(&context.span, msg).to_any());
         }
 
-        if is_check_valid && !is_singular {
+        if is_check_valid && !is_singular && !replayed {
             air_context.finish_query();
+        }
+        if recording {
+            if let (Some(inc), Some(plan)) = (inc, plan.as_ref()) {
+                inc.store(plan, rounds);
+            }
         }
 
         RunCommandQueriesResult {
@@ -1070,6 +1123,8 @@ impl Verifier {
         comment: &str,
         desc_prefix: Option<&str>,
         default_prover_failed_assert_ids: &mut Vec<AssertId>,
+        inc: Option<&incremental::BucketCache>,
+        plans: &mut [Option<incremental::Plan>],
     ) -> RunCommandQueriesResult {
         let user_filter = self.user_filter.as_ref().unwrap();
         let includes_function = user_filter.includes_function(function_name);
@@ -1096,7 +1151,8 @@ impl Verifier {
             air_context.comment(comment);
             air_context.comment(&context.span.as_string);
         }
-        for command in commands.iter() {
+        let mut none = None;
+        for (i, command) in commands.iter().enumerate() {
             result = result
                 + self.check_result_validity(
                     bucket_id,
@@ -1111,6 +1167,8 @@ impl Verifier {
                     &context,
                     *prover_choice,
                     default_prover_failed_assert_ids,
+                    inc,
+                    plans.get_mut(i).unwrap_or(&mut none),
                 );
         }
 
@@ -1360,6 +1418,13 @@ impl Verifier {
             profile_all_file_name.as_ref(),
             vir::def::ProverChoice::DefaultProver,
         )?;
+        let mut inc = self.incremental.clone().map(|cache| {
+            let prelude = ctx.prelude(PreludeConfig {
+                arch_word_bits: ctx.arch_word_bits,
+                solver: self.args.solver,
+            });
+            incremental::BucketCache::new(cache, &prelude)
+        });
         if self.args.solver_version_check {
             air_context.set_expected_solver_version(match self.args.solver {
                 air::context::SmtSolver::Z3 => crate::consts::EXPECTED_Z3_VERSION.to_string(),
@@ -1388,7 +1453,7 @@ impl Verifier {
                 "Associated-Type-Decls",
                 vir::assoc_types_to_air::assoc_type_decls_to_air(ctx, &krate.traits),
             ),
-            CommandBatch::new(
+            CommandBatch::owned(
                 "Datatypes",
                 vir::datatype_to_air::datatypes_and_primitives_to_air(
                     ctx,
@@ -1399,6 +1464,7 @@ impl Verifier {
                         .cloned()
                         .collect(),
                 ),
+                BatchOwner::Datatypes,
             ),
             CommandBatch::new("Trait-Bounds", vir::traits::trait_bound_axioms(ctx, &krate.traits)),
             CommandBatch::new(
@@ -1432,7 +1498,11 @@ impl Verifier {
             ctx.fun = vir::ast_to_sst_func::mk_fun_ctx(function, false);
             let commands = vir::sst_to_air_func::func_name_to_air(ctx, reporter, function)?;
             let title = "Function-Decl ".to_string() + &fun_as_friendly_rust_name(&function.x.name);
-            bucket_context.push(CommandBatch::new(title, commands));
+            bucket_context.push(CommandBatch::owned(
+                title,
+                commands,
+                BatchOwner::function(&function.x.name),
+            ));
         }
         ctx.fun = None;
 
@@ -1484,8 +1554,17 @@ impl Verifier {
                     break;
                 };
                 match &op.kind {
-                    OpKind::Context(_context_op, commands) => {
-                        let batch = CommandBatch::new(op.to_air_comment(), commands.clone());
+                    OpKind::Context(context_op, commands) => {
+                        // An item's own axioms are read by the queries that reach what it
+                        // declares; a broadcast axiom or a trait-impl axiom can fire anywhere.
+                        let owner = match (context_op, &op.function) {
+                            (ContextOp::ReqEns | ContextOp::SpecDefinition, Some(function)) => {
+                                BatchOwner::function(&function.x.name)
+                            }
+                            _ => BatchOwner::Module,
+                        };
+                        let batch =
+                            CommandBatch::owned(op.to_air_comment(), commands.clone(), owner);
                         self.run_command_batch(bucket_id, reporter, &mut air_context, &batch);
                         bucket_context.push(batch);
                     }
@@ -1529,12 +1608,38 @@ impl Verifier {
                                     "Found singular command when Verus is compiled without Singular feature"
                                 );
                             }
+                            // The incremental cache's plan for each check of this query (one
+                            // the user filter keeps): a check it replays sends nothing to a
+                            // solver, and a spun-off query whose every check it replays needs
+                            // no solver of its own.
+                            let selected = self
+                                .user_filter
+                                .as_ref()
+                                .map_or(true, |filter| filter.includes_function(&function.x.name));
+                            let mut plans: Vec<Option<incremental::Plan>> = match &mut inc {
+                                Some(inc) if selected && !self.expand_flag && !*profile_rerun => {
+                                    inc.plan(
+                                        &bucket_context,
+                                        cmds,
+                                        &fun_as_friendly_rust_name(&function.x.name),
+                                        incremental::kind_name(query_op),
+                                        function.x.attrs.rlimit.unwrap_or(self.args.rlimit),
+                                        self.args.multiple_errors,
+                                    )
+                                }
+                                _ => cmds.commands.iter().map(|_| None).collect(),
+                            };
+                            let all_replayed = !plans.is_empty()
+                                && plans.iter().all(|plan| {
+                                    plan.as_ref().map_or(false, |plan| plan.replay.is_some())
+                                });
                             let mut spinoff_z3_context;
-                            let do_spinoff = (cmds.prover_choice
+                            let do_spinoff = ((cmds.prover_choice
                                 == vir::def::ProverChoice::Nonlinear)
                                 || (cmds.prover_choice == vir::def::ProverChoice::BitVector)
                                 || *profile_rerun
-                                || self.args.spinoff_all;
+                                || self.args.spinoff_all)
+                                && !all_replayed;
 
                             let profile_file_name = if *profile_rerun
                                 || ((self.args.profile_all || self.args.capture_profiles)
@@ -1623,6 +1728,8 @@ impl Verifier {
                                 &op.to_air_comment(),
                                 None,
                                 &mut default_prover_failed_assert_ids,
+                                inc.as_ref(),
+                                &mut plans,
                             );
                             func_curr_smt_time +=
                                 query_air_context.get_time().1 - iter_curr_smt_time;
@@ -3372,6 +3479,9 @@ impl VerifierCallbacksEraseMacro {
                     ""
                 }
             );
+        }
+        if let Some(cache) = &self.verifier.incremental {
+            cache.finish(&self.verifier.args);
         }
     }
 }
