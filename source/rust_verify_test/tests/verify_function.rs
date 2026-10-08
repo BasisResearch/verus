@@ -74,6 +74,31 @@ mod sixth {
     impl cell { proof fn f() { assert(13int == 13); } }
     }
 }
+mod line {
+    use vstd::prelude::*;
+    verus! {
+    proof fn f() { assert(14int == 14); }
+    #[allow(non_camel_case_types)]
+    pub struct line {}
+    impl line { proof fn f() { assert(15int == 15); } }
+    }
+}
+mod eighth {
+    use vstd::prelude::*;
+    verus! {
+    #[allow(non_camel_case_types)]
+    pub struct first {}
+    impl first { proof fn shared() { assert(16int == 16); } }
+    }
+}
+mod ninth {
+    use vstd::prelude::*;
+    verus! {
+    pub struct G<T> { t: T }
+    impl G<u8> { proof fn g() { assert(17int == 17); } }
+    impl G<u16> { proof fn g() { assert(18int == 18); } }
+    }
+}
 "#;
 
 // `gamma` fails, so a run that verifies it reports an error.
@@ -219,7 +244,7 @@ fn verify_function_in_two_modules_requires_qualifying_a_shared_name() {
     assert_eq!(
         error_lines(&stderr),
         [
-            "--verify-function shared matches functions in more than one module, qualify it with the module (e.g. first::shared),",
+            "--verify-function shared matches more than one function, use a name that matches only one (e.g. first::shared),",
             "matched results are:",
             "- first::shared",
             "- second::shared",
@@ -286,10 +311,13 @@ fn verify_function_qualified_with_one_module() {
     assert!(output.status.success(), "{}", stderr);
     assert_eq!(stdout, results(1));
 
-    // The hints keep the qualifier
+    // The hint's wildcard matches the same names, so it selects the functions listed
     let (output, _, stderr) = run(&["crate::alph"]);
     assert!(!output.status.success());
-    assert!(stderr.contains("consider using wildcard crate::*alph*"), "{}", stderr);
+    assert!(stderr.contains("consider using wildcard *crate::alph* "), "{}", stderr);
+    let (output, stdout, stderr) = run(&["*crate::alph*"]);
+    assert!(output.status.success(), "{}", stderr);
+    assert_eq!(stdout, results(2));
 }
 
 #[test]
@@ -347,7 +375,7 @@ fn verify_function_qualified_and_unqualified_readings_are_ambiguous() {
     assert_eq!(
         error_lines(&stderr),
         [
-            "--verify-function cell::f matches functions in more than one module, qualify it with the module (e.g. crate::cell::f),",
+            "--verify-function cell::f matches more than one function, use a name that matches only one (e.g. crate::cell::f),",
             "matched results are:",
             "- cell::f",
             "- fifth::cell::f",
@@ -362,17 +390,107 @@ fn verify_function_qualified_and_unqualified_readings_are_ambiguous() {
     assert_eq!(stderr.matches("note: verifying module sixth").count(), 0, "{}", stderr);
 }
 
-// `moved` is owned by `first` but named by the path of `second::Item`, from the crate's name,
-// so it is listed (and matched) by that name, without `first::` before it.
+// `moved` is owned by `first` but named by the path of `second::Item`,
+// so it is listed by that path from the crate root, and matched by it with or without `crate::`
+// (or by its full name, as on main).
 #[test]
-fn verify_function_lists_a_name_from_another_module_as_is() {
+fn verify_function_names_a_function_by_its_path_from_the_crate_root() {
     let (output, _, stderr) = run_in(&["first", "second"], &["zzz"]);
     assert!(!output.status.success());
     let lines = error_lines(&stderr);
-    assert!(lines.contains(&"- fixture::second::Item::moved".to_string()), "{}", stderr);
+    assert!(lines.contains(&"- second::Item::moved".to_string()), "{}", stderr);
     assert!(!stderr.contains("first::fixture"), "{}", stderr);
 
-    let (output, stdout, stderr) = run_in(&["first", "second"], &["fixture::second::Item::moved"]);
+    for pattern in
+        ["crate::second::Item::moved", "second::Item::moved", "fixture::second::Item::moved"]
+    {
+        for modules in [&["first", "second"][..], &["first"][..]] {
+            let (output, stdout, stderr) = run_in(modules, &[pattern]);
+            assert!(output.status.success(), "{pattern}: {}", stderr);
+            assert_eq!(stdout, results(1), "{pattern}");
+        }
+    }
+}
+
+// Two functions of one module that match the same name are ambiguous too,
+// unless a single module is selected and the pattern works on main.
+#[test]
+fn verify_function_ambiguity_within_one_module() {
+    // `line::f` is the path of `f` in module `line`, and the name of the method `f` of `line::line`
+    let (output, stdout, stderr) = run_in(&["line", "first"], &["line::f"]);
+    assert!(!output.status.success());
+    assert!(!stdout.contains("verified"), "{}", stdout);
+    assert_eq!(
+        error_lines(&stderr),
+        [
+            "--verify-function line::f matches more than one function, use a name that matches only one (e.g. crate::line::f),",
+            "matched results are:",
+            "- line::f",
+            "- line::line::f",
+        ]
+    );
+    for pattern in ["crate::line::f", "line::line::f"] {
+        let (output, stdout, stderr) = run_in(&["line", "first"], &[pattern]);
+        assert!(output.status.success(), "{pattern}: {}", stderr);
+        assert_eq!(stdout, results(1), "{pattern}");
+    }
+
+    // As on main: with `line` alone, `line::f` is the method's name relative to the module
+    let (output, stdout, stderr) = run_in(&["line"], &["line::f"]);
     assert!(output.status.success(), "{}", stderr);
     assert_eq!(stdout, results(1));
+}
+
+// The example in the hint is a name that the same rule resolves to one function:
+// `first::shared` is also the method `shared` of `eighth::first`, so the hint is `crate::first::shared`.
+#[test]
+fn verify_function_hint_names_just_one_function() {
+    let modules = ["first", "second", "eighth"];
+    let (output, _, stderr) = run_in(&modules, &["shared"]);
+    assert!(!output.status.success());
+    assert_eq!(
+        error_lines(&stderr),
+        [
+            "--verify-function shared matches more than one function, use a name that matches only one (e.g. crate::first::shared),",
+            "matched results are:",
+            "- first::shared",
+            "- second::shared",
+        ]
+    );
+    let (output, stdout, stderr) = run_in(&modules, &["crate::first::shared"]);
+    assert!(output.status.success(), "{}", stderr);
+    assert_eq!(stdout, results(1));
+    assert_eq!(stderr.matches("note: verifying module eighth").count(), 0, "{}", stderr);
+}
+
+// `G<u8>::g` and `G<u16>::g` are both named `G::g`: main verifies both with one module,
+// and with several modules no name selects just one, so the hint is a wildcard.
+#[test]
+fn verify_function_functions_with_the_same_name() {
+    let (output, stdout, stderr) = run_in(&["ninth"], &["G::g"]);
+    assert!(output.status.success(), "{}", stderr);
+    assert_eq!(stdout, results(2));
+
+    let (output, _, stderr) = run_in(&["ninth", "first"], &["G::g"]);
+    assert!(!output.status.success());
+    assert_eq!(
+        error_lines(&stderr),
+        [
+            "--verify-function G::g matches more than one function and no name matches only one of them, consider using wildcard G::g* to verify them all,",
+            "matched results are:",
+            "- ninth::G::g",
+            "- ninth::G::g",
+        ]
+    );
+    let (output, stdout, stderr) = run_in(&["ninth", "first"], &["G::g*"]);
+    assert!(output.status.success(), "{}", stderr);
+    assert_eq!(stdout, results(2));
+}
+
+#[test]
+fn verify_function_repeated_bad_pattern_reports_once() {
+    let (_, _, single_stderr) = run(&["delta"]);
+    let (output, _, stderr) = run(&["delta", "alpha", "delta"]);
+    assert!(!output.status.success());
+    assert_eq!(stderr, single_stderr);
 }
