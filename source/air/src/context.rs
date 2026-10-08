@@ -1,5 +1,5 @@
 use crate::ast::{
-    AssertId, AxiomInfoFilter, Command, CommandX, Decl, Ident, Query, Typ, TypeError, Typs,
+    AssertId, AxiomInfoFilter, Command, CommandX, Decl, Expr, Ident, Query, Typ, TypeError, Typs,
 };
 use crate::closure::ClosureTerm;
 use crate::emitter::Emitter;
@@ -34,6 +34,22 @@ pub(crate) struct AxiomInfo {
     pub(crate) label: Ident,
     pub(crate) filter: AxiomInfoFilter,
     pub(crate) decl: Decl,
+    /// The `LabeledAxiom` expression this stands for, so that a failure can
+    /// be recorded by the axiom it drew its labels from (see `FailedAssertion`).
+    pub(crate) node: Expr,
+}
+
+/// Where the last `Invalid` result of a query came from, as positions in the
+/// AIR rather than as messages: the index of the failed assertion among the
+/// query's labeled assertions in `label_asserts` order (what
+/// `smt_verify::assertion_labels` lists), and the labeled axiom whose labels
+/// were appended to the error, if any. A caller that caches verdicts
+/// rebuilds the same error from the same query later, with that query's own
+/// spans.
+#[derive(Clone, Debug)]
+pub struct FailedAssertion {
+    pub assertion: usize,
+    pub axiom: Option<Expr>,
 }
 
 #[derive(Debug)]
@@ -115,6 +131,7 @@ pub struct Context {
     pub(crate) usage_info_enabled: bool,
     pub(crate) check_valid_used: bool,
     pub(crate) solver: SmtSolver,
+    pub(crate) last_failure: Option<FailedAssertion>,
 }
 
 impl Context {
@@ -181,6 +198,7 @@ impl Context {
             single_check_query: false,
             usage_info_enabled: false,
             check_valid_used: false,
+            last_failure: None,
             solver,
         };
         context.axiom_infos.push_scope(false);
@@ -484,6 +502,12 @@ impl Context {
         self.check_valid_used = true;
 
         validity
+    }
+
+    /// Where the last `Invalid` result came from (see `FailedAssertion`);
+    /// `None` after any other result.
+    pub fn last_failure(&self) -> Option<&FailedAssertion> {
+        self.last_failure.as_ref()
     }
 
     pub fn check_valid_used(&self) -> bool {

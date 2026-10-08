@@ -18,6 +18,8 @@ mod block_to_assert;
 mod closure;
 mod def;
 mod smt_verify;
+pub use def::mk_skolem_id;
+pub use smt_verify::{labeled_axioms, query_labels};
 mod tests;
 mod typecheck;
 mod util;

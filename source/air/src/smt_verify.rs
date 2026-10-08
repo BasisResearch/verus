@@ -60,7 +60,7 @@ fn label_asserts<'ctx>(
                 label_asserts(context, infos, axiom_infos, expr),
             ))
         }
-        ExprX::LabeledAxiom(labels, filter, expr) => {
+        ExprX::LabeledAxiom(labels, filter, inner) => {
             let count = context.axiom_infos_count;
             context.axiom_infos_count += 1;
             let label = Arc::new(GLOBAL_PREFIX_LABEL.to_string() + &count.to_string());
@@ -70,17 +70,80 @@ fn label_asserts<'ctx>(
                 label: label.clone(),
                 filter: filter.clone(),
                 decl,
+                node: expr.clone(),
             };
             axiom_infos.push(axiom_info);
             let lhs = Arc::new(ExprX::Var(label));
             Arc::new(ExprX::Binary(
                 BinaryOp::Implies,
                 lhs,
-                label_asserts(context, infos, axiom_infos, expr),
+                label_asserts(context, infos, axiom_infos, inner),
             ))
         }
         _ => expr.clone(),
     }
+}
+
+/// The labeled assertions and labeled axioms of `expr`, in the order
+/// `label_asserts` numbers them (it walks the same shape: the right side of
+/// an implication or equality, the parts of a conjunction or disjunction, the
+/// body of a `forall`). An assertion's error is the message a failure of it
+/// reports before any axiom labels are appended; an axiom is the whole
+/// `LabeledAxiom` expression.
+fn walk_labels(expr: &Expr, assertions: &mut Vec<ArcDynMessage>, axioms: &mut Vec<Expr>) {
+    match &**expr {
+        ExprX::Binary(BinaryOp::Implies, _, rhs) | ExprX::Binary(BinaryOp::Eq, _, rhs) => {
+            walk_labels(rhs, assertions, axioms)
+        }
+        ExprX::Multi(MultiOp::And, exprs) | ExprX::Multi(MultiOp::Or, exprs) => {
+            for e in exprs.iter() {
+                walk_labels(e, assertions, axioms);
+            }
+        }
+        ExprX::Bind(bind, body) => {
+            if let BindX::Quant(Quant::Forall, _, _, _) = &**bind {
+                walk_labels(body, assertions, axioms);
+            }
+        }
+        ExprX::LabeledAssertion(_, error, _, inner) => {
+            assertions.push(error.clone());
+            walk_labels(inner, assertions, axioms);
+        }
+        ExprX::LabeledAxiom(_, _, inner) => {
+            axioms.push(expr.clone());
+            walk_labels(inner, assertions, axioms);
+        }
+        _ => {}
+    }
+}
+
+/// The error of each labeled assertion of a query as the verifier hands it
+/// over, indexed as `FailedAssertion::assertion` is, and the labeled axioms
+/// of its assertion (`FailedAssertion::axiom` names one by it). The query is
+/// lowered the way `Context::check_valid` lowers it before `label_asserts`
+/// numbers its assertions (the type-check pass in between rewrites closures
+/// only, and moves no assertion).
+pub fn query_labels(
+    message_interface: &dyn crate::messages::MessageInterface,
+    query: &Query,
+) -> (Vec<ArcDynMessage>, Vec<Expr>) {
+    let (query, _, _) = crate::var_to_const::lower_query(query);
+    let query = crate::block_to_assert::lower_query(message_interface, &query);
+    let mut assertions = Vec::new();
+    let mut axioms = Vec::new();
+    if let StmtX::Assert(_, _, _, expr) = &*query.assertion {
+        walk_labels(expr, &mut assertions, &mut axioms);
+    }
+    (assertions, axioms)
+}
+
+/// Every `LabeledAxiom` expression a declared axiom can report labels from,
+/// as `FailedAssertion::axiom` names one.
+pub fn labeled_axioms(expr: &Expr) -> Vec<Expr> {
+    let mut assertions = Vec::new();
+    let mut axioms = Vec::new();
+    walk_labels(expr, &mut assertions, &mut axioms);
+    axioms
 }
 
 /// In SMT-LIB, functions applied to zero arguments are considered constants.
@@ -150,6 +213,7 @@ pub(crate) fn smt_check_assertion<'ctx>(
     only_check_earlier: bool,
     report_long_running: Option<&mut ReportLongRunning>,
 ) -> ValidityResult {
+    context.last_failure = None;
     let disabled_expr = if only_check_earlier {
         // disable all labels that come after the first known error
         let mut disabled: Vec<Expr> = Vec::new();
@@ -441,6 +505,7 @@ fn smt_get_model(
     let mut discovered_error: Option<AssertionInfo> = None;
     let mut discovered_assert_id: Option<Option<Arc<Vec<u64>>>> = None;
     let mut discovered_additional_info: Vec<ArcDynMessage> = Vec::new();
+    let mut failure: Option<crate::context::FailedAssertion> = None;
 
     context.smt_log.log_word("get-model");
 
@@ -459,11 +524,12 @@ fn smt_get_model(
     for def in model.iter() {
         model_defs.insert(def.name.clone(), def.clone());
     }
-    for info in infos.iter_mut() {
+    for (index, info) in infos.iter_mut().enumerate() {
         if let Some(def) = model_defs.get(&info.label) {
             if *def.body == "true" {
                 discovered_error = Some(info.clone());
                 discovered_assert_id = Some(info.assert_id.clone());
+                failure = Some(crate::context::FailedAssertion { assertion: index, axiom: None });
 
                 // Disable this label in subsequent check-sat calls to get additional errors
                 info.disabled = true;
@@ -485,6 +551,9 @@ fn smt_get_model(
                 && (info.filter.is_none() || info.filter == discovered_error.filter)
             {
                 discovered_additional_info.append(&mut info.labels.clone());
+                if let Some(failure) = &mut failure {
+                    failure.axiom = Some(info.node.clone());
+                }
                 break;
             }
         }
@@ -504,6 +573,7 @@ fn smt_get_model(
     let error = discovered_error.error;
     let e = context.message_interface.append_labels(&error, &discovered_additional_info);
     context.state = ContextState::FoundInvalid(infos, Some(air_model.clone()));
+    context.last_failure = failure;
     ValidityResult::Invalid(Some(air_model), Some(e), discovered_assert_id.unwrap())
 }
 
@@ -518,6 +588,7 @@ pub(crate) fn smt_check_query<'ctx>(
         context.smt_log.log_push();
         context.push_name_scope();
     }
+    context.last_failure = None;
 
     let rlimit_count_1 = if matches!(context.solver, SmtSolver::Z3) {
         let rlimit_count = match smt_get_rlimit_count(context) {
