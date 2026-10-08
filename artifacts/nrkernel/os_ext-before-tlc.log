@@ -1,0 +1,40 @@
+TLC2 Version 2026.09.24.190251 (rev: 11305b4)
+Warning: Please run the Java VM, which executes TLC with a throughput optimized garbage collector, by passing the "-XX:+UseParallelGC" property.
+(Use the -nowarning option to disable this warning.)
+Running breadth-first search Model-Checking with fp 69 and seed -1845344759831052557 with 1 worker on 32 cores with 1024MB heap and 64MB offheap memory [pid: 1546678] (Linux 7.0.0-1012-aws amd64, Ubuntu 25.0.4.1 64bit, MSBDiskFPSet, DiskStateQueue).
+Parsing file /data/home/kirancodes/Documents/code/verus-research/wt-export-nrkernel/artifacts/nrkernel/before/os_ext/MC.tla
+Parsing file /data/home/kirancodes/Documents/code/verus-research/wt-export-nrkernel/artifacts/nrkernel/before/os_ext/State_tla.tla
+Parsing file /tmp/tlc-5929340076312351557/Integers.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/Integers.tla)
+Parsing file /tmp/tlc-5929340076312351557/Sequences.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/Sequences.tla)
+Parsing file /tmp/tlc-5929340076312351557/FiniteSets.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/FiniteSets.tla)
+Parsing file /tmp/tlc-5929340076312351557/TLC.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/TLC.tla)
+Parsing file /tmp/tlc-5929340076312351557/Naturals.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/Naturals.tla)
+Semantic processing of module Naturals
+Semantic processing of module Integers
+Semantic processing of module Sequences
+Semantic processing of module FiniteSets
+Semantic processing of module TLC
+Semantic processing of module State_tla
+Semantic processing of module MC
+Linting of module State_tla
+Linting of module MC
+Starting... (2026-10-07 19:59:48)
+Computing initial states...
+Error: In evaluation, the identifier shootdown_vec is either undefined or not an operator.
+line 54, col 37 to line 54, col 49 of module State_tla
+Error: The error occurred when TLC was evaluating the nested
+expressions at the following positions:
+0. Line 125, column 9 to line 125, column 29 in State_tla
+1. Line 125, column 9 to line 125, column 19 in State_tla
+2. Line 58, column 5 to line 58, column 17 in State_tla
+3. Line 54, column 6 to line 54, column 94 in State_tla
+4. Line 54, column 7 to line 54, column 69 in State_tla
+5. Line 54, column 8 to line 54, column 30 in State_tla
+6. Line 54, column 37 to line 54, column 68 in State_tla
+7. Line 54, column 37 to line 54, column 63 in State_tla
+8. Line 54, column 37 to line 54, column 49 in State_tla
+
+
+0 states generated, 0 distinct states found, 0 states left on queue.
+The depth of the complete state graph search is 0.
+Finished in 00s at (2026-10-07 19:59:48)

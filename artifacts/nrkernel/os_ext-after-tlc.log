@@ -1,0 +1,118 @@
+TLC2 Version 2026.09.24.190251 (rev: 11305b4)
+Warning: Please run the Java VM, which executes TLC with a throughput optimized garbage collector, by passing the "-XX:+UseParallelGC" property.
+(Use the -nowarning option to disable this warning.)
+Running breadth-first search Model-Checking with fp 50 and seed -4270116511732418232 with 1 worker on 32 cores with 1024MB heap and 64MB offheap memory [pid: 2304931] (Linux 7.0.0-1012-aws amd64, Ubuntu 25.0.4.1 64bit, MSBDiskFPSet, DiskStateQueue).
+Parsing file /data/home/kirancodes/Documents/code/verus-research/wt-export-nrkernel/artifacts/nrkernel/after/os_ext/MC.tla
+Parsing file /data/home/kirancodes/Documents/code/verus-research/wt-export-nrkernel/artifacts/nrkernel/after/os_ext/State_tla.tla
+Parsing file /tmp/tlc-6566550127639203805/Integers.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/Integers.tla)
+Parsing file /tmp/tlc-6566550127639203805/Sequences.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/Sequences.tla)
+Parsing file /tmp/tlc-6566550127639203805/FiniteSets.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/FiniteSets.tla)
+Parsing file /tmp/tlc-6566550127639203805/TLC.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/TLC.tla)
+Parsing file /tmp/tlc-6566550127639203805/Naturals.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/Naturals.tla)
+Semantic processing of module Naturals
+Semantic processing of module Integers
+Semantic processing of module Sequences
+Semantic processing of module FiniteSets
+Semantic processing of module TLC
+Semantic processing of module State_tla
+Semantic processing of module MC
+Linting of module State_tla
+Linting of module MC
+Starting... (2026-10-07 20:40:45)
+Computing initial states...
+Error: Overflow when computing 2*1073741824
+Error: The error occurred when TLC was evaluating the nested
+expressions at the following positions:
+0. Line 134, column 9 to line 134, column 280 in State_tla
+1. Line 134, column 9 to line 134, column 270 in State_tla
+2. Line 134, column 9 to line 134, column 255 in State_tla
+3. Line 134, column 10 to line 134, column 216 in State_tla
+4. Line 134, column 223 to line 134, column 254 in State_tla
+5. Line 134, column 260 to line 134, column 270 in State_tla
+6. Line 67, column 5 to line 67, column 17 in State_tla
+7. Line 63, column 6 to line 63, column 94 in State_tla
+8. Line 63, column 7 to line 63, column 69 in State_tla
+9. Line 63, column 8 to line 63, column 30 in State_tla
+10. Line 63, column 75 to line 63, column 94 in State_tla
+11. Line 59, column 6 to line 59, column 183 in State_tla
+12. Line 59, column 144 to line 59, column 182 in State_tla
+13. Line 59, column 167 to line 59, column 182 in State_tla
+14. Line 55, column 6 to line 55, column 929 in State_tla
+15. Line 55, column 684 to line 55, column 929 in State_tla
+16. Line 55, column 688 to line 55, column 695 in State_tla
+17. Line 55, column 688 to line 55, column 690 in State_tla
+18. Line 55, column 18 to line 55, column 678 in State_tla
+19. Line 55, column 19 to line 55, column 673 in State_tla
+20. Line 55, column 249 to line 55, column 673 in State_tla
+21. Line 55, column 291 to line 55, column 672 in State_tla
+22. Line 55, column 606 to line 55, column 672 in State_tla
+23. Line 55, column 511 to line 55, column 601 in State_tla
+24. Line 55, column 565 to line 55, column 601 in State_tla
+25. Line 55, column 569 to line 55, column 601 in State_tla
+26. Line 55, column 511 to line 55, column 601 in State_tla
+27. Line 55, column 565 to line 55, column 601 in State_tla
+28. Line 55, column 569 to line 55, column 601 in State_tla
+29. Line 55, column 511 to line 55, column 601 in State_tla
+30. Line 55, column 565 to line 55, column 601 in State_tla
+31. Line 55, column 569 to line 55, column 601 in State_tla
+32. Line 55, column 511 to line 55, column 601 in State_tla
+33. Line 55, column 565 to line 55, column 601 in State_tla
+34. Line 55, column 569 to line 55, column 601 in State_tla
+35. Line 55, column 511 to line 55, column 601 in State_tla
+36. Line 55, column 565 to line 55, column 601 in State_tla
+37. Line 55, column 569 to line 55, column 601 in State_tla
+38. Line 55, column 511 to line 55, column 601 in State_tla
+39. Line 55, column 565 to line 55, column 601 in State_tla
+40. Line 55, column 569 to line 55, column 601 in State_tla
+41. Line 55, column 511 to line 55, column 601 in State_tla
+42. Line 55, column 565 to line 55, column 601 in State_tla
+43. Line 55, column 569 to line 55, column 601 in State_tla
+44. Line 55, column 511 to line 55, column 601 in State_tla
+45. Line 55, column 565 to line 55, column 601 in State_tla
+46. Line 55, column 569 to line 55, column 601 in State_tla
+47. Line 55, column 511 to line 55, column 601 in State_tla
+48. Line 55, column 565 to line 55, column 601 in State_tla
+49. Line 55, column 569 to line 55, column 601 in State_tla
+50. Line 55, column 511 to line 55, column 601 in State_tla
+51. Line 55, column 565 to line 55, column 601 in State_tla
+52. Line 55, column 569 to line 55, column 601 in State_tla
+53. Line 55, column 511 to line 55, column 601 in State_tla
+54. Line 55, column 565 to line 55, column 601 in State_tla
+55. Line 55, column 569 to line 55, column 601 in State_tla
+56. Line 55, column 511 to line 55, column 601 in State_tla
+57. Line 55, column 565 to line 55, column 601 in State_tla
+58. Line 55, column 569 to line 55, column 601 in State_tla
+59. Line 55, column 511 to line 55, column 601 in State_tla
+60. Line 55, column 565 to line 55, column 601 in State_tla
+61. Line 55, column 569 to line 55, column 601 in State_tla
+62. Line 55, column 511 to line 55, column 601 in State_tla
+63. Line 55, column 565 to line 55, column 601 in State_tla
+64. Line 55, column 569 to line 55, column 601 in State_tla
+65. Line 55, column 511 to line 55, column 601 in State_tla
+66. Line 55, column 565 to line 55, column 601 in State_tla
+67. Line 55, column 569 to line 55, column 601 in State_tla
+68. Line 55, column 511 to line 55, column 601 in State_tla
+69. Line 55, column 565 to line 55, column 601 in State_tla
+70. Line 55, column 569 to line 55, column 601 in State_tla
+71. Line 55, column 511 to line 55, column 601 in State_tla
+72. Line 55, column 565 to line 55, column 601 in State_tla
+73. Line 55, column 569 to line 55, column 601 in State_tla
+74. Line 55, column 511 to line 55, column 601 in State_tla
+75. Line 55, column 565 to line 55, column 601 in State_tla
+76. Line 55, column 569 to line 55, column 601 in State_tla
+77. Line 55, column 511 to line 55, column 601 in State_tla
+78. Line 55, column 565 to line 55, column 601 in State_tla
+79. Line 55, column 569 to line 55, column 601 in State_tla
+80. Line 55, column 511 to line 55, column 601 in State_tla
+81. Line 55, column 565 to line 55, column 601 in State_tla
+82. Line 55, column 569 to line 55, column 601 in State_tla
+83. Line 55, column 511 to line 55, column 601 in State_tla
+84. Line 55, column 565 to line 55, column 601 in State_tla
+85. Line 55, column 569 to line 55, column 601 in State_tla
+86. Line 55, column 511 to line 55, column 601 in State_tla
+87. Line 55, column 565 to line 55, column 601 in State_tla
+
+
+0 states generated, 0 distinct states found, 0 states left on queue.
+The depth of the complete state graph search is 0.
+Finished in 02s at (2026-10-07 20:40:46)

@@ -1,0 +1,14 @@
+*
+!.gitignore
+!report.txt
+!campaign.json
+!compatibility.json
+!reexport.py
+!compat.py
+!check_campaign.py
+!tests.log
+!os_ext-before-tlc.log
+!os_ext-after-tlc.log
+!merge-validation.txt
+!merge-compatibility.json
+!merge-tests.log

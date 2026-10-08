@@ -255,9 +255,14 @@ pub struct Report {
     pub next: String,
     /// The variables Init never assigns; TLC cannot compute an initial state.
     pub init_unassigned: Vec<String>,
-    /// The variables `init` leaves unassigned whose type has a small domain:
-    /// Init draws them from it.
+    /// Incomplete variables drawn from their type's finite domain, or an
+    /// explicitly reported finite carrier hole, before the source Init filters them.
     pub init_enumerated: Vec<Enumerated>,
+    /// Leaf fields not assigned on every Init path, before domain enumeration.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub init_fields_unassigned: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub init_domain_warning: Option<String>,
     pub invariants: Vec<String>,
     /// Every transition Next reaches, with the variables it leaves unassigned.
     pub transitions: Vec<Transition>,
@@ -509,10 +514,6 @@ const EUCLID_B: &str = "euclid_b";
 /// a larger variant of a datatype, is a hole constant the .cfg supplies.
 const MAX_TYPE_DOMAIN: u128 = 1 << 10;
 
-/// The most initial-state combinations Init draws the variables `init`
-/// leaves unassigned from (see [`Enumerated`]).
-const MAX_INIT_STATES: u128 = 1 << 16;
-
 /// The module-level names the export generates beside the operators.
 const GENERATED_NAMES: [&str; 11] = [
     "Init", "Next", "Spec", "vars", "Inv", "TypeOK", "Fairness", EUCLID_DIV, EUCLID_MOD, EUCLID_A,
@@ -726,6 +727,9 @@ struct TraceAction {
 
 #[derive(Clone)]
 struct Exporter {
+    word_bits: ArchWordBits,
+    init_domains: bool,
+    strict_types: bool,
     datatypes: HashMap<Path, Datatype>,
     functions: Functions,
     state_path: Path,
@@ -1913,6 +1917,18 @@ impl Exporter {
             }
             ExprX::NullaryOpr(_) => self.refuse("nullary operator", &e.span),
             ExprX::Unary(op, inner) => match op {
+                UnaryOp::BitNot(Some(width)) => {
+                    let width = match (width, self.word_bits) {
+                        (IntegerTypeBitwidth::Width(w), _) => *w,
+                        (IntegerTypeBitwidth::ArchWordSize, ArchWordBits::Exactly(w)) => w,
+                        _ => {
+                            return self
+                                .refuse("bit complement with unspecified pointer width", &e.span);
+                        }
+                    };
+                    let value = self.expr(inner, env);
+                    format!("((2 ^ {width}) - 1 - ({value}))")
+                }
                 UnaryOp::Not => format!("~({})", self.expr(inner, env)),
                 UnaryOp::Trigger(_) | UnaryOp::CoerceMode { .. } => self.expr(inner, env),
                 // A clip to `int`, or of an operand whose own type lies
@@ -2191,6 +2207,7 @@ impl Exporter {
                 };
                 format!("({} {sym} {})", self.expr(a, env), self.expr(b, env))
             }
+            BinaryOp::Bitwise(op, behavior) => self.bitwise(e, op, behavior, a, b, env),
             BinaryOp::Xor => format!("({} # {})", self.expr(a, env), self.expr(b, env)),
             BinaryOp::Index(..) => {
                 // Array or slice indexing: 0-based in Verus, 1-based here.
@@ -2200,6 +2217,81 @@ impl Exporter {
                 let what = format!("binary operator {:?}", op);
                 self.refuse(what, &e.span)
             }
+        }
+    }
+
+    /// Unsigned fixed-width bit operations. The jar has no Bitwise module.
+    /// Local recursion avoids global helper names and works in candidate exports too.
+    fn bitwise(
+        &mut self,
+        e: &Expr,
+        op: &BitwiseOp,
+        behavior: &BitshiftBehavior,
+        a: &Expr,
+        b: &Expr,
+        env: &Env,
+    ) -> String {
+        let width = match &*a.typ {
+            TypX::Int(IntRange::U(w)) => *w,
+            TypX::Int(IntRange::USize) => match self.word_bits {
+                ArchWordBits::Exactly(w) => w,
+                _ => return self.refuse("bit operation with unspecified pointer width", &e.span),
+            },
+            _ => return self.refuse("bit operation without a fixed unsigned width", &e.span),
+        };
+        let left = self.quiet(|x| x.expr(a, env));
+        let right = self.quiet(|x| x.expr(b, env));
+        match op {
+            BitwiseOp::Shl(_, false) | BitwiseOp::Shr => {
+                // Spec shifts permit arbitrarily large nonnegative amounts; these
+                // give zero at/above the width. Negative shifts are unspecified.
+                // Avoid constructing 2^width: a small u64 operand must work
+                // on TLC even though that intermediate exceeds its IntValue.
+                let f = self.bind("shift__");
+                let x = self.bind("shift_x__");
+                let n = self.bind("shift_n__");
+                let value = if matches!(op, BitwiseOp::Shr) {
+                    format!(
+                        "(LET RECURSIVE {f}(_, _) {f}({x}, {n}) == IF {n} = 0 \\/ {x} = 0 THEN {x} ELSE {f}({x} \\div 2, {n} - 1) IN {f}({left}, {right}))"
+                    )
+                } else {
+                    let mask = self.bind("low_bits__");
+                    let mx = self.bind("mask_x__");
+                    let mn = self.bind("mask_n__");
+                    format!(
+                        "(LET RECURSIVE {mask}(_, _), {f}(_, _) {mask}({mx}, {mn}) == IF {mn} = 0 \\/ {mx} = 0 THEN 0 ELSE ({mx} % 2) + 2 * {mask}({mx} \\div 2, {mn} - 1) {f}({x}, {n}) == IF {n} = 0 \\/ {x} = 0 THEN {x} ELSE 2 * {f}({x}, {n} - 1) IN {f}({mask}({left}, {width} - ({right})), {right}))"
+                    )
+                };
+                let message =
+                    tla_string(&format!("negative unsigned shift at {}", span_string(&e.span)));
+                let outside = match behavior {
+                    BitshiftBehavior::Allow => "0".into(),
+                    BitshiftBehavior::Error(_) => format!(
+                        "Assert(FALSE, {})",
+                        tla_string(&format!(
+                            "unsigned shift amount out of range at {}",
+                            span_string(&e.span)
+                        ))
+                    ),
+                };
+                format!(
+                    "(IF ({right}) < 0 THEN Assert(FALSE, {message}) ELSE IF ({right}) >= {width} THEN {outside} ELSE {value})"
+                )
+            }
+            BitwiseOp::BitAnd | BitwiseOp::BitOr | BitwiseOp::BitXor => {
+                let f = self.bind("bits__");
+                let x = self.bind("bits_x__");
+                let y = self.bind("bits_y__");
+                let bit = match op {
+                    BitwiseOp::BitAnd => format!("({x} % 2 = 1 /\\ {y} % 2 = 1)"),
+                    BitwiseOp::BitOr => format!("({x} % 2 = 1 \\/ {y} % 2 = 1)"),
+                    _ => format!("({x} % 2 # {y} % 2)"),
+                };
+                format!(
+                    "(LET RECURSIVE {f}(_, _) {f}({x}, {y}) == IF {x} = 0 /\\ {y} = 0 THEN 0 ELSE (IF {bit} THEN 1 ELSE 0) + 2 * {f}({x} \\div 2, {y} \\div 2) IN {f}({left}, {right}))"
+                )
+            }
+            _ => self.refuse("signed or architecture-dependent shift", &e.span),
         }
     }
 
@@ -4502,7 +4594,8 @@ impl Exporter {
             TypX::Int(range @ (IntRange::U(_) | IntRange::I(_))) => match int_type_bounds(range) {
                 (Some(lo), Some(hi)) => {
                     let size = (hi - lo + 1) as u128;
-                    (size <= MAX_TYPE_DOMAIN).then(|| (format!("{lo}..{hi}"), size))
+                    (self.init_domains || size <= MAX_TYPE_DOMAIN)
+                        .then(|| (format!("{lo}..{hi}"), size))
                 }
                 _ => None,
             },
@@ -4653,10 +4746,11 @@ impl Exporter {
                 .filter(|n| !split || *n <= 1)
                 .fold(1u128, |acc, n| acc.saturating_mul(n))
         };
-        let mut split: Vec<bool> = all.iter().map(|b| size(b, false) > MAX_TYPE_DOMAIN).collect();
+        let mut split: Vec<bool> =
+            all.iter().map(|b| !self.init_domains && size(b, false) > MAX_TYPE_DOMAIN).collect();
         let union =
             all.iter().zip(&split).fold(0u128, |acc, (b, s)| acc.saturating_add(size(b, *s)));
-        if union > MAX_TYPE_DOMAIN {
+        if !self.init_domains && union > MAX_TYPE_DOMAIN {
             for (b, s) in all.iter().zip(split.iter_mut()) {
                 *s = *s || size(b, false) > 1;
             }
@@ -5013,6 +5107,14 @@ impl Exporter {
             _ => Some(format!("({})", parts.join(" /\\ "))),
         };
         match &**typ {
+            TypX::Bool if self.strict_types => Some(format!("{subject} \\in BOOLEAN")),
+            TypX::Int(IntRange::Char) if self.strict_types => {
+                Some(format!("({subject} \\in STRING /\\ Len({subject}) = 1)"))
+            }
+            TypX::Int(range) if self.strict_types => Some(match int_range_pred(subject, range) {
+                Some(p) => format!("({subject} \\in Int /\\ {p})"),
+                None => format!("{subject} \\in Int"),
+            }),
             TypX::Int(range) => int_range_pred(subject, range),
             TypX::Decorate(_, _, t) | TypX::Boxed(t) => self.type_pred(subject, t, seen),
             TypX::Datatype(Dt::Tuple(_), args, _) => {
@@ -5060,6 +5162,15 @@ impl Exporter {
                     let tagged = d.x.variants.len() > 1;
                     seen.push(p.clone());
                     let mut parts = Vec::new();
+                    if self.strict_types && tagged {
+                        let tags =
+                            d.x.variants
+                                .iter()
+                                .filter(|v| v.name.to_string() != "dummy_to_use_type_params")
+                                .map(|v| format!("\"{}\"", v.name))
+                                .collect::<Vec<_>>();
+                        parts.push(format!("{subject}.tag \\in {{{}}}", tags.join(", ")));
+                    }
                     for v in d.x.variants.iter() {
                         if v.name.to_string() == "dummy_to_use_type_params" {
                             continue;
@@ -5474,10 +5585,253 @@ impl Exporter {
     /// predicate and `states` its state parameter. TLC computes an initial
     /// state only when every variable is assigned (`x = e`), else it stops
     /// ("current state is not a legal state").
-    fn init_unassigned(&self, body: &Expr, states: &HashSet<VarIdent>) -> Vec<String> {
+    fn init_unassigned(
+        &self,
+        body: &Expr,
+        states: &HashSet<VarIdent>,
+    ) -> (Vec<String>, Vec<String>) {
         let binders = self.state_binders(body, states);
         let assigned = self.init_assigns(body, states, &binders, &BTreeSet::new(), 0);
-        self.state_vars.iter().filter(|v| !assigned.contains(*v)).cloned().collect()
+        let vars = self.state_vars.iter().filter(|v| !assigned.contains(*v)).cloned().collect();
+        let mut leaves = Vec::new();
+        for (v, t) in self.state_vars.iter().zip(&self.state_types) {
+            self.init_leaves(v, t, &mut vec![self.state_path.clone()], &mut leaves);
+        }
+        let relational = self.init_relational_sequences(body, states, &binders, 0);
+        leaves.retain(|v| {
+            !assigned
+                .iter()
+                .chain(relational.iter())
+                .any(|a| v == a || v.starts_with(&format!("{a}.")))
+        });
+        (vars, leaves)
+    }
+
+    /// A relational sequence initializer can completely specify every element
+    /// without giving TLC a whole-variable assignment. Preserve its original
+    /// export (and assignment diagnostic): a finite carrier would restrict the
+    /// source relation, not fill in an unconstrained field.
+    fn init_relational_sequences(
+        &self,
+        e: &Expr,
+        states: &HashSet<VarIdent>,
+        binders: &HashMap<VarIdent, String>,
+        depth: usize,
+    ) -> BTreeSet<String> {
+        let e = peel(e);
+        if let ExprX::Block(_, Some(tail)) = &e.x {
+            return self.init_relational_sequences(tail, states, binders, depth);
+        }
+        let call_args = |e: &Expr, op: &str| -> Option<Exprs> {
+            let e = peel(e);
+            if let ExprX::Call { target: CallTarget::Fun(_, f, ..), args, .. } = &e.x {
+                if vstd_op(&fun_as_friendly_rust_name(f)) == Some(op) {
+                    return Some(args.clone());
+                }
+            }
+            None
+        };
+        let equality = |e: &Expr| -> Option<(Expr, Expr)> {
+            match &peel(e).x {
+                ExprX::Binary(BinaryOp::Eq(_), a, b)
+                | ExprX::BinaryOpr(BinaryOpr::ExtEq(..), a, b) => Some((a.clone(), b.clone())),
+                _ => None,
+            }
+        };
+        let parts = conjuncts(&e);
+        let mut lengths = Vec::new();
+        let mut out = BTreeSet::new();
+        for c in &parts {
+            if let Some((a, b)) = equality(c) {
+                for (a, b) in [(&a, &b), (&b, &a)] {
+                    if let Some(args) = call_args(a, "seq_len") {
+                        if let Some(field) = self.init_field_path(&args[0], states, binders) {
+                            lengths.push((field, b.clone()));
+                        }
+                    }
+                }
+            }
+            // Follow a helper taking the whole state; only unconditional
+            // conjuncts contribute facts. Never combine different disjuncts.
+            if let ExprX::Call { target: CallTarget::Fun(kind, fun, typs, ..), args, .. } =
+                &peel(c).x
+            {
+                if depth < 16 {
+                    if let Ok(f) = self.functions.resolve(FunctionUse::Call(kind, fun, typs)) {
+                        if let Some(body) = &f.x.body {
+                            let inner: HashSet<_> =
+                                f.x.params
+                                    .iter()
+                                    .zip(args.iter())
+                                    .filter(|(p, a)| {
+                                        self.is_state_typ(&p.x.typ)
+                                            && read_var(a).is_some_and(|v| states.contains(&v))
+                                    })
+                                    .map(|(p, _)| p.x.name.clone())
+                                    .collect();
+                            if !inner.is_empty() {
+                                let bs = self.state_binders(body, &inner);
+                                out.extend(self.init_relational_sequences(
+                                    body,
+                                    &inner,
+                                    &bs,
+                                    depth + 1,
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        for c in &parts {
+            let c = peel(c);
+            let ExprX::Quant(q, qs, body) = &c.x else { continue };
+            if !matches!(q.quant, air::ast::Quant::Forall) || qs.len() != 1 {
+                continue;
+            }
+            let body = peel(body);
+            let ExprX::Logical(LogicalOp::Implies, guard, value) = &body.x else { continue };
+            let Some((a, b)) = equality(value) else { continue };
+            for (a, b) in [(&a, &b), (&b, &a)] {
+                let Some(args) = call_args(a, "seq_index") else { continue };
+                if args.len() != 2 || read_var(&args[1]).as_ref() != Some(&qs[0].name) {
+                    continue;
+                }
+                let Some(field) = self.init_field_path(&args[0], states, binders) else { continue };
+                // A circular element equality does not define the collection.
+                let mut circular = false;
+                crate::ast_visitor::expr_visitor_walk(b, &mut |x: &Expr| {
+                    circular |= self.init_field_path(x, states, binders).as_ref() == Some(&field);
+                    circular |= read_var(x).is_some_and(|v| states.contains(&v));
+                    crate::visitor::VisitorControlFlow::Recurse
+                });
+                if circular {
+                    continue;
+                }
+                if lengths.iter().any(|(f, len)| {
+                    f == &field && self.init_full_index_range(guard, &qs[0].name, len)
+                }) {
+                    out.insert(field);
+                }
+            }
+        }
+        out
+    }
+
+    /// Exactly 0 <= i < length; an additional guard would leave elements free.
+    fn init_full_index_range(&self, guard: &Expr, index: &VarIdent, length: &Expr) -> bool {
+        let mut comparisons = Vec::new();
+        for c in conjuncts(guard) {
+            match &peel(&c).x {
+                ExprX::Binary(BinaryOp::Inequality(op), a, b) => {
+                    comparisons.push((*op, a.clone(), b.clone()));
+                }
+                ExprX::Multi(MultiOp::Chained(ops), args) => {
+                    for (i, op) in ops.iter().enumerate() {
+                        let ChainedOp::Inequality(op) = op else { return false };
+                        comparisons.push((*op, args[i].clone(), args[i + 1].clone()));
+                    }
+                }
+                _ => return false,
+            }
+        }
+        let mut lower = false;
+        let mut upper = false;
+        for (op, a, b) in comparisons {
+            if matches!(op, InequalityOp::Le)
+                && matches!(&peel(&a).x, ExprX::Const(Constant::Int(i)) if i.to_string() == "0")
+                && read_var(&b).as_ref() == Some(index)
+            {
+                lower = true;
+            } else if matches!(op, InequalityOp::Lt)
+                && read_var(&a).as_ref() == Some(index)
+                && same_expr(&self.functions, &b, length)
+            {
+                upper = true;
+            } else {
+                return false;
+            }
+        }
+        lower && upper
+    }
+
+    /// Struct leaves for diagnostics; collections, enums and recursive types
+    /// remain whole values, because a tag or key is not a fixed field path.
+    fn init_leaves(&self, name: &str, typ: &Typ, seen: &mut Vec<Path>, out: &mut Vec<String>) {
+        if let TypX::Datatype(Dt::Path(p), args, _) = &**typ {
+            if !seen.contains(p) && !collection_name(p).starts_with("vstd::") {
+                if let Some(d) = self.datatypes.get(p) {
+                    if d.x.variants.len() == 1
+                        && !d.x.variants[0].fields.is_empty()
+                        && !matches!(d.x.transparency, DatatypeTransparency::Never)
+                    {
+                        seen.push(p.clone());
+                        for f in d.x.variants[0].fields.iter() {
+                            let t = crate::sst_util::subst_typ_for_datatype(
+                                &d.x.typ_params,
+                                args,
+                                &f.a.0,
+                            );
+                            self.init_leaves(
+                                &format!("{name}.{}", field_name(&f.name)),
+                                &t,
+                                seen,
+                                out,
+                            );
+                        }
+                        seen.pop();
+                        return;
+                    }
+                }
+            }
+        }
+        out.push(name.into());
+    }
+
+    fn init_field_path(
+        &self,
+        e: &Expr,
+        states: &HashSet<VarIdent>,
+        binders: &HashMap<VarIdent, String>,
+    ) -> Option<String> {
+        let e = peel(e);
+        if let Some(v) = read_var(&e).and_then(|v| binders.get(&v)) {
+            return Some(v.clone());
+        }
+        match &e.x {
+            ExprX::UnaryOpr(UnaryOpr::Field(f), inner) => {
+                if read_var(inner).is_some_and(|v| states.contains(&v)) {
+                    Some(self.state_var(&field_name(&f.field)))
+                } else {
+                    self.init_field_path(inner, states, binders)
+                        .map(|p| format!("{p}.{}", field_name(&f.field)))
+                }
+            }
+            ExprX::ReadPlace(p, _) => self.init_place_path(p, states, binders),
+            _ => None,
+        }
+    }
+
+    fn init_place_path(
+        &self,
+        p: &Place,
+        states: &HashSet<VarIdent>,
+        binders: &HashMap<VarIdent, String>,
+    ) -> Option<String> {
+        if let Some(v) = place_var(p).and_then(|v| binders.get(&v)) {
+            return Some(v.clone());
+        }
+        match &p.x {
+            PlaceX::Field(f, inner) => {
+                if place_var(inner).is_some_and(|v| states.contains(&v)) {
+                    Some(self.state_var(&field_name(&f.field)))
+                } else {
+                    self.init_place_path(inner, states, binders)
+                        .map(|p| format!("{p}.{}", field_name(&f.field)))
+                }
+            }
+            _ => None,
+        }
     }
 
     /// The names a pattern on a state in `states` binds to its fields, each
@@ -5571,27 +5925,7 @@ impl Exporter {
             it.fold(first, |acc, b| acc.intersection(&b).cloned().collect())
         };
         let is_state = |x: &Expr| read_var(x).is_some_and(|v| states.contains(&v));
-        let field = |x: &Expr| -> Option<String> {
-            let x = peel(x);
-            if let Some(v) = read_var(&x).and_then(|v| binders.get(&v)) {
-                return Some(v.clone());
-            }
-            let (dt, field, base) = match &x.x {
-                ExprX::UnaryOpr(UnaryOpr::Field(FieldOpr { datatype, field, .. }), inner) => {
-                    (datatype, field, read_var(inner))
-                }
-                ExprX::ReadPlace(p, _) => match &p.x {
-                    PlaceX::Field(FieldOpr { datatype, field, .. }, inner) => {
-                        (datatype, field, place_var(inner))
-                    }
-                    _ => return None,
-                },
-                _ => return None,
-            };
-            let ours = matches!(dt, Dt::Path(p) if *p == self.state_path)
-                && base.is_some_and(|v| states.contains(&v));
-            ours.then(|| self.state_var(&field_name(field)))
-        };
+        let field = |x: &Expr| self.init_field_path(x, states, binders);
         // `s.done`, `!s.done`: printed `done = TRUE`, `done = FALSE`
         // (see [`Exporter::bool_field_assignment`]).
         if let Some(x) = bool_field(e).and_then(|(b, _)| field(&b)) {
@@ -8972,6 +9306,9 @@ pub fn export_module(
         state_vars.push(v);
     }
     let mut ex = Exporter {
+        word_bits: krate.arch.word_bits,
+        init_domains: false,
+        strict_types: false,
         datatypes,
         functions,
         state_path: triple.state.clone(),
@@ -9180,7 +9517,7 @@ pub fn export_module(
         }
     }
     let transitions = ex.transitions(&(triple.next.clone(), Variant::Plain, false));
-    let init_unassigned = match ex
+    let (init_unassigned, mut init_fields_unassigned) = match ex
         .functions
         .resolve(FunctionUse::Root(&triple.init))
         .ok()
@@ -9193,7 +9530,7 @@ pub fn export_module(
                 let states = params.iter().take(1).map(|p| p.name.clone()).collect();
                 ex.init_unassigned(cbody, &states)
             }
-            _ => Vec::new(),
+            _ => (Vec::new(), Vec::new()),
         },
         Some(body) => {
             let f = ex.functions.resolve(FunctionUse::Root(&triple.init))?;
@@ -9205,39 +9542,67 @@ pub fn export_module(
                     .collect();
             ex.init_unassigned(&body, &states)
         }
-        None => Vec::new(),
+        None => (Vec::new(), Vec::new()),
     };
     // Verus's state is always within its fields' types, so a step that
     // would leave them is disabled: TypeOK holds initially and after each
     // step.
     let type_ok = ex.type_ok();
-    // Init draws a variable `init` leaves unassigned from its type's domain
-    // when that is small and has no hole, so TLC can compute the initial
-    // states Verus allows (`init` filters them): a `Map<Tid, ThreadState>`
-    // constrained key by key, as verus-tla's mutex is. At most
-    // [`MAX_INIT_STATES`] combinations are drawn.
+    // Draw every incomplete top-level value before evaluating the original
+    // predicate, including its subfield constraints. Never turn a subfield
+    // assignment into a claim that the whole record has been initialized.
     ex.bound.clear();
     ex.current = "Init".into();
+    ex.current_key = None;
+    let init_hole_start = ex.holes.len();
     let mut init_enumerated: Vec<Enumerated> = Vec::new();
-    let mut combinations: u128 = 1;
-    for v in init_unassigned.clone() {
-        let Some(i) = ex.state_vars.iter().position(|x| *x == v) else { continue };
+    // Preserve the legacy finite-domain path, including its enumeration cap.
+    // Only variables it still reports as unassigned are candidates for widening.
+    let mut combinations = 1u128;
+    for v in &init_unassigned {
+        let Some(i) = ex.state_vars.iter().position(|x| x == v) else { continue };
         let typ = ex.state_types[i].clone();
+        let Some(span) =
+            ex.functions.resolve(FunctionUse::Root(&triple.init)).ok().map(|f| f.span.clone())
+        else {
+            continue;
+        };
         let first_hole = ex.holes.len();
-        let span =
-            ex.functions.resolve(FunctionUse::Root(&triple.init)).ok().map(|f| f.span.clone());
-        let Some(span) = span else { continue };
         let bounded = ex.bound_from_type(&typ, &span, &mut vec![ex.state_path.clone()]);
         if ex.holes.len() > first_hole {
             ex.drop_holes(first_hole);
             continue;
         }
         let Some((domain, n)) = bounded else { continue };
-        let Some(c) = combinations.checked_mul(n).filter(|c| *c <= MAX_INIT_STATES) else {
+        let Some(c) = combinations.checked_mul(n).filter(|c| *c <= 1 << 16) else { continue };
+        combinations = c;
+        init_enumerated.push(Enumerated { variable: v.clone(), domain });
+    }
+    ex.init_domains = true;
+    for v in &init_unassigned {
+        if init_enumerated.iter().any(|e| &e.variable == v)
+            || !init_fields_unassigned.iter().any(|f| f == v || f.starts_with(&format!("{v}.")))
+        {
+            continue;
+        }
+        let Some(i) = ex.state_vars.iter().position(|x| x == v) else { continue };
+        let typ = ex.state_types[i].clone();
+        let Some(span) =
+            ex.functions.resolve(FunctionUse::Root(&triple.init)).ok().map(|f| f.span.clone())
+        else {
             continue;
         };
-        combinations = c;
-        init_enumerated.push(Enumerated { variable: v, domain });
+        let domain = ex.type_domain(v, &typ, &span);
+        init_enumerated.push(Enumerated { variable: v.clone(), domain });
+    }
+    let init_hole_end = ex.holes.len();
+    let init_domain_warning = (init_hole_end > init_hole_start).then(||
+        "Init uses finite domain holes for incomplete fields; only initial values in the configured carriers are explored. See init_enumerated and holes in the report.".to_string());
+    ex.init_domains = false;
+    // Existing finite whole-variable enumeration is already described by
+    // init_enumerated. Add leaf diagnostics for newly bounded or partial records.
+    if init_hole_end == init_hole_start && !init_fields_unassigned.iter().any(|f| f.contains('.')) {
+        init_fields_unassigned.clear();
     }
     let init_unassigned: Vec<String> = init_unassigned
         .into_iter()
@@ -9647,6 +10012,17 @@ pub fn export_module(
             ex.bound.clear();
         }
     }
+    ex.strict_types = true;
+    for i in init_hole_start..init_hole_end {
+        let constant = ex.holes[i].constant.clone();
+        let typ = ex.hole_typs[&constant].clone();
+        ex.bound.clear();
+        let v = ex.bind("init_value__");
+        let pred = ex.type_pred(&v, &typ, &mut Vec::new()).unwrap_or_else(|| "TRUE".into());
+        label_assumes
+            .push(format!("IsFiniteSet({constant}) /\\ (\\A {v} \\in {constant} : {pred})"));
+    }
+    ex.strict_types = false;
     let parameters: Vec<ModelParam> = match &closed {
         None => Vec::new(),
         Some(c) => triple
@@ -9777,6 +10153,9 @@ pub fn export_module(
     }
     for (constant, _) in &model_tables {
         tla.push_str(&format!("\\* WARNING: {constant} is an uninterpreted function hole; supply a typed finite table. Finite carriers restrict the model.\n"));
+    }
+    if let Some(warning) = &init_domain_warning {
+        tla.push_str(&format!("\\* WARNING: {warning}\n"));
     }
     tla.push_str("EXTENDS Integers, Sequences, FiniteSets, TLC\n\n");
     if !model_constants.is_empty() {
@@ -10016,6 +10395,8 @@ pub fn export_module(
         next: next_name,
         init_unassigned,
         init_enumerated,
+        init_fields_unassigned,
+        init_domain_warning,
         invariants: inv_names,
         transitions,
         skipped_invariants: skipped,

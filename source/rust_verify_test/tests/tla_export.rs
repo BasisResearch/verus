@@ -94,7 +94,8 @@ fn tla_tools() -> Option<String> {
 /// Run a class from the TLA+ tools: whether java exited successfully, and
 /// its stdout and stderr.
 fn java(jar: &str, dir: &Path, args: &[&str]) -> (bool, String) {
-    let out = std::process::Command::new("java")
+    let out = std::process::Command::new("timeout")
+        .args(["60", "java"])
         .arg(format!("-Djava.io.tmpdir={}", dir.display()))
         .args(["-cp", jar])
         .args(args)
@@ -1494,8 +1495,9 @@ pub open spec fn small(s: State) -> bool { s.x <= 2 }
 #[test]
 fn tla_export_reports_what_init_leaves_unassigned() {
     let ex = export_code(INIT_GAP, "test_crate");
-    assert_eq!(ex.report["init_unassigned"], serde_json::json!(["y"]));
-    assert!(ex.cfg.contains("\\* Init never assigns y: TLC cannot compute"), "{}", ex.cfg);
+    assert_eq!(ex.report["init_unassigned"], serde_json::json!([]));
+    assert_eq!(ex.report["init_enumerated"][0]["domain"], "Dom_int");
+    assert!(ex.tla.contains("WARNING: Init uses finite domain holes"), "{}", ex.tla);
     assert!(ex.tla.contains("(x = 0)"), "{}", ex.tla);
     // `is_zero(pre)` in next is a guard: Next assigns both variables.
     assert!(!ex.cfg.contains("Transition next never assigns"), "{}", ex.cfg);
@@ -2491,7 +2493,8 @@ fn tla_export_assigns_an_init_equality_of_two_fields() {
     assert!(ex.tla.contains("(z = y)"), "{}", ex.tla);
     // With nothing assigned before it, the equality assigns neither.
     let gap = export_code(&INIT_FIELD_EQUALITY.replace("s.x == 1", "true"), "test_crate");
-    assert_eq!(gap.report["init_unassigned"], serde_json::json!(["x", "y", "z"]), "{}", gap.tla);
+    assert_eq!(gap.report["init_unassigned"], serde_json::json!([]), "{}", gap.tla);
+    assert_eq!(gap.report["init_enumerated"].as_array().unwrap().len(), 3);
     let Some(jar) = tla_tools() else { return };
     sany(&jar, &ex.spec());
     let run = tlc(&jar, &ex.spec(), &ex.cfg);
@@ -9012,6 +9015,207 @@ pub open spec fn some(s: State) -> bool { exists|c: Multiset<int>| c.len() == s.
     sany(&jar, &ex.spec());
 }
 
+#[test]
+fn tla_export_unsigned_bits() {
+    let ex = export_code(
+        r#"
+verus! {
+pub struct State { pub x: u8 }
+pub open spec fn init(s: State) -> bool { s.x == 0 }
+pub open spec fn next(pre: State, post: State) -> bool {
+    pre.x < 255 && post.x == pre.x + 1
+}
+pub open spec fn bits(s: State) -> bool {
+    &&& (s.x & 15u8) == s.x % 16
+    &&& (s.x | 15u8) == (s.x / 16) * 16 + 15
+    &&& (s.x ^ 255u8) == 255 - s.x
+    &&& !s.x == 255 - s.x
+    &&& (s.x >> 2u8) == s.x / 4
+    &&& (s.x << 2u8) == (s.x % 64) * 4
+    &&& (s.x >> (s.x % 8)) <= s.x
+    &&& (s.x << 8u8) == 0
+    &&& (s.x >> 8u8) == 0
+}
+}
+"#,
+        "test_crate",
+    );
+    assert_eq!(ex.report["refusals"], serde_json::json!([]), "{}", ex.report);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let run = tlc(&jar, &ex.spec(), &ex.cfg);
+    assert_eq!(run.distinct, 256);
+    assert!(run.violated.is_empty(), "{:?}", run);
+}
+
+#[test]
+fn tla_export_partial_nested_init() {
+    let ex = export_code(
+        r#"
+verus! {
+pub struct Inner { pub fixed: bool, pub free: bool }
+pub struct State { pub nested: Inner, pub free: u8, pub n: nat }
+pub open spec fn init(s: State) -> bool { s.nested.fixed && s.free < 2 }
+pub open spec fn next(pre: State, post: State) -> bool { post == pre }
+pub open spec fn preserved(s: State) -> bool { s.nested.fixed && s.free < 2 }
+}
+"#,
+        "test_crate",
+    );
+    assert_eq!(ex.report["refusals"], serde_json::json!([]));
+    assert_eq!(ex.report["init_unassigned"], serde_json::json!([]));
+    assert_eq!(ex.report["init_enumerated"].as_array().unwrap().len(), 3);
+    assert_eq!(
+        ex.report["init_fields_unassigned"],
+        serde_json::json!(["nested.free", "free", "n"])
+    );
+    assert!(ex.tla.contains("IsFiniteSet(Dom_nat)"), "{}", ex.tla);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let cfg = format!("{}\nCONSTANT Dom_nat <- Nats\n", ex.cfg);
+    // Supply a finite carrier as an operator, as in campaign configurations.
+    let tla = ex.tla.replace("====", "Nats == 0..2\n====");
+    std::fs::write(ex.spec(), tla).unwrap();
+    let run = tlc(&jar, &ex.spec(), &cfg);
+    assert_eq!(run.distinct, 12);
+    assert!(run.violated.is_empty(), "{:?}", run);
+}
+
+#[test]
+fn tla_export_wide_unsigned_bits_and_pointer_width() {
+    let ex = export_code(
+        r#"
+verus! {
+global size_of usize == 8;
+pub struct State { pub x: u64 }
+pub open spec fn init(s: State) -> bool { s.x == 3 }
+pub open spec fn next(pre: State, post: State) -> bool { post == pre }
+pub open spec fn bits(s: State) -> bool {
+    &&& (s.x << 2u64) == 12
+    &&& (s.x >> 52u64) == 0
+    &&& (s.x & 1u64) == 1
+    &&& (s.x ^ 1u64) == 2
+    &&& ((s.x as usize) << 1usize) == 6
+    &&& (0u64 << 63u64) == 0
+    &&& (s.x << 64u64) == 0
+}
+}
+"#,
+        "test_crate",
+    );
+    assert_eq!(ex.report["refusals"], serde_json::json!([]));
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let run = tlc(&jar, &ex.spec(), &ex.cfg);
+    assert_eq!(run.distinct, 1);
+    assert!(run.violated.is_empty(), "{:?}", run);
+}
+
+#[test]
+fn tla_export_refuses_signed_and_unknown_width_bits() {
+    for typ in ["i8", "usize"] {
+        let code = format!(
+            r#"
+verus! {{
+pub struct State {{ pub x: {typ} }}
+pub open spec fn init(s: State) -> bool {{ s.x == 0 }}
+pub open spec fn next(pre: State, post: State) -> bool {{ post.x == (pre.x << 1) }}
+}}
+"#
+        );
+        let ex = export_code(&code, "test_crate");
+        assert!(!ex.report["refusals"].as_array().unwrap().is_empty());
+        assert!(ex.report["refusals"][0]["location"].as_str().unwrap().contains("test.rs"));
+        let Some(jar) = tla_tools() else { continue };
+        sany(&jar, &ex.spec());
+        assert!(tlc_output(&jar, &ex.spec(), &ex.cfg).contains("Assert"));
+    }
+}
+
+#[test]
+fn tla_export_partial_init_enum_and_large_finite_record() {
+    let ex = export_code(
+        r#"
+verus! {
+pub enum E { A, B }
+pub struct Pair { pub x: u8, pub y: u8 }
+pub struct State { pub e: E, pub pair: Pair }
+pub open spec fn init(s: State) -> bool { s.pair.x == 0 && s.pair.y < 2 }
+pub open spec fn next(pre: State, post: State) -> bool { post == pre }
+}
+"#,
+        "test_crate",
+    );
+    assert_eq!(ex.report["holes"], serde_json::json!([]));
+    assert_eq!(ex.report["init_fields_unassigned"], serde_json::json!(["e", "pair.y"]));
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let run = tlc(&jar, &ex.spec(), &ex.cfg);
+    assert_eq!(run.distinct, 4);
+}
+
+#[test]
+fn tla_export_partial_init_rejects_an_ill_typed_carrier() {
+    let ex = export_code(
+        r#"
+verus! {
+pub struct State { pub x: nat }
+pub open spec fn init(s: State) -> bool { true }
+pub open spec fn next(pre: State, post: State) -> bool { post == pre }
+}
+"#,
+        "test_crate",
+    );
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let cfg = format!("{}\nCONSTANT Dom_nat <- Values\n", ex.cfg);
+    std::fs::write(ex.spec(), ex.tla.replace("====", "Values == {-1, 0}\n====")).unwrap();
+    let out = tlc_output(&jar, &ex.spec(), &cfg);
+    assert!(out.contains("Assumption") && out.contains("is false"), "{}", out);
+}
+
+#[test]
+fn tla_export_bit_shift_in_an_exec_constant() {
+    let ex = export_code(
+        r#"
+verus! {
+pub const MASK: u8 = 1u8 << 3u8;
+pub struct State { pub x: u8 }
+pub open spec fn init(s: State) -> bool { s.x == MASK }
+pub open spec fn next(pre: State, post: State) -> bool { post == pre }
+pub open spec fn value(s: State) -> bool { s.x == 8 }
+}
+"#,
+        "test_crate",
+    );
+    assert_eq!(ex.report["refusals"], serde_json::json!([]));
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let run = tlc(&jar, &ex.spec(), &ex.cfg);
+    assert_eq!(run.distinct, 1);
+    assert!(run.violated.is_empty(), "{:?}", run);
+}
+
+#[test]
+fn tla_export_partial_init_char_carrier() {
+    let ex = export_code(
+        r#"
+verus! {
+pub struct State { pub c: char }
+pub open spec fn init(s: State) -> bool { true }
+pub open spec fn next(pre: State, post: State) -> bool { post == pre }
+}
+"#,
+        "test_crate",
+    );
+    assert!(ex.report["init_domain_warning"].as_str().unwrap().contains("finite domain holes"));
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let cfg = format!("{}\nCONSTANT Dom_char <- Chars\n", ex.cfg);
+    std::fs::write(ex.spec(), ex.tla.replace("====", "Chars == {\"a\", \"b\"}\n====")).unwrap();
+    assert_eq!(tlc(&jar, &ex.spec(), &cfg).distinct, 2);
+}
+
 /// Concrete type arguments must reach trait calls nested in generic helpers.
 /// Two instantiations exercise operator and table identity, including Self::V.
 #[test]
@@ -9342,6 +9546,141 @@ pub open spec fn inv(s: State) -> bool { value(s.x) == Some(s.x) }
     std::fs::write(ex.spec(), text).unwrap();
     let bad = tlc_output(&jar, &ex.spec(), &cfg);
     assert!(bad.contains("Assumption") && bad.contains("false"), "{}", bad);
+}
+
+// Raft's actual Init predicate (toydb c23eebe8), with only the payload types
+// reduced. Its length and element constraints are not a whole-value TLC
+// assignment. They also do not leave an unconstrained sequence to widen.
+const RAFT_RELATIONAL_INIT: &str = r#"
+use vstd::prelude::*;
+verus! {
+pub struct Host { pub term: nat, pub ready: bool }
+pub struct GState {
+    pub n: nat, pub hosts: Seq<Host>, pub net: Set<bool>,
+    pub leader_log: Map<nat, Seq<bool>>, pub leader_of: Map<nat, int>,
+    pub voters: Map<nat, Set<int>>, pub elect_log: Map<nat, Seq<bool>>,
+    pub elect_votes: Map<nat, Map<int, Seq<bool>>>, pub commits: Set<bool>,
+    pub reads: Set<bool>, pub read_hwm: Map<nat, nat>,
+}
+pub open spec fn init_host() -> Host { Host { term: 0, ready: false } }
+pub open spec fn init(s: GState) -> bool {
+    &&& s.n >= 1
+    &&& s.hosts.len() == s.n
+    &&& forall|i: int| 0 <= i < s.n ==> s.hosts[i] == init_host()
+    &&& s.net == Set::<bool>::empty()
+    &&& s.leader_log == Map::<nat, Seq<bool>>::empty()
+    &&& s.leader_of == Map::<nat, int>::empty()
+    &&& s.voters == Map::<nat, Set<int>>::empty()
+    &&& s.elect_log == Map::<nat, Seq<bool>>::empty()
+    &&& s.elect_votes == Map::<nat, Map<int, Seq<bool>>>::empty()
+    &&& s.commits == Set::<bool>::empty()
+    &&& s.reads == Set::<bool>::empty()
+    &&& s.read_hwm == Map::<nat, nat>::empty()
+}
+pub open spec fn next(pre: GState, post: GState) -> bool { post == pre }
+}
+"#;
+
+#[test]
+fn tla_export_raft_init_is_byte_identical() {
+    let ex = export_code(RAFT_RELATIONAL_INIT, "test_crate");
+    // Pin the complete emitted operator from the original Raft export, not
+    // merely absence of the new domain name or its final Init wrapper.
+    let expected = r#"init ==
+    ((((((((((((n >= 1) /\ (n = Len(hosts))) /\ (\A i \in 0..(n) - 1 : (((0 <= i) /\ (i < n)) => (hosts[(i) + 1] = init_host)))) /\ (net = {})) /\ (leader_log = [k__ \in {} |-> k__])) /\ (leader_of = [k__2 \in {} |-> k__2])) /\ (voters = [k__3 \in {} |-> k__3])) /\ (elect_log = [k__4 \in {} |-> k__4])) /\ (elect_votes = [k__5 \in {} |-> k__5])) /\ (commits = {})) /\ (reads = {})) /\ (read_hwm = [k__6 \in {} |-> k__6]))
+"#;
+    let operator = ex.tla.split("init ==\n").nth(1).unwrap().split("\n\n").next().unwrap();
+    assert_eq!(format!("init ==\n{}\n", operator), expected);
+    assert!(ex.tla.contains("\nInit == init /\\ TypeOK\n"), "{}", ex.tla);
+    assert_eq!(ex.report["init_unassigned"], serde_json::json!(["hosts"]));
+    assert_eq!(ex.report["init_enumerated"], serde_json::json!([]));
+    assert_eq!(ex.report["holes"], serde_json::json!([]));
+    assert!(ex.report.get("init_fields_unassigned").is_none());
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    // Like RaftExportMC, supply the relationally specified sequence in the
+    // harness, without modifying the emitted Init or adding a carrier hole.
+    let text = ex
+        .tla
+        .replace("====", "RaftInit == n = 2 /\\ hosts = <<init_host, init_host>> /\\ Init\n====");
+    std::fs::write(ex.spec(), text).unwrap();
+    let run = tlc(&jar, &ex.spec(), "INIT RaftInit\nNEXT Next\nCHECK_DEADLOCK FALSE\n");
+    assert_eq!(run.distinct, 1);
+}
+
+#[test]
+fn tla_export_relational_init_helper_and_incomplete_index_guard() {
+    let code = r#"
+use vstd::prelude::*;
+verus! {
+pub struct State { pub hosts: Seq<bool> }
+pub open spec fn initialize(s: State) -> bool {
+    s.hosts.len() == 2 && forall|i: int| 0 <= i < 2 ==> s.hosts[i] == false
+}
+pub open spec fn init(s: State) -> bool { initialize(s) }
+pub open spec fn next(pre: State, post: State) -> bool { post == pre }
+}
+"#;
+    let ex = export_code(code, "test_crate");
+    assert_eq!(ex.report["holes"], serde_json::json!([]));
+    assert!(ex.tla.contains("\nInit == init\n"), "{}", ex.tla);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    std::fs::write(
+        ex.spec(),
+        ex.tla.replace("====", "Seed == hosts = <<FALSE, FALSE>> /\\ Init\n===="),
+    )
+    .unwrap();
+    assert_eq!(tlc(&jar, &ex.spec(), "INIT Seed\nNEXT Next\n").distinct, 1);
+
+    // A shorter or conditional range, or a circular equality, does leave a
+    // gap. None may be mistaken for the complete relational initializer.
+    for partial in [
+        code.replace("i < 2", "i < 1"),
+        code.replace("0 <= i < 2", "0 <= i < 2 && i == 0"),
+        code.replace("s.hosts[i] == false", "s.hosts[i] == s.hosts[i]"),
+    ] {
+        let ex = export_code(&partial, "test_crate");
+        assert_eq!(ex.report["init_enumerated"][0]["domain"], "Dom_Seq_bool");
+        sany(&jar, &ex.spec());
+        std::fs::write(
+            ex.spec(),
+            ex.tla.replace("====", "Carrier == {<<FALSE, FALSE>>, <<FALSE, TRUE>>}\n===="),
+        )
+        .unwrap();
+        let cfg = format!("{}\nCONSTANT Dom_Seq_bool <- Carrier\n", ex.cfg);
+        assert_eq!(tlc(&jar, &ex.spec(), &cfg).distinct, 2);
+    }
+}
+
+#[test]
+fn tla_export_complete_record_init_never_adds_a_carrier() {
+    for initializer in
+        ["s.r == R { n: 1, b: true }", "s.r.n == 1 && s.r.b == true", "initialize(s)"]
+    {
+        let code = format!(
+            r#"
+verus! {{
+pub struct R {{ pub n: nat, pub b: bool }}
+pub struct State {{ pub r: R }}
+pub open spec fn initialize(s: State) -> bool {{ s.r.n == 1 && s.r.b == true }}
+pub open spec fn init(s: State) -> bool {{ {initializer} }}
+pub open spec fn next(pre: State, post: State) -> bool {{ post == pre }}
+}}
+"#
+        );
+        let ex = export_code(&code, "test_crate");
+        assert_eq!(ex.report["holes"], serde_json::json!([]), "{}", ex.tla);
+        assert!(ex.tla.contains("\nInit == init /\\ TypeOK\n"));
+        let Some(jar) = tla_tools() else { continue };
+        sany(&jar, &ex.spec());
+        std::fs::write(
+            ex.spec(),
+            ex.tla.replace("====", "Seed == r = [n |-> 1, b |-> TRUE] /\\ Init\n===="),
+        )
+        .unwrap();
+        assert_eq!(tlc(&jar, &ex.spec(), "INIT Seed\nNEXT Next\n").distinct, 1);
+    }
 }
 
 /// Rust knows the blanket bound is false for Concrete. The exporter does not
@@ -11569,5 +11908,55 @@ fn tla_export_trace_safety_diagnosis() {
         let ex = export_code(code, "test_crate");
         trace_action_log(&ex, &[(r#"{"step":"a","params":{"n":1},"state":{"x":1}}"#, depth)]);
         trace_safety_probe(&ex, enabled, depth);
+    }
+}
+
+#[test]
+fn tla_export_relational_init_uses_specialized_helpers_and_bounds() {
+    let code = r#"
+use vstd::prelude::*;
+verus! {
+pub trait Count { spec fn len() -> nat; }
+pub struct One;
+pub struct Two;
+impl Count for One { open spec fn len() -> nat { 1 } }
+impl Count for Two { open spec fn len() -> nat { 2 } }
+pub open spec fn length<C: Count>() -> nat { C::len() }
+pub struct State { pub hosts: Seq<bool> }
+pub open spec fn initialize<C: Count>(s: State) -> bool {
+    s.hosts.len() == length::<Two>()
+    && forall|i: int| 0 <= i < length::<C>() ==> s.hosts[i] == false
+}
+pub open spec fn init(s: State) -> bool { initialize::<Two>(s) }
+pub open spec fn next(pre: State, post: State) -> bool { post == pre }
+pub open spec fn bounded(s: State) -> bool { s.hosts.len() == 2 }
+}
+"#;
+    for (source, complete) in [
+        (code.to_string(), true),
+        (code.replace("initialize::<Two>(s)", "initialize::<One>(s)"), false),
+    ] {
+        let ex = export_code(&source, "test_crate:bounded");
+        assert_eq!(ex.report["refusals"], serde_json::json!([]), "{}", ex.report);
+        if complete {
+            assert_eq!(ex.report["holes"], serde_json::json!([]), "{}", ex.report);
+        } else {
+            assert_eq!(ex.report["init_enumerated"][0]["domain"], "Dom_Seq_bool");
+        }
+        let Some(jar) = tla_tools() else { continue };
+        sany(&jar, &ex.spec());
+        let (text, cfg) = if complete {
+            (
+                ex.tla.replace("====", "Seed == hosts = <<FALSE, FALSE>> /\\ Init\n===="),
+                "INIT Seed\nNEXT Next\n".into(),
+            )
+        } else {
+            (
+                ex.tla.replace("====", "Carrier == {<<FALSE, FALSE>>, <<FALSE, TRUE>>}\n===="),
+                format!("{}\nCONSTANT Dom_Seq_bool <- Carrier\n", ex.cfg),
+            )
+        };
+        std::fs::write(ex.spec(), text).unwrap();
+        assert_eq!(tlc(&jar, &ex.spec(), &cfg).distinct, if complete { 1 } else { 2 });
     }
 }

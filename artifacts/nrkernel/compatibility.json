@@ -1,0 +1,212 @@
+[
+  {
+    "file": "adder_sync/State_tla.cfg",
+    "equal": true,
+    "before_sha256": "dc42f4ac7c164de76a1e973997e5ae2260509e35a94e5630e465dc8c72e68ae0",
+    "after_sha256": "dc42f4ac7c164de76a1e973997e5ae2260509e35a94e5630e465dc8c72e68ae0"
+  },
+  {
+    "file": "adder_sync/State_tla.tla",
+    "equal": true,
+    "before_sha256": "725766b12b5b421dacb6c5054e41a53668ad7ca5d7b599e15ded5c790861510a",
+    "after_sha256": "725766b12b5b421dacb6c5054e41a53668ad7ca5d7b599e15ded5c790861510a"
+  },
+  {
+    "file": "adder_sync/State_tla.tla.json",
+    "equal": true,
+    "before_sha256": "3372d5fda84add04eeae424368d3f76a86a02441163edd476fdae72aae2376f4",
+    "after_sha256": "3372d5fda84add04eeae424368d3f76a86a02441163edd476fdae72aae2376f4"
+  },
+  {
+    "file": "adder_sync/State_tla_trace.cfg",
+    "equal": true,
+    "before_sha256": "4c0dda1fee2484b902db6b6975cb40855f3c30e9ee28849bb5873db06d8fd6ba",
+    "after_sha256": "4c0dda1fee2484b902db6b6975cb40855f3c30e9ee28849bb5873db06d8fd6ba"
+  },
+  {
+    "file": "adder_sync/State_tla_trace.tla",
+    "equal": true,
+    "before_sha256": "6073c4dc0590ba3763597966daccf6f13cf14948d345d4eb21093aa33516cf7c",
+    "after_sha256": "6073c4dc0590ba3763597966daccf6f13cf14948d345d4eb21093aa33516cf7c"
+  },
+  {
+    "file": "assert_sync/State_tla.cfg",
+    "equal": true,
+    "before_sha256": "1d76b7c9bb7d8ce49c4b93bf801cfb6d424f3e8c34743eb59f32dcb52b42dc8f",
+    "after_sha256": "1d76b7c9bb7d8ce49c4b93bf801cfb6d424f3e8c34743eb59f32dcb52b42dc8f"
+  },
+  {
+    "file": "assert_sync/State_tla.tla",
+    "equal": true,
+    "before_sha256": "21f47913911f6eddeab42094ff9457fd0c59b3ca17efeee1d33f7cf42f0b7b83",
+    "after_sha256": "21f47913911f6eddeab42094ff9457fd0c59b3ca17efeee1d33f7cf42f0b7b83"
+  },
+  {
+    "file": "assert_sync/State_tla.tla.json",
+    "equal": true,
+    "before_sha256": "4aa8f159903ef05fbd2fb83caa910bf387bbfc135986b2d18871241ba8393153",
+    "after_sha256": "4aa8f159903ef05fbd2fb83caa910bf387bbfc135986b2d18871241ba8393153"
+  },
+  {
+    "file": "assert_sync/State_tla_trace.cfg",
+    "equal": true,
+    "before_sha256": "4c0dda1fee2484b902db6b6975cb40855f3c30e9ee28849bb5873db06d8fd6ba",
+    "after_sha256": "4c0dda1fee2484b902db6b6975cb40855f3c30e9ee28849bb5873db06d8fd6ba"
+  },
+  {
+    "file": "assert_sync/State_tla_trace.tla",
+    "equal": true,
+    "before_sha256": "b935daad11f45694a70f41958fdcd4585c72cdff969d6e97de40f9d6f3572b87",
+    "after_sha256": "b935daad11f45694a70f41958fdcd4585c72cdff969d6e97de40f9d6f3572b87"
+  },
+  {
+    "file": "counter/State_tla.cfg",
+    "equal": true,
+    "before_sha256": "07ea3953075a098d96c20f1553408b68a4c2ceb221a9ce5c468fd3bbd73fa2d7",
+    "after_sha256": "07ea3953075a098d96c20f1553408b68a4c2ceb221a9ce5c468fd3bbd73fa2d7"
+  },
+  {
+    "file": "counter/State_tla.tla",
+    "equal": true,
+    "before_sha256": "32a3e06033059aba667eb83e746d9d0784a7689b22b0fcb353bfde97f64815d7",
+    "after_sha256": "32a3e06033059aba667eb83e746d9d0784a7689b22b0fcb353bfde97f64815d7"
+  },
+  {
+    "file": "counter/State_tla.tla.json",
+    "equal": true,
+    "before_sha256": "49f252cfaa566dff4d801a658097b5de54436741391b6be34a9d118aa3129c3d",
+    "after_sha256": "49f252cfaa566dff4d801a658097b5de54436741391b6be34a9d118aa3129c3d"
+  },
+  {
+    "file": "counter/State_tla_trace.cfg",
+    "equal": true,
+    "before_sha256": "4c0dda1fee2484b902db6b6975cb40855f3c30e9ee28849bb5873db06d8fd6ba",
+    "after_sha256": "4c0dda1fee2484b902db6b6975cb40855f3c30e9ee28849bb5873db06d8fd6ba"
+  },
+  {
+    "file": "counter/State_tla_trace.tla",
+    "equal": true,
+    "before_sha256": "93c356846281fea9b2d8775b063f81f879f015ce28fc535edd50c50f4997d03d",
+    "after_sha256": "93c356846281fea9b2d8775b063f81f879f015ce28fc535edd50c50f4997d03d"
+  },
+  {
+    "file": "mutex_liveness/ProgramState_tla.cfg",
+    "equal": true,
+    "before_sha256": "533a092f3d125531cff14cc059695cbef2e2f413479fce6d04e39f9a9aec25f5",
+    "after_sha256": "533a092f3d125531cff14cc059695cbef2e2f413479fce6d04e39f9a9aec25f5"
+  },
+  {
+    "file": "mutex_liveness/ProgramState_tla.tla",
+    "equal": true,
+    "before_sha256": "7c3ceee1e316f004b1d215305aff40280508c6e74fc25639f0ad93c5bf476bb6",
+    "after_sha256": "7c3ceee1e316f004b1d215305aff40280508c6e74fc25639f0ad93c5bf476bb6"
+  },
+  {
+    "file": "mutex_liveness/ProgramState_tla.tla.json",
+    "equal": true,
+    "before_sha256": "d928b9d108d918407af60ea700ea83363b587c7880751ee834f8931bc3d1b187",
+    "after_sha256": "d928b9d108d918407af60ea700ea83363b587c7880751ee834f8931bc3d1b187"
+  },
+  {
+    "file": "mutex_liveness/ProgramState_tla_trace.cfg",
+    "equal": true,
+    "before_sha256": "4c0dda1fee2484b902db6b6975cb40855f3c30e9ee28849bb5873db06d8fd6ba",
+    "after_sha256": "4c0dda1fee2484b902db6b6975cb40855f3c30e9ee28849bb5873db06d8fd6ba"
+  },
+  {
+    "file": "mutex_liveness/ProgramState_tla_trace.tla",
+    "equal": true,
+    "before_sha256": "96921e0e2309c939a3cf6d93903cbc2208c0b184f01593067ee11f34d6fdee81",
+    "after_sha256": "96921e0e2309c939a3cf6d93903cbc2208c0b184f01593067ee11f34d6fdee81"
+  },
+  {
+    "file": "mutex_tla/State_tla.cfg",
+    "equal": true,
+    "before_sha256": "87833bc818627b60e0318620066a059bd45598a501e7acc4eca96e73c253b234",
+    "after_sha256": "87833bc818627b60e0318620066a059bd45598a501e7acc4eca96e73c253b234"
+  },
+  {
+    "file": "mutex_tla/State_tla.tla",
+    "equal": true,
+    "before_sha256": "4d3dd5fb3d3da516180294f85e3e8005ed3ec2cb2f1df8e87179b3fa08d0d365",
+    "after_sha256": "4d3dd5fb3d3da516180294f85e3e8005ed3ec2cb2f1df8e87179b3fa08d0d365"
+  },
+  {
+    "file": "mutex_tla/State_tla.tla.json",
+    "equal": true,
+    "before_sha256": "43ee7aa2655c84888a4c43408db7fd7a898e7467251731709bd4113ac5871109",
+    "after_sha256": "43ee7aa2655c84888a4c43408db7fd7a898e7467251731709bd4113ac5871109"
+  },
+  {
+    "file": "mutex_tla/State_tla_trace.cfg",
+    "equal": true,
+    "before_sha256": "4c0dda1fee2484b902db6b6975cb40855f3c30e9ee28849bb5873db06d8fd6ba",
+    "after_sha256": "4c0dda1fee2484b902db6b6975cb40855f3c30e9ee28849bb5873db06d8fd6ba"
+  },
+  {
+    "file": "mutex_tla/State_tla_trace.tla",
+    "equal": true,
+    "before_sha256": "66dc230bc0d2126cd7925ca0126574c985fb016adbfa1fbff0ee65d179d5476c",
+    "after_sha256": "66dc230bc0d2126cd7925ca0126574c985fb016adbfa1fbff0ee65d179d5476c"
+  },
+  {
+    "file": "safety/GState_tla.cfg",
+    "equal": true,
+    "before_sha256": "eb12beca600714588a82fb1822d473615f947848839487780cf60d4898c69108",
+    "after_sha256": "eb12beca600714588a82fb1822d473615f947848839487780cf60d4898c69108"
+  },
+  {
+    "file": "safety/GState_tla.tla",
+    "equal": true,
+    "before_sha256": "97529bd4ed13f71080e27f0df7a577f7dc13c6c58716da8217ab0402d1c6b7dc",
+    "after_sha256": "97529bd4ed13f71080e27f0df7a577f7dc13c6c58716da8217ab0402d1c6b7dc"
+  },
+  {
+    "file": "safety/GState_tla.tla.json",
+    "equal": true,
+    "before_sha256": "e2c2502f6f15a2411c72421c09916628090fad3907d452e1ee733486886af4a8",
+    "after_sha256": "e2c2502f6f15a2411c72421c09916628090fad3907d452e1ee733486886af4a8"
+  },
+  {
+    "file": "safety/GState_tla_trace.cfg",
+    "equal": true,
+    "before_sha256": "4c0dda1fee2484b902db6b6975cb40855f3c30e9ee28849bb5873db06d8fd6ba",
+    "after_sha256": "4c0dda1fee2484b902db6b6975cb40855f3c30e9ee28849bb5873db06d8fd6ba"
+  },
+  {
+    "file": "safety/GState_tla_trace.tla",
+    "equal": true,
+    "before_sha256": "e14592b3506b90046635551d5e547027a7dede87fff387443d5223019d866cab",
+    "after_sha256": "e14592b3506b90046635551d5e547027a7dede87fff387443d5223019d866cab"
+  },
+  {
+    "file": "toggle_sync/State_tla.cfg",
+    "equal": true,
+    "before_sha256": "e34239e8f50d92f3290b25f157ce0cbae93e05596b46d8be30531cc66a6c2be9",
+    "after_sha256": "e34239e8f50d92f3290b25f157ce0cbae93e05596b46d8be30531cc66a6c2be9"
+  },
+  {
+    "file": "toggle_sync/State_tla.tla",
+    "equal": true,
+    "before_sha256": "9cc3234e6384a7f60c94351bbe7a70c07661729dbfc5effe5142c793b0124a2c",
+    "after_sha256": "9cc3234e6384a7f60c94351bbe7a70c07661729dbfc5effe5142c793b0124a2c"
+  },
+  {
+    "file": "toggle_sync/State_tla.tla.json",
+    "equal": true,
+    "before_sha256": "aa1914830cc83dd52a19a6d33ac902760b32b5fa357ef37a4939dded31d5cddf",
+    "after_sha256": "aa1914830cc83dd52a19a6d33ac902760b32b5fa357ef37a4939dded31d5cddf"
+  },
+  {
+    "file": "toggle_sync/State_tla_trace.cfg",
+    "equal": true,
+    "before_sha256": "4c0dda1fee2484b902db6b6975cb40855f3c30e9ee28849bb5873db06d8fd6ba",
+    "after_sha256": "4c0dda1fee2484b902db6b6975cb40855f3c30e9ee28849bb5873db06d8fd6ba"
+  },
+  {
+    "file": "toggle_sync/State_tla_trace.tla",
+    "equal": true,
+    "before_sha256": "3b5997b17d7fefc6cbb2fcfe64276c50fc773fe59fca13aa99868b303205a0e0",
+    "after_sha256": "3b5997b17d7fefc6cbb2fcfe64276c50fc773fe59fca13aa99868b303205a0e0"
+  }
+]
