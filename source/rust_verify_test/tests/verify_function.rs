@@ -1,7 +1,10 @@
 #![feature(rustc_private)]
+#[macro_use]
+mod common;
+use common::*;
 
 use std::fs;
-use std::process::{Command, Output};
+use std::process::Output;
 
 const CODE: &str = r#"
 use vstd::prelude::*;
@@ -25,6 +28,20 @@ mod second {
     proof fn only_second() { assert(7int + 7 == 14); }
     }
 }
+mod point {
+    use vstd::prelude::*;
+    verus! {
+    proof fn origin() { assert(0int == 0); }
+    }
+}
+mod third {
+    use vstd::prelude::*;
+    verus! {
+    #[allow(non_camel_case_types)]
+    pub struct point {}
+    impl point { proof fn f() { assert(8int == 8); } }
+    }
+}
 "#;
 
 // `gamma` fails, so a run that verifies it reports an error.
@@ -37,21 +54,18 @@ fn run_in(modules: &[&str], functions: &[&str]) -> (Output, String, String) {
     let dir = tempfile::tempdir().unwrap();
     let input = dir.path().join("fixture.rs");
     fs::write(&input, CODE).unwrap();
-    let current = std::env::current_exe().unwrap();
-    let binary = current.parent().unwrap().parent().unwrap().join("rust_verify");
-    let mut command = Command::new(binary);
-    command.args(["--mcp", "--crate-type=lib", "-V", "no-solver-version-check"]);
+    let mut args = vec!["--crate-type=lib", "-V", "no-solver-version-check"];
     for m in modules {
-        if *m == "--verify-root" {
-            command.arg(m);
-        } else {
-            command.args(["--verify-only-module", m]);
+        if *m != "--verify-root" {
+            args.push("--verify-only-module");
         }
+        args.push(*m);
     }
     for f in functions {
-        command.args(["--verify-function", f]);
+        args.extend(["--verify-function", *f]);
     }
-    let output = command.arg(&input).output().unwrap();
+    args.push(input.to_str().unwrap());
+    let output = run_verus_raw(&args, dir.path());
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
     (output, stdout, stderr)
@@ -130,16 +144,17 @@ fn verify_function_reports_every_bad_pattern() {
     let (output, stdout, stderr) = run(&["delta", "alpha", "zeta"]);
     assert!(!output.status.success());
     assert!(!stdout.contains("verified"), "{}", stdout);
-    // One error, holding each pattern's message as a single flag words it
-    let message = |s: &str| {
+    // One error, holding each pattern's message as a single flag words it,
+    // separated by a blank line (compared line by line, without the indentation)
+    let message = |s: &str| -> Vec<String> {
         let start = s.find("error: ").unwrap() + "error: ".len();
         let end = s.find("\nerror: aborting").unwrap();
-        s[start..end].trim_end().to_string()
+        s[start..end].trim_end().lines().map(|line| line.trim().to_string()).collect()
     };
-    assert_eq!(
-        message(&stderr),
-        format!("{}\n       \n       {}", message(&delta_stderr), message(&zeta_stderr))
-    );
+    let mut expected = message(&delta_stderr);
+    expected.push(String::new());
+    expected.extend(message(&zeta_stderr));
+    assert_eq!(message(&stderr), expected);
     assert!(stderr.contains("error: aborting due to 1 previous error"), "{}", stderr);
 }
 
@@ -195,4 +210,70 @@ fn verify_function_in_root_and_a_module() {
         run_in(&["--verify-root", "first"], &["crate::beta", "first::shared", "alpha_two"]);
     assert!(output.status.success(), "{}", stderr);
     assert_eq!(stdout, results(3));
+}
+
+#[test]
+fn verify_function_wildcard_across_modules() {
+    let (output, stdout, stderr) = run_in(&["first", "second"], &["*shared"]);
+    assert!(output.status.success(), "{}", stderr);
+    assert_eq!(stdout, results(2));
+}
+
+#[test]
+fn verify_function_ambiguity_across_modules_suggests_a_wildcard_that_works() {
+    let (output, _, stderr) = run_in(&["first", "second"], &["shar"]);
+    assert!(!output.status.success());
+    assert!(
+        stderr.contains(
+            "more than one match found for --verify-function shar, consider using wildcard *shar* to verify all matched results,"
+        ),
+        "{}",
+        stderr
+    );
+    let (output, stdout, stderr) = run_in(&["first", "second"], &["*shar*"]);
+    assert!(output.status.success(), "{}", stderr);
+    assert_eq!(stdout, results(2));
+}
+
+// On main, a module-qualified pattern with a single module is "could not find function".
+#[test]
+fn verify_function_qualified_with_one_module() {
+    let (output, stdout, stderr) = run_in(&["first"], &["first::shared"]);
+    assert!(output.status.success(), "{}", stderr);
+    assert_eq!(stdout, results(1));
+
+    let (output, stdout, stderr) = run_in(&["first"], &["first::only_*"]);
+    assert!(output.status.success(), "{}", stderr);
+    assert_eq!(stdout, results(1));
+
+    let (output, stdout, stderr) = run(&["crate::beta"]);
+    assert!(output.status.success(), "{}", stderr);
+    assert_eq!(stdout, results(1));
+
+    // The hints keep the qualifier
+    let (output, _, stderr) = run(&["crate::alph"]);
+    assert!(!output.status.success());
+    assert!(stderr.contains("consider using wildcard crate::*alph*"), "{}", stderr);
+}
+
+#[test]
+fn verify_function_qualified_by_the_path_from_crate() {
+    let (output, stdout, stderr) = run_in(&["first"], &["crate::first::shared"]);
+    assert!(output.status.success(), "{}", stderr);
+    assert_eq!(stdout, results(1));
+
+    let (output, stdout, stderr) =
+        run_in(&["--verify-root", "first"], &["crate::first::shared", "crate::beta"]);
+    assert!(output.status.success(), "{}", stderr);
+    assert_eq!(stdout, results(2));
+}
+
+// `point::f` names the method `f` of struct `third::point`; it is not `f` in module `point`.
+#[test]
+fn verify_function_name_that_starts_with_a_module_name() {
+    let (output, stdout, stderr) = run_in(&["point", "third"], &["point::f"]);
+    assert!(output.status.success(), "{}", stderr);
+    assert_eq!(stdout, results(1));
+    assert_eq!(stderr.matches("note: verifying module third (selected functions)").count(), 1);
+    assert_eq!(stderr.matches("note: verifying module point").count(), 0, "{}", stderr);
 }

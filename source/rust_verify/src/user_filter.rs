@@ -1,7 +1,7 @@
 use crate::buckets::{Bucket, BucketId};
 use crate::config::Args;
 use crate::util::error;
-use crate::verifier::module_name;
+use crate::verifier::{module_name, module_name_of_segments};
 use std::collections::HashSet;
 use std::sync::Arc;
 use vir::ast::{Fun, Function, Krate, VirErr};
@@ -78,15 +78,12 @@ impl UserFilter {
                 .iter()
                 .map(|module| Self::module_fun_names(module, &local_krate.functions))
                 .collect();
+            // How a pattern names each module: `crate` for the root, else its path
             let qualifiers: Vec<String> = modules
                 .iter()
-                .map(|m| {
-                    if m.is_empty() {
-                        "crate".to_string()
-                    } else {
-                        m.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::")
-                    }
-                })
+                .map(
+                    |m| if m.is_empty() { "crate".to_string() } else { module_name_of_segments(m) },
+                )
                 .collect();
 
             // Resolve every pattern before failing, so that one run reports all the bad ones
@@ -210,17 +207,13 @@ impl UserFilter {
             .collect()
     }
 
-    /// Get the functions that match the given string.
+    /// Get the functions that match the given pattern.
     ///
-    /// The first part of this process is to
-    /// infer whether this is an "exact match" filter.
-    /// (If the user doesn't supply any * in the pattern, then it is usuall
-    /// exact - however, if there is no exact match, but there is _exactly one_
-    /// partial match, then we upgrade to a partial match, i.e., return false)
-    ///
-    /// With more than one module, the pattern is matched in all of them,
-    /// and must not match in two of them unless it is qualified by its module
-    /// (`foo::bar::f`, or `crate::f` for the root module).
+    /// The pattern is first matched as written, in all the selected modules.
+    /// If that fails and the pattern starts with the name of a selected module
+    /// (`foo::bar::f` or `crate::foo::bar::f`, or `crate::f` for the root module),
+    /// the rest of the pattern is matched in that module only,
+    /// trying the longest such module name first.
     ///
     /// Errors (with the message) if there is no match.
     fn get_matches(
@@ -228,16 +221,64 @@ impl UserFilter {
         module_fun_names: &[Vec<(Fun, String)>],
         pattern: &String,
     ) -> Result<HashSet<Fun>, String> {
-        let several_modules = module_fun_names.len() > 1;
-        let qualified = qualifiers
+        let all_modules: Vec<usize> = (0..module_fun_names.len()).collect();
+        let unqualified =
+            Self::get_matches_in(qualifiers, module_fun_names, &all_modules, "", pattern, pattern);
+        if unqualified.is_ok() {
+            return unqualified;
+        }
+        let mut prefixes: Vec<(usize, String)> = qualifiers
             .iter()
             .enumerate()
-            .filter(|(_, q)| several_modules && pattern.starts_with(&format!("{q}::")))
-            .max_by_key(|(_, q)| q.len());
-        let (modules, prefix, function_pattern): (Vec<usize>, String, &str) = match qualified {
-            Some((i, q)) => (vec![i], format!("{q}::"), &pattern[q.len() + 2..]),
-            None => ((0..module_fun_names.len()).collect(), String::new(), pattern.as_str()),
-        };
+            .flat_map(|(i, q)| {
+                let absolute = (q != "crate").then(|| format!("crate::{q}::"));
+                std::iter::once(format!("{q}::")).chain(absolute).map(move |p| (i, p))
+            })
+            .filter(|(_, p)| pattern.len() > p.len() && pattern.starts_with(p.as_str()))
+            .collect();
+        prefixes.sort_by_key(|(_, p)| std::cmp::Reverse(p.len()));
+        let mut qualified_err = None;
+        for (i, prefix) in prefixes {
+            let function_pattern = &pattern[prefix.len()..];
+            match Self::get_matches_in(
+                qualifiers,
+                module_fun_names,
+                &[i],
+                &prefix,
+                pattern,
+                function_pattern,
+            ) {
+                Ok(m) => return Ok(m),
+                Err(msg) => {
+                    qualified_err.get_or_insert(msg);
+                }
+            }
+        }
+        Err(qualified_err.unwrap_or_else(|| unqualified.unwrap_err()))
+    }
+
+    /// Get the functions in the given modules that match `function_pattern`,
+    /// which is `pattern` without the module qualifier `prefix`.
+    ///
+    /// The first part of this process is to
+    /// infer whether this is an "exact match" filter.
+    /// (If the user doesn't supply any * in the pattern, then it is usuall
+    /// exact - however, if there is no exact match, but there is _exactly one_
+    /// partial match, then we upgrade to a partial match, i.e., return false)
+    ///
+    /// A wildcard pattern selects its matches in every module,
+    /// but an exact name must not match in two modules.
+    ///
+    /// Errors (with the message) if there is no match.
+    fn get_matches_in(
+        qualifiers: &[String],
+        module_fun_names: &[Vec<(Fun, String)>],
+        modules: &[usize],
+        prefix: &str,
+        pattern: &str,
+        function_pattern: &str,
+    ) -> Result<HashSet<Fun>, String> {
+        let several_modules = module_fun_names.len() > 1;
         let funs: Vec<(usize, &(Fun, String))> =
             modules.iter().flat_map(|&i| module_fun_names[i].iter().map(move |f| (i, f))).collect();
         // With several modules, show each function qualified by its module
@@ -255,9 +296,10 @@ impl UserFilter {
         // if the user provides an exact match (no *), then filter as an exact match.
         // If we find anything this way, we're done.
         let matches = Self::get_matches_strictly_by_pattern(function_pattern, &funs);
+        let clean = function_pattern.trim_matches('*');
         if matches.len() > 0 {
             let first_module = matches[0].0;
-            if matches.iter().any(|(i, _)| *i != first_module) {
+            if clean == function_pattern && matches.iter().any(|(i, _)| *i != first_module) {
                 let msg = vec![
                     format!(
                         "--verify-function {pattern} matches functions in more than one module, qualify it with the module (e.g. {}::{function_pattern}),",
@@ -279,7 +321,6 @@ impl UserFilter {
         // print an informative error message.
         let substring_matches = Self::get_all_substring_matches(function_pattern, &funs);
 
-        let clean = function_pattern.trim_matches('*');
         if clean == function_pattern {
             // If there's no exact match, but there is *exactly one* substring match,
             // then we go ahead and use that function.
