@@ -576,7 +576,7 @@ pub fn parse_args_with_imports(
     opts.optmulti(
         "",
         OPT_VERIFY_FUNCTION,
-        "Verify just the functions matched by this pattern, within the modules given by verify-only-module and verify-root, \nmatches on unique substring (foo) or wildcards at ends of the argument (*foo, foo*, *foo*), \ncan be repeated to verify the union of the functions matched by each pattern; \na pattern with :: is also matched against each function's path from the crate root (foo::bar::f or crate::foo::bar::f, or crate::f for the root); \nwith several modules, or a pattern with :: that matches nothing within one module, \na pattern without * at its ends must match exactly one function",
+        "Verify just the functions matched by this pattern, within the modules given by verify-only-module and verify-root, \nmatches on unique substring (foo) or wildcards at ends of the argument (*foo, foo*, *foo*), \ncan be repeated to verify the union of the functions matched by each pattern; \na pattern with :: is also matched against each function's path from the crate root (foo::bar::f or crate::foo::bar::f, or crate::f for the root) \nand against its module's path followed by its name relative to the module (foo::S::f for a method of an impl of S in module foo); \na pattern without * at its ends that matches functions in more than one module is an error",
         "PATTERN",
     );
     opts.optflag("", OPT_NO_EXTERNAL_BY_DEFAULT, "(deprecated) Verify all items, even those declared outside the verus! macro, and even if they aren't marked #[verifier::verify]");

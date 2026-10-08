@@ -2,11 +2,11 @@ use crate::buckets::{Bucket, BucketId};
 use crate::config::Args;
 use crate::util::error;
 use crate::verifier::module_name;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use vir::ast::{Fun, Function, Krate, VirErr};
 use vir::ast_util::{
-    friendly_fun_name_crate_relative, fun_as_friendly_rust_name, parse_path_segments_from_user_str,
+    fun_as_friendly_rust_name, parse_path_segments_from_user_str, path_as_friendly_rust_name,
 };
 use vir::def::krate_to_string_ignore_stable_id;
 
@@ -25,22 +25,27 @@ type ModuleId = vir::ast::Idents;
 /// A function in one of the selected modules, with the names a pattern can match it by
 struct FunName {
     fun: Fun,
-    /// The name relative to the function's module, as on main
+    /// The index of the function's module among the selected modules
+    module: usize,
+    /// The name relative to the function's module
     name: String,
-    /// The path from the crate root and the same path after `crate::`,
-    /// if the function's name starts with the crate's name
-    path: Option<(String, String)>,
+    /// The names that a pattern with `::` is also matched against:
+    /// the path from the crate root, if the function is named by a path in this crate,
+    /// and the module's path followed by the relative name (without the crate's name),
+    /// each with and without `crate::`
+    qualified: Vec<String>,
     /// The name shown when several modules are selected
     listed: String,
+    /// Where the function is defined, shown to tell apart functions listed by the same name
+    location: String,
 }
 
 impl FunName {
     /// The names a pattern is matched against: the relative name,
-    /// and if `qualified`, also the path from the crate root, with and without `crate::`
+    /// and if `qualified`, also the qualified names
     fn names(&self, qualified: bool) -> impl Iterator<Item = &str> {
-        let paths = self.path.as_ref().filter(|_| qualified);
-        std::iter::once(self.name.as_str())
-            .chain(paths.into_iter().flat_map(|(p, c)| [p.as_str(), c.as_str()]))
+        let qualified = if qualified { &self.qualified[..] } else { &[] };
+        std::iter::once(self.name.as_str()).chain(qualified.iter().map(|n| n.as_str()))
     }
 
     fn display(&self, several_modules: bool) -> &str {
@@ -51,7 +56,7 @@ impl FunName {
 /// What a pattern selects, or why it selects nothing
 enum Resolution<'a> {
     Selected(Vec<&'a FunName>),
-    /// An exact pattern that matches several functions
+    /// An exact pattern that matches functions in several modules
     Ambiguous(Vec<&'a FunName>),
     /// An exact pattern that matches no function, but is a substring of several
     Substrings(Vec<&'a FunName>),
@@ -123,7 +128,7 @@ impl UserFilter {
             let mut errors = Vec::new();
             let mut seen = HashSet::new();
             for pattern in args.verify_function.iter().filter(|p| seen.insert(p.as_str())) {
-                match Self::resolve(&funs, several_modules, pattern) {
+                match Self::resolve(&funs, pattern) {
                     Resolution::Selected(m) => matches.extend(m.iter().map(|f| f.fun.clone())),
                     failure => errors.push(Self::message(&funs, several_modules, pattern, failure)),
                 }
@@ -225,63 +230,63 @@ impl UserFilter {
 
     /// The functions owned by the modules, each with the names a pattern can match it by.
     fn fun_names(modules: &[ModuleId], funs: &Vec<Function>) -> Vec<FunName> {
+        // For each module: the prefix of the names of the functions in it, the prefix of the
+        // names of the functions in the crate, and the module's path from the crate root
+        // (empty for the root, otherwise ending with `::`)
+        let mut prefixes: Vec<Option<(String, String, String)>> = vec![None; modules.len()];
         funs.iter()
             .filter_map(|f| {
                 let owning_module = f.x.owning_module.as_ref()?;
                 let module = modules.iter().position(|m| m == &owning_module.segments)?;
-                let name = friendly_fun_name_crate_relative(owning_module, &f.x.name);
-                // The path from the crate root is the full name without the crate's name,
-                // even for a function named by a path outside its module
-                let krate = krate_to_string_ignore_stable_id(&owning_module.krate);
+                let (module_prefix, krate_prefix, module_path) = prefixes[module]
+                    .get_or_insert_with(|| {
+                        let krate = krate_to_string_ignore_stable_id(&owning_module.krate);
+                        let path = module_name(owning_module);
+                        let path = if path.is_empty() { path } else { path + "::" };
+                        (path_as_friendly_rust_name(owning_module) + "::", krate + "::", path)
+                    });
                 let full = fun_as_friendly_rust_name(&f.x.name);
-                let path = full
-                    .strip_prefix(&format!("{krate}::"))
-                    .map(|p| (p.to_string(), format!("crate::{p}")));
-                let listed = match &path {
-                    Some((_, from_crate)) if modules[module].is_empty() => from_crate.clone(),
-                    Some((p, _)) => p.clone(),
-                    None => name.clone(),
+                // A function may be named by a path outside its module
+                // (e.g. a method of an impl of a type defined elsewhere);
+                // then its relative name is its full name
+                let name = full.strip_prefix(module_prefix.as_str()).unwrap_or(&full).to_string();
+                let path = full.strip_prefix(krate_prefix.as_str());
+                let owned = (!module_path.is_empty()).then(|| {
+                    let rest = name.strip_prefix(krate_prefix.as_str()).unwrap_or(&name);
+                    format!("{module_path}{rest}")
+                });
+                let mut qualified: Vec<String> = Vec::new();
+                for n in path.into_iter().chain(owned.as_deref()) {
+                    for n in [n.to_string(), format!("crate::{n}")] {
+                        if !qualified.contains(&n) {
+                            qualified.push(n);
+                        }
+                    }
+                }
+                let listed = match (path, &owned) {
+                    (Some(p), _) if module_path.is_empty() => format!("crate::{p}"),
+                    (Some(p), _) => p.to_string(),
+                    (None, Some(owned)) => owned.clone(),
+                    (None, None) => name.clone(),
                 };
-                Some(FunName { fun: f.x.name.clone(), name, path, listed })
+                // A span prints as `file:line:col: line:col (#ctxt)`
+                let location = f.span.as_string.split(": ").next().unwrap_or("").to_string();
+                Some(FunName { fun: f.x.name.clone(), module, name, qualified, listed, location })
             })
             .collect()
     }
 
     /// Resolve one pattern.
     ///
-    /// With one module, a pattern selects what it selects on main
-    /// (see `resolve_by`, matching the names relative to the module, where
-    /// an exact name may select several functions).
-    /// Otherwise (several modules, or a pattern with `::` that selects nothing on main),
-    /// the general rule applies: a pattern with `::` is also matched against each function's
-    /// path from the crate root, with or without `crate::`,
-    /// and a pattern without `*` at its ends must select exactly one function.
-    fn resolve<'a>(funs: &'a [FunName], several_modules: bool, pattern: &str) -> Resolution<'a> {
+    /// A pattern is matched against each function's name relative to its module,
+    /// and, if the pattern contains `::`, against its qualified names too.
+    /// A pattern with `*` at either end selects every function with a name that it matches.
+    /// A pattern without (an exact pattern) selects every function with a name equal to it,
+    /// as long as these functions are all in one module (otherwise it is ambiguous).
+    /// An exact pattern that equals no name selects the one function with a name that contains it,
+    /// and is an error if several do.
+    fn resolve<'a>(funs: &'a [FunName], pattern: &str) -> Resolution<'a> {
         let qualified = pattern.contains("::");
-        if !several_modules {
-            let on_main = Self::resolve_by(funs, pattern, false, false);
-            if !qualified || matches!(on_main, Resolution::Selected(_)) {
-                return on_main;
-            }
-        }
-        Self::resolve_by(funs, pattern, qualified, true)
-    }
-
-    /// The first part of this process is to
-    /// infer whether this is an "exact match" filter.
-    /// (If the user doesn't supply any * at the ends of the pattern, then it is usually
-    /// exact - however, if there is no exact match, but there is _exactly one_
-    /// partial match, then we upgrade to a partial match)
-    ///
-    /// Each function is matched by its relative name, and if `qualified`,
-    /// by its path from the crate root too.
-    /// If `unique`, an exact pattern that matches several functions is ambiguous.
-    fn resolve_by<'a>(
-        funs: &'a [FunName],
-        pattern: &str,
-        qualified: bool,
-        unique: bool,
-    ) -> Resolution<'a> {
         let clean = pattern.trim_matches('*');
         let exact = clean == pattern;
 
@@ -293,7 +298,7 @@ impl UserFilter {
             .iter()
             .filter(|f| f.names(qualified).any(|n| Self::matches_strictly_by_pattern(pattern, n)))
             .collect();
-        if matches.len() > 1 && exact && unique {
+        if exact && matches.iter().any(|f| f.module != matches[0].module) {
             return Resolution::Ambiguous(matches);
         } else if matches.len() > 0 {
             return Resolution::Selected(matches);
@@ -322,37 +327,63 @@ impl UserFilter {
         pattern: &str,
         failure: Resolution,
     ) -> String {
-        let display_sorted = |funs: Vec<&FunName>| {
-            let mut names =
-                funs.iter().map(|f| f.display(several_modules).to_string()).collect::<Vec<_>>();
-            names.sort();
-            names
+        // Sorted by name; with several modules, functions listed by the same name
+        // are told apart by location, in the order they are defined
+        let display_sorted = |mut funs: Vec<&FunName>| {
+            let mut counts: HashMap<&str, usize> = HashMap::new();
+            for f in &funs {
+                *counts.entry(f.display(several_modules)).or_default() += 1;
+            }
+            funs.sort_by_key(|f| f.display(several_modules));
+            funs.iter()
+                .map(|f| {
+                    let name = f.display(several_modules);
+                    if several_modules && counts[name] > 1 {
+                        format!("{name} (at {})", f.location)
+                    } else {
+                        name.to_string()
+                    }
+                })
+                .collect::<Vec<_>>()
         };
         let clean = pattern.trim_matches('*');
         match failure {
             Resolution::Selected(_) => unreachable!(),
             Resolution::Ambiguous(matches) => {
-                // Suggest a name that this resolution selects just one of the matches by
-                let selects =
-                    |name: &str, f: &FunName| match Self::resolve(funs, several_modules, name) {
-                        Resolution::Selected(m) => m.len() == 1 && m[0].fun == f.fun,
-                        _ => false,
-                    };
+                // Suggest a name of one of the matches that selects just that function,
+                // or else one that selects just the matches in its module
+                let selected = |name: &str| match Self::resolve(funs, name) {
+                    Resolution::Selected(m) => Some(m),
+                    _ => None,
+                };
                 let mut sorted = matches.clone();
                 sorted.sort_by(|f, g| f.display(several_modules).cmp(g.display(several_modules)));
-                let example = sorted.iter().find_map(|f| {
-                    let candidates = [
-                        Some(f.display(several_modules)),
-                        f.path.as_ref().map(|(_, c)| c.as_str()),
-                    ];
-                    candidates.into_iter().flatten().find(|name| selects(name, f))
+                let candidates = || {
+                    sorted.iter().flat_map(|f| {
+                        std::iter::once(f.display(several_modules))
+                            .chain(f.qualified.iter().map(|n| n.as_str()))
+                            .map(move |name| (*f, name))
+                    })
+                };
+                let one_function = candidates().find(|(f, name)| {
+                    selected(name).is_some_and(|m| m.len() == 1 && m[0].fun == f.fun)
                 });
-                let header = match example {
-                    Some(example) => format!(
+                let one_module = candidates().find(|(f, name)| {
+                    selected(name).is_some_and(|m| {
+                        let in_module = matches.iter().filter(|g| g.module == f.module);
+                        m.len() == in_module.clone().count()
+                            && in_module.zip(&m).all(|(g, h)| g.fun == h.fun)
+                    })
+                });
+                let header = match (one_function, one_module) {
+                    (Some((_, example)), _) => format!(
                         "--verify-function {pattern} matches more than one function, use a name that matches only one (e.g. {example}),"
                     ),
-                    None => format!(
-                        "--verify-function {pattern} matches more than one function and no name matches only one of them, consider using wildcard {pattern}* to verify them all,"
+                    (None, Some((_, example))) => format!(
+                        "--verify-function {pattern} matches functions in more than one module, use a name that matches the functions of only one module (e.g. {example}),"
+                    ),
+                    (None, None) => format!(
+                        "--verify-function {pattern} matches functions in more than one module, and no name matches the functions of only one module,"
                     ),
                 };
                 Self::listing(

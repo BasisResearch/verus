@@ -13,6 +13,7 @@ proof fn alpha() { assert(1int + 1 == 2); }
 proof fn alpha_two() { assert(2int + 2 == 4); }
 proof fn beta() { assert(3int + 3 == 6); }
 proof fn gamma() { assert(false); }
+pub struct S<T> { t: T }
 }
 mod first {
     use vstd::prelude::*;
@@ -99,6 +100,32 @@ mod ninth {
     impl G<u16> { proof fn g() { assert(18int == 18); } }
     }
 }
+mod ta {
+    use vstd::prelude::*;
+    verus! {
+    impl crate::S<u8> { proof fn f() { assert(19int == 19); } }
+    }
+}
+mod tb {
+    use vstd::prelude::*;
+    verus! {
+    impl crate::S<u16> { proof fn f() { assert(20int == 20); } }
+    }
+}
+mod eleventh {
+    use vstd::prelude::*;
+    verus! {
+    impl crate::ninth::G<u32> { proof fn g() { assert(21int == 21); } }
+    impl crate::ninth::G<u64> { proof fn g() { assert(22int == 22); } }
+    }
+}
+mod twelfth {
+    use vstd::prelude::*;
+    verus! {
+    pub trait Tw { proof fn tw(); }
+    impl Tw for Seq<int> { proof fn tw() { assert(23int == 23); } }
+    }
+}
 "#;
 
 // `gamma` fails, so a run that verifies it reports an error.
@@ -128,11 +155,23 @@ fn run_in(modules: &[&str], functions: &[&str]) -> (Output, String, String) {
     (output, stdout, stderr)
 }
 
-// The lines of the error message, without rustc's indentation
+// The lines of the error message, without rustc's indentation,
+// and with `(at DIR/fixture.rs:...)` shortened to `(at fixture.rs:...)`
 fn error_lines(stderr: &str) -> Vec<String> {
     let start = stderr.find("error: ").unwrap() + "error: ".len();
     let end = stderr.find("\nerror: aborting").unwrap();
-    stderr[start..end].trim_end().lines().map(|line| line.trim().to_string()).collect()
+    let shorten = |line: &str| match (line.find("(at "), line.find("fixture.rs:")) {
+        (Some(at), Some(file)) => format!("{}{}", &line[..at + "(at ".len()], &line[file..]),
+        _ => line.to_string(),
+    };
+    stderr[start..end].trim_end().lines().map(|line| shorten(line.trim())).collect()
+}
+
+// Where `text` starts in the fixture, as `fixture.rs:line:column`
+fn location(text: &str) -> String {
+    let (line, col) =
+        CODE.lines().enumerate().find_map(|(i, l)| l.find(text).map(|c| (i + 1, c + 1))).unwrap();
+    format!("fixture.rs:{line}:{col}")
 }
 
 fn results(n: usize) -> String {
@@ -296,7 +335,7 @@ fn verify_function_ambiguity_across_modules_suggests_a_wildcard_that_works() {
     assert_eq!(stdout, results(2));
 }
 
-// On main, a module-qualified pattern with a single module is "could not find function".
+// A pattern with `::` is matched against the paths from the crate root with one module, too.
 #[test]
 fn verify_function_qualified_with_one_module() {
     let (output, stdout, stderr) = run_in(&["first"], &["first::shared"]);
@@ -351,19 +390,20 @@ fn verify_function_qualified_name_is_not_read_as_a_substring() {
     assert_eq!(stdout, results(1));
 }
 
-// With one module, a pattern that works on main selects what it selects on main:
-// `a::f` is the unique substring match `Data::f`, which fails.
-// The path from `crate` names `f` in module `a`.
+// With one module too, `a::f` is the path of `f` in module `a`, an exact match,
+// so it is not read as a substring of `Data::f` (which fails).
 #[test]
-fn verify_function_qualified_with_one_module_as_on_main() {
-    let (output, stdout, stderr) = run_in(&["a"], &["a::f"]);
+fn verify_function_qualified_name_is_not_read_as_a_substring_with_one_module() {
+    for pattern in ["a::f", "crate::a::f"] {
+        let (output, stdout, stderr) = run_in(&["a"], &[pattern]);
+        assert!(output.status.success(), "{pattern}: {}", stderr);
+        assert_eq!(stdout, results(1), "{pattern}");
+    }
+
+    let (output, stdout, stderr) = run_in(&["a"], &["a::Data::f"]);
     assert!(!output.status.success());
     assert_eq!(stderr.matches("error: assertion failed").count(), 1, "{}", stderr);
     assert!(stdout.contains("0 verified, 1 errors"), "{}", stdout);
-
-    let (output, stdout, stderr) = run_in(&["a"], &["crate::a::f"]);
-    assert!(output.status.success(), "{}", stderr);
-    assert_eq!(stdout, results(1));
 }
 
 // `cell::f` names `f` in module `cell` and the methods `cell::f` in `fifth` and `sixth`.
@@ -391,8 +431,8 @@ fn verify_function_qualified_and_unqualified_readings_are_ambiguous() {
 }
 
 // `moved` is owned by `first` but named by the path of `second::Item`,
-// so it is listed by that path from the crate root, and matched by it with or without `crate::`
-// (or by its full name, as on main).
+// so it is listed by that path from the crate root, and matched by it with or without `crate::`,
+// by its full name (its name relative to `first`), and by `first::` followed by that path.
 #[test]
 fn verify_function_names_a_function_by_its_path_from_the_crate_root() {
     let (output, _, stderr) = run_in(&["first", "second"], &["zzz"]);
@@ -401,9 +441,12 @@ fn verify_function_names_a_function_by_its_path_from_the_crate_root() {
     assert!(lines.contains(&"- second::Item::moved".to_string()), "{}", stderr);
     assert!(!stderr.contains("first::fixture"), "{}", stderr);
 
-    for pattern in
-        ["crate::second::Item::moved", "second::Item::moved", "fixture::second::Item::moved"]
-    {
+    for pattern in [
+        "crate::second::Item::moved",
+        "second::Item::moved",
+        "fixture::second::Item::moved",
+        "first::second::Item::moved",
+    ] {
         for modules in [&["first", "second"][..], &["first"][..]] {
             let (output, stdout, stderr) = run_in(modules, &[pattern]);
             assert!(output.status.success(), "{pattern}: {}", stderr);
@@ -412,33 +455,20 @@ fn verify_function_names_a_function_by_its_path_from_the_crate_root() {
     }
 }
 
-// Two functions of one module that match the same name are ambiguous too,
-// unless a single module is selected and the pattern works on main.
+// Functions of one module that match a pattern exactly are all selected:
+// `line::f` is the path of `f` in module `line`, and the name of the method `f` of `line::line`
 #[test]
-fn verify_function_ambiguity_within_one_module() {
-    // `line::f` is the path of `f` in module `line`, and the name of the method `f` of `line::line`
-    let (output, stdout, stderr) = run_in(&["line", "first"], &["line::f"]);
-    assert!(!output.status.success());
-    assert!(!stdout.contains("verified"), "{}", stdout);
-    assert_eq!(
-        error_lines(&stderr),
-        [
-            "--verify-function line::f matches more than one function, use a name that matches only one (e.g. crate::line::f),",
-            "matched results are:",
-            "- line::f",
-            "- line::line::f",
-        ]
-    );
-    for pattern in ["crate::line::f", "line::line::f"] {
-        let (output, stdout, stderr) = run_in(&["line", "first"], &[pattern]);
-        assert!(output.status.success(), "{pattern}: {}", stderr);
-        assert_eq!(stdout, results(1), "{pattern}");
+fn verify_function_exact_matches_within_one_module() {
+    for modules in [&["line", "first"][..], &["line"][..]] {
+        let (output, stdout, stderr) = run_in(modules, &["line::f"]);
+        assert!(output.status.success(), "{}", stderr);
+        assert_eq!(stdout, results(2));
+        for pattern in ["crate::line::f", "line::line::f"] {
+            let (output, stdout, stderr) = run_in(modules, &[pattern]);
+            assert!(output.status.success(), "{pattern}: {}", stderr);
+            assert_eq!(stdout, results(1), "{pattern}");
+        }
     }
-
-    // As on main: with `line` alone, `line::f` is the method's name relative to the module
-    let (output, stdout, stderr) = run_in(&["line"], &["line::f"]);
-    assert!(output.status.success(), "{}", stderr);
-    assert_eq!(stdout, results(1));
 }
 
 // The example in the hint is a name that the same rule resolves to one function:
@@ -463,28 +493,81 @@ fn verify_function_hint_names_just_one_function() {
     assert_eq!(stderr.matches("note: verifying module eighth").count(), 0, "{}", stderr);
 }
 
-// `G<u8>::g` and `G<u16>::g` are both named `G::g`: main verifies both with one module,
-// and with several modules no name selects just one, so the hint is a wildcard.
+// `G<u8>::g` and `G<u16>::g` are both named `G::g` in `ninth`, and both selected by it,
+// however the module is written and whichever other modules are selected.
 #[test]
 fn verify_function_functions_with_the_same_name() {
-    let (output, stdout, stderr) = run_in(&["ninth"], &["G::g"]);
-    assert!(output.status.success(), "{}", stderr);
-    assert_eq!(stdout, results(2));
+    for modules in [&["ninth"][..], &["ninth", "first"][..]] {
+        for pattern in ["G::g", "ninth::G::g", "crate::ninth::G::g"] {
+            let (output, stdout, stderr) = run_in(modules, &[pattern]);
+            assert!(output.status.success(), "{pattern}: {}", stderr);
+            assert_eq!(stdout, results(2), "{pattern}");
+        }
+    }
+}
 
-    let (output, _, stderr) = run_in(&["ninth", "first"], &["G::g"]);
+// `ta` and `tb` each have a method `f` of `crate::S`, so `S::f` is ambiguous with both,
+// and they are told apart by their modules. The listing shows where each is defined.
+#[test]
+fn verify_function_impls_of_one_type_in_two_modules() {
+    let (output, stdout, stderr) = run_in(&["ta", "tb"], &["S::f"]);
     assert!(!output.status.success());
+    assert!(!stdout.contains("verified"), "{}", stdout);
     assert_eq!(
         error_lines(&stderr),
         [
-            "--verify-function G::g matches more than one function and no name matches only one of them, consider using wildcard G::g* to verify them all,",
-            "matched results are:",
-            "- ninth::G::g",
-            "- ninth::G::g",
+            "--verify-function S::f matches more than one function, use a name that matches only one (e.g. ta::S::f),".to_string(),
+            "matched results are:".to_string(),
+            format!("- S::f (at {})", location("fn f() { assert(19int")),
+            format!("- S::f (at {})", location("fn f() { assert(20int")),
         ]
     );
-    let (output, stdout, stderr) = run_in(&["ninth", "first"], &["G::g*"]);
+    for pattern in ["ta::S::f", "crate::ta::S::f"] {
+        let (output, stdout, stderr) = run_in(&["ta", "tb"], &[pattern]);
+        assert!(output.status.success(), "{pattern}: {}", stderr);
+        assert_eq!(stdout, results(1), "{pattern}");
+        assert_eq!(stderr.matches("note: verifying module tb").count(), 0, "{}", stderr);
+    }
+}
+
+// `eleventh` has two methods `g` of `crate::ninth::G` too, so no name selects one function of
+// `ninth::G::g`, and the hint names the functions of one module, which the same rule selects.
+#[test]
+fn verify_function_same_names_in_two_modules() {
+    let modules = ["ninth", "eleventh"];
+    let (output, _, stderr) = run_in(&modules, &["ninth::G::g"]);
+    assert!(!output.status.success());
+    let listed = ["17int", "18int", "21int", "22int"]
+        .map(|n| format!("- ninth::G::g (at {})", location(&format!("fn g() {{ assert({n}"))));
+    let mut expected = vec![
+        "--verify-function ninth::G::g matches functions in more than one module, use a name that matches the functions of only one module (e.g. eleventh::ninth::G::g),".to_string(),
+        "matched results are:".to_string(),
+    ];
+    expected.extend(listed);
+    assert_eq!(error_lines(&stderr), expected);
+
+    let (output, stdout, stderr) = run_in(&modules, &["eleventh::ninth::G::g"]);
     assert!(output.status.success(), "{}", stderr);
     assert_eq!(stdout, results(2));
+    assert_eq!(stderr.matches("note: verifying module ninth").count(), 0, "{}", stderr);
+}
+
+// A method of an impl for a type of another crate has no path from the crate root,
+// but its module's path followed by its full name names it.
+#[test]
+fn verify_function_method_of_a_type_of_another_crate() {
+    let (output, _, stderr) = run_in(&["twelfth", "first"], &["zzz"]);
+    assert!(!output.status.success());
+    let lines = error_lines(&stderr);
+    assert!(lines.contains(&"- twelfth::vstd::seq::Seq::tw".to_string()), "{}", stderr);
+
+    for modules in [&["twelfth", "first"][..], &["twelfth"][..]] {
+        for pattern in ["twelfth::vstd::seq::Seq::tw", "crate::twelfth::vstd::seq::Seq::tw"] {
+            let (output, stdout, stderr) = run_in(modules, &[pattern]);
+            assert!(output.status.success(), "{pattern}: {}", stderr);
+            assert_eq!(stdout, results(1), "{pattern}");
+        }
+    }
 }
 
 #[test]
