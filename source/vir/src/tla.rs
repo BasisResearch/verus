@@ -156,6 +156,9 @@
 //! fairness of their spec (`WF_vars`) goes into `Spec`, and is never
 //! assumed where the spec does not state it (see [`temporal_sources`]).
 
+mod functions;
+use functions::{FunctionUse, Functions, ResolvedFunction, compiler_target};
+
 use crate::ast::*;
 use crate::ast_util::{fun_as_friendly_rust_name, path_as_friendly_rust_name};
 use serde::Serialize;
@@ -284,6 +287,7 @@ pub struct Report {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub restrictions: Vec<Refusal>,
     /// Bounded choices, including their source location and carrier.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub choices: Vec<Choice>,
     /// The trace spec written beside the export (see [`TraceReport`]).
     pub trace: TraceReport,
@@ -502,6 +506,7 @@ pub struct ExprExport {
     /// The constants of `holes` the model's module does not declare.
     pub undeclared: Vec<String>,
     pub refusals: Vec<Refusal>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub choices: Vec<Choice>,
     /// Whether the operator reaches a refusal (its own or one the model's
     /// operators already had).
@@ -626,8 +631,9 @@ enum Variant {
     /// A verus-tla action: `f().forward(input)` for a spec fn `f` of no
     /// parameters building an `Action { precondition, transition }`, as the
     /// operator `f(input)` over the pre and post states, so TLC names its
-    /// steps (and `WF_vars` its fairness) after `f`.
-    Forward,
+    /// steps (and `WF_vars` its fairness) after `f`. The index identifies
+    /// the specialized forward method in `forward_methods`.
+    Forward(usize),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -654,6 +660,8 @@ struct Env {
     /// rustc gives every binding its own `VarIdent`, so a binder that
     /// shadows a name (`let k = k + 1`) never inherits the domain it had.
     domains: HashMap<VarIdent, Dom>,
+    /// Original quantifier/constructor binders available in this scope.
+    trace_binders: HashSet<VarIdent>,
     /// Names a pattern bound to a field of a whole state (`let State { x,
     /// .. } = post`), so `x == e` assigns it as `post.x == e` does.
     field_binders: HashMap<VarIdent, FieldBinder>,
@@ -681,6 +689,7 @@ impl Env {
             values: HashMap::new(),
             primed: HashSet::new(),
             domains: HashMap::new(),
+            trace_binders: HashSet::new(),
             field_binders: HashMap::new(),
             partial_values: HashMap::new(),
         }
@@ -920,13 +929,33 @@ impl BoundLinear {
     }
 }
 
+/// One already-lowered existential arm, before its field quantifiers are wrapped.
+#[derive(Clone)]
+struct TraceVariant {
+    tag: String,
+    fields: Vec<String>,
+    names: Vec<String>,
+    domains: Vec<String>,
+    body: String,
+}
+
+/// A whole action-record disjunct, with (log name, type, domain, TLA binder)
+/// for each parameter. Its body retains the disjunct's guards.
+#[derive(Clone)]
+struct TraceAction {
+    fun: Fun,
+    params: Vec<(String, Typ, Option<String>, String)>,
+    body: String,
+    selected: bool,
+}
+
 #[derive(Clone)]
 struct Exporter {
     word_bits: ArchWordBits,
     init_domains: bool,
     strict_types: bool,
     datatypes: HashMap<Path, Datatype>,
-    functions: HashMap<Fun, Function>,
+    functions: Functions,
     state_path: Path,
     /// The state datatype's fields: the record labels, and the TLA+ variable
     /// each is held in (the label, renamed where it would clash with a
@@ -1027,6 +1056,24 @@ struct Exporter {
     /// Whether the property being printed has a `[][A]_vars` conjunct, which
     /// TLC checks only when the property has no premise.
     temporal_top_action: bool,
+    /// Independently selectable action-record branches of closure roots.
+    trace_actions: HashMap<OpKey, Vec<TraceAction>>,
+    /// Action-builder arguments seen while lowering the model, by enclosing
+    /// function. Keep the original quantifier/caller domains before inlining
+    /// erases the call sites used by general trace relations.
+    action_domains: HashMap<String, Vec<(Fun, Vec<Option<Dom>>)>>,
+    /// Domains built only from certified trace inputs and total generated
+    /// operations. Certification happens at construction, never by parsing
+    /// printed TLA. All trace consumers share this eligibility boundary.
+    safe_trace_domains: HashSet<String>,
+    /// A computed bound in an independently exposed helper may rely on a
+    /// caller's guard. Next itself retains that scope; a standalone helper
+    /// check cannot assume it, and must fail explicitly rather than crash TLC.
+    unsafe_trace_relations: HashSet<String>,
+    /// Closure roots to lower after the model is complete, in a private copy.
+    trace_roots: HashMap<OpKey, (Expr, Env)>,
+    /// Enum-arm templates keyed by their existential expression.
+    trace_variants: HashMap<usize, Vec<TraceVariant>>,
     /// Every one-binder `exists` printed, by the address of its expression:
     /// the binder's name, its domain and the body, for [`Steps`].
     exists_printed: HashMap<usize, (String, String, String)>,
@@ -1063,10 +1110,10 @@ struct Exporter {
     /// The 0-ary functions standing for the model's constants (see
     /// [`Exporter::close_extras`]), and the operator each is.
     constant_ops: HashMap<Fun, String>,
-    instances: Vec<(Fun, Typs, Fun)>,
-    assoc_types: Vec<AssocTypeImpl>,
     tables: BTreeMap<String, (String, Vec<String>)>,
     table_names: HashMap<Fun, String>,
+    /// Interned specialized forward methods, the discriminator in Variant::Forward.
+    forward_methods: Vec<Fun>,
 }
 
 fn ident_name(v: &VarIdent) -> String {
@@ -1826,7 +1873,7 @@ impl Exporter {
             Variant::Plain => {}
             Variant::Primed => candidate = format!("{candidate}_post"),
             Variant::Record => candidate = format!("{candidate}_rec"),
-            Variant::Forward => {}
+            Variant::Forward(_) => {}
         }
         if *post_args {
             candidate = format!("{candidate}_postarg");
@@ -2082,10 +2129,12 @@ impl Exporter {
                                 out.push((format!("({m}.tag = \"Some\")"), e.clone()));
                             }
                         } else if !matches!(&*e.typ, TypX::Bool) {
-                            let fun = self.instantiate_call(kind, fun, typs);
-                            if let Some(f) = self.functions.get(&fun).cloned() {
+                            if let Ok(f) =
+                                self.functions.resolve(FunctionUse::Call(kind, fun, typs))
+                            {
+                                let fun = f.name().clone();
                                 if !f.x.decrease.is_empty() {
-                                    let name = self.ensure_defined(&fun);
+                                    let name = self.ensure_defined(&f);
                                     let arguments: Vec<_> =
                                         args.iter().map(|a| self.safety_value(a, env)).collect();
                                     out.push((
@@ -2311,11 +2360,11 @@ impl Exporter {
 
     /// Definedness of a recursive value helper is recursive too, rather
     /// than a bounded unrolling that would silently miss deeper reads.
-    fn ensure_defined(&mut self, fun: &Fun) -> String {
+    fn ensure_defined(&mut self, f: &ResolvedFunction) -> String {
+        let fun = f.name();
         if let Some(name) = self.defined_functions.get(fun) {
             return name.clone();
         }
-        let f = self.functions[fun].clone();
         let name = self.bind(&format!("Defined_{}", last_segment(&fun.path)));
         self.used_names.insert(name.clone());
         self.defined_functions.insert(fun.clone(), name.clone());
@@ -2411,9 +2460,6 @@ impl Exporter {
         let calls = probe.current_calls[first_call..].to_vec();
         let mut renamed = false;
         for call in calls {
-            if let Some(f) = probe.functions.get(&call.callee.0) {
-                self.functions.entry(call.callee.0.clone()).or_insert_with(|| f.clone());
-            }
             let name = self.op_name(&call.callee);
             renamed |= probe.op_names.get(&call.callee) != Some(&name);
         }
@@ -2437,7 +2483,11 @@ impl Exporter {
             for word in guard.split(|c: char| !c.is_alphanumeric() && c != '_') {
                 if let Some(key) = names.get(word) {
                     if seen.insert(key.clone()) {
-                        self.quiet(|x| x.ensure_function(key));
+                        let f = self
+                            .functions
+                            .resolve(FunctionUse::Root(&key.0))
+                            .expect("resolved guard dependency");
+                        self.quiet(|x| x.ensure_function(&f, key.1, key.2));
                     }
                 }
             }
@@ -2528,7 +2578,7 @@ impl Exporter {
             _ => None,
         };
         if let Some((index, len)) = upper {
-            if let Some((_, f, args)) = called(&peel(len)) {
+            if let Some((_, f, _, args)) = called(&peel(len)) {
                 if vstd_op(&fun_as_friendly_rust_name(&f)) == Some("seq_len") {
                     let i = self.safety_value(index, env);
                     let seq = self.safety_value(&args[0], env);
@@ -2741,7 +2791,7 @@ impl Exporter {
         let both: Vec<String> = self
             .implications
             .iter()
-            .filter(|(g, _)| complementary(g, guard))
+            .filter(|(g, _)| complementary(&self.functions, g, guard))
             .flat_map(|(_, a)| a.intersection(&assigned).cloned().collect::<Vec<_>>())
             .collect();
         self.current_assigned.extend(both);
@@ -2825,7 +2875,7 @@ impl Exporter {
         if let Some(v) = self.role_field(e, env, Role::Pre) {
             return Some(v);
         }
-        if let Some((_, f, args)) = called(&peel(e)) {
+        if let Some((_, f, _, args)) = called(&peel(e)) {
             if vstd_op(&fun_as_friendly_rust_name(&f)) == Some("seq_update") {
                 return self.shape_origin(&args[0], env);
             }
@@ -2835,7 +2885,7 @@ impl Exporter {
 
     fn record_shape_assignment(&mut self, a: &Expr, b: &Expr, env: &Env) {
         if self.in_init && self.branch_depth == 0 {
-            if let Some((_, f, args)) = called(&peel(a)) {
+            if let Some((_, f, _, args)) = called(&peel(a)) {
                 if vstd_op(&fun_as_friendly_rust_name(&f)) == Some("seq_len") {
                     if let (Some(seq), Some(len)) = (
                         self.role_field(&args[0], env, Role::Pre),
@@ -2922,7 +2972,14 @@ impl Exporter {
             }
             ExprX::VarAt(..) => self.refuse("old(...) reference", &e.span),
             ExprX::ConstVar(fun, _) | ExprX::StaticVar(fun) => {
-                self.ensure_function(&(fun.clone(), Variant::Plain, false))
+                match self.functions.resolve(FunctionUse::Root(fun)) {
+                    Ok(f) => self.ensure_function(&f, Variant::Plain, false),
+                    Err(reason) => self
+                        .constant_ops
+                        .get(fun)
+                        .cloned()
+                        .unwrap_or_else(|| self.refuse(reason, &e.span)),
+                }
             }
             ExprX::ReadPlace(place, _) => self.place(place, env),
             ExprX::Call { target, args, .. } => self.call(e, target, args, env),
@@ -4076,16 +4133,20 @@ impl Exporter {
                         _ => {}
                     }
                 }
-                let fun = &self.instantiate_call(kind, fun, typs);
+                let fun = match self.functions.resolve(FunctionUse::Call(kind, fun, typs)) {
+                    Ok(fun) => fun,
+                    Err(reason) => {
+                        self.conj_level = level;
+                        return self.refuse(format!("{reason}: {friendly}"), &e.span);
+                    }
+                };
+                let callee = fun;
+                let fun = callee.name();
                 // `<_ as View>::view(&[a, b])` (`seq![a, b]`) resolves to the
                 // array's `View` impl.
                 if vstd_op(&fun_as_friendly_rust_name(fun)) == Some("array_view") {
                     return self.vstd_call(e, "array_view", args, env);
                 }
-                let Some(callee) = self.functions.get(fun).cloned() else {
-                    let what = format!("call to {friendly} (no definition in the crate)");
-                    return self.refuse(what, &e.span);
-                };
                 if callee.x.params.iter().zip(args.iter()).any(|(p, a)| {
                     typ_has_specfn(&p.x.typ, &self.datatypes, &mut HashSet::new())
                         || typ_has_specfn(&a.typ, &self.datatypes, &mut HashSet::new())
@@ -4095,7 +4156,7 @@ impl Exporter {
                     }
                     // Arguments are operands; only the reduced body inherits
                     // the caller's assignment level.
-                    let reduced = self.quiet(|x| x.inline_call(fun, args, env));
+                    let reduced = self.quiet(|x| x.inline_call(&callee, args, env));
                     self.conj_level = level;
                     let out = match reduced {
                         Some((body, scope, lets)) => {
@@ -4144,7 +4205,7 @@ impl Exporter {
                 {
                     let printed: Vec<String> = args.iter().map(|a| self.expr(a, env)).collect();
                     self.conj_level = level;
-                    let name = self.ensure_function(&(fun.clone(), Variant::Record, false));
+                    let name = self.ensure_function(&callee, Variant::Record, false);
                     return format!("{name}({})", printed.join(", "));
                 }
                 // Every state argument fits its role (checked above): it is
@@ -4177,7 +4238,7 @@ impl Exporter {
                 }
                 self.conj_level = level;
                 let key = (fun.clone(), variant, post_args);
-                let name = self.ensure_function(&key);
+                let name = self.ensure_function(&callee, variant, post_args);
                 // `ensure_function` recorded this call last.
                 if let Some(call) = self.current_calls.last_mut().filter(|c| c.callee == key) {
                     call.args = domains;
@@ -4222,202 +4283,10 @@ impl Exporter {
         }
     }
 
-    /// The function a call runs: a trait method call that Verus resolved to
-    /// an impl (or a default method) runs that function, which has the body
-    /// the trait's declaration lacks.
-    fn resolved_fun(&self, kind: &CallTargetKind, fun: &Fun) -> Fun {
-        if let CallTargetKind::DynamicResolved { resolved, .. } = kind {
-            if self.functions.get(resolved).is_some_and(|f| f.x.body.is_some()) {
-                return resolved.clone();
-            }
-        }
-        fun.clone()
-    }
-
-    /// Match an impl's type pattern against an already checked call. Never
-    /// select by method name or receiver alone: every trait argument matters.
-    fn match_impl_type(pattern: &Typ, actual: &Typ, subst: &mut HashMap<Ident, Typ>) -> bool {
-        match (&**pattern, &**actual) {
-            (TypX::TypParam(p), _) => match subst.get(p) {
-                Some(t) => crate::ast_util::types_equal(t, actual),
-                None => {
-                    subst.insert(p.clone(), actual.clone());
-                    true
-                }
-            },
-            (TypX::Datatype(p, ps, _), TypX::Datatype(a, ts, _))
-                if p == a && ps.len() == ts.len() =>
-            {
-                ps.iter().zip(ts.iter()).all(|(p, a)| Self::match_impl_type(p, a, subst))
-            }
-            (TypX::Decorate(pd, pa, p), TypX::Decorate(ad, aa, a)) if pd == ad => {
-                let allocator = match (pa, aa) {
-                    (None, None) => true,
-                    (Some(p), Some(a)) => {
-                        Self::match_impl_type(&p.allocator_typ, &a.allocator_typ, subst)
-                    }
-                    _ => false,
-                };
-                allocator && Self::match_impl_type(p, a, subst)
-            }
-            (TypX::Boxed(p), TypX::Boxed(a)) => Self::match_impl_type(p, a, subst),
-            _ => crate::ast_util::types_equal(pattern, actual),
-        }
-    }
-
-    fn normalize_type(&self, typ: &Typ) -> Typ {
-        crate::ast_visitor::map_typ_visitor_env(typ, &mut (), &|_, t| {
-            if let TypX::Projection { trait_typ_args, trait_path, name } = &**t {
-                let candidates: Vec<_> = self
-                    .assoc_types
-                    .iter()
-                    .filter_map(|a| {
-                        if a.x.trait_path != *trait_path
-                            || a.x.name != *name
-                            || a.x.trait_typ_args.len() != trait_typ_args.len()
-                        {
-                            return None;
-                        }
-                        let mut subst = HashMap::new();
-                        a.x.trait_typ_args
-                            .iter()
-                            .zip(trait_typ_args.iter())
-                            .all(|(p, t)| Self::match_impl_type(p, t, &mut subst))
-                            .then(|| crate::sst_util::subst_typ(&subst, &a.x.typ))
-                    })
-                    .collect();
-                if let [typ] = candidates.as_slice() {
-                    return Ok(typ.clone());
-                }
-            }
-            Ok(t.clone())
-        })
-        .expect("associated type normalization")
-    }
-
-    /// Preserve existing polymorphic operators when no dispatch or opaque
-    /// function depends on their type arguments.
-    fn needs_instance(&self, fun: &Fun, seen: &mut HashSet<Fun>) -> bool {
-        if !seen.insert(fun.clone()) {
-            return false;
-        }
-        let Some(f) = self.functions.get(fun) else { return false };
-        let Some(body) = &f.x.body else { return true };
-        crate::ast_visitor::expr_visitor_check(body, &mut |_, e| {
-            if let ExprX::Call { target: CallTarget::Fun(kind, callee, ..), .. } = &e.x {
-                if vstd_op(&fun_as_friendly_rust_name(callee)).is_some() {
-                    return Ok(());
-                }
-                if matches!(kind, CallTargetKind::Dynamic)
-                    || self.needs_instance(&self.resolved_fun(kind, callee), seen)
-                {
-                    return Err(());
-                }
-            }
-            Ok(())
-        })
-        .is_err()
-    }
-
-    /// Specialize before rendering: type arguments on calls inside a generic
-    /// body must be substituted too, including associated type projections.
-    fn instantiate_call(&mut self, kind: &CallTargetKind, fun: &Fun, typs: &Typs) -> Fun {
-        let resolved = self.resolved_fun(kind, fun);
-        let mut ts = match kind {
-            CallTargetKind::DynamicResolved { typs, .. } if resolved != *fun => typs.clone(),
-            _ => typs.clone(),
-        };
-        if vstd_op(&fun_as_friendly_rust_name(&resolved)).is_some() {
-            return resolved;
-        }
-        let mut target = resolved;
-        if matches!(kind, CallTargetKind::Dynamic) && !ts.iter().any(typ_mentions_param) {
-            let matches: Vec<_> = self
-                .functions
-                .values()
-                .filter_map(|f| {
-                    let FunctionKind::TraitMethodImpl {
-                        method,
-                        trait_typ_args,
-                        inherit_body_from,
-                        ..
-                    } = &f.x.kind
-                    else {
-                        return None;
-                    };
-                    if method != fun || trait_typ_args.len() > ts.len() {
-                        return None;
-                    }
-                    let mut subst = HashMap::new();
-                    if !trait_typ_args
-                        .iter()
-                        .zip(ts.iter())
-                        .all(|(p, a)| Self::match_impl_type(p, a, &mut subst))
-                    {
-                        return None;
-                    }
-                    if let Some(default) = inherit_body_from {
-                        return Some((default.clone(), ts.clone()));
-                    }
-                    let args: Option<Vec<_>> =
-                        f.x.typ_params.iter().map(|p| subst.get(p).cloned()).collect();
-                    Some((f.x.name.clone(), Arc::new(args?)))
-                })
-                .collect();
-            if let [(only, args)] = matches.as_slice() {
-                target = only.clone();
-                ts = args.clone();
-            }
-        }
-        let Some(f) = self.functions.get(&target).cloned() else { return target };
-        if f.x.typ_params.is_empty()
-            || f.x.typ_params.len() != ts.len()
-            || !self.needs_instance(&target, &mut HashSet::new())
-        {
-            return target;
-        }
-        if let Some((_, _, instance)) = self
-            .instances
-            .iter()
-            .find(|(base, args, _)| base == &target && crate::ast_util::n_types_equal(args, &ts))
-        {
-            return instance.clone();
-        }
-        let subst: HashMap<Ident, Typ> =
-            f.x.typ_params.iter().cloned().zip(ts.iter().cloned()).collect();
-        let specialized = crate::ast_visitor::map_function_visitor_env(
-            &f,
-            &mut crate::ast_visitor::VisitorScopeMap::new(),
-            &mut (),
-            &|_, _, e| Ok(e.clone()),
-            &|_, _, s| Ok(vec![s.clone()]),
-            &|_, t| {
-                let t = crate::sst_util::subst_typ(&subst, t);
-                Ok(self.normalize_type(&t))
-            },
-            &|_, _, p| Ok(p.clone()),
-        )
-        .expect("function type substitution");
-        let instance = self.synthetic(
-            &specialized,
-            specialized.x.params.as_ref().clone(),
-            specialized.x.body.clone(),
-            &specialized.x.ret.x.typ,
-        );
-        // synthetic is also used for wrappers, which drop preconditions. An
-        // instantiation preserves the complete contract instead.
-        let mut x = specialized.x.clone();
-        x.name = instance.clone();
-        x.typ_params = Arc::new(vec![]);
-        self.functions.insert(instance.clone(), specialized.new_x(x));
-        self.instances.push((target, ts.clone(), instance.clone()));
-        instance
-    }
-
     /// Unlike TypeOK (whose values come from the source), user-supplied
     /// carriers need membership checks even for booleans and signed integers.
     fn table_type_pred(&mut self, v: &str, typ: &Typ, seen: &mut Vec<Typ>) -> Option<String> {
-        let normalized = self.normalize_type(typ);
+        let normalized = self.functions.normalize_type(typ);
         let typ = &normalized;
         match &**typ {
             TypX::Bool => Some(format!("{v} \\in BOOLEAN")),
@@ -4505,9 +4374,9 @@ impl Exporter {
                 Some(format!("({})", parts.join(" /\\ ")))
             }
             TypX::Primitive(Primitive::StrSlice, _) => Some(format!("{v} \\in STRING")),
-            TypX::TypParam(_) | TypX::Projection { .. } => {
+            TypX::TypParam(_) | TypX::Projection { .. } if typ_mentions_param(typ) => {
                 let (fun, _, _) = self.current_key.as_ref()?;
-                let span = self.functions.get(fun)?.span.clone();
+                let span = self.functions.resolve(FunctionUse::Root(fun)).ok()?.span.clone();
                 let dom = self.type_domain("abstract carrier", typ, &span);
                 Some(format!("{v} \\in {dom}"))
             }
@@ -4517,7 +4386,7 @@ impl Exporter {
 
     /// One mathematical function value per concrete function, shared by all
     /// state variants. Tuple keys also cover nullary and multi-argument calls.
-    fn uninterpreted(&mut self, f: &Function, env: &Env) -> String {
+    fn uninterpreted(&mut self, f: &ResolvedFunction, env: &Env) -> String {
         if f.x.mode != Mode::Spec {
             return self.refuse("uninterpreted non-spec function", &f.span);
         }
@@ -4585,7 +4454,11 @@ impl Exporter {
                     continue;
                 }
                 let v = self.bind("element__");
-                if matches!(&*t, TypX::TypParam(_) | TypX::Projection { .. }) {
+                // Only genuinely abstract types may use an unconstrained carrier.
+                // An unresolved concrete projection must fail table_type_pred below.
+                if matches!(&*t, TypX::TypParam(_) | TypX::Projection { .. })
+                    && typ_mentions_param(&t)
+                {
                     let carrier = self.type_domain("abstract carrier", &t, &f.span);
                     assumptions
                         .push(format!("IsFiniteSet({carrier}) /\\ {c} \\subseteq {carrier}"));
@@ -4712,9 +4585,15 @@ impl Exporter {
                 let (record, renv, mut lets) = self.resolve_record(inner, env, depth + 1)?;
                 self.closure_of_field(&record, field, renv, &mut lets, depth)
             }
-            ExprX::Call { target: CallTarget::Fun(kind, fun, ..), args, .. } => {
-                let fun = &self.resolved_fun(kind, fun);
-                let (body, env2, mut lets) = self.inline_call(fun, args, env)?;
+            ExprX::Call { target: CallTarget::Fun(kind, fun, typs, ..), args, .. } => {
+                let fun = match self.functions.resolve(FunctionUse::Call(kind, fun, typs)) {
+                    Ok(fun) => fun,
+                    Err(reason) => {
+                        self.refuse(reason, &f.span);
+                        return None;
+                    }
+                };
+                let (body, env2, mut lets) = self.inline_call(&fun, args, env)?;
                 let (params, cbody, cenv, mut clets) =
                     self.resolve_closure(&body, &env2, depth + 1)?;
                 lets.append(&mut clets);
@@ -4799,11 +4678,10 @@ impl Exporter {
     /// and the LET bindings that environment relies on.
     fn inline_call(
         &mut self,
-        fun: &Fun,
+        callee: &ResolvedFunction,
         args: &Exprs,
         env: &Env,
     ) -> Option<(Expr, Env, Vec<String>)> {
-        let callee = self.functions.get(fun).cloned()?;
         let body = callee.x.body.clone()?;
         let mut env2 = Env::new();
         let mut lets = Vec::new();
@@ -4865,9 +4743,22 @@ impl Exporter {
                 lets.append(&mut rest);
                 Some((record, scope, lets))
             }
-            ExprX::Call { target: CallTarget::Fun(kind, fun, ..), args, .. } => {
-                let fun = &self.resolved_fun(kind, fun);
-                let (body, env2, mut lets) = self.inline_call(fun, args, env)?;
+            ExprX::Call { target: CallTarget::Fun(kind, fun, typs, ..), args, .. } => {
+                let fun = match self.functions.resolve(FunctionUse::Call(kind, fun, typs)) {
+                    Ok(fun) => fun,
+                    Err(reason) => {
+                        self.refuse(reason, &e.span);
+                        return None;
+                    }
+                };
+                if typ_datatype(&fun.x.ret.x.typ).is_some_and(|p| last_segment(&p) == "Action") {
+                    let domains = args.iter().map(|a| self.action_arg_domain(a, env, 0)).collect();
+                    self.action_domains
+                        .entry(self.current.clone())
+                        .or_default()
+                        .push((fun.name().clone(), domains));
+                }
+                let (body, env2, mut lets) = self.inline_call(&fun, args, env)?;
                 let (record, renv, mut rlets) = self.resolve_record(&body, &env2, depth + 1)?;
                 lets.append(&mut rlets);
                 Some((record, renv, lets))
@@ -4880,6 +4771,53 @@ impl Exporter {
             }
             _ => None,
         }
+    }
+
+    /// A value may escape its source guard order only when it is a literal
+    /// or a total pre-state projection. Original binders are also valid when
+    /// kept in their scope (quantified templates and dependent field bounds).
+    /// Calls, indexing, casts and arithmetic are deliberately not inferred safe.
+    fn trace_input_eligible(&self, e: &Expr, env: &Env, depth: usize) -> bool {
+        if depth > 16 {
+            return false;
+        }
+        let e = peel(e);
+        if matches!(e.x, ExprX::Const(_)) || self.role_field(&e, env, Role::Pre).is_some() {
+            return true;
+        }
+        let Some(v) = read_var(&e) else { return false };
+        if env.roles.get(&v) == Some(&Role::Pre) {
+            return true;
+        }
+        if let Some((value, scope)) = env.values.get(&v) {
+            return self.trace_input_eligible(value, scope, depth + 1);
+        }
+        env.trace_binders.contains(&v)
+    }
+
+    fn trace_domain_eligible(&self, domain: &str) -> bool {
+        self.safe_trace_domains.contains(domain) || self.hole_typs.contains_key(domain)
+    }
+
+    /// Only reuse domains already established in the model or literal
+    /// singleton values. Computing a new argument value here could hoist a
+    /// partial expression above its guard or read an unassigned post state.
+    fn action_arg_domain(&mut self, e: &Expr, env: &Env, depth: usize) -> Option<Dom> {
+        if depth > 16 {
+            return None;
+        }
+        let e = peel(e);
+        if matches!(e.x, ExprX::Const(_)) {
+            let domain = format!("{{{}}}", self.quiet(|x| x.expr(&e, env)));
+            self.safe_trace_domains.insert(domain.clone());
+            return Some(Dom::Closed(domain, false));
+        }
+        let v = read_var(&e)?;
+        if let Some(d) = env.domains.get(&v) {
+            return Some(d.clone());
+        }
+        let (value, scope) = env.values.get(&v)?;
+        self.action_arg_domain(value, scope, depth + 1)
     }
 
     fn resolve_record_place(
@@ -5458,9 +5396,9 @@ impl Exporter {
         let name = self.bind_var(&mut scope, &b.name);
         let guards = conjuncts(&peel(cond));
         let holes_before = self.holes.len();
-        let domain = match self
-            .quiet(|x| x.bound_from_guard(&b.name, &b.a, &[b.name.clone()], &guards, &scope))
-        {
+        let domain = match self.quiet(|x| {
+            x.bound_from_guard(&b.name, &b.a, std::slice::from_ref(&b.name), &guards, &scope)
+        }) {
             Some(domain) => domain,
             None if matches!(&*crate::ast_util::undecorate_typ(&b.a), TypX::TypParam(_)) => {
                 return self.refuse("choose without a representable domain", &e.span);
@@ -5500,6 +5438,7 @@ impl Exporter {
         let mut env2 = env.clone();
         for b in binders.iter() {
             self.bind_var(&mut env2, &b.name);
+            env2.trace_binders.insert(b.name.clone());
         }
         if !forall && binders.len() == 1 {
             if let Some(out) = self.exists_per_variant(e, &binders[0], body, &env2) {
@@ -5720,6 +5659,7 @@ impl Exporter {
         // read as they would from a plain `\\E binder \\in domain`.
         let mut variants = Vec::new();
         let mut sets = Vec::new();
+        let mut trace_safe = true;
         for ((vname, fields, names, record), (bounded, s)) in
             all.into_iter().zip(field_bounds.into_iter().zip(split))
         {
@@ -5746,33 +5686,62 @@ impl Exporter {
                         constant
                     }
                 };
+                trace_safe &= self.trace_domain_eligible(&domain);
                 domains.push(domain);
             }
             let binds: Vec<String> =
                 names.iter().zip(&domains).map(|(n, d)| format!("{n} \\in {d}")).collect();
             sets.push(if binds.is_empty() {
                 format!("{{{record}}}")
+            } else if domains.iter().enumerate().any(|(i, d)| {
+                names[..i]
+                    .iter()
+                    .any(|n| d.split(|c: char| !c.is_alphanumeric() && c != '_').any(|t| t == n))
+            }) {
+                let mut set = format!("{{{record}}}");
+                for (name, domain) in names.iter().zip(&domains).rev() {
+                    set = format!("UNION {{{set} : {name} \\in {domain}}}");
+                }
+                set
             } else {
                 format!("{{{record} : {}}}", binds.join(", "))
             });
-            variants.push((record, names, domains));
+            variants.push((
+                vname.to_string(),
+                fields.iter().map(|(f, _)| f.to_string()).collect::<Vec<_>>(),
+                record,
+                names,
+                domains,
+            ));
         }
         if variants.is_empty() {
             return None;
         }
         let union = format!("({})", sets.join(" \\cup "));
         let mut env2 = env.clone();
+        if trace_safe {
+            self.safe_trace_domains.insert(union.clone());
+        }
         env2.domains.insert(x.clone(), Dom::Closed(union.clone(), true));
         let sb = self.in_branch(body, &env2);
         self.exists_printed.insert(Arc::as_ptr(e) as usize, (xname.clone(), union, sb.clone()));
         let mut parts = Vec::new();
-        for (record, names, domains) in variants {
+        let mut trace_variants = Vec::new();
+        for (tag, fields, record, names, domains) in variants {
             let mut out = format!("(LET {xname} == {record} IN {sb})");
+            trace_variants.push(TraceVariant {
+                tag,
+                fields,
+                names: names.clone(),
+                domains: domains.clone(),
+                body: out.clone(),
+            });
             for (n, dom) in names.iter().zip(domains).rev() {
                 out = format!("(\\E {n} \\in {dom} : {out})");
             }
             parts.push(out);
         }
+        self.trace_variants.insert(Arc::as_ptr(e) as usize, trace_variants);
         Some(format!("({})", parts.join(" \\/ ")))
     }
 
@@ -5792,10 +5761,10 @@ impl Exporter {
         if let ExprX::Match(place, arms, _) = &e.x {
             return is_x(place).then(|| (arms.clone(), env.clone(), vec![x.clone()]));
         }
-        let ExprX::Call { target: CallTarget::Fun(kind, fun, ..), args, .. } = &e.x else {
+        let ExprX::Call { target: CallTarget::Fun(kind, fun, typs, ..), args, .. } = &e.x else {
             return None;
         };
-        let callee = self.functions.get(&self.resolved_fun(kind, fun))?.clone();
+        let callee = self.functions.resolve(FunctionUse::Call(kind, fun, typs)).ok()?;
         let body = peel(callee.x.body.as_ref()?);
         let ExprX::Match(place, arms, _) = &body.x else { return None };
         let scrutinee = place_var(place).filter(|_| matches!(place.x, PlaceX::Local(_)))?;
@@ -5845,14 +5814,15 @@ impl Exporter {
         let mut env = Env::new();
         let mut unbound: Vec<VarIdent> = arm_unbound.to_vec();
         let (guarded, target) = match &arm_body.x {
-            ExprX::Call { target: CallTarget::Fun(kind, fun, ..), args, .. } => {
-                let callee = self.functions.get(&self.resolved_fun(kind, fun))?.clone();
+            ExprX::Call { target: CallTarget::Fun(kind, fun, typs, ..), args, .. } => {
+                let callee = self.functions.resolve(FunctionUse::Call(kind, fun, typs)).ok()?;
                 let mut target_param = None;
                 for (p, a) in callee.x.params.iter().zip(args.iter()) {
                     let arg = read_var(a);
                     match arg.as_ref().and_then(|v| field_of.get(v).map(|i| (v, *i))) {
                         Some((_, i)) if i < k => {
                             env.names.insert(p.x.name.clone(), names[i].clone());
+                            env.trace_binders.insert(p.x.name.clone());
                         }
                         Some((v, i)) => {
                             if v == &target && i == k {
@@ -5875,6 +5845,7 @@ impl Exporter {
                 for (v, i) in &field_of {
                     if *i < k {
                         env.names.insert(v.clone(), names[*i].clone());
+                        env.trace_binders.insert(v.clone());
                     } else {
                         unbound.push(v.clone());
                     }
@@ -5965,8 +5936,21 @@ impl Exporter {
         span: &crate::messages::Span,
         seen: &mut Vec<Path>,
     ) -> Option<(String, u128)> {
-        let normalized = self.normalize_type(typ);
+        let normalized = self.functions.normalize_type(typ);
         let typ = &normalized;
+        let result = self.bound_from_type_inner(typ, span, seen);
+        if let Some((domain, _)) = &result {
+            self.safe_trace_domains.insert(domain.clone());
+        }
+        result
+    }
+
+    fn bound_from_type_inner(
+        &mut self,
+        typ: &Typ,
+        span: &crate::messages::Span,
+        seen: &mut Vec<Path>,
+    ) -> Option<(String, u128)> {
         match &**typ {
             TypX::Bool => Some(("BOOLEAN".into(), 2)),
             TypX::Int(range @ (IntRange::U(_) | IntRange::I(_))) => match int_type_bounds(range) {
@@ -6320,10 +6304,16 @@ impl Exporter {
                     _ => continue,
                 };
                 let x = self.bind("x__");
-                return Some(match range.as_ref().and_then(|r| int_range_pred(&x, r)) {
+                let domain = match range.as_ref().and_then(|r| int_range_pred(&x, r)) {
                     Some(in_range) => format!("{{{x} \\in {set} : {in_range}}}"),
                     None => set,
-                });
+                };
+                if self.trace_input_eligible(&args[0], env, 0) {
+                    self.safe_trace_domains.insert(domain.clone());
+                } else {
+                    self.unsafe_trace_relations.insert(self.current.clone());
+                }
+                return Some(domain);
             }
         }
         // Integer range from inequalities and chained comparisons; a `char`
@@ -6333,9 +6323,11 @@ impl Exporter {
         }
         let mut lower: Option<String> = None;
         let mut upper: Option<String> = None;
+        let mut trace_safe = true;
         // `v op other`, with `strict` strict comparisons on the way (each one
         // step further from `other`).
         let mut note = |this: &mut Self, op: InequalityOp, other: &Expr, strict: usize| {
+            trace_safe &= this.trace_input_eligible(other, env, 0);
             let o = this.expr(other, env);
             let shifted = |sign: &str| {
                 if strict == 0 { o.clone() } else { format!("({o}) {sign} {strict}") }
@@ -6418,7 +6410,15 @@ impl Exporter {
             (u, t) => u.or(t.map(|t| t.to_string())),
         };
         match (lower, upper) {
-            (Some(l), Some(u)) => Some(format!("{l}..{u}")),
+            (Some(l), Some(u)) => {
+                let domain = format!("{l}..{u}");
+                if trace_safe {
+                    self.safe_trace_domains.insert(domain.clone());
+                } else {
+                    self.unsafe_trace_relations.insert(self.current.clone());
+                }
+                Some(domain)
+            }
             _ => None,
         }
     }
@@ -6674,8 +6674,9 @@ impl Exporter {
             k.1 == Variant::Plain
                 && self
                     .functions
-                    .get(&k.0)
-                    .is_some_and(|f| self.param_roles(f).contains(&Some(Role::Post)))
+                    .resolve(FunctionUse::Root(&k.0))
+                    .ok()
+                    .is_some_and(|f| self.param_roles(&f).contains(&Some(Role::Post)))
         };
         // The operators `t` reaches through branches, and those it conjoins
         // (`t` left out), following conjoined calls.
@@ -6746,7 +6747,7 @@ impl Exporter {
     /// A recursive function is only ever called in its record variant (see
     /// [`Exporter::call`]); these roles serve the plain wrapper a recursive
     /// root gets (see [`Exporter::ensure_function`]).
-    fn param_roles(&self, f: &Function) -> Vec<Option<Role>> {
+    fn param_roles(&self, f: &ResolvedFunction) -> Vec<Option<Role>> {
         let mut seen = 0;
         f.x.params
             .iter()
@@ -6764,7 +6765,13 @@ impl Exporter {
     /// Emit the operator for `key` (and, first, everything it calls) unless
     /// it is emitted or being emitted; return its name. A refusal it reaches
     /// taints the operator being printed.
-    fn ensure_function(&mut self, key: &OpKey) -> String {
+    fn ensure_function(
+        &mut self,
+        f: &ResolvedFunction,
+        variant: Variant,
+        post_args: bool,
+    ) -> String {
+        let key = &(f.name().clone(), variant, post_args);
         let name = self.op_name(key);
         let reach = match (self.conj_level, self.branch_depth > 0) {
             (false, _) => Reach::Other,
@@ -6785,7 +6792,6 @@ impl Exporter {
             return name;
         }
         let (fun, variant, post_args) = key;
-        let Some(f) = self.functions.get(fun).cloned() else { return name };
         self.emitting.insert(key.clone());
         let previous = std::mem::replace(&mut self.current, fun_as_friendly_rust_name(fun));
         let previous_key = std::mem::replace(&mut self.current_key, Some(key.clone()));
@@ -6810,7 +6816,7 @@ impl Exporter {
         let previous_level = std::mem::replace(&mut self.conj_level, true);
         let mut env = Env::new();
         let roles = match variant {
-            Variant::Record | Variant::Forward => vec![None; f.x.params.len()],
+            Variant::Record | Variant::Forward(_) => vec![None; f.x.params.len()],
             Variant::Plain | Variant::Primed => self.param_roles(&f),
         };
         let mut params = Vec::new();
@@ -6852,7 +6858,7 @@ impl Exporter {
                         None => env.name(&p.x.name),
                     })
                     .collect();
-            let rec = self.ensure_function(&(fun.clone(), Variant::Record, false));
+            let rec = self.ensure_function(f, Variant::Record, false);
             format!("{rec}({})", args.join(", "))
         } else {
             match &f.x.body {
@@ -6870,7 +6876,7 @@ impl Exporter {
                 Variant::Plain if !f.x.decrease.is_empty() => " (applies the record variant)",
                 Variant::Plain => "",
                 Variant::Primed => " (read in the post state)",
-                Variant::Record | Variant::Forward => " (the state passed as a record)",
+                Variant::Record | Variant::Forward(_) => " (the state passed as a record)",
             },
             if *post_args { " (given an argument read in the post state)" } else { "" },
             span_string(&f.span)
@@ -7022,9 +7028,11 @@ impl Exporter {
             }
             // Follow a helper taking the whole state; only unconditional
             // conjuncts contribute facts. Never combine different disjuncts.
-            if let ExprX::Call { target: CallTarget::Fun(kind, fun, ..), args, .. } = &peel(c).x {
+            if let ExprX::Call { target: CallTarget::Fun(kind, fun, typs, ..), args, .. } =
+                &peel(c).x
+            {
                 if depth < 16 {
-                    if let Some(f) = self.functions.get(&self.resolved_fun(kind, fun)) {
+                    if let Ok(f) = self.functions.resolve(FunctionUse::Call(kind, fun, typs)) {
                         if let Some(body) = &f.x.body {
                             let inner: HashSet<_> =
                                 f.x.params
@@ -7076,7 +7084,7 @@ impl Exporter {
                     continue;
                 }
                 if lengths.iter().any(|(f, len)| {
-                    f == &field && Self::init_full_index_range(guard, &qs[0].name, len)
+                    f == &field && self.init_full_index_range(guard, &qs[0].name, len)
                 }) {
                     out.insert(field);
                 }
@@ -7086,7 +7094,7 @@ impl Exporter {
     }
 
     /// Exactly 0 <= i < length; an additional guard would leave elements free.
-    fn init_full_index_range(guard: &Expr, index: &VarIdent, length: &Expr) -> bool {
+    fn init_full_index_range(&self, guard: &Expr, index: &VarIdent, length: &Expr) -> bool {
         let mut comparisons = Vec::new();
         for c in conjuncts(guard) {
             match &peel(&c).x {
@@ -7112,7 +7120,7 @@ impl Exporter {
                 lower = true;
             } else if matches!(op, InequalityOp::Lt)
                 && read_var(&a).as_ref() == Some(index)
-                && same_expr(&b, length)
+                && same_expr(&self.functions, &b, length)
             {
                 upper = true;
             } else {
@@ -7313,7 +7321,7 @@ impl Exporter {
                         ExprX::Logical(LogicalOp::Implies, g, b) => {
                             let a = self.init_assigns(b, states, binders, &seen, depth);
                             for (g2, a2) in &implications {
-                                if complementary(g, g2) {
+                                if complementary(&self.functions, g, g2) {
                                     s.extend(a.intersection(a2).cloned());
                                 }
                             }
@@ -7373,9 +7381,12 @@ impl Exporter {
             {
                 field(&args[0]).into_iter().collect()
             }
-            ExprX::Call { target: CallTarget::Fun(kind, fun, ..), args, .. } if depth < 16 => {
-                let fun = self.resolved_fun(kind, fun);
-                let Some(callee) = self.functions.get(&fun) else { return BTreeSet::new() };
+            ExprX::Call { target: CallTarget::Fun(kind, fun, typs, ..), args, .. }
+                if depth < 16 =>
+            {
+                let Ok(callee) = self.functions.resolve(FunctionUse::Call(kind, fun, typs)) else {
+                    return BTreeSet::new();
+                };
                 let Some(body) = &callee.x.body else { return BTreeSet::new() };
                 let inner: HashSet<VarIdent> = callee
                     .x
@@ -7498,7 +7509,7 @@ impl Exporter {
     /// `next`'s step structure, when its body is a one-binder `exists` over
     /// a datatype that was printed.
     fn steps(&self, next: &Fun, pending: &mut Vec<Path>) -> Option<Steps> {
-        let f = self.functions.get(next)?;
+        let f = self.functions.resolve(FunctionUse::Root(next)).ok()?;
         let body = peel(f.x.body.as_ref()?);
         let ExprX::Quant(q, binders, qbody) = &body.x else { return None };
         if !matches!(q.quant, air::ast::Quant::Exists) || binders.len() != 1 {
@@ -7520,11 +7531,11 @@ impl Exporter {
     /// post, i, mi)`.
     fn step_arms(&self, qbody: &Expr, binder: &VarIdent) -> Option<Vec<StepArm>> {
         let call = peel(qbody);
-        let ExprX::Call { target: CallTarget::Fun(_, fun, ..), args, .. } = &call.x else {
+        let ExprX::Call { target: CallTarget::Fun(kind, fun, typs, ..), args, .. } = &call.x else {
             return None;
         };
         let idx = args.iter().position(|a| read_var(a).as_ref() == Some(binder))?;
-        let g = self.functions.get(fun)?;
+        let g = self.functions.resolve(FunctionUse::Call(kind, fun, typs)).ok()?;
         let param = g.x.params.get(idx)?.x.name.clone();
         let gbody = peel(g.x.body.as_ref()?);
         let ExprX::Match(place, arms, _) = &gbody.x else { return None };
@@ -7545,10 +7556,15 @@ impl Exporter {
                 }
                 _ => None,
             };
-            let called = peel(&arm.x.body);
+            let body_parts = conjuncts(&peel(&arm.x.body));
+            let calls: Vec<Expr> = body_parts.into_iter().filter(|e| {
+                matches!(&e.x, ExprX::Call { target: CallTarget::Fun(kind, f, typs, ..), .. }
+                    if self.functions.resolve(FunctionUse::Call(kind, f, typs)).is_ok_and(|f| self.param_roles(&f).contains(&Some(Role::Post))))
+            }).collect();
+            let called = if calls.len() == 1 { calls[0].clone() } else { peel(&arm.x.body) };
             let (function, operator, args) = match &called.x {
-                ExprX::Call { target: CallTarget::Fun(_, h, ..), args, .. } => {
-                    match self.functions.get(h) {
+                ExprX::Call { target: CallTarget::Fun(kind, h, typs, ..), args, .. } => {
+                    match self.functions.resolve(FunctionUse::Call(kind, h, typs)).ok() {
                         Some(hf) => {
                             let args =
                                 hf.x.params
@@ -7564,7 +7580,9 @@ impl Exporter {
                                     .collect();
                             (
                                 Some(fun_as_friendly_rust_name(h)),
-                                self.op_names.get(&(h.clone(), Variant::Plain, false)).cloned(),
+                                self.op_names
+                                    .get(&(hf.name().clone(), Variant::Plain, false))
+                                    .cloned(),
                                 args,
                             )
                         }
@@ -7647,16 +7665,16 @@ impl Exporter {
         };
         let mut found: Vec<Fun> = self
             .functions
-            .keys()
+            .names()
+            .into_iter()
             .filter(|f| fun_as_friendly_rust_name(f) == name)
-            .cloned()
             .collect();
         found.sort_by_key(|f| format!("{f:?}"));
         let Some(fun) = found.first().cloned() else {
             out.error = Some(format!("no function `{name}` in the crate"));
             return out;
         };
-        let f = self.functions[&fun].clone();
+        let f = self.functions.resolve(FunctionUse::Root(&fun)).expect("selected function");
         let states = f.x.params.iter().filter(|p| self.is_state_typ(&p.x.typ)).count();
         if f.x.mode != Mode::Spec
             || f.x.body.is_none()
@@ -7670,7 +7688,7 @@ impl Exporter {
         }
         self.conj_level = false;
         let key = (fun.clone(), Variant::Plain, false);
-        out.operator = Some(self.ensure_function(&key));
+        out.operator = Some(self.ensure_function(&f, Variant::Plain, false));
         out.states = states;
         out.ret = Some(self.type_ref(&f.x.ret.x.typ, pending));
         out.tainted = self.tainted.contains(&key);
@@ -7912,27 +7930,38 @@ fn bool_field(e: &Expr) -> Option<(Expr, bool)> {
 
 /// Every crate function `root`'s body calls, directly or through the
 /// functions it calls (`root` itself only through a cycle).
-fn reached_functions(functions: &HashMap<Fun, Function>, root: &Fun) -> HashSet<Fun> {
-    let mut seen: HashSet<Fun> = HashSet::new();
-    let mut stack = vec![root.clone()];
-    while let Some(f) = stack.pop() {
-        let Some(body) = functions.get(&f).and_then(|f| f.x.body.clone()) else { continue };
-        crate::ast_visitor::expr_visitor_walk(&body, &mut |x: &Expr| {
-            if let ExprX::Call { target: CallTarget::Fun(kind, fun, ..), .. } = &x.x {
-                let mut callees = vec![fun.clone()];
-                if let CallTargetKind::DynamicResolved { resolved, .. } = kind {
-                    callees.push(resolved.clone());
-                }
-                for c in callees {
-                    if functions.contains_key(&c) && seen.insert(c.clone()) {
-                        stack.push(c);
+fn reached_functions(functions: &Functions, root: &Fun) -> HashSet<Fun> {
+    functions
+        .resolve(FunctionUse::Root(root))
+        .ok()
+        .and_then(|f| f.x.body.clone())
+        .map(|body| reached_expr(functions, &body))
+        .unwrap_or_default()
+}
+
+/// Follow actual instances, while retaining original names for source-level
+/// property selection. Never open a generic declaration in place of a call.
+fn reached_expr(functions: &Functions, expression: &Expr) -> HashSet<Fun> {
+    let mut names = HashSet::new();
+    let mut expanded = HashSet::new();
+    let mut stack = vec![expression.clone()];
+    while let Some(body) = stack.pop() {
+        crate::ast_visitor::expr_visitor_walk(&body, &mut |e| {
+            if let ExprX::Call { target: CallTarget::Fun(kind, fun, typs, ..), .. } = &e.x {
+                if let Ok(f) = functions.resolve(FunctionUse::Call(kind, fun, typs)) {
+                    names.insert(f.original().clone());
+                    names.insert(f.name().clone());
+                    if expanded.insert(f.name().clone()) {
+                        if let Some(body) = &f.x.body {
+                            stack.push(body.clone());
+                        }
                     }
                 }
             }
             crate::visitor::VisitorControlFlow::Recurse
         });
     }
-    seen
+    names
 }
 
 /// Whether a pattern could match a value built by `variant`: only a
@@ -8030,7 +8059,7 @@ fn sync_guarded_scrutinee(place: &Place) -> bool {
         return true;
     }
     let PlaceX::Temporary(e) = &place.x else { return false };
-    called(e).is_some_and(|(_, fun, args)| {
+    called(e).is_some_and(|(_, fun, _, args)| {
         let f = fun_as_friendly_rust_name(&fun);
         ["::index", "::spec_index", "::arrow_0"].iter().any(|m| f.ends_with(m))
             && args.first().and_then(read_var).is_some_and(|v| v.0.starts_with("update_tmp_"))
@@ -8039,8 +8068,9 @@ fn sync_guarded_scrutinee(place: &Place) -> bool {
 
 /// Whether `e` is vstd's `arbitrary()`.
 fn is_arbitrary(e: &Expr) -> bool {
-    called(e)
-        .is_some_and(|(_, fun, _)| fun_as_friendly_rust_name(&fun) == "vstd::pervasive::arbitrary")
+    called(e).is_some_and(|(_, fun, _, _)| {
+        fun_as_friendly_rust_name(&fun) == "vstd::pervasive::arbitrary"
+    })
 }
 
 /// Where the assertion `cond` of VerusSync's `tmp_assert && cond` (`init`)
@@ -8111,34 +8141,34 @@ fn access_path(e: &Expr) -> Option<(VarIdent, Vec<Ident>)> {
 /// Whether `a` and `b` are the same expression, for the common shapes of a
 /// guard (reads, literals, operators, calls); anything else is not, so the
 /// answer is never a wrong yes.
-fn same_expr(a: &Expr, b: &Expr) -> bool {
+fn same_expr(functions: &Functions, a: &Expr, b: &Expr) -> bool {
     if let (Some(x), Some(y)) = (access_path(a), access_path(b)) {
         return x == y;
     }
     let (a, b) = (peel(a), peel(b));
     let all = |xs: &Exprs, ys: &Exprs| {
-        xs.len() == ys.len() && xs.iter().zip(ys.iter()).all(|(x, y)| same_expr(x, y))
+        xs.len() == ys.len() && xs.iter().zip(ys.iter()).all(|(x, y)| same_expr(functions, x, y))
     };
     match (&a.x, &b.x) {
         (ExprX::Const(x), ExprX::Const(y)) => x == y,
-        (ExprX::Unary(o1, x), ExprX::Unary(o2, y)) => o1 == o2 && same_expr(x, y),
+        (ExprX::Unary(o1, x), ExprX::Unary(o2, y)) => o1 == o2 && same_expr(functions, x, y),
         (
             ExprX::UnaryOpr(UnaryOpr::IsVariant { datatype: d1, variant: v1 }, x),
             ExprX::UnaryOpr(UnaryOpr::IsVariant { datatype: d2, variant: v2 }, y),
-        ) => d1 == d2 && v1 == v2 && same_expr(x, y),
+        ) => d1 == d2 && v1 == v2 && same_expr(functions, x, y),
         (ExprX::UnaryOpr(UnaryOpr::Field(f1), x), ExprX::UnaryOpr(UnaryOpr::Field(f2), y)) => {
-            f1.datatype == f2.datatype && f1.field == f2.field && same_expr(x, y)
+            f1.datatype == f2.datatype && f1.field == f2.field && same_expr(functions, x, y)
         }
         (ExprX::Binary(o1, x1, y1), ExprX::Binary(o2, x2, y2)) => {
-            o1 == o2 && same_expr(x1, x2) && same_expr(y1, y2)
+            o1 == o2 && same_expr(functions, x1, x2) && same_expr(functions, y1, y2)
         }
         (ExprX::Logical(o1, x1, y1), ExprX::Logical(o2, x2, y2)) => {
-            o1 == o2 && same_expr(x1, x2) && same_expr(y1, y2)
+            o1 == o2 && same_expr(functions, x1, x2) && same_expr(functions, y1, y2)
         }
         (
-            ExprX::Call { target: CallTarget::Fun(_, f1, ..), args: a1, .. },
-            ExprX::Call { target: CallTarget::Fun(_, f2, ..), args: a2, .. },
-        ) => f1 == f2 && all(a1, a2),
+            ExprX::Call { target: CallTarget::Fun(..), args: a1, .. },
+            ExprX::Call { target: CallTarget::Fun(..), args: a2, .. },
+        ) => functions.same_call(&a, &b) && all(a1, a2),
         _ => false,
     }
 }
@@ -8146,10 +8176,9 @@ fn same_expr(a: &Expr, b: &Expr) -> bool {
 /// Whether exactly one of the guards `a` and `b` holds in every state: one
 /// is the negation of the other (`g`, `!g`), or they are opposite
 /// comparisons of the same operands (`x == y`, `x != y`; `x < y`, `x >= y`).
-fn complementary(a: &Expr, b: &Expr) -> bool {
+fn complementary(functions: &Functions, a: &Expr, b: &Expr) -> bool {
     let (a, b) = (peel(a), peel(b));
-    let negates =
-        |n: &Expr, g: &Expr| matches!(&n.x, ExprX::Unary(UnaryOp::Not, x) if same_expr(x, g));
+    let negates = |n: &Expr, g: &Expr| matches!(&n.x, ExprX::Unary(UnaryOp::Not, x) if same_expr(functions, x, g));
     if negates(&a, &b) || negates(&b, &a) {
         return true;
     }
@@ -8165,7 +8194,7 @@ fn complementary(a: &Expr, b: &Expr) -> bool {
     };
     match (&a.x, &b.x) {
         (ExprX::Binary(o1, x1, y1), ExprX::Binary(o2, x2, y2)) => {
-            opposite(o1, o2) && same_expr(x1, x2) && same_expr(y1, y2)
+            opposite(o1, o2) && same_expr(functions, x1, x2) && same_expr(functions, y1, y2)
         }
         _ => false,
     }
@@ -8239,11 +8268,11 @@ fn is_unit(typ: &Typ) -> bool {
 }
 
 /// A call `e` to a crate function: the function (resolved, see
-/// [`Exporter::resolved_fun`]) and the arguments.
-fn called(e: &Expr) -> Option<(CallTargetKind, Fun, Exprs)> {
+/// [`compiler_target`]), complete type arguments, and value arguments.
+fn called(e: &Expr) -> Option<(CallTargetKind, Fun, Typs, Exprs)> {
     match &peel(e).x {
-        ExprX::Call { target: CallTarget::Fun(kind, fun, ..), args, .. } => {
-            Some((kind.clone(), fun.clone(), args.clone()))
+        ExprX::Call { target: CallTarget::Fun(kind, fun, typs, ..), args, .. } => {
+            Some((kind.clone(), fun.clone(), typs.clone(), args.clone()))
         }
         _ => None,
     }
@@ -8270,13 +8299,15 @@ struct TemporalSource {
 
 /// Whether two `.entails` receivers are the same spec: the same variable,
 /// or a call to the same function of no arguments (`spec()`).
-fn same_receiver(a: &Expr, b: &Expr) -> bool {
+fn same_receiver(functions: &Functions, a: &Expr, b: &Expr) -> bool {
     let (a, b) = (peel(a), peel(b));
     if let (Some(x), Some(y)) = (read_var(&a), read_var(&b)) {
         return x == y;
     }
     match (called(&a), called(&b)) {
-        (Some((_, f, fa)), Some((_, g, ga))) => f == g && fa.is_empty() && ga.is_empty(),
+        (Some((_, _, _, fa)), Some((_, _, _, ga))) => {
+            fa.is_empty() && ga.is_empty() && functions.same_call(&a, &b)
+        }
         _ => false,
     }
 }
@@ -8299,14 +8330,14 @@ fn same_receiver(a: &Expr, b: &Expr) -> bool {
 ///
 /// Returns them with what was passed over and why.
 fn temporal_sources(
-    functions: &HashMap<Fun, Function>,
+    functions: &Functions,
     in_module: &[Function],
 ) -> (Vec<TemporalSource>, Vec<String>) {
     let short = |f: &Function| last_segment(&f.x.name.path);
     let mut out: Vec<TemporalSource> = Vec::new();
     let mut notes = Vec::new();
     let entails = |e: &Expr| -> Option<(Expr, Expr)> {
-        let (_, fun, args) = called(e)?;
+        let (_, fun, _, args) = called(e)?;
         (last_segment(&fun.path) == "entails" && args.len() == 2 && is_temp_pred(&args[0].typ))
             .then(|| (args[0].clone(), args[1].clone()))
     };
@@ -8362,7 +8393,7 @@ fn temporal_sources(
                     spec.push(model.clone());
                     for r in f.x.require.iter() {
                         match entails(r) {
-                            Some((r2, c)) if same_receiver(&r2, &model) => {
+                            Some((r2, c)) if same_receiver(functions, &r2, &model) => {
                                 src_notes.push(format!(
                                     "its requires at {} (the receiver's .entails(c)) is read as a conjunct of its spec: TLC checks spec /\\ c => property, which implies what the lemma proves",
                                     span_string(&r.span)
@@ -8402,22 +8433,12 @@ fn temporal_sources(
         // ensures and requires, exported or not): a building block such as
         // `fairness()` that a lemma's requires use is not a property.
         let mut reached = reached_functions(functions, &spec_fn.x.name);
-        let mut roots = Vec::new();
         let stated = in_module
             .iter()
             .filter(|f| f.x.mode == Mode::Proof)
             .flat_map(|f| f.x.require.iter().chain(f.x.ensure.0.iter()));
         for e in stated {
-            crate::ast_visitor::expr_visitor_walk(e, &mut |x: &Expr| {
-                if let ExprX::Call { target: CallTarget::Fun(_, fun, ..), .. } = &x.x {
-                    roots.push(fun.clone());
-                }
-                crate::visitor::VisitorControlFlow::Recurse
-            });
-        }
-        for r in roots {
-            reached.extend(reached_functions(functions, &r));
-            reached.insert(r);
+            reached.extend(reached_expr(functions, e));
         }
         let spec_call = SpannedTyped::new(
             &spec_fn.span,
@@ -8447,6 +8468,25 @@ fn temporal_sources(
                 || f.x.body.is_none()
                 || reached.contains(&f.x.name)
             {
+                continue;
+            }
+            // A generic helper is meaningful at its call sites. Rendering its
+            // unspecialized declaration as well would introduce abstract tables
+            // even when every checked caller has concrete type arguments.
+            if !f.x.typ_params.is_empty()
+                && in_module.iter().any(|caller| {
+                    caller.x.name != f.x.name
+                        && caller.x.mode == Mode::Spec
+                        && caller.x.params.is_empty()
+                        && is_temp_pred(&caller.x.ret.x.typ)
+                        && reached_functions(functions, &caller.x.name).contains(&f.x.name)
+                        && !reached_functions(functions, &f.x.name).contains(&caller.x.name)
+                })
+            {
+                notes.push(format!(
+                    "{}: generic temporal helper exported at its instantiated call sites",
+                    fun_as_friendly_rust_name(&f.x.name)
+                ));
                 continue;
             }
             out.push(TemporalSource {
@@ -8592,7 +8632,7 @@ impl Exporter {
     /// the type's own when it is small (see [`Exporter::bound_from_type`]),
     /// else a hole constant.
     fn type_domain(&mut self, name: &str, typ: &Typ, span: &crate::messages::Span) -> String {
-        let normalized = self.normalize_type(typ);
+        let normalized = self.functions.normalize_type(typ);
         let typ = &normalized;
         match self.bound_from_type(typ, span, &mut Vec::new()) {
             Some((d, _)) => d,
@@ -8694,26 +8734,39 @@ impl Exporter {
     /// `f().forward(input)`, verus-tla's `Action::forward` on the record a
     /// crate spec fn `f` of no parameters builds: `f`, `forward`, the
     /// receiver `f()` and `input`.
-    fn forward_parts(&self, e: &Expr) -> Option<(Fun, Fun, Expr, Expr)> {
-        let (kind, fun, args) = called(e)?;
-        let forward = self.resolved_fun(&kind, &fun);
-        if last_segment(&forward.path) != "forward" || args.len() != 2 {
+    fn forward_parts(
+        &mut self,
+        e: &Expr,
+    ) -> Option<(ResolvedFunction, ResolvedFunction, Expr, Expr)> {
+        let (kind, fun, typs, args) = called(e)?;
+        if last_segment(&compiler_target(&kind, &fun).path) != "forward" || args.len() != 2 {
             return None;
         }
-        let fwd = self.functions.get(&forward)?;
-        fwd.x.body.as_ref()?;
-        let recv_typ = &fwd.x.params.first()?.x.typ;
+        let forward = self
+            .functions
+            .resolve(FunctionUse::Call(&kind, &fun, &typs))
+            .map_err(|reason| {
+                self.refuse(reason, &e.span);
+            })
+            .ok()?;
+        forward.x.body.as_ref()?;
+        let recv_typ = &forward.x.params.first()?.x.typ;
         if !typ_datatype(recv_typ).is_some_and(|p| last_segment(&p) == "Action") {
             return None;
         }
         let recv = peel(&args[0]);
-        let (k2, f2, a2) = called(&recv)?;
-        let f2 = self.resolved_fun(&k2, &f2);
-        let builder = self.functions.get(&f2)?;
-        if !a2.is_empty() || !builder.x.params.is_empty() || builder.x.body.is_none() {
+        let (kind, fun, typs, args2) = called(&recv)?;
+        let builder = self
+            .functions
+            .resolve(FunctionUse::Call(&kind, &fun, &typs))
+            .map_err(|reason| {
+                self.refuse(reason, &recv.span);
+            })
+            .ok()?;
+        if !args2.is_empty() || !builder.x.params.is_empty() || builder.x.body.is_none() {
             return None;
         }
-        Some((f2, forward, recv, args[1].clone()))
+        Some((builder, forward, recv, args[1].clone()))
     }
 
     /// The call to the operator of the verus-tla action `e` (`f().forward(input)`):
@@ -8721,6 +8774,12 @@ impl Exporter {
     fn forward_call(&mut self, e: &Expr, env: &Env) -> Option<String> {
         let (f, forward, recv, input) = self.forward_parts(e)?;
         let has_input = !is_unit(&input.typ);
+        let domains =
+            if has_input { vec![self.action_arg_domain(&input, env, 0)] } else { Vec::new() };
+        self.action_domains
+            .entry(self.current.clone())
+            .or_default()
+            .push((f.name().clone(), domains));
         let arg = if has_input { Some(self.quiet(|x| x.expr(&input, env))) } else { None };
         let name = self.ensure_forward(&f, &forward, &recv, has_input);
         Some(match arg {
@@ -8732,10 +8791,25 @@ impl Exporter {
     /// The operator of a verus-tla action's forward step, `forward`'s closure
     /// over `(s, s_prime)` printed with `self` bound to `recv` (`f()`), and
     /// `input` its one parameter (none for `()`).
-    fn ensure_forward(&mut self, f: &Fun, forward: &Fun, recv: &Expr, has_input: bool) -> String {
-        let key = (f.clone(), Variant::Forward, false);
-        let fwd = self.functions[forward].clone();
-        let span = self.functions.get(f).map(|b| b.span.clone()).unwrap_or(fwd.span.clone());
+    fn ensure_forward(
+        &mut self,
+        f: &ResolvedFunction,
+        forward: &ResolvedFunction,
+        recv: &Expr,
+        has_input: bool,
+    ) -> String {
+        // Both the builder and forward method may depend on type arguments.
+        // Fairness and transition calls must refer to this same specialization.
+        let method = match self.forward_methods.iter().position(|m| m == forward.name()) {
+            Some(i) => i,
+            None => {
+                self.forward_methods.push(forward.name().clone());
+                self.forward_methods.len() - 1
+            }
+        };
+        let key = (f.name().clone(), Variant::Forward(method), false);
+        let fwd = forward.clone();
+        let span = f.span.clone();
         let recv = recv.clone();
         self.ensure_generated(&key, move |x| {
             let mut env = Env::new();
@@ -8761,7 +8835,7 @@ impl Exporter {
                 if lets.is_empty() { body } else { format!("LET {} IN {body}", lets.join(" ")) };
             let comment = format!(
                 "{}().forward({}), {}",
-                fun_as_friendly_rust_name(f),
+                fun_as_friendly_rust_name(f.name()),
                 if has_input { "input" } else { "()" },
                 span_string(&span)
             );
@@ -8769,11 +8843,311 @@ impl Exporter {
         })
     }
 
+    /// Each independently evaluated trace relation starts with no assigned
+    /// successor variables, just like a freshly emitted model operator.
+    fn reset_trace_context(&mut self) {
+        // Cached quantified templates may become siblings of freshly lowered
+        // branches. Reserve their locals so a LET cannot shadow a template's
+        // parameter when the branches are merged into one trace operator.
+        self.bound = self.locals_ever.clone();
+        self.current_tainted = false;
+        self.branch_depth = 0;
+        self.conj_level = true;
+        self.current_calls.clear();
+        self.current_assigned.clear();
+        self.enclosing_assigned.clear();
+        self.implications.clear();
+        self.pre_assigned.clear();
+        self.current_key = None;
+        self.in_init = false;
+    }
+
+    /// Collect every action occurrence. Selection is allowed only for a
+    /// conjunctive application, or a path to one with its condition retained.
+    /// Unsupported occurrences are kept as general relations; dropping one
+    /// would make the other occurrences of the same name an incomplete dispatch.
+    fn trace_action_branches(&mut self, body: &Expr, env: &Env) -> Vec<TraceAction> {
+        let body = peel(body);
+        if let ExprX::Logical(LogicalOp::Or, a, b) = &body.x {
+            let mut out = self.trace_action_branches(a, env);
+            out.extend(self.trace_action_branches(b, env));
+            return out;
+        }
+        if let ExprX::If(cond, a, Some(b)) = &body.x {
+            let guard = self.quiet(|x| x.expr(cond, env));
+            let mut out = Vec::new();
+            for (branch, positive) in [(a, true), (b, false)] {
+                for mut action in self.trace_action_branches(branch, env) {
+                    if action.selected {
+                        let g = if positive { guard.clone() } else { format!("~({guard})") };
+                        action.body = format!("IF {g} THEN ({}) ELSE FALSE", action.body);
+                    }
+                    out.push(action);
+                }
+            }
+            return out;
+        }
+        let mut builders = Vec::new();
+        crate::ast_visitor::expr_visitor_walk(&body, &mut |e: &Expr| {
+            if let ExprX::Call { target: CallTarget::Fun(kind, fun, typs, ..), args, .. } = &e.x {
+                if let Ok(f) = self.functions.resolve(FunctionUse::Call(kind, fun, typs)) {
+                    if typ_datatype(&f.x.ret.x.typ).is_some_and(|p| last_segment(&p) == "Action") {
+                        builders.push((f, args.clone()));
+                    }
+                }
+            }
+            crate::visitor::VisitorControlFlow::Recurse
+        });
+        if let [(fun, args)] = &builders[..] {
+            if let Some(action) = self.trace_action_branch(&body, env, fun, args) {
+                return vec![action];
+            }
+        }
+        builders.into_iter().map(|(fun, _)| self.trace_general_action(&fun, &body)).collect()
+    }
+
+    /// Calls hidden inside helpers (including closure-returning helpers) have
+    /// no independently lowered call-site template. Find them in the source
+    /// bodies, not just the emitted operator graph: inlining removes edges.
+    /// Their general relations override any selected occurrences of the name.
+    fn trace_indirect_actions(&mut self, body: &Expr) -> Vec<TraceAction> {
+        let mut pending = vec![(body.clone(), false)];
+        let mut seen = HashSet::new();
+        let mut sites = Vec::new();
+        while let Some((body, indirect)) = pending.pop() {
+            crate::ast_visitor::expr_visitor_walk(&body, &mut |e: &Expr| {
+                if let ExprX::Call { target: CallTarget::Fun(kind, fun, typs, ..), .. } = &e.x {
+                    if let Ok(f) = self.functions.resolve(FunctionUse::Call(kind, fun, typs)) {
+                        if indirect
+                            && typ_datatype(&f.x.ret.x.typ)
+                                .is_some_and(|p| last_segment(&p) == "Action")
+                        {
+                            sites.push((f.clone(), body.clone()));
+                        }
+                        if seen.insert(f.name().clone()) {
+                            if let Some(callee) = &f.x.body {
+                                pending.push((callee.clone(), true));
+                            }
+                        }
+                    }
+                }
+                crate::visitor::VisitorControlFlow::Recurse
+            });
+        }
+        sites.into_iter().map(|(fun, site)| self.trace_general_action(&fun, &site)).collect()
+    }
+
+    fn trace_action_branch(
+        &mut self,
+        body: &Expr,
+        env: &Env,
+        fun: &ResolvedFunction,
+        args: &Exprs,
+    ) -> Option<TraceAction> {
+        self.reset_trace_context();
+        let f = fun;
+        let site = match &body.x {
+            ExprX::Quant(q, _, inner) if matches!(q.quant, air::ast::Quant::Exists) => peel(inner),
+            _ => body.clone(),
+        };
+        // A builder somewhere under a conditional, negation, or nested
+        // disjunction does not mean that taking this relation executes it.
+        let application = conjuncts(&site).into_iter().find(|e| {
+            matches!(&e.x, ExprX::Call { target: CallTarget::FnSpec(_), args, .. }
+                if args.len() == 2
+                && read_var(&args[0]).and_then(|v| env.roles.get(&v).copied()) == Some(Role::Pre)
+                && read_var(&args[1]).and_then(|v| env.roles.get(&v).copied()) == Some(Role::Post))
+        })?;
+        let ExprX::Call { target: CallTarget::FnSpec(c), .. } = &application.x else { return None };
+        let forward = self.forward_parts(c);
+        if forward.is_none() {
+            let (kind, wrapper, typs, wrapper_args) = called(c)?;
+            let wrapper = self.functions.resolve(FunctionUse::Call(&kind, &wrapper, &typs)).ok()?;
+            let index = wrapper_args.iter().position(|a| {
+                called(a).is_some_and(|(kind, f, typs, _)| {
+                    self.functions
+                        .resolve(FunctionUse::Call(&kind, &f, &typs))
+                        .is_ok_and(|f| f.same_instance(fun))
+                })
+            })?;
+            // Merely passing the builder to a wrapper does not imply that
+            // the wrapper executes it (it might allow stuttering instead).
+            // Recognize a faithful wrapper by both field applications as
+            // unconditional conjuncts on the closure's pre/post parameters.
+            let wrapper_body = peel(wrapper.x.body.as_ref()?);
+            let ExprX::Closure(ps, cb) = &wrapper_body.x else { return None };
+            if ps.len() != 2 {
+                return None;
+            }
+            let receiver = &wrapper.x.params.get(index)?.x.name;
+            for (field, arity) in [("precondition", 1), ("transition", 2)] {
+                if !conjuncts(cb).iter().any(|e| {
+                    let ExprX::Call { target: CallTarget::FnSpec(c), args, .. } = &e.x else {
+                        return false;
+                    };
+                    access_path(c).is_some_and(|(v, fields)| {
+                        &v == receiver && fields.len() == 1 && fields[0].as_str() == field
+                    }) && args.len() == arity
+                        && args
+                            .iter()
+                            .zip(ps.iter())
+                            .all(|(a, p)| read_var(a).as_ref() == Some(&p.name))
+                }) {
+                    return None;
+                }
+            }
+        }
+        let forward_input = forward.and_then(|(builder, forward, _, input)| {
+            (builder.same_instance(fun) && !is_unit(&input.typ)).then(|| {
+                let p = &forward.x.params[1];
+                (input, ident_name(&p.x.name))
+            })
+        });
+        let (params, text) = match &body.x {
+            ExprX::Quant(q, binders, _)
+                if matches!(q.quant, air::ast::Quant::Exists) && binders.len() == 1 =>
+            {
+                let (arg, log_name, typ) = if let Some((input, name)) = &forward_input {
+                    (input, name.clone(), input.typ.clone())
+                } else if args.len() == 1 {
+                    (&args[0], ident_name(&f.x.params[0].x.name), f.x.params[0].x.typ.clone())
+                } else {
+                    return None;
+                };
+                if read_var(arg).as_ref() != Some(&binders[0].name) {
+                    return None;
+                }
+                let (name, domain, text) =
+                    self.exists_printed.get(&(Arc::as_ptr(body) as usize)).cloned()?;
+                if !self.trace_domain_eligible(&domain) {
+                    return None;
+                }
+                (vec![(log_name, typ, Some(domain), name)], text)
+            }
+            ExprX::Quant(..) => return None,
+            _ => {
+                let mut params = Vec::new();
+                let mut inputs: Vec<_> =
+                    f.x.params
+                        .iter()
+                        .zip(args.iter())
+                        .map(|(p, a)| (ident_name(&p.x.name), a))
+                        .collect();
+                if let Some((input, name)) = &forward_input {
+                    inputs.push((name.clone(), input));
+                }
+                if inputs.iter().any(|(_, input)| !self.trace_input_eligible(input, env, 0)) {
+                    return None;
+                }
+                let mut text = self.expr(body, env);
+                for (log_name, input) in inputs {
+                    let value = self.quiet(|x| x.expr(input, env));
+                    let binder = self.bind("trace_input");
+                    params.push((
+                        log_name,
+                        input.typ.clone(),
+                        Some(format!("{{{value}}}")),
+                        binder.clone(),
+                    ));
+                    text = format!("({binder} = {value}) /\\ ({text})");
+                }
+                (params, text)
+            }
+        };
+        Some(TraceAction { fun: fun.name().clone(), params, body: text, selected: true })
+    }
+
+    /// A builder that cannot be selected still checks its precondition and
+    /// transition, conjoined with Next. No call-site parameters are discarded.
+    fn trace_general_action(&mut self, fun: &ResolvedFunction, site: &Expr) -> TraceAction {
+        self.reset_trace_context();
+        let mut forward = None;
+        crate::ast_visitor::expr_visitor_walk(site, &mut |e: &Expr| {
+            if let ExprX::Call { target: CallTarget::FnSpec(c), .. } = &e.x {
+                if let Some((builder, fwd, _, input)) = self.forward_parts(c) {
+                    if builder.same_instance(fun) {
+                        forward = Some((fwd, input));
+                    }
+                }
+            }
+            crate::visitor::VisitorControlFlow::Recurse
+        });
+        if let Some((fwd, input)) = forward {
+            let method = self.forward_methods.iter().position(|m| m == fwd.name());
+            if let Some(op) = method
+                .and_then(|method| {
+                    self.op_names.get(&(fun.name().clone(), Variant::Forward(method), false))
+                })
+                .cloned()
+            {
+                let mut params = Vec::new();
+                let body = if is_unit(&input.typ) {
+                    op
+                } else {
+                    let log_name = ident_name(&fwd.x.params[1].x.name);
+                    let name = self.bind("trace_input");
+                    let domain = self.trace_domain(&input.typ, &input.span, None);
+                    params.push((log_name, input.typ.clone(), domain, name.clone()));
+                    format!("{op}({name})")
+                };
+                return TraceAction { fun: fun.name().clone(), params, body, selected: false };
+            }
+        }
+        let f = fun;
+        let mut env = Env::new();
+        let mut params = Vec::new();
+        for p in f.x.params.iter() {
+            let name = self.bind_var(&mut env, &p.x.name);
+            let domain = self.trace_domain(&p.x.typ, &p.span, None);
+            params.push((ident_name(&p.x.name), p.x.typ.clone(), domain, name));
+        }
+        let mut parts = Vec::new();
+        if let Some((record, renv, lets)) =
+            f.x.body.as_ref().and_then(|b| self.resolve_record(b, &env, 0))
+        {
+            for (field, arity) in [("precondition", 1), ("transition", 2)] {
+                if let Some((ps, body, mut cenv, clets)) = self.closure_of_field(
+                    &record,
+                    &Arc::new(field.to_string()),
+                    renv.clone(),
+                    &mut lets.clone(),
+                    0,
+                ) {
+                    if ps.len() == arity {
+                        for (i, p) in ps.iter().enumerate() {
+                            cenv.roles.insert(
+                                p.name.clone(),
+                                if i == 0 { Role::Pre } else { Role::Post },
+                            );
+                        }
+                        let text = self.expr(&body, &cenv);
+                        parts.push(if clets.is_empty() {
+                            text
+                        } else {
+                            format!("LET {} IN {text}", clets.join(" "))
+                        });
+                    }
+                }
+            }
+        }
+        let body = if parts.len() == 2 {
+            format!("({}) /\\ ({})", parts[0], parts[1])
+        } else {
+            // Other Action APIs may not expose these two closures. Keep the
+            // name known and fail explicitly rather than taking OTHER -> Next.
+            format!(
+                "Assert(FALSE, \"trace: {} has no independently checkable action relation\")",
+                fun_as_friendly_rust_name(fun.name())
+            )
+        };
+        TraceAction { fun: fun.name().clone(), params, body, selected: false }
+    }
+
     /// The operator of a spec fn of no parameters returning a closure over
     /// one state (a predicate, pre role) or two (an action, pre and post),
     /// as verus-tla's `init()`, `next()` and state predicates are written.
-    fn ensure_closure_root(&mut self, f: &Fun) -> Option<String> {
-        let func = self.functions.get(f)?.clone();
+    fn ensure_closure_root(&mut self, func: &ResolvedFunction) -> Option<String> {
+        let f = func.name();
         if !func.x.params.is_empty() {
             return None;
         }
@@ -8790,6 +9164,9 @@ impl Exporter {
                 env.roles.insert(p.name.clone(), if k == 0 { Role::Pre } else { Role::Post });
             }
             let body = x.expr(&cbody, &env);
+            if params.len() == 2 {
+                x.trace_roots.insert((f.clone(), Variant::Plain, false), (cbody.clone(), env));
+            }
             (vec![], body, format!("{}, {}", fun_as_friendly_rust_name(f), span_string(&func.span)))
         }))
     }
@@ -8798,13 +9175,17 @@ impl Exporter {
     /// closure by its operator, `enabled(a)` as `ENABLED`, anything else
     /// reduced to a closure over one state and printed in place.
     fn state_formula(&mut self, p: &Expr, env: &Env) -> String {
-        if let Some((kind, fun, args)) = called(p) {
-            let fun = self.resolved_fun(&kind, &fun);
-            if last_segment(&fun.path) == "enabled" && args.len() == 1 {
+        if let Some((kind, fun, typs, args)) = called(p) {
+            let resolved = compiler_target(&kind, &fun);
+            if last_segment(&resolved.path) == "enabled" && args.len() == 1 {
                 let a = self.action_formula(&args[0], env);
                 return format!("ENABLED ({a})");
             }
             if args.is_empty() {
+                let fun = match self.functions.resolve(FunctionUse::Call(&kind, &fun, &typs)) {
+                    Ok(fun) => fun,
+                    Err(reason) => return self.refuse(reason, &p.span),
+                };
                 if let Some(name) = self.ensure_closure_root(&fun) {
                     return name;
                 }
@@ -8828,9 +9209,12 @@ impl Exporter {
         if let Some(call) = self.quiet(|x| x.forward_call(a, env)) {
             return call;
         }
-        if let Some((kind, fun, args)) = called(a) {
-            let fun = self.resolved_fun(&kind, &fun);
+        if let Some((kind, fun, typs, args)) = called(a) {
             if args.is_empty() {
+                let fun = match self.functions.resolve(FunctionUse::Call(&kind, &fun, &typs)) {
+                    Ok(fun) => fun,
+                    Err(reason) => return self.refuse(reason, &a.span),
+                };
                 if let Some(name) = self.quiet(|x| x.ensure_closure_root(&fun)) {
                     return name;
                 }
@@ -8851,8 +9235,8 @@ impl Exporter {
 
     /// `lift_action(a)`'s argument when `e` is one.
     fn lifted_action(&self, e: &Expr) -> Option<Expr> {
-        let (kind, fun, args) = called(e)?;
-        let fun = self.resolved_fun(&kind, &fun);
+        let (kind, fun, _, args) = called(e)?;
+        let fun = compiler_target(&kind, &fun);
         (last_segment(&fun.path) == "lift_action" && args.len() == 1).then(|| args[0].clone())
     }
 
@@ -8875,12 +9259,12 @@ impl Exporter {
                 return self.temporal(&value, &venv, depth + 1, pos);
             }
         }
-        let Some((kind, fun, args)) = called(&e).filter(|_| is_temp_pred(&e.typ)) else {
+        let Some((kind, fun, typs, args)) = called(&e).filter(|_| is_temp_pred(&e.typ)) else {
             let what = format!("temporal formula of kind {}", expr_kind(&e.x));
             return self.refuse(what, &e.span);
         };
-        let fun = self.resolved_fun(&kind, &fun);
-        let name = last_segment(&fun.path);
+        let resolved = compiler_target(&kind, &fun);
+        let name = last_segment(&resolved.path);
         let t = |x: &mut Self, i: usize| x.temporal(&args[i], env, depth + 1, TempPos::Nested);
         match (name.as_str(), args.len()) {
             ("always", 1) => match self.lifted_action(&args[0]) {
@@ -8945,11 +9329,14 @@ impl Exporter {
                         target: CallTarget::Fun(
                             CallTargetKind::Static,
                             Arc::new(FunX {
-                                path: fun.path.pop_segment().push_segment(Arc::new(
+                                path: resolved.path.pop_segment().push_segment(Arc::new(
                                     "forward".to_string(),
                                 )),
                             }),
-                            Arc::new(vec![]),
+                            match &kind {
+                                CallTargetKind::DynamicResolved { typs, .. } => typs.clone(),
+                                _ => typs.clone(),
+                            },
                             Arc::new(vec![]),
                             CallTargetAttrs {
                                 autospec: AutospecUsage::Final,
@@ -8993,17 +9380,23 @@ impl Exporter {
                 "a TempPred built from a closure over the execution (only verus-tla's operators are exported)",
                 &e.span,
             ),
-            _ => match self.inline_call(&fun, &args, env) {
-                Some((body, env2, lets)) => {
-                    let b = self.temporal(&body, &env2, depth + 1, pos);
-                    if lets.is_empty() { b } else { format!("(LET {} IN {b})", lets.join(" ")) }
-                }
-                None => {
-                    let what = format!(
-                        "call to {} (a TempPred with no definition in the crate)",
-                        fun_as_friendly_rust_name(&fun)
-                    );
-                    self.refuse(what, &e.span)
+            _ => {
+                let fun = match self.functions.resolve(FunctionUse::Call(&kind, &fun, &typs)) {
+                    Ok(fun) => fun,
+                    Err(reason) => return self.refuse(reason, &e.span),
+                };
+                match self.inline_call(&fun, &args, env) {
+                    Some((body, env2, lets)) => {
+                        let b = self.temporal(&body, &env2, depth + 1, pos);
+                        if lets.is_empty() { b } else { format!("(LET {} IN {b})", lets.join(" ")) }
+                    }
+                    None => {
+                        let what = format!(
+                            "call to {} (a TempPred with no definition in the crate)",
+                            fun_as_friendly_rust_name(fun.name())
+                        );
+                        self.refuse(what, &e.span)
+                    }
                 }
             },
         }
@@ -9011,12 +9404,12 @@ impl Exporter {
 
     /// A spec's conjuncts: `.and` chains split, and a crate spec fn of no
     /// parameters returning a `TempPred` (`spec()`, `fairness()`) opened.
-    fn spec_conjuncts(&self, e: &Expr, depth: usize) -> Vec<Expr> {
+    fn spec_conjuncts(&mut self, e: &Expr, depth: usize) -> Vec<Expr> {
         let e = peel(e);
         if depth < 16 {
-            if let Some((kind, fun, args)) = called(&e) {
-                let fun = self.resolved_fun(&kind, &fun);
-                let name = last_segment(&fun.path);
+            if let Some((kind, fun, typs, args)) = called(&e) {
+                let resolved = compiler_target(&kind, &fun);
+                let name = last_segment(&resolved.path);
                 if name == "and" && args.len() == 2 && is_temp_pred(&e.typ) {
                     let mut out = self.spec_conjuncts(&args[0], depth + 1);
                     out.extend(self.spec_conjuncts(&args[1], depth + 1));
@@ -9026,7 +9419,11 @@ impl Exporter {
                     && is_temp_pred(&e.typ)
                     && !TEMPORAL_PRIMITIVES.contains(&name.as_str())
                 {
-                    if let Some(body) = self.functions.get(&fun).and_then(|f| f.x.body.clone()) {
+                    let Ok(fun) = self.functions.resolve(FunctionUse::Call(&kind, &fun, &typs))
+                    else {
+                        return vec![e];
+                    };
+                    if let Some(body) = fun.x.body.clone() {
                         return self.spec_conjuncts(&body, depth + 1);
                     }
                 }
@@ -9038,16 +9435,16 @@ impl Exporter {
     /// Whether the spec conjunct `e` is fairness TLC takes in a `Spec`:
     /// `weak_fairness` (`WF_vars`), under `tla_forall` and `and`; nothing
     /// else (`always`, a disjunction of fairness, ...) goes into `Spec`.
-    fn is_fairness(&self, e: &Expr, depth: usize) -> bool {
+    fn is_fairness(&mut self, e: &Expr, depth: usize) -> bool {
         if depth > 16 {
             return false;
         }
         let e = peel(e);
-        let Some((kind, fun, args)) = called(&e).filter(|_| is_temp_pred(&e.typ)) else {
+        let Some((kind, fun, typs, args)) = called(&e).filter(|_| is_temp_pred(&e.typ)) else {
             return false;
         };
-        let fun = self.resolved_fun(&kind, &fun);
-        match (last_segment(&fun.path).as_str(), args.len()) {
+        let resolved = compiler_target(&kind, &fun);
+        match (last_segment(&resolved.path).as_str(), args.len()) {
             ("weak_fairness", 1 | 2) => true,
             ("and", 2) => args.iter().all(|a| self.is_fairness(a, depth + 1)),
             ("tla_forall", 1) => match &peel(&args[0]).x {
@@ -9056,11 +9453,13 @@ impl Exporter {
                 }
                 _ => false,
             },
-            (name, 0) if !TEMPORAL_PRIMITIVES.contains(&name) => self
-                .functions
-                .get(&fun)
-                .and_then(|f| f.x.body.clone())
-                .is_some_and(|b| self.is_fairness(&b, depth + 1)),
+            (name, 0) if !TEMPORAL_PRIMITIVES.contains(&name) => {
+                let Ok(fun) = self.functions.resolve(FunctionUse::Call(&kind, &fun, &typs)) else {
+                    return false;
+                };
+                let body = fun.x.body.clone();
+                body.is_some_and(|b| self.is_fairness(&b, depth + 1))
+            }
             _ => false,
         }
     }
@@ -9068,26 +9467,14 @@ impl Exporter {
     /// Whether `e` states fairness: it calls `weak_fairness`, directly or
     /// through the functions it calls.
     fn states_fairness(&self, e: &Expr) -> bool {
-        let mut funs = Vec::new();
-        crate::ast_visitor::expr_visitor_walk(e, &mut |x: &Expr| {
-            if let ExprX::Call { target: CallTarget::Fun(_, fun, ..), .. } = &x.x {
-                funs.push(fun.clone());
-            }
-            crate::visitor::VisitorControlFlow::Recurse
-        });
-        funs.iter().any(|f| {
-            last_segment(&f.path) == "weak_fairness"
-                || reached_functions(&self.functions, f)
-                    .iter()
-                    .any(|g| last_segment(&g.path) == "weak_fairness")
-        })
+        reached_expr(&self.functions, e).iter().any(|f| last_segment(&f.path) == "weak_fairness")
     }
 
     /// Whether the spec conjunct `c` is `lift_state(init())` (`is_init`) or
     /// `always(lift_action(next()))`, for the recognised `init`/`next`.
-    fn names_root(&self, c: &Expr, root: &Fun, is_init: bool) -> bool {
-        let Some((kind, fun, args)) = called(c) else { return false };
-        let fun = self.resolved_fun(&kind, &fun);
+    fn names_root(&mut self, c: &Expr, root: &Fun, is_init: bool) -> bool {
+        let Some((kind, fun, _, args)) = called(c) else { return false };
+        let fun = compiler_target(&kind, &fun);
         let inner = match (last_segment(&fun.path).as_str(), args.len(), is_init) {
             ("lift_state", 1, true) => args[0].clone(),
             ("always", 1, false) => match self.lifted_action(&args[0]) {
@@ -9096,7 +9483,13 @@ impl Exporter {
             },
             _ => return false,
         };
-        called(&inner).is_some_and(|(k, f, a)| a.is_empty() && self.resolved_fun(&k, &f) == *root)
+        called(&inner).is_some_and(|(k, f, ts, a)| {
+            a.is_empty()
+                && self
+                    .functions
+                    .resolve(FunctionUse::Call(&k, &f, &ts))
+                    .is_ok_and(|f| f.name() == root)
+        })
     }
 }
 
@@ -9532,6 +9925,7 @@ fn classify_extras(
 }
 
 fn recognise(
+    functions: &Functions,
     krate: &Krate,
     module: &str,
     named: Option<&[String]>,
@@ -9541,8 +9935,8 @@ fn recognise(
         .functions
         .iter()
         .filter(|f| module_of(f).map(|m| path_as_friendly_rust_name(&m) == module).unwrap_or(false))
-        .cloned()
-        .collect();
+        .map(|f| functions.resolve(FunctionUse::Root(&f.x.name)).map(|r| (*r).clone()))
+        .collect::<Result<_, _>>()?;
     if in_module.is_empty() {
         let known: BTreeSet<String> = krate
             .functions
@@ -10088,47 +10482,6 @@ struct Closed {
 }
 
 impl Exporter {
-    /// A spec fn the export adds beside `of`: `of` renamed (`<name>__tla_closed`)
-    /// with the given parameters and body, returning `ret`.
-    fn synthetic(
-        &mut self,
-        of: &Function,
-        params: Vec<Param>,
-        body: Option<Expr>,
-        ret: &Typ,
-    ) -> Fun {
-        let segments = &of.x.name.path.segments;
-        let last = segments.last().map(|s| s.to_string()).unwrap_or_default();
-        let mut n = 1;
-        let fun = loop {
-            let seg = if n == 1 {
-                format!("{last}__tla_closed")
-            } else {
-                format!("{last}__tla_closed{n}")
-            };
-            let mut segs: Vec<Ident> = segments[..segments.len().saturating_sub(1)].to_vec();
-            segs.push(Arc::new(seg));
-            let path =
-                Arc::new(PathX { krate: of.x.name.path.krate.clone(), segments: Arc::new(segs) });
-            let fun = Arc::new(FunX { path });
-            if !self.functions.contains_key(&fun) {
-                break fun;
-            }
-            n += 1;
-        };
-        let mut x = of.x.clone();
-        x.name = fun.clone();
-        x.params = Arc::new(params);
-        x.ret = of.x.ret.new_x(ParamX { typ: ret.clone(), ..of.x.ret.x.clone() });
-        x.require = Arc::new(vec![]);
-        x.decrease = Arc::new(vec![]);
-        x.decrease_when = None;
-        x.decrease_by = None;
-        x.body = body;
-        self.functions.insert(fun.clone(), crate::def::Spanned::new(of.span.clone(), x));
-        fun
-    }
-
     /// Close `init`, `next` and the candidates over the state and constants
     /// over their parameters beside the states: each constant becomes a
     /// `CONSTANT` (a record of one per field for a struct), and `init`,
@@ -10144,8 +10497,8 @@ impl Exporter {
             constants: Vec::new(),
             assumes: Vec::new(),
         };
-        let next_f = self.functions[&triple.next].clone();
-        let init_f = self.functions[&triple.init].clone();
+        let next_f = self.functions.resolve(FunctionUse::Root(&triple.next)).expect("next root");
+        let init_f = self.functions.resolve(FunctionUse::Root(&triple.init)).expect("init root");
         let span = next_f.span.clone();
         let next_friendly = fun_as_friendly_rust_name(&triple.next);
         // Each constant: a 0-ary operator a `ConstVar` reads.
@@ -10255,6 +10608,7 @@ impl Exporter {
             self.op_names.insert(key.clone(), op.clone());
             self.emitted.insert(key);
             self.arity.insert(op.clone(), 0);
+            self.safe_trace_domains.insert(format!("{{{op}}}"));
             self.constant_ops.insert(fun.clone(), op.clone());
             constant_funs.push(fun);
         }
@@ -10292,7 +10646,7 @@ impl Exporter {
             )
         };
         let extras = triple.extras.clone();
-        let mut wrap = |this: &mut Self, f: &Function, in_init: bool| -> Fun {
+        let mut wrap = |this: &mut Self, f: &ResolvedFunction, in_init: bool| -> Fun {
             let mine: Vec<&Extra> = extras.iter().filter(|x| x.in_init == in_init).collect();
             let mut args = Vec::new();
             let mut states = Vec::new();
@@ -10324,7 +10678,7 @@ impl Exporter {
                 );
                 closed.quantifiers.push((in_init, i, body.clone()));
             }
-            this.synthetic(f, states, Some(body), &bool_typ)
+            this.functions.synthetic(f, states, Some(body), &bool_typ)
         };
         let (mut next_w, mut init_w) = (None, None);
         if extras.iter().any(|x| !x.in_init) {
@@ -10353,7 +10707,7 @@ impl Exporter {
             closed.init = Some(std::mem::replace(&mut triple.init, w));
         }
         for (f, given) in triple.closed.clone() {
-            let Some(func) = self.functions.get(&f).cloned() else { continue };
+            let Ok(func) = self.functions.resolve(FunctionUse::Root(&f)) else { continue };
             let mut args = Vec::new();
             let mut states = Vec::new();
             for (p, g) in func.x.params.iter().zip(&given) {
@@ -10365,7 +10719,7 @@ impl Exporter {
                     Some(k) => args.push(constant(*k, &p.x.typ)),
                 }
             }
-            let w = self.synthetic(&func, states, Some(call(&func, args)), &bool_typ);
+            let w = self.functions.synthetic(&func, states, Some(call(&func, args)), &bool_typ);
             // The wrapper is printed under the candidate's own name.
             let short = ident_name(&VarIdent(
                 Arc::new(last_segment(&f.path)),
@@ -10416,7 +10770,8 @@ pub fn export_module(
 ) -> Result<Export, String> {
     let (module, named) = parse_export_arg(arg)?;
     let module = module.as_str();
-    let mut triple = recognise(krate, module, named.as_deref(), overrides)?;
+    let functions = Functions::new(krate);
+    let mut triple = recognise(&functions, krate, module, named.as_deref(), overrides)?;
     let datatypes: HashMap<Path, Datatype> = krate
         .datatypes
         .iter()
@@ -10425,8 +10780,6 @@ pub fn export_module(
             Dt::Tuple(_) => None,
         })
         .collect();
-    let functions: HashMap<Fun, Function> =
-        krate.functions.iter().map(|f| (f.x.name.clone(), f.clone())).collect();
     let state_dt = datatypes.get(&triple.state).ok_or("state datatype not found")?.clone();
     let state_fields: Vec<String> = state_dt
         .x
@@ -10506,6 +10859,12 @@ pub fn export_module(
         temporal_notes: BTreeSet::new(),
         temporal_unchecked: Vec::new(),
         temporal_top_action: false,
+        trace_actions: HashMap::new(),
+        action_domains: HashMap::new(),
+        safe_trace_domains: HashSet::new(),
+        unsafe_trace_relations: HashSet::new(),
+        trace_roots: HashMap::new(),
+        trace_variants: HashMap::new(),
         exists_printed: HashMap::new(),
         current_key: None,
         def_owners: Vec::new(),
@@ -10527,10 +10886,9 @@ pub fn export_module(
         read_calls: Arc::new(HashMap::new()),
         read_work: 0,
         constant_ops: HashMap::new(),
-        instances: Vec::new(),
-        assoc_types: krate.assoc_type_impls.clone(),
         tables: BTreeMap::new(),
         table_names: HashMap::new(),
+        forward_methods: Vec::new(),
     };
     for v in &state_vars {
         ex.used_names.insert(v.clone());
@@ -10555,23 +10913,14 @@ pub fn export_module(
         .functions
         .iter()
         .filter(|f| module_of(f).map(|m| path_as_friendly_rust_name(&m) == module).unwrap_or(false))
-        .cloned()
-        .collect();
+        .map(|f| ex.functions.resolve(FunctionUse::Root(&f.x.name)).map(|r| (*r).clone()))
+        .collect::<Result<_, _>>()?;
     let (sources, source_notes) = temporal_sources(&ex.functions, &in_module);
     // Each candidate set aside, with the sources that read it.
     let mut read_by_property: Vec<(Fun, Vec<usize>)> = Vec::new();
     if !triple.explicit {
         for (i, src) in sources.iter().enumerate() {
-            let mut read: HashSet<Fun> = HashSet::new();
-            crate::ast_visitor::expr_visitor_walk(&src.formula, &mut |x: &Expr| {
-                if let ExprX::Call { target: CallTarget::Fun(_, fun, ..), .. } = &x.x {
-                    read.insert(fun.clone());
-                }
-                crate::visitor::VisitorControlFlow::Recurse
-            });
-            for f in read.clone() {
-                read.extend(reached_functions(&ex.functions, &f));
-            }
+            let read = reached_expr(&ex.functions, &src.formula);
             for (f, selected, _) in triple.candidates.iter_mut() {
                 if *selected && read.contains(f) {
                     *selected = false;
@@ -10605,7 +10954,7 @@ pub fn export_module(
     );
     if verus_tla {
         for (i, r) in roots.iter().enumerate() {
-            let f = ex.functions.get(r).cloned().ok_or("root missing")?;
+            let f = ex.functions.resolve(FunctionUse::Root(r))?;
             let key = (r.clone(), Variant::Plain, false);
             let name = ex.op_name(&key);
             ex.current = fun_as_friendly_rust_name(r);
@@ -10630,7 +10979,11 @@ pub fn export_module(
                                 if k == 0 { Role::Pre } else { Role::Post },
                             );
                         }
-                        ex.expr(body, &env)
+                        let printed = ex.expr(body, &env);
+                        if i == 1 {
+                            ex.trace_roots.insert(key.clone(), (body.clone(), env));
+                        }
+                        printed
                     }
                     _ => ex.refuse("verus-tla root whose body is not a closure literal", &b.span),
                 },
@@ -10656,14 +11009,22 @@ pub fn export_module(
         }
     } else {
         ex.in_init = true;
-        init_name = ex.ensure_function(&(triple.init.clone(), Variant::Plain, false));
+        init_name = ex.ensure_function(
+            &ex.functions.resolve(FunctionUse::Root(&triple.init))?,
+            Variant::Plain,
+            false,
+        );
         ex.in_init = false;
         if !ex.init_lengths.is_empty() {
             let mut probe = ex.clone();
             probe.partial_actions = false;
             probe.shape_writes.clear();
             let key = (triple.next.clone(), Variant::Plain, false);
-            probe.ensure_function(&key);
+            probe.ensure_function(
+                &probe.functions.resolve(FunctionUse::Root(&triple.next))?,
+                Variant::Plain,
+                false,
+            );
             if let Some(assigned) = probe.assigned.get(&key) {
                 for (seq, len) in &ex.init_lengths {
                     if [seq, len].iter().all(|v| {
@@ -10674,7 +11035,11 @@ pub fn export_module(
                 }
             }
         }
-        next_name = ex.ensure_function(&(triple.next.clone(), Variant::Plain, false));
+        next_name = ex.ensure_function(
+            &ex.functions.resolve(FunctionUse::Root(&triple.next))?,
+            Variant::Plain,
+            false,
+        );
         // A predicate init or next reads, unprimed or primed, is a guard or helper of
         // the transition, not an invariant, unless the command line names
         // it; it is reported as excluded, never dropped silently.
@@ -10691,35 +11056,40 @@ pub fn export_module(
                 continue;
             }
             let key = (inv_fun(r), Variant::Plain, false);
-            let name = ex.ensure_function(&key);
+            let name =
+                ex.ensure_function(&ex.functions.resolve(FunctionUse::Root(&key.0))?, key.1, key.2);
             invs.push((r.clone(), name, ex.tainted.contains(&key)));
         }
     }
     ex.partial_actions = false;
     let transitions = ex.transitions(&(triple.next.clone(), Variant::Plain, false));
-    let (init_unassigned, mut init_fields_unassigned) =
-        match ex.functions.get(&triple.init).and_then(|f| f.x.body.clone()) {
-            // verus-tla: the initial predicate is the body of the closure `init()`
-            // returns, over its one parameter.
-            Some(body) if verus_tla => match &peel(&body).x {
-                ExprX::Closure(params, cbody) => {
-                    let states = params.iter().take(1).map(|p| p.name.clone()).collect();
-                    ex.init_unassigned(cbody, &states)
-                }
-                _ => (Vec::new(), Vec::new()),
-            },
-            Some(body) => {
-                let f = &ex.functions[&triple.init];
-                let states =
-                    f.x.params
-                        .iter()
-                        .filter(|p| ex.is_state_typ(&p.x.typ))
-                        .map(|p| p.x.name.clone())
-                        .collect();
-                ex.init_unassigned(&body, &states)
+    let (init_unassigned, mut init_fields_unassigned) = match ex
+        .functions
+        .resolve(FunctionUse::Root(&triple.init))
+        .ok()
+        .and_then(|f| f.x.body.clone())
+    {
+        // verus-tla: the initial predicate is the body of the closure `init()`
+        // returns, over its one parameter.
+        Some(body) if verus_tla => match &peel(&body).x {
+            ExprX::Closure(params, cbody) => {
+                let states = params.iter().take(1).map(|p| p.name.clone()).collect();
+                ex.init_unassigned(cbody, &states)
             }
-            None => (Vec::new(), Vec::new()),
-        };
+            _ => (Vec::new(), Vec::new()),
+        },
+        Some(body) => {
+            let f = ex.functions.resolve(FunctionUse::Root(&triple.init))?;
+            let states =
+                f.x.params
+                    .iter()
+                    .filter(|p| ex.is_state_typ(&p.x.typ))
+                    .map(|p| p.x.name.clone())
+                    .collect();
+            ex.init_unassigned(&body, &states)
+        }
+        None => (Vec::new(), Vec::new()),
+    };
     // Verus's state is always within its fields' types, so a step that
     // would leave them is disabled: TypeOK holds initially and after each
     // step.
@@ -10738,7 +11108,11 @@ pub fn export_module(
     for v in &init_unassigned {
         let Some(i) = ex.state_vars.iter().position(|x| x == v) else { continue };
         let typ = ex.state_types[i].clone();
-        let Some(span) = ex.functions.get(&triple.init).map(|f| f.span.clone()) else { continue };
+        let Some(span) =
+            ex.functions.resolve(FunctionUse::Root(&triple.init)).ok().map(|f| f.span.clone())
+        else {
+            continue;
+        };
         let first_hole = ex.holes.len();
         let bounded = ex.bound_from_type(&typ, &span, &mut vec![ex.state_path.clone()]);
         if ex.holes.len() > first_hole {
@@ -10759,7 +11133,11 @@ pub fn export_module(
         }
         let Some(i) = ex.state_vars.iter().position(|x| x == v) else { continue };
         let typ = ex.state_types[i].clone();
-        let Some(span) = ex.functions.get(&triple.init).map(|f| f.span.clone()) else { continue };
+        let Some(span) =
+            ex.functions.resolve(FunctionUse::Root(&triple.init)).ok().map(|f| f.span.clone())
+        else {
+            continue;
+        };
         let domain = ex.type_domain(v, &typ, &span);
         init_enumerated.push(Enumerated { variable: v.clone(), domain });
     }
@@ -10982,12 +11360,16 @@ pub fn export_module(
         let key = (inv_fun(f), Variant::Plain, false);
         let name = if verus_tla {
             // The property's lift_state may have emitted it already.
-            ex.ensure_closure_root(f)
+            ex.ensure_closure_root(&ex.functions.resolve(FunctionUse::Root(f))?)
         } else if reached {
             outcome.insert(f.clone(), (false, reached_reason.clone()));
             continue;
         } else {
-            Some(ex.ensure_function(&key))
+            Some(ex.ensure_function(
+                &ex.functions.resolve(FunctionUse::Root(&key.0))?,
+                key.1,
+                key.2,
+            ))
         };
         match name {
             Some(name) => {
@@ -11122,6 +11504,10 @@ pub fn export_module(
         euclid: model_euclid,
         recursive: model_recursive.clone(),
     };
+    // Named-expression helpers are not emitted in the base module. Start
+    // trace lowering from the actual model, before those helpers can mark a
+    // trace dependency as already emitted (or claim its constants/names).
+    let mut trace_ex = ex.clone();
     let expr_exports: Vec<ExprExport> =
         exprs.iter().map(|name| ex.export_expr(name, &model, &mut pending)).collect();
     let variables = state_vars
@@ -11578,8 +11964,15 @@ pub fn export_module(
     );
     cfg.push_str("\\* CONSTRAINT <a state predicate bounding the model>\n");
     let next_key = (triple.next.clone(), Variant::Plain, false);
-    let (trace_module_name, trace_tla, trace_cfg, trace) =
-        ex.trace_spec(module, &module_name, &next_key, &ex.trace_operators(&next_key));
+    // Trace-only lowering must never change model definitions, names, holes,
+    // assignment analysis, or the report's model metadata.
+    let (trace_module_name, trace_tla, trace_cfg, trace) = trace_ex.trace_spec(
+        module,
+        &module_name,
+        &next_key,
+        &ex.trace_operators(&next_key),
+        !type_ok.is_empty(),
+    );
     let report = Report {
         module: module.to_string(),
         shape: triple.shape.to_string(),
@@ -11673,6 +12066,11 @@ pub struct TraceReport {
     /// their record labels.
     pub observables: Vec<String>,
     pub steps: Vec<TraceStep>,
+    /// Named steps whose original enclosing relation is retained, rather than
+    /// an independently selectable existential arm.
+    pub general_relation_steps: Vec<String>,
+    /// Policy for a step name this export does not know.
+    pub unknown_step: String,
 }
 
 /// The names the trace module binds: operator parameters and bound
@@ -11757,7 +12155,9 @@ impl Exporter {
         visiting: &mut Vec<(OpKey, usize)>,
     ) -> Option<(String, bool)> {
         match d {
-            Dom::Closed(s, from_type) => Some((s.clone(), *from_type)),
+            Dom::Closed(s, from_type) => {
+                self.trace_domain_eligible(s).then(|| (s.clone(), *from_type))
+            }
             Dom::Param(k, i) => self.resolve_param(k, *i, reachable, visiting),
             Dom::Field { of, tag, var, access, hole, field_typ } => {
                 let (of, from_type) = self.resolve_dom(of, reachable, visiting)?;
@@ -12038,28 +12438,215 @@ impl Exporter {
             return hole;
         }
         let first = self.holes.len();
+        let owners = self.hole_owners.len();
+        let hole_typs = self.hole_typs.clone();
         let constants = self.constants.clone();
         let domain = self.quiet(|x| x.bound_from_type(typ, span, &mut Vec::new()));
         if self.holes.len() > first {
             self.holes.truncate(first);
+            self.hole_owners.truncate(owners);
+            self.hole_typs = hole_typs;
             self.constants = constants;
             return None;
         }
         domain.map(|(d, _)| d)
     }
 
+    /// Specialize the root existential's chosen constructor. Keep the original
+    /// dispatcher (including match guards), and narrow only fields passed
+    /// unchanged to the named transition. Computed arguments need the general
+    /// relation check; treating them as independent parameters would widen Next.
+    fn trace_variant_arms(
+        &self,
+        next: &OpKey,
+        step: &TraceStep,
+    ) -> Option<Vec<(TraceVariant, Vec<Option<usize>>)>> {
+        let f = self.functions.resolve(FunctionUse::Root(&next.0)).ok()?;
+        let body = peel(f.x.body.as_ref()?);
+        let ExprX::Quant(q, binders, qbody) = &body.x else { return None };
+        if !matches!(q.quant, air::ast::Quant::Exists) || binders.len() != 1 {
+            return None;
+        }
+        let variants = self.trace_variants.get(&(Arc::as_ptr(&body) as usize))?;
+        let dispatch = peel(qbody);
+        let ExprX::Call { target: CallTarget::Fun(kind, dispatch_fun, typs, ..), .. } = &dispatch.x
+        else {
+            return None;
+        };
+        let dispatcher =
+            self.functions.resolve(FunctionUse::Call(kind, dispatch_fun, typs)).ok()?;
+        let dispatch_body = peel(dispatcher.x.body.as_ref()?);
+        let ExprX::Match(_, match_arms, _) = &dispatch_body.x else { return None };
+        let mut seen = HashSet::new();
+        for arm in match_arms.iter() {
+            let PatternX::Constructor(_, tag, fields) = &arm.x.pattern.x else { return None };
+            if !seen.insert(tag.clone())
+                || !matches!(arm.x.guard.x, ExprX::Const(Constant::Bool(true)))
+                || fields.iter().any(|f| !matches!(f.a.x, PatternX::Var(_) | PatternX::Wildcard(_)))
+            {
+                return None;
+            }
+        }
+        let arms = self.step_arms(qbody, &binders[0].name)?;
+        // A summary only recognizes a direct conjunctive call. Account for
+        // every occurrence, including those under an IF or in a helper:
+        // selecting only the known sites would discard valid calls.
+        let target = self.op_names.iter().find(|(_, name)| *name == &step.operator)?.0;
+        for (summary, arm) in arms.iter().zip(match_arms.iter()) {
+            let mut occurrences = 0;
+            let mut indirect = false;
+            crate::ast_visitor::expr_visitor_walk(&arm.x.body, &mut |e: &Expr| {
+                if let ExprX::Call { target: CallTarget::Fun(kind, fun, typs, ..), .. } = &e.x {
+                    let Ok(fun) = self.functions.resolve(FunctionUse::Call(kind, fun, typs)) else {
+                        indirect = true;
+                        return crate::visitor::VisitorControlFlow::Recurse;
+                    };
+                    let key = (fun.name().clone(), Variant::Plain, false);
+                    if &key == target {
+                        occurrences += 1;
+                    } else if self.reachable_from(&key).contains(target)
+                        || reached_functions(&self.functions, &key.0).contains(&target.0)
+                    {
+                        indirect = true;
+                    }
+                }
+                crate::visitor::VisitorControlFlow::Recurse
+            });
+            let selected = summary.operator.as_ref() == Some(&step.operator);
+            if indirect || occurrences != usize::from(selected) {
+                return None;
+            }
+        }
+        let mut out = Vec::new();
+        for arm in arms.iter().filter(|a| a.operator.as_ref() == Some(&step.operator)) {
+            let variant = variants.iter().find(|v| Some(&v.tag) == arm.variant.as_ref())?;
+            if arm.args.iter().any(|a| a.field.is_none())
+                || variant.domains.iter().any(|d| !self.trace_domain_eligible(d))
+            {
+                return None;
+            }
+            let mapping = variant
+                .fields
+                .iter()
+                .map(|field| arm.args.iter().position(|a| a.field.as_ref() == Some(field)))
+                .collect();
+            // Repeated use of one field must still equate the logged arguments.
+            if arm
+                .args
+                .iter()
+                .enumerate()
+                .any(|(i, a)| arm.args[..i].iter().any(|b| a.field == b.field))
+            {
+                return None;
+            }
+            out.push((variant.clone(), mapping));
+        }
+        (!out.is_empty()).then_some(out)
+    }
+
+    /// The existential's dispatcher itself can be logged with its Step
+    /// parameter; its parameter domain supplies the original existential.
+    fn trace_is_dispatcher(&self, next: &OpKey, step: &TraceStep) -> bool {
+        let Ok(f) = self.functions.resolve(FunctionUse::Root(&next.0)) else { return false };
+        let Some(body) = &f.x.body else { return false };
+        let body = peel(body);
+        let ExprX::Quant(q, binders, inner) = &body.x else { return false };
+        if !matches!(q.quant, air::ast::Quant::Exists) || binders.len() != 1 {
+            return false;
+        }
+        let inner = peel(inner);
+        let ExprX::Call { target: CallTarget::Fun(kind, fun, typs, ..), args, .. } = &inner.x
+        else {
+            return false;
+        };
+        let Ok(callee) = self.functions.resolve(FunctionUse::Call(kind, fun, typs)) else {
+            return false;
+        };
+        let Some((_, domain, _)) = self.exists_printed.get(&(Arc::as_ptr(&body) as usize)) else {
+            return false;
+        };
+        let root_roles: HashMap<VarIdent, Role> =
+            f.x.params
+                .iter()
+                .zip(self.param_roles(&f))
+                .filter_map(|(p, role)| role.map(|r| (p.x.name.clone(), r)))
+                .collect();
+        self.op_names.get(&(callee.name().clone(), Variant::Plain, false)) == Some(&step.operator)
+            && step.params.len() == 1
+            && self.trace_domain_eligible(domain)
+            && step.params[0].domain.as_ref() == Some(domain)
+            && self.param_roles(&callee).iter().zip(args.iter()).all(|(role, arg)| match role {
+                Some(r) => read_var(arg).and_then(|v| root_roles.get(&v).copied()) == Some(*r),
+                None => read_var(arg).as_ref() == Some(&binders[0].name),
+            })
+            && self.trace_variants.contains_key(&(Arc::as_ptr(&body) as usize))
+    }
+
     /// The trace spec: a module extending the export that follows one logged
     /// behaviour. Each log line after the header names a step, its
     /// parameters and the observed state after it; `TraceNext` takes the
-    /// logged step (so it only ever narrows `Next`, which it conjoins) and
-    /// compares the observed fields.
+    /// logged arm with its parameters, then compares the observed fields.
+    /// Relations without an independently selectable arm retain Next.
     fn trace_spec(
         &mut self,
         module: &str,
         module_name: &str,
         next_key: &OpKey,
         operators: &[OpKey],
+        has_type_ok: bool,
     ) -> (String, String, String, TraceReport) {
+        let model_defs = self.defs.len();
+        let model_constants = self.constants.clone();
+        let model_recursive = self.recursive();
+        let model_euclid = self.uses_euclid;
+        let reachable = self.reachable_from(next_key);
+        let owners: HashSet<_> =
+            reachable.iter().map(|k| fun_as_friendly_rust_name(&k.0)).collect();
+        let action_domains: Vec<_> = self
+            .action_domains
+            .iter()
+            .filter(|(owner, _)| owners.contains(*owner))
+            .flat_map(|(_, calls)| calls.clone())
+            .collect();
+        if let Some((body, env)) = self.trace_roots.get(next_key).cloned() {
+            let mut actions = self.trace_action_branches(&body, &env);
+            actions.extend(self.trace_indirect_actions(&body));
+            for action in &mut actions {
+                if action.selected {
+                    continue;
+                }
+                let calls: Vec<_> = action_domains
+                    .iter()
+                    .filter(|(fun, args)| fun == &action.fun && args.len() == action.params.len())
+                    .collect();
+                if calls.is_empty() {
+                    continue;
+                }
+                for (i, (_, _, domain, _)) in action.params.iter_mut().enumerate() {
+                    let mut parts = Vec::new();
+                    let mut complete = true;
+                    for (_, args) in &calls {
+                        let d = args[i].as_ref().and_then(|d| {
+                            self.resolve_dom(d, &reachable, &mut Vec::new()).map(|(d, _)| d)
+                        });
+                        if let Some(d) = d.or_else(|| domain.clone()) {
+                            if !parts.contains(&d) {
+                                parts.push(d);
+                            }
+                        } else {
+                            complete = false;
+                        }
+                    }
+                    parts.sort();
+                    *domain =
+                        if complete { Some(format!("({})", parts.join(" \\cup "))) } else { None };
+                }
+            }
+            self.trace_actions.insert(next_key.clone(), actions);
+        }
+        let trace_helpers = self.defs[model_defs..].to_vec();
+        let trace_constants: Vec<_> =
+            self.constants.difference(&model_constants).cloned().collect();
         let trace_module = format!("{module_name}_trace");
         let reachable = self.reachable_from(next_key);
         let log = self.trace_name("TraceLog");
@@ -12115,10 +12702,19 @@ impl Exporter {
         ] = <[String; 21]>::try_from(names).expect("twenty-one names");
         let arity = operators
             .iter()
-            .filter_map(|k| self.functions.get(&k.0))
-            .map(|f| self.param_roles(f).iter().filter(|r| r.is_none()).count())
+            .filter_map(|k| self.functions.resolve(FunctionUse::Root(&k.0)).ok())
+            .map(|f| self.param_roles(&f).iter().filter(|r| r.is_none()).count())
             .max()
             .unwrap_or(0);
+        let arity = arity.max(
+            self.trace_actions
+                .get(next_key)
+                .into_iter()
+                .flatten()
+                .map(|a| a.params.len())
+                .max()
+                .unwrap_or(0),
+        );
         let n = TraceNames {
             j: self.trace_name("j"),
             v: self.trace_name("v"),
@@ -12156,6 +12752,16 @@ impl Exporter {
         }
         // The loggable steps: every operator Next reaches through branches
         // (see [`Exporter::trace_operators`]) printed as a plain operator.
+        let unsafe_helpers: HashSet<_> = operators
+            .iter()
+            .filter(|key| *key != next_key)
+            .filter(|key| {
+                self.reachable_from(key)
+                    .iter()
+                    .any(|k| self.unsafe_trace_relations.contains(&fun_as_friendly_rust_name(&k.0)))
+            })
+            .map(|k| fun_as_friendly_rust_name(&k.0))
+            .collect();
         let by_name: HashMap<String, OpKey> =
             self.op_names.iter().map(|(k, n)| (n.clone(), k.clone())).collect();
         let mut steps: Vec<TraceStep> = Vec::new();
@@ -12164,7 +12770,7 @@ impl Exporter {
                 continue;
             }
             let Some(operator) = self.op_names.get(key).cloned() else { continue };
-            let Some(f) = self.functions.get(&key.0).cloned() else { continue };
+            let Ok(f) = self.functions.resolve(FunctionUse::Root(&key.0)) else { continue };
             let friendly = fun_as_friendly_rust_name(&key.0);
             let short = friendly.rsplit("::").next().unwrap_or(&friendly).to_string();
             let roles = self.param_roles(&f);
@@ -12208,6 +12814,79 @@ impl Exporter {
                 enumerated,
             });
         }
+        let mut action_typs = HashMap::new();
+        let mut action_operators = HashSet::new();
+        let mut action_defs = Vec::new();
+        // The same action may occur at several call sites (for example,
+        // acquire(A) and acquire(B)). It is one log name with all those arms.
+        let mut actions: Vec<TraceAction> = Vec::new();
+        for action in self.trace_actions.get(next_key).cloned().unwrap_or_default() {
+            if let Some(prior) = actions.iter_mut().find(|a| a.fun == action.fun) {
+                if !prior.selected {
+                    continue;
+                }
+                if !action.selected {
+                    *prior = action;
+                    continue;
+                }
+                let mut aliases = Vec::new();
+                for ((_, _, domain, name), (_, _, other_domain, other_name)) in
+                    prior.params.iter_mut().zip(&action.params)
+                {
+                    *domain = match (domain.as_ref(), other_domain.as_ref()) {
+                        (Some(d), Some(other)) => Some(format!("({d} \\cup {other})")),
+                        _ => None,
+                    };
+                    if name != other_name {
+                        aliases.push(format!("{other_name} == {name}"));
+                    }
+                }
+                let other = if aliases.is_empty() {
+                    action.body
+                } else {
+                    format!("(LET {} IN {})", aliases.join(" "), action.body)
+                };
+                prior.body = format!("({}) \\/ ({other})", prior.body);
+            } else {
+                actions.push(action);
+            }
+        }
+        for action in actions {
+            let friendly = fun_as_friendly_rust_name(&action.fun);
+            let short = friendly.rsplit("::").next().unwrap().to_string();
+            let operator = self.trace_name(&format!("TraceAction_{short}"));
+            let args = action.params.iter().map(|(_, _, _, v)| v.clone()).collect::<Vec<_>>();
+            let head = if args.is_empty() {
+                operator.clone()
+            } else {
+                format!("{operator}({})", args.join(", "))
+            };
+            action_defs.push(format!("{head} == {}\n", action.body));
+            action_typs.insert(
+                operator.clone(),
+                action.params.iter().map(|(_, t, _, _)| t.clone()).collect::<Vec<_>>(),
+            );
+            if action.selected {
+                action_operators.insert(operator.clone());
+            }
+            let enumerated = action.params.iter().all(|(_, _, d, _)| d.is_some());
+            steps.push(TraceStep {
+                step: short,
+                function: friendly,
+                operator,
+                short_name_shared: false,
+                params: action
+                    .params
+                    .iter()
+                    .map(|(name, typ, domain, _)| TraceParam {
+                        name: name.clone(),
+                        typ: typ_name(typ),
+                        domain: domain.clone(),
+                    })
+                    .collect(),
+                enumerated,
+            });
+        }
         // A last segment two steps share names neither: those steps are
         // logged by their full paths, and the short name stops TLC.
         let mut shared: Vec<(String, Vec<String>)> = Vec::new();
@@ -12227,17 +12906,26 @@ impl Exporter {
         // The param types' decoders, in the order the steps list them.
         let mut step_arms = Vec::new();
         let mut enabled_parts = Vec::new();
-        for s in &steps {
-            let f = by_name[&s.operator].0.clone();
-            let f = self.functions[&f].clone();
-            let roles = self.param_roles(&f);
-            let typs: Vec<Typ> =
-                f.x.params
-                    .iter()
-                    .zip(roles.iter())
-                    .filter(|(_, r)| r.is_none())
-                    .map(|(p, _)| p.x.typ.clone())
-                    .collect();
+        let mut arm_defs = Vec::new();
+        let mut general_relation_steps = Vec::new();
+        let identity = self.trace_name("TraceIdentity");
+        arm_defs.push(format!("{identity}({j}) == {j}\n"));
+        for s in &mut steps {
+            let typs = if let Some(typs) = action_typs.get(&s.operator) {
+                typs.clone()
+            } else {
+                let f = by_name[&s.operator].0.clone();
+                let f = self.functions.resolve(FunctionUse::Root(&f)).expect("trace root");
+                let roles = self.param_roles(&f);
+                let typs: Vec<Typ> =
+                    f.x.params
+                        .iter()
+                        .zip(roles.iter())
+                        .filter(|(_, r)| r.is_none())
+                        .map(|(p, _)| p.x.typ.clone())
+                        .collect();
+                typs
+            };
             let guard = if s.function == s.step {
                 format!("{e}.step = \"{}\"", s.step)
             } else {
@@ -12247,11 +12935,82 @@ impl Exporter {
                 "{params_declared}({e}, {{{}}})",
                 s.params.iter().map(|p| format!("\"{}\"", p.name)).collect::<Vec<_>>().join(", ")
             );
+            let direct =
+                action_operators.contains(&s.operator) || self.trace_is_dispatcher(next_key, s);
+            let variants = self.trace_variant_arms(next_key, s);
+            // An eligible template keeps the original dispatcher and guard
+            // order. Only a general helper check loses that calling scope.
+            if !direct
+                && variants.is_none()
+                && !action_typs.contains_key(&s.operator)
+                && unsafe_helpers.contains(&s.function)
+            {
+                s.enumerated = false;
+                general_relation_steps.push(s.step.clone());
+                step_arms.push(format!(
+                    "{guard} -> Next /\\ {declared} /\\ Assert(FALSE, \"trace: {} cannot be checked independently because its domain requires caller guards; log next instead\")",
+                    s.step
+                ));
+                continue;
+            }
+            let specialized = variants.is_some();
+            let mut selected_enabled = None;
+            if let Some(variants) = variants {
+                let name = self.trace_name(&format!("TraceArm_{}", s.operator));
+                let decoders: Vec<_> = typs
+                    .iter()
+                    .map(|typ| self.trace_codec(typ, &n, &mut memo, &mut defs).0)
+                    .collect();
+                let formals: Vec<_> = (0..typs.len())
+                    .map(|i| self.trace_name(&format!("trace_decode_{i}")))
+                    .collect();
+                let mut parts = Vec::new();
+                for (variant, mapping) in variants {
+                    let mut body = variant.body;
+                    for ((v, dom), mapped) in
+                        variant.names.iter().zip(&variant.domains).zip(mapping).rev()
+                    {
+                        let domain = if let Some(i) = mapped {
+                            let decoder = &formals[i];
+                            format!("{param}({e}, \"{}\", {decoder}, {dom})", s.params[i].name)
+                        } else {
+                            dom.clone()
+                        };
+                        body = format!("(\\E {v} \\in {domain} : {body})");
+                    }
+                    parts.push(body);
+                }
+                let type_ok = if has_type_ok { " /\\ TypeOK'" } else { "" };
+                let formal_args = formals.iter().map(|d| format!(", {d}(_)")).collect::<String>();
+                let logged_args = decoders.iter().map(|d| format!(", {d}")).collect::<String>();
+                let typed_args =
+                    formals.iter().map(|_| format!(", {identity}")).collect::<String>();
+                arm_defs.push(format!(
+                    "{name}({e}{formal_args}) == {declared} /\\ ({}){type_ok}\n",
+                    parts.join(" \\/ ")
+                ));
+                step_arms.push(format!("{guard} -> {name}({e}{logged_args})"));
+                // TraceEnabled enumerates model values, not JSON encodings.
+                // Share the selected body with identity parameter decoders.
+                selected_enabled = Some(format!("{name}({r}{typed_args})"));
+            } else if !direct {
+                general_relation_steps.push(s.step.clone());
+            }
+            let prefix = if direct { "" } else { "Next /\\ " };
+            let suffix = if direct && has_type_ok { " /\\ TypeOK'" } else { "" };
             if s.params.is_empty() {
-                step_arms.push(format!("{guard} ->\n           {declared} /\\ {}", s.operator));
+                if !specialized {
+                    step_arms.push(format!(
+                        "{guard} ->\n           {prefix}{declared} /\\ {}{suffix}",
+                        s.operator
+                    ));
+                }
+                let relation = selected_enabled
+                    .map(|body| format!("LET {r} == [step |-> \"{}\"] IN {body}", s.step))
+                    .unwrap_or_else(|| format!("{prefix}{}{suffix}", s.operator));
                 enabled_parts.push(format!(
-                    "(IF ENABLED (Next /\\ {}) THEN {{[step |-> \"{}\"]}} ELSE {{}})",
-                    s.operator, s.step
+                    "(IF ENABLED ({relation}) THEN {{[step |-> \"{}\"]}} ELSE {{}})",
+                    s.step
                 ));
                 continue;
             }
@@ -12281,12 +13040,14 @@ impl Exporter {
                     None => enumerable = false,
                 }
             }
-            step_arms.push(format!(
-                "{guard} ->\n           {declared} /\\ \\E {} : {}({})",
-                binds.join(", "),
-                s.operator,
-                args.join(", ")
-            ));
+            if !specialized {
+                step_arms.push(format!(
+                    "{guard} ->\n           {prefix}{declared} /\\ \\E {} : {}({}){suffix}",
+                    binds.join(", "),
+                    s.operator,
+                    args.join(", ")
+                ));
+            }
             if enumerable {
                 let record = s
                     .params
@@ -12301,11 +13062,12 @@ impl Exporter {
                     .map(|p| format!("{r}.params.{}", p.name))
                     .collect::<Vec<_>>()
                     .join(", ");
+                let relation = selected_enabled
+                    .unwrap_or_else(|| format!("{prefix}{}({from_record}){suffix}", s.operator));
                 enabled_parts.push(format!(
-                    "{{{r} \\in {{[step |-> \"{}\", params |-> [{record}]] : {}}} :\n        ENABLED (Next /\\ {}({from_record}))}}",
+                    "{{{r} \\in {{[step |-> \"{}\", params |-> [{record}]] : {}}} :\n        ENABLED ({relation})}}",
                     s.step,
                     enum_binds.join(", "),
-                    s.operator,
                 ));
             }
         }
@@ -12315,9 +13077,7 @@ impl Exporter {
                 functions.join(", ")
             ));
         }
-        step_arms.push(format!(
-            "OTHER -> Assert(FALSE, \"trace: the model has no step \" \\o {e}.step)"
-        ));
+        step_arms.push("OTHER -> Next".to_string());
         let observables = self.state_fields.clone();
         let vars = self.state_vars.join(", ");
         let mut tla = String::new();
@@ -12329,9 +13089,29 @@ impl Exporter {
             "\\* The log is newline-delimited JSON: a header line naming the module\n\\* ({{\"module\": \"{module_name}\", \"export\": \"{module}\"}}, optionally \"state\": the\n\\* observed initial state; another module or export stops TLC), then one line per step:\n\\* {{\"step\": \"<t_* name>\", \"params\": {{...}}, \"state\": {{...}}}}. A step is named by\n\\* its spec fn's last segment or full path, by the full path alone when two\n\\* steps share the last segment; a parameter the step does not declare stops\n\\* TLC. Values are in the export's encoding: a struct or enum value is an\n\\* object (an enum's with its \"tag\"), a Seq an array, a Set an array of its\n\\* elements, a Map an array of [key, value] pairs, a tuple an array, a struct\n\\* without fields {{}} (or {{\"tag\": \"unit\"}}). An object\n\\* observed in the state is partial: only the fields it names are compared, so\n\\* a ghost field is left out of the log and free in the model (an enum's tag\n\\* too: its fields are then compared under whichever variant the model has);\n\\* a key naming no field of its type stops TLC, as one naming no state field\n\\* does; a Seq may be observed partially as an object keyed by the Verus index\n\\* (\"0\", \"1\", ...; {{}} observes nothing, [] is the empty Seq; a key\n\\* that is no index stops TLC). A key a line or the header does not define\n\\* stops TLC, so a misspelled \"state\" or \"params\" never observes nothing.\n\\* A record inside a Set element, a Map key or a parameter is decoded whole,\n\\* so it must name every field and an enum its tag (one left out there stops\n\\* TLC). A parameter left out of \"params\" ranges over what Next's calls to\n\\* the step pass it (the bound of the quantifier binding the argument, or the\n\\* field of a value matched against a pattern, such as a VerusSync step's\n\\* Dom_Step_<t>_v<i>), else its type's finite domain (not a Dom_<Type> hole,\n\\* which holds only what a quantifier binds, never a value a call computes);\n\\* with neither it must be logged, and TraceEnabled leaves the step out (the\n\\* report's trace steps say which, \"enumerated\"). A logged parameter outside\n\\* its domain is a step the model cannot take.\n"
         ));
         tla.push_str(&format!(
-            "\\* TraceNext conjoins Next, then the logged step, so it only ever narrows\n\\* the model: a trace TLC follows to its end ({accepted}) is a behaviour of\n\\* {module_name}. Otherwise the deepest {index} reached is the first logged step\n\\* the model cannot take from any state that explains the log so far; and\n\\* when TLC finds no initial state (0 states generated, depth 0), the header's\n\\* observed state is none of Init's, so the log diverges before its first step.\n\\* Next takes values only in the export's Dom_ holes, so the .cfg must give\n\\* each one every value the log carries for it: a logged value outside it\n\\* diverges as a step the model cannot take.\n\\* A pass means the observed state sequence is a behaviour of the model: a\n\\* logged step's name and parameters count only through their effect on the\n\\* state, so a step that another of Next's steps explains (the same observed\n\\* successor) is accepted even if the model never takes the logged one there.\n"
+            "\\* TraceNext selects the logged existential arm and its logged parameters.\n\\* Missing parameters retain their original domains; dispatch guards and\n\\* TypeOK are preserved. General relations retain their enclosing Next check\n\\* (listed in trace.general_relation_steps). Unknown names fall back to Next,\n\\* checking only the observed state sequence (trace.unknown_step).\n\\* A trace conforms when it reaches {accepted}; otherwise the deepest {index}\n\\* is the first unexplained step; when TLC finds no initial state (0 states generated, depth 0),\n\\* the header is rejected.\n\\* A pass means the observed state sequence is a behaviour of the model.\n"
         ));
         tla.push_str(&format!("EXTENDS {module_name}, Json, TLC, Integers, Sequences\n\n"));
+        if !trace_constants.is_empty() {
+            tla.push_str(&format!("CONSTANTS {}\n", trace_constants.join(", ")));
+        }
+        if self.uses_euclid && !model_euclid {
+            tla.push_str(&euclid_defs());
+        }
+        for (name, arity) in self.recursive() {
+            if !model_recursive.contains_key(&name) {
+                let params = if arity == 0 {
+                    String::new()
+                } else {
+                    format!("({})", vec!["_"; arity].join(", "))
+                };
+                tla.push_str(&format!("RECURSIVE {name}{params}\n"));
+            }
+        }
+        for helper in &trace_helpers {
+            tla.push_str(helper);
+            tla.push('\n');
+        }
         tla.push_str(&format!("CONSTANT {log}  \\* the log's path\n"));
         tla.push_str(&format!("VARIABLE {index}  \\* the next logged step to take\n\n"));
         tla.push_str(&format!("{lines} == ndJsonDeserialize({log})\n"));
@@ -12379,12 +13159,18 @@ impl Exporter {
         tla.push_str(&format!(
             "{observed_next}({j}) == \\A {k} \\in DOMAIN {j} : {observed_key_next}({k}, {j}[{k}])\n\n"
         ));
+        for action in &action_defs {
+            tla.push_str(action);
+        }
+        for arm in &arm_defs {
+            tla.push_str(arm);
+        }
         tla.push_str(&format!("{step_op}({e}) ==\n    CASE {}\n\n", step_arms.join("\n      [] ")));
         tla.push_str(&format!(
             "{init} ==\n    /\\ {keys}({header}, {{\"module\", \"export\", \"state\"}}, \"the log's header\")\n    /\\ Assert(\"module\" \\in DOMAIN {header} /\\ {header}.module = \"{module_name}\",\n              \"trace: the log's header does not name the module {module_name}\")\n    /\\ Assert(\"export\" \\in DOMAIN {header} /\\ {header}.export = \"{module}\",\n              \"trace: the log's header does not name the export {module}\")\n    /\\ Init\n    /\\ {index} = 1\n    /\\ {observed}({state_of}({header}))\n\n"
         ));
         tla.push_str(&format!(
-            "{next} ==\n    /\\ {index} <= Len({trace})\n    /\\ LET {e} == {trace}[{index}] IN\n           /\\ {keys}({e}, {{\"step\", \"params\", \"state\"}}, \"a step line\")\n           /\\ Assert(\"step\" \\in DOMAIN {e}, \"trace: a step line names no step\")\n           /\\ Next\n           /\\ {step_op}({e})\n           /\\ {observed_next}({state_of}({e}))\n    /\\ {index}' = {index} + 1\n\n"
+            "{next} ==\n    /\\ {index} <= Len({trace})\n    /\\ LET {e} == {trace}[{index}] IN\n           /\\ {keys}({e}, {{\"step\", \"params\", \"state\"}}, \"a step line\")\n           /\\ Assert(\"step\" \\in DOMAIN {e}, \"trace: a step line names no step\")\n           /\\ {step_op}({e})\n           /\\ {observed_next}({state_of}({e}))\n    /\\ {index}' = {index} + 1\n\n"
         ));
         tla.push_str(&format!("{spec} == {init} /\\ [][{next}]_<<{vars}, {index}>>\n"));
         tla.push_str(&format!(
@@ -12404,7 +13190,7 @@ impl Exporter {
         ));
         tla.push_str(&format!("{}\n", "=".repeat(trace_module.len() + 20)));
         let cfg = format!(
-            "\\* Trace validation: TLC follows the log named by {log}. On a well-formed log\n\\* it ends with no error either way (a malformed one stops at an Assert); the trace conforms when some state reaches {accepted}\n\\* (the depth of the search is the number of logged steps plus one). Depth d\n\\* below that means logged step d diverged; depth 0 (no initial state) means\n\\* the header's observed state is not an initial state of the model.\nINIT {init}\nNEXT {next}\nCHECK_DEADLOCK FALSE\nCONSTANT {log} = \"trace.ndjson\"\n\\* The export's CONSTANTS, if it has any, are needed here too, and each Dom_\n\\* constant must cover every value the log carries for it: TraceNext conjoins\n\\* Next, which only takes values in the holes, so a logged value outside one\n\\* diverges (the step shows as not enabled in TraceDiagnosis).\n"
+            "\\* Trace validation: TLC follows the log named by {log}. On a well-formed log\n\\* it ends with no error either way (a malformed one stops at an Assert); the trace conforms when some state reaches {accepted}\n\\* (the depth of the search is the number of logged steps plus one). Depth d\n\\* below that means logged step d diverged; depth 0 (no initial state) means\n\\* the header's observed state is not an initial state of the model.\nINIT {init}\nNEXT {next}\nCHECK_DEADLOCK FALSE\nCONSTANT {log} = \"trace.ndjson\"\n\\* The export's CONSTANTS, if it has any, are needed here too, and each Dom_\n\\* constant must cover every value the log carries for it: selected arms\n\\* retain their parameter domains, so a logged value outside one\n\\* diverges (the step shows as not enabled in TraceDiagnosis).\n"
         );
         let mut cfg = cfg;
         if !self.values.is_empty() {
@@ -12414,8 +13200,16 @@ impl Exporter {
                 cfg.push_str(&format!("\\*   {c} = <a {t}>\n"));
             }
         }
-        let report =
-            TraceReport { module: trace_module.clone(), index_variable: index, observables, steps };
+        let report = TraceReport {
+            module: trace_module.clone(),
+            index_variable: index,
+            observables,
+            steps,
+            general_relation_steps,
+            unknown_step:
+                "Next (state-only conformance; logged name and parameters are not checked)"
+                    .to_string(),
+        };
         (trace_module, tla, cfg, report)
     }
 }

@@ -1,0 +1,37 @@
+---- MODULE State_tla ----
+\* Exported by verus -V tla-export from the Verus model in `test_crate`.
+\* Mapping: structs are records; enum values are records with a `tag`;
+\* Seq is a 1-based sequence (every index shifted once); Set is a set;
+\* Map is a function (dom = DOMAIN, insert = :> @@); an ISet or IMap is a Set or
+\* Map; Multiset is a function from the elements it holds to their counts (each
+\* above 0, count = the value or 0); Option is a record tagged
+\* None/Some with field v0; nat/int/uN are Int, and TypeOK keeps each variable
+\* in its type's range (conjoined to Init, primed to Next); a spec fn is an operator, its
+\* pre/post state parameters dropped and read as the unprimed/primed variables;
+\* a quantifier is bounded from its guard, or from a CONSTANT Dom_<Type>.
+\* What the export could not express is an Assert(FALSE, ...) that stops TLC
+\* wherever it is evaluated.
+EXTENDS Integers, Sequences, FiniteSets, TLC
+
+VARIABLES x
+vars == <<x>>
+
+\* test_crate::init, @SOURCE@:9:1: 9:50 (#0)
+init ==
+    (x = 0)
+
+\* test_crate::ready, @SOURCE@:7:1: 7:38 (#0)
+ready ==
+    (x = 0)
+
+\* test_crate::next, @SOURCE@:10:1: 10:56 (#0)
+next ==
+    (\E k \in 0..(IF ((1) - 1) < 255 THEN ((1) - 1) ELSE 255) : ((k < 1) /\ (ready /\ (x' = 1))))
+
+\* The state's integer fields stay within their types, as in Verus.
+TypeOK ==
+    /\ (0 <= x /\ x <= 255)
+Init == init /\ TypeOK
+Next == next /\ TypeOK'
+Spec == Init /\ [][Next]_vars
+=============================

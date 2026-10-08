@@ -157,7 +157,11 @@ def main():
     with ThreadPoolExecutor(max_workers=args.jobs) as pool:
         names = args.only or (['anvil/sub_network','anvil/sub_vrs_reconcile'] if args.round2 else PRIMARY+SUPPLEMENTAL)
         rows = list(pool.map(one,names))
-    provenance = dict(campaign=str(campaign),phase=args.phase,binary=str(binary),binary_version=(binary.parent/'version.txt').read_text(),
+    source_root = binary.parents[3]
+    source_paths = ['source/vir/src/tla.rs', 'source/vir/src/tla/functions.rs',
+        'source/rust_verify_test/tests/tla_export.rs']
+    source_sha256 = {p:digest(source_root/p) for p in source_paths if (source_root/p).exists()}
+    provenance = dict(source_sha256=source_sha256, campaign=str(campaign),phase=args.phase,binary=str(binary),binary_version=(binary.parent/'version.txt').read_text(),
         sha256={p.name:digest(p) for p in [binary,binary.parent/'rust_verify']},
         base_commit=subprocess.check_output(['git','rev-parse','origin/kg/export-partial'],cwd=ROOT,text=True).strip(),
         head_commit=subprocess.check_output(['git','rev-parse','HEAD'],cwd=ROOT,text=True).strip(),rows=rows)

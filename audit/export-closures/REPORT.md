@@ -56,15 +56,22 @@ excluded), and an unused partial field that reproduced the exact unknown
 `kind` operator error before the fix. The latter must still explore all three
 states; simply disabling the action would fail the test.
 
+## Merge integration
+
+The merge of `ca16f117` keeps shared stack history. Closure-valued helper calls
+use `FunctionUse::Call` with compiler type arguments, and inline only the
+resulting `ResolvedFunction`. Record reduction retains both nested field
+projection and the incoming action-domain bookkeeping used to select trace
+arms. No raw function-map lookup is exposed outside the centralized resolver.
+
+Empty choice lists are omitted from JSON reports; actual choices retain their
+source locations, carriers, and warnings. This keeps all 35 fixture/Raft
+artifacts byte-identical to the incoming parent, including JSON reports.
 
 
+## Cumulative campaign after merge of `ca16f117`
 
-
-
-
-## Cumulative campaign after rebase onto `fb8014b0`
-
-The table measures all 33 requested export targets: Anvil’s five (including both API adapters), IronKV host, nrkernel’s six, NR’s three, and all 18 Splinter attempts. Five additional campaign adapters/controls follow separately. A compiler error or timeout is **not** a zero-refusal export. `Before` uses the original campaign binary; `L1–3` uses the clean lane-3 checkout at `fb8014b0`; `After` uses the rebased lane-4 binary. Binary hashes and version strings are saved in `cumulative-results.json` (the parent binary embeds its pre-commit dirty version string).
+The table measures all 33 requested export targets: Anvil’s five (including both API adapters), IronKV host, nrkernel’s six, NR’s three, and all 18 Splinter attempts. Five additional campaign adapters/controls follow separately. A compiler error or timeout is **not** a zero-refusal export. `Before` uses the original campaign binary; `L1–3` uses the clean lane-3 checkout at `ca16f117`; `After` uses the merged lane-4 binary. Binary hashes and version strings are saved in `cumulative-results.json` (the parent binary embeds its pre-commit dirty version string).
 
 - **before:** 9/33 zero-refusal exports; 9/33 also pass SANY; 3/9 saved-bound TLC runs complete; 3/9 explore without an evaluation error.
 - **parent:** 17/33 zero-refusal exports; 17/33 also pass SANY; 5/9 saved-bound TLC runs complete; 7/9 explore without an evaluation error.
@@ -105,7 +112,7 @@ L1 = traits; L2 = nrkernel bit operations/partial Init; L3 = partial reads/finit
 | splinter/AllocationCrashAwareJournal | compile error | compile error | compile error | not exported → not exported | no saved bounds → no saved bounds | Campaign Rust input does not compile; no lane unblocks it |
 | splinter/AllocationJournal | compile error | compile error | compile error | not exported → not exported | no saved bounds → no saved bounds | Campaign Rust input does not compile; no lane unblocks it |
 | splinter/CoordinationSystem | 0 | 0 | 0 | pass → pass | timeout before progress → evaluation/config error | L3 guards/carriers; unchanged config lacks Dom_Key |
-| splinter/CrashTolerantJournal | 0 | 0 | 0 | pass → pass | evaluation/config error → progress; timeout (at least 29 states reported) | L3 guarded partial reads/casts unblock evaluation; L4 unchanged |
+| splinter/CrashTolerantJournal | 0 | 0 | 0 | pass → pass | evaluation/config error → progress; timeout (at least 35 states reported) | L3 guarded partial reads/casts unblock evaluation; L4 unchanged |
 | splinter/CrashTolerantMap | 0 | 0 | 0 | pass → pass | evaluation/config error → evaluation/config error | L3 guards/carriers; unchanged config lacks Dom_Key |
 | splinter/FilteredBetree | compile error | compile error | compile error | not exported → not exported | no saved bounds → no saved bounds | Campaign Rust input does not compile; no lane unblocks it |
 | splinter/LikesBetree | compile error | compile error | compile error | not exported → not exported | no saved bounds → no saved bounds | Campaign Rust input does not compile; no lane unblocks it |
@@ -131,21 +138,21 @@ L1 = traits; L2 = nrkernel bit operations/partial Init; L3 = partial reads/finit
 
 These are additional bounded replays, separate from the original campaign counts above. Both use byte-identical saved `MC.tla`/`MC.cfg` files. Reproduce with `python3 audit/export-closures/cumulative.py round2-replay --round2 --verus source/target-verus/release/verus`. No TLC command was saved for these harnesses, so the replay uses lane 3’s 30-second cap, one worker, and `-continue`. A completed search with a counterexample is not a clean invariant pass.
 
-| Machine | L1–3 refusals | L1–4 refusals | Parent TLC | Rebased stack TLC |
+| Machine | L1–3 refusals | L1–4 refusals | Parent TLC | Merged stack TLC |
 |---|---:|---:|---|---|
 | anvil/sub_network | 2 | 0 | evaluation/config error | complete (9 states) |
-| anvil/sub_vrs_reconcile | 0 | 0 | complete search with invariant CTI (7 states) | complete search with invariant CTI (7 states) |
+| anvil/sub_vrs_reconcile | 0 | 0 | evaluation/config error | evaluation/config error |
 
 Network: lane 4 removes both closure refusals and the unchanged transport harness completes with nine distinct states. Controller: the original-campaign export above confirms lane 4 removes all nine parent closure refusals; SANY passes. Its round-2 controller harness was marked preliminary/unvalidated by that campaign, so no bounded controller verdict is claimed.
 
-VRS: lane 3’s saved clean `5e38e1ee` replay failed on an Option projection after two states. Both the current parent and rebased stack now finish the complete seven-state search. With `-continue`, TLC reports `not_error` violated along the source’s explicit `Init → AfterListPods → Error` path for an absent/invalid response. This is an expected behavior of the unconstrained-response harness, not a claimed controller defect. Lane 3 unblocks this execution; lane 4 preserves the fix. The full round-2 logs, violations, command provenance, and bound hashes are included in the machine-readable evidence.
+VRS: the preceding fb8014b0 stack completed a seven-state search (with the saved harness’s expected not_error counterexample). The incoming ca16f117 parent and this merge both emit distinct specialized table names such as Table_marshal_spec_2, while the unchanged saved MC.cfg assigns the older Table_marshal_spec__tla_closed names. TLC therefore stops before exploration with an unassigned-constant error. This is an inherited harness/configuration mismatch; the table does not claim the previous seven-state result for this merge. Exact diagnostics and the unchanged bound hashes are retained in the evidence.
 
 ### Validation and remaining blockers
 
-**216 exporter tests passed**, with `TLA2TOOLS_JAR` set. All **28** example/Raft `.tla`/`.cfg` artifacts are byte-identical. The rebase preserves the lower lanes’ tests and both restriction and choice reporting; captured environments in partial-read analysis now use the same immutable `Arc<Env>` representation as closure reduction.
+**270 exporter tests passed**, with `TLA2TOOLS_JAR` set. All **35** example/Raft `.tla`/`.cfg`/`.json` artifacts are byte-identical against the incoming parent. Workspace formatting and clippy, including the exporter test target, pass with warnings denied. The merge preserves the lower lanes’ tests, trace-arm bookkeeping, centralized specialization, and both restriction and choice reporting; captured environments in partial-read analysis now use the same immutable `Arc<Env>` representation as closure reduction.
 
 Every remaining refusal, including its exact source location and multiplicity, is listed in [BLOCKERS.md](BLOCKERS.md). That file also records compiler, SANY, TLC configuration/evaluation, and timeout failures. The machine-readable report retains each individual refusal. The lane-4 `sub_api_sm` SANY regression is fixed: definedness analysis follows consumed symbolic fields and keeps their guards under the reduction’s LET bindings. It no longer emits guards for unused record fields. Both a bound-parameter closure record and the former unbound `kind` reproducer are TLC-checked. Independent lower-lane limitations and repairs are reflected in the parent and cumulative columns; their exact remaining diagnostics are in the blocker report.
 
 Exporter suite: `export PATH=$HOME/.cargo/bin:$PATH; export TMPDIR=$HOME/tmp; source tools/activate; cd source; TLA2TOOLS_JAR=$HOME/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar timeout 1800 vargo test --release --vstd-no-verify -p rust_verify_test --test tla_export -- --test-threads=4`. Fixture comparison uses the existing `toydb-pr-30/src/raft/safety.rs` because `base/toydb/src/raft/safety.rs` is absent.
 
-Reproduce with `python3 audit/export-closures/cumulative.py before --original-deps --verus ../base/verus/source/target-verus/release/verus`, then `parent` with the lane-3 binary and `after` with `source/target-verus/release/verus`; run `summarize-cumulative.py --tests <passed-count>` after `regression.py regression-stacked source/target-verus/release/verus`. Raw commands/logs and modules are retained in ignored `cumulative-*` directories. Historical lane-4-only measurements in `results.json` are superseded by `cumulative-results.json`.
+Reproduce with `python3 audit/export-closures/cumulative.py before --original-deps --verus ../base/verus/source/target-verus/release/verus`, then `parent` with the lane-3 binary and `after` with `source/target-verus/release/verus`; run `summarize-cumulative.py --tests <passed-count> --fixture-parent regression-parent-ca16 --parent-phase parent-ca16 --after-phase merged-ca16-final --round2-parent-phase round2-parent-ca16 --round2-after-phase round2-merged-ca16-final` after `regression.py regression-stacked source/target-verus/release/verus`. Raw commands/logs and modules are retained in ignored `cumulative-*` directories. Historical lane-4-only measurements in `results.json` are superseded by `cumulative-results.json`.

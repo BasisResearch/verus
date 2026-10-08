@@ -1,6 +1,7 @@
 {
-  "base_commit": "fb8014b0888681513f83e968863bd8e8438b9090",
-  "tests": 216,
+  "fixture_parent": "regression-parent-ca16",
+  "base_commit": "ca16f117659d44954c434c4e5c9a775f9eb49375",
+  "tests": 270,
   "counts": {
     "before": {
       "primary": {
@@ -3691,21 +3692,21 @@
     },
     "parent": {
       "campaign": "/data/home/kirancodes/Documents/code/verus-research/campaign-real/results",
-      "phase": "parent-fb801",
+      "phase": "parent-ca16",
       "binary": "/data/home/kirancodes/Documents/code/verus-research/wt-export-partial/source/target-verus/release/verus",
-      "binary_version": "0.2026.10.07.5e38e1e.dirty",
+      "binary_version": "0.2026.10.08.fb8014b.dirty",
       "sha256": {
         "verus": "5ffa1cb2b1e0df2bbed030d98414f20640f9c0613551a62be858ad320bf87a2a",
-        "rust_verify": "392bdb513502890508cf0a9cddf83fcad03e0041b3b4c960e60a04c26e3de1e4"
+        "rust_verify": "b9a2a5ac0f52dd16a12b46156ffb4b6edb003df0d423fecca8e02621fff493c5"
       },
-      "base_commit": "fb8014b0888681513f83e968863bd8e8438b9090",
-      "head_commit": "70a1754fc6c22a3451b6f94a3bf86e1b4b8fd75b",
+      "base_commit": "ca16f117659d44954c434c4e5c9a775f9eb49375",
+      "head_commit": "8b00f9bffa9c8b156ee2cad7460612fe712d6114",
       "rows": [
         {
           "machine": "anvil/Cluster-adapter",
           "primary": true,
           "export_rc": 0,
-          "export_seconds": 2.41,
+          "export_seconds": 2.0,
           "refusals": 22,
           "export_status": "exported",
           "campaign_bounds": false,
@@ -3835,7 +3836,7 @@
           "machine": "anvil/sub_api",
           "primary": true,
           "export_rc": 0,
-          "export_seconds": 2.81,
+          "export_seconds": 2.2,
           "refusals": 8,
           "export_status": "exported",
           "campaign_bounds": false,
@@ -3895,7 +3896,7 @@
           "machine": "anvil/sub_api_sm",
           "primary": true,
           "export_rc": 0,
-          "export_seconds": 2.71,
+          "export_seconds": 2.0,
           "refusals": 15,
           "export_status": "exported",
           "campaign_bounds": false,
@@ -3990,7 +3991,7 @@
           "machine": "anvil/sub_controller",
           "primary": true,
           "export_rc": 0,
-          "export_seconds": 2.51,
+          "export_seconds": 1.9,
           "refusals": 9,
           "export_status": "exported",
           "campaign_bounds": false,
@@ -4055,7 +4056,7 @@
           "machine": "anvil/sub_network",
           "primary": true,
           "export_rc": 0,
-          "export_seconds": 2.01,
+          "export_seconds": 1.81,
           "refusals": 2,
           "export_status": "exported",
           "campaign_bounds": false,
@@ -4085,7 +4086,7 @@
           "machine": "ironkv/host_protocol_t",
           "primary": true,
           "export_rc": 0,
-          "export_seconds": 3.61,
+          "export_seconds": 3.11,
           "refusals": 0,
           "export_status": "exported",
           "campaign_bounds": false,
@@ -4104,7 +4105,7 @@
           "machine": "nrkernel/hlspec",
           "primary": true,
           "export_rc": 0,
-          "export_seconds": 8.21,
+          "export_seconds": 5.81,
           "refusals": 1,
           "export_status": "exported",
           "campaign_bounds": false,
@@ -4138,7 +4139,7 @@
           "machine": "nrkernel/mmu_rl1",
           "primary": true,
           "export_rc": 0,
-          "export_seconds": 10.02,
+          "export_seconds": 6.11,
           "refusals": 0,
           "export_status": "exported",
           "campaign_bounds": false,
@@ -4170,7 +4171,7 @@
           "machine": "nrkernel/mmu_rl2",
           "primary": true,
           "export_rc": 0,
-          "export_seconds": 9.49,
+          "export_seconds": 6.52,
           "refusals": 0,
           "export_status": "exported",
           "campaign_bounds": false,
@@ -4204,7 +4205,7 @@
           "machine": "nrkernel/mmu_rl3",
           "primary": true,
           "export_rc": 0,
-          "export_seconds": 7.41,
+          "export_seconds": 6.62,
           "refusals": 0,
           "export_status": "exported",
           "campaign_bounds": false,
@@ -4236,7 +4237,7 @@
           "machine": "nrkernel/os",
           "primary": true,
           "export_rc": 0,
-          "export_seconds": 13.72,
+          "export_seconds": 13.12,
           "refusals": 7,
           "export_status": "exported",
           "campaign_bounds": false,
@@ -4304,7 +4305,7 @@
           "machine": "nrkernel/os_ext",
           "primary": true,
           "export_rc": 0,
-          "export_seconds": 8.11,
+          "export_seconds": 5.91,
           "refusals": 0,
           "export_status": "exported",
           "campaign_bounds": false,
@@ -4332,7 +4333,7 @@
           "machine": "nr/AsynchronousSingleton",
           "primary": true,
           "export_rc": 0,
-          "export_seconds": 4.71,
+          "export_seconds": 4.12,
           "refusals": 0,
           "export_status": "exported",
           "campaign_bounds": false,
@@ -4351,7 +4352,7 @@
           "machine": "nr/SimpleLog",
           "primary": true,
           "export_rc": 0,
-          "export_seconds": 3.51,
+          "export_seconds": 3.31,
           "refusals": 0,
           "export_status": "exported",
           "campaign_bounds": false,
@@ -4370,7 +4371,7 @@
           "machine": "nr/UnboundedLog",
           "primary": true,
           "export_rc": 0,
-          "export_seconds": 3.71,
+          "export_seconds": 3.41,
           "refusals": 0,
           "export_status": "exported",
           "campaign_bounds": false,
@@ -4389,7 +4390,7 @@
           "machine": "splinter/AbstractJournal",
           "primary": true,
           "export_rc": 0,
-          "export_seconds": 1.21,
+          "export_seconds": 1.1,
           "refusals": 0,
           "export_status": "exported",
           "campaign_bounds": true,
@@ -4420,7 +4421,7 @@
           "machine": "splinter/AbstractMap",
           "primary": true,
           "export_rc": 0,
-          "export_seconds": 1.41,
+          "export_seconds": 1.1,
           "refusals": 0,
           "export_status": "exported",
           "campaign_bounds": true,
@@ -4451,7 +4452,7 @@
           "machine": "splinter/AllocationBetree",
           "primary": true,
           "export_rc": 1,
-          "export_seconds": 1.11,
+          "export_seconds": 0.8,
           "refusals": null,
           "export_status": "compiler_error",
           "campaign_bounds": false,
@@ -4473,7 +4474,7 @@
           "machine": "splinter/AllocationBranchBetree",
           "primary": true,
           "export_rc": 1,
-          "export_seconds": 1.61,
+          "export_seconds": 1.21,
           "refusals": null,
           "export_status": "compiler_error",
           "campaign_bounds": false,
@@ -4495,7 +4496,7 @@
           "machine": "splinter/AllocationCrashAwareJournal",
           "primary": true,
           "export_rc": 1,
-          "export_seconds": 1.31,
+          "export_seconds": 1.1,
           "refusals": null,
           "export_status": "compiler_error",
           "campaign_bounds": false,
@@ -4539,7 +4540,7 @@
           "machine": "splinter/CoordinationSystem",
           "primary": true,
           "export_rc": 0,
-          "export_seconds": 1.61,
+          "export_seconds": 1.5,
           "refusals": 0,
           "export_status": "exported",
           "campaign_bounds": true,
@@ -4565,13 +4566,13 @@
           ],
           "invariant_violations": [],
           "search_complete": false,
-          "tlc_diagnostics": "TLC2 Version 2026.09.24.190251 (rev: 11305b4)\nWarning: Please run the Java VM, which executes TLC with a throughput optimized garbage collector, by passing the \"-XX:+UseParallelGC\" property.\n(Use the -nowarning option to disable this warning.)\nRunning breadth-first search Model-Checking with fp 83 and seed -7584415926429857656 with 1 worker on 32 cores with 1024MB heap and 64MB offheap memory [pid: 3164441] (Linux 7.0.0-1012-aws amd64, Ubuntu 25.0.4.1 64bit, MSBDiskFPSet, DiskStateQueue).\nParsing file /data/home/kirancodes/Documents/code/verus-research/wt-export-closures/audit/export-closures/cumulative-parent-fb801/splinter/CoordinationSystem/MC.tla\nParsing file /data/home/kirancodes/Documents/code/verus-research/wt-export-closures/audit/export-closures/cumulative-parent-fb801/splinter/CoordinationSystem/State_tla.tla\nParsing file /tmp/tlc-8814164770432571948/_TLCTrace.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/_TLCTrace.tla)\nParsing file /tmp/tlc-8814164770432571948/Integers.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/Integers.tla)\nParsing file /tmp/tlc-8814164770432571948/Sequences.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/Sequences.tla)\nParsing file /tmp/tlc-8814164770432571948/FiniteSets.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/FiniteSets.tla)\nParsing file /tmp/tlc-8814164770432571948/TLC.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/TLC.tla)\nParsing file /tmp/tlc-8814164770432571948/Naturals.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/Naturals.tla)\nParsing file /tmp/tlc-8814164770432571948/TLCExt.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/TLCExt.tla)\nSemantic processing of module Naturals\nSemantic processing of module Integers\nSemantic processing of module Sequences\nSemantic processing of module FiniteSets\nSemantic processing of module TLC\nSemantic processing of module State_tla\nSemantic processing of module TLCExt\nSemantic processing of module _TLCTrace\nSemantic processing of module MC\nLinting of module State_tla\nLinting of module TLCExt\nLinting of module _TLCTrace\nLinting of module MC\nStarting... (2026-10-08 02:26:17)\nError: The constant parameter Dom_Key is not assigned a value by the configuration file.\nFinished in 00s at (2026-10-08 02:26:17)\n"
+          "tlc_diagnostics": "TLC2 Version 2026.09.24.190251 (rev: 11305b4)\nWarning: Please run the Java VM, which executes TLC with a throughput optimized garbage collector, by passing the \"-XX:+UseParallelGC\" property.\n(Use the -nowarning option to disable this warning.)\nRunning breadth-first search Model-Checking with fp 53 and seed -3107995594919021108 with 1 worker on 32 cores with 1024MB heap and 64MB offheap memory [pid: 2507490] (Linux 7.0.0-1012-aws amd64, Ubuntu 25.0.4.1 64bit, MSBDiskFPSet, DiskStateQueue).\nParsing file /data/home/kirancodes/Documents/code/verus-research/wt-export-closures/audit/export-closures/cumulative-parent-ca16/splinter/CoordinationSystem/MC.tla\nParsing file /data/home/kirancodes/Documents/code/verus-research/wt-export-closures/audit/export-closures/cumulative-parent-ca16/splinter/CoordinationSystem/State_tla.tla\nParsing file /tmp/tlc-4136362545095712952/_TLCTrace.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/_TLCTrace.tla)\nParsing file /tmp/tlc-4136362545095712952/Integers.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/Integers.tla)\nParsing file /tmp/tlc-4136362545095712952/Sequences.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/Sequences.tla)\nParsing file /tmp/tlc-4136362545095712952/FiniteSets.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/FiniteSets.tla)\nParsing file /tmp/tlc-4136362545095712952/TLC.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/TLC.tla)\nParsing file /tmp/tlc-4136362545095712952/Naturals.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/Naturals.tla)\nParsing file /tmp/tlc-4136362545095712952/TLCExt.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/TLCExt.tla)\nSemantic processing of module Naturals\nSemantic processing of module Integers\nSemantic processing of module Sequences\nSemantic processing of module FiniteSets\nSemantic processing of module TLC\nSemantic processing of module State_tla\nSemantic processing of module TLCExt\nSemantic processing of module _TLCTrace\nSemantic processing of module MC\nLinting of module State_tla\nLinting of module TLCExt\nLinting of module _TLCTrace\nLinting of module MC\nStarting... (2026-10-08 14:19:08)\nError: The constant parameter Dom_Key is not assigned a value by the configuration file.\nFinished in 00s at (2026-10-08 14:19:08)\n"
         },
         {
           "machine": "splinter/CrashTolerantJournal",
           "primary": true,
           "export_rc": 0,
-          "export_seconds": 1.21,
+          "export_seconds": 1.1,
           "refusals": 0,
           "export_status": "exported",
           "campaign_bounds": true,
@@ -4592,8 +4593,8 @@
           "saved_tlc_command": true,
           "tlc_rc": 124,
           "tlc_budget_seconds": "30",
-          "generated": 334,
-          "distinct": 37,
+          "generated": 403,
+          "distinct": 56,
           "tlc_errors": [],
           "invariant_violations": [],
           "search_complete": false
@@ -4602,7 +4603,7 @@
           "machine": "splinter/CrashTolerantMap",
           "primary": true,
           "export_rc": 0,
-          "export_seconds": 1.21,
+          "export_seconds": 1.1,
           "refusals": 0,
           "export_status": "exported",
           "campaign_bounds": true,
@@ -4628,7 +4629,7 @@
           ],
           "invariant_violations": [],
           "search_complete": false,
-          "tlc_diagnostics": "TLC2 Version 2026.09.24.190251 (rev: 11305b4)\nWarning: Please run the Java VM, which executes TLC with a throughput optimized garbage collector, by passing the \"-XX:+UseParallelGC\" property.\n(Use the -nowarning option to disable this warning.)\nRunning breadth-first search Model-Checking with fp 75 and seed -137763344196241044 with 1 worker on 32 cores with 1024MB heap and 64MB offheap memory [pid: 3164809] (Linux 7.0.0-1012-aws amd64, Ubuntu 25.0.4.1 64bit, MSBDiskFPSet, DiskStateQueue).\nParsing file /data/home/kirancodes/Documents/code/verus-research/wt-export-closures/audit/export-closures/cumulative-parent-fb801/splinter/CrashTolerantMap/MC.tla\nParsing file /data/home/kirancodes/Documents/code/verus-research/wt-export-closures/audit/export-closures/cumulative-parent-fb801/splinter/CrashTolerantMap/State_tla.tla\nParsing file /tmp/tlc-8154492589523396059/_TLCTrace.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/_TLCTrace.tla)\nParsing file /tmp/tlc-8154492589523396059/Integers.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/Integers.tla)\nParsing file /tmp/tlc-8154492589523396059/Sequences.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/Sequences.tla)\nParsing file /tmp/tlc-8154492589523396059/FiniteSets.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/FiniteSets.tla)\nParsing file /tmp/tlc-8154492589523396059/TLC.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/TLC.tla)\nParsing file /tmp/tlc-8154492589523396059/Naturals.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/Naturals.tla)\nParsing file /tmp/tlc-8154492589523396059/TLCExt.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/TLCExt.tla)\nSemantic processing of module Naturals\nSemantic processing of module Integers\nSemantic processing of module Sequences\nSemantic processing of module FiniteSets\nSemantic processing of module TLC\nSemantic processing of module State_tla\nSemantic processing of module TLCExt\nSemantic processing of module _TLCTrace\nSemantic processing of module MC\nLinting of module State_tla\nLinting of module TLCExt\nLinting of module _TLCTrace\nLinting of module MC\nStarting... (2026-10-08 02:26:19)\nError: The constant parameter Dom_Key is not assigned a value by the configuration file.\nFinished in 00s at (2026-10-08 02:26:19)\n"
+          "tlc_diagnostics": "TLC2 Version 2026.09.24.190251 (rev: 11305b4)\nWarning: Please run the Java VM, which executes TLC with a throughput optimized garbage collector, by passing the \"-XX:+UseParallelGC\" property.\n(Use the -nowarning option to disable this warning.)\nRunning breadth-first search Model-Checking with fp 118 and seed 175993049267149693 with 1 worker on 32 cores with 1024MB heap and 64MB offheap memory [pid: 2507873] (Linux 7.0.0-1012-aws amd64, Ubuntu 25.0.4.1 64bit, MSBDiskFPSet, DiskStateQueue).\nParsing file /data/home/kirancodes/Documents/code/verus-research/wt-export-closures/audit/export-closures/cumulative-parent-ca16/splinter/CrashTolerantMap/MC.tla\nParsing file /data/home/kirancodes/Documents/code/verus-research/wt-export-closures/audit/export-closures/cumulative-parent-ca16/splinter/CrashTolerantMap/State_tla.tla\nParsing file /tmp/tlc-9741653972864989847/_TLCTrace.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/_TLCTrace.tla)\nParsing file /tmp/tlc-9741653972864989847/Integers.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/Integers.tla)\nParsing file /tmp/tlc-9741653972864989847/Sequences.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/Sequences.tla)\nParsing file /tmp/tlc-9741653972864989847/FiniteSets.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/FiniteSets.tla)\nParsing file /tmp/tlc-9741653972864989847/TLC.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/TLC.tla)\nParsing file /tmp/tlc-9741653972864989847/Naturals.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/Naturals.tla)\nParsing file /tmp/tlc-9741653972864989847/TLCExt.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/TLCExt.tla)\nSemantic processing of module Naturals\nSemantic processing of module Integers\nSemantic processing of module Sequences\nSemantic processing of module FiniteSets\nSemantic processing of module TLC\nSemantic processing of module State_tla\nSemantic processing of module TLCExt\nSemantic processing of module _TLCTrace\nSemantic processing of module MC\nLinting of module State_tla\nLinting of module TLCExt\nLinting of module _TLCTrace\nLinting of module MC\nStarting... (2026-10-08 14:19:10)\nError: The constant parameter Dom_Key is not assigned a value by the configuration file.\nFinished in 00s at (2026-10-08 14:19:10)\n"
         },
         {
           "machine": "splinter/FilteredBetree",
@@ -4652,7 +4653,7 @@
           "machine": "splinter/LikesBetree",
           "primary": true,
           "export_rc": 1,
-          "export_seconds": 0.8,
+          "export_seconds": 0.7,
           "refusals": null,
           "export_status": "compiler_error",
           "campaign_bounds": false,
@@ -4674,7 +4675,7 @@
           "machine": "splinter/LikesJournal",
           "primary": true,
           "export_rc": 1,
-          "export_seconds": 0.9,
+          "export_seconds": 0.8,
           "refusals": null,
           "export_status": "compiler_error",
           "campaign_bounds": false,
@@ -4716,7 +4717,7 @@
           "machine": "splinter/LinkedJournal",
           "primary": true,
           "export_rc": 0,
-          "export_seconds": 1.3,
+          "export_seconds": 1.2,
           "refusals": 0,
           "export_status": "exported",
           "campaign_bounds": true,
@@ -4747,13 +4748,13 @@
             "inv"
           ],
           "search_complete": false,
-          "tlc_diagnostics": "TLC2 Version 2026.09.24.190251 (rev: 11305b4)\nWarning: Please run the Java VM, which executes TLC with a throughput optimized garbage collector, by passing the \"-XX:+UseParallelGC\" property.\n(Use the -nowarning option to disable this warning.)\nRunning breadth-first search Model-Checking with fp 5 and seed -8824462235079527030 with 1 worker on 32 cores with 1024MB heap and 64MB offheap memory [pid: 3167527] (Linux 7.0.0-1012-aws amd64, Ubuntu 25.0.4.1 64bit, MSBDiskFPSet, DiskStateQueue).\nParsing file /data/home/kirancodes/Documents/code/verus-research/wt-export-closures/audit/export-closures/cumulative-parent-fb801/splinter/LinkedJournal/MC.tla\nParsing file /data/home/kirancodes/Documents/code/verus-research/wt-export-closures/audit/export-closures/cumulative-parent-fb801/splinter/LinkedJournal/State_tla.tla\nParsing file /tmp/tlc-9836955910057278816/_TLCTrace.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/_TLCTrace.tla)\nParsing file /tmp/tlc-9836955910057278816/Integers.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/Integers.tla)\nParsing file /tmp/tlc-9836955910057278816/Sequences.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/Sequences.tla)\nParsing file /tmp/tlc-9836955910057278816/FiniteSets.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/FiniteSets.tla)\nParsing file /tmp/tlc-9836955910057278816/TLC.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/TLC.tla)\nParsing file /tmp/tlc-9836955910057278816/Naturals.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/Naturals.tla)\nParsing file /tmp/tlc-9836955910057278816/TLCExt.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/TLCExt.tla)\nSemantic processing of module Naturals\nSemantic processing of module Integers\nSemantic processing of module Sequences\nSemantic processing of module FiniteSets\nSemantic processing of module TLC\nSemantic processing of module State_tla\nSemantic processing of module TLCExt\nSemantic processing of module _TLCTrace\nSemantic processing of module MC\nLinting of module State_tla\nLinting of module TLCExt\nLinting of module _TLCTrace\nLinting of module MC\nStarting... (2026-10-08 02:26:24)\nComputing initial states...\nFinished computing initial states: 1 distinct state generated at 2026-10-08 02:26:25.\nError: Invariant inv is violated.\nError: The behavior up to this point is:\nState 1: <Initial predicate>\n/\\ unmarshalled_tail = [msgs |-> <<>>, seq_start |-> 0, seq_end |-> 0]\n/\\ truncated_journal = [disk_view |-> [entries |-> <<>>, boundary_lsn |-> 0], freshest_rec |-> [tag |-> \"None\"]]\n\nState 2: <Next line 386, col 9 to line 386, col 30 of module State_tla>\n/\\ unmarshalled_tail = [msgs |-> (0 :> [key |-> [v0 |-> 0], message |-> [tag |-> \"Define\", value |-> [v0 |-> 0]]]), seq_start |-> 0, seq_end |-> 1]\n/\\ truncated_journal = [disk_view |-> [entries |-> <<>>, boundary_lsn |-> 0], freshest_rec |-> [tag |-> \"None\"]]\n\nState 3: <Next line 386, col 9 to line 386, col 30 of module State_tla>\n/\\ unmarshalled_tail = [msgs |-> <<>>, seq_start |-> 1, seq_end |-> 1]\n/\\ truncated_journal = [disk_view |-> [entries |-> ([au |-> 0, page |-> 0] :> [message_seq |-> [msgs |-> (0 :> [key |-> [v0 |-> 0], message |-> [tag |-> \"Define\", value |-> [v0 |-> 0]]]), seq_start |-> 0, seq_end |-> 1], prior_rec |-> [tag |-> \"None\"]]), boundary_lsn |-> 0], freshest_rec |-> [v0 |-> [au |-> 0, page |-> 0], tag |-> \"Some\"]]\n\n9 states generated, 4 distinct states found, 1 states left on queue.\nThe depth of the complete state graph search is 3.\nFinished in 01s at (2026-10-08 02:26:26)\nTrace exploration spec path: ./MC_TTrace_1791426384.tla\n"
+          "tlc_diagnostics": "TLC2 Version 2026.09.24.190251 (rev: 11305b4)\nWarning: Please run the Java VM, which executes TLC with a throughput optimized garbage collector, by passing the \"-XX:+UseParallelGC\" property.\n(Use the -nowarning option to disable this warning.)\nRunning breadth-first search Model-Checking with fp 91 and seed -4662465068025740172 with 1 worker on 32 cores with 1024MB heap and 64MB offheap memory [pid: 2508096] (Linux 7.0.0-1012-aws amd64, Ubuntu 25.0.4.1 64bit, MSBDiskFPSet, DiskStateQueue).\nParsing file /data/home/kirancodes/Documents/code/verus-research/wt-export-closures/audit/export-closures/cumulative-parent-ca16/splinter/LinkedJournal/MC.tla\nParsing file /data/home/kirancodes/Documents/code/verus-research/wt-export-closures/audit/export-closures/cumulative-parent-ca16/splinter/LinkedJournal/State_tla.tla\nParsing file /tmp/tlc-15764368902693330370/_TLCTrace.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/_TLCTrace.tla)\nParsing file /tmp/tlc-15764368902693330370/Integers.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/Integers.tla)\nParsing file /tmp/tlc-15764368902693330370/Sequences.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/Sequences.tla)\nParsing file /tmp/tlc-15764368902693330370/FiniteSets.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/FiniteSets.tla)\nParsing file /tmp/tlc-15764368902693330370/TLC.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/TLC.tla)\nParsing file /tmp/tlc-15764368902693330370/Naturals.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/Naturals.tla)\nParsing file /tmp/tlc-15764368902693330370/TLCExt.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/TLCExt.tla)\nSemantic processing of module Naturals\nSemantic processing of module Integers\nSemantic processing of module Sequences\nSemantic processing of module FiniteSets\nSemantic processing of module TLC\nSemantic processing of module State_tla\nSemantic processing of module TLCExt\nSemantic processing of module _TLCTrace\nSemantic processing of module MC\nLinting of module State_tla\nLinting of module TLCExt\nLinting of module _TLCTrace\nLinting of module MC\nStarting... (2026-10-08 14:19:14)\nComputing initial states...\nFinished computing initial states: 1 distinct state generated at 2026-10-08 14:19:14.\nError: Invariant inv is violated.\nError: The behavior up to this point is:\nState 1: <Initial predicate>\n/\\ unmarshalled_tail = [msgs |-> <<>>, seq_start |-> 0, seq_end |-> 0]\n/\\ truncated_journal = [disk_view |-> [entries |-> <<>>, boundary_lsn |-> 0], freshest_rec |-> [tag |-> \"None\"]]\n\nState 2: <Next line 386, col 9 to line 386, col 30 of module State_tla>\n/\\ unmarshalled_tail = [msgs |-> (0 :> [key |-> [v0 |-> 0], message |-> [tag |-> \"Define\", value |-> [v0 |-> 0]]]), seq_start |-> 0, seq_end |-> 1]\n/\\ truncated_journal = [disk_view |-> [entries |-> <<>>, boundary_lsn |-> 0], freshest_rec |-> [tag |-> \"None\"]]\n\nState 3: <Next line 386, col 9 to line 386, col 30 of module State_tla>\n/\\ unmarshalled_tail = [msgs |-> <<>>, seq_start |-> 1, seq_end |-> 1]\n/\\ truncated_journal = [disk_view |-> [entries |-> ([au |-> 0, page |-> 0] :> [message_seq |-> [msgs |-> (0 :> [key |-> [v0 |-> 0], message |-> [tag |-> \"Define\", value |-> [v0 |-> 0]]]), seq_start |-> 0, seq_end |-> 1], prior_rec |-> [tag |-> \"None\"]]), boundary_lsn |-> 0], freshest_rec |-> [v0 |-> [au |-> 0, page |-> 0], tag |-> \"Some\"]]\n\n9 states generated, 4 distinct states found, 1 states left on queue.\nThe depth of the complete state graph search is 3.\nFinished in 00s at (2026-10-08 14:19:14)\nTrace exploration spec path: ./MC_TTrace_1791469154.tla\n"
         },
         {
           "machine": "splinter/PagedBetree",
           "primary": true,
           "export_rc": 0,
-          "export_seconds": 1.81,
+          "export_seconds": 1.1,
           "refusals": 0,
           "export_status": "exported",
           "campaign_bounds": true,
@@ -4784,7 +4785,7 @@
           "machine": "splinter/PagedJournal",
           "primary": true,
           "export_rc": 0,
-          "export_seconds": 2.12,
+          "export_seconds": 1.1,
           "refusals": 0,
           "export_status": "exported",
           "campaign_bounds": true,
@@ -4815,7 +4816,7 @@
           "machine": "splinter/PivotBetree",
           "primary": true,
           "export_rc": 0,
-          "export_seconds": 1.82,
+          "export_seconds": 1.1,
           "refusals": 0,
           "export_status": "exported",
           "campaign_bounds": true,
@@ -4846,7 +4847,7 @@
           "machine": "splinter/UnifiedCrashAwareJournal",
           "primary": true,
           "export_rc": 1,
-          "export_seconds": 1.51,
+          "export_seconds": 1.1,
           "refusals": null,
           "export_status": "compiler_error",
           "campaign_bounds": false,
@@ -4868,7 +4869,7 @@
           "machine": "anvil/sub_vrs_reconcile",
           "primary": false,
           "export_rc": 0,
-          "export_seconds": 3.01,
+          "export_seconds": 1.91,
           "refusals": 0,
           "export_status": "exported",
           "campaign_bounds": false,
@@ -4887,7 +4888,7 @@
           "machine": "nr/UnboundedLog-mono",
           "primary": false,
           "export_rc": 0,
-          "export_seconds": 2.01,
+          "export_seconds": 1.81,
           "refusals": 0,
           "export_status": "exported",
           "campaign_bounds": true,
@@ -4913,13 +4914,13 @@
           ],
           "invariant_violations": [],
           "search_complete": false,
-          "tlc_diagnostics": "TLC2 Version 2026.09.24.190251 (rev: 11305b4)\nWarning: Please run the Java VM, which executes TLC with a throughput optimized garbage collector, by passing the \"-XX:+UseParallelGC\" property.\n(Use the -nowarning option to disable this warning.)\nRunning breadth-first search Model-Checking with fp 55 and seed 4097020658574760903 with 1 worker on 32 cores with 1024MB heap and 64MB offheap memory [pid: 3180658] (Linux 7.0.0-1012-aws amd64, Ubuntu 25.0.4.1 64bit, MSBDiskFPSet, DiskStateQueue).\nParsing file /data/home/kirancodes/Documents/code/verus-research/wt-export-closures/audit/export-closures/cumulative-parent-fb801/nr/UnboundedLog-mono/MC.tla\nParsing file /data/home/kirancodes/Documents/code/verus-research/wt-export-closures/audit/export-closures/cumulative-parent-fb801/nr/UnboundedLog-mono/State_tla.tla\nParsing file /tmp/tlc-12315012073107192372/_TLCTrace.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/_TLCTrace.tla)\nParsing file /tmp/tlc-12315012073107192372/Integers.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/Integers.tla)\nParsing file /tmp/tlc-12315012073107192372/Sequences.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/Sequences.tla)\nParsing file /tmp/tlc-12315012073107192372/FiniteSets.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/FiniteSets.tla)\nParsing file /tmp/tlc-12315012073107192372/TLC.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/TLC.tla)\nParsing file /tmp/tlc-12315012073107192372/Naturals.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/Naturals.tla)\nParsing file /tmp/tlc-12315012073107192372/TLCExt.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/TLCExt.tla)\nSemantic processing of module Naturals\nSemantic processing of module Integers\nSemantic processing of module Sequences\nSemantic processing of module FiniteSets\nSemantic processing of module TLC\nSemantic processing of module State_tla\nSemantic processing of module TLCExt\nSemantic processing of module _TLCTrace\nSemantic processing of module MC\nLinting of module State_tla\nLinting of module TLCExt\nLinting of module _TLCTrace\nLinting of module MC\nStarting... (2026-10-08 02:26:50)\nError: The constant parameter Table_arbitrary__tla_closed2 is not assigned a value by the configuration file.\nFinished in 00s at (2026-10-08 02:26:50)\n"
+          "tlc_diagnostics": "TLC2 Version 2026.09.24.190251 (rev: 11305b4)\nWarning: Please run the Java VM, which executes TLC with a throughput optimized garbage collector, by passing the \"-XX:+UseParallelGC\" property.\n(Use the -nowarning option to disable this warning.)\nRunning breadth-first search Model-Checking with fp 87 and seed -3629557419273379152 with 1 worker on 32 cores with 1024MB heap and 64MB offheap memory [pid: 2508887] (Linux 7.0.0-1012-aws amd64, Ubuntu 25.0.4.1 64bit, MSBDiskFPSet, DiskStateQueue).\nParsing file /data/home/kirancodes/Documents/code/verus-research/wt-export-closures/audit/export-closures/cumulative-parent-ca16/nr/UnboundedLog-mono/MC.tla\nParsing file /data/home/kirancodes/Documents/code/verus-research/wt-export-closures/audit/export-closures/cumulative-parent-ca16/nr/UnboundedLog-mono/State_tla.tla\nParsing file /tmp/tlc-3613501156178044414/_TLCTrace.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/_TLCTrace.tla)\nParsing file /tmp/tlc-3613501156178044414/Integers.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/Integers.tla)\nParsing file /tmp/tlc-3613501156178044414/Sequences.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/Sequences.tla)\nParsing file /tmp/tlc-3613501156178044414/FiniteSets.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/FiniteSets.tla)\nParsing file /tmp/tlc-3613501156178044414/TLC.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/TLC.tla)\nParsing file /tmp/tlc-3613501156178044414/Naturals.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/Naturals.tla)\nParsing file /tmp/tlc-3613501156178044414/TLCExt.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/TLCExt.tla)\nSemantic processing of module Naturals\nSemantic processing of module Integers\nSemantic processing of module Sequences\nSemantic processing of module FiniteSets\nSemantic processing of module TLC\nSemantic processing of module State_tla\nSemantic processing of module TLCExt\nSemantic processing of module _TLCTrace\nSemantic processing of module MC\nLinting of module State_tla\nLinting of module TLCExt\nLinting of module _TLCTrace\nLinting of module MC\nStarting... (2026-10-08 14:19:27)\nError: The constant parameter Table_arbitrary__tla_closed2 is not assigned a value by the configuration file.\nFinished in 00s at (2026-10-08 14:19:27)\n"
         },
         {
           "machine": "nr/CyclicBuffer",
           "primary": false,
           "export_rc": 0,
-          "export_seconds": 5.31,
+          "export_seconds": 3.51,
           "refusals": 6,
           "export_status": "exported",
           "campaign_bounds": false,
@@ -4941,13 +4942,13 @@
             },
             {
               "what": "uninterpreted function carrier type SyncSendIfSyncSend_tuple0 cannot be constrained",
-              "location": "vstd/tokens.rs:88:10: 88:31 (#0)",
-              "in_function": "vstd::tokens::KeyValueToken::key__tla_closed"
+              "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/verus-lang_verified-node-replication/verified-node-replication/src/spec/unbounded_log.rs:265:1: 1171:2 (#355)",
+              "in_function": "nrspec::spec::unbounded_log::UnboundedLog::impl&%5::key__tla_closed"
             },
             {
               "what": "uninterpreted function carrier type SyncSendIfSyncSend_tuple0 cannot be constrained",
-              "location": "vstd/tokens.rs:87:10: 87:46 (#0)",
-              "in_function": "vstd::tokens::KeyValueToken::instance_id__tla_closed"
+              "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/verus-lang_verified-node-replication/verified-node-replication/src/spec/unbounded_log.rs:265:1: 1171:2 (#355)",
+              "in_function": "nrspec::spec::unbounded_log::UnboundedLog::impl&%5::instance_id__tla_closed"
             },
             {
               "what": "uninterpreted function carrier type SyncSendIfSyncSend_tuple0 cannot be constrained",
@@ -4956,8 +4957,8 @@
             },
             {
               "what": "uninterpreted function carrier type SyncSendIfSyncSend_tuple0 cannot be constrained",
-              "location": "vstd/tokens.rs:89:10: 89:35 (#0)",
-              "in_function": "vstd::tokens::KeyValueToken::value__tla_closed"
+              "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/verus-lang_verified-node-replication/verified-node-replication/src/spec/unbounded_log.rs:265:1: 1171:2 (#355)",
+              "in_function": "nrspec::spec::unbounded_log::UnboundedLog::impl&%5::value__tla_closed"
             }
           ],
           "choices": [],
@@ -4969,7 +4970,7 @@
           "machine": "nr/FlatCombiner",
           "primary": false,
           "export_rc": 0,
-          "export_seconds": 5.11,
+          "export_seconds": 3.31,
           "refusals": 0,
           "export_status": "exported",
           "campaign_bounds": true,
@@ -4995,13 +4996,13 @@
           ],
           "invariant_violations": [],
           "search_complete": false,
-          "tlc_diagnostics": "TLC2 Version 2026.09.24.190251 (rev: 11305b4)\nWarning: Please run the Java VM, which executes TLC with a throughput optimized garbage collector, by passing the \"-XX:+UseParallelGC\" property.\n(Use the -nowarning option to disable this warning.)\nRunning breadth-first search Model-Checking with fp 6 and seed -8414916000823207338 with 1 worker on 32 cores with 1024MB heap and 64MB offheap memory [pid: 3182984] (Linux 7.0.0-1012-aws amd64, Ubuntu 25.0.4.1 64bit, MSBDiskFPSet, DiskStateQueue).\nParsing file /data/home/kirancodes/Documents/code/verus-research/wt-export-closures/audit/export-closures/cumulative-parent-fb801/nr/FlatCombiner/MC.tla\nParsing file /data/home/kirancodes/Documents/code/verus-research/wt-export-closures/audit/export-closures/cumulative-parent-fb801/nr/FlatCombiner/State_tla.tla\nParsing file /tmp/tlc-4659811847193961262/_TLCTrace.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/_TLCTrace.tla)\nParsing file /tmp/tlc-4659811847193961262/Integers.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/Integers.tla)\nParsing file /tmp/tlc-4659811847193961262/Sequences.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/Sequences.tla)\nParsing file /tmp/tlc-4659811847193961262/FiniteSets.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/FiniteSets.tla)\nParsing file /tmp/tlc-4659811847193961262/TLC.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/TLC.tla)\nParsing file /tmp/tlc-4659811847193961262/Naturals.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/Naturals.tla)\nParsing file /tmp/tlc-4659811847193961262/TLCExt.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/TLCExt.tla)\nSemantic processing of module Naturals\nSemantic processing of module Integers\nSemantic processing of module Sequences\nSemantic processing of module FiniteSets\nSemantic processing of module TLC\nSemantic processing of module State_tla\nSemantic processing of module TLCExt\nSemantic processing of module _TLCTrace\nSemantic processing of module MC\nLinting of module State_tla\nLinting of module TLCExt\nLinting of module _TLCTrace\nLinting of module MC\nStarting... (2026-10-08 02:26:58)\nError: The constant parameter Table_arbitrary__tla_closed is not assigned a value by the configuration file.\nFinished in 00s at (2026-10-08 02:26:58)\n"
+          "tlc_diagnostics": "TLC2 Version 2026.09.24.190251 (rev: 11305b4)\nWarning: Please run the Java VM, which executes TLC with a throughput optimized garbage collector, by passing the \"-XX:+UseParallelGC\" property.\n(Use the -nowarning option to disable this warning.)\nRunning breadth-first search Model-Checking with fp 106 and seed 2217820478356974792 with 1 worker on 32 cores with 1024MB heap and 64MB offheap memory [pid: 2514342] (Linux 7.0.0-1012-aws amd64, Ubuntu 25.0.4.1 64bit, MSBDiskFPSet, DiskStateQueue).\nParsing file /data/home/kirancodes/Documents/code/verus-research/wt-export-closures/audit/export-closures/cumulative-parent-ca16/nr/FlatCombiner/MC.tla\nParsing file /data/home/kirancodes/Documents/code/verus-research/wt-export-closures/audit/export-closures/cumulative-parent-ca16/nr/FlatCombiner/State_tla.tla\nParsing file /tmp/tlc-8784771221160702061/_TLCTrace.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/_TLCTrace.tla)\nParsing file /tmp/tlc-8784771221160702061/Integers.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/Integers.tla)\nParsing file /tmp/tlc-8784771221160702061/Sequences.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/Sequences.tla)\nParsing file /tmp/tlc-8784771221160702061/FiniteSets.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/FiniteSets.tla)\nParsing file /tmp/tlc-8784771221160702061/TLC.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/TLC.tla)\nParsing file /tmp/tlc-8784771221160702061/Naturals.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/Naturals.tla)\nParsing file /tmp/tlc-8784771221160702061/TLCExt.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/TLCExt.tla)\nSemantic processing of module Naturals\nSemantic processing of module Integers\nSemantic processing of module Sequences\nSemantic processing of module FiniteSets\nSemantic processing of module TLC\nSemantic processing of module State_tla\nSemantic processing of module TLCExt\nSemantic processing of module _TLCTrace\nSemantic processing of module MC\nLinting of module State_tla\nLinting of module TLCExt\nLinting of module _TLCTrace\nLinting of module MC\nStarting... (2026-10-08 14:19:35)\nError: The constant parameter Table_arbitrary__tla_closed is not assigned a value by the configuration file.\nFinished in 00s at (2026-10-08 14:19:35)\n"
         },
         {
           "machine": "nr/RwLockSpec",
           "primary": false,
           "export_rc": 0,
-          "export_seconds": 6.63,
+          "export_seconds": 3.31,
           "refusals": 0,
           "export_status": "exported",
           "campaign_bounds": true,
@@ -5031,22 +5032,27 @@
       ]
     },
     "after": {
+      "source_sha256": {
+        "source/vir/src/tla.rs": "e3fcb00710c68dc0a06645d93a385f61f19fa0f6f10a97fd147779b1b696d5ce",
+        "source/vir/src/tla/functions.rs": "65715a8933723478baa3b821eaf34334375f90a73d6de119184e4082b4cfd88e",
+        "source/rust_verify_test/tests/tla_export.rs": "4a9d0ae9647b0bbb5c97d897e10d932f8380ab2247c47c44856058194c7f3d64"
+      },
       "campaign": "/data/home/kirancodes/Documents/code/verus-research/campaign-real/results",
-      "phase": "reconfirm-fb801",
+      "phase": "merged-ca16-final",
       "binary": "/data/home/kirancodes/Documents/code/verus-research/wt-export-closures/source/target-verus/release/verus",
-      "binary_version": "0.2026.10.08.ae43c66",
+      "binary_version": "0.2026.10.08.8b00f9b.dirty",
       "sha256": {
         "verus": "5ffa1cb2b1e0df2bbed030d98414f20640f9c0613551a62be858ad320bf87a2a",
-        "rust_verify": "b222e780d3a4d68986f9d82bc4cd17de2fe994ca4842200d12dab71644be1f97"
+        "rust_verify": "767c837fb3d48b20328f55ca965f527f24641b3e388c9fa9087709944a2a9599"
       },
-      "base_commit": "fb8014b0888681513f83e968863bd8e8438b9090",
-      "head_commit": "ae43c6691153efee234c375a300d0b72bd399d40",
+      "base_commit": "ca16f117659d44954c434c4e5c9a775f9eb49375",
+      "head_commit": "8b00f9bffa9c8b156ee2cad7460612fe712d6114",
       "rows": [
         {
           "machine": "anvil/Cluster-adapter",
           "primary": true,
           "export_rc": 0,
-          "export_seconds": 3.21,
+          "export_seconds": 8.01,
           "refusals": 62,
           "export_status": "exported",
           "campaign_bounds": false,
@@ -5376,7 +5382,7 @@
           "machine": "anvil/sub_api",
           "primary": true,
           "export_rc": 0,
-          "export_seconds": 5.82,
+          "export_seconds": 6.21,
           "refusals": 58,
           "export_status": "exported",
           "campaign_bounds": false,
@@ -5695,7 +5701,7 @@
           "machine": "anvil/sub_api_sm",
           "primary": true,
           "export_rc": 0,
-          "export_seconds": 2.71,
+          "export_seconds": 6.11,
           "refusals": 8,
           "export_status": "exported",
           "campaign_bounds": false,
@@ -5755,15 +5761,15 @@
           "machine": "anvil/sub_controller",
           "primary": true,
           "export_rc": 0,
-          "export_seconds": 2.61,
+          "export_seconds": 2.11,
           "refusals": 0,
           "export_status": "exported",
           "campaign_bounds": false,
           "tlc_status": "no_saved_bounds",
           "explores": false,
           "completes": false,
-          "holes": 233,
-          "restrictions": 0,
+          "holes": 88,
+          "restrictions": 2,
           "refusal_details": [],
           "choices": [],
           "init_unassigned": [],
@@ -5774,7 +5780,7 @@
           "machine": "anvil/sub_network",
           "primary": true,
           "export_rc": 0,
-          "export_seconds": 2.21,
+          "export_seconds": 2.0,
           "refusals": 0,
           "export_status": "exported",
           "campaign_bounds": false,
@@ -5793,7 +5799,7 @@
           "machine": "ironkv/host_protocol_t",
           "primary": true,
           "export_rc": 0,
-          "export_seconds": 3.71,
+          "export_seconds": 3.41,
           "refusals": 0,
           "export_status": "exported",
           "campaign_bounds": false,
@@ -5812,7 +5818,7 @@
           "machine": "nrkernel/hlspec",
           "primary": true,
           "export_rc": 0,
-          "export_seconds": 8.22,
+          "export_seconds": 6.41,
           "refusals": 0,
           "export_status": "exported",
           "campaign_bounds": false,
@@ -5851,7 +5857,7 @@
           "machine": "nrkernel/mmu_rl1",
           "primary": true,
           "export_rc": 0,
-          "export_seconds": 8.42,
+          "export_seconds": 7.11,
           "refusals": 0,
           "export_status": "exported",
           "campaign_bounds": false,
@@ -5883,7 +5889,7 @@
           "machine": "nrkernel/mmu_rl2",
           "primary": true,
           "export_rc": 0,
-          "export_seconds": 9.43,
+          "export_seconds": 7.01,
           "refusals": 0,
           "export_status": "exported",
           "campaign_bounds": false,
@@ -5917,7 +5923,7 @@
           "machine": "nrkernel/mmu_rl3",
           "primary": true,
           "export_rc": 0,
-          "export_seconds": 9.34,
+          "export_seconds": 7.11,
           "refusals": 0,
           "export_status": "exported",
           "campaign_bounds": false,
@@ -5949,7 +5955,7 @@
           "machine": "nrkernel/os",
           "primary": true,
           "export_rc": 0,
-          "export_seconds": 18.45,
+          "export_seconds": 13.91,
           "refusals": 6,
           "export_status": "exported",
           "campaign_bounds": false,
@@ -6024,7 +6030,7 @@
           "machine": "nrkernel/os_ext",
           "primary": true,
           "export_rc": 0,
-          "export_seconds": 8.32,
+          "export_seconds": 6.41,
           "refusals": 0,
           "export_status": "exported",
           "campaign_bounds": false,
@@ -6052,7 +6058,7 @@
           "machine": "nr/AsynchronousSingleton",
           "primary": true,
           "export_rc": 0,
-          "export_seconds": 4.21,
+          "export_seconds": 3.51,
           "refusals": 0,
           "export_status": "exported",
           "campaign_bounds": false,
@@ -6071,7 +6077,7 @@
           "machine": "nr/SimpleLog",
           "primary": true,
           "export_rc": 0,
-          "export_seconds": 3.91,
+          "export_seconds": 3.51,
           "refusals": 0,
           "export_status": "exported",
           "campaign_bounds": false,
@@ -6090,7 +6096,7 @@
           "machine": "nr/UnboundedLog",
           "primary": true,
           "export_rc": 0,
-          "export_seconds": 3.81,
+          "export_seconds": 3.61,
           "refusals": 0,
           "export_status": "exported",
           "campaign_bounds": false,
@@ -6259,7 +6265,7 @@
           "machine": "splinter/CoordinationSystem",
           "primary": true,
           "export_rc": 0,
-          "export_seconds": 1.61,
+          "export_seconds": 1.71,
           "refusals": 0,
           "export_status": "exported",
           "campaign_bounds": true,
@@ -6285,13 +6291,13 @@
           ],
           "invariant_violations": [],
           "search_complete": false,
-          "tlc_diagnostics": "TLC2 Version 2026.09.24.190251 (rev: 11305b4)\nWarning: Please run the Java VM, which executes TLC with a throughput optimized garbage collector, by passing the \"-XX:+UseParallelGC\" property.\n(Use the -nowarning option to disable this warning.)\nRunning breadth-first search Model-Checking with fp 59 and seed -4591254151854713093 with 1 worker on 32 cores with 1024MB heap and 64MB offheap memory [pid: 3946568] (Linux 7.0.0-1012-aws amd64, Ubuntu 25.0.4.1 64bit, MSBDiskFPSet, DiskStateQueue).\nParsing file /data/home/kirancodes/Documents/code/verus-research/wt-export-closures/audit/export-closures/cumulative-reconfirm-fb801/splinter/CoordinationSystem/MC.tla\nParsing file /data/home/kirancodes/Documents/code/verus-research/wt-export-closures/audit/export-closures/cumulative-reconfirm-fb801/splinter/CoordinationSystem/State_tla.tla\nParsing file /tmp/tlc-3348862978888075320/_TLCTrace.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/_TLCTrace.tla)\nParsing file /tmp/tlc-3348862978888075320/Integers.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/Integers.tla)\nParsing file /tmp/tlc-3348862978888075320/Sequences.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/Sequences.tla)\nParsing file /tmp/tlc-3348862978888075320/FiniteSets.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/FiniteSets.tla)\nParsing file /tmp/tlc-3348862978888075320/TLC.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/TLC.tla)\nParsing file /tmp/tlc-3348862978888075320/Naturals.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/Naturals.tla)\nParsing file /tmp/tlc-3348862978888075320/TLCExt.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/TLCExt.tla)\nSemantic processing of module Naturals\nSemantic processing of module Integers\nSemantic processing of module Sequences\nSemantic processing of module FiniteSets\nSemantic processing of module TLC\nSemantic processing of module State_tla\nSemantic processing of module TLCExt\nSemantic processing of module _TLCTrace\nSemantic processing of module MC\nLinting of module State_tla\nLinting of module TLCExt\nLinting of module _TLCTrace\nLinting of module MC\nStarting... (2026-10-08 03:33:12)\nError: The constant parameter Dom_Key is not assigned a value by the configuration file.\nFinished in 00s at (2026-10-08 03:33:12)\n"
+          "tlc_diagnostics": "TLC2 Version 2026.09.24.190251 (rev: 11305b4)\nWarning: Please run the Java VM, which executes TLC with a throughput optimized garbage collector, by passing the \"-XX:+UseParallelGC\" property.\n(Use the -nowarning option to disable this warning.)\nRunning breadth-first search Model-Checking with fp 81 and seed 8846578003152626309 with 1 worker on 32 cores with 1024MB heap and 64MB offheap memory [pid: 2627656] (Linux 7.0.0-1012-aws amd64, Ubuntu 25.0.4.1 64bit, MSBDiskFPSet, DiskStateQueue).\nParsing file /data/home/kirancodes/Documents/code/verus-research/wt-export-closures/audit/export-closures/cumulative-merged-ca16-final/splinter/CoordinationSystem/MC.tla\nParsing file /data/home/kirancodes/Documents/code/verus-research/wt-export-closures/audit/export-closures/cumulative-merged-ca16-final/splinter/CoordinationSystem/State_tla.tla\nParsing file /tmp/tlc-14134441100035945652/_TLCTrace.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/_TLCTrace.tla)\nParsing file /tmp/tlc-14134441100035945652/Integers.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/Integers.tla)\nParsing file /tmp/tlc-14134441100035945652/Sequences.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/Sequences.tla)\nParsing file /tmp/tlc-14134441100035945652/FiniteSets.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/FiniteSets.tla)\nParsing file /tmp/tlc-14134441100035945652/TLC.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/TLC.tla)\nParsing file /tmp/tlc-14134441100035945652/Naturals.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/Naturals.tla)\nParsing file /tmp/tlc-14134441100035945652/TLCExt.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/TLCExt.tla)\nSemantic processing of module Naturals\nSemantic processing of module Integers\nSemantic processing of module Sequences\nSemantic processing of module FiniteSets\nSemantic processing of module TLC\nSemantic processing of module State_tla\nSemantic processing of module TLCExt\nSemantic processing of module _TLCTrace\nSemantic processing of module MC\nLinting of module State_tla\nLinting of module TLCExt\nLinting of module _TLCTrace\nLinting of module MC\nStarting... (2026-10-08 14:25:54)\nError: The constant parameter Dom_Key is not assigned a value by the configuration file.\nFinished in 00s at (2026-10-08 14:25:54)\n"
         },
         {
           "machine": "splinter/CrashTolerantJournal",
           "primary": true,
           "export_rc": 0,
-          "export_seconds": 1.21,
+          "export_seconds": 1.2,
           "refusals": 0,
           "export_status": "exported",
           "campaign_bounds": true,
@@ -6312,8 +6318,8 @@
           "saved_tlc_command": true,
           "tlc_rc": 124,
           "tlc_budget_seconds": "30",
-          "generated": 234,
-          "distinct": 29,
+          "generated": 303,
+          "distinct": 35,
           "tlc_errors": [],
           "invariant_violations": [],
           "search_complete": false
@@ -6322,7 +6328,7 @@
           "machine": "splinter/CrashTolerantMap",
           "primary": true,
           "export_rc": 0,
-          "export_seconds": 1.1,
+          "export_seconds": 1.2,
           "refusals": 0,
           "export_status": "exported",
           "campaign_bounds": true,
@@ -6348,7 +6354,7 @@
           ],
           "invariant_violations": [],
           "search_complete": false,
-          "tlc_diagnostics": "TLC2 Version 2026.09.24.190251 (rev: 11305b4)\nWarning: Please run the Java VM, which executes TLC with a throughput optimized garbage collector, by passing the \"-XX:+UseParallelGC\" property.\n(Use the -nowarning option to disable this warning.)\nRunning breadth-first search Model-Checking with fp 71 and seed -4097163018885792480 with 1 worker on 32 cores with 1024MB heap and 64MB offheap memory [pid: 3946764] (Linux 7.0.0-1012-aws amd64, Ubuntu 25.0.4.1 64bit, MSBDiskFPSet, DiskStateQueue).\nParsing file /data/home/kirancodes/Documents/code/verus-research/wt-export-closures/audit/export-closures/cumulative-reconfirm-fb801/splinter/CrashTolerantMap/MC.tla\nParsing file /data/home/kirancodes/Documents/code/verus-research/wt-export-closures/audit/export-closures/cumulative-reconfirm-fb801/splinter/CrashTolerantMap/State_tla.tla\nParsing file /tmp/tlc-2661302486145099212/_TLCTrace.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/_TLCTrace.tla)\nParsing file /tmp/tlc-2661302486145099212/Integers.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/Integers.tla)\nParsing file /tmp/tlc-2661302486145099212/Sequences.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/Sequences.tla)\nParsing file /tmp/tlc-2661302486145099212/FiniteSets.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/FiniteSets.tla)\nParsing file /tmp/tlc-2661302486145099212/TLC.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/TLC.tla)\nParsing file /tmp/tlc-2661302486145099212/Naturals.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/Naturals.tla)\nParsing file /tmp/tlc-2661302486145099212/TLCExt.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/TLCExt.tla)\nSemantic processing of module Naturals\nSemantic processing of module Integers\nSemantic processing of module Sequences\nSemantic processing of module FiniteSets\nSemantic processing of module TLC\nSemantic processing of module State_tla\nSemantic processing of module TLCExt\nSemantic processing of module _TLCTrace\nSemantic processing of module MC\nLinting of module State_tla\nLinting of module TLCExt\nLinting of module _TLCTrace\nLinting of module MC\nStarting... (2026-10-08 03:33:14)\nError: The constant parameter Dom_Key is not assigned a value by the configuration file.\nFinished in 00s at (2026-10-08 03:33:14)\n"
+          "tlc_diagnostics": "TLC2 Version 2026.09.24.190251 (rev: 11305b4)\nWarning: Please run the Java VM, which executes TLC with a throughput optimized garbage collector, by passing the \"-XX:+UseParallelGC\" property.\n(Use the -nowarning option to disable this warning.)\nRunning breadth-first search Model-Checking with fp 123 and seed 4685839203305982676 with 1 worker on 32 cores with 1024MB heap and 64MB offheap memory [pid: 2628378] (Linux 7.0.0-1012-aws amd64, Ubuntu 25.0.4.1 64bit, MSBDiskFPSet, DiskStateQueue).\nParsing file /data/home/kirancodes/Documents/code/verus-research/wt-export-closures/audit/export-closures/cumulative-merged-ca16-final/splinter/CrashTolerantMap/MC.tla\nParsing file /data/home/kirancodes/Documents/code/verus-research/wt-export-closures/audit/export-closures/cumulative-merged-ca16-final/splinter/CrashTolerantMap/State_tla.tla\nParsing file /tmp/tlc-10633197852909977164/_TLCTrace.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/_TLCTrace.tla)\nParsing file /tmp/tlc-10633197852909977164/Integers.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/Integers.tla)\nParsing file /tmp/tlc-10633197852909977164/Sequences.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/Sequences.tla)\nParsing file /tmp/tlc-10633197852909977164/FiniteSets.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/FiniteSets.tla)\nParsing file /tmp/tlc-10633197852909977164/TLC.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/TLC.tla)\nParsing file /tmp/tlc-10633197852909977164/Naturals.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/Naturals.tla)\nParsing file /tmp/tlc-10633197852909977164/TLCExt.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/TLCExt.tla)\nSemantic processing of module Naturals\nSemantic processing of module Integers\nSemantic processing of module Sequences\nSemantic processing of module FiniteSets\nSemantic processing of module TLC\nSemantic processing of module State_tla\nSemantic processing of module TLCExt\nSemantic processing of module _TLCTrace\nSemantic processing of module MC\nLinting of module State_tla\nLinting of module TLCExt\nLinting of module _TLCTrace\nLinting of module MC\nStarting... (2026-10-08 14:25:56)\nError: The constant parameter Dom_Key is not assigned a value by the configuration file.\nFinished in 00s at (2026-10-08 14:25:56)\n"
         },
         {
           "machine": "splinter/FilteredBetree",
@@ -6372,7 +6378,7 @@
           "machine": "splinter/LikesBetree",
           "primary": true,
           "export_rc": 1,
-          "export_seconds": 0.81,
+          "export_seconds": 0.8,
           "refusals": null,
           "export_status": "compiler_error",
           "campaign_bounds": false,
@@ -6414,7 +6420,7 @@
           "machine": "splinter/LinkedBetreeVars",
           "primary": true,
           "export_rc": 1,
-          "export_seconds": 0.5,
+          "export_seconds": 0.6,
           "refusals": null,
           "export_status": "compiler_error",
           "campaign_bounds": false,
@@ -6467,13 +6473,13 @@
             "inv"
           ],
           "search_complete": false,
-          "tlc_diagnostics": "TLC2 Version 2026.09.24.190251 (rev: 11305b4)\nWarning: Please run the Java VM, which executes TLC with a throughput optimized garbage collector, by passing the \"-XX:+UseParallelGC\" property.\n(Use the -nowarning option to disable this warning.)\nRunning breadth-first search Model-Checking with fp 96 and seed -7224524159858407419 with 1 worker on 32 cores with 1024MB heap and 64MB offheap memory [pid: 3947466] (Linux 7.0.0-1012-aws amd64, Ubuntu 25.0.4.1 64bit, MSBDiskFPSet, DiskStateQueue).\nParsing file /data/home/kirancodes/Documents/code/verus-research/wt-export-closures/audit/export-closures/cumulative-reconfirm-fb801/splinter/LinkedJournal/MC.tla\nParsing file /data/home/kirancodes/Documents/code/verus-research/wt-export-closures/audit/export-closures/cumulative-reconfirm-fb801/splinter/LinkedJournal/State_tla.tla\nParsing file /tmp/tlc-14066714746627537086/_TLCTrace.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/_TLCTrace.tla)\nParsing file /tmp/tlc-14066714746627537086/Integers.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/Integers.tla)\nParsing file /tmp/tlc-14066714746627537086/Sequences.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/Sequences.tla)\nParsing file /tmp/tlc-14066714746627537086/FiniteSets.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/FiniteSets.tla)\nParsing file /tmp/tlc-14066714746627537086/TLC.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/TLC.tla)\nParsing file /tmp/tlc-14066714746627537086/Naturals.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/Naturals.tla)\nParsing file /tmp/tlc-14066714746627537086/TLCExt.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/TLCExt.tla)\nSemantic processing of module Naturals\nSemantic processing of module Integers\nSemantic processing of module Sequences\nSemantic processing of module FiniteSets\nSemantic processing of module TLC\nSemantic processing of module State_tla\nSemantic processing of module TLCExt\nSemantic processing of module _TLCTrace\nSemantic processing of module MC\nLinting of module State_tla\nLinting of module TLCExt\nLinting of module _TLCTrace\nLinting of module MC\nStarting... (2026-10-08 03:33:19)\nComputing initial states...\nFinished computing initial states: 1 distinct state generated at 2026-10-08 03:33:19.\nError: Invariant inv is violated.\nError: The behavior up to this point is:\nState 1: <Initial predicate>\n/\\ unmarshalled_tail = [msgs |-> <<>>, seq_start |-> 0, seq_end |-> 0]\n/\\ truncated_journal = [disk_view |-> [entries |-> <<>>, boundary_lsn |-> 0], freshest_rec |-> [tag |-> \"None\"]]\n\nState 2: <Next line 386, col 9 to line 386, col 30 of module State_tla>\n/\\ unmarshalled_tail = [msgs |-> (0 :> [key |-> [v0 |-> 0], message |-> [tag |-> \"Define\", value |-> [v0 |-> 0]]]), seq_start |-> 0, seq_end |-> 1]\n/\\ truncated_journal = [disk_view |-> [entries |-> <<>>, boundary_lsn |-> 0], freshest_rec |-> [tag |-> \"None\"]]\n\nState 3: <Next line 386, col 9 to line 386, col 30 of module State_tla>\n/\\ unmarshalled_tail = [msgs |-> <<>>, seq_start |-> 1, seq_end |-> 1]\n/\\ truncated_journal = [disk_view |-> [entries |-> ([au |-> 0, page |-> 0] :> [message_seq |-> [msgs |-> (0 :> [key |-> [v0 |-> 0], message |-> [tag |-> \"Define\", value |-> [v0 |-> 0]]]), seq_start |-> 0, seq_end |-> 1], prior_rec |-> [tag |-> \"None\"]]), boundary_lsn |-> 0], freshest_rec |-> [v0 |-> [au |-> 0, page |-> 0], tag |-> \"Some\"]]\n\n9 states generated, 4 distinct states found, 1 states left on queue.\nThe depth of the complete state graph search is 3.\nFinished in 00s at (2026-10-08 03:33:19)\nTrace exploration spec path: ./MC_TTrace_1791430398.tla\n"
+          "tlc_diagnostics": "TLC2 Version 2026.09.24.190251 (rev: 11305b4)\nWarning: Please run the Java VM, which executes TLC with a throughput optimized garbage collector, by passing the \"-XX:+UseParallelGC\" property.\n(Use the -nowarning option to disable this warning.)\nRunning breadth-first search Model-Checking with fp 72 and seed -5916640537347375151 with 1 worker on 32 cores with 1024MB heap and 64MB offheap memory [pid: 2629874] (Linux 7.0.0-1012-aws amd64, Ubuntu 25.0.4.1 64bit, MSBDiskFPSet, DiskStateQueue).\nParsing file /data/home/kirancodes/Documents/code/verus-research/wt-export-closures/audit/export-closures/cumulative-merged-ca16-final/splinter/LinkedJournal/MC.tla\nParsing file /data/home/kirancodes/Documents/code/verus-research/wt-export-closures/audit/export-closures/cumulative-merged-ca16-final/splinter/LinkedJournal/State_tla.tla\nParsing file /tmp/tlc-8994685578259895850/_TLCTrace.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/_TLCTrace.tla)\nParsing file /tmp/tlc-8994685578259895850/Integers.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/Integers.tla)\nParsing file /tmp/tlc-8994685578259895850/Sequences.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/Sequences.tla)\nParsing file /tmp/tlc-8994685578259895850/FiniteSets.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/FiniteSets.tla)\nParsing file /tmp/tlc-8994685578259895850/TLC.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/TLC.tla)\nParsing file /tmp/tlc-8994685578259895850/Naturals.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/Naturals.tla)\nParsing file /tmp/tlc-8994685578259895850/TLCExt.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/TLCExt.tla)\nSemantic processing of module Naturals\nSemantic processing of module Integers\nSemantic processing of module Sequences\nSemantic processing of module FiniteSets\nSemantic processing of module TLC\nSemantic processing of module State_tla\nSemantic processing of module TLCExt\nSemantic processing of module _TLCTrace\nSemantic processing of module MC\nLinting of module State_tla\nLinting of module TLCExt\nLinting of module _TLCTrace\nLinting of module MC\nStarting... (2026-10-08 14:26:01)\nComputing initial states...\nFinished computing initial states: 1 distinct state generated at 2026-10-08 14:26:01.\nError: Invariant inv is violated.\nError: The behavior up to this point is:\nState 1: <Initial predicate>\n/\\ unmarshalled_tail = [msgs |-> <<>>, seq_start |-> 0, seq_end |-> 0]\n/\\ truncated_journal = [disk_view |-> [entries |-> <<>>, boundary_lsn |-> 0], freshest_rec |-> [tag |-> \"None\"]]\n\nState 2: <Next line 386, col 9 to line 386, col 30 of module State_tla>\n/\\ unmarshalled_tail = [msgs |-> (0 :> [key |-> [v0 |-> 0], message |-> [tag |-> \"Define\", value |-> [v0 |-> 0]]]), seq_start |-> 0, seq_end |-> 1]\n/\\ truncated_journal = [disk_view |-> [entries |-> <<>>, boundary_lsn |-> 0], freshest_rec |-> [tag |-> \"None\"]]\n\nState 3: <Next line 386, col 9 to line 386, col 30 of module State_tla>\n/\\ unmarshalled_tail = [msgs |-> <<>>, seq_start |-> 1, seq_end |-> 1]\n/\\ truncated_journal = [disk_view |-> [entries |-> ([au |-> 0, page |-> 0] :> [message_seq |-> [msgs |-> (0 :> [key |-> [v0 |-> 0], message |-> [tag |-> \"Define\", value |-> [v0 |-> 0]]]), seq_start |-> 0, seq_end |-> 1], prior_rec |-> [tag |-> \"None\"]]), boundary_lsn |-> 0], freshest_rec |-> [v0 |-> [au |-> 0, page |-> 0], tag |-> \"Some\"]]\n\n9 states generated, 4 distinct states found, 1 states left on queue.\nThe depth of the complete state graph search is 3.\nFinished in 00s at (2026-10-08 14:26:01)\nTrace exploration spec path: ./MC_TTrace_1791469561.tla\n"
         },
         {
           "machine": "splinter/PagedBetree",
           "primary": true,
           "export_rc": 0,
-          "export_seconds": 1.4,
+          "export_seconds": 1.1,
           "refusals": 0,
           "export_status": "exported",
           "campaign_bounds": true,
@@ -6504,7 +6510,7 @@
           "machine": "splinter/PagedJournal",
           "primary": true,
           "export_rc": 0,
-          "export_seconds": 1.2,
+          "export_seconds": 1.1,
           "refusals": 0,
           "export_status": "exported",
           "campaign_bounds": true,
@@ -6588,7 +6594,7 @@
           "machine": "anvil/sub_vrs_reconcile",
           "primary": false,
           "export_rc": 0,
-          "export_seconds": 2.1,
+          "export_seconds": 2.21,
           "refusals": 0,
           "export_status": "exported",
           "campaign_bounds": false,
@@ -6607,7 +6613,7 @@
           "machine": "nr/UnboundedLog-mono",
           "primary": false,
           "export_rc": 0,
-          "export_seconds": 1.91,
+          "export_seconds": 1.9,
           "refusals": 0,
           "export_status": "exported",
           "campaign_bounds": true,
@@ -6633,13 +6639,13 @@
           ],
           "invariant_violations": [],
           "search_complete": false,
-          "tlc_diagnostics": "TLC2 Version 2026.09.24.190251 (rev: 11305b4)\nWarning: Please run the Java VM, which executes TLC with a throughput optimized garbage collector, by passing the \"-XX:+UseParallelGC\" property.\n(Use the -nowarning option to disable this warning.)\nRunning breadth-first search Model-Checking with fp 18 and seed -6611291305587098164 with 1 worker on 32 cores with 1024MB heap and 64MB offheap memory [pid: 3958828] (Linux 7.0.0-1012-aws amd64, Ubuntu 25.0.4.1 64bit, MSBDiskFPSet, DiskStateQueue).\nParsing file /data/home/kirancodes/Documents/code/verus-research/wt-export-closures/audit/export-closures/cumulative-reconfirm-fb801/nr/UnboundedLog-mono/MC.tla\nParsing file /data/home/kirancodes/Documents/code/verus-research/wt-export-closures/audit/export-closures/cumulative-reconfirm-fb801/nr/UnboundedLog-mono/State_tla.tla\nParsing file /tmp/tlc-17997968497998978552/_TLCTrace.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/_TLCTrace.tla)\nParsing file /tmp/tlc-17997968497998978552/Integers.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/Integers.tla)\nParsing file /tmp/tlc-17997968497998978552/Sequences.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/Sequences.tla)\nParsing file /tmp/tlc-17997968497998978552/FiniteSets.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/FiniteSets.tla)\nParsing file /tmp/tlc-17997968497998978552/TLC.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/TLC.tla)\nParsing file /tmp/tlc-17997968497998978552/Naturals.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/Naturals.tla)\nParsing file /tmp/tlc-17997968497998978552/TLCExt.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/TLCExt.tla)\nSemantic processing of module Naturals\nSemantic processing of module Integers\nSemantic processing of module Sequences\nSemantic processing of module FiniteSets\nSemantic processing of module TLC\nSemantic processing of module State_tla\nSemantic processing of module TLCExt\nSemantic processing of module _TLCTrace\nSemantic processing of module MC\nLinting of module State_tla\nLinting of module TLCExt\nLinting of module _TLCTrace\nLinting of module MC\nStarting... (2026-10-08 03:33:34)\nError: The constant parameter Table_arbitrary__tla_closed2 is not assigned a value by the configuration file.\nFinished in 00s at (2026-10-08 03:33:34)\n"
+          "tlc_diagnostics": "TLC2 Version 2026.09.24.190251 (rev: 11305b4)\nWarning: Please run the Java VM, which executes TLC with a throughput optimized garbage collector, by passing the \"-XX:+UseParallelGC\" property.\n(Use the -nowarning option to disable this warning.)\nRunning breadth-first search Model-Checking with fp 121 and seed 396198801335133109 with 1 worker on 32 cores with 1024MB heap and 64MB offheap memory [pid: 2634552] (Linux 7.0.0-1012-aws amd64, Ubuntu 25.0.4.1 64bit, MSBDiskFPSet, DiskStateQueue).\nParsing file /data/home/kirancodes/Documents/code/verus-research/wt-export-closures/audit/export-closures/cumulative-merged-ca16-final/nr/UnboundedLog-mono/MC.tla\nParsing file /data/home/kirancodes/Documents/code/verus-research/wt-export-closures/audit/export-closures/cumulative-merged-ca16-final/nr/UnboundedLog-mono/State_tla.tla\nParsing file /tmp/tlc-9246569861929421820/_TLCTrace.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/_TLCTrace.tla)\nParsing file /tmp/tlc-9246569861929421820/Integers.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/Integers.tla)\nParsing file /tmp/tlc-9246569861929421820/Sequences.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/Sequences.tla)\nParsing file /tmp/tlc-9246569861929421820/FiniteSets.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/FiniteSets.tla)\nParsing file /tmp/tlc-9246569861929421820/TLC.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/TLC.tla)\nParsing file /tmp/tlc-9246569861929421820/Naturals.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/Naturals.tla)\nParsing file /tmp/tlc-9246569861929421820/TLCExt.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/TLCExt.tla)\nSemantic processing of module Naturals\nSemantic processing of module Integers\nSemantic processing of module Sequences\nSemantic processing of module FiniteSets\nSemantic processing of module TLC\nSemantic processing of module State_tla\nSemantic processing of module TLCExt\nSemantic processing of module _TLCTrace\nSemantic processing of module MC\nLinting of module State_tla\nLinting of module TLCExt\nLinting of module _TLCTrace\nLinting of module MC\nStarting... (2026-10-08 14:26:15)\nError: The constant parameter Table_arbitrary__tla_closed2 is not assigned a value by the configuration file.\nFinished in 00s at (2026-10-08 14:26:15)\n"
         },
         {
           "machine": "nr/CyclicBuffer",
           "primary": false,
           "export_rc": 0,
-          "export_seconds": 3.71,
+          "export_seconds": 3.81,
           "refusals": 6,
           "export_status": "exported",
           "campaign_bounds": false,
@@ -6661,13 +6667,13 @@
             },
             {
               "what": "uninterpreted function carrier type SyncSendIfSyncSend_tuple0 cannot be constrained",
-              "location": "vstd/tokens.rs:88:10: 88:31 (#0)",
-              "in_function": "vstd::tokens::KeyValueToken::key__tla_closed"
+              "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/verus-lang_verified-node-replication/verified-node-replication/src/spec/unbounded_log.rs:265:1: 1171:2 (#355)",
+              "in_function": "nrspec::spec::unbounded_log::UnboundedLog::impl&%5::key__tla_closed"
             },
             {
               "what": "uninterpreted function carrier type SyncSendIfSyncSend_tuple0 cannot be constrained",
-              "location": "vstd/tokens.rs:87:10: 87:46 (#0)",
-              "in_function": "vstd::tokens::KeyValueToken::instance_id__tla_closed"
+              "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/verus-lang_verified-node-replication/verified-node-replication/src/spec/unbounded_log.rs:265:1: 1171:2 (#355)",
+              "in_function": "nrspec::spec::unbounded_log::UnboundedLog::impl&%5::instance_id__tla_closed"
             },
             {
               "what": "uninterpreted function carrier type SyncSendIfSyncSend_tuple0 cannot be constrained",
@@ -6676,8 +6682,8 @@
             },
             {
               "what": "uninterpreted function carrier type SyncSendIfSyncSend_tuple0 cannot be constrained",
-              "location": "vstd/tokens.rs:89:10: 89:35 (#0)",
-              "in_function": "vstd::tokens::KeyValueToken::value__tla_closed"
+              "location": "/Users/kirancodes/Documents/code/verus-research/survey/repos/verus-lang_verified-node-replication/verified-node-replication/src/spec/unbounded_log.rs:265:1: 1171:2 (#355)",
+              "in_function": "nrspec::spec::unbounded_log::UnboundedLog::impl&%5::value__tla_closed"
             }
           ],
           "choices": [],
@@ -6689,7 +6695,7 @@
           "machine": "nr/FlatCombiner",
           "primary": false,
           "export_rc": 0,
-          "export_seconds": 3.31,
+          "export_seconds": 3.81,
           "refusals": 0,
           "export_status": "exported",
           "campaign_bounds": true,
@@ -6715,13 +6721,13 @@
           ],
           "invariant_violations": [],
           "search_complete": false,
-          "tlc_diagnostics": "TLC2 Version 2026.09.24.190251 (rev: 11305b4)\nWarning: Please run the Java VM, which executes TLC with a throughput optimized garbage collector, by passing the \"-XX:+UseParallelGC\" property.\n(Use the -nowarning option to disable this warning.)\nRunning breadth-first search Model-Checking with fp 64 and seed -6656051772787671534 with 1 worker on 32 cores with 1024MB heap and 64MB offheap memory [pid: 3959372] (Linux 7.0.0-1012-aws amd64, Ubuntu 25.0.4.1 64bit, MSBDiskFPSet, DiskStateQueue).\nParsing file /data/home/kirancodes/Documents/code/verus-research/wt-export-closures/audit/export-closures/cumulative-reconfirm-fb801/nr/FlatCombiner/MC.tla\nParsing file /data/home/kirancodes/Documents/code/verus-research/wt-export-closures/audit/export-closures/cumulative-reconfirm-fb801/nr/FlatCombiner/State_tla.tla\nParsing file /tmp/tlc-7395332783806414000/_TLCTrace.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/_TLCTrace.tla)\nParsing file /tmp/tlc-7395332783806414000/Integers.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/Integers.tla)\nParsing file /tmp/tlc-7395332783806414000/Sequences.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/Sequences.tla)\nParsing file /tmp/tlc-7395332783806414000/FiniteSets.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/FiniteSets.tla)\nParsing file /tmp/tlc-7395332783806414000/TLC.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/TLC.tla)\nParsing file /tmp/tlc-7395332783806414000/Naturals.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/Naturals.tla)\nParsing file /tmp/tlc-7395332783806414000/TLCExt.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/TLCExt.tla)\nSemantic processing of module Naturals\nSemantic processing of module Integers\nSemantic processing of module Sequences\nSemantic processing of module FiniteSets\nSemantic processing of module TLC\nSemantic processing of module State_tla\nSemantic processing of module TLCExt\nSemantic processing of module _TLCTrace\nSemantic processing of module MC\nLinting of module State_tla\nLinting of module TLCExt\nLinting of module _TLCTrace\nLinting of module MC\nStarting... (2026-10-08 03:33:42)\nError: The constant parameter Table_arbitrary__tla_closed is not assigned a value by the configuration file.\nFinished in 00s at (2026-10-08 03:33:42)\n"
+          "tlc_diagnostics": "TLC2 Version 2026.09.24.190251 (rev: 11305b4)\nWarning: Please run the Java VM, which executes TLC with a throughput optimized garbage collector, by passing the \"-XX:+UseParallelGC\" property.\n(Use the -nowarning option to disable this warning.)\nRunning breadth-first search Model-Checking with fp 10 and seed 866331681271228377 with 1 worker on 32 cores with 1024MB heap and 64MB offheap memory [pid: 2637283] (Linux 7.0.0-1012-aws amd64, Ubuntu 25.0.4.1 64bit, MSBDiskFPSet, DiskStateQueue).\nParsing file /data/home/kirancodes/Documents/code/verus-research/wt-export-closures/audit/export-closures/cumulative-merged-ca16-final/nr/FlatCombiner/MC.tla\nParsing file /data/home/kirancodes/Documents/code/verus-research/wt-export-closures/audit/export-closures/cumulative-merged-ca16-final/nr/FlatCombiner/State_tla.tla\nParsing file /tmp/tlc-4982442723810998035/_TLCTrace.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/_TLCTrace.tla)\nParsing file /tmp/tlc-4982442723810998035/Integers.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/Integers.tla)\nParsing file /tmp/tlc-4982442723810998035/Sequences.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/Sequences.tla)\nParsing file /tmp/tlc-4982442723810998035/FiniteSets.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/FiniteSets.tla)\nParsing file /tmp/tlc-4982442723810998035/TLC.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/TLC.tla)\nParsing file /tmp/tlc-4982442723810998035/Naturals.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/Naturals.tla)\nParsing file /tmp/tlc-4982442723810998035/TLCExt.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/TLCExt.tla)\nSemantic processing of module Naturals\nSemantic processing of module Integers\nSemantic processing of module Sequences\nSemantic processing of module FiniteSets\nSemantic processing of module TLC\nSemantic processing of module State_tla\nSemantic processing of module TLCExt\nSemantic processing of module _TLCTrace\nSemantic processing of module MC\nLinting of module State_tla\nLinting of module TLCExt\nLinting of module _TLCTrace\nLinting of module MC\nStarting... (2026-10-08 14:26:24)\nError: The constant parameter Table_arbitrary__tla_closed is not assigned a value by the configuration file.\nFinished in 00s at (2026-10-08 14:26:24)\n"
         },
         {
           "machine": "nr/RwLockSpec",
           "primary": false,
           "export_rc": 0,
-          "export_seconds": 3.51,
+          "export_seconds": 3.61,
           "refusals": 0,
           "export_status": "exported",
           "campaign_bounds": true,
@@ -6752,8 +6758,12 @@
     }
   },
   "golden": {
+    "toggle_sync/State_tla.tla.json": {
+      "sha256": "1c86c85f36cc32a7b6fb1d319bb6c60fa624432f61b2f686fc231eb5ecfb85a1",
+      "identical": true
+    },
     "toggle_sync/State_tla_trace.cfg": {
-      "sha256": "4c0dda1fee2484b902db6b6975cb40855f3c30e9ee28849bb5873db06d8fd6ba",
+      "sha256": "322df0e96bbdd44f2cdb5a29a05ef6901d35a510c529533bf90e4dc830bf0557",
       "identical": true
     },
     "toggle_sync/State_tla.tla": {
@@ -6761,11 +6771,15 @@
       "identical": true
     },
     "toggle_sync/State_tla_trace.tla": {
-      "sha256": "3f5e835d59fa409dbb407f510828856cd78970b5aac1f12c5ee83b91e75ba177",
+      "sha256": "6a142bbedd6b28ff2d48fdf51323b2bc3b46177ac0b287d443deec5f1b0d8b7f",
       "identical": true
     },
     "toggle_sync/State_tla.cfg": {
       "sha256": "e34239e8f50d92f3290b25f157ce0cbae93e05596b46d8be30531cc66a6c2be9",
+      "identical": true
+    },
+    "safety/GState_tla.tla.json": {
+      "sha256": "c135933101c04683c3485d110f8fb5c4316fd85d593f0de80f587c187c005162",
       "identical": true
     },
     "safety/GState_tla.tla": {
@@ -6777,15 +6791,19 @@
       "identical": true
     },
     "safety/GState_tla_trace.tla": {
-      "sha256": "d5453e1974335f65659bc9a3d978a620c73c9c2e2ba9eca973743b4ba0f458e2",
+      "sha256": "2dbe3611bc2a9437bcc37a6fe7b070a00eae9ddd95370c49ba0aae68412e47e6",
       "identical": true
     },
     "safety/GState_tla_trace.cfg": {
-      "sha256": "4c0dda1fee2484b902db6b6975cb40855f3c30e9ee28849bb5873db06d8fd6ba",
+      "sha256": "322df0e96bbdd44f2cdb5a29a05ef6901d35a510c529533bf90e4dc830bf0557",
+      "identical": true
+    },
+    "assert_sync/State_tla.tla.json": {
+      "sha256": "6171ac530ee9b195ebf13d444c67019bc1a6482509423ae1bb478c11f99a04c0",
       "identical": true
     },
     "assert_sync/State_tla_trace.cfg": {
-      "sha256": "4c0dda1fee2484b902db6b6975cb40855f3c30e9ee28849bb5873db06d8fd6ba",
+      "sha256": "322df0e96bbdd44f2cdb5a29a05ef6901d35a510c529533bf90e4dc830bf0557",
       "identical": true
     },
     "assert_sync/State_tla.tla": {
@@ -6793,15 +6811,19 @@
       "identical": true
     },
     "assert_sync/State_tla_trace.tla": {
-      "sha256": "f911283a6bc434202484b66403ec1162f9e7da85a7cfc4a72d81410652f36cb7",
+      "sha256": "29ead3426bf02587bc241a11fe43a6f9812de9ebd0359dba4485ae2d3b529edc",
       "identical": true
     },
     "assert_sync/State_tla.cfg": {
       "sha256": "1d76b7c9bb7d8ce49c4b93bf801cfb6d424f3e8c34743eb59f32dcb52b42dc8f",
       "identical": true
     },
+    "mutex_tla/State_tla.tla.json": {
+      "sha256": "c481fad79ac1943655dfcea9b25393371edcecc58df21fdb0dc6db7ca36bc33d",
+      "identical": true
+    },
     "mutex_tla/State_tla_trace.cfg": {
-      "sha256": "4c0dda1fee2484b902db6b6975cb40855f3c30e9ee28849bb5873db06d8fd6ba",
+      "sha256": "322df0e96bbdd44f2cdb5a29a05ef6901d35a510c529533bf90e4dc830bf0557",
       "identical": true
     },
     "mutex_tla/State_tla.tla": {
@@ -6809,15 +6831,19 @@
       "identical": true
     },
     "mutex_tla/State_tla_trace.tla": {
-      "sha256": "14a2f613e1b1ea798f16d634098573257cc348fc702df053ad0f6c91198bd82e",
+      "sha256": "e087b940d785f5fc5fc474e1aeb8b1936a205401b12ce4a5161bc85158007cad",
       "identical": true
     },
     "mutex_tla/State_tla.cfg": {
       "sha256": "87833bc818627b60e0318620066a059bd45598a501e7acc4eca96e73c253b234",
       "identical": true
     },
+    "adder_sync/State_tla.tla.json": {
+      "sha256": "7978dd00e10d6c888c94cc5114ecd9d782e9e0de4d22a5f4cfe961b39b595875",
+      "identical": true
+    },
     "adder_sync/State_tla_trace.cfg": {
-      "sha256": "4c0dda1fee2484b902db6b6975cb40855f3c30e9ee28849bb5873db06d8fd6ba",
+      "sha256": "322df0e96bbdd44f2cdb5a29a05ef6901d35a510c529533bf90e4dc830bf0557",
       "identical": true
     },
     "adder_sync/State_tla.tla": {
@@ -6825,19 +6851,23 @@
       "identical": true
     },
     "adder_sync/State_tla_trace.tla": {
-      "sha256": "7c8c811f987d40daaaba2fe7766975a8ddfc1c2137dffe4b4205d40f5a002cfe",
+      "sha256": "4177cc2ffb614424ff99e62c0c082fd1669fc2c4eecb456236bb14735dca9dd3",
       "identical": true
     },
     "adder_sync/State_tla.cfg": {
       "sha256": "dc42f4ac7c164de76a1e973997e5ae2260509e35a94e5630e465dc8c72e68ae0",
       "identical": true
     },
+    "mutex_liveness/ProgramState_tla.tla.json": {
+      "sha256": "c54c576e21c314939215020633b1d69e453ee94b30249c764bf7dc92f9a9a064",
+      "identical": true
+    },
     "mutex_liveness/ProgramState_tla_trace.tla": {
-      "sha256": "32e0ccfe8b360d360fc6cae5abf3b979e33e8f7ef9b57cc8604cd364ccf64b16",
+      "sha256": "a32435dff49b79d3e7b1f22f5cd224030e8a246c390d3676dac867eb0b5d9041",
       "identical": true
     },
     "mutex_liveness/ProgramState_tla_trace.cfg": {
-      "sha256": "4c0dda1fee2484b902db6b6975cb40855f3c30e9ee28849bb5873db06d8fd6ba",
+      "sha256": "322df0e96bbdd44f2cdb5a29a05ef6901d35a510c529533bf90e4dc830bf0557",
       "identical": true
     },
     "mutex_liveness/ProgramState_tla.cfg": {
@@ -6848,8 +6878,12 @@
       "sha256": "600532382b8e746592f9ebe03de066614877f36a4e6608784bb5285c3f27ec92",
       "identical": true
     },
+    "counter/State_tla.tla.json": {
+      "sha256": "e7080147644d729da2c2c1cd15cabe0edfa72469095058b069e50282c69f29a2",
+      "identical": true
+    },
     "counter/State_tla_trace.cfg": {
-      "sha256": "4c0dda1fee2484b902db6b6975cb40855f3c30e9ee28849bb5873db06d8fd6ba",
+      "sha256": "322df0e96bbdd44f2cdb5a29a05ef6901d35a510c529533bf90e4dc830bf0557",
       "identical": true
     },
     "counter/State_tla.tla": {
@@ -6857,7 +6891,7 @@
       "identical": true
     },
     "counter/State_tla_trace.tla": {
-      "sha256": "159795c1491bc0b122b10f65d8f2e984071de4d9244fd349fd3f8205fad7b2ad",
+      "sha256": "f7a2634d8ea62b6f52dcf3068093d73df09281b0b94b4815ae5892b53f584172",
       "identical": true
     },
     "counter/State_tla.cfg": {
@@ -6868,21 +6902,21 @@
   "round2_anvil": {
     "parent": {
       "campaign": "/data/home/kirancodes/Documents/code/verus-research/campaign-real/round2",
-      "phase": "round2-parent-fb801",
+      "phase": "round2-parent-ca16",
       "binary": "/data/home/kirancodes/Documents/code/verus-research/wt-export-partial/source/target-verus/release/verus",
-      "binary_version": "0.2026.10.07.5e38e1e.dirty",
+      "binary_version": "0.2026.10.08.fb8014b.dirty",
       "sha256": {
         "verus": "5ffa1cb2b1e0df2bbed030d98414f20640f9c0613551a62be858ad320bf87a2a",
-        "rust_verify": "392bdb513502890508cf0a9cddf83fcad03e0041b3b4c960e60a04c26e3de1e4"
+        "rust_verify": "b9a2a5ac0f52dd16a12b46156ffb4b6edb003df0d423fecca8e02621fff493c5"
       },
-      "base_commit": "fb8014b0888681513f83e968863bd8e8438b9090",
-      "head_commit": "70a1754fc6c22a3451b6f94a3bf86e1b4b8fd75b",
+      "base_commit": "ca16f117659d44954c434c4e5c9a775f9eb49375",
+      "head_commit": "8b00f9bffa9c8b156ee2cad7460612fe712d6114",
       "rows": [
         {
           "machine": "anvil/sub_network",
           "primary": true,
           "export_rc": 0,
-          "export_seconds": 2.51,
+          "export_seconds": 1.81,
           "refusals": 2,
           "export_status": "exported",
           "campaign_bounds": true,
@@ -6925,18 +6959,18 @@
           ],
           "invariant_violations": [],
           "search_complete": false,
-          "tlc_diagnostics": "TLC2 Version 2026.09.24.190251 (rev: 11305b4)\nWarning: Please run the Java VM, which executes TLC with a throughput optimized garbage collector, by passing the \"-XX:+UseParallelGC\" property.\n(Use the -nowarning option to disable this warning.)\nRunning breadth-first search Model-Checking with fp 32 and seed -6779081535006499228 with 1 worker on 32 cores with 1024MB heap and 64MB offheap memory [pid: 3159654] (Linux 7.0.0-1012-aws amd64, Ubuntu 25.0.4.1 64bit, MSBDiskFPSet, DiskStateQueue).\nParsing file /data/home/kirancodes/Documents/code/verus-research/wt-export-closures/audit/export-closures/cumulative-round2-parent-fb801/anvil/sub_network/MC.tla\nParsing file /data/home/kirancodes/Documents/code/verus-research/wt-export-closures/audit/export-closures/cumulative-round2-parent-fb801/anvil/sub_network/NetworkState_tla.tla\nParsing file /tmp/tlc-12717507666874792275/Integers.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/Integers.tla)\nParsing file /tmp/tlc-12717507666874792275/Sequences.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/Sequences.tla)\nParsing file /tmp/tlc-12717507666874792275/FiniteSets.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/FiniteSets.tla)\nParsing file /tmp/tlc-12717507666874792275/TLC.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/TLC.tla)\nParsing file /tmp/tlc-12717507666874792275/Naturals.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/Naturals.tla)\nSemantic processing of module Naturals\nSemantic processing of module Integers\nSemantic processing of module Sequences\nSemantic processing of module FiniteSets\nSemantic processing of module TLC\nSemantic processing of module NetworkState_tla\nSemantic processing of module MC\nLinting of module NetworkState_tla\nLinting of module MC\nStarting... (2026-10-08 02:25:28)\nComputing initial states...\nFinished computing initial states: 1 distinct state generated at 2026-10-08 02:25:28.\nError: The first argument of Assert evaluated to FALSE; the second argument was:\n\"tla-export refused: application of a spec_fn value that does not reduce to a closure at /Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/state_machine/action.rs:28:17: 28:46 (#0)\"\nError: The behavior up to this point is:\nState 1: <Initial predicate>\nin_flight = <<>>\n\nError: The first argument of Assert evaluated to FALSE; the second argument was:\n\"tla-export refused: application of a spec_fn value that does not reduce to a closure at /Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/state_machine/action.rs:28:17: 28:46 (#0)\"\nError: The behavior up to this point is:\nState 1: <Initial predicate>\nin_flight = <<>>\n\nError: The error occurred when TLC was evaluating the nested\nexpressions at the following positions:\n0. Line 33, column 9 to line 33, column 23 in NetworkState_tla\n1. Line 33, column 9 to line 33, column 12 in NetworkState_tla\n2. Line 27, column 6 to line 27, column 958 in NetworkState_tla\n3. Line 27, column 422 to line 27, column 957 in NetworkState_tla\n4. Line 27, column 443 to line 27, column 956 in NetworkState_tla\n5. Line 27, column 443 to line 27, column 674 in NetworkState_tla\n\n\n1 states generated, 1 distinct states found, 0 states left on queue.\nThe depth of the complete state graph search is 1.\nFinished in 00s at (2026-10-08 02:25:28)\n"
+          "tlc_diagnostics": "TLC2 Version 2026.09.24.190251 (rev: 11305b4)\nWarning: Please run the Java VM, which executes TLC with a throughput optimized garbage collector, by passing the \"-XX:+UseParallelGC\" property.\n(Use the -nowarning option to disable this warning.)\nRunning breadth-first search Model-Checking with fp 22 and seed -9201540355260402426 with 1 worker on 32 cores with 1024MB heap and 64MB offheap memory [pid: 2500273] (Linux 7.0.0-1012-aws amd64, Ubuntu 25.0.4.1 64bit, MSBDiskFPSet, DiskStateQueue).\nParsing file /data/home/kirancodes/Documents/code/verus-research/wt-export-closures/audit/export-closures/cumulative-round2-parent-ca16/anvil/sub_network/MC.tla\nParsing file /data/home/kirancodes/Documents/code/verus-research/wt-export-closures/audit/export-closures/cumulative-round2-parent-ca16/anvil/sub_network/NetworkState_tla.tla\nParsing file /tmp/tlc-13783368814035301358/Integers.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/Integers.tla)\nParsing file /tmp/tlc-13783368814035301358/Sequences.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/Sequences.tla)\nParsing file /tmp/tlc-13783368814035301358/FiniteSets.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/FiniteSets.tla)\nParsing file /tmp/tlc-13783368814035301358/TLC.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/TLC.tla)\nParsing file /tmp/tlc-13783368814035301358/Naturals.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/Naturals.tla)\nSemantic processing of module Naturals\nSemantic processing of module Integers\nSemantic processing of module Sequences\nSemantic processing of module FiniteSets\nSemantic processing of module TLC\nSemantic processing of module NetworkState_tla\nSemantic processing of module MC\nLinting of module NetworkState_tla\nLinting of module MC\nStarting... (2026-10-08 14:18:33)\nComputing initial states...\nFinished computing initial states: 1 distinct state generated at 2026-10-08 14:18:33.\nError: The first argument of Assert evaluated to FALSE; the second argument was:\n\"tla-export refused: application of a spec_fn value that does not reduce to a closure at /Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/state_machine/action.rs:28:17: 28:46 (#0)\"\nError: The behavior up to this point is:\nState 1: <Initial predicate>\nin_flight = <<>>\n\nError: The first argument of Assert evaluated to FALSE; the second argument was:\n\"tla-export refused: application of a spec_fn value that does not reduce to a closure at /Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/state_machine/action.rs:28:17: 28:46 (#0)\"\nError: The behavior up to this point is:\nState 1: <Initial predicate>\nin_flight = <<>>\n\nError: The error occurred when TLC was evaluating the nested\nexpressions at the following positions:\n0. Line 33, column 9 to line 33, column 23 in NetworkState_tla\n1. Line 33, column 9 to line 33, column 12 in NetworkState_tla\n2. Line 27, column 6 to line 27, column 958 in NetworkState_tla\n3. Line 27, column 422 to line 27, column 957 in NetworkState_tla\n4. Line 27, column 443 to line 27, column 956 in NetworkState_tla\n5. Line 27, column 443 to line 27, column 674 in NetworkState_tla\n\n\n1 states generated, 1 distinct states found, 0 states left on queue.\nThe depth of the complete state graph search is 1.\nFinished in 00s at (2026-10-08 14:18:33)\n"
         },
         {
           "machine": "anvil/sub_vrs_reconcile",
           "primary": false,
           "export_rc": 0,
-          "export_seconds": 2.71,
+          "export_seconds": 1.91,
           "refusals": 0,
           "export_status": "exported",
           "campaign_bounds": true,
-          "tlc_status": "complete_with_counterexample",
-          "explores": true,
+          "tlc_status": "evaluation_error",
+          "explores": false,
           "completes": false,
           "holes": 139,
           "restrictions": 3,
@@ -6946,43 +6980,43 @@
           "init_enumerated": [],
           "sany_ok": true,
           "bound_files": {
-            "MC.tla": "874c29fbcd9d9fc495cf3c8f0cf5da68bfc9ddc43e3b709959c994774523f56a",
+            "MC.tla": "4d6aaeb89404afb4fce8e0fe482ac7b7938add448704dec3551a06e529577191",
             "MC.cfg": "d3d323e21f9f8d3c8f7fbc78499675cece24487ca202c636ff3118107ab480bf"
           },
           "saved_tlc_command": false,
-          "tlc_rc": 0,
+          "tlc_rc": 151,
           "tlc_budget_seconds": "30",
-          "generated": 7960,
-          "distinct": 7,
           "tlc_errors": [
-            "Error: Invariant not_error is violated.",
-            "Error: The behavior up to this point is:"
+            "Error: The constant parameter Table_marshal_spec_2 is not assigned a value by the configuration file."
           ],
-          "invariant_violations": [
-            "not_error"
-          ],
-          "search_complete": true,
-          "tlc_diagnostics": "TLC2 Version 2026.09.24.190251 (rev: 11305b4)\nWarning: Please run the Java VM, which executes TLC with a throughput optimized garbage collector, by passing the \"-XX:+UseParallelGC\" property.\n(Use the -nowarning option to disable this warning.)\nRunning breadth-first search Model-Checking with fp 4 and seed 8348491920200915512 with 1 worker on 32 cores with 1024MB heap and 64MB offheap memory [pid: 3159782] (Linux 7.0.0-1012-aws amd64, Ubuntu 25.0.4.1 64bit, MSBDiskFPSet, DiskStateQueue).\nParsing file /data/home/kirancodes/Documents/code/verus-research/wt-export-closures/audit/export-closures/cumulative-round2-parent-fb801/anvil/sub_vrs_reconcile/MC.tla\nParsing file /data/home/kirancodes/Documents/code/verus-research/wt-export-closures/audit/export-closures/cumulative-round2-parent-fb801/anvil/sub_vrs_reconcile/VReplicaSetReconcileState_tla.tla\nParsing file /tmp/tlc-587784603169930375/Integers.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/Integers.tla)\nParsing file /tmp/tlc-587784603169930375/Sequences.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/Sequences.tla)\nParsing file /tmp/tlc-587784603169930375/FiniteSets.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/FiniteSets.tla)\nParsing file /tmp/tlc-587784603169930375/TLC.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/TLC.tla)\nParsing file /tmp/tlc-587784603169930375/Naturals.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/Naturals.tla)\nSemantic processing of module Naturals\nSemantic processing of module Integers\nSemantic processing of module Sequences\nSemantic processing of module FiniteSets\nSemantic processing of module TLC\nSemantic processing of module VReplicaSetReconcileState_tla\nSemantic processing of module MC\nLinting of module VReplicaSetReconcileState_tla\nLinting of module MC\nStarting... (2026-10-08 02:25:29)\nComputing initial states...\nFinished computing initial states: 1 distinct state generated at 2026-10-08 02:25:29.\nError: Invariant not_error is violated.\nError: The behavior up to this point is:\nState 1: <Initial predicate>\n/\\ reconcile_step = [tag |-> \"Init\"]\n/\\ filtered_pods = [tag |-> \"None\"]\n\nState 2: <Next line 291, col 9 to line 291, col 23 of module VReplicaSetReconcileState_tla>\n/\\ reconcile_step = [tag |-> \"AfterListPods\"]\n/\\ filtered_pods = [tag |-> \"None\"]\n\nState 3: <Next line 291, col 9 to line 291, col 23 of module VReplicaSetReconcileState_tla>\n/\\ reconcile_step = [tag |-> \"Error\"]\n/\\ filtered_pods = [tag |-> \"None\"]\n\nModel checking completed. No error has been found.\n  Estimates of the probability that TLC did not check all reachable states\n  because two distinct states had the same fingerprint:\n  calculated (optimistic):  val = 3.0E-15\n7960 states generated, 7 distinct states found, 0 states left on queue.\nThe depth of the complete state graph search is 4.\nThe average outdegree of the complete state graph is 1 (minimum is 0, the maximum 4 and the 95th percentile is 4).\nFinished in 01s at (2026-10-08 02:25:30)\n"
+          "invariant_violations": [],
+          "search_complete": false,
+          "tlc_diagnostics": "TLC2 Version 2026.09.24.190251 (rev: 11305b4)\nWarning: Please run the Java VM, which executes TLC with a throughput optimized garbage collector, by passing the \"-XX:+UseParallelGC\" property.\n(Use the -nowarning option to disable this warning.)\nRunning breadth-first search Model-Checking with fp 89 and seed 5404181561708011741 with 1 worker on 32 cores with 1024MB heap and 64MB offheap memory [pid: 2500341] (Linux 7.0.0-1012-aws amd64, Ubuntu 25.0.4.1 64bit, MSBDiskFPSet, DiskStateQueue).\nParsing file /data/home/kirancodes/Documents/code/verus-research/wt-export-closures/audit/export-closures/cumulative-round2-parent-ca16/anvil/sub_vrs_reconcile/MC.tla\nParsing file /data/home/kirancodes/Documents/code/verus-research/wt-export-closures/audit/export-closures/cumulative-round2-parent-ca16/anvil/sub_vrs_reconcile/VReplicaSetReconcileState_tla.tla\nParsing file /tmp/tlc-3421825768333619670/Integers.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/Integers.tla)\nParsing file /tmp/tlc-3421825768333619670/Sequences.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/Sequences.tla)\nParsing file /tmp/tlc-3421825768333619670/FiniteSets.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/FiniteSets.tla)\nParsing file /tmp/tlc-3421825768333619670/TLC.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/TLC.tla)\nParsing file /tmp/tlc-3421825768333619670/Naturals.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/Naturals.tla)\nSemantic processing of module Naturals\nSemantic processing of module Integers\nSemantic processing of module Sequences\nSemantic processing of module FiniteSets\nSemantic processing of module TLC\nSemantic processing of module VReplicaSetReconcileState_tla\nSemantic processing of module MC\nLinting of module VReplicaSetReconcileState_tla\nLinting of module MC\nStarting... (2026-10-08 14:18:34)\nError: The constant parameter Table_marshal_spec_2 is not assigned a value by the configuration file.\nFinished in 00s at (2026-10-08 14:18:34)\n"
         }
       ]
     },
     "after": {
+      "source_sha256": {
+        "source/vir/src/tla.rs": "e3fcb00710c68dc0a06645d93a385f61f19fa0f6f10a97fd147779b1b696d5ce",
+        "source/vir/src/tla/functions.rs": "65715a8933723478baa3b821eaf34334375f90a73d6de119184e4082b4cfd88e",
+        "source/rust_verify_test/tests/tla_export.rs": "4a9d0ae9647b0bbb5c97d897e10d932f8380ab2247c47c44856058194c7f3d64"
+      },
       "campaign": "/data/home/kirancodes/Documents/code/verus-research/campaign-real/round2",
-      "phase": "round2-reconfirm-fb801",
+      "phase": "round2-merged-ca16-final",
       "binary": "/data/home/kirancodes/Documents/code/verus-research/wt-export-closures/source/target-verus/release/verus",
-      "binary_version": "0.2026.10.08.ae43c66",
+      "binary_version": "0.2026.10.08.8b00f9b.dirty",
       "sha256": {
         "verus": "5ffa1cb2b1e0df2bbed030d98414f20640f9c0613551a62be858ad320bf87a2a",
-        "rust_verify": "b222e780d3a4d68986f9d82bc4cd17de2fe994ca4842200d12dab71644be1f97"
+        "rust_verify": "767c837fb3d48b20328f55ca965f527f24641b3e388c9fa9087709944a2a9599"
       },
-      "base_commit": "fb8014b0888681513f83e968863bd8e8438b9090",
-      "head_commit": "ae43c6691153efee234c375a300d0b72bd399d40",
+      "base_commit": "ca16f117659d44954c434c4e5c9a775f9eb49375",
+      "head_commit": "8b00f9bffa9c8b156ee2cad7460612fe712d6114",
       "rows": [
         {
           "machine": "anvil/sub_network",
           "primary": true,
           "export_rc": 0,
-          "export_seconds": 2.61,
+          "export_seconds": 1.81,
           "refusals": 0,
           "export_status": "exported",
           "campaign_bounds": true,
@@ -7013,12 +7047,12 @@
           "machine": "anvil/sub_vrs_reconcile",
           "primary": false,
           "export_rc": 0,
-          "export_seconds": 2.81,
+          "export_seconds": 2.01,
           "refusals": 0,
           "export_status": "exported",
           "campaign_bounds": true,
-          "tlc_status": "complete_with_counterexample",
-          "explores": true,
+          "tlc_status": "evaluation_error",
+          "explores": false,
           "completes": false,
           "holes": 139,
           "restrictions": 3,
@@ -7028,23 +7062,18 @@
           "init_enumerated": [],
           "sany_ok": true,
           "bound_files": {
-            "MC.tla": "874c29fbcd9d9fc495cf3c8f0cf5da68bfc9ddc43e3b709959c994774523f56a",
+            "MC.tla": "4d6aaeb89404afb4fce8e0fe482ac7b7938add448704dec3551a06e529577191",
             "MC.cfg": "d3d323e21f9f8d3c8f7fbc78499675cece24487ca202c636ff3118107ab480bf"
           },
           "saved_tlc_command": false,
-          "tlc_rc": 0,
+          "tlc_rc": 151,
           "tlc_budget_seconds": "30",
-          "generated": 7960,
-          "distinct": 7,
           "tlc_errors": [
-            "Error: Invariant not_error is violated.",
-            "Error: The behavior up to this point is:"
+            "Error: The constant parameter Table_marshal_spec_2 is not assigned a value by the configuration file."
           ],
-          "invariant_violations": [
-            "not_error"
-          ],
-          "search_complete": true,
-          "tlc_diagnostics": "TLC2 Version 2026.09.24.190251 (rev: 11305b4)\nWarning: Please run the Java VM, which executes TLC with a throughput optimized garbage collector, by passing the \"-XX:+UseParallelGC\" property.\n(Use the -nowarning option to disable this warning.)\nRunning breadth-first search Model-Checking with fp 65 and seed 8696097799063069571 with 1 worker on 32 cores with 1024MB heap and 64MB offheap memory [pid: 3933850] (Linux 7.0.0-1012-aws amd64, Ubuntu 25.0.4.1 64bit, MSBDiskFPSet, DiskStateQueue).\nParsing file /data/home/kirancodes/Documents/code/verus-research/wt-export-closures/audit/export-closures/cumulative-round2-reconfirm-fb801/anvil/sub_vrs_reconcile/MC.tla\nParsing file /data/home/kirancodes/Documents/code/verus-research/wt-export-closures/audit/export-closures/cumulative-round2-reconfirm-fb801/anvil/sub_vrs_reconcile/VReplicaSetReconcileState_tla.tla\nParsing file /tmp/tlc-10112153001907017269/Integers.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/Integers.tla)\nParsing file /tmp/tlc-10112153001907017269/Sequences.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/Sequences.tla)\nParsing file /tmp/tlc-10112153001907017269/FiniteSets.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/FiniteSets.tla)\nParsing file /tmp/tlc-10112153001907017269/TLC.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/TLC.tla)\nParsing file /tmp/tlc-10112153001907017269/Naturals.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/Naturals.tla)\nSemantic processing of module Naturals\nSemantic processing of module Integers\nSemantic processing of module Sequences\nSemantic processing of module FiniteSets\nSemantic processing of module TLC\nSemantic processing of module VReplicaSetReconcileState_tla\nSemantic processing of module MC\nLinting of module VReplicaSetReconcileState_tla\nLinting of module MC\nStarting... (2026-10-08 03:32:19)\nComputing initial states...\nFinished computing initial states: 1 distinct state generated at 2026-10-08 03:32:20.\nError: Invariant not_error is violated.\nError: The behavior up to this point is:\nState 1: <Initial predicate>\n/\\ reconcile_step = [tag |-> \"Init\"]\n/\\ filtered_pods = [tag |-> \"None\"]\n\nState 2: <Next line 291, col 9 to line 291, col 23 of module VReplicaSetReconcileState_tla>\n/\\ reconcile_step = [tag |-> \"AfterListPods\"]\n/\\ filtered_pods = [tag |-> \"None\"]\n\nState 3: <Next line 291, col 9 to line 291, col 23 of module VReplicaSetReconcileState_tla>\n/\\ reconcile_step = [tag |-> \"Error\"]\n/\\ filtered_pods = [tag |-> \"None\"]\n\nModel checking completed. No error has been found.\n  Estimates of the probability that TLC did not check all reachable states\n  because two distinct states had the same fingerprint:\n  calculated (optimistic):  val = 3.0E-15\n7960 states generated, 7 distinct states found, 0 states left on queue.\nThe depth of the complete state graph search is 4.\nThe average outdegree of the complete state graph is 1 (minimum is 0, the maximum 4 and the 95th percentile is 4).\nFinished in 01s at (2026-10-08 03:32:20)\n"
+          "invariant_violations": [],
+          "search_complete": false,
+          "tlc_diagnostics": "TLC2 Version 2026.09.24.190251 (rev: 11305b4)\nWarning: Please run the Java VM, which executes TLC with a throughput optimized garbage collector, by passing the \"-XX:+UseParallelGC\" property.\n(Use the -nowarning option to disable this warning.)\nRunning breadth-first search Model-Checking with fp 32 and seed -6226654789890194241 with 1 worker on 32 cores with 1024MB heap and 64MB offheap memory [pid: 2603308] (Linux 7.0.0-1012-aws amd64, Ubuntu 25.0.4.1 64bit, MSBDiskFPSet, DiskStateQueue).\nParsing file /data/home/kirancodes/Documents/code/verus-research/wt-export-closures/audit/export-closures/cumulative-round2-merged-ca16-final/anvil/sub_vrs_reconcile/MC.tla\nParsing file /data/home/kirancodes/Documents/code/verus-research/wt-export-closures/audit/export-closures/cumulative-round2-merged-ca16-final/anvil/sub_vrs_reconcile/VReplicaSetReconcileState_tla.tla\nParsing file /tmp/tlc-15632621354249795545/Integers.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/Integers.tla)\nParsing file /tmp/tlc-15632621354249795545/Sequences.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/Sequences.tla)\nParsing file /tmp/tlc-15632621354249795545/FiniteSets.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/FiniteSets.tla)\nParsing file /tmp/tlc-15632621354249795545/TLC.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/TLC.tla)\nParsing file /tmp/tlc-15632621354249795545/Naturals.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/Naturals.tla)\nSemantic processing of module Naturals\nSemantic processing of module Integers\nSemantic processing of module Sequences\nSemantic processing of module FiniteSets\nSemantic processing of module TLC\nSemantic processing of module VReplicaSetReconcileState_tla\nSemantic processing of module MC\nLinting of module VReplicaSetReconcileState_tla\nLinting of module MC\nStarting... (2026-10-08 14:25:08)\nError: The constant parameter Table_marshal_spec_2 is not assigned a value by the configuration file.\nFinished in 00s at (2026-10-08 14:25:08)\n"
         }
       ]
     },
@@ -7123,7 +7152,7 @@
   },
   "previous_stack": {
     "base_commit": "fb8014b0888681513f83e968863bd8e8438b9090",
-    "head_commit": "70a1754fc6c22a3451b6f94a3bf86e1b4b8fd75b",
+    "head_commit": "ae43c6691153efee234c375a300d0b72bd399d40",
     "primary": {
       "targets": 33,
       "exported": 24,
@@ -7201,7 +7230,7 @@
       "machine": "anvil/sub_api_sm",
       "primary": true,
       "export_rc": 0,
-      "export_seconds": 2.71,
+      "export_seconds": 6.11,
       "refusals": 8,
       "export_status": "exported",
       "campaign_bounds": false,

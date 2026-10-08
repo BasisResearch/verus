@@ -1,5 +1,5 @@
 The golden files are the unmodified parent-lane exports at commit
-6fc818cad8e20a29dc50432c8b8a7b0a49b91253. They were generated with the same crate name (test_crate) as the test
+519e9295f3540890f0116f977ab9344ce58b662c. They were generated with the same crate name (test_crate) as the test
 harness. Only the checkout-dependent source path (@SOURCE@) is normalized. The regression
 compares every byte of the four generated TLA/configuration files for all
 six examples/tla Rust fixtures and the pinned Raft model.

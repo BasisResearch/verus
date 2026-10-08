@@ -1,0 +1,433 @@
+{
+  "first_parent": "fb8014b0888681513f83e968863bd8e8438b9090",
+  "incoming_parent": "519e9295f3540890f0116f977ab9344ce58b662c",
+  "test_result": "test result: ok. 264 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 105.02s",
+  "test_sets": {
+    "ours": 210,
+    "incoming": 246,
+    "merged": 264,
+    "all_retained": true
+  },
+  "TLA2TOOLS_JAR": "/Users/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar",
+  "checks": {
+    "tests": {
+      "command": "vargo test --release -p rust_verify_test --test tla_export -- --test-threads=4",
+      "log_sha256": "3e65ecc9e805d7febeb6e6330ed94b642c749cc9b2981debf5858a079d997201",
+      "exit_code": 0
+    },
+    "fmt": {
+      "command": "vargo fmt --exclude vstd -- --check",
+      "log_sha256": "22279b11da1321d7c569a5a912d0894b5bbf847d33070fcfec4cf94f0158edf2",
+      "exit_code": 0
+    },
+    "clippy": {
+      "command": "vargo clippy --release -- -D warnings",
+      "log_sha256": "f7008b3f113e68d6e008093bec0229263288b3603af75635881fbf7d7d01e2e9",
+      "exit_code": 0
+    },
+    "clippy_exporter_tests": {
+      "command": "vargo cmd -- cargo clippy --release -p rust_verify_test --test tla_export -- -D warnings",
+      "log_sha256": "3e8acf911013d8c7af02dc3cadc16942f6e8933f92f6d9ee197dce2cb46487bf",
+      "exit_code": 0
+    }
+  },
+  "fixture_parent": {
+    "binary": "/data/home/kirancodes/Documents/code/verus-research/wt-export-nrkernel/source/target-verus/release/verus",
+    "group": "fixtures",
+    "phase": "merge-parent-fixtures",
+    "export_seconds": 90,
+    "tlc_seconds": 30,
+    "jobs": 2,
+    "sha256": {
+      "verus": "5ffa1cb2b1e0df2bbed030d98414f20640f9c0613551a62be858ad320bf87a2a",
+      "rust_verify": "e8cb0b82be30b392427dc42b28195c5e2e0dfa4a3094df9e03fc4bb7cce21193"
+    },
+    "rows": [
+      {
+        "id": "adder_sync",
+        "export_rc": 0,
+        "export_seconds": 0.504,
+        "status": "exported",
+        "refusals": 0,
+        "holes": 1,
+        "restrictions": 0,
+        "reasons": [],
+        "sany_status": "ok"
+      },
+      {
+        "id": "assert_sync",
+        "export_rc": 0,
+        "export_seconds": 0.504,
+        "status": "exported",
+        "refusals": 0,
+        "holes": 0,
+        "restrictions": 0,
+        "reasons": [],
+        "sany_status": "ok"
+      },
+      {
+        "id": "counter",
+        "export_rc": 0,
+        "export_seconds": 0.505,
+        "status": "exported",
+        "refusals": 0,
+        "holes": 0,
+        "restrictions": 0,
+        "reasons": [],
+        "sany_status": "ok"
+      },
+      {
+        "id": "mutex_liveness",
+        "export_rc": 0,
+        "export_seconds": 0.504,
+        "status": "exported",
+        "refusals": 0,
+        "holes": 0,
+        "restrictions": 0,
+        "reasons": [],
+        "sany_status": "ok"
+      },
+      {
+        "id": "mutex_tla",
+        "export_rc": 0,
+        "export_seconds": 0.504,
+        "status": "exported",
+        "refusals": 0,
+        "holes": 0,
+        "restrictions": 0,
+        "reasons": [],
+        "sany_status": "ok"
+      },
+      {
+        "id": "toggle_sync",
+        "export_rc": 0,
+        "export_seconds": 0.504,
+        "status": "exported",
+        "refusals": 0,
+        "holes": 0,
+        "restrictions": 0,
+        "reasons": [],
+        "sany_status": "ok"
+      },
+      {
+        "id": "toydb",
+        "export_rc": 0,
+        "export_seconds": 1.906,
+        "status": "exported",
+        "refusals": 0,
+        "holes": 3,
+        "restrictions": 0,
+        "reasons": [],
+        "sany_status": "ok"
+      }
+    ]
+  },
+  "fixture_merged": {
+    "binary": "/data/home/kirancodes/Documents/code/verus-research/wt-export-partial/source/target-verus/release/verus",
+    "group": "fixtures",
+    "phase": "merge-fixtures",
+    "export_seconds": 90,
+    "tlc_seconds": 30,
+    "jobs": 2,
+    "sha256": {
+      "verus": "5ffa1cb2b1e0df2bbed030d98414f20640f9c0613551a62be858ad320bf87a2a",
+      "rust_verify": "b9a2a5ac0f52dd16a12b46156ffb4b6edb003df0d423fecca8e02621fff493c5"
+    },
+    "rows": [
+      {
+        "id": "adder_sync",
+        "export_rc": 0,
+        "export_seconds": 0.503,
+        "status": "exported",
+        "refusals": 0,
+        "holes": 1,
+        "restrictions": 0,
+        "reasons": [],
+        "sany_status": "ok"
+      },
+      {
+        "id": "assert_sync",
+        "export_rc": 0,
+        "export_seconds": 0.504,
+        "status": "exported",
+        "refusals": 0,
+        "holes": 0,
+        "restrictions": 0,
+        "reasons": [],
+        "sany_status": "ok"
+      },
+      {
+        "id": "counter",
+        "export_rc": 0,
+        "export_seconds": 0.505,
+        "status": "exported",
+        "refusals": 0,
+        "holes": 0,
+        "restrictions": 0,
+        "reasons": [],
+        "sany_status": "ok"
+      },
+      {
+        "id": "mutex_liveness",
+        "export_rc": 0,
+        "export_seconds": 0.504,
+        "status": "exported",
+        "refusals": 0,
+        "holes": 0,
+        "restrictions": 0,
+        "reasons": [],
+        "sany_status": "ok"
+      },
+      {
+        "id": "mutex_tla",
+        "export_rc": 0,
+        "export_seconds": 0.507,
+        "status": "exported",
+        "refusals": 0,
+        "holes": 0,
+        "restrictions": 0,
+        "reasons": [],
+        "sany_status": "ok"
+      },
+      {
+        "id": "toggle_sync",
+        "export_rc": 0,
+        "export_seconds": 0.512,
+        "status": "exported",
+        "refusals": 0,
+        "holes": 0,
+        "restrictions": 0,
+        "reasons": [],
+        "sany_status": "ok"
+      },
+      {
+        "id": "toydb",
+        "export_rc": 0,
+        "export_seconds": 1.605,
+        "status": "exported",
+        "refusals": 0,
+        "holes": 3,
+        "restrictions": 0,
+        "reasons": [],
+        "sany_status": "ok"
+      }
+    ]
+  },
+  "fixture_comparison": [
+    {
+      "file": "adder_sync/export/State_tla.cfg",
+      "equal": true,
+      "parent_sha256": "dc42f4ac7c164de76a1e973997e5ae2260509e35a94e5630e465dc8c72e68ae0",
+      "merged_sha256": "dc42f4ac7c164de76a1e973997e5ae2260509e35a94e5630e465dc8c72e68ae0"
+    },
+    {
+      "file": "adder_sync/export/State_tla.tla",
+      "equal": true,
+      "parent_sha256": "8543fcd50a1d8953a6bcc4ad77dc76b66c3296a516c832512df874c3d380f4ec",
+      "merged_sha256": "8543fcd50a1d8953a6bcc4ad77dc76b66c3296a516c832512df874c3d380f4ec"
+    },
+    {
+      "file": "adder_sync/export/State_tla.tla.json",
+      "equal": true,
+      "parent_sha256": "8ec0f079d1da015386a899804462b194bd055572d9885d5b7eb8bd41650fb049",
+      "merged_sha256": "8ec0f079d1da015386a899804462b194bd055572d9885d5b7eb8bd41650fb049"
+    },
+    {
+      "file": "adder_sync/export/State_tla_trace.cfg",
+      "equal": true,
+      "parent_sha256": "322df0e96bbdd44f2cdb5a29a05ef6901d35a510c529533bf90e4dc830bf0557",
+      "merged_sha256": "322df0e96bbdd44f2cdb5a29a05ef6901d35a510c529533bf90e4dc830bf0557"
+    },
+    {
+      "file": "adder_sync/export/State_tla_trace.tla",
+      "equal": true,
+      "parent_sha256": "72699f40a53939fccbbdb2fe0dcf7afdf8168393f26b877262a4d104afb1dac9",
+      "merged_sha256": "72699f40a53939fccbbdb2fe0dcf7afdf8168393f26b877262a4d104afb1dac9"
+    },
+    {
+      "file": "assert_sync/export/State_tla.cfg",
+      "equal": true,
+      "parent_sha256": "1d76b7c9bb7d8ce49c4b93bf801cfb6d424f3e8c34743eb59f32dcb52b42dc8f",
+      "merged_sha256": "1d76b7c9bb7d8ce49c4b93bf801cfb6d424f3e8c34743eb59f32dcb52b42dc8f"
+    },
+    {
+      "file": "assert_sync/export/State_tla.tla",
+      "equal": true,
+      "parent_sha256": "4f8b2690d458c291d49843ce47886c2b8331d8c95bc15b54d9de399d85a41c7f",
+      "merged_sha256": "4f8b2690d458c291d49843ce47886c2b8331d8c95bc15b54d9de399d85a41c7f"
+    },
+    {
+      "file": "assert_sync/export/State_tla.tla.json",
+      "equal": true,
+      "parent_sha256": "0529116a70eed4501a419b6688aa611a83d7704c559e5d16c431045bccfa39af",
+      "merged_sha256": "0529116a70eed4501a419b6688aa611a83d7704c559e5d16c431045bccfa39af"
+    },
+    {
+      "file": "assert_sync/export/State_tla_trace.cfg",
+      "equal": true,
+      "parent_sha256": "322df0e96bbdd44f2cdb5a29a05ef6901d35a510c529533bf90e4dc830bf0557",
+      "merged_sha256": "322df0e96bbdd44f2cdb5a29a05ef6901d35a510c529533bf90e4dc830bf0557"
+    },
+    {
+      "file": "assert_sync/export/State_tla_trace.tla",
+      "equal": true,
+      "parent_sha256": "f8a83c5fd93fc8d3ccac57e63a63402661adc41291f110d32baf939247d12f04",
+      "merged_sha256": "f8a83c5fd93fc8d3ccac57e63a63402661adc41291f110d32baf939247d12f04"
+    },
+    {
+      "file": "counter/export/State_tla.cfg",
+      "equal": true,
+      "parent_sha256": "07ea3953075a098d96c20f1553408b68a4c2ceb221a9ce5c468fd3bbd73fa2d7",
+      "merged_sha256": "07ea3953075a098d96c20f1553408b68a4c2ceb221a9ce5c468fd3bbd73fa2d7"
+    },
+    {
+      "file": "counter/export/State_tla.tla",
+      "equal": true,
+      "parent_sha256": "36b11ce6b0077fb01d44e390d543360a1be4f0248dcc7ae6207c002ce154be18",
+      "merged_sha256": "36b11ce6b0077fb01d44e390d543360a1be4f0248dcc7ae6207c002ce154be18"
+    },
+    {
+      "file": "counter/export/State_tla.tla.json",
+      "equal": true,
+      "parent_sha256": "ccf39fd05947e9fcef454bab0b8a63f3f796d11bf7da52dd014f4c5e5e5cda53",
+      "merged_sha256": "ccf39fd05947e9fcef454bab0b8a63f3f796d11bf7da52dd014f4c5e5e5cda53"
+    },
+    {
+      "file": "counter/export/State_tla_trace.cfg",
+      "equal": true,
+      "parent_sha256": "322df0e96bbdd44f2cdb5a29a05ef6901d35a510c529533bf90e4dc830bf0557",
+      "merged_sha256": "322df0e96bbdd44f2cdb5a29a05ef6901d35a510c529533bf90e4dc830bf0557"
+    },
+    {
+      "file": "counter/export/State_tla_trace.tla",
+      "equal": true,
+      "parent_sha256": "29d2043f672d8618a0665b69b027d866ac50ecf080b6a11be0652a9852bc9c5d",
+      "merged_sha256": "29d2043f672d8618a0665b69b027d866ac50ecf080b6a11be0652a9852bc9c5d"
+    },
+    {
+      "file": "mutex_liveness/export/ProgramState_tla.cfg",
+      "equal": true,
+      "parent_sha256": "533a092f3d125531cff14cc059695cbef2e2f413479fce6d04e39f9a9aec25f5",
+      "merged_sha256": "533a092f3d125531cff14cc059695cbef2e2f413479fce6d04e39f9a9aec25f5"
+    },
+    {
+      "file": "mutex_liveness/export/ProgramState_tla.tla",
+      "equal": true,
+      "parent_sha256": "9e27c19574876bbd23c17b346401f9dee0f4afe39538338b4ecaafeb3e9eca46",
+      "merged_sha256": "9e27c19574876bbd23c17b346401f9dee0f4afe39538338b4ecaafeb3e9eca46"
+    },
+    {
+      "file": "mutex_liveness/export/ProgramState_tla.tla.json",
+      "equal": true,
+      "parent_sha256": "41252778ae3cb6caa27e40735f9813cdfbded22de71b7ee16f1bdec390b3b965",
+      "merged_sha256": "41252778ae3cb6caa27e40735f9813cdfbded22de71b7ee16f1bdec390b3b965"
+    },
+    {
+      "file": "mutex_liveness/export/ProgramState_tla_trace.cfg",
+      "equal": true,
+      "parent_sha256": "322df0e96bbdd44f2cdb5a29a05ef6901d35a510c529533bf90e4dc830bf0557",
+      "merged_sha256": "322df0e96bbdd44f2cdb5a29a05ef6901d35a510c529533bf90e4dc830bf0557"
+    },
+    {
+      "file": "mutex_liveness/export/ProgramState_tla_trace.tla",
+      "equal": true,
+      "parent_sha256": "eba5985faae1c1d661fbc9e23e7a18cceeb5671dcefea1dda8ad1d24f9ad524e",
+      "merged_sha256": "eba5985faae1c1d661fbc9e23e7a18cceeb5671dcefea1dda8ad1d24f9ad524e"
+    },
+    {
+      "file": "mutex_tla/export/State_tla.cfg",
+      "equal": true,
+      "parent_sha256": "87833bc818627b60e0318620066a059bd45598a501e7acc4eca96e73c253b234",
+      "merged_sha256": "87833bc818627b60e0318620066a059bd45598a501e7acc4eca96e73c253b234"
+    },
+    {
+      "file": "mutex_tla/export/State_tla.tla",
+      "equal": true,
+      "parent_sha256": "38cd23a4c57b84b1206f69640383f5240a3c4f67bce0eb48ecaed63eb8691e78",
+      "merged_sha256": "38cd23a4c57b84b1206f69640383f5240a3c4f67bce0eb48ecaed63eb8691e78"
+    },
+    {
+      "file": "mutex_tla/export/State_tla.tla.json",
+      "equal": true,
+      "parent_sha256": "d1e0d86f6cb008a33b797eb53bc9f4e93224969d12fb28abc99b00c5ba2b0166",
+      "merged_sha256": "d1e0d86f6cb008a33b797eb53bc9f4e93224969d12fb28abc99b00c5ba2b0166"
+    },
+    {
+      "file": "mutex_tla/export/State_tla_trace.cfg",
+      "equal": true,
+      "parent_sha256": "322df0e96bbdd44f2cdb5a29a05ef6901d35a510c529533bf90e4dc830bf0557",
+      "merged_sha256": "322df0e96bbdd44f2cdb5a29a05ef6901d35a510c529533bf90e4dc830bf0557"
+    },
+    {
+      "file": "mutex_tla/export/State_tla_trace.tla",
+      "equal": true,
+      "parent_sha256": "392951ac64d855b9f0a8942aafa3203d3ead92cc7c298abf02db6a4b732515d9",
+      "merged_sha256": "392951ac64d855b9f0a8942aafa3203d3ead92cc7c298abf02db6a4b732515d9"
+    },
+    {
+      "file": "toggle_sync/export/State_tla.cfg",
+      "equal": true,
+      "parent_sha256": "e34239e8f50d92f3290b25f157ce0cbae93e05596b46d8be30531cc66a6c2be9",
+      "merged_sha256": "e34239e8f50d92f3290b25f157ce0cbae93e05596b46d8be30531cc66a6c2be9"
+    },
+    {
+      "file": "toggle_sync/export/State_tla.tla",
+      "equal": true,
+      "parent_sha256": "806366842567db143b16430c8cf0631e211f7e935b9d133007d98f7b899e21fe",
+      "merged_sha256": "806366842567db143b16430c8cf0631e211f7e935b9d133007d98f7b899e21fe"
+    },
+    {
+      "file": "toggle_sync/export/State_tla.tla.json",
+      "equal": true,
+      "parent_sha256": "61e4f39ede07b504a49f4e55fd91d27fa04b565c7cddaace86cc3b6245e306e3",
+      "merged_sha256": "61e4f39ede07b504a49f4e55fd91d27fa04b565c7cddaace86cc3b6245e306e3"
+    },
+    {
+      "file": "toggle_sync/export/State_tla_trace.cfg",
+      "equal": true,
+      "parent_sha256": "322df0e96bbdd44f2cdb5a29a05ef6901d35a510c529533bf90e4dc830bf0557",
+      "merged_sha256": "322df0e96bbdd44f2cdb5a29a05ef6901d35a510c529533bf90e4dc830bf0557"
+    },
+    {
+      "file": "toggle_sync/export/State_tla_trace.tla",
+      "equal": true,
+      "parent_sha256": "a23c658d50539f63acad177d98c9927453ebf726d46a19e9640c66bd0b047025",
+      "merged_sha256": "a23c658d50539f63acad177d98c9927453ebf726d46a19e9640c66bd0b047025"
+    },
+    {
+      "file": "toydb/export/GState_tla.cfg",
+      "equal": true,
+      "parent_sha256": "9a981c712bfa625bb8a523e592661c86cde5a227abe5412a34af54b6bc3b05b7",
+      "merged_sha256": "9a981c712bfa625bb8a523e592661c86cde5a227abe5412a34af54b6bc3b05b7"
+    },
+    {
+      "file": "toydb/export/GState_tla.tla",
+      "equal": true,
+      "parent_sha256": "c573df8522483f57f208d0bb3972e8b04249592620fc0f171a1a9b9d39ca6ee8",
+      "merged_sha256": "c573df8522483f57f208d0bb3972e8b04249592620fc0f171a1a9b9d39ca6ee8"
+    },
+    {
+      "file": "toydb/export/GState_tla.tla.json",
+      "equal": true,
+      "parent_sha256": "1d4df6cb1db8f0002ac4a0de7de6cbdff926871f39b73bc71a49e968c8eec9a5",
+      "merged_sha256": "1d4df6cb1db8f0002ac4a0de7de6cbdff926871f39b73bc71a49e968c8eec9a5"
+    },
+    {
+      "file": "toydb/export/GState_tla_trace.cfg",
+      "equal": true,
+      "parent_sha256": "322df0e96bbdd44f2cdb5a29a05ef6901d35a510c529533bf90e4dc830bf0557",
+      "merged_sha256": "322df0e96bbdd44f2cdb5a29a05ef6901d35a510c529533bf90e4dc830bf0557"
+    },
+    {
+      "file": "toydb/export/GState_tla_trace.tla",
+      "equal": true,
+      "parent_sha256": "53aa2b0441502b75913cda058bc064c89b3b895c0d008ada588bad28373495cb",
+      "merged_sha256": "53aa2b0441502b75913cda058bc064c89b3b895c0d008ada588bad28373495cb"
+    }
+  ],
+  "source_sha256": {
+    "source/vir/src/tla.rs": "6802bac25e3eb93de4a44e7fb0ac01c2f321cfbf5eff0dfe1bab60e202f986a6",
+    "source/vir/src/tla/functions.rs": "65715a8933723478baa3b821eaf34334375f90a73d6de119184e4082b4cfd88e",
+    "source/rust_verify_test/tests/tla_export.rs": "91af1a5c6e5290ae1d05ddb793d8536d5d20c7b482ec766b1956f4532d7dbe7a"
+  }
+}

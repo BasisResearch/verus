@@ -1,0 +1,34 @@
+Merge validation: origin/kg/export-traits d016cf3fa6dfb29a02f6f14a5d6651b631f95133
+
+Merged into kg/export-nrkernel without rebasing. Preserved bit operations,
+partial Init, trace-arm bookkeeping, and the centralized Functions resolver.
+All added Init body lookups use FunctionUse::Root or FunctionUse::Call;
+sequence-bound equality uses the specialization-aware same_expr comparator.
+The new relational-init regression tests complete and incomplete sequence
+initializers through differently specialized helpers, with TLC (1/2 states).
+
+Validation:
+- Release rebuild succeeded; vstd: 2045 verified, zero errors.
+- Full tla_export suite: 246 passed, zero failures, with TLA2TOOLS_JAR set to
+  ~/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar (1200-second bound).
+- source: cargo fmt -- --check; cargo clippy --all-targets -- -D warnings pass.
+- tools/vargo: same fmt and clippy checks pass.
+- Raft's pinned Init regression passes.
+- Independently rebuilt the incoming d016cf3f parent, exported the same six
+  examples/tla fixtures plus the pinned Toydb safety.rs with compat.py, and
+  compared all 35 .tla/.cfg/.json artifacts: byte-identical to the merged build.
+  SHA-256 evidence is in merge-compatibility.json.
+- All 14 model modules/configs also remain byte-identical to compat-before,
+  the original baseline. The other 21 artifacts (trace TLA/configs and JSON)
+  differ from that old snapshot because of the incoming #62 trace changes.
+  The merge adds no differences beyond those already present in d016cf3f.
+
+Reproduction (from this worktree; export PATH and TMPDIR as in the task):
+  cd source
+  TLA2TOOLS_JAR=$HOME/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar \
+    VERUS_MCP_ENABLED=1 timeout 1200 \
+    ../../base/verus/tools/vargo/target/release/vargo \
+    test --release -p rust_verify_test --test tla_export
+
+The historical campaign report and compatibility.json retain their original
+baseline and results; the campaign was not rerun for this merge-only update.

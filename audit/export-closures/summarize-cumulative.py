@@ -7,6 +7,7 @@ from pathlib import Path
 
 ap = argparse.ArgumentParser(description=__doc__)
 ap.add_argument('--tests', type=int, required=True)
+ap.add_argument('--fixture-parent', default='regression-before')
 ap.add_argument('--after-phase', default='after')
 ap.add_argument('--parent-phase', default='parent')
 ap.add_argument('--previous-phase')
@@ -35,11 +36,11 @@ def counts(rows):
         refusals=sum(r['refusals'] or 0 for r in rows))
 summary_counts={phase:{group:counts([r for r in s['rows'] if r['primary']==primary])
     for group,primary in [('primary',True),('supplemental',False)]} for phase,s in phases.items()}
-old=HERE/'regression-before';new=HERE/'regression-stacked'
+old=HERE/args.fixture_parent;new=HERE/'regression-stacked'
 golden={str(p.relative_to(old)):dict(sha256=hashlib.sha256(p.read_bytes()).hexdigest(),
-    identical=p.read_bytes()==(new/p.relative_to(old)).read_bytes()) for p in old.rglob('*') if p.suffix in ['.tla','.cfg']}
-assert len(golden)==28 and all(x['identical'] for x in golden.values())
-evidence=dict(base_commit=phases['after']['base_commit'],tests=args.tests,counts=summary_counts,phases=phases,golden=golden)
+    identical=p.read_bytes()==(new/p.relative_to(old)).read_bytes()) for p in old.rglob('*') if p.suffix in ['.tla','.cfg','.json']}
+assert len(golden)==35 and all(x['identical'] for x in golden.values())
+evidence=dict(fixture_parent=args.fixture_parent, base_commit=phases['after']['base_commit'],tests=args.tests,counts=summary_counts,phases=phases,golden=golden)
 round2 = {}
 if args.round2_parent_phase and args.round2_after_phase:
     for key, phase in [('parent',args.round2_parent_phase),('after',args.round2_after_phase)]:
@@ -111,8 +112,8 @@ def tlc(r):
     return label
 maps={p:{r['machine']:r for r in s['rows']} for p,s in phases.items()}
 base = phases['after']['base_commit'][:8]
-lines=[f'## Cumulative campaign after rebase onto `{base}`','',
- f'The table measures all 33 requested export targets: Anvil’s five (including both API adapters), IronKV host, nrkernel’s six, NR’s three, and all 18 Splinter attempts. Five additional campaign adapters/controls follow separately. A compiler error or timeout is **not** a zero-refusal export. `Before` uses the original campaign binary; `L1–3` uses the clean lane-3 checkout at `{base}`; `After` uses the rebased lane-4 binary. Binary hashes and version strings are saved in `cumulative-results.json` (the parent binary embeds its pre-commit dirty version string).','']
+lines=[f'## Cumulative campaign after merge of `{base}`','',
+ f'The table measures all 33 requested export targets: Anvil’s five (including both API adapters), IronKV host, nrkernel’s six, NR’s three, and all 18 Splinter attempts. Five additional campaign adapters/controls follow separately. A compiler error or timeout is **not** a zero-refusal export. `Before` uses the original campaign binary; `L1–3` uses the clean lane-3 checkout at `{base}`; `After` uses the merged lane-4 binary. Binary hashes and version strings are saved in `cumulative-results.json` (the parent binary embeds its pre-commit dirty version string).','']
 for phase,s in summary_counts.items():
     p=s['primary'];lines.append(f"- **{phase}:** {p['zero_refusals']}/33 zero-refusal exports; {p['zero_refusals_and_sany']}/33 also pass SANY; {p['completes']}/9 saved-bound TLC runs complete; {p['explores']}/9 explore without an evaluation error.")
 if previous_stack:
@@ -130,7 +131,7 @@ for primary,title in [(True,'Requested campaign targets'),(False,'Additional cam
 if round2:
     lines += ['', '### Round-2 Anvil harnesses', '',
         'These are additional bounded replays, separate from the original campaign counts above. Both use byte-identical saved `MC.tla`/`MC.cfg` files. Reproduce with `python3 audit/export-closures/cumulative.py round2-replay --round2 --verus source/target-verus/release/verus`. No TLC command was saved for these harnesses, so the replay uses lane 3’s 30-second cap, one worker, and `-continue`. A completed search with a counterexample is not a clean invariant pass.', '',
-        '| Machine | L1–3 refusals | L1–4 refusals | Parent TLC | Rebased stack TLC |',
+        '| Machine | L1–3 refusals | L1–4 refusals | Parent TLC | Merged stack TLC |',
         '|---|---:|---:|---|---|']
     parents = {r['machine']:r for r in round2['parent']['rows']}
     for row in round2['after']['rows']:
@@ -138,11 +139,11 @@ if round2:
         lines.append(f"| {row['machine']} | {refusal(parent)} | {refusal(row)} | {tlc(parent)} | {tlc(row)} |")
     lines += ['',
         'Network: lane 4 removes both closure refusals and the unchanged transport harness completes with nine distinct states. Controller: the original-campaign export above confirms lane 4 removes all nine parent closure refusals; SANY passes. Its round-2 controller harness was marked preliminary/unvalidated by that campaign, so no bounded controller verdict is claimed.', '',
-        'VRS: lane 3’s saved clean `5e38e1ee` replay failed on an Option projection after two states. Both the current parent and rebased stack now finish the complete seven-state search. With `-continue`, TLC reports `not_error` violated along the source’s explicit `Init → AfterListPods → Error` path for an absent/invalid response. This is an expected behavior of the unconstrained-response harness, not a claimed controller defect. Lane 3 unblocks this execution; lane 4 preserves the fix. The full round-2 logs, violations, command provenance, and bound hashes are included in the machine-readable evidence.']
+        'VRS: the preceding fb8014b0 stack completed a seven-state search (with the saved harness’s expected not_error counterexample). The incoming ca16f117 parent and this merge both emit distinct specialized table names such as Table_marshal_spec_2, while the unchanged saved MC.cfg assigns the older Table_marshal_spec__tla_closed names. TLC therefore stops before exploration with an unassigned-constant error. This is an inherited harness/configuration mismatch; the table does not claim the previous seven-state result for this merge. Exact diagnostics and the unchanged bound hashes are retained in the evidence.']
 lines+=['','### Validation and remaining blockers','',
- f'**{args.tests} exporter tests passed**, with `TLA2TOOLS_JAR` set. All **28** example/Raft `.tla`/`.cfg` artifacts are byte-identical. The rebase preserves the lower lanes’ tests and both restriction and choice reporting; captured environments in partial-read analysis now use the same immutable `Arc<Env>` representation as closure reduction.','',
+ f'**{args.tests} exporter tests passed**, with `TLA2TOOLS_JAR` set. All **35** example/Raft `.tla`/`.cfg`/`.json` artifacts are byte-identical against the incoming parent. Workspace formatting and clippy, including the exporter test target, pass with warnings denied. The merge preserves the lower lanes’ tests, trace-arm bookkeeping, centralized specialization, and both restriction and choice reporting; captured environments in partial-read analysis now use the same immutable `Arc<Env>` representation as closure reduction.','',
  'Every remaining refusal, including its exact source location and multiplicity, is listed in [BLOCKERS.md](BLOCKERS.md). That file also records compiler, SANY, TLC configuration/evaluation, and timeout failures. The machine-readable report retains each individual refusal. The lane-4 `sub_api_sm` SANY regression is fixed: definedness analysis follows consumed symbolic fields and keeps their guards under the reduction’s LET bindings. It no longer emits guards for unused record fields. Both a bound-parameter closure record and the former unbound `kind` reproducer are TLC-checked. Independent lower-lane limitations and repairs are reflected in the parent and cumulative columns; their exact remaining diagnostics are in the blocker report.','',
- 'Exporter suite: `export PATH=$HOME/.cargo/bin:$PATH; export TMPDIR=$HOME/tmp; source tools/activate; cd source; TLA2TOOLS_JAR=$HOME/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar timeout 1800 vargo test --release --vstd-no-verify -p rust_verify_test --test tla_export -- --test-threads=4`. Fixture comparison uses the existing `toydb-pr-30/src/raft/safety.rs` because `base/toydb/src/raft/safety.rs` is absent.\n\nReproduce with `python3 audit/export-closures/cumulative.py before --original-deps --verus ../base/verus/source/target-verus/release/verus`, then `parent` with the lane-3 binary and `after` with `source/target-verus/release/verus`; run `summarize-cumulative.py --tests <passed-count>` after `regression.py regression-stacked source/target-verus/release/verus`. Raw commands/logs and modules are retained in ignored `cumulative-*` directories. Historical lane-4-only measurements in `results.json` are superseded by `cumulative-results.json`.']
+ 'Exporter suite: `export PATH=$HOME/.cargo/bin:$PATH; export TMPDIR=$HOME/tmp; source tools/activate; cd source; TLA2TOOLS_JAR=$HOME/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar timeout 1800 vargo test --release --vstd-no-verify -p rust_verify_test --test tla_export -- --test-threads=4`. Fixture comparison uses the existing `toydb-pr-30/src/raft/safety.rs` because `base/toydb/src/raft/safety.rs` is absent.\n\nReproduce with `python3 audit/export-closures/cumulative.py before --original-deps --verus ../base/verus/source/target-verus/release/verus`, then `parent` with the lane-3 binary and `after` with `source/target-verus/release/verus`; run `summarize-cumulative.py --tests <passed-count> --fixture-parent regression-parent-ca16 --parent-phase parent-ca16 --after-phase merged-ca16-final --round2-parent-phase round2-parent-ca16 --round2-after-phase round2-merged-ca16-final` after `regression.py regression-stacked source/target-verus/release/verus`. Raw commands/logs and modules are retained in ignored `cumulative-*` directories. Historical lane-4-only measurements in `results.json` are superseded by `cumulative-results.json`.']
 report=(HERE/'REPORT.md').read_text().split('## Cumulative campaign')[0].split('## Reproduction')[0]+'\n'+'\n'.join(lines)+'\n'
 (HERE/'REPORT.md').write_text(report)
 block=['# Remaining cumulative campaign blockers','', 'Locations below are emitted by the exporter or compiler; repeated refusals are counted rather than hidden. Timeouts have no completed refusal report and therefore no inferred source-level cause.','']
@@ -158,10 +159,15 @@ for a in phases['after']['rows']:
     if a['export_status']=='timeout':block+=['','Export exceeded the original 90-second timeout. No completed report; construct/location unknown.']
     if a['tlc_status'] in ['timeout_before_progress','exploring_timeout']:block+=['',f"TLC: {a['tlc_status']}, original {a['tlc_budget_seconds']}-second budget."]
     block+=['']
+if round2:
+    for a in round2['after']['rows']:
+        if not a.get('tlc_diagnostics'): continue
+        block += ['## Round-2 '+a['machine'], '', 'Unchanged campaign harness:', '',
+            '```text', a['tlc_diagnostics'].rstrip(), '```', '']
 (HERE/'BLOCKERS.md').write_text('\n'.join(block)+'\n')
 # Use repository URLs in the external PR description.
 url='https://github.com/BasisResearch/verus/blob/kg/export-closures/audit/export-closures/'
 body=report.replace('[BLOCKERS.md](BLOCKERS.md)',f'[BLOCKERS.md]({url}BLOCKERS.md)')
-body+=f'\n[Full machine-readable evidence]({url}cumulative-results.json)\n'
+body+=f'\n[Full machine-readable evidence]({url}cumulative-results.json) · [Merge validation and hashes]({url}merge-validation.json)\n'
 (HERE/'pr-body.log').write_text(body)
 print(json.dumps(summary_counts,indent=2))
