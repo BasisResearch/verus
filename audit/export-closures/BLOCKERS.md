@@ -289,16 +289,16 @@ tlc_diagnostics:
 TLC2 Version 2026.09.24.190251 (rev: 11305b4)
 Warning: Please run the Java VM, which executes TLC with a throughput optimized garbage collector, by passing the "-XX:+UseParallelGC" property.
 (Use the -nowarning option to disable this warning.)
-Running breadth-first search Model-Checking with fp 29 and seed -6573910260560206265 with 1 worker on 32 cores with 1024MB heap and 64MB offheap memory [pid: 1113295] (Linux 7.0.0-1012-aws amd64, Ubuntu 25.0.4.1 64bit, MSBDiskFPSet, DiskStateQueue).
-Parsing file /data/home/kirancodes/Documents/code/verus-research/wt-export-closures/audit/export-closures/cumulative-stacked-5e38/splinter/CoordinationSystem/MC.tla
-Parsing file /data/home/kirancodes/Documents/code/verus-research/wt-export-closures/audit/export-closures/cumulative-stacked-5e38/splinter/CoordinationSystem/State_tla.tla
-Parsing file /tmp/tlc-13049178554385414206/_TLCTrace.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/_TLCTrace.tla)
-Parsing file /tmp/tlc-13049178554385414206/Integers.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/Integers.tla)
-Parsing file /tmp/tlc-13049178554385414206/Sequences.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/Sequences.tla)
-Parsing file /tmp/tlc-13049178554385414206/FiniteSets.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/FiniteSets.tla)
-Parsing file /tmp/tlc-13049178554385414206/TLC.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/TLC.tla)
-Parsing file /tmp/tlc-13049178554385414206/Naturals.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/Naturals.tla)
-Parsing file /tmp/tlc-13049178554385414206/TLCExt.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/TLCExt.tla)
+Running breadth-first search Model-Checking with fp 35 and seed 3423221849717361939 with 1 worker on 32 cores with 1024MB heap and 64MB offheap memory [pid: 3210571] (Linux 7.0.0-1012-aws amd64, Ubuntu 25.0.4.1 64bit, MSBDiskFPSet, DiskStateQueue).
+Parsing file /data/home/kirancodes/Documents/code/verus-research/wt-export-closures/audit/export-closures/cumulative-stacked-fb801/splinter/CoordinationSystem/MC.tla
+Parsing file /data/home/kirancodes/Documents/code/verus-research/wt-export-closures/audit/export-closures/cumulative-stacked-fb801/splinter/CoordinationSystem/State_tla.tla
+Parsing file /tmp/tlc-2567896288953579752/_TLCTrace.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/_TLCTrace.tla)
+Parsing file /tmp/tlc-2567896288953579752/Integers.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/Integers.tla)
+Parsing file /tmp/tlc-2567896288953579752/Sequences.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/Sequences.tla)
+Parsing file /tmp/tlc-2567896288953579752/FiniteSets.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/FiniteSets.tla)
+Parsing file /tmp/tlc-2567896288953579752/TLC.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/TLC.tla)
+Parsing file /tmp/tlc-2567896288953579752/Naturals.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/Naturals.tla)
+Parsing file /tmp/tlc-2567896288953579752/TLCExt.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/TLCExt.tla)
 Semantic processing of module Naturals
 Semantic processing of module Integers
 Semantic processing of module Sequences
@@ -312,9 +312,9 @@ Linting of module State_tla
 Linting of module TLCExt
 Linting of module _TLCTrace
 Linting of module MC
-Starting... (2026-10-08 00:13:47)
+Starting... (2026-10-08 02:27:51)
 Error: The constant parameter Dom_Key is not assigned a value by the configuration file.
-Finished in 00s at (2026-10-08 00:13:47)
+Finished in 00s at (2026-10-08 02:27:51)
 ```
 
 ## splinter/CrashTolerantJournal
@@ -330,16 +330,16 @@ tlc_diagnostics:
 TLC2 Version 2026.09.24.190251 (rev: 11305b4)
 Warning: Please run the Java VM, which executes TLC with a throughput optimized garbage collector, by passing the "-XX:+UseParallelGC" property.
 (Use the -nowarning option to disable this warning.)
-Running breadth-first search Model-Checking with fp 107 and seed -6817774154199524779 with 1 worker on 32 cores with 1024MB heap and 64MB offheap memory [pid: 1114099] (Linux 7.0.0-1012-aws amd64, Ubuntu 25.0.4.1 64bit, MSBDiskFPSet, DiskStateQueue).
-Parsing file /data/home/kirancodes/Documents/code/verus-research/wt-export-closures/audit/export-closures/cumulative-stacked-5e38/splinter/CrashTolerantMap/MC.tla
-Parsing file /data/home/kirancodes/Documents/code/verus-research/wt-export-closures/audit/export-closures/cumulative-stacked-5e38/splinter/CrashTolerantMap/State_tla.tla
-Parsing file /tmp/tlc-2102017440200262090/_TLCTrace.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/_TLCTrace.tla)
-Parsing file /tmp/tlc-2102017440200262090/Integers.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/Integers.tla)
-Parsing file /tmp/tlc-2102017440200262090/Sequences.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/Sequences.tla)
-Parsing file /tmp/tlc-2102017440200262090/FiniteSets.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/FiniteSets.tla)
-Parsing file /tmp/tlc-2102017440200262090/TLC.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/TLC.tla)
-Parsing file /tmp/tlc-2102017440200262090/Naturals.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/Naturals.tla)
-Parsing file /tmp/tlc-2102017440200262090/TLCExt.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/TLCExt.tla)
+Running breadth-first search Model-Checking with fp 93 and seed -5982148847973287231 with 1 worker on 32 cores with 1024MB heap and 64MB offheap memory [pid: 3213370] (Linux 7.0.0-1012-aws amd64, Ubuntu 25.0.4.1 64bit, MSBDiskFPSet, DiskStateQueue).
+Parsing file /data/home/kirancodes/Documents/code/verus-research/wt-export-closures/audit/export-closures/cumulative-stacked-fb801/splinter/CrashTolerantMap/MC.tla
+Parsing file /data/home/kirancodes/Documents/code/verus-research/wt-export-closures/audit/export-closures/cumulative-stacked-fb801/splinter/CrashTolerantMap/State_tla.tla
+Parsing file /tmp/tlc-6216467646820574364/_TLCTrace.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/_TLCTrace.tla)
+Parsing file /tmp/tlc-6216467646820574364/Integers.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/Integers.tla)
+Parsing file /tmp/tlc-6216467646820574364/Sequences.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/Sequences.tla)
+Parsing file /tmp/tlc-6216467646820574364/FiniteSets.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/FiniteSets.tla)
+Parsing file /tmp/tlc-6216467646820574364/TLC.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/TLC.tla)
+Parsing file /tmp/tlc-6216467646820574364/Naturals.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/Naturals.tla)
+Parsing file /tmp/tlc-6216467646820574364/TLCExt.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/TLCExt.tla)
 Semantic processing of module Naturals
 Semantic processing of module Integers
 Semantic processing of module Sequences
@@ -353,9 +353,9 @@ Linting of module State_tla
 Linting of module TLCExt
 Linting of module _TLCTrace
 Linting of module MC
-Starting... (2026-10-08 00:13:51)
+Starting... (2026-10-08 02:27:54)
 Error: The constant parameter Dom_Key is not assigned a value by the configuration file.
-Finished in 00s at (2026-10-08 00:13:51)
+Finished in 00s at (2026-10-08 02:27:54)
 ```
 
 ## splinter/FilteredBetree
@@ -567,16 +567,16 @@ tlc_diagnostics:
 TLC2 Version 2026.09.24.190251 (rev: 11305b4)
 Warning: Please run the Java VM, which executes TLC with a throughput optimized garbage collector, by passing the "-XX:+UseParallelGC" property.
 (Use the -nowarning option to disable this warning.)
-Running breadth-first search Model-Checking with fp 114 and seed 7262724005461863575 with 1 worker on 32 cores with 1024MB heap and 64MB offheap memory [pid: 1115672] (Linux 7.0.0-1012-aws amd64, Ubuntu 25.0.4.1 64bit, MSBDiskFPSet, DiskStateQueue).
-Parsing file /data/home/kirancodes/Documents/code/verus-research/wt-export-closures/audit/export-closures/cumulative-stacked-5e38/splinter/LinkedJournal/MC.tla
-Parsing file /data/home/kirancodes/Documents/code/verus-research/wt-export-closures/audit/export-closures/cumulative-stacked-5e38/splinter/LinkedJournal/State_tla.tla
-Parsing file /tmp/tlc-9749695023142245919/_TLCTrace.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/_TLCTrace.tla)
-Parsing file /tmp/tlc-9749695023142245919/Integers.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/Integers.tla)
-Parsing file /tmp/tlc-9749695023142245919/Sequences.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/Sequences.tla)
-Parsing file /tmp/tlc-9749695023142245919/FiniteSets.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/FiniteSets.tla)
-Parsing file /tmp/tlc-9749695023142245919/TLC.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/TLC.tla)
-Parsing file /tmp/tlc-9749695023142245919/Naturals.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/Naturals.tla)
-Parsing file /tmp/tlc-9749695023142245919/TLCExt.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/TLCExt.tla)
+Running breadth-first search Model-Checking with fp 81 and seed -8413984765129447700 with 1 worker on 32 cores with 1024MB heap and 64MB offheap memory [pid: 3219800] (Linux 7.0.0-1012-aws amd64, Ubuntu 25.0.4.1 64bit, MSBDiskFPSet, DiskStateQueue).
+Parsing file /data/home/kirancodes/Documents/code/verus-research/wt-export-closures/audit/export-closures/cumulative-stacked-fb801/splinter/LinkedJournal/MC.tla
+Parsing file /data/home/kirancodes/Documents/code/verus-research/wt-export-closures/audit/export-closures/cumulative-stacked-fb801/splinter/LinkedJournal/State_tla.tla
+Parsing file /tmp/tlc-8843497520996731515/_TLCTrace.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/_TLCTrace.tla)
+Parsing file /tmp/tlc-8843497520996731515/Integers.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/Integers.tla)
+Parsing file /tmp/tlc-8843497520996731515/Sequences.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/Sequences.tla)
+Parsing file /tmp/tlc-8843497520996731515/FiniteSets.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/FiniteSets.tla)
+Parsing file /tmp/tlc-8843497520996731515/TLC.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/TLC.tla)
+Parsing file /tmp/tlc-8843497520996731515/Naturals.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/Naturals.tla)
+Parsing file /tmp/tlc-8843497520996731515/TLCExt.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/TLCExt.tla)
 Semantic processing of module Naturals
 Semantic processing of module Integers
 Semantic processing of module Sequences
@@ -590,27 +590,27 @@ Linting of module State_tla
 Linting of module TLCExt
 Linting of module _TLCTrace
 Linting of module MC
-Starting... (2026-10-08 00:13:58)
+Starting... (2026-10-08 02:28:00)
 Computing initial states...
-Finished computing initial states: 1 distinct state generated at 2026-10-08 00:13:59.
+Finished computing initial states: 1 distinct state generated at 2026-10-08 02:28:00.
 Error: Invariant inv is violated.
 Error: The behavior up to this point is:
 State 1: <Initial predicate>
 /\ unmarshalled_tail = [msgs |-> <<>>, seq_start |-> 0, seq_end |-> 0]
 /\ truncated_journal = [disk_view |-> [entries |-> <<>>, boundary_lsn |-> 0], freshest_rec |-> [tag |-> "None"]]
 
-State 2: <Next line 387, col 9 to line 387, col 30 of module State_tla>
+State 2: <Next line 386, col 9 to line 386, col 30 of module State_tla>
 /\ unmarshalled_tail = [msgs |-> (0 :> [key |-> [v0 |-> 0], message |-> [tag |-> "Define", value |-> [v0 |-> 0]]]), seq_start |-> 0, seq_end |-> 1]
 /\ truncated_journal = [disk_view |-> [entries |-> <<>>, boundary_lsn |-> 0], freshest_rec |-> [tag |-> "None"]]
 
-State 3: <Next line 387, col 9 to line 387, col 30 of module State_tla>
+State 3: <Next line 386, col 9 to line 386, col 30 of module State_tla>
 /\ unmarshalled_tail = [msgs |-> <<>>, seq_start |-> 1, seq_end |-> 1]
 /\ truncated_journal = [disk_view |-> [entries |-> ([au |-> 0, page |-> 0] :> [message_seq |-> [msgs |-> (0 :> [key |-> [v0 |-> 0], message |-> [tag |-> "Define", value |-> [v0 |-> 0]]]), seq_start |-> 0, seq_end |-> 1], prior_rec |-> [tag |-> "None"]]), boundary_lsn |-> 0], freshest_rec |-> [v0 |-> [au |-> 0, page |-> 0], tag |-> "Some"]]
 
 9 states generated, 4 distinct states found, 1 states left on queue.
 The depth of the complete state graph search is 3.
-Finished in 01s at (2026-10-08 00:13:59)
-Trace exploration spec path: ./MC_TTrace_1791418438.tla
+Finished in 00s at (2026-10-08 02:28:01)
+Trace exploration spec path: ./MC_TTrace_1791426480.tla
 ```
 
 ## splinter/UnifiedCrashAwareJournal
@@ -683,16 +683,16 @@ tlc_diagnostics:
 TLC2 Version 2026.09.24.190251 (rev: 11305b4)
 Warning: Please run the Java VM, which executes TLC with a throughput optimized garbage collector, by passing the "-XX:+UseParallelGC" property.
 (Use the -nowarning option to disable this warning.)
-Running breadth-first search Model-Checking with fp 3 and seed 3742290779771544703 with 1 worker on 32 cores with 1024MB heap and 64MB offheap memory [pid: 1120631] (Linux 7.0.0-1012-aws amd64, Ubuntu 25.0.4.1 64bit, MSBDiskFPSet, DiskStateQueue).
-Parsing file /data/home/kirancodes/Documents/code/verus-research/wt-export-closures/audit/export-closures/cumulative-stacked-5e38/nr/UnboundedLog-mono/MC.tla
-Parsing file /data/home/kirancodes/Documents/code/verus-research/wt-export-closures/audit/export-closures/cumulative-stacked-5e38/nr/UnboundedLog-mono/State_tla.tla
-Parsing file /tmp/tlc-7139107740319579156/_TLCTrace.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/_TLCTrace.tla)
-Parsing file /tmp/tlc-7139107740319579156/Integers.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/Integers.tla)
-Parsing file /tmp/tlc-7139107740319579156/Sequences.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/Sequences.tla)
-Parsing file /tmp/tlc-7139107740319579156/FiniteSets.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/FiniteSets.tla)
-Parsing file /tmp/tlc-7139107740319579156/TLC.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/TLC.tla)
-Parsing file /tmp/tlc-7139107740319579156/Naturals.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/Naturals.tla)
-Parsing file /tmp/tlc-7139107740319579156/TLCExt.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/TLCExt.tla)
+Running breadth-first search Model-Checking with fp 30 and seed -6451576256874972345 with 1 worker on 32 cores with 1024MB heap and 64MB offheap memory [pid: 3228414] (Linux 7.0.0-1012-aws amd64, Ubuntu 25.0.4.1 64bit, MSBDiskFPSet, DiskStateQueue).
+Parsing file /data/home/kirancodes/Documents/code/verus-research/wt-export-closures/audit/export-closures/cumulative-stacked-fb801/nr/UnboundedLog-mono/MC.tla
+Parsing file /data/home/kirancodes/Documents/code/verus-research/wt-export-closures/audit/export-closures/cumulative-stacked-fb801/nr/UnboundedLog-mono/State_tla.tla
+Parsing file /tmp/tlc-5399890727796603825/_TLCTrace.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/_TLCTrace.tla)
+Parsing file /tmp/tlc-5399890727796603825/Integers.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/Integers.tla)
+Parsing file /tmp/tlc-5399890727796603825/Sequences.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/Sequences.tla)
+Parsing file /tmp/tlc-5399890727796603825/FiniteSets.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/FiniteSets.tla)
+Parsing file /tmp/tlc-5399890727796603825/TLC.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/TLC.tla)
+Parsing file /tmp/tlc-5399890727796603825/Naturals.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/Naturals.tla)
+Parsing file /tmp/tlc-5399890727796603825/TLCExt.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/TLCExt.tla)
 Semantic processing of module Naturals
 Semantic processing of module Integers
 Semantic processing of module Sequences
@@ -706,9 +706,9 @@ Linting of module State_tla
 Linting of module TLCExt
 Linting of module _TLCTrace
 Linting of module MC
-Starting... (2026-10-08 00:14:17)
+Starting... (2026-10-08 02:28:18)
 Error: The constant parameter Table_arbitrary__tla_closed2 is not assigned a value by the configuration file.
-Finished in 00s at (2026-10-08 00:14:17)
+Finished in 00s at (2026-10-08 02:28:18)
 ```
 
 ## nr/CyclicBuffer
@@ -728,16 +728,16 @@ tlc_diagnostics:
 TLC2 Version 2026.09.24.190251 (rev: 11305b4)
 Warning: Please run the Java VM, which executes TLC with a throughput optimized garbage collector, by passing the "-XX:+UseParallelGC" property.
 (Use the -nowarning option to disable this warning.)
-Running breadth-first search Model-Checking with fp 44 and seed 6032827322633983474 with 1 worker on 32 cores with 1024MB heap and 64MB offheap memory [pid: 1125294] (Linux 7.0.0-1012-aws amd64, Ubuntu 25.0.4.1 64bit, MSBDiskFPSet, DiskStateQueue).
-Parsing file /data/home/kirancodes/Documents/code/verus-research/wt-export-closures/audit/export-closures/cumulative-stacked-5e38/nr/FlatCombiner/MC.tla
-Parsing file /data/home/kirancodes/Documents/code/verus-research/wt-export-closures/audit/export-closures/cumulative-stacked-5e38/nr/FlatCombiner/State_tla.tla
-Parsing file /tmp/tlc-1085303760162031589/_TLCTrace.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/_TLCTrace.tla)
-Parsing file /tmp/tlc-1085303760162031589/Integers.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/Integers.tla)
-Parsing file /tmp/tlc-1085303760162031589/Sequences.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/Sequences.tla)
-Parsing file /tmp/tlc-1085303760162031589/FiniteSets.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/FiniteSets.tla)
-Parsing file /tmp/tlc-1085303760162031589/TLC.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/TLC.tla)
-Parsing file /tmp/tlc-1085303760162031589/Naturals.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/Naturals.tla)
-Parsing file /tmp/tlc-1085303760162031589/TLCExt.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/TLCExt.tla)
+Running breadth-first search Model-Checking with fp 48 and seed -8403186532091267327 with 1 worker on 32 cores with 1024MB heap and 64MB offheap memory [pid: 3230638] (Linux 7.0.0-1012-aws amd64, Ubuntu 25.0.4.1 64bit, MSBDiskFPSet, DiskStateQueue).
+Parsing file /data/home/kirancodes/Documents/code/verus-research/wt-export-closures/audit/export-closures/cumulative-stacked-fb801/nr/FlatCombiner/MC.tla
+Parsing file /data/home/kirancodes/Documents/code/verus-research/wt-export-closures/audit/export-closures/cumulative-stacked-fb801/nr/FlatCombiner/State_tla.tla
+Parsing file /tmp/tlc-5391063167985747656/_TLCTrace.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/_TLCTrace.tla)
+Parsing file /tmp/tlc-5391063167985747656/Integers.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/Integers.tla)
+Parsing file /tmp/tlc-5391063167985747656/Sequences.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/Sequences.tla)
+Parsing file /tmp/tlc-5391063167985747656/FiniteSets.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/FiniteSets.tla)
+Parsing file /tmp/tlc-5391063167985747656/TLC.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/TLC.tla)
+Parsing file /tmp/tlc-5391063167985747656/Naturals.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/Naturals.tla)
+Parsing file /tmp/tlc-5391063167985747656/TLCExt.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/TLCExt.tla)
 Semantic processing of module Naturals
 Semantic processing of module Integers
 Semantic processing of module Sequences
@@ -751,8 +751,8 @@ Linting of module State_tla
 Linting of module TLCExt
 Linting of module _TLCTrace
 Linting of module MC
-Starting... (2026-10-08 00:14:23)
+Starting... (2026-10-08 02:28:25)
 Error: The constant parameter Table_arbitrary__tla_closed is not assigned a value by the configuration file.
-Finished in 00s at (2026-10-08 00:14:23)
+Finished in 00s at (2026-10-08 02:28:26)
 ```
 

@@ -10,6 +10,8 @@ ap.add_argument('--tests', type=int, required=True)
 ap.add_argument('--after-phase', default='after')
 ap.add_argument('--parent-phase', default='parent')
 ap.add_argument('--previous-phase')
+ap.add_argument('--round2-parent-phase')
+ap.add_argument('--round2-after-phase')
 args = ap.parse_args()
 HERE = Path(__file__).resolve().parent
 phase_dirs = {'before':'before', 'parent':args.parent_phase, 'after':args.after_phase}
@@ -38,6 +40,17 @@ golden={str(p.relative_to(old)):dict(sha256=hashlib.sha256(p.read_bytes()).hexdi
     identical=p.read_bytes()==(new/p.relative_to(old)).read_bytes()) for p in old.rglob('*') if p.suffix in ['.tla','.cfg']}
 assert len(golden)==28 and all(x['identical'] for x in golden.values())
 evidence=dict(base_commit=phases['after']['base_commit'],tests=args.tests,counts=summary_counts,phases=phases,golden=golden)
+round2 = {}
+if args.round2_parent_phase and args.round2_after_phase:
+    for key, phase in [('parent',args.round2_parent_phase),('after',args.round2_after_phase)]:
+        summary = json.loads((HERE/f'cumulative-{phase}/summary.json').read_text())
+        for row in summary['rows']:
+            if row.get('tlc_errors'):
+                row['tlc_diagnostics'] = (HERE/f'cumulative-{phase}'/row['machine']/'MC.log').read_text()[-6500:]
+        round2[key] = summary
+    round2['before_option_fix'] = json.loads((HERE.parent/'export-partial/anvil-measurements.json').read_text())['before']
+    evidence['round2_anvil'] = round2
+
 previous_stack = None
 if args.previous_phase:
     previous_stack = json.loads((HERE/f'cumulative-{args.previous_phase}/summary.json').read_text())
@@ -69,7 +82,7 @@ lanes={
  'nr/AsynchronousSingleton':'L1 concrete dispatch/typed tables',
  'nr/SimpleLog':'L1 concrete dispatch/typed tables',
  'nr/UnboundedLog':'L1 concrete dispatch/typed tables; L3 carriers',
- 'anvil/sub_vrs_reconcile':'L1 dispatch/tables removes refusals; L4 unchanged',
+ 'anvil/sub_vrs_reconcile':'L1 dispatch/tables removes refusals; L3 fixes Option projection through helper match arms (round-2 replay below)',
  'nr/UnboundedLog-mono':'L1 table + L3 guarded reads; unchanged config lacks table assignment',
  'nr/CyclicBuffer':'L1 dispatch/tables; see remaining located refusals',
  'nr/FlatCombiner':'L1 replaces uninterpreted refusal with table; original config lacks Table_arbitrary__tla_closed',
@@ -92,9 +105,9 @@ def sany(r):
     return 'pass' if r.get('sany_ok') else ('fail' if r['export_status']=='exported' else 'not exported')
 def tlc(r):
     status=r['tlc_status']
-    label={'no_saved_bounds':'no saved bounds','complete':'complete','evaluation_error':'evaluation/config error','sany_error':'SANY error','timeout_before_progress':'timeout before progress','exploring_timeout':'progress; timeout','blocked_by_export':'export blocked','invariant_counterexample':'invariant CTI'}[status]
+    label={'no_saved_bounds':'no saved bounds','complete':'complete','evaluation_error':'evaluation/config error','sany_error':'SANY error','timeout_before_progress':'timeout before progress','exploring_timeout':'progress; timeout','blocked_by_export':'export blocked','invariant_counterexample':'invariant CTI','complete_with_counterexample':'complete search with invariant CTI'}[status]
     if status == 'exploring_timeout': label+=f" (at least {r.get('distinct','?')} states reported)"
-    elif status in ['complete','invariant_counterexample']: label+=f" ({r.get('distinct','?')} states)"
+    elif status in ['complete','invariant_counterexample','complete_with_counterexample']: label+=f" ({r.get('distinct','?')} states)"
     return label
 maps={p:{r['machine']:r for r in s['rows']} for p,s in phases.items()}
 base = phases['after']['base_commit'][:8]
@@ -105,15 +118,27 @@ for phase,s in summary_counts.items():
 if previous_stack:
     old_counts = evidence['previous_stack']['primary']
     new_counts = summary_counts['after']['primary']
-    lines += ['', f"Since the previous stack on `{previous_stack['base_commit'][:8]}`, zero-refusal exports increased **{old_counts['zero_refusals']}→{new_counts['zero_refusals']}**, zero-refusal exports passing SANY **{old_counts['zero_refusals_and_sany']}→{new_counts['zero_refusals_and_sany']}**, completed campaign-bound TLC runs **{old_counts['completes']}→{new_counts['completes']}**, and explorations **{old_counts['explores']}→{new_counts['explores']}**. The three MMU exports now finish with zero refusals; PagedBetree and PivotBetree regain their bounded completions."]
-lines+=['','The table distinguishes completed runs, invariant counterexamples, and progress until timeout. Lane 4’s additional zero-refusal targets over lane 3 are identified by the intermediate column.\n\nOriginal `MC.tla`, `MC.cfg`, and TLC commands/timeouts were replayed unchanged, with their hashes recorded. The other 24 primary targets have no saved campaign bounds; no new constants, table interpretations, adapters, or bounds were invented. Reaching states before a TLC evaluation error does not count as exploration. Lane-3 restrictions and finite carriers remain explicitly reported approximations, so a completed bounded run is not a proof of the unrestricted source.','',
+    lines += ['', f"Since the previous stack on `{previous_stack['base_commit'][:8]}`, zero-refusal exports **{old_counts['zero_refusals']}→{new_counts['zero_refusals']}**, zero-refusal exports passing SANY **{old_counts['zero_refusals_and_sany']}→{new_counts['zero_refusals_and_sany']}**, completed campaign-bound TLC runs **{old_counts['completes']}→{new_counts['completes']}**, and explorations **{old_counts['explores']}→{new_counts['explores']}**."]
+lines+=['','The table distinguishes completed runs, invariant counterexamples, and progress until timeout. Lane 4’s additional zero-refusal targets over lane 3 are identified by the intermediate column.\n\nOriginal `MC.tla`, `MC.cfg`, and TLC commands/timeouts were replayed unchanged, with their hashes recorded. The original campaign has no saved bounds for the other 24 primary targets (round-2 Anvil replays are reported separately); no new constants, table interpretations, adapters, or bounds were invented. Reaching states before a TLC evaluation error does not count as exploration. Lane-3 restrictions and finite carriers remain explicitly reported approximations, so a completed bounded run is not a proof of the unrestricted source.','',
  'L1 = traits; L2 = nrkernel bit operations/partial Init; L3 = partial reads/finite carriers; L4 = closure reduction/bounded choose. Intermediate attribution also uses the committed lane reports (`artifacts/nrkernel/report.txt`, `audit/export-partial/REPORT.md`) and the trait lane’s recorded campaign results. More refusals can mean reduction reached previously hidden unsupported expressions.','']
 for primary,title in [(True,'Requested campaign targets'),(False,'Additional campaign adapters and controls')]:
-    lines+=['', '### '+title,'','| Target | Before | L1–3 | After | SANY parent → after | TLC before → after (campaign bounds) | Lane contribution |','|---|---:|---:|---:|---|---|---|']
+    lines+=['', '### '+title,'','| Target | Before | L1–3 | After | SANY parent → after | TLC before → after (original campaign bounds) | Lane contribution |','|---|---:|---:|---:|---|---|---|']
     for a in phases['after']['rows']:
         if a['primary']!=primary:continue
         name=a['machine'];b=maps['before'][name];p=maps['parent'][name]
         lines.append(f"| {name} | {refusal(b)} | {refusal(p)} | {refusal(a)} | {sany(p)} → {sany(a)} | {tlc(b)} → {tlc(a)} | {lanes[name]} |")
+if round2:
+    lines += ['', '### Round-2 Anvil harnesses', '',
+        'These are additional bounded replays, separate from the original campaign counts above. Both use byte-identical saved `MC.tla`/`MC.cfg` files. Reproduce with `python3 audit/export-closures/cumulative.py round2-replay --round2 --verus source/target-verus/release/verus`. No TLC command was saved for these harnesses, so the replay uses lane 3’s 30-second cap, one worker, and `-continue`. A completed search with a counterexample is not a clean invariant pass.', '',
+        '| Machine | L1–3 refusals | L1–4 refusals | Parent TLC | Rebased stack TLC |',
+        '|---|---:|---:|---|---|']
+    parents = {r['machine']:r for r in round2['parent']['rows']}
+    for row in round2['after']['rows']:
+        parent = parents[row['machine']]
+        lines.append(f"| {row['machine']} | {refusal(parent)} | {refusal(row)} | {tlc(parent)} | {tlc(row)} |")
+    lines += ['',
+        'Network: lane 4 removes both closure refusals and the unchanged transport harness completes with nine distinct states. Controller: the original-campaign export above confirms lane 4 removes all nine parent closure refusals; SANY passes. Its round-2 controller harness was marked preliminary/unvalidated by that campaign, so no bounded controller verdict is claimed.', '',
+        'VRS: lane 3’s saved clean `5e38e1ee` replay failed on an Option projection after two states. Both the current parent and rebased stack now finish the complete seven-state search. With `-continue`, TLC reports `not_error` violated along the source’s explicit `Init → AfterListPods → Error` path for an absent/invalid response. This is an expected behavior of the unconstrained-response harness, not a claimed controller defect. Lane 3 unblocks this execution; lane 4 preserves the fix. The full round-2 logs, violations, command provenance, and bound hashes are included in the machine-readable evidence.']
 lines+=['','### Validation and remaining blockers','',
  f'**{args.tests} exporter tests passed**, with `TLA2TOOLS_JAR` set. All **28** example/Raft `.tla`/`.cfg` artifacts are byte-identical. The rebase preserves the lower lanes’ tests and both restriction and choice reporting; captured environments in partial-read analysis now use the same immutable `Arc<Env>` representation as closure reduction.','',
  'Every remaining refusal, including its exact source location and multiplicity, is listed in [BLOCKERS.md](BLOCKERS.md). That file also records compiler, SANY, TLC configuration/evaluation, and timeout failures. The machine-readable report retains each individual refusal. The lane-4 `sub_api_sm` SANY regression is fixed: definedness analysis follows consumed symbolic fields and keeps their guards under the reduction’s LET bindings. It no longer emits guards for unused record fields. Both a bound-parameter closure record and the former unbound `kind` reproducer are TLC-checked. Independent lower-lane limitations and repairs are reflected in the parent and cumulative columns; their exact remaining diagnostics are in the blocker report.','',

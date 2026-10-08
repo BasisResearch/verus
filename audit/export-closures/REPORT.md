@@ -59,26 +59,28 @@ states; simply disabling the action would fail the test.
 
 
 
-## Cumulative campaign after rebase onto `5e38e1ee`
 
-The table measures all 33 requested export targets: Anvil’s five (including both API adapters), IronKV host, nrkernel’s six, NR’s three, and all 18 Splinter attempts. Five additional campaign adapters/controls follow separately. A compiler error or timeout is **not** a zero-refusal export. `Before` uses the original campaign binary; `L1–3` uses the clean lane-3 checkout at `5e38e1ee`; `After` uses the rebased lane-4 binary. Binary hashes and version strings are saved in `cumulative-results.json` (the parent binary embeds its pre-commit dirty version string).
+
+## Cumulative campaign after rebase onto `fb8014b0`
+
+The table measures all 33 requested export targets: Anvil’s five (including both API adapters), IronKV host, nrkernel’s six, NR’s three, and all 18 Splinter attempts. Five additional campaign adapters/controls follow separately. A compiler error or timeout is **not** a zero-refusal export. `Before` uses the original campaign binary; `L1–3` uses the clean lane-3 checkout at `fb8014b0`; `After` uses the rebased lane-4 binary. Binary hashes and version strings are saved in `cumulative-results.json` (the parent binary embeds its pre-commit dirty version string).
 
 - **before:** 9/33 zero-refusal exports; 9/33 also pass SANY; 3/9 saved-bound TLC runs complete; 3/9 explore without an evaluation error.
 - **parent:** 17/33 zero-refusal exports; 17/33 also pass SANY; 5/9 saved-bound TLC runs complete; 7/9 explore without an evaluation error.
 - **after:** 20/33 zero-refusal exports; 20/33 also pass SANY; 5/9 saved-bound TLC runs complete; 7/9 explore without an evaluation error.
 
-Since the previous stack on `64f1c6e3`, zero-refusal exports increased **17→20**, zero-refusal exports passing SANY **15→20**, completed campaign-bound TLC runs **3→5**, and explorations **5→7**. The three MMU exports now finish with zero refusals; PagedBetree and PivotBetree regain their bounded completions.
+Since the previous stack on `5e38e1ee`, zero-refusal exports **20→20**, zero-refusal exports passing SANY **20→20**, completed campaign-bound TLC runs **5→5**, and explorations **7→7**.
 
 The table distinguishes completed runs, invariant counterexamples, and progress until timeout. Lane 4’s additional zero-refusal targets over lane 3 are identified by the intermediate column.
 
-Original `MC.tla`, `MC.cfg`, and TLC commands/timeouts were replayed unchanged, with their hashes recorded. The other 24 primary targets have no saved campaign bounds; no new constants, table interpretations, adapters, or bounds were invented. Reaching states before a TLC evaluation error does not count as exploration. Lane-3 restrictions and finite carriers remain explicitly reported approximations, so a completed bounded run is not a proof of the unrestricted source.
+Original `MC.tla`, `MC.cfg`, and TLC commands/timeouts were replayed unchanged, with their hashes recorded. The original campaign has no saved bounds for the other 24 primary targets (round-2 Anvil replays are reported separately); no new constants, table interpretations, adapters, or bounds were invented. Reaching states before a TLC evaluation error does not count as exploration. Lane-3 restrictions and finite carriers remain explicitly reported approximations, so a completed bounded run is not a proof of the unrestricted source.
 
 L1 = traits; L2 = nrkernel bit operations/partial Init; L3 = partial reads/finite carriers; L4 = closure reduction/bounded choose. Intermediate attribution also uses the committed lane reports (`artifacts/nrkernel/report.txt`, `audit/export-partial/REPORT.md`) and the trait lane’s recorded campaign results. More refusals can mean reduction reached previously hidden unsupported expressions.
 
 
 ### Requested campaign targets
 
-| Target | Before | L1–3 | After | SANY parent → after | TLC before → after (campaign bounds) | Lane contribution |
+| Target | Before | L1–3 | After | SANY parent → after | TLC before → after (original campaign bounds) | Lane contribution |
 |---|---:|---:|---:|---|---|---|
 | anvil/Cluster-adapter | 22 | 22 | 62 | pass → pass | no saved bounds → no saved bounds | L1 trait tables; L4 reduces reachable records, exposing deeper callbacks/choices; still refused |
 | anvil/sub_api | 14 | 8 | 58 | pass → pass | no saved bounds → no saved bounds | L1 trait tables; L3 carriers/guards; L4 action/choice reduction exposes deeper callbacks; still refused |
@@ -116,17 +118,30 @@ L1 = traits; L2 = nrkernel bit operations/partial Init; L3 = partial reads/finit
 
 ### Additional campaign adapters and controls
 
-| Target | Before | L1–3 | After | SANY parent → after | TLC before → after (campaign bounds) | Lane contribution |
+| Target | Before | L1–3 | After | SANY parent → after | TLC before → after (original campaign bounds) | Lane contribution |
 |---|---:|---:|---:|---|---|---|
-| anvil/sub_vrs_reconcile | 5 | 0 | 0 | pass → pass | no saved bounds → no saved bounds | L1 dispatch/tables removes refusals; L4 unchanged |
+| anvil/sub_vrs_reconcile | 5 | 0 | 0 | pass → pass | no saved bounds → no saved bounds | L1 dispatch/tables removes refusals; L3 fixes Option projection through helper match arms (round-2 replay below) |
 | nr/UnboundedLog-mono | 1 | 0 | 0 | pass → pass | evaluation/config error → evaluation/config error | L1 table + L3 guarded reads; unchanged config lacks table assignment |
 | nr/CyclicBuffer | 6 | 6 | 6 | pass → pass | no saved bounds → no saved bounds | L1 dispatch/tables; see remaining located refusals |
 | nr/FlatCombiner | 1 | 0 | 0 | pass → pass | complete (418 states) → evaluation/config error | L1 replaces uninterpreted refusal with table; original config lacks Table_arbitrary__tla_closed |
 | nr/RwLockSpec | 0 | 0 | 0 | pass → pass | complete (207 states) → complete (207 states) | Existing bounded completion |
 
+### Round-2 Anvil harnesses
+
+These are additional bounded replays, separate from the original campaign counts above. Both use byte-identical saved `MC.tla`/`MC.cfg` files. Reproduce with `python3 audit/export-closures/cumulative.py round2-replay --round2 --verus source/target-verus/release/verus`. No TLC command was saved for these harnesses, so the replay uses lane 3’s 30-second cap, one worker, and `-continue`. A completed search with a counterexample is not a clean invariant pass.
+
+| Machine | L1–3 refusals | L1–4 refusals | Parent TLC | Rebased stack TLC |
+|---|---:|---:|---|---|
+| anvil/sub_network | 2 | 0 | evaluation/config error | complete (9 states) |
+| anvil/sub_vrs_reconcile | 0 | 0 | complete search with invariant CTI (7 states) | complete search with invariant CTI (7 states) |
+
+Network: lane 4 removes both closure refusals and the unchanged transport harness completes with nine distinct states. Controller: the original-campaign export above confirms lane 4 removes all nine parent closure refusals; SANY passes. Its round-2 controller harness was marked preliminary/unvalidated by that campaign, so no bounded controller verdict is claimed.
+
+VRS: lane 3’s saved clean `5e38e1ee` replay failed on an Option projection after two states. Both the current parent and rebased stack now finish the complete seven-state search. With `-continue`, TLC reports `not_error` violated along the source’s explicit `Init → AfterListPods → Error` path for an absent/invalid response. This is an expected behavior of the unconstrained-response harness, not a claimed controller defect. Lane 3 unblocks this execution; lane 4 preserves the fix. The full round-2 logs, violations, command provenance, and bound hashes are included in the machine-readable evidence.
+
 ### Validation and remaining blockers
 
-**213 exporter tests passed**, with `TLA2TOOLS_JAR` set. All **28** example/Raft `.tla`/`.cfg` artifacts are byte-identical. The rebase preserves the lower lanes’ tests and both restriction and choice reporting; captured environments in partial-read analysis now use the same immutable `Arc<Env>` representation as closure reduction.
+**216 exporter tests passed**, with `TLA2TOOLS_JAR` set. All **28** example/Raft `.tla`/`.cfg` artifacts are byte-identical. The rebase preserves the lower lanes’ tests and both restriction and choice reporting; captured environments in partial-read analysis now use the same immutable `Arc<Env>` representation as closure reduction.
 
 Every remaining refusal, including its exact source location and multiplicity, is listed in [BLOCKERS.md](BLOCKERS.md). That file also records compiler, SANY, TLC configuration/evaluation, and timeout failures. The machine-readable report retains each individual refusal. The lane-4 `sub_api_sm` SANY regression is fixed: definedness analysis follows consumed symbolic fields and keeps their guards under the reduction’s LET bindings. It no longer emits guards for unused record fields. Both a bound-parameter closure record and the former unbound `kind` reproducer are TLC-checked. Independent lower-lane limitations and repairs are reflected in the parent and cumulative columns; their exact remaining diagnostics are in the blocker report.
 

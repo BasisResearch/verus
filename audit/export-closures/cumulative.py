@@ -39,8 +39,10 @@ def main():
     ap.add_argument('--original-deps', action='store_true')
     ap.add_argument('--jobs', type=int, default=2)
     ap.add_argument('--only', nargs='+')
+    ap.add_argument('--round2', action='store_true')
     args = ap.parse_args()
     binary = args.verus.resolve()
+    campaign = RESEARCH/'campaign-real/round2' if args.round2 else CAMPAIGN
     dest = AUDIT / ('cumulative-' + args.phase)
     dest.mkdir(exist_ok=True)
     env = dict(os.environ, PATH=str(Path.home()/'.cargo/bin')+':'+os.environ['PATH'],
@@ -54,18 +56,29 @@ def main():
             cmd = ['timeout', '90', str(binary), str(src), '--crate-type=lib', '--crate-name', name,
                 '--no-verify', '--compile', '--export', str(deps/(name+'.vir')),
                 '-o', str(deps/('lib'+name+'.rlib'))]
+            if args.round2:
+                cmd = json.loads((campaign/'deps'/(name+'-command.json')).read_text())
+                cmd[2] = str(binary)
+                for flag in ['--export', '-o']:
+                    i = cmd.index(flag)+1
+                    cmd[i] = str(deps/Path(cmd[i]).name)
             proc = subprocess.run(cmd, env=env, cwd=ROOT, capture_output=True, text=True)
             (deps/(name+'.log')).write_text(proc.stdout+proc.stderr)
             if proc.returncode:
                 raise RuntimeError('dependency build failed: '+name)
 
     def one(name):
-        old = CAMPAIGN/name
+        old = campaign/name
         out = dest/name
         if out.exists():
             shutil.rmtree(out)  # Only this runner's evidence, inside this worktree.
         out.mkdir(parents=True)
         cmd = json.loads((old/'command.json').read_text())
+        if isinstance(cmd, dict):
+            a = cmd['arguments']
+            cmd = ['timeout', str(a.get('timeout_secs',90)), str(binary), '-V',
+                'tla-export='+a['module'], '--log-dir', str(out/'export'),
+                a['path'], *a.get('extra_args', [])]
         cmd[2] = str(binary)
         cmd[cmd.index('--log-dir')+1] = str(out/'export')
         cmd = [str(RESEARCH/'campaign-real'/a) if a.startswith('sources/') else a for a in cmd]
@@ -82,7 +95,7 @@ def main():
         row = dict(machine=name, primary=name in PRIMARY, export_rc=proc.returncode,
             export_seconds=round(time.monotonic()-start,2), refusals=None,
             export_status='timeout' if proc.returncode==124 else 'compiler_error',
-            campaign_bounds=(old/'MC-command.json').exists(), tlc_status='no_saved_bounds',
+            campaign_bounds=(old/'MC-command.json').exists() or (args.round2 and (old/'MC.cfg').exists()), tlc_status='no_saved_bounds',
             explores=False, completes=False)
         reports = sorted((out/'export').glob('*.tla.json'))
         if proc.returncode == 0 and reports:
@@ -106,7 +119,11 @@ def main():
                     shutil.copyfile(old/filename,out/filename)
                     assert (old/filename).read_bytes()==(out/filename).read_bytes()
                     row['bound_files'][filename] = digest(out/filename)
-                tlc = json.loads((old/'MC-command.json').read_text())
+                saved_command = old/'MC-command.json'
+                row['saved_tlc_command'] = saved_command.exists()
+                tlc = json.loads(saved_command.read_text()) if saved_command.exists() else [
+                    'timeout','30','java','-Xmx1g','-cp',str(jar),'tlc2.TLC',
+                    '-deadlock','-continue','-workers','1','MC.tla']
                 (out/'MC-command.json').write_text(json.dumps(tlc,indent=2)+'\n')
                 proc = subprocess.run(tlc,cwd=out,env=env,capture_output=True,text=True)
                 text = proc.stdout+proc.stderr
@@ -117,11 +134,13 @@ def main():
                 if counts:
                     row.update(generated=int(counts[-1][0].replace(',','')),distinct=int(counts[-1][1].replace(',','')))
                 row['tlc_errors'] = [line for line in text.splitlines() if line.startswith('Error:')][:8]
-                violation = bool(re.search(r'Error: Invariant \S+ is violated',text))
+                row['invariant_violations'] = sorted(set(re.findall(r'Error: Invariant (\S+) is violated',text)))
+                violation = bool(row['invariant_violations'])
+                row['search_complete'] = 'Model checking completed.' in text
                 if 'Model checking completed.' in text and not row['tlc_errors']:
                     row.update(tlc_status='complete',explores=True,completes=True)
                 elif violation and proc.returncode != 124:
-                    row.update(tlc_status='invariant_counterexample',explores=True)
+                    row.update(tlc_status='complete_with_counterexample' if row['search_complete'] else 'invariant_counterexample',explores=True)
                 elif proc.returncode == 124 and not row['tlc_errors']:
                     row['tlc_status'] = 'exploring_timeout' if counts else 'timeout_before_progress'
                     row['explores'] = bool(counts)
@@ -136,8 +155,9 @@ def main():
         return row
 
     with ThreadPoolExecutor(max_workers=args.jobs) as pool:
-        rows = list(pool.map(one,args.only or PRIMARY+SUPPLEMENTAL))
-    provenance = dict(phase=args.phase,binary=str(binary),binary_version=(binary.parent/'version.txt').read_text(),
+        names = args.only or (['anvil/sub_network','anvil/sub_vrs_reconcile'] if args.round2 else PRIMARY+SUPPLEMENTAL)
+        rows = list(pool.map(one,names))
+    provenance = dict(campaign=str(campaign),phase=args.phase,binary=str(binary),binary_version=(binary.parent/'version.txt').read_text(),
         sha256={p.name:digest(p) for p in [binary,binary.parent/'rust_verify']},
         base_commit=subprocess.check_output(['git','rev-parse','origin/kg/export-partial'],cwd=ROOT,text=True).strip(),
         head_commit=subprocess.check_output(['git','rev-parse','HEAD'],cwd=ROOT,text=True).strip(),rows=rows)
