@@ -41,6 +41,7 @@ impl ResolvedFunction {
     }
 }
 
+#[derive(Clone)]
 pub(super) struct Functions(RefCell<Registry>);
 
 impl Functions {
@@ -133,6 +134,7 @@ pub(super) fn compiler_target(kind: &CallTargetKind, fun: &Fun) -> Fun {
     }
 }
 
+#[derive(Clone)]
 struct Registry {
     functions: HashMap<Fun, Function>,
     instances: Vec<(Fun, Typs, Fun)>,

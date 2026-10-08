@@ -533,6 +533,7 @@ enum Reach {
 /// A call recorded for [`Exporter::transitions`]: the callee, how it is
 /// reached, and what the branches enclosing the call (within the caller)
 /// assign, which TLC has assigned too on any step through the call.
+#[derive(Clone)]
 struct Call {
     callee: OpKey,
     reach: Reach,
@@ -626,6 +627,8 @@ struct Env {
     /// rustc gives every binding its own `VarIdent`, so a binder that
     /// shadows a name (`let k = k + 1`) never inherits the domain it had.
     domains: HashMap<VarIdent, Dom>,
+    /// Original quantifier/constructor binders available in this scope.
+    trace_binders: HashSet<VarIdent>,
     /// Names a pattern bound to a field of a whole state (`let State { x,
     /// .. } = post`), so `x == e` assigns it as `post.x == e` does.
     field_binders: HashMap<VarIdent, FieldBinder>,
@@ -652,6 +655,7 @@ impl Env {
             values: HashMap::new(),
             primed: HashSet::new(),
             domains: HashMap::new(),
+            trace_binders: HashSet::new(),
             field_binders: HashMap::new(),
         }
     }
@@ -700,6 +704,27 @@ impl Env {
     }
 }
 
+/// One already-lowered existential arm, before its field quantifiers are wrapped.
+#[derive(Clone)]
+struct TraceVariant {
+    tag: String,
+    fields: Vec<String>,
+    names: Vec<String>,
+    domains: Vec<String>,
+    body: String,
+}
+
+/// A whole action-record disjunct, with (log name, type, domain, TLA binder)
+/// for each parameter. Its body retains the disjunct's guards.
+#[derive(Clone)]
+struct TraceAction {
+    fun: Fun,
+    params: Vec<(String, Typ, Option<String>, String)>,
+    body: String,
+    selected: bool,
+}
+
+#[derive(Clone)]
 struct Exporter {
     datatypes: HashMap<Path, Datatype>,
     functions: Functions,
@@ -801,6 +826,24 @@ struct Exporter {
     /// Whether the property being printed has a `[][A]_vars` conjunct, which
     /// TLC checks only when the property has no premise.
     temporal_top_action: bool,
+    /// Independently selectable action-record branches of closure roots.
+    trace_actions: HashMap<OpKey, Vec<TraceAction>>,
+    /// Action-builder arguments seen while lowering the model, by enclosing
+    /// function. Keep the original quantifier/caller domains before inlining
+    /// erases the call sites used by general trace relations.
+    action_domains: HashMap<String, Vec<(Fun, Vec<Option<Dom>>)>>,
+    /// Domains built only from certified trace inputs and total generated
+    /// operations. Certification happens at construction, never by parsing
+    /// printed TLA. All trace consumers share this eligibility boundary.
+    safe_trace_domains: HashSet<String>,
+    /// A computed bound in an independently exposed helper may rely on a
+    /// caller's guard. Next itself retains that scope; a standalone helper
+    /// check cannot assume it, and must fail explicitly rather than crash TLC.
+    unsafe_trace_relations: HashSet<String>,
+    /// Closure roots to lower after the model is complete, in a private copy.
+    trace_roots: HashMap<OpKey, (Expr, Env)>,
+    /// Enum-arm templates keyed by their existential expression.
+    trace_variants: HashMap<usize, Vec<TraceVariant>>,
     /// Every one-binder `exists` printed, by the address of its expression:
     /// the binder's name, its domain and the body, for [`Steps`].
     exists_printed: HashMap<usize, (String, String, String)>,
@@ -3378,6 +3421,13 @@ impl Exporter {
                         return None;
                     }
                 };
+                if typ_datatype(&fun.x.ret.x.typ).is_some_and(|p| last_segment(&p) == "Action") {
+                    let domains = args.iter().map(|a| self.action_arg_domain(a, env, 0)).collect();
+                    self.action_domains
+                        .entry(self.current.clone())
+                        .or_default()
+                        .push((fun.name().clone(), domains));
+                }
                 let (body, env2, mut lets) = self.inline_call(&fun, args, env)?;
                 let (record, renv, mut rlets) = self.resolve_record(&body, &env2, depth + 1)?;
                 lets.append(&mut rlets);
@@ -3385,6 +3435,53 @@ impl Exporter {
             }
             _ => None,
         }
+    }
+
+    /// A value may escape its source guard order only when it is a literal
+    /// or a total pre-state projection. Original binders are also valid when
+    /// kept in their scope (quantified templates and dependent field bounds).
+    /// Calls, indexing, casts and arithmetic are deliberately not inferred safe.
+    fn trace_input_eligible(&self, e: &Expr, env: &Env, depth: usize) -> bool {
+        if depth > 16 {
+            return false;
+        }
+        let e = peel(e);
+        if matches!(e.x, ExprX::Const(_)) || self.role_field(&e, env, Role::Pre).is_some() {
+            return true;
+        }
+        let Some(v) = read_var(&e) else { return false };
+        if env.roles.get(&v) == Some(&Role::Pre) {
+            return true;
+        }
+        if let Some((value, scope)) = env.values.get(&v) {
+            return self.trace_input_eligible(value, scope, depth + 1);
+        }
+        env.trace_binders.contains(&v)
+    }
+
+    fn trace_domain_eligible(&self, domain: &str) -> bool {
+        self.safe_trace_domains.contains(domain) || self.hole_typs.contains_key(domain)
+    }
+
+    /// Only reuse domains already established in the model or literal
+    /// singleton values. Computing a new argument value here could hoist a
+    /// partial expression above its guard or read an unassigned post state.
+    fn action_arg_domain(&mut self, e: &Expr, env: &Env, depth: usize) -> Option<Dom> {
+        if depth > 16 {
+            return None;
+        }
+        let e = peel(e);
+        if matches!(e.x, ExprX::Const(_)) {
+            let domain = format!("{{{}}}", self.quiet(|x| x.expr(&e, env)));
+            self.safe_trace_domains.insert(domain.clone());
+            return Some(Dom::Closed(domain, false));
+        }
+        let v = read_var(&e)?;
+        if let Some(d) = env.domains.get(&v) {
+            return Some(d.clone());
+        }
+        let (value, scope) = env.values.get(&v)?;
+        self.action_arg_domain(value, scope, depth + 1)
     }
 
     fn resolve_record_place(
@@ -3887,6 +3984,7 @@ impl Exporter {
         let mut env2 = env.clone();
         for b in binders.iter() {
             self.bind_var(&mut env2, &b.name);
+            env2.trace_binders.insert(b.name.clone());
         }
         if !forall && binders.len() == 1 {
             if let Some(out) = self.exists_per_variant(e, &binders[0], body, &env2) {
@@ -4107,6 +4205,7 @@ impl Exporter {
         // read as they would from a plain `\\E binder \\in domain`.
         let mut variants = Vec::new();
         let mut sets = Vec::new();
+        let mut trace_safe = true;
         for ((vname, fields, names, record), (bounded, s)) in
             all.into_iter().zip(field_bounds.into_iter().zip(split))
         {
@@ -4133,33 +4232,62 @@ impl Exporter {
                         constant
                     }
                 };
+                trace_safe &= self.trace_domain_eligible(&domain);
                 domains.push(domain);
             }
             let binds: Vec<String> =
                 names.iter().zip(&domains).map(|(n, d)| format!("{n} \\in {d}")).collect();
             sets.push(if binds.is_empty() {
                 format!("{{{record}}}")
+            } else if domains.iter().enumerate().any(|(i, d)| {
+                names[..i]
+                    .iter()
+                    .any(|n| d.split(|c: char| !c.is_alphanumeric() && c != '_').any(|t| t == n))
+            }) {
+                let mut set = format!("{{{record}}}");
+                for (name, domain) in names.iter().zip(&domains).rev() {
+                    set = format!("UNION {{{set} : {name} \\in {domain}}}");
+                }
+                set
             } else {
                 format!("{{{record} : {}}}", binds.join(", "))
             });
-            variants.push((record, names, domains));
+            variants.push((
+                vname.to_string(),
+                fields.iter().map(|(f, _)| f.to_string()).collect::<Vec<_>>(),
+                record,
+                names,
+                domains,
+            ));
         }
         if variants.is_empty() {
             return None;
         }
         let union = format!("({})", sets.join(" \\cup "));
         let mut env2 = env.clone();
+        if trace_safe {
+            self.safe_trace_domains.insert(union.clone());
+        }
         env2.domains.insert(x.clone(), Dom::Closed(union.clone(), true));
         let sb = self.in_branch(body, &env2);
         self.exists_printed.insert(Arc::as_ptr(e) as usize, (xname.clone(), union, sb.clone()));
         let mut parts = Vec::new();
-        for (record, names, domains) in variants {
+        let mut trace_variants = Vec::new();
+        for (tag, fields, record, names, domains) in variants {
             let mut out = format!("(LET {xname} == {record} IN {sb})");
+            trace_variants.push(TraceVariant {
+                tag,
+                fields,
+                names: names.clone(),
+                domains: domains.clone(),
+                body: out.clone(),
+            });
             for (n, dom) in names.iter().zip(domains).rev() {
                 out = format!("(\\E {n} \\in {dom} : {out})");
             }
             parts.push(out);
         }
+        self.trace_variants.insert(Arc::as_ptr(e) as usize, trace_variants);
         Some(format!("({})", parts.join(" \\/ ")))
     }
 
@@ -4240,6 +4368,7 @@ impl Exporter {
                     match arg.as_ref().and_then(|v| field_of.get(v).map(|i| (v, *i))) {
                         Some((_, i)) if i < k => {
                             env.names.insert(p.x.name.clone(), names[i].clone());
+                            env.trace_binders.insert(p.x.name.clone());
                         }
                         Some((v, i)) => {
                             if v == &target && i == k {
@@ -4262,6 +4391,7 @@ impl Exporter {
                 for (v, i) in &field_of {
                     if *i < k {
                         env.names.insert(v.clone(), names[*i].clone());
+                        env.trace_binders.insert(v.clone());
                     } else {
                         unbound.push(v.clone());
                     }
@@ -4354,6 +4484,19 @@ impl Exporter {
     ) -> Option<(String, u128)> {
         let normalized = self.functions.normalize_type(typ);
         let typ = &normalized;
+        let result = self.bound_from_type_inner(typ, span, seen);
+        if let Some((domain, _)) = &result {
+            self.safe_trace_domains.insert(domain.clone());
+        }
+        result
+    }
+
+    fn bound_from_type_inner(
+        &mut self,
+        typ: &Typ,
+        span: &crate::messages::Span,
+        seen: &mut Vec<Path>,
+    ) -> Option<(String, u128)> {
         match &**typ {
             TypX::Bool => Some(("BOOLEAN".into(), 2)),
             TypX::Int(range @ (IntRange::U(_) | IntRange::I(_))) => match int_type_bounds(range) {
@@ -4705,10 +4848,16 @@ impl Exporter {
                     _ => continue,
                 };
                 let x = self.bind("x__");
-                return Some(match range.as_ref().and_then(|r| int_range_pred(&x, r)) {
+                let domain = match range.as_ref().and_then(|r| int_range_pred(&x, r)) {
                     Some(in_range) => format!("{{{x} \\in {set} : {in_range}}}"),
                     None => set,
-                });
+                };
+                if self.trace_input_eligible(&args[0], env, 0) {
+                    self.safe_trace_domains.insert(domain.clone());
+                } else {
+                    self.unsafe_trace_relations.insert(self.current.clone());
+                }
+                return Some(domain);
             }
         }
         // Integer range from inequalities and chained comparisons; a `char`
@@ -4718,9 +4867,11 @@ impl Exporter {
         }
         let mut lower: Option<String> = None;
         let mut upper: Option<String> = None;
+        let mut trace_safe = true;
         // `v op other`, with `strict` strict comparisons on the way (each one
         // step further from `other`).
         let mut note = |this: &mut Self, op: InequalityOp, other: &Expr, strict: usize| {
+            trace_safe &= this.trace_input_eligible(other, env, 0);
             let o = this.expr(other, env);
             let shifted = |sign: &str| {
                 if strict == 0 { o.clone() } else { format!("({o}) {sign} {strict}") }
@@ -4803,7 +4954,15 @@ impl Exporter {
             (u, t) => u.or(t.map(|t| t.to_string())),
         };
         match (lower, upper) {
-            (Some(l), Some(u)) => Some(format!("{l}..{u}")),
+            (Some(l), Some(u)) => {
+                let domain = format!("{l}..{u}");
+                if trace_safe {
+                    self.safe_trace_domains.insert(domain.clone());
+                } else {
+                    self.unsafe_trace_relations.insert(self.current.clone());
+                }
+                Some(domain)
+            }
             _ => None,
         }
     }
@@ -5688,7 +5847,12 @@ impl Exporter {
                 }
                 _ => None,
             };
-            let called = peel(&arm.x.body);
+            let body_parts = conjuncts(&peel(&arm.x.body));
+            let calls: Vec<Expr> = body_parts.into_iter().filter(|e| {
+                matches!(&e.x, ExprX::Call { target: CallTarget::Fun(kind, f, typs, ..), .. }
+                    if self.functions.resolve(FunctionUse::Call(kind, f, typs)).is_ok_and(|f| self.param_roles(&f).contains(&Some(Role::Post))))
+            }).collect();
+            let called = if calls.len() == 1 { calls[0].clone() } else { peel(&arm.x.body) };
             let (function, operator, args) = match &called.x {
                 ExprX::Call { target: CallTarget::Fun(kind, h, typs, ..), args, .. } => {
                     match self.functions.resolve(FunctionUse::Call(kind, h, typs)).ok() {
@@ -6767,6 +6931,12 @@ impl Exporter {
     fn forward_call(&mut self, e: &Expr, env: &Env) -> Option<String> {
         let (f, forward, recv, input) = self.forward_parts(e)?;
         let has_input = !is_unit(&input.typ);
+        let domains =
+            if has_input { vec![self.action_arg_domain(&input, env, 0)] } else { Vec::new() };
+        self.action_domains
+            .entry(self.current.clone())
+            .or_default()
+            .push((f.name().clone(), domains));
         let arg = if has_input { Some(self.quiet(|x| x.expr(&input, env))) } else { None };
         let name = self.ensure_forward(&f, &forward, &recv, has_input);
         Some(match arg {
@@ -6830,6 +7000,306 @@ impl Exporter {
         })
     }
 
+    /// Each independently evaluated trace relation starts with no assigned
+    /// successor variables, just like a freshly emitted model operator.
+    fn reset_trace_context(&mut self) {
+        // Cached quantified templates may become siblings of freshly lowered
+        // branches. Reserve their locals so a LET cannot shadow a template's
+        // parameter when the branches are merged into one trace operator.
+        self.bound = self.locals_ever.clone();
+        self.current_tainted = false;
+        self.branch_depth = 0;
+        self.conj_level = true;
+        self.current_calls.clear();
+        self.current_assigned.clear();
+        self.enclosing_assigned.clear();
+        self.implications.clear();
+        self.pre_assigned.clear();
+        self.current_key = None;
+        self.in_init = false;
+    }
+
+    /// Collect every action occurrence. Selection is allowed only for a
+    /// conjunctive application, or a path to one with its condition retained.
+    /// Unsupported occurrences are kept as general relations; dropping one
+    /// would make the other occurrences of the same name an incomplete dispatch.
+    fn trace_action_branches(&mut self, body: &Expr, env: &Env) -> Vec<TraceAction> {
+        let body = peel(body);
+        if let ExprX::Logical(LogicalOp::Or, a, b) = &body.x {
+            let mut out = self.trace_action_branches(a, env);
+            out.extend(self.trace_action_branches(b, env));
+            return out;
+        }
+        if let ExprX::If(cond, a, Some(b)) = &body.x {
+            let guard = self.quiet(|x| x.expr(cond, env));
+            let mut out = Vec::new();
+            for (branch, positive) in [(a, true), (b, false)] {
+                for mut action in self.trace_action_branches(branch, env) {
+                    if action.selected {
+                        let g = if positive { guard.clone() } else { format!("~({guard})") };
+                        action.body = format!("IF {g} THEN ({}) ELSE FALSE", action.body);
+                    }
+                    out.push(action);
+                }
+            }
+            return out;
+        }
+        let mut builders = Vec::new();
+        crate::ast_visitor::expr_visitor_walk(&body, &mut |e: &Expr| {
+            if let ExprX::Call { target: CallTarget::Fun(kind, fun, typs, ..), args, .. } = &e.x {
+                if let Ok(f) = self.functions.resolve(FunctionUse::Call(kind, fun, typs)) {
+                    if typ_datatype(&f.x.ret.x.typ).is_some_and(|p| last_segment(&p) == "Action") {
+                        builders.push((f, args.clone()));
+                    }
+                }
+            }
+            crate::visitor::VisitorControlFlow::Recurse
+        });
+        if let [(fun, args)] = &builders[..] {
+            if let Some(action) = self.trace_action_branch(&body, env, fun, args) {
+                return vec![action];
+            }
+        }
+        builders.into_iter().map(|(fun, _)| self.trace_general_action(&fun, &body)).collect()
+    }
+
+    /// Calls hidden inside helpers (including closure-returning helpers) have
+    /// no independently lowered call-site template. Find them in the source
+    /// bodies, not just the emitted operator graph: inlining removes edges.
+    /// Their general relations override any selected occurrences of the name.
+    fn trace_indirect_actions(&mut self, body: &Expr) -> Vec<TraceAction> {
+        let mut pending = vec![(body.clone(), false)];
+        let mut seen = HashSet::new();
+        let mut sites = Vec::new();
+        while let Some((body, indirect)) = pending.pop() {
+            crate::ast_visitor::expr_visitor_walk(&body, &mut |e: &Expr| {
+                if let ExprX::Call { target: CallTarget::Fun(kind, fun, typs, ..), .. } = &e.x {
+                    if let Ok(f) = self.functions.resolve(FunctionUse::Call(kind, fun, typs)) {
+                        if indirect
+                            && typ_datatype(&f.x.ret.x.typ)
+                                .is_some_and(|p| last_segment(&p) == "Action")
+                        {
+                            sites.push((f.clone(), body.clone()));
+                        }
+                        if seen.insert(f.name().clone()) {
+                            if let Some(callee) = &f.x.body {
+                                pending.push((callee.clone(), true));
+                            }
+                        }
+                    }
+                }
+                crate::visitor::VisitorControlFlow::Recurse
+            });
+        }
+        sites.into_iter().map(|(fun, site)| self.trace_general_action(&fun, &site)).collect()
+    }
+
+    fn trace_action_branch(
+        &mut self,
+        body: &Expr,
+        env: &Env,
+        fun: &ResolvedFunction,
+        args: &Exprs,
+    ) -> Option<TraceAction> {
+        self.reset_trace_context();
+        let f = fun;
+        let site = match &body.x {
+            ExprX::Quant(q, _, inner) if matches!(q.quant, air::ast::Quant::Exists) => peel(inner),
+            _ => body.clone(),
+        };
+        // A builder somewhere under a conditional, negation, or nested
+        // disjunction does not mean that taking this relation executes it.
+        let application = conjuncts(&site).into_iter().find(|e| {
+            matches!(&e.x, ExprX::Call { target: CallTarget::FnSpec(_), args, .. }
+                if args.len() == 2
+                && read_var(&args[0]).and_then(|v| env.roles.get(&v).copied()) == Some(Role::Pre)
+                && read_var(&args[1]).and_then(|v| env.roles.get(&v).copied()) == Some(Role::Post))
+        })?;
+        let ExprX::Call { target: CallTarget::FnSpec(c), .. } = &application.x else { return None };
+        let forward = self.forward_parts(c);
+        if forward.is_none() {
+            let (kind, wrapper, typs, wrapper_args) = called(c)?;
+            let wrapper = self.functions.resolve(FunctionUse::Call(&kind, &wrapper, &typs)).ok()?;
+            let index = wrapper_args.iter().position(|a| {
+                called(a).is_some_and(|(kind, f, typs, _)| {
+                    self.functions
+                        .resolve(FunctionUse::Call(&kind, &f, &typs))
+                        .is_ok_and(|f| f.same_instance(fun))
+                })
+            })?;
+            // Merely passing the builder to a wrapper does not imply that
+            // the wrapper executes it (it might allow stuttering instead).
+            // Recognize a faithful wrapper by both field applications as
+            // unconditional conjuncts on the closure's pre/post parameters.
+            let wrapper_body = peel(wrapper.x.body.as_ref()?);
+            let ExprX::Closure(ps, cb) = &wrapper_body.x else { return None };
+            if ps.len() != 2 {
+                return None;
+            }
+            let receiver = &wrapper.x.params.get(index)?.x.name;
+            for (field, arity) in [("precondition", 1), ("transition", 2)] {
+                if !conjuncts(cb).iter().any(|e| {
+                    let ExprX::Call { target: CallTarget::FnSpec(c), args, .. } = &e.x else {
+                        return false;
+                    };
+                    access_path(c).is_some_and(|(v, fields)| {
+                        &v == receiver && fields.len() == 1 && fields[0].as_str() == field
+                    }) && args.len() == arity
+                        && args
+                            .iter()
+                            .zip(ps.iter())
+                            .all(|(a, p)| read_var(a).as_ref() == Some(&p.name))
+                }) {
+                    return None;
+                }
+            }
+        }
+        let forward_input = forward.and_then(|(builder, forward, _, input)| {
+            (builder.same_instance(fun) && !is_unit(&input.typ)).then(|| {
+                let p = &forward.x.params[1];
+                (input, ident_name(&p.x.name))
+            })
+        });
+        let (params, text) = match &body.x {
+            ExprX::Quant(q, binders, _)
+                if matches!(q.quant, air::ast::Quant::Exists) && binders.len() == 1 =>
+            {
+                let (arg, log_name, typ) = if let Some((input, name)) = &forward_input {
+                    (input, name.clone(), input.typ.clone())
+                } else if args.len() == 1 {
+                    (&args[0], ident_name(&f.x.params[0].x.name), f.x.params[0].x.typ.clone())
+                } else {
+                    return None;
+                };
+                if read_var(arg).as_ref() != Some(&binders[0].name) {
+                    return None;
+                }
+                let (name, domain, text) =
+                    self.exists_printed.get(&(Arc::as_ptr(body) as usize)).cloned()?;
+                if !self.trace_domain_eligible(&domain) {
+                    return None;
+                }
+                (vec![(log_name, typ, Some(domain), name)], text)
+            }
+            ExprX::Quant(..) => return None,
+            _ => {
+                let mut params = Vec::new();
+                let mut inputs: Vec<_> =
+                    f.x.params
+                        .iter()
+                        .zip(args.iter())
+                        .map(|(p, a)| (ident_name(&p.x.name), a))
+                        .collect();
+                if let Some((input, name)) = &forward_input {
+                    inputs.push((name.clone(), input));
+                }
+                if inputs.iter().any(|(_, input)| !self.trace_input_eligible(input, env, 0)) {
+                    return None;
+                }
+                let mut text = self.expr(body, env);
+                for (log_name, input) in inputs {
+                    let value = self.quiet(|x| x.expr(input, env));
+                    let binder = self.bind("trace_input");
+                    params.push((
+                        log_name,
+                        input.typ.clone(),
+                        Some(format!("{{{value}}}")),
+                        binder.clone(),
+                    ));
+                    text = format!("({binder} = {value}) /\\ ({text})");
+                }
+                (params, text)
+            }
+        };
+        Some(TraceAction { fun: fun.name().clone(), params, body: text, selected: true })
+    }
+
+    /// A builder that cannot be selected still checks its precondition and
+    /// transition, conjoined with Next. No call-site parameters are discarded.
+    fn trace_general_action(&mut self, fun: &ResolvedFunction, site: &Expr) -> TraceAction {
+        self.reset_trace_context();
+        let mut forward = None;
+        crate::ast_visitor::expr_visitor_walk(site, &mut |e: &Expr| {
+            if let ExprX::Call { target: CallTarget::FnSpec(c), .. } = &e.x {
+                if let Some((builder, fwd, _, input)) = self.forward_parts(c) {
+                    if builder.same_instance(fun) {
+                        forward = Some((fwd, input));
+                    }
+                }
+            }
+            crate::visitor::VisitorControlFlow::Recurse
+        });
+        if let Some((fwd, input)) = forward {
+            let method = self.forward_methods.iter().position(|m| m == fwd.name());
+            if let Some(op) = method
+                .and_then(|method| {
+                    self.op_names.get(&(fun.name().clone(), Variant::Forward(method), false))
+                })
+                .cloned()
+            {
+                let mut params = Vec::new();
+                let body = if is_unit(&input.typ) {
+                    op
+                } else {
+                    let log_name = ident_name(&fwd.x.params[1].x.name);
+                    let name = self.bind("trace_input");
+                    let domain = self.trace_domain(&input.typ, &input.span, None);
+                    params.push((log_name, input.typ.clone(), domain, name.clone()));
+                    format!("{op}({name})")
+                };
+                return TraceAction { fun: fun.name().clone(), params, body, selected: false };
+            }
+        }
+        let f = fun;
+        let mut env = Env::new();
+        let mut params = Vec::new();
+        for p in f.x.params.iter() {
+            let name = self.bind_var(&mut env, &p.x.name);
+            let domain = self.trace_domain(&p.x.typ, &p.span, None);
+            params.push((ident_name(&p.x.name), p.x.typ.clone(), domain, name));
+        }
+        let mut parts = Vec::new();
+        if let Some((record, renv, lets)) =
+            f.x.body.as_ref().and_then(|b| self.resolve_record(b, &env, 0))
+        {
+            for (field, arity) in [("precondition", 1), ("transition", 2)] {
+                if let Some((ps, body, mut cenv, clets)) = self.closure_of_field(
+                    &record,
+                    &Arc::new(field.to_string()),
+                    renv.clone(),
+                    &mut lets.clone(),
+                    0,
+                ) {
+                    if ps.len() == arity {
+                        for (i, p) in ps.iter().enumerate() {
+                            cenv.roles.insert(
+                                p.name.clone(),
+                                if i == 0 { Role::Pre } else { Role::Post },
+                            );
+                        }
+                        let text = self.expr(&body, &cenv);
+                        parts.push(if clets.is_empty() {
+                            text
+                        } else {
+                            format!("LET {} IN {text}", clets.join(" "))
+                        });
+                    }
+                }
+            }
+        }
+        let body = if parts.len() == 2 {
+            format!("({}) /\\ ({})", parts[0], parts[1])
+        } else {
+            // Other Action APIs may not expose these two closures. Keep the
+            // name known and fail explicitly rather than taking OTHER -> Next.
+            format!(
+                "Assert(FALSE, \"trace: {} has no independently checkable action relation\")",
+                fun_as_friendly_rust_name(fun.name())
+            )
+        };
+        TraceAction { fun: fun.name().clone(), params, body, selected: false }
+    }
+
     /// The operator of a spec fn of no parameters returning a closure over
     /// one state (a predicate, pre role) or two (an action, pre and post),
     /// as verus-tla's `init()`, `next()` and state predicates are written.
@@ -6851,6 +7321,9 @@ impl Exporter {
                 env.roles.insert(p.name.clone(), if k == 0 { Role::Pre } else { Role::Post });
             }
             let body = x.expr(&cbody, &env);
+            if params.len() == 2 {
+                x.trace_roots.insert((f.clone(), Variant::Plain, false), (cbody.clone(), env));
+            }
             (vec![], body, format!("{}, {}", fun_as_friendly_rust_name(f), span_string(&func.span)))
         }))
     }
@@ -8292,6 +8765,7 @@ impl Exporter {
             self.op_names.insert(key.clone(), op.clone());
             self.emitted.insert(key);
             self.arity.insert(op.clone(), 0);
+            self.safe_trace_domains.insert(format!("{{{op}}}"));
             self.constant_ops.insert(fun.clone(), op.clone());
             constant_funs.push(fun);
         }
@@ -8537,6 +9011,12 @@ pub fn export_module(
         temporal_notes: BTreeSet::new(),
         temporal_unchecked: Vec::new(),
         temporal_top_action: false,
+        trace_actions: HashMap::new(),
+        action_domains: HashMap::new(),
+        safe_trace_domains: HashSet::new(),
+        unsafe_trace_relations: HashSet::new(),
+        trace_roots: HashMap::new(),
+        trace_variants: HashMap::new(),
         exists_printed: HashMap::new(),
         current_key: None,
         def_owners: Vec::new(),
@@ -8638,7 +9118,11 @@ pub fn export_module(
                                 if k == 0 { Role::Pre } else { Role::Post },
                             );
                         }
-                        ex.expr(body, &env)
+                        let printed = ex.expr(body, &env);
+                        if i == 1 {
+                            ex.trace_roots.insert(key.clone(), (body.clone(), env));
+                        }
+                        printed
                     }
                     _ => ex.refuse("verus-tla root whose body is not a closure literal", &b.span),
                 },
@@ -9106,6 +9590,10 @@ pub fn export_module(
         euclid: model_euclid,
         recursive: model_recursive.clone(),
     };
+    // Named-expression helpers are not emitted in the base module. Start
+    // trace lowering from the actual model, before those helpers can mark a
+    // trace dependency as already emitted (or claim its constants/names).
+    let mut trace_ex = ex.clone();
     let expr_exports: Vec<ExprExport> =
         exprs.iter().map(|name| ex.export_expr(name, &model, &mut pending)).collect();
     let variables = state_vars
@@ -9509,8 +9997,15 @@ pub fn export_module(
     );
     cfg.push_str("\\* CONSTRAINT <a state predicate bounding the model>\n");
     let next_key = (triple.next.clone(), Variant::Plain, false);
-    let (trace_module_name, trace_tla, trace_cfg, trace) =
-        ex.trace_spec(module, &module_name, &next_key, &ex.trace_operators(&next_key));
+    // Trace-only lowering must never change model definitions, names, holes,
+    // assignment analysis, or the report's model metadata.
+    let (trace_module_name, trace_tla, trace_cfg, trace) = trace_ex.trace_spec(
+        module,
+        &module_name,
+        &next_key,
+        &ex.trace_operators(&next_key),
+        !type_ok.is_empty(),
+    );
     let report = Report {
         module: module.to_string(),
         shape: triple.shape.to_string(),
@@ -9600,6 +10095,11 @@ pub struct TraceReport {
     /// their record labels.
     pub observables: Vec<String>,
     pub steps: Vec<TraceStep>,
+    /// Named steps whose original enclosing relation is retained, rather than
+    /// an independently selectable existential arm.
+    pub general_relation_steps: Vec<String>,
+    /// Policy for a step name this export does not know.
+    pub unknown_step: String,
 }
 
 /// The names the trace module binds: operator parameters and bound
@@ -9684,7 +10184,9 @@ impl Exporter {
         visiting: &mut Vec<(OpKey, usize)>,
     ) -> Option<(String, bool)> {
         match d {
-            Dom::Closed(s, from_type) => Some((s.clone(), *from_type)),
+            Dom::Closed(s, from_type) => {
+                self.trace_domain_eligible(s).then(|| (s.clone(), *from_type))
+            }
             Dom::Param(k, i) => self.resolve_param(k, *i, reachable, visiting),
             Dom::Field { of, tag, var, access, hole, field_typ } => {
                 let (of, from_type) = self.resolve_dom(of, reachable, visiting)?;
@@ -9965,28 +10467,215 @@ impl Exporter {
             return hole;
         }
         let first = self.holes.len();
+        let owners = self.hole_owners.len();
+        let hole_typs = self.hole_typs.clone();
         let constants = self.constants.clone();
         let domain = self.quiet(|x| x.bound_from_type(typ, span, &mut Vec::new()));
         if self.holes.len() > first {
             self.holes.truncate(first);
+            self.hole_owners.truncate(owners);
+            self.hole_typs = hole_typs;
             self.constants = constants;
             return None;
         }
         domain.map(|(d, _)| d)
     }
 
+    /// Specialize the root existential's chosen constructor. Keep the original
+    /// dispatcher (including match guards), and narrow only fields passed
+    /// unchanged to the named transition. Computed arguments need the general
+    /// relation check; treating them as independent parameters would widen Next.
+    fn trace_variant_arms(
+        &self,
+        next: &OpKey,
+        step: &TraceStep,
+    ) -> Option<Vec<(TraceVariant, Vec<Option<usize>>)>> {
+        let f = self.functions.resolve(FunctionUse::Root(&next.0)).ok()?;
+        let body = peel(f.x.body.as_ref()?);
+        let ExprX::Quant(q, binders, qbody) = &body.x else { return None };
+        if !matches!(q.quant, air::ast::Quant::Exists) || binders.len() != 1 {
+            return None;
+        }
+        let variants = self.trace_variants.get(&(Arc::as_ptr(&body) as usize))?;
+        let dispatch = peel(qbody);
+        let ExprX::Call { target: CallTarget::Fun(kind, dispatch_fun, typs, ..), .. } = &dispatch.x
+        else {
+            return None;
+        };
+        let dispatcher =
+            self.functions.resolve(FunctionUse::Call(kind, dispatch_fun, typs)).ok()?;
+        let dispatch_body = peel(dispatcher.x.body.as_ref()?);
+        let ExprX::Match(_, match_arms, _) = &dispatch_body.x else { return None };
+        let mut seen = HashSet::new();
+        for arm in match_arms.iter() {
+            let PatternX::Constructor(_, tag, fields) = &arm.x.pattern.x else { return None };
+            if !seen.insert(tag.clone())
+                || !matches!(arm.x.guard.x, ExprX::Const(Constant::Bool(true)))
+                || fields.iter().any(|f| !matches!(f.a.x, PatternX::Var(_) | PatternX::Wildcard(_)))
+            {
+                return None;
+            }
+        }
+        let arms = self.step_arms(qbody, &binders[0].name)?;
+        // A summary only recognizes a direct conjunctive call. Account for
+        // every occurrence, including those under an IF or in a helper:
+        // selecting only the known sites would discard valid calls.
+        let target = self.op_names.iter().find(|(_, name)| *name == &step.operator)?.0;
+        for (summary, arm) in arms.iter().zip(match_arms.iter()) {
+            let mut occurrences = 0;
+            let mut indirect = false;
+            crate::ast_visitor::expr_visitor_walk(&arm.x.body, &mut |e: &Expr| {
+                if let ExprX::Call { target: CallTarget::Fun(kind, fun, typs, ..), .. } = &e.x {
+                    let Ok(fun) = self.functions.resolve(FunctionUse::Call(kind, fun, typs)) else {
+                        indirect = true;
+                        return crate::visitor::VisitorControlFlow::Recurse;
+                    };
+                    let key = (fun.name().clone(), Variant::Plain, false);
+                    if &key == target {
+                        occurrences += 1;
+                    } else if self.reachable_from(&key).contains(target)
+                        || reached_functions(&self.functions, &key.0).contains(&target.0)
+                    {
+                        indirect = true;
+                    }
+                }
+                crate::visitor::VisitorControlFlow::Recurse
+            });
+            let selected = summary.operator.as_ref() == Some(&step.operator);
+            if indirect || occurrences != usize::from(selected) {
+                return None;
+            }
+        }
+        let mut out = Vec::new();
+        for arm in arms.iter().filter(|a| a.operator.as_ref() == Some(&step.operator)) {
+            let variant = variants.iter().find(|v| Some(&v.tag) == arm.variant.as_ref())?;
+            if arm.args.iter().any(|a| a.field.is_none())
+                || variant.domains.iter().any(|d| !self.trace_domain_eligible(d))
+            {
+                return None;
+            }
+            let mapping = variant
+                .fields
+                .iter()
+                .map(|field| arm.args.iter().position(|a| a.field.as_ref() == Some(field)))
+                .collect();
+            // Repeated use of one field must still equate the logged arguments.
+            if arm
+                .args
+                .iter()
+                .enumerate()
+                .any(|(i, a)| arm.args[..i].iter().any(|b| a.field == b.field))
+            {
+                return None;
+            }
+            out.push((variant.clone(), mapping));
+        }
+        (!out.is_empty()).then_some(out)
+    }
+
+    /// The existential's dispatcher itself can be logged with its Step
+    /// parameter; its parameter domain supplies the original existential.
+    fn trace_is_dispatcher(&self, next: &OpKey, step: &TraceStep) -> bool {
+        let Ok(f) = self.functions.resolve(FunctionUse::Root(&next.0)) else { return false };
+        let Some(body) = &f.x.body else { return false };
+        let body = peel(body);
+        let ExprX::Quant(q, binders, inner) = &body.x else { return false };
+        if !matches!(q.quant, air::ast::Quant::Exists) || binders.len() != 1 {
+            return false;
+        }
+        let inner = peel(inner);
+        let ExprX::Call { target: CallTarget::Fun(kind, fun, typs, ..), args, .. } = &inner.x
+        else {
+            return false;
+        };
+        let Ok(callee) = self.functions.resolve(FunctionUse::Call(kind, fun, typs)) else {
+            return false;
+        };
+        let Some((_, domain, _)) = self.exists_printed.get(&(Arc::as_ptr(&body) as usize)) else {
+            return false;
+        };
+        let root_roles: HashMap<VarIdent, Role> =
+            f.x.params
+                .iter()
+                .zip(self.param_roles(&f))
+                .filter_map(|(p, role)| role.map(|r| (p.x.name.clone(), r)))
+                .collect();
+        self.op_names.get(&(callee.name().clone(), Variant::Plain, false)) == Some(&step.operator)
+            && step.params.len() == 1
+            && self.trace_domain_eligible(domain)
+            && step.params[0].domain.as_ref() == Some(domain)
+            && self.param_roles(&callee).iter().zip(args.iter()).all(|(role, arg)| match role {
+                Some(r) => read_var(arg).and_then(|v| root_roles.get(&v).copied()) == Some(*r),
+                None => read_var(arg).as_ref() == Some(&binders[0].name),
+            })
+            && self.trace_variants.contains_key(&(Arc::as_ptr(&body) as usize))
+    }
+
     /// The trace spec: a module extending the export that follows one logged
     /// behaviour. Each log line after the header names a step, its
     /// parameters and the observed state after it; `TraceNext` takes the
-    /// logged step (so it only ever narrows `Next`, which it conjoins) and
-    /// compares the observed fields.
+    /// logged arm with its parameters, then compares the observed fields.
+    /// Relations without an independently selectable arm retain Next.
     fn trace_spec(
         &mut self,
         module: &str,
         module_name: &str,
         next_key: &OpKey,
         operators: &[OpKey],
+        has_type_ok: bool,
     ) -> (String, String, String, TraceReport) {
+        let model_defs = self.defs.len();
+        let model_constants = self.constants.clone();
+        let model_recursive = self.recursive();
+        let model_euclid = self.uses_euclid;
+        let reachable = self.reachable_from(next_key);
+        let owners: HashSet<_> =
+            reachable.iter().map(|k| fun_as_friendly_rust_name(&k.0)).collect();
+        let action_domains: Vec<_> = self
+            .action_domains
+            .iter()
+            .filter(|(owner, _)| owners.contains(*owner))
+            .flat_map(|(_, calls)| calls.clone())
+            .collect();
+        if let Some((body, env)) = self.trace_roots.get(next_key).cloned() {
+            let mut actions = self.trace_action_branches(&body, &env);
+            actions.extend(self.trace_indirect_actions(&body));
+            for action in &mut actions {
+                if action.selected {
+                    continue;
+                }
+                let calls: Vec<_> = action_domains
+                    .iter()
+                    .filter(|(fun, args)| fun == &action.fun && args.len() == action.params.len())
+                    .collect();
+                if calls.is_empty() {
+                    continue;
+                }
+                for (i, (_, _, domain, _)) in action.params.iter_mut().enumerate() {
+                    let mut parts = Vec::new();
+                    let mut complete = true;
+                    for (_, args) in &calls {
+                        let d = args[i].as_ref().and_then(|d| {
+                            self.resolve_dom(d, &reachable, &mut Vec::new()).map(|(d, _)| d)
+                        });
+                        if let Some(d) = d.or_else(|| domain.clone()) {
+                            if !parts.contains(&d) {
+                                parts.push(d);
+                            }
+                        } else {
+                            complete = false;
+                        }
+                    }
+                    parts.sort();
+                    *domain =
+                        if complete { Some(format!("({})", parts.join(" \\cup "))) } else { None };
+                }
+            }
+            self.trace_actions.insert(next_key.clone(), actions);
+        }
+        let trace_helpers = self.defs[model_defs..].to_vec();
+        let trace_constants: Vec<_> =
+            self.constants.difference(&model_constants).cloned().collect();
         let trace_module = format!("{module_name}_trace");
         let reachable = self.reachable_from(next_key);
         let log = self.trace_name("TraceLog");
@@ -10046,6 +10735,15 @@ impl Exporter {
             .map(|f| self.param_roles(&f).iter().filter(|r| r.is_none()).count())
             .max()
             .unwrap_or(0);
+        let arity = arity.max(
+            self.trace_actions
+                .get(next_key)
+                .into_iter()
+                .flatten()
+                .map(|a| a.params.len())
+                .max()
+                .unwrap_or(0),
+        );
         let n = TraceNames {
             j: self.trace_name("j"),
             v: self.trace_name("v"),
@@ -10083,6 +10781,16 @@ impl Exporter {
         }
         // The loggable steps: every operator Next reaches through branches
         // (see [`Exporter::trace_operators`]) printed as a plain operator.
+        let unsafe_helpers: HashSet<_> = operators
+            .iter()
+            .filter(|key| *key != next_key)
+            .filter(|key| {
+                self.reachable_from(key)
+                    .iter()
+                    .any(|k| self.unsafe_trace_relations.contains(&fun_as_friendly_rust_name(&k.0)))
+            })
+            .map(|k| fun_as_friendly_rust_name(&k.0))
+            .collect();
         let by_name: HashMap<String, OpKey> =
             self.op_names.iter().map(|(k, n)| (n.clone(), k.clone())).collect();
         let mut steps: Vec<TraceStep> = Vec::new();
@@ -10135,6 +10843,79 @@ impl Exporter {
                 enumerated,
             });
         }
+        let mut action_typs = HashMap::new();
+        let mut action_operators = HashSet::new();
+        let mut action_defs = Vec::new();
+        // The same action may occur at several call sites (for example,
+        // acquire(A) and acquire(B)). It is one log name with all those arms.
+        let mut actions: Vec<TraceAction> = Vec::new();
+        for action in self.trace_actions.get(next_key).cloned().unwrap_or_default() {
+            if let Some(prior) = actions.iter_mut().find(|a| a.fun == action.fun) {
+                if !prior.selected {
+                    continue;
+                }
+                if !action.selected {
+                    *prior = action;
+                    continue;
+                }
+                let mut aliases = Vec::new();
+                for ((_, _, domain, name), (_, _, other_domain, other_name)) in
+                    prior.params.iter_mut().zip(&action.params)
+                {
+                    *domain = match (domain.as_ref(), other_domain.as_ref()) {
+                        (Some(d), Some(other)) => Some(format!("({d} \\cup {other})")),
+                        _ => None,
+                    };
+                    if name != other_name {
+                        aliases.push(format!("{other_name} == {name}"));
+                    }
+                }
+                let other = if aliases.is_empty() {
+                    action.body
+                } else {
+                    format!("(LET {} IN {})", aliases.join(" "), action.body)
+                };
+                prior.body = format!("({}) \\/ ({other})", prior.body);
+            } else {
+                actions.push(action);
+            }
+        }
+        for action in actions {
+            let friendly = fun_as_friendly_rust_name(&action.fun);
+            let short = friendly.rsplit("::").next().unwrap().to_string();
+            let operator = self.trace_name(&format!("TraceAction_{short}"));
+            let args = action.params.iter().map(|(_, _, _, v)| v.clone()).collect::<Vec<_>>();
+            let head = if args.is_empty() {
+                operator.clone()
+            } else {
+                format!("{operator}({})", args.join(", "))
+            };
+            action_defs.push(format!("{head} == {}\n", action.body));
+            action_typs.insert(
+                operator.clone(),
+                action.params.iter().map(|(_, t, _, _)| t.clone()).collect::<Vec<_>>(),
+            );
+            if action.selected {
+                action_operators.insert(operator.clone());
+            }
+            let enumerated = action.params.iter().all(|(_, _, d, _)| d.is_some());
+            steps.push(TraceStep {
+                step: short,
+                function: friendly,
+                operator,
+                short_name_shared: false,
+                params: action
+                    .params
+                    .iter()
+                    .map(|(name, typ, domain, _)| TraceParam {
+                        name: name.clone(),
+                        typ: typ_name(typ),
+                        domain: domain.clone(),
+                    })
+                    .collect(),
+                enumerated,
+            });
+        }
         // A last segment two steps share names neither: those steps are
         // logged by their full paths, and the short name stops TLC.
         let mut shared: Vec<(String, Vec<String>)> = Vec::new();
@@ -10154,17 +10935,26 @@ impl Exporter {
         // The param types' decoders, in the order the steps list them.
         let mut step_arms = Vec::new();
         let mut enabled_parts = Vec::new();
-        for s in &steps {
-            let f = by_name[&s.operator].0.clone();
-            let f = self.functions.resolve(FunctionUse::Root(&f)).expect("trace root");
-            let roles = self.param_roles(&f);
-            let typs: Vec<Typ> =
-                f.x.params
-                    .iter()
-                    .zip(roles.iter())
-                    .filter(|(_, r)| r.is_none())
-                    .map(|(p, _)| p.x.typ.clone())
-                    .collect();
+        let mut arm_defs = Vec::new();
+        let mut general_relation_steps = Vec::new();
+        let identity = self.trace_name("TraceIdentity");
+        arm_defs.push(format!("{identity}({j}) == {j}\n"));
+        for s in &mut steps {
+            let typs = if let Some(typs) = action_typs.get(&s.operator) {
+                typs.clone()
+            } else {
+                let f = by_name[&s.operator].0.clone();
+                let f = self.functions.resolve(FunctionUse::Root(&f)).expect("trace root");
+                let roles = self.param_roles(&f);
+                let typs: Vec<Typ> =
+                    f.x.params
+                        .iter()
+                        .zip(roles.iter())
+                        .filter(|(_, r)| r.is_none())
+                        .map(|(p, _)| p.x.typ.clone())
+                        .collect();
+                typs
+            };
             let guard = if s.function == s.step {
                 format!("{e}.step = \"{}\"", s.step)
             } else {
@@ -10174,11 +10964,82 @@ impl Exporter {
                 "{params_declared}({e}, {{{}}})",
                 s.params.iter().map(|p| format!("\"{}\"", p.name)).collect::<Vec<_>>().join(", ")
             );
+            let direct =
+                action_operators.contains(&s.operator) || self.trace_is_dispatcher(next_key, s);
+            let variants = self.trace_variant_arms(next_key, s);
+            // An eligible template keeps the original dispatcher and guard
+            // order. Only a general helper check loses that calling scope.
+            if !direct
+                && variants.is_none()
+                && !action_typs.contains_key(&s.operator)
+                && unsafe_helpers.contains(&s.function)
+            {
+                s.enumerated = false;
+                general_relation_steps.push(s.step.clone());
+                step_arms.push(format!(
+                    "{guard} -> Next /\\ {declared} /\\ Assert(FALSE, \"trace: {} cannot be checked independently because its domain requires caller guards; log next instead\")",
+                    s.step
+                ));
+                continue;
+            }
+            let specialized = variants.is_some();
+            let mut selected_enabled = None;
+            if let Some(variants) = variants {
+                let name = self.trace_name(&format!("TraceArm_{}", s.operator));
+                let decoders: Vec<_> = typs
+                    .iter()
+                    .map(|typ| self.trace_codec(typ, &n, &mut memo, &mut defs).0)
+                    .collect();
+                let formals: Vec<_> = (0..typs.len())
+                    .map(|i| self.trace_name(&format!("trace_decode_{i}")))
+                    .collect();
+                let mut parts = Vec::new();
+                for (variant, mapping) in variants {
+                    let mut body = variant.body;
+                    for ((v, dom), mapped) in
+                        variant.names.iter().zip(&variant.domains).zip(mapping).rev()
+                    {
+                        let domain = if let Some(i) = mapped {
+                            let decoder = &formals[i];
+                            format!("{param}({e}, \"{}\", {decoder}, {dom})", s.params[i].name)
+                        } else {
+                            dom.clone()
+                        };
+                        body = format!("(\\E {v} \\in {domain} : {body})");
+                    }
+                    parts.push(body);
+                }
+                let type_ok = if has_type_ok { " /\\ TypeOK'" } else { "" };
+                let formal_args = formals.iter().map(|d| format!(", {d}(_)")).collect::<String>();
+                let logged_args = decoders.iter().map(|d| format!(", {d}")).collect::<String>();
+                let typed_args =
+                    formals.iter().map(|_| format!(", {identity}")).collect::<String>();
+                arm_defs.push(format!(
+                    "{name}({e}{formal_args}) == {declared} /\\ ({}){type_ok}\n",
+                    parts.join(" \\/ ")
+                ));
+                step_arms.push(format!("{guard} -> {name}({e}{logged_args})"));
+                // TraceEnabled enumerates model values, not JSON encodings.
+                // Share the selected body with identity parameter decoders.
+                selected_enabled = Some(format!("{name}({r}{typed_args})"));
+            } else if !direct {
+                general_relation_steps.push(s.step.clone());
+            }
+            let prefix = if direct { "" } else { "Next /\\ " };
+            let suffix = if direct && has_type_ok { " /\\ TypeOK'" } else { "" };
             if s.params.is_empty() {
-                step_arms.push(format!("{guard} ->\n           {declared} /\\ {}", s.operator));
+                if !specialized {
+                    step_arms.push(format!(
+                        "{guard} ->\n           {prefix}{declared} /\\ {}{suffix}",
+                        s.operator
+                    ));
+                }
+                let relation = selected_enabled
+                    .map(|body| format!("LET {r} == [step |-> \"{}\"] IN {body}", s.step))
+                    .unwrap_or_else(|| format!("{prefix}{}{suffix}", s.operator));
                 enabled_parts.push(format!(
-                    "(IF ENABLED (Next /\\ {}) THEN {{[step |-> \"{}\"]}} ELSE {{}})",
-                    s.operator, s.step
+                    "(IF ENABLED ({relation}) THEN {{[step |-> \"{}\"]}} ELSE {{}})",
+                    s.step
                 ));
                 continue;
             }
@@ -10208,12 +11069,14 @@ impl Exporter {
                     None => enumerable = false,
                 }
             }
-            step_arms.push(format!(
-                "{guard} ->\n           {declared} /\\ \\E {} : {}({})",
-                binds.join(", "),
-                s.operator,
-                args.join(", ")
-            ));
+            if !specialized {
+                step_arms.push(format!(
+                    "{guard} ->\n           {prefix}{declared} /\\ \\E {} : {}({}){suffix}",
+                    binds.join(", "),
+                    s.operator,
+                    args.join(", ")
+                ));
+            }
             if enumerable {
                 let record = s
                     .params
@@ -10228,11 +11091,12 @@ impl Exporter {
                     .map(|p| format!("{r}.params.{}", p.name))
                     .collect::<Vec<_>>()
                     .join(", ");
+                let relation = selected_enabled
+                    .unwrap_or_else(|| format!("{prefix}{}({from_record}){suffix}", s.operator));
                 enabled_parts.push(format!(
-                    "{{{r} \\in {{[step |-> \"{}\", params |-> [{record}]] : {}}} :\n        ENABLED (Next /\\ {}({from_record}))}}",
+                    "{{{r} \\in {{[step |-> \"{}\", params |-> [{record}]] : {}}} :\n        ENABLED ({relation})}}",
                     s.step,
                     enum_binds.join(", "),
-                    s.operator,
                 ));
             }
         }
@@ -10242,9 +11106,7 @@ impl Exporter {
                 functions.join(", ")
             ));
         }
-        step_arms.push(format!(
-            "OTHER -> Assert(FALSE, \"trace: the model has no step \" \\o {e}.step)"
-        ));
+        step_arms.push("OTHER -> Next".to_string());
         let observables = self.state_fields.clone();
         let vars = self.state_vars.join(", ");
         let mut tla = String::new();
@@ -10256,9 +11118,29 @@ impl Exporter {
             "\\* The log is newline-delimited JSON: a header line naming the module\n\\* ({{\"module\": \"{module_name}\", \"export\": \"{module}\"}}, optionally \"state\": the\n\\* observed initial state; another module or export stops TLC), then one line per step:\n\\* {{\"step\": \"<t_* name>\", \"params\": {{...}}, \"state\": {{...}}}}. A step is named by\n\\* its spec fn's last segment or full path, by the full path alone when two\n\\* steps share the last segment; a parameter the step does not declare stops\n\\* TLC. Values are in the export's encoding: a struct or enum value is an\n\\* object (an enum's with its \"tag\"), a Seq an array, a Set an array of its\n\\* elements, a Map an array of [key, value] pairs, a tuple an array, a struct\n\\* without fields {{}} (or {{\"tag\": \"unit\"}}). An object\n\\* observed in the state is partial: only the fields it names are compared, so\n\\* a ghost field is left out of the log and free in the model (an enum's tag\n\\* too: its fields are then compared under whichever variant the model has);\n\\* a key naming no field of its type stops TLC, as one naming no state field\n\\* does; a Seq may be observed partially as an object keyed by the Verus index\n\\* (\"0\", \"1\", ...; {{}} observes nothing, [] is the empty Seq; a key\n\\* that is no index stops TLC). A key a line or the header does not define\n\\* stops TLC, so a misspelled \"state\" or \"params\" never observes nothing.\n\\* A record inside a Set element, a Map key or a parameter is decoded whole,\n\\* so it must name every field and an enum its tag (one left out there stops\n\\* TLC). A parameter left out of \"params\" ranges over what Next's calls to\n\\* the step pass it (the bound of the quantifier binding the argument, or the\n\\* field of a value matched against a pattern, such as a VerusSync step's\n\\* Dom_Step_<t>_v<i>), else its type's finite domain (not a Dom_<Type> hole,\n\\* which holds only what a quantifier binds, never a value a call computes);\n\\* with neither it must be logged, and TraceEnabled leaves the step out (the\n\\* report's trace steps say which, \"enumerated\"). A logged parameter outside\n\\* its domain is a step the model cannot take.\n"
         ));
         tla.push_str(&format!(
-            "\\* TraceNext conjoins Next, then the logged step, so it only ever narrows\n\\* the model: a trace TLC follows to its end ({accepted}) is a behaviour of\n\\* {module_name}. Otherwise the deepest {index} reached is the first logged step\n\\* the model cannot take from any state that explains the log so far; and\n\\* when TLC finds no initial state (0 states generated, depth 0), the header's\n\\* observed state is none of Init's, so the log diverges before its first step.\n\\* Next takes values only in the export's Dom_ holes, so the .cfg must give\n\\* each one every value the log carries for it: a logged value outside it\n\\* diverges as a step the model cannot take.\n\\* A pass means the observed state sequence is a behaviour of the model: a\n\\* logged step's name and parameters count only through their effect on the\n\\* state, so a step that another of Next's steps explains (the same observed\n\\* successor) is accepted even if the model never takes the logged one there.\n"
+            "\\* TraceNext selects the logged existential arm and its logged parameters.\n\\* Missing parameters retain their original domains; dispatch guards and\n\\* TypeOK are preserved. General relations retain their enclosing Next check\n\\* (listed in trace.general_relation_steps). Unknown names fall back to Next,\n\\* checking only the observed state sequence (trace.unknown_step).\n\\* A trace conforms when it reaches {accepted}; otherwise the deepest {index}\n\\* is the first unexplained step; when TLC finds no initial state (0 states generated, depth 0),\n\\* the header is rejected.\n\\* A pass means the observed state sequence is a behaviour of the model.\n"
         ));
         tla.push_str(&format!("EXTENDS {module_name}, Json, TLC, Integers, Sequences\n\n"));
+        if !trace_constants.is_empty() {
+            tla.push_str(&format!("CONSTANTS {}\n", trace_constants.join(", ")));
+        }
+        if self.uses_euclid && !model_euclid {
+            tla.push_str(&euclid_defs());
+        }
+        for (name, arity) in self.recursive() {
+            if !model_recursive.contains_key(&name) {
+                let params = if arity == 0 {
+                    String::new()
+                } else {
+                    format!("({})", vec!["_"; arity].join(", "))
+                };
+                tla.push_str(&format!("RECURSIVE {name}{params}\n"));
+            }
+        }
+        for helper in &trace_helpers {
+            tla.push_str(helper);
+            tla.push('\n');
+        }
         tla.push_str(&format!("CONSTANT {log}  \\* the log's path\n"));
         tla.push_str(&format!("VARIABLE {index}  \\* the next logged step to take\n\n"));
         tla.push_str(&format!("{lines} == ndJsonDeserialize({log})\n"));
@@ -10306,12 +11188,18 @@ impl Exporter {
         tla.push_str(&format!(
             "{observed_next}({j}) == \\A {k} \\in DOMAIN {j} : {observed_key_next}({k}, {j}[{k}])\n\n"
         ));
+        for action in &action_defs {
+            tla.push_str(action);
+        }
+        for arm in &arm_defs {
+            tla.push_str(arm);
+        }
         tla.push_str(&format!("{step_op}({e}) ==\n    CASE {}\n\n", step_arms.join("\n      [] ")));
         tla.push_str(&format!(
             "{init} ==\n    /\\ {keys}({header}, {{\"module\", \"export\", \"state\"}}, \"the log's header\")\n    /\\ Assert(\"module\" \\in DOMAIN {header} /\\ {header}.module = \"{module_name}\",\n              \"trace: the log's header does not name the module {module_name}\")\n    /\\ Assert(\"export\" \\in DOMAIN {header} /\\ {header}.export = \"{module}\",\n              \"trace: the log's header does not name the export {module}\")\n    /\\ Init\n    /\\ {index} = 1\n    /\\ {observed}({state_of}({header}))\n\n"
         ));
         tla.push_str(&format!(
-            "{next} ==\n    /\\ {index} <= Len({trace})\n    /\\ LET {e} == {trace}[{index}] IN\n           /\\ {keys}({e}, {{\"step\", \"params\", \"state\"}}, \"a step line\")\n           /\\ Assert(\"step\" \\in DOMAIN {e}, \"trace: a step line names no step\")\n           /\\ Next\n           /\\ {step_op}({e})\n           /\\ {observed_next}({state_of}({e}))\n    /\\ {index}' = {index} + 1\n\n"
+            "{next} ==\n    /\\ {index} <= Len({trace})\n    /\\ LET {e} == {trace}[{index}] IN\n           /\\ {keys}({e}, {{\"step\", \"params\", \"state\"}}, \"a step line\")\n           /\\ Assert(\"step\" \\in DOMAIN {e}, \"trace: a step line names no step\")\n           /\\ {step_op}({e})\n           /\\ {observed_next}({state_of}({e}))\n    /\\ {index}' = {index} + 1\n\n"
         ));
         tla.push_str(&format!("{spec} == {init} /\\ [][{next}]_<<{vars}, {index}>>\n"));
         tla.push_str(&format!(
@@ -10331,7 +11219,7 @@ impl Exporter {
         ));
         tla.push_str(&format!("{}\n", "=".repeat(trace_module.len() + 20)));
         let cfg = format!(
-            "\\* Trace validation: TLC follows the log named by {log}. On a well-formed log\n\\* it ends with no error either way (a malformed one stops at an Assert); the trace conforms when some state reaches {accepted}\n\\* (the depth of the search is the number of logged steps plus one). Depth d\n\\* below that means logged step d diverged; depth 0 (no initial state) means\n\\* the header's observed state is not an initial state of the model.\nINIT {init}\nNEXT {next}\nCHECK_DEADLOCK FALSE\nCONSTANT {log} = \"trace.ndjson\"\n\\* The export's CONSTANTS, if it has any, are needed here too, and each Dom_\n\\* constant must cover every value the log carries for it: TraceNext conjoins\n\\* Next, which only takes values in the holes, so a logged value outside one\n\\* diverges (the step shows as not enabled in TraceDiagnosis).\n"
+            "\\* Trace validation: TLC follows the log named by {log}. On a well-formed log\n\\* it ends with no error either way (a malformed one stops at an Assert); the trace conforms when some state reaches {accepted}\n\\* (the depth of the search is the number of logged steps plus one). Depth d\n\\* below that means logged step d diverged; depth 0 (no initial state) means\n\\* the header's observed state is not an initial state of the model.\nINIT {init}\nNEXT {next}\nCHECK_DEADLOCK FALSE\nCONSTANT {log} = \"trace.ndjson\"\n\\* The export's CONSTANTS, if it has any, are needed here too, and each Dom_\n\\* constant must cover every value the log carries for it: selected arms\n\\* retain their parameter domains, so a logged value outside one\n\\* diverges (the step shows as not enabled in TraceDiagnosis).\n"
         );
         let mut cfg = cfg;
         if !self.values.is_empty() {
@@ -10341,8 +11229,16 @@ impl Exporter {
                 cfg.push_str(&format!("\\*   {c} = <a {t}>\n"));
             }
         }
-        let report =
-            TraceReport { module: trace_module.clone(), index_variable: index, observables, steps };
+        let report = TraceReport {
+            module: trace_module.clone(),
+            index_variable: index,
+            observables,
+            steps,
+            general_relation_steps,
+            unknown_step:
+                "Next (state-only conformance; logged name and parameters are not checked)"
+                    .to_string(),
+        };
         (trace_module, tla, cfg, report)
     }
 }

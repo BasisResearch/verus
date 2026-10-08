@@ -461,11 +461,35 @@ quantifier binds, not a value a call computes. With neither (a call passes
 `pre.x + 5` to an `int`) it must be logged, and `TraceEnabled` leaves the
 step out: the report's trace step has `"enumerated": false`. A logged
 parameter is narrowed to its domain, so a value outside it is a step the
-model cannot take. The verus-tla shape has one step, `next`, since its `Next` is not
-split into named transitions.
+model cannot take. The verus-tla shape also exposes independently named action-record branches
+(`acquire` and `release` in `mutex_tla.rs`); `next` remains accepted for old logs.
 
-`TraceNext` conjoins `Next` and then the logged step (so it only ever
-narrows the model, and the step reads the successor `Next` has assigned) and compares the observed fields in the successor. TLC run on it
+For an existential step-enum dispatcher (including VerusSync's `next_by`),
+`TraceNext` selects the logged constructor's relation. Logged parameters narrow
+its field binders to singleton values in the original domains. Unlogged fields
+keep their original domains, including dependent bounds. The original dispatcher,
+its guards, and `TypeOK'` are retained. Action-record branches likewise retain
+both their preconditions and transitions, including the path conditions of
+`if` branches. Fixed and quantified call sites of the same action are combined.
+If any occurrence cannot be selected, the whole action name uses the reported
+general-relation check so that other call sites are not silently dropped.
+Selection and domain reuse share one conservative eligibility rule: source
+operands must be literals or total pre-state projections. Existing quantifier
+and constructor binders may stay in their original scope, including dependent
+bounds; generated type domains and configured constants are also safe.
+Calls, indexing, casts, and arithmetic in an input or bound do not qualify,
+even if a surrounding guard happens to make them safe. That action name uses
+the reported general-relation check instead. Its parameters use certified
+call-site domains, or a safe finite type domain; if neither exists, they must
+be logged (`enumerated: false`). An unsafe component invalidates a domain
+union; it is never silently dropped. These same domains feed `TraceEnabled`
+and `TraceDiagnosis`, so diagnostics cannot reintroduce eager evaluation.
+A helper with a computed bound may depend on a caller guard that cannot be
+retained in an independent check. Such helpers are reported as general and
+non-enumerable, omitted from `TraceEnabled`, and fail explicitly when logged;
+use `next` for state-only validation in that case.
+The observed successor comparison is
+unchanged. TLC run on it
 (`INIT TraceInit`, `NEXT TraceNext`, `CONSTANT TraceLog = "<log path>"`)
 ends without error on a well-formed log either way (the export's hole
 constants, such as `Dom_Step_add_v0`, go in its `.cfg` too): the log conforms when the depth of the search
@@ -476,26 +500,46 @@ observed state is not an initial state of the model: the log diverges
 before its first step. At a diverging step, `TraceEnabled` is the set of the model's enabled steps
 with their parameters, and `TraceDiagnosis` says whether the logged step is
 enabled at all and which observed fields no successor by it matches.
+`TraceEnabled` uses the same selected relations as trace validation, with
+parameters in their model types rather than their JSON encodings.
 
-**A pass means the observed state sequence is a behaviour of the model.**
-The logged step's name and parameters count only through their effect on
-the observed state: `TraceNext` requires a successor that both `Next` and the
-logged step allow, not that `Next` took it by that step. So a step another
-of `Next`'s steps explains is accepted. With `next` either
-`exists|n: int| t_set(pre, post, n)` or `pre.x < 10 && t_jump(pre, post, pre.x + 5)`,
-logging `t_jump` with `to` 0 from `x` 0, `y` 0 is followed, since `t_set(0)`
-reaches the same state, though the model's `t_jump` only ever passes
-`pre.x + 5`. Restricting `Next` to the logged step's call sites is future
-work.
+**A selected arm must be enabled under the logged name.** A different arm
+with the same observed successor cannot explain a disabled selected arm.
+For general relations that cannot be independently selected (for example,
+helpers that only assign part of the state, or computed call arguments), the
+existing `Next` conjunction remains; `trace.general_relation_steps` lists these
+names. Its state-sequence semantics are unchanged.
+Action wrappers are selected only when they unconditionally apply the action's
+precondition and transition (or use verus-tla's `forward` relation). A wrapper
+that permits skipping the action uses the reported general-relation check.
+Enum selection must account for every call site; an unsupported nested or
+indirect occurrence also makes the name a general relation. Conditional paths
+retain their guards in the selected bodies; only eligible domains escape them.
+Coverage includes source-level calls inside helpers and returned closures,
+even when inlining removes their operator-call edges. Action occurrences in
+helpers likewise make the whole action name general. Inputs that read the post
+state retain the general-relation check so `Next` assigns the successor before
+the logged action reads it.
 
-**The `Dom_` constants must cover every value the log carries.** Since
-`TraceNext` conjoins `Next`, and `Next` takes a step's arguments only from
-the export's holes (a VerusSync step's `Dom_Step_<t>_v<i>`, a `Dom_<Type>`
-bound), a logged parameter or observed value outside the hole the `.cfg`
-gives is a divergence, not a malformed log: TLC stops there, and
-`TraceDiagnosis` only says the step is not enabled. Give each hole in the
-trace `.cfg` at least the values the log carries (the generated header and
-`.cfg` say so too).
+Trace-only helpers are emitted in the trace module. Generating the trace spec
+does not change the base model's definitions or export report metadata.
+Requesting named expressions with `tla-export-expr` does not change the trace
+module or remove its helper definitions.
+
+An unknown step name falls back to `Next` and the observed-state comparison;
+its name and parameters are not checked. The JSON report advertises this weaker
+policy in `trace.unknown_step`. The same metadata is embedded in the trace
+module as a `VERUS_TRACE_POLICY` comment for MCP previews, including when the
+trace module is copied without its JSON report. Updated MCP previews display
+the policy and identify unknown names and general relations used by a log.
+Ambiguous short names and misspelled parameters
+of known steps still stop TLC.
+
+**The `Dom_` constants must cover every value the log carries.** Selected arms
+retain their parameter domains. A logged value outside its domain diverges;
+leaving a parameter out still ranges over the original hole. Give each hole in
+the trace `.cfg` at least the values the log carries.
+
 `counter_trace_ok.ndjson` and `counter_trace_bad.ndjson` name the export
 `test_crate`, as the tests export `counter.rs`. The first is followed to its
 end (depth 6);
