@@ -1,0 +1,13 @@
+/before/
+/after/
+/deps/
+/probes/
+/regression-before/
+/regression-after/
+*.log
+/nrkernel-before/
+/nrkernel-after/
+
+/cumulative-*/
+/regression-stacked/
+/regression-parent-ca16/

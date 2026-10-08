@@ -1,0 +1,788 @@
+# Remaining cumulative campaign blockers
+
+Locations below are emitted by the exporter or compiler; repeated refusals are counted rather than hidden. Timeouts have no completed refusal report and therefore no inferred source-level cause.
+
+## anvil/Cluster-adapter
+
+- 1× **closure value `model` used other than in an application**, `/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/kubernetes_cluster/spec/cluster.rs:133:25: 133:30 (#0)` (in `cluster_adapter::adapter::init`).
+- 1× **application of a spec_fn value that does not reduce to a closure**, `/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/kubernetes_cluster/spec/external/state_machine.rs:41:24: 41:38 (#0)` (in `cluster_adapter::adapter::init`).
+- 15× **application of a spec_fn value that does not reduce to a closure**, `/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/state_machine/state_machine.rs:44:26: 44:116 (#0)` (in `cluster_adapter::adapter::next`).
+- 15× **choose without a representable domain**, `/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/state_machine/state_machine.rs:45:32: 45:136 (#0)` (in `cluster_adapter::adapter::next`).
+- 15× **application of a spec_fn value that does not reduce to a closure**, `/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/state_machine/state_machine.rs:48:35: 48:71 (#0)` (in `cluster_adapter::adapter::next`).
+- 15× **application of a spec_fn value that does not reduce to a closure**, `/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/state_machine/state_machine.rs:48:75: 48:111 (#0)` (in `cluster_adapter::adapter::next`).
+
+## anvil/sub_api
+
+- 10× **application of a spec_fn value that does not reduce to a closure**, `/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/kubernetes_cluster/spec/api_server/state_machine.rs:88:45: 88:100 (#0)` (in `sub_adapters2::sub_api::next`).
+- 10× **application of a spec_fn value that does not reduce to a closure**, `/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/kubernetes_cluster/spec/api_server/state_machine.rs:105:45: 105:104 (#0)` (in `sub_adapters2::sub_api::next`).
+- 1× **application of a spec_fn value that does not reduce to a closure**, `/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/kubernetes_cluster/spec/api_server/state_machine.rs:196:45: 196:98 (#0)` (in `sub_adapters2::sub_api::next`).
+- 1× **ordering comparison of chars**, `vstd/utf8.rs:1103:40: 1103:79 (#0)` (in `vstd::utf8::is_ascii_chars`).
+- 20× **application of a spec_fn value that does not reduce to a closure**, `/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/kubernetes_cluster/spec/api_server/state_machine.rs:148:45: 148:88 (#0)` (in `sub_adapters2::sub_api::next`).
+- 16× **application of a spec_fn value that does not reduce to a closure**, `/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/kubernetes_cluster/spec/api_server/state_machine.rs:172:45: 172:101 (#0)` (in `sub_adapters2::sub_api::next`).
+
+## anvil/sub_api_sm
+
+- 2× **application of a spec_fn value that does not reduce to a closure**, `/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/state_machine/state_machine.rs:44:26: 44:116 (#0)` (in `sub_adapters2::sub_api_sm::next`).
+- 2× **choose without a representable domain**, `/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/state_machine/state_machine.rs:45:32: 45:136 (#0)` (in `sub_adapters2::sub_api_sm::next`).
+- 2× **application of a spec_fn value that does not reduce to a closure**, `/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/state_machine/state_machine.rs:48:35: 48:71 (#0)` (in `sub_adapters2::sub_api_sm::next`).
+- 2× **application of a spec_fn value that does not reduce to a closure**, `/Users/kirancodes/Documents/code/verus-research/survey/repos/anvil-verifier_anvil/src/state_machine/state_machine.rs:48:75: 48:111 (#0)` (in `sub_adapters2::sub_api_sm::next`).
+
+## nrkernel/os
+
+- 1× **integer type bound**, `/data/home/kirancodes/Documents/code/verus-research/survey/repos/matthias-brun_verified-nrkernel/page-table/src/spec_t/os.rs:242:18: 242:28 (#0)` (in `lib::spec_t::os::step_MemOp`).
+- 1× **integer type bound**, `/data/home/kirancodes/Documents/code/verus-research/survey/repos/matthias-brun_verified-nrkernel/page-table/src/spec_t/os.rs:249:18: 249:28 (#0)` (in `lib::spec_t::os::step_MemOp`).
+- 4× **integer type bound**, `/data/home/kirancodes/Documents/code/verus-research/survey/repos/matthias-brun_verified-nrkernel/page-table/src/spec_t/mmu/defs.rs:434:29: 434:39 (#0)` (in `lib::spec_t::mmu::defs::nat_keys`).
+
+## splinter/AllocationBetree
+
+
+compiler_diagnostics:
+```text
+error[E0659]: `Address` is ambiguous
+  --> /data/home/kirancodes/Documents/code/verus-research/campaign-real/sources/splinter/allocation_layer/AllocationBetree_v.rs:95:110
+   |
+95 |     transition!{ internal_grow(lbl: Label, new_betree: LinkedBetreeVars::State<SimpleBuffer>, new_root_addr: Address) {
+   |                                                                                                              ^^^^^^^ ambiguous name
+   |
+
+error[E0659]: `Address` is ambiguous
+  --> /data/home/kirancodes/Documents/code/verus-research/campaign-real/sources/splinter/allocation_layer/AllocationBetree_v.rs:47:48
+   |
+47 |     pub open spec fn is_fresh(self, addrs: Set<Address>) -> bool
+   |                                                ^^^^^^^ ambiguous name
+   |
+
+error[E0659]: `Address` is ambiguous
+   --> /data/home/kirancodes/Documents/code/verus-research/campaign-real/sources/splinter/allocation_layer/LikesBetree_v.rs:358:65
+    |
+358 |     proof fn addr_for_buffer(self, betree_likes: Likes, buffer: Address) -> (addr: Address)
+    |                                                                 ^^^^^^^ ambiguous name
+    |
+
+error[E0659]: `Address` is ambiguous
+   --> /data/home/kirancodes/Documents/code/verus-research/campaign-real/sources/splinter/allocation_layer/LikesBetree_v.rs:358:84
+    |
+358 |     proof fn addr_for_buffer(self, betree_likes: Likes, buffer: Address) -> (addr: Address)
+    |                                                                                    ^^^^^^^ ambiguous name
+    |
+
+error[E0659]: `Address` is ambiguous
+   --> /data/home/kirancodes/Documents/code/verus-research/campaign-real/sources/splinter/allocation_layer/LikesBetree_v.rs:378:71
+    |
+378 |     proof fn tree_buffers_are_closed(self, betree_likes: Likes, addr: Address)
+    |                                                                       ^^^^^^^ ambiguous name
+    |
+
+error[E0659]: `Address` is ambiguous
+    --> /data/home/kirancodes/Documents/code/verus-research/campaign-real/sources/splinter/allocation_layer/LikesBetree_v.rs:1094:110
+     |
+1094 |     transition!{ internal_grow(lbl: Label, new_betree: LinkedBetreeVars::State<SimpleBuffer>, new_root_addr: Address) {
+     |                                                                                                              ^^^^^^^ ambiguous name
+     |
+
+error[E0659]: `Address` is ambiguous
+    --> /data/home/kirancodes/Documents/code/verus-research/campaign-real/sources/splinter/allocation_layer/LikesBetree_v.rs:1400:133
+     |
+1400 | ...nkedBetreeVars::State<SimpleBuffer>, new_root_addr: Address) { 
+     |                                                        ^^^^^^^ ambiguous name
+     |
+
+error[E0659]: `Address` is ambiguous
+    --> /data/home/kirancodes/Documents/code/verus-research/campaign-real/sources/splinter/allocation_layer/LikesBetree_v.rs:1062:48
+     |
+1062 |     pub open spec fn is_fresh(self, addrs: Set<Address>) -> bool
+     |                                                ^^^^^^^ ambiguous name
+     |
+```
+
+## splinter/AllocationBranchBetree
+
+
+compiler_diagnostics:
+```text
+error[E0432]: unresolved import `crate::betree::LinkedBranch_v::Refinement_v`
+  --> /data/home/kirancodes/Documents/code/verus-research/campaign-real/sources/splinter/allocation_layer/AllocationBranchBetree_v.rs:27:5
+   |
+27 | use crate::betree::LinkedBranch_v::Refinement_v;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ no `Refinement_v` in `betree::LinkedBranch_v`
+
+
+error[E0432]: unresolved import `crate::betree::LinkedBranch_v::Refinement_v`
+  --> /data/home/kirancodes/Documents/code/verus-research/campaign-real/sources/splinter/allocation_layer/AllocationBranch_v.rs:17:5
+   |
+17 | use crate::betree::LinkedBranch_v::Refinement_v;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ no `Refinement_v` in `betree::LinkedBranch_v`
+   |
+
+error[E0425]: cannot find function `lemma_values_finite` in this scope
+   --> /data/home/kirancodes/Documents/code/verus-research/campaign-real/sources/splinter/allocation_layer/AllocationBranchBetree_v.rs:838:9
+    |
+838 |           lemma_values_finite(post.branch_summary);
+    |           ^^^^^^^^^^^^^^^^^^^
+    |
+
+error[E0425]: cannot find function `lemma_values_finite` in this scope
+   --> /data/home/kirancodes/Documents/code/verus-research/campaign-real/sources/splinter/allocation_layer/AllocationBranchBetree_v.rs:965:13
+    |
+965 |               lemma_values_finite(post.branch_summary);
+    |               ^^^^^^^^^^^^^^^^^^^
+    |
+
+error[E0425]: cannot find function `lemma_values_finite` in this scope
+    --> /data/home/kirancodes/Documents/code/verus-research/campaign-real/sources/splinter/allocation_layer/AllocationBranchBetree_v.rs:1159:9
+     |
+1159 |           lemma_values_finite(root_to_au);
+     |           ^^^^^^^^^^^^^^^^^^^
+     |
+
+error[E0425]: cannot find function `lemma_values_finite` in this scope
+    --> /data/home/kirancodes/Documents/code/verus-research/campaign-real/sources/splinter/allocation_layer/AllocationBranchBetree_v.rs:1166:9
+     |
+1166 |           lemma_values_finite(result);
+     |           ^^^^^^^^^^^^^^^^^^^
+     |
+
+error[E0425]: cannot find function `lemma_values_finite` in this scope
+    --> /data/home/kirancodes/Documents/code/verus-research/campaign-real/sources/splinter/allocation_layer/AllocationBranchBetree_v.rs:1455:5
+     |
+1455 |       lemma_values_finite(branch_summary);
+     |       ^^^^^^^^^^^^^^^^^^^
+     |
+
+error[E0425]: cannot find function `lemma_values_finite` in this scope
+    --> /data/home/kirancodes/Documents/code/verus-research/campaign-real/sources/splinter/allocation_layer/AllocationBranchBetree_v.rs:1472:5
+     |
+1472 |       lemma_values_finite(post_summary);
+     |       ^^^^^^^^^^^^^^^^^^^
+     |
+```
+
+## splinter/AllocationCrashAwareJournal
+
+
+compiler_diagnostics:
+```text
+error[E0308]: mismatched types
+  --> /data/home/kirancodes/Documents/code/verus-research/campaign-real/sources/splinter/allocation_layer/AllocationJournal_v.rs:64:14
+   |
+64 |     Map::new(|lsn| lsn_au_index.contains_key(lsn) && bdy <= lsn, |lsn| lsn_au_index[lsn])
+   |     -------- ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ expected `Set<nat>`, found `FnSpec<(nat,), bool>`
+   |     |
+
+error[E0308]: mismatched types
+  --> /data/home/kirancodes/Documents/code/verus-research/campaign-real/sources/splinter/allocation_layer/AllocationJournal_v.rs:82:14
+   |
+82 |     Map::new(|lsn| start_lsn <= lsn < end_lsn, |lsn| value)
+   |     -------- ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ expected `Set<nat>`, found `FnSpec<(_,), bool>`
+   |     |
+
+error[E0308]: mismatched types
+   --> /data/home/kirancodes/Documents/code/verus-research/campaign-real/sources/splinter/allocation_layer/AllocationJournal_v.rs:130:9
+    |
+126 | pub open spec(checked) fn au_addrs_past_pointer(ptr: Pointer) -> Set<Address> {
+    |                                                                  ------------ expected `vstd::set::Set<spec::AsyncDisk_t::Address>` because of return type
+...
+
+error[E0308]: mismatched types
+   --> /data/home/kirancodes/Documents/code/verus-research/campaign-real/sources/splinter/allocation_layer/AllocationJournal_v.rs:137:9
+    |
+135 |       pub open spec fn tight_domain(self, index: LsnAUIndex, root: Pointer) -> Set<Address>
+    |                                                                                ------------ expected `vstd::set::Set<spec::AsyncDisk_t::Address>` because of return type
+136 |       {
+
+error[E0599]: no method named `build_lsn_au_index_page_walk_consistency` found for struct `journal::LinkedJournal_v::DiskView` in the current scope
+   --> /data/home/kirancodes/Documents/code/verus-research/campaign-real/sources/splinter/allocation_layer/AllocationJournal_v.rs:743:14
+    |
+743 |         self.build_lsn_au_index_page_walk_consistency(self.next(bottom));
+    |              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+
+error[E0308]: mismatched types
+    --> /data/home/kirancodes/Documents/code/verus-research/campaign-real/sources/splinter/allocation_layer/AllocationJournal_v.rs:1044:61
+     |
+1044 |             let sub_domain = dv.tight_domain(index.restrict(sub_lsns), sub_freshest_rec);
+     |                                                    -------- ^^^^^^^^ expected `Set<nat>`, found `Option<Set<_>>`
+     |                                                    |
+
+error[E0308]: mismatched types
+    --> /data/home/kirancodes/Documents/code/verus-research/campaign-real/sources/splinter/allocation_layer/AllocationJournal_v.rs:1047:98
+     |
+1047 |             &&& sub_dv.build_lsn_au_index_au_walk(sub_freshest_rec, sub_first) == index.restrict(sub_lsns)
+     |                                                                                         -------- ^^^^^^^^ expected `Set<nat>`, found `Option<Set<_>>`
+     |                                                                                         |
+
+error[E0308]: mismatched types
+    --> /data/home/kirancodes/Documents/code/verus-research/campaign-real/sources/splinter/allocation_layer/AllocationJournal_v.rs:1053:40
+     |
+1053 |         let sub_index = index.restrict(sub_lsns);
+     |                               -------- ^^^^^^^^ expected `Set<nat>`, found `Option<Set<_>>`
+     |                               |
+```
+
+## splinter/AllocationJournal
+
+
+compiler_diagnostics:
+```text
+error[E0308]: mismatched types
+  --> /data/home/kirancodes/Documents/code/verus-research/campaign-real/sources/splinter/allocation_layer/AllocationJournal_v.rs:64:14
+   |
+64 |     Map::new(|lsn| lsn_au_index.contains_key(lsn) && bdy <= lsn, |lsn| lsn_au_index[lsn])
+   |     -------- ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ expected `Set<nat>`, found `FnSpec<(nat,), bool>`
+   |     |
+
+error[E0308]: mismatched types
+  --> /data/home/kirancodes/Documents/code/verus-research/campaign-real/sources/splinter/allocation_layer/AllocationJournal_v.rs:82:14
+   |
+82 |     Map::new(|lsn| start_lsn <= lsn < end_lsn, |lsn| value)
+   |     -------- ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ expected `Set<nat>`, found `FnSpec<(_,), bool>`
+   |     |
+
+error[E0308]: mismatched types
+   --> /data/home/kirancodes/Documents/code/verus-research/campaign-real/sources/splinter/allocation_layer/AllocationJournal_v.rs:130:9
+    |
+126 | pub open spec(checked) fn au_addrs_past_pointer(ptr: Pointer) -> Set<Address> {
+    |                                                                  ------------ expected `vstd::set::Set<spec::AsyncDisk_t::Address>` because of return type
+...
+
+error[E0308]: mismatched types
+   --> /data/home/kirancodes/Documents/code/verus-research/campaign-real/sources/splinter/allocation_layer/AllocationJournal_v.rs:137:9
+    |
+135 |       pub open spec fn tight_domain(self, index: LsnAUIndex, root: Pointer) -> Set<Address>
+    |                                                                                ------------ expected `vstd::set::Set<spec::AsyncDisk_t::Address>` because of return type
+136 |       {
+
+error[E0599]: no method named `build_lsn_au_index_page_walk_consistency` found for struct `journal::LinkedJournal_v::DiskView` in the current scope
+   --> /data/home/kirancodes/Documents/code/verus-research/campaign-real/sources/splinter/allocation_layer/AllocationJournal_v.rs:743:14
+    |
+743 |         self.build_lsn_au_index_page_walk_consistency(self.next(bottom));
+    |              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+
+error[E0308]: mismatched types
+    --> /data/home/kirancodes/Documents/code/verus-research/campaign-real/sources/splinter/allocation_layer/AllocationJournal_v.rs:1044:61
+     |
+1044 |             let sub_domain = dv.tight_domain(index.restrict(sub_lsns), sub_freshest_rec);
+     |                                                    -------- ^^^^^^^^ expected `Set<nat>`, found `Option<Set<_>>`
+     |                                                    |
+
+error[E0308]: mismatched types
+    --> /data/home/kirancodes/Documents/code/verus-research/campaign-real/sources/splinter/allocation_layer/AllocationJournal_v.rs:1047:98
+     |
+1047 |             &&& sub_dv.build_lsn_au_index_au_walk(sub_freshest_rec, sub_first) == index.restrict(sub_lsns)
+     |                                                                                         -------- ^^^^^^^^ expected `Set<nat>`, found `Option<Set<_>>`
+     |                                                                                         |
+
+error[E0308]: mismatched types
+    --> /data/home/kirancodes/Documents/code/verus-research/campaign-real/sources/splinter/allocation_layer/AllocationJournal_v.rs:1053:40
+     |
+1053 |         let sub_index = index.restrict(sub_lsns);
+     |                               -------- ^^^^^^^^ expected `Set<nat>`, found `Option<Set<_>>`
+     |                               |
+```
+
+## splinter/CoordinationSystem
+
+
+tlc_diagnostics:
+```text
+TLC2 Version 2026.09.24.190251 (rev: 11305b4)
+Warning: Please run the Java VM, which executes TLC with a throughput optimized garbage collector, by passing the "-XX:+UseParallelGC" property.
+(Use the -nowarning option to disable this warning.)
+Running breadth-first search Model-Checking with fp 81 and seed 8846578003152626309 with 1 worker on 32 cores with 1024MB heap and 64MB offheap memory [pid: 2627656] (Linux 7.0.0-1012-aws amd64, Ubuntu 25.0.4.1 64bit, MSBDiskFPSet, DiskStateQueue).
+Parsing file /data/home/kirancodes/Documents/code/verus-research/wt-export-closures/audit/export-closures/cumulative-merged-ca16-final/splinter/CoordinationSystem/MC.tla
+Parsing file /data/home/kirancodes/Documents/code/verus-research/wt-export-closures/audit/export-closures/cumulative-merged-ca16-final/splinter/CoordinationSystem/State_tla.tla
+Parsing file /tmp/tlc-14134441100035945652/_TLCTrace.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/_TLCTrace.tla)
+Parsing file /tmp/tlc-14134441100035945652/Integers.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/Integers.tla)
+Parsing file /tmp/tlc-14134441100035945652/Sequences.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/Sequences.tla)
+Parsing file /tmp/tlc-14134441100035945652/FiniteSets.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/FiniteSets.tla)
+Parsing file /tmp/tlc-14134441100035945652/TLC.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/TLC.tla)
+Parsing file /tmp/tlc-14134441100035945652/Naturals.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/Naturals.tla)
+Parsing file /tmp/tlc-14134441100035945652/TLCExt.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/TLCExt.tla)
+Semantic processing of module Naturals
+Semantic processing of module Integers
+Semantic processing of module Sequences
+Semantic processing of module FiniteSets
+Semantic processing of module TLC
+Semantic processing of module State_tla
+Semantic processing of module TLCExt
+Semantic processing of module _TLCTrace
+Semantic processing of module MC
+Linting of module State_tla
+Linting of module TLCExt
+Linting of module _TLCTrace
+Linting of module MC
+Starting... (2026-10-08 14:25:54)
+Error: The constant parameter Dom_Key is not assigned a value by the configuration file.
+Finished in 00s at (2026-10-08 14:25:54)
+```
+
+## splinter/CrashTolerantJournal
+
+
+TLC: exploring_timeout, original 30-second budget.
+
+## splinter/CrashTolerantMap
+
+
+tlc_diagnostics:
+```text
+TLC2 Version 2026.09.24.190251 (rev: 11305b4)
+Warning: Please run the Java VM, which executes TLC with a throughput optimized garbage collector, by passing the "-XX:+UseParallelGC" property.
+(Use the -nowarning option to disable this warning.)
+Running breadth-first search Model-Checking with fp 123 and seed 4685839203305982676 with 1 worker on 32 cores with 1024MB heap and 64MB offheap memory [pid: 2628378] (Linux 7.0.0-1012-aws amd64, Ubuntu 25.0.4.1 64bit, MSBDiskFPSet, DiskStateQueue).
+Parsing file /data/home/kirancodes/Documents/code/verus-research/wt-export-closures/audit/export-closures/cumulative-merged-ca16-final/splinter/CrashTolerantMap/MC.tla
+Parsing file /data/home/kirancodes/Documents/code/verus-research/wt-export-closures/audit/export-closures/cumulative-merged-ca16-final/splinter/CrashTolerantMap/State_tla.tla
+Parsing file /tmp/tlc-10633197852909977164/_TLCTrace.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/_TLCTrace.tla)
+Parsing file /tmp/tlc-10633197852909977164/Integers.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/Integers.tla)
+Parsing file /tmp/tlc-10633197852909977164/Sequences.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/Sequences.tla)
+Parsing file /tmp/tlc-10633197852909977164/FiniteSets.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/FiniteSets.tla)
+Parsing file /tmp/tlc-10633197852909977164/TLC.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/TLC.tla)
+Parsing file /tmp/tlc-10633197852909977164/Naturals.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/Naturals.tla)
+Parsing file /tmp/tlc-10633197852909977164/TLCExt.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/TLCExt.tla)
+Semantic processing of module Naturals
+Semantic processing of module Integers
+Semantic processing of module Sequences
+Semantic processing of module FiniteSets
+Semantic processing of module TLC
+Semantic processing of module State_tla
+Semantic processing of module TLCExt
+Semantic processing of module _TLCTrace
+Semantic processing of module MC
+Linting of module State_tla
+Linting of module TLCExt
+Linting of module _TLCTrace
+Linting of module MC
+Starting... (2026-10-08 14:25:56)
+Error: The constant parameter Dom_Key is not assigned a value by the configuration file.
+Finished in 00s at (2026-10-08 14:25:56)
+```
+
+## splinter/FilteredBetree
+
+
+compiler_diagnostics:
+```text
+error[E0308]: mismatched types
+   --> /data/home/kirancodes/Documents/code/verus-research/campaign-real/sources/splinter/betree/FilteredBetree_v.rs:428:38
+    |
+428 |         OffsetMap{ offsets: Map::new(|k| true,
+    |                             -------- ^^^^^^^^ expected `Set<Key>`, found `FnSpec<(_,), bool>`
+    |                             |
+
+error[E0308]: mismatched types
+  --> /data/home/kirancodes/Documents/code/verus-research/campaign-real/sources/splinter/betree/OffsetMap_v.rs:34:9
+   |
+30 |     pub open spec(checked) fn active_keys(self, offset: nat) -> Set<Key>
+   |                                                                 -------- expected `vstd::set::Set<spec::KeyType_t::Key>` because of return type
+...
+
+error[E0308]: mismatched types
+  --> /data/home/kirancodes/Documents/code/verus-research/campaign-real/sources/splinter/betree/OffsetMap_v.rs:40:38
+   |
+40 |         OffsetMap{ offsets: Map::new(|k| self.offsets.contains_key(k), 
+   |                             -------- ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ expected `Set<Key>`, found `FnSpec<(Key,), bool>`
+   |                             |
+
+error: aborting due to 3 previous errors
+
+For more information about this error, try `rustc --explain E0308`.
+```
+
+## splinter/LikesBetree
+
+
+compiler_diagnostics:
+```text
+error[E0659]: `Address` is ambiguous
+   --> /data/home/kirancodes/Documents/code/verus-research/campaign-real/sources/splinter/betree/LinkedBetree_v.rs:234:22
+    |
+234 |     pub entries: Map<Address, BetreeNode>,
+    |                      ^^^^^^^ ambiguous name
+    |
+
+error[E0659]: `Address` is ambiguous
+   --> /data/home/kirancodes/Documents/code/verus-research/campaign-real/sources/splinter/betree/LinkedBetree_v.rs:303:89
+    |
+303 |     pub open spec(checked) fn node_children_respects_rank(self, ranking: Ranking, addr: Address) -> bool
+    |                                                                                         ^^^^^^^ ambiguous name
+    |
+
+error[E0659]: `Address` is ambiguous
+   --> /data/home/kirancodes/Documents/code/verus-research/campaign-real/sources/splinter/betree/LinkedBetree_v.rs:322:57
+    |
+322 |     pub open spec(checked) fn is_fresh(self, addrs: Set<Address>) -> bool 
+    |                                                         ^^^^^^^ ambiguous name
+    |
+
+error[E0659]: `Address` is ambiguous
+   --> /data/home/kirancodes/Documents/code/verus-research/campaign-real/sources/splinter/betree/LinkedBetree_v.rs:327:55
+    |
+327 |     pub open spec(checked) fn modify_disk(self, addr: Address, node: BetreeNode) -> DiskView
+    |                                                       ^^^^^^^ ambiguous name
+    |
+
+error[E0659]: `Address` is ambiguous
+   --> /data/home/kirancodes/Documents/code/verus-research/campaign-real/sources/splinter/betree/LinkedBetree_v.rs:356:31
+    |
+356 |     spec fn repr(self) -> Set<Address>;
+    |                               ^^^^^^^ ambiguous name
+    |
+
+error[E0659]: `Address` is ambiguous
+   --> /data/home/kirancodes/Documents/code/verus-research/campaign-real/sources/splinter/betree/LinkedBetree_v.rs:361:16
+    |
+361 |     pub addr1: Address,
+    |                ^^^^^^^ ambiguous name
+    |
+
+error[E0659]: `Address` is ambiguous
+   --> /data/home/kirancodes/Documents/code/verus-research/campaign-real/sources/splinter/betree/LinkedBetree_v.rs:362:16
+    |
+362 |     pub addr2: Address,
+    |                ^^^^^^^ ambiguous name
+    |
+
+error[E0659]: `Address` is ambiguous
+   --> /data/home/kirancodes/Documents/code/verus-research/campaign-real/sources/splinter/betree/LinkedBetree_v.rs:371:45
+    |
+371 |     open spec(checked) fn repr(self) -> Set<Address>
+    |                                             ^^^^^^^ ambiguous name
+    |
+```
+
+## splinter/LikesJournal
+
+
+compiler_diagnostics:
+```text
+error[E0308]: mismatched types
+  --> /data/home/kirancodes/Documents/code/verus-research/campaign-real/sources/splinter/allocation_layer/LikesJournal_v.rs:34:9
+   |
+33 |     Map::new(
+   |     -------- arguments to this function are incorrect
+34 |         |k| lsn_addr_index.contains_key(k) && bdy <= k,
+
+error[E0308]: mismatched types
+  --> /data/home/kirancodes/Documents/code/verus-research/campaign-real/sources/splinter/allocation_layer/LikesJournal_v.rs:50:14
+   |
+50 |     Map::new(|x: LSN| start <= x < end, |x:LSN| value)
+   |     -------- ^^^^^^^^^^^^^^^^^^^^^^^^^ expected `Set<nat>`, found `FnSpec<(nat,), bool>`
+   |     |
+
+error[E0308]: mismatched types
+   --> /data/home/kirancodes/Documents/code/verus-research/campaign-real/sources/splinter/allocation_layer/LikesJournal_v.rs:686:56
+    |
+686 |         let frozen_index = pre.lsn_addr_index.restrict(frozen_lsns);
+    |                                               -------- ^^^^^^^^^^^ expected `Set<nat>`, found `Option<Set<nat>>`
+    |                                               |
+
+error[E0599]: no associated function or constant named `inv_next` found for struct `journal::LinkedJournal_v::LinkedJournal::State` in the current scope
+   --> /data/home/kirancodes/Documents/code/verus-research/campaign-real/sources/splinter/allocation_layer/LikesJournal_v.rs:799:48
+    |
+799 |           LinkedJournal_v::LinkedJournal::State::inv_next(pre.journal, post.journal, State::lbl_i(lbl), istep);
+    |                                                  ^^^^^^^^ associated function or constant not found in `journal::LinkedJournal_v::LinkedJournal::State`
+    |
+
+error originates in the macro `state_machine` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: use of deprecated method `vstd::set::Set::<A>::finite`: Every Set is always finite, so this is always true.
+   --> /data/home/kirancodes/Documents/code/verus-research/campaign-real/sources/splinter/disk/GenericDisk_v.rs:123:20
+    |
+123 |     requires addrs.finite()
+
+error: aborting due to 4 previous errors; 3 warnings emitted
+
+Some errors have detailed explanations: E0308, E0599.
+For more information about an error, try `rustc --explain E0308`.
+```
+
+## splinter/LinkedBetreeVars
+
+
+compiler_diagnostics:
+```text
+error[E0659]: `Address` is ambiguous
+   --> /data/home/kirancodes/Documents/code/verus-research/campaign-real/sources/splinter/betree/LinkedBetree_v.rs:234:22
+    |
+234 |     pub entries: Map<Address, BetreeNode>,
+    |                      ^^^^^^^ ambiguous name
+    |
+
+error[E0659]: `Address` is ambiguous
+   --> /data/home/kirancodes/Documents/code/verus-research/campaign-real/sources/splinter/betree/LinkedBetree_v.rs:303:89
+    |
+303 |     pub open spec(checked) fn node_children_respects_rank(self, ranking: Ranking, addr: Address) -> bool
+    |                                                                                         ^^^^^^^ ambiguous name
+    |
+
+error[E0659]: `Address` is ambiguous
+   --> /data/home/kirancodes/Documents/code/verus-research/campaign-real/sources/splinter/betree/LinkedBetree_v.rs:322:57
+    |
+322 |     pub open spec(checked) fn is_fresh(self, addrs: Set<Address>) -> bool 
+    |                                                         ^^^^^^^ ambiguous name
+    |
+
+error[E0659]: `Address` is ambiguous
+   --> /data/home/kirancodes/Documents/code/verus-research/campaign-real/sources/splinter/betree/LinkedBetree_v.rs:327:55
+    |
+327 |     pub open spec(checked) fn modify_disk(self, addr: Address, node: BetreeNode) -> DiskView
+    |                                                       ^^^^^^^ ambiguous name
+    |
+
+error[E0659]: `Address` is ambiguous
+   --> /data/home/kirancodes/Documents/code/verus-research/campaign-real/sources/splinter/betree/LinkedBetree_v.rs:356:31
+    |
+356 |     spec fn repr(self) -> Set<Address>;
+    |                               ^^^^^^^ ambiguous name
+    |
+
+error[E0659]: `Address` is ambiguous
+   --> /data/home/kirancodes/Documents/code/verus-research/campaign-real/sources/splinter/betree/LinkedBetree_v.rs:361:16
+    |
+361 |     pub addr1: Address,
+    |                ^^^^^^^ ambiguous name
+    |
+
+error[E0659]: `Address` is ambiguous
+   --> /data/home/kirancodes/Documents/code/verus-research/campaign-real/sources/splinter/betree/LinkedBetree_v.rs:362:16
+    |
+362 |     pub addr2: Address,
+    |                ^^^^^^^ ambiguous name
+    |
+
+error[E0659]: `Address` is ambiguous
+   --> /data/home/kirancodes/Documents/code/verus-research/campaign-real/sources/splinter/betree/LinkedBetree_v.rs:371:45
+    |
+371 |     open spec(checked) fn repr(self) -> Set<Address>
+    |                                             ^^^^^^^ ambiguous name
+    |
+```
+
+## splinter/LinkedJournal
+
+
+tlc_diagnostics:
+```text
+TLC2 Version 2026.09.24.190251 (rev: 11305b4)
+Warning: Please run the Java VM, which executes TLC with a throughput optimized garbage collector, by passing the "-XX:+UseParallelGC" property.
+(Use the -nowarning option to disable this warning.)
+Running breadth-first search Model-Checking with fp 72 and seed -5916640537347375151 with 1 worker on 32 cores with 1024MB heap and 64MB offheap memory [pid: 2629874] (Linux 7.0.0-1012-aws amd64, Ubuntu 25.0.4.1 64bit, MSBDiskFPSet, DiskStateQueue).
+Parsing file /data/home/kirancodes/Documents/code/verus-research/wt-export-closures/audit/export-closures/cumulative-merged-ca16-final/splinter/LinkedJournal/MC.tla
+Parsing file /data/home/kirancodes/Documents/code/verus-research/wt-export-closures/audit/export-closures/cumulative-merged-ca16-final/splinter/LinkedJournal/State_tla.tla
+Parsing file /tmp/tlc-8994685578259895850/_TLCTrace.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/_TLCTrace.tla)
+Parsing file /tmp/tlc-8994685578259895850/Integers.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/Integers.tla)
+Parsing file /tmp/tlc-8994685578259895850/Sequences.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/Sequences.tla)
+Parsing file /tmp/tlc-8994685578259895850/FiniteSets.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/FiniteSets.tla)
+Parsing file /tmp/tlc-8994685578259895850/TLC.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/TLC.tla)
+Parsing file /tmp/tlc-8994685578259895850/Naturals.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/Naturals.tla)
+Parsing file /tmp/tlc-8994685578259895850/TLCExt.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/TLCExt.tla)
+Semantic processing of module Naturals
+Semantic processing of module Integers
+Semantic processing of module Sequences
+Semantic processing of module FiniteSets
+Semantic processing of module TLC
+Semantic processing of module State_tla
+Semantic processing of module TLCExt
+Semantic processing of module _TLCTrace
+Semantic processing of module MC
+Linting of module State_tla
+Linting of module TLCExt
+Linting of module _TLCTrace
+Linting of module MC
+Starting... (2026-10-08 14:26:01)
+Computing initial states...
+Finished computing initial states: 1 distinct state generated at 2026-10-08 14:26:01.
+Error: Invariant inv is violated.
+Error: The behavior up to this point is:
+State 1: <Initial predicate>
+/\ unmarshalled_tail = [msgs |-> <<>>, seq_start |-> 0, seq_end |-> 0]
+/\ truncated_journal = [disk_view |-> [entries |-> <<>>, boundary_lsn |-> 0], freshest_rec |-> [tag |-> "None"]]
+
+State 2: <Next line 386, col 9 to line 386, col 30 of module State_tla>
+/\ unmarshalled_tail = [msgs |-> (0 :> [key |-> [v0 |-> 0], message |-> [tag |-> "Define", value |-> [v0 |-> 0]]]), seq_start |-> 0, seq_end |-> 1]
+/\ truncated_journal = [disk_view |-> [entries |-> <<>>, boundary_lsn |-> 0], freshest_rec |-> [tag |-> "None"]]
+
+State 3: <Next line 386, col 9 to line 386, col 30 of module State_tla>
+/\ unmarshalled_tail = [msgs |-> <<>>, seq_start |-> 1, seq_end |-> 1]
+/\ truncated_journal = [disk_view |-> [entries |-> ([au |-> 0, page |-> 0] :> [message_seq |-> [msgs |-> (0 :> [key |-> [v0 |-> 0], message |-> [tag |-> "Define", value |-> [v0 |-> 0]]]), seq_start |-> 0, seq_end |-> 1], prior_rec |-> [tag |-> "None"]]), boundary_lsn |-> 0], freshest_rec |-> [v0 |-> [au |-> 0, page |-> 0], tag |-> "Some"]]
+
+9 states generated, 4 distinct states found, 1 states left on queue.
+The depth of the complete state graph search is 3.
+Finished in 00s at (2026-10-08 14:26:01)
+Trace exploration spec path: ./MC_TTrace_1791469561.tla
+```
+
+## splinter/UnifiedCrashAwareJournal
+
+
+compiler_diagnostics:
+```text
+error[E0308]: mismatched types
+  --> /data/home/kirancodes/Documents/code/verus-research/campaign-real/sources/splinter/allocation_layer/AllocationJournal_v.rs:64:14
+   |
+64 |     Map::new(|lsn| lsn_au_index.contains_key(lsn) && bdy <= lsn, |lsn| lsn_au_index[lsn])
+   |     -------- ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ expected `Set<nat>`, found `FnSpec<(nat,), bool>`
+   |     |
+
+error[E0308]: mismatched types
+  --> /data/home/kirancodes/Documents/code/verus-research/campaign-real/sources/splinter/allocation_layer/AllocationJournal_v.rs:82:14
+   |
+82 |     Map::new(|lsn| start_lsn <= lsn < end_lsn, |lsn| value)
+   |     -------- ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ expected `Set<nat>`, found `FnSpec<(_,), bool>`
+   |     |
+
+error[E0308]: mismatched types
+   --> /data/home/kirancodes/Documents/code/verus-research/campaign-real/sources/splinter/allocation_layer/AllocationJournal_v.rs:130:9
+    |
+126 | pub open spec(checked) fn au_addrs_past_pointer(ptr: Pointer) -> Set<Address> {
+    |                                                                  ------------ expected `vstd::set::Set<spec::AsyncDisk_t::Address>` because of return type
+...
+
+error[E0308]: mismatched types
+   --> /data/home/kirancodes/Documents/code/verus-research/campaign-real/sources/splinter/allocation_layer/AllocationJournal_v.rs:137:9
+    |
+135 |       pub open spec fn tight_domain(self, index: LsnAUIndex, root: Pointer) -> Set<Address>
+    |                                                                                ------------ expected `vstd::set::Set<spec::AsyncDisk_t::Address>` because of return type
+136 |       {
+
+error[E0599]: no method named `build_lsn_au_index_page_walk_consistency` found for struct `journal::LinkedJournal_v::DiskView` in the current scope
+   --> /data/home/kirancodes/Documents/code/verus-research/campaign-real/sources/splinter/allocation_layer/AllocationJournal_v.rs:743:14
+    |
+743 |         self.build_lsn_au_index_page_walk_consistency(self.next(bottom));
+    |              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+
+error[E0308]: mismatched types
+    --> /data/home/kirancodes/Documents/code/verus-research/campaign-real/sources/splinter/allocation_layer/AllocationJournal_v.rs:1044:61
+     |
+1044 |             let sub_domain = dv.tight_domain(index.restrict(sub_lsns), sub_freshest_rec);
+     |                                                    -------- ^^^^^^^^ expected `Set<nat>`, found `Option<Set<_>>`
+     |                                                    |
+
+error[E0308]: mismatched types
+    --> /data/home/kirancodes/Documents/code/verus-research/campaign-real/sources/splinter/allocation_layer/AllocationJournal_v.rs:1047:98
+     |
+1047 |             &&& sub_dv.build_lsn_au_index_au_walk(sub_freshest_rec, sub_first) == index.restrict(sub_lsns)
+     |                                                                                         -------- ^^^^^^^^ expected `Set<nat>`, found `Option<Set<_>>`
+     |                                                                                         |
+
+error[E0308]: mismatched types
+    --> /data/home/kirancodes/Documents/code/verus-research/campaign-real/sources/splinter/allocation_layer/AllocationJournal_v.rs:1053:40
+     |
+1053 |         let sub_index = index.restrict(sub_lsns);
+     |                               -------- ^^^^^^^^ expected `Set<nat>`, found `Option<Set<_>>`
+     |                               |
+```
+
+## nr/UnboundedLog-mono
+
+
+tlc_diagnostics:
+```text
+TLC2 Version 2026.09.24.190251 (rev: 11305b4)
+Warning: Please run the Java VM, which executes TLC with a throughput optimized garbage collector, by passing the "-XX:+UseParallelGC" property.
+(Use the -nowarning option to disable this warning.)
+Running breadth-first search Model-Checking with fp 121 and seed 396198801335133109 with 1 worker on 32 cores with 1024MB heap and 64MB offheap memory [pid: 2634552] (Linux 7.0.0-1012-aws amd64, Ubuntu 25.0.4.1 64bit, MSBDiskFPSet, DiskStateQueue).
+Parsing file /data/home/kirancodes/Documents/code/verus-research/wt-export-closures/audit/export-closures/cumulative-merged-ca16-final/nr/UnboundedLog-mono/MC.tla
+Parsing file /data/home/kirancodes/Documents/code/verus-research/wt-export-closures/audit/export-closures/cumulative-merged-ca16-final/nr/UnboundedLog-mono/State_tla.tla
+Parsing file /tmp/tlc-9246569861929421820/_TLCTrace.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/_TLCTrace.tla)
+Parsing file /tmp/tlc-9246569861929421820/Integers.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/Integers.tla)
+Parsing file /tmp/tlc-9246569861929421820/Sequences.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/Sequences.tla)
+Parsing file /tmp/tlc-9246569861929421820/FiniteSets.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/FiniteSets.tla)
+Parsing file /tmp/tlc-9246569861929421820/TLC.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/TLC.tla)
+Parsing file /tmp/tlc-9246569861929421820/Naturals.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/Naturals.tla)
+Parsing file /tmp/tlc-9246569861929421820/TLCExt.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/TLCExt.tla)
+Semantic processing of module Naturals
+Semantic processing of module Integers
+Semantic processing of module Sequences
+Semantic processing of module FiniteSets
+Semantic processing of module TLC
+Semantic processing of module State_tla
+Semantic processing of module TLCExt
+Semantic processing of module _TLCTrace
+Semantic processing of module MC
+Linting of module State_tla
+Linting of module TLCExt
+Linting of module _TLCTrace
+Linting of module MC
+Starting... (2026-10-08 14:26:15)
+Error: The constant parameter Table_arbitrary__tla_closed2 is not assigned a value by the configuration file.
+Finished in 00s at (2026-10-08 14:26:15)
+```
+
+## nr/CyclicBuffer
+
+- 1× **uninterpreted function carrier type PointsTo_Option_ConcreteLogEntry_DT cannot be constrained**, `vstd/cell.rs:132:5: 132:63 (#0)` (in `vstd::cell::impl&%2::mem_contents__tla_closed`).
+- 1× **uninterpreted function carrier type CellId cannot be constrained**, `vstd/cell.rs:129:5: 129:45 (#0)` (in `vstd::cell::impl&%2::id__tla_closed`).
+- 1× **uninterpreted function carrier type SyncSendIfSyncSend_tuple0 cannot be constrained**, `/Users/kirancodes/Documents/code/verus-research/survey/repos/verus-lang_verified-node-replication/verified-node-replication/src/spec/unbounded_log.rs:265:1: 1171:2 (#355)` (in `nrspec::spec::unbounded_log::UnboundedLog::impl&%5::key__tla_closed`).
+- 1× **uninterpreted function carrier type SyncSendIfSyncSend_tuple0 cannot be constrained**, `/Users/kirancodes/Documents/code/verus-research/survey/repos/verus-lang_verified-node-replication/verified-node-replication/src/spec/unbounded_log.rs:265:1: 1171:2 (#355)` (in `nrspec::spec::unbounded_log::UnboundedLog::impl&%5::instance_id__tla_closed`).
+- 1× **uninterpreted function carrier type SyncSendIfSyncSend_tuple0 cannot be constrained**, `/Users/kirancodes/Documents/code/verus-research/survey/repos/verus-lang_verified-node-replication/verified-node-replication/src/spec/unbounded_log.rs:265:1: 1171:2 (#355)` (in `nrspec::spec::unbounded_log::UnboundedLog::impl&%28::id__tla_closed`).
+- 1× **uninterpreted function carrier type SyncSendIfSyncSend_tuple0 cannot be constrained**, `/Users/kirancodes/Documents/code/verus-research/survey/repos/verus-lang_verified-node-replication/verified-node-replication/src/spec/unbounded_log.rs:265:1: 1171:2 (#355)` (in `nrspec::spec::unbounded_log::UnboundedLog::impl&%5::value__tla_closed`).
+
+## nr/FlatCombiner
+
+
+tlc_diagnostics:
+```text
+TLC2 Version 2026.09.24.190251 (rev: 11305b4)
+Warning: Please run the Java VM, which executes TLC with a throughput optimized garbage collector, by passing the "-XX:+UseParallelGC" property.
+(Use the -nowarning option to disable this warning.)
+Running breadth-first search Model-Checking with fp 10 and seed 866331681271228377 with 1 worker on 32 cores with 1024MB heap and 64MB offheap memory [pid: 2637283] (Linux 7.0.0-1012-aws amd64, Ubuntu 25.0.4.1 64bit, MSBDiskFPSet, DiskStateQueue).
+Parsing file /data/home/kirancodes/Documents/code/verus-research/wt-export-closures/audit/export-closures/cumulative-merged-ca16-final/nr/FlatCombiner/MC.tla
+Parsing file /data/home/kirancodes/Documents/code/verus-research/wt-export-closures/audit/export-closures/cumulative-merged-ca16-final/nr/FlatCombiner/State_tla.tla
+Parsing file /tmp/tlc-4982442723810998035/_TLCTrace.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/_TLCTrace.tla)
+Parsing file /tmp/tlc-4982442723810998035/Integers.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/Integers.tla)
+Parsing file /tmp/tlc-4982442723810998035/Sequences.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/Sequences.tla)
+Parsing file /tmp/tlc-4982442723810998035/FiniteSets.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/FiniteSets.tla)
+Parsing file /tmp/tlc-4982442723810998035/TLC.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/TLC.tla)
+Parsing file /tmp/tlc-4982442723810998035/Naturals.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/Naturals.tla)
+Parsing file /tmp/tlc-4982442723810998035/TLCExt.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/TLCExt.tla)
+Semantic processing of module Naturals
+Semantic processing of module Integers
+Semantic processing of module Sequences
+Semantic processing of module FiniteSets
+Semantic processing of module TLC
+Semantic processing of module State_tla
+Semantic processing of module TLCExt
+Semantic processing of module _TLCTrace
+Semantic processing of module MC
+Linting of module State_tla
+Linting of module TLCExt
+Linting of module _TLCTrace
+Linting of module MC
+Starting... (2026-10-08 14:26:24)
+Error: The constant parameter Table_arbitrary__tla_closed is not assigned a value by the configuration file.
+Finished in 00s at (2026-10-08 14:26:24)
+```
+
+## Round-2 anvil/sub_vrs_reconcile
+
+Unchanged campaign harness:
+
+```text
+TLC2 Version 2026.09.24.190251 (rev: 11305b4)
+Warning: Please run the Java VM, which executes TLC with a throughput optimized garbage collector, by passing the "-XX:+UseParallelGC" property.
+(Use the -nowarning option to disable this warning.)
+Running breadth-first search Model-Checking with fp 32 and seed -6226654789890194241 with 1 worker on 32 cores with 1024MB heap and 64MB offheap memory [pid: 2603308] (Linux 7.0.0-1012-aws amd64, Ubuntu 25.0.4.1 64bit, MSBDiskFPSet, DiskStateQueue).
+Parsing file /data/home/kirancodes/Documents/code/verus-research/wt-export-closures/audit/export-closures/cumulative-round2-merged-ca16-final/anvil/sub_vrs_reconcile/MC.tla
+Parsing file /data/home/kirancodes/Documents/code/verus-research/wt-export-closures/audit/export-closures/cumulative-round2-merged-ca16-final/anvil/sub_vrs_reconcile/VReplicaSetReconcileState_tla.tla
+Parsing file /tmp/tlc-15632621354249795545/Integers.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/Integers.tla)
+Parsing file /tmp/tlc-15632621354249795545/Sequences.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/Sequences.tla)
+Parsing file /tmp/tlc-15632621354249795545/FiniteSets.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/FiniteSets.tla)
+Parsing file /tmp/tlc-15632621354249795545/TLC.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/TLC.tla)
+Parsing file /tmp/tlc-15632621354249795545/Naturals.tla (jar:file:/data/home/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar!/tla2sany/StandardModules/Naturals.tla)
+Semantic processing of module Naturals
+Semantic processing of module Integers
+Semantic processing of module Sequences
+Semantic processing of module FiniteSets
+Semantic processing of module TLC
+Semantic processing of module VReplicaSetReconcileState_tla
+Semantic processing of module MC
+Linting of module VReplicaSetReconcileState_tla
+Linting of module MC
+Starting... (2026-10-08 14:25:08)
+Error: The constant parameter Table_marshal_spec_2 is not assigned a value by the configuration file.
+Finished in 00s at (2026-10-08 14:25:08)
+```
+

@@ -1,0 +1,76 @@
+{
+  "first_parent": "8b00f9bffa9c8b156ee2cad7460612fe712d6114",
+  "incoming_parent": "ca16f117659d44954c434c4e5c9a775f9eb49375",
+  "test_result": "test result: ok. 270 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 108.01s",
+  "test_sets": {
+    "ours": 216,
+    "incoming": 264,
+    "merged": 270,
+    "all_retained": true,
+    "renamed_for_new_supported_behavior": {
+      "tla_export_refuses_a_closure_passed_as_a_value": "tla_export_reduces_a_closure_passed_as_a_value",
+      "tla_export_refuses_set_choose_and_a_function_parameter": "tla_export_collection_choose_and_literal_function_parameters"
+    }
+  },
+  "checks": {
+    "build": {
+      "command": "vargo build --release --vstd-no-verify",
+      "exit_code": 0,
+      "log_sha256": "b61673beecf0ec5270f79d36bd8a4b21390f4dde0894038836ffeca1d84e6738"
+    },
+    "exporter_tests": {
+      "command": "TLA2TOOLS_JAR=$HOME/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar timeout 1800 vargo test --release --vstd-no-verify -p rust_verify_test --test tla_export -- --test-threads=4",
+      "exit_code": 0,
+      "log_sha256": "d2108ac8abfb7fdebaeb118b33fb1726efcfc97d22a0f50796b3e1c81cddb2e8"
+    },
+    "fmt": {
+      "command": "vargo fmt --exclude vstd -- --check",
+      "exit_code": 0,
+      "log_sha256": "68d0d247b5df73992c70925923613c3093ef4be50a5e6fb9930eee1b16ae339b"
+    },
+    "clippy": {
+      "command": "timeout 1200 vargo clippy --release -- -D warnings",
+      "exit_code": 0,
+      "log_sha256": "6f0d1c5bb5104a2f7147711cc1c5ec4955b553f78085b13e77ae13385c75e80d"
+    },
+    "clippy_exporter_tests": {
+      "command": "timeout 1200 vargo cmd -- cargo clippy --release -p rust_verify_test --test tla_export -- -D warnings",
+      "exit_code": 0,
+      "log_sha256": "69cd6b124be43804ecc06f55d9400b33206541b5c853332de5d2d49c74c66dc7"
+    },
+    "vargo_fmt": {
+      "command": "cd tools/vargo && cargo fmt -- --check",
+      "exit_code": 0,
+      "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "vargo_clippy": {
+      "command": "cd tools/vargo && timeout 600 cargo clippy --all-targets -- -D warnings",
+      "exit_code": 0,
+      "log_sha256": "f1a4f68488407c5dff6e9e5b11d356f024615dde7bfb8128d1bfe439313142b5"
+    }
+  },
+  "parent_binary_matches_committed_lane3_evidence": true,
+  "parent_source_sha256": {
+    "source/vir/src/tla.rs": "6802bac25e3eb93de4a44e7fb0ac01c2f321cfbf5eff0dfe1bab60e202f986a6",
+    "source/vir/src/tla/functions.rs": "65715a8933723478baa3b821eaf34334375f90a73d6de119184e4082b4cfd88e",
+    "source/rust_verify_test/tests/tla_export.rs": "91af1a5c6e5290ae1d05ddb793d8536d5d20c7b482ec766b1956f4532d7dbe7a"
+  },
+  "source_sha256": {
+    "source/vir/src/tla.rs": "e3fcb00710c68dc0a06645d93a385f61f19fa0f6f10a97fd147779b1b696d5ce",
+    "source/vir/src/tla/functions.rs": "65715a8933723478baa3b821eaf34334375f90a73d6de119184e4082b4cfd88e",
+    "source/rust_verify_test/tests/tla_export.rs": "4a9d0ae9647b0bbb5c97d897e10d932f8380ab2247c47c44856058194c7f3d64"
+  },
+  "binary_sha256": {
+    "verus": "5ffa1cb2b1e0df2bbed030d98414f20640f9c0613551a62be858ad320bf87a2a",
+    "rust_verify": "767c837fb3d48b20328f55ca965f527f24641b3e388c9fa9087709944a2a9599"
+  },
+  "fixture_count": 35,
+  "fixtures_identical": true,
+  "notes": [
+    "All lookups use Functions::resolve; closure inlining takes ResolvedFunction.",
+    "Action record reduction preserves trace-arm action_domains bookkeeping.",
+    "Empty choice lists omitted to preserve legacy JSON reports.",
+    "Final cumulative campaign replays use the final rebuilt binary; source hashes identify the in-progress merge tree.",
+    "Clippy exits zero with -D warnings; Cargo also reports an existing proc-macro-error2 future-incompatibility advisory."
+  ]
+}
