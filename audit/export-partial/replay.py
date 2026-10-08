@@ -24,7 +24,7 @@ REGRESSIONS = ['splinter/PagedBetree', 'splinter/PivotBetree', 'nrkernel/mmu_rl1
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument('group', choices=['partial', 'collections', 'fixtures', 'regressions'])
+    ap.add_argument('group', choices=['partial', 'collections', 'fixtures', 'regressions', 'anvil'])
     ap.add_argument('phase')
     ap.add_argument('--verus', type=Path, required=True)
     ap.add_argument('--export-seconds', type=int, default=90)
@@ -36,6 +36,21 @@ def main():
     dest.mkdir(exist_ok=True)
     env = dict(os.environ, PATH=str(Path.home()/'.cargo/bin')+':'+os.environ['PATH'],
                TMPDIR=str(Path.home()/'tmp'), VERUS_MCP_ENABLED='1')
+    campaign = ROOT.parent / 'campaign-real/round2' if args.group == 'anvil' else CAMPAIGN
+    if args.group == 'anvil':
+        deps = dest/'deps'
+        deps.mkdir(exist_ok=True)
+        for crate in ['verus_temporal_logic', 'k8s_openapi']:
+            cmd = json.loads((campaign/'deps'/f'{crate}-command.json').read_text())
+            cmd[2] = str(binary)
+            for flag in ['--export', '-o']:
+                i = cmd.index(flag)+1
+                cmd[i] = str(deps/Path(cmd[i]).name)
+            (deps/f'{crate}-command.json').write_text(json.dumps(cmd, indent=2)+'\n')
+            result = subprocess.run(cmd, cwd=ROOT, env=env, capture_output=True, text=True)
+            (deps/f'{crate}.log').write_text(result.stdout+result.stderr)
+            if result.returncode:
+                raise RuntimeError(f'{crate} dependency build failed; see {deps}')
     rows = []
     if args.group == 'fixtures':
         inputs = [(f.stem, f, f.stem + {'adder_sync':'::Adder', 'toggle_sync':'::Toggle',
@@ -44,7 +59,7 @@ def main():
         # The documented base/toydb checkout lacks safety.rs on this box.
         inputs.append(('toydb', ROOT.parent/'trace-arm-eval/toydb/src/raft/safety.rs', 'safety'))
     else:
-        inputs = [(name, None, None) for name in ({'partial': PARTIAL, 'collections': COLLECTIONS, 'regressions': REGRESSIONS}[args.group])]
+        inputs = [(name, None, None) for name in ({'partial': PARTIAL, 'collections': COLLECTIONS, 'regressions': REGRESSIONS, 'anvil': ['anvil/sub_network', 'anvil/sub_controller', 'anvil/sub_vrs_reconcile']}[args.group])]
     def run_one(item):
         name, source, module = item
         out = dest / name
@@ -56,10 +71,17 @@ def main():
             cmd = ['timeout', str(args.export_seconds), str(binary), '-V', 'tla-export='+module,
                    '--log-dir', str(export), '--no-verify', str(source), '--crate-type=lib']
         else:
-            cmd = json.loads((CAMPAIGN/name/'command.json').read_text())
+            cmd = json.loads((campaign/name/'command.json').read_text())
+            if isinstance(cmd, dict):
+                a = cmd['arguments']
+                cmd = ['timeout', str(args.export_seconds), str(binary), '-V', 'tla-export='+a['module'],
+                       '--log-dir', str(export), a['path'], *a.get('extra_args', [])]
             cmd[1:3] = [str(args.export_seconds), str(binary)]
             cmd[cmd.index('--log-dir')+1] = str(export)
             cmd = [str(ROOT.parent/'campaign-real'/x) if x.startswith('sources/') else x for x in cmd]
+        if args.group == 'anvil':
+            cmd = [x.split('=')[0]+'='+str(deps/Path(x).name)
+                   if '=' in x and '/round2/deps/' in x else x for x in cmd]
         (out/'command.json').write_text(json.dumps(cmd, indent=2)+'\n')
         started = time.monotonic()
         p = subprocess.run(cmd, cwd=ROOT, env=env, capture_output=True, text=True)
@@ -83,18 +105,23 @@ def main():
                 not re.search(r'error', result, re.I)) else 'error'
             if row['sany_status'] == 'error':
                 row['status'] = 'sany_error'
-            if args.group != 'fixtures' and (CAMPAIGN/name/'MC-command.json').exists():
+            if args.group != 'fixtures' and ((campaign/name/'MC-command.json').exists() or (args.group == 'anvil' and (campaign/name/'MC.cfg').exists())):
                 spec = next(export.glob('*_tla.tla'))
                 shutil.copyfile(spec, out/spec.name)
                 for filename in ['MC.tla', 'MC.cfg']:
-                    shutil.copyfile(CAMPAIGN/name/filename, out/filename)
-                tlc = json.loads((CAMPAIGN/name/'MC-command.json').read_text())
+                    shutil.copyfile(campaign/name/filename, out/filename)
+                command_file = campaign/name/'MC-command.json'
+                tlc = json.loads(command_file.read_text()) if command_file.exists() else [
+                    'timeout', str(args.tlc_seconds), 'java', '-Xmx1g', '-cp', str(jar),
+                    'tlc2.TLC', '-deadlock', '-continue', '-workers', '1', 'MC.tla']
                 tlc[1] = str(args.tlc_seconds)
                 (out/'MC-command.json').write_text(json.dumps(tlc, indent=2)+'\n')
                 p = subprocess.run(tlc, cwd=out, env=env, capture_output=True, text=True)
                 text = p.stdout+p.stderr
                 (out/'MC.log').write_text(text)
                 row['tlc_rc'] = p.returncode
+                row['invariant_violations'] = sorted(set(re.findall(r'Error: Invariant (\S+) is violated', text)))
+                row['exploration_complete'] = 'Model checking completed.' in text
                 counts = re.findall(r'(\d+) states generated[^\n]*?(\d+) distinct states found', text)
                 if counts:
                     row.update(generated=int(counts[-1][0]), distinct=int(counts[-1][1]))

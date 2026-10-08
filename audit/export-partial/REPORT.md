@@ -71,6 +71,22 @@ CrashTolerantMap now exposes the explicit `Dom_Key` carrier for `TotalKMMap::emp
 
 AbstractMap now completes with **33 generated / 3 distinct states**, using the original sources, adapter, and bounds. The undefined cast at `MsgHistory_v.rs:189` disables the affected predicate instead of crashing TLC. A dedicated recursive-cast regression reproduces this boundary.
 
+## Anvil Option projection through a value helper
+
+The saved round-2 `sub_vrs_reconcile/MC.tla` reproduces `None.v0` in `extract_some_k_list_resp_view`: 1,138 generated / 2 distinct states, stopping after `Init -> AfterListPods`. The clean lane-3 binary at `5e38e1ee` reproduces the same failure with a fresh export and the identical configuration.
+
+This was a misplaced restriction plus an analysis gap. Boolean conditions inside a value-returning helper were treated as action predicates. Wrapping the negated response test with `IF defined THEN condition ELSE FALSE` changed which branch `reconcile_core` selected on a missing response, sending execution into the branch that extracts its payload. The caller's definedness walk skipped `match` arms, so it missed those partial reads.
+
+Value helpers now retain their condition/value semantics. Their enclosing predicate checks definedness through selected match arms, arm guards, and short-circuit logical operands before evaluating the call. A genuine off-domain value disables that predicate with a source-located report. Generated match fallbacks share LETs to avoid repeated expansion. Cached guards account for the receiving scope's bound names, nested matches reserve outer names first, and destructuring initializer guards use only their lexical LET prefix.
+
+The regression tests cover the negated response condition inside a match helper, unguarded Option projections inside helper bodies and match-arm guards, nested matches, and a destructuring initializer whose helper-local name is reused by a later declaration.
+
+The unchanged VRS model now finishes at **7,960 generated / 7 distinct states**, depth 4, with zero refusals and no projection/evaluation error. With TLC's `-continue`, the complete search also reports a `not_error` invariant violation: `Init -> AfterListPods -> Error`. This is the source's explicit error branch for an absent/invalid response in this unconstrained response harness, not a claimed controller defect. Three partial-read restrictions remain reported, including the guard at the outer `next` predicate.
+
+All three Anvil machines were replayed on this lane. `sub_network` retains its two pre-existing closure-application refusals; `sub_controller` retains nine closure-related refusals. Their generated modules pass SANY, but lane-3 alone cannot run the network relation, and the saved controller harness references closure-specialized operators supplied by lane 4. Its prior campaign report also labels that harness preliminary/unvalidated. Neither is counted as a successful TLC run. No closure adapter, source, carrier assignment, or campaign constraint was changed. Dependencies were rebuilt from the saved commands into this worktree to match the verifier's crate identities.
+
+Current Anvil/replay evidence, binary and source hashes, and unchanged bound checks are in `anvil-measurements.json`; the earlier twelve-machine measurements remain in `measurements.json`.
+
 ## Definedness regression repair
 
 The lane-4 report was reproduced on clean `64f1c6e3`. There were two causes:
@@ -115,9 +131,9 @@ The nine supplemental modules have no saved `MC-command.json` in this campaign, 
 
 ## Validation and remaining work
 
-**207 exporter tests passed, 0 failed**, with `TLA2TOOLS_JAR` set. The vstd rebuild verified 2,045 functions with no errors. All 28 generated fixture files and all 16 saved campaign bound/configuration files compare byte-identically. The full golden regression and the separate raw re-export check both pass.
+**210 exporter tests passed, 0 failed**, with `TLA2TOOLS_JAR` set. The vstd rebuild verified 2,045 functions with no errors. All 28 generated fixture files and all 22 saved campaign bound/configuration files compare byte-identically. The full golden regression and the separate raw re-export check both pass.
 
-Fourteen new TLC-backed tests cover partial reads, carriers, recursive helpers and casts, lazy conditional values, invalidation of inferred shape facts, redundant guards, recursive substitution declarations, guard-only dependencies, and bounded shared-helper analysis. A separate golden regression pins Raft and every example's four generated files.
+Seventeen new TLC-backed tests cover partial reads, carriers, recursive helpers and casts, lazy conditional values, invalidation of inferred shape facts, redundant guards, recursive substitution declarations, guard-only dependencies, bounded shared-helper analysis, Option projections in value helpers, and lexical scope of their guards. A separate golden regression pins Raft and every example's four generated files.
 
 Remaining campaign limitations (not hidden as successful exploration):
 
@@ -138,6 +154,7 @@ export TMPDIR=$HOME/tmp
 export TLA2TOOLS_JAR=$HOME/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar
 (cd source && timeout 900 ../tools/vargo/target/release/vargo test --release -p rust_verify_test --test tla_export -- --test-threads=4)
 python3 audit/export-partial/replay.py partial final-before --verus ../base/verus/source/target-verus/release/verus
+python3 audit/export-partial/replay.py anvil anvil-acceptance --verus source/target-verus/release/verus --jobs 2
 python3 audit/export-partial/replay.py regressions bounded-final --verus source/target-verus/release/verus --jobs 2
 python3 audit/export-partial/replay.py partial bounded-final-partial --verus source/target-verus/release/verus
 python3 audit/export-partial/replay.py collections collections-before --verus ../base/verus/source/target-verus/release/verus

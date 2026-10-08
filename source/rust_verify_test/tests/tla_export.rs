@@ -10168,3 +10168,120 @@ pub open spec fn bounded(s: State) -> bool { s.n <= 1 }
     assert_eq!(run.distinct, 2);
     assert!(run.violated.is_empty());
 }
+
+/// Anvil's response guard is inside a value-returning match helper. Making
+/// its negated condition FALSE would select the unsafe branch on None.
+#[test]
+fn tla_export_partial_option_helper_preserves_branch_selection() {
+    let ex = export_code_with(
+        r#"
+verus! {
+pub struct State { pub phase: u8, pub response: Option<int>, pub n: int }
+pub open spec fn extract(response: Option<int>) -> int { response.unwrap() }
+pub open spec fn advance(s: State) -> State {
+    match s.phase {
+        0 => State { phase: 1, ..s },
+        1 => {
+            if !(s.response.is_some() && extract(s.response) == 7) {
+                State { phase: 2, ..s }
+            } else {
+                State { phase: 3, n: extract(s.response), ..s }
+            }
+        },
+        _ => s,
+    }
+}
+pub open spec fn init(s: State) -> bool { s.phase == 0 && (s.response == None || s.response == Some(7)) && s.n == 0 }
+pub open spec fn next(pre: State, post: State) -> bool { post == advance(pre) }
+pub open spec fn bounded(s: State) -> bool { s.phase <= 3 && if s.phase == 3 { s.n == 7 } else { s.n == 0 } }
+}
+"#,
+        "test_crate",
+        &["--no-verify"],
+    );
+    assert!(ex.report["refusals"].as_array().unwrap().is_empty(), "{}", ex.report);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let run = tlc(&jar, &ex.spec(), &ex.cfg);
+    assert_eq!(run.distinct, 6);
+    assert!(run.violated.is_empty());
+}
+
+/// A match arm's guard and body can both call a partial value helper. Disable
+/// the enclosing transition, without changing the helper's condition or value.
+#[test]
+fn tla_export_partial_option_helper_in_match_arm_and_guard() {
+    for arm in [
+        "1 => State { phase: 2, n: extract(s.response), ..s },",
+        "1 if extract(s.response) > 0 => State { phase: 2, ..s },",
+    ] {
+        let code = format!(
+            r#"
+verus! {{
+pub struct State {{ pub phase: u8, pub response: Option<int>, pub n: int }}
+pub open spec fn extract(response: Option<int>) -> int {{
+    // The nested match also contributes guard LETs; they must not shadow
+    // the caller match's generated locals.
+    match response {{ Some(v) => v, None => response.unwrap() }}
+}}
+pub open spec fn advance(s: State) -> State {{
+    match s.phase {{ 0 => State {{ phase: 1, ..s }}, {arm} _ => s }}
+}}
+pub open spec fn init(s: State) -> bool {{ s.phase == 0 && s.response == None && s.n == 0 }}
+pub open spec fn next(pre: State, post: State) -> bool {{ post == advance(pre) }}
+pub open spec fn bounded(s: State) -> bool {{ s.phase <= 1 && s.n == 0 }}
+}}
+"#
+        );
+        let ex = export_code_with(&code, "test_crate", &["--no-verify"]);
+        assert!(ex.report["refusals"].as_array().unwrap().is_empty(), "{}", ex.report);
+        assert!(!ex.report["restrictions"].as_array().unwrap().is_empty(), "{}", ex.report);
+        let Some(jar) = tla_tools() else { return };
+        sany(&jar, &ex.spec());
+        let run = tlc(&jar, &ex.spec(), &ex.cfg);
+        assert_eq!(run.distinct, 2);
+        assert!(run.violated.is_empty());
+    }
+}
+
+/// A destructuring initializer's helper can bind a name used by a later LET.
+/// Later bindings must not capture the initializer's definedness expression.
+#[test]
+fn tla_export_partial_helper_guard_keeps_lexical_let_prefix() {
+    let ex = export_code_with(
+        r#"
+use vstd::map::*;
+use vstd::set::*;
+verus! {
+pub struct State { pub phase: u8, pub response: Option<int>, pub n: int }
+pub open spec fn split(response: Option<int>) -> (Map<int, int>, int) {
+    let split_element = response.unwrap();
+    let left = Map::new(Set::empty().insert(split_element), |k: int| Map::<int, int>::empty()[k]);
+    (left, 0)
+}
+pub open spec fn advance(s: State) -> State {
+    match s.phase {
+        0 => State { phase: 1, ..s },
+        1 => {
+            let (left, right) = split(s.response);
+            let split_element = 1int;
+            State { phase: 2, n: left[split_element] + right, ..s }
+        },
+        _ => s,
+    }
+}
+pub open spec fn init(s: State) -> bool { s.phase == 0 && s.response == Some(0) && s.n == 0 }
+pub open spec fn next(pre: State, post: State) -> bool { post == advance(pre) }
+pub open spec fn bounded(s: State) -> bool { s.phase <= 1 && s.n == 0 }
+}
+"#,
+        "test_crate",
+        &["--no-verify"],
+    );
+    assert!(ex.report["refusals"].as_array().unwrap().is_empty(), "{}", ex.report);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let run = tlc(&jar, &ex.spec(), &ex.cfg);
+    assert_eq!(run.distinct, 2);
+    assert!(run.violated.is_empty());
+}

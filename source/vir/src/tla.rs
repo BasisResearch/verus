@@ -1038,7 +1038,8 @@ struct Exporter {
     defined_functions: HashMap<Fun, String>,
     // One analysis of a repeated helper application per guard context. Sharing
     // these immutable snapshots also keeps speculative exporter clones cheap.
-    read_calls: Arc<HashMap<(Fun, Vec<String>, Vec<bool>, Vec<String>), Vec<(String, Expr)>>>,
+    read_calls:
+        Arc<HashMap<(Fun, Vec<String>, Vec<bool>, Vec<String>, Vec<String>), Vec<(String, Expr)>>>,
     read_work: usize,
     /// The 0-ary functions standing for the model's constants (see
     /// [`Exporter::close_extras`]), and the operator each is.
@@ -1176,6 +1177,29 @@ fn requirements_and(rs: &[(String, Expr)]) -> String {
         "TRUE".into()
     } else {
         format!("({})", rs.iter().map(|(g, _)| g.as_str()).collect::<Vec<_>>().join(" /\\ "))
+    }
+}
+
+/// Bind only the lexical prefix visible where these requirements arose.
+fn wrap_read_lets(requirements: &mut [(String, Expr)], lets: &[String]) {
+    if !lets.is_empty() {
+        for (guard, _) in requirements {
+            let mut needed = guard.clone();
+            let mut used = Vec::new();
+            for binding in lets.iter().rev() {
+                let (name, value) = binding.split_once(" == ").expect("LET binding");
+                if needed.split(|c: char| !c.is_alphanumeric() && c != '_').any(|word| word == name)
+                {
+                    used.push(binding.clone());
+                    needed.push(' ');
+                    needed.push_str(value);
+                }
+            }
+            if !used.is_empty() {
+                used.reverse();
+                *guard = format!("(LET {} IN {guard})", used.join(" "));
+            }
+        }
     }
 }
 
@@ -1922,7 +1946,30 @@ impl Exporter {
             ExprX::Unary(_, a) | ExprX::UnaryOpr(_, a) => {
                 out.extend(self.read_requirements(a, env, depth + 1))
             }
-            ExprX::Binary(_, a, b) | ExprX::BinaryOpr(_, a, b) | ExprX::Logical(_, a, b) => {
+            ExprX::Logical(op, a, b) => {
+                out.extend(self.read_requirements(a, env, depth + 1));
+                let saved = self.safety_facts.len();
+                let left = self.safety_value(a, env);
+                if *op == LogicalOp::Or {
+                    self.safety_facts.push(format!("~({left})"));
+                } else {
+                    self.add_guard_fact(a, env);
+                }
+                let right = self.read_requirements(b, env, depth + 1);
+                let right: Vec<_> =
+                    right.into_iter().filter(|(g, _)| !self.safety_facts.contains(g)).collect();
+                self.safety_facts.truncate(saved);
+                if !right.is_empty() {
+                    let defined = requirements_and(&right);
+                    let guard = if *op == LogicalOp::Or {
+                        format!("(IF {left} THEN TRUE ELSE {defined})")
+                    } else {
+                        format!("(IF {left} THEN {defined} ELSE TRUE)")
+                    };
+                    out.push((guard, right[0].1.clone()));
+                }
+            }
+            ExprX::Binary(_, a, b) | ExprX::BinaryOpr(_, a, b) => {
                 out.extend(self.read_requirements(a, env, depth + 1));
                 out.extend(self.read_requirements(b, env, depth + 1));
             }
@@ -2032,11 +2079,17 @@ impl Exporter {
                                                 &mut HashSet::new(),
                                             )
                                         });
+                                        // Cached local binders must remain fresh in the
+                                        // receiving scope, including enclosing lazy LETs.
+                                        let mut bound: Vec<_> =
+                                            self.bound.iter().cloned().collect();
+                                        bound.sort();
                                         let key = (
                                             fun.clone(),
                                             arguments.clone(),
                                             primed.clone(),
                                             self.safety_facts.clone(),
+                                            bound,
                                         );
                                         if cacheable && let Some(rs) = self.read_calls.get(&key) {
                                             out.extend(rs.clone());
@@ -2104,6 +2157,79 @@ impl Exporter {
                     ));
                 }
             }
+            ExprX::Match(place, arms, _) => {
+                out.extend(self.place_requirements(place, env, depth + 1));
+                let bound = self.bound.clone();
+                let scrutinee = self.safety_place(place, env);
+                let subject = self.bind("defined_match__");
+                // Reserve outer LET names before analyzing nested matches.
+                let rests: Vec<_> = arms.iter().map(|_| self.bind("defined_rest__")).collect();
+                let mut branches = Vec::new();
+                let mut site = None;
+                for arm in arms.iter() {
+                    let mut scope = env.clone();
+                    let (pattern, bindings) =
+                        self.pattern(&subject, &arm.x.pattern, &mut scope, None, None);
+                    for v in unique_pattern_names(&arm.x.pattern) {
+                        scope.values.remove(&v);
+                        scope.partial_values.remove(&v);
+                        if env.place_reads_post(place) {
+                            scope.primed.insert(v);
+                        } else {
+                            scope.primed.remove(&v);
+                        }
+                    }
+                    let guard = self.safety_value(&arm.x.guard, &scope);
+                    let guard_rs = self.read_requirements(&arm.x.guard, &scope, depth + 1);
+                    let saved = self.safety_facts.len();
+                    if let Some(p) = &pattern {
+                        self.safety_facts.push(p.clone());
+                    }
+                    self.add_guard_fact(&arm.x.guard, &scope);
+                    let body_rs = self.read_requirements(&arm.x.body, &scope, depth + 1);
+                    let body_rs: Vec<_> = body_rs
+                        .into_iter()
+                        .filter(|(g, _)| !self.safety_facts.contains(g))
+                        .collect();
+                    self.safety_facts.truncate(saved);
+                    if site.is_none() {
+                        site = guard_rs.first().or(body_rs.first()).map(|(_, e)| e.clone());
+                    }
+                    branches.push((pattern, bindings, guard, guard_rs, body_rs));
+                }
+                if let Some(site) = site {
+                    let mut tail = "TRUE".to_string();
+                    for ((pattern, bindings, guard, guard_rs, body_rs), rest) in
+                        branches.into_iter().zip(rests).rev()
+                    {
+                        // Share the remaining arms rather than duplicating their
+                        // guards at both the pattern and arm-guard fallback.
+                        let body = requirements_and(&body_rs);
+                        let body = if guard == "TRUE" {
+                            body
+                        } else {
+                            format!(
+                                "({} /\\ (IF {guard} THEN {body} ELSE {rest}))",
+                                requirements_and(&guard_rs)
+                            )
+                        };
+                        let body = if bindings.is_empty() {
+                            body
+                        } else {
+                            let bindings: Vec<_> =
+                                bindings.into_iter().map(|(n, v)| format!("{n} == {v}")).collect();
+                            format!("(LET {} IN {body})", bindings.join(" "))
+                        };
+                        let body = match pattern {
+                            Some(pattern) => format!("(IF {pattern} THEN {body} ELSE {rest})"),
+                            None => body,
+                        };
+                        tail = format!("(LET {rest} == {tail} IN {body})");
+                    }
+                    out.push((format!("(LET {subject} == {scrutinee} IN {tail})"), site));
+                }
+                self.bound = bound;
+            }
             ExprX::Block(stmts, Some(tail)) => {
                 let saved_bound = self.bound.clone();
                 let mut scope = env.clone();
@@ -2124,7 +2250,11 @@ impl Exporter {
                                 .insert(name.clone(), (init.clone(), Arc::new(before)));
                             lets.push(format!("{n} == {value}"));
                         } else {
-                            out.extend(self.place_requirements(init, &scope, depth + 1));
+                            let mut rs = self.place_requirements(init, &scope, depth + 1);
+                            // This initializer precedes the remaining declarations.
+                            // A later LET must not capture names in its guard.
+                            wrap_read_lets(&mut rs, &lets);
+                            out.extend(rs);
                             let primed = scope.place_reads_post(init);
                             let (_, bindings) =
                                 self.pattern(&value, pattern, &mut scope, None, None);
@@ -2139,28 +2269,9 @@ impl Exporter {
                         }
                     }
                 }
-                out.extend(self.read_requirements(tail, &scope, depth + 1));
-                if !lets.is_empty() {
-                    for (guard, _) in &mut out {
-                        let mut needed = guard.clone();
-                        let mut used = Vec::new();
-                        for binding in lets.iter().rev() {
-                            let (name, value) = binding.split_once(" == ").expect("LET binding");
-                            if needed
-                                .split(|c: char| !c.is_alphanumeric() && c != '_')
-                                .any(|word| word == name)
-                            {
-                                used.push(binding.clone());
-                                needed.push(' ');
-                                needed.push_str(value);
-                            }
-                        }
-                        if !used.is_empty() {
-                            used.reverse();
-                            *guard = format!("(LET {} IN {guard})", used.join(" "));
-                        }
-                    }
-                }
+                let mut rs = self.read_requirements(tail, &scope, depth + 1);
+                wrap_read_lets(&mut rs, &lets);
+                out.extend(rs);
                 self.bound = saved_bound;
             }
             _ => {}
@@ -6440,7 +6551,11 @@ impl Exporter {
         let previous = std::mem::replace(&mut self.current, fun_as_friendly_rust_name(fun));
         let previous_key = std::mem::replace(&mut self.current_key, Some(key.clone()));
         let previous_predicate_depth = std::mem::replace(&mut self.predicate_depth, 0);
-        let previous_safety = std::mem::replace(&mut self.in_safety, false);
+        // A condition inside a value helper selects its returned value. Making
+        // that condition FALSE on undefinedness can select an unsafe branch.
+        // The caller guards the helper's complete value, including match arms.
+        let previous_safety =
+            std::mem::replace(&mut self.in_safety, !matches!(&*f.x.ret.x.typ, TypX::Bool));
         let previous_facts = std::mem::replace(
             &mut self.safety_facts,
             if self.in_init { vec![] } else { self.stable_lengths.clone() },
