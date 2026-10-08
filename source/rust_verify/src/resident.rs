@@ -8020,6 +8020,9 @@ mod tests {
                 retain_only: false,
                 max_live_solvers: None,
                 rlimit: 10.0,
+                auto_recommends: true,
+                threaded: true,
+                expansion: None,
             },
         );
         let input = format!("{}\n{{\"command\":\"list\"}}\n", " ".repeat(65537));
