@@ -87,6 +87,14 @@
 //! scores a function by whether everything it rests on verified takes the
 //! closure over those.
 //!
+//! A `check` or `check_many` with `followups` follows a failed body check up
+//! as the batch run does, in the session's own solvers: the expand-errors
+//! chain (with `expand_errors`), rebuilt from the crate for the failing
+//! function's bucket, and the recommends follow-up the session retained. Its
+//! answer's `printed` is what the batch run prints for the function, in the
+//! batch run's order; a session that checks its queries records the same in
+//! each failing function's `initial` (see `followups`).
+//!
 //! `VERUS_RESIDENT_MAX_SOLVERS` caps how many retained solvers run at once,
 //! for modules whose every function is spun off into a bucket and a solver
 //! of its own. An ordinary session's contexts then keep what they send their
@@ -96,8 +104,12 @@
 //! solver is relaunched from its record when a request needs it. Diagnostic
 //! modes, whose readings live in the solver, are not capped.
 
+mod followups;
 mod relevance;
 mod twin;
+
+pub(crate) use followups::ExpansionSource;
+use followups::{Emit, Emitted, PrintOrder};
 
 use crate::buckets::BucketId;
 use crate::commands::{QueryOp, Style};
@@ -163,6 +175,14 @@ pub(crate) struct InitialVerdict {
     assert_id: Option<Vec<u64>>,
     diagnostics: Vec<SourceDiagnostic>,
     elapsed_ms: u128,
+    /// On a failing function's first query: what the invocation printed for
+    /// the function's whole op chain, in the order it printed it (the
+    /// failures of every query of the function, then what its follow-ups
+    /// reported: the expand-errors note, the recommends follow-up), as
+    /// `printed` is for a check with `followups`. Its other queries carry an
+    /// empty list: what they reported is in this one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    printed: Option<Vec<SourceDiagnostic>>,
 }
 
 impl InitialVerdict {
@@ -190,8 +210,15 @@ impl InitialVerdict {
                 .map(|(message, level)| SourceDiagnostic::of(message, level))
                 .collect(),
             elapsed_ms: elapsed.as_millis(),
+            printed: None,
         }
     }
+}
+
+/// What a printed diagnostic reads as on the wire, for the verifier's record
+/// of what an invocation printed (`InitialVerdict::printed`).
+pub(crate) fn printed_diagnostic(message: &MessageX, level: MessageLevel) -> SourceDiagnostic {
+    SourceDiagnostic::of(message, level)
 }
 
 #[derive(Clone, Copy, Serialize)]
@@ -332,6 +359,14 @@ enum Request {
         /// invocation's `--multiple-errors`.
         #[serde(default)]
         multiple_errors: Option<u32>,
+        /// After a failure, run the follow-ups the batch run would, and
+        /// answer `printed` (see `followups`).
+        #[serde(default)]
+        followups: bool,
+        /// With `followups`, the expand-errors chain too, as under
+        /// `--expand-errors`.
+        #[serde(default)]
+        expand_errors: bool,
     },
     /// Check several retained queries, up to `threads` at once: queries of
     /// different buckets run in their own solvers concurrently, queries of
@@ -347,6 +382,10 @@ enum Request {
         multiple_errors: Option<u32>,
         #[serde(default)]
         threads: Option<usize>,
+        #[serde(default)]
+        followups: bool,
+        #[serde(default)]
+        expand_errors: bool,
     },
     /// Probe the query with parts of it switched off (see `air::bisect`).
     Bisect {
@@ -658,6 +697,7 @@ impl RetainedBucket {
         mut spinoffs: Vec<SolverState>,
         symbols: Option<crate::provenance::Symbols>,
         quantifiers: crate::provenance::Quantifiers,
+        mut printed: HashMap<vir::ast::Fun, Vec<SourceDiagnostic>>,
     ) -> Self {
         let mut states = Vec::new();
         // Spinoff queries already own their declaration context. The unused
@@ -694,6 +734,14 @@ impl RetainedBucket {
                     *repeat,
                 ));
                 *repeat += 1;
+                // What the invocation printed for a failing function goes
+                // with its first query, and its others carry none.
+                let mut initial = query.initial.clone();
+                if let Some(initial) = &mut initial {
+                    if let Some(list) = printed.get_mut(&query.context.fun) {
+                        initial.printed = Some(std::mem::take(list));
+                    }
+                }
                 queries.push(QueryDescription {
                     id: QueryId(queries.len()),
                     function,
@@ -708,7 +756,7 @@ impl RetainedBucket {
                     span: query.context.span.as_string.clone(),
                     fingerprint: fingerprints[local].0,
                     reads: fingerprints[local].1.clone(),
-                    initial: query.initial.clone(),
+                    initial,
                 });
                 addresses.push((solver, local));
             }
@@ -1054,6 +1102,14 @@ pub(crate) struct SessionInfo {
     pub(crate) max_live_solvers: Option<usize>,
     /// The invocation's `--rlimit`: what a check runs at without an override.
     pub(crate) rlimit: f32,
+    /// Whether the invocation checks recommends after a failure (no
+    /// `--no-auto-recommends-check`), which a check with `followups` does too.
+    pub(crate) auto_recommends: bool,
+    /// Whether the invocation verifies with threads (`--num-threads` other
+    /// than 1), whose main thread sorts what a function's checks collected.
+    pub(crate) threaded: bool,
+    /// What rebuilds a bucket's context for the expand-errors chain.
+    pub(crate) expansion: Option<std::sync::Arc<ExpansionSource>>,
 }
 
 #[derive(Serialize)]
@@ -1079,6 +1135,9 @@ enum Response<'a> {
         /// `--rlimit` and `--multiple-errors`.
         rlimit: f32,
         multiple_errors: u32,
+        /// Whether `check` and `check_many` take `followups` and
+        /// `expand_errors`.
+        followups: bool,
         input_files: &'a [String],
         buckets: &'a [BucketDescription],
     },
@@ -1126,6 +1185,13 @@ enum Response<'a> {
         inst_graph_error: Option<String>,
         /// The rlimit the check ran at.
         rlimit: f32,
+        /// With `followups`, for a failure: what the batch run prints for the
+        /// check and the follow-ups it ran, in the batch run's order.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        printed: Option<Vec<SourceDiagnostic>>,
+        /// With `followups`, for a failure: the follow-ups run.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        followups: Option<FollowupReport>,
     },
     InstGraph {
         session: &'a str,
@@ -2342,7 +2408,7 @@ impl From<MessageLevel> for DiagnosticLevel {
 }
 
 #[derive(Clone, Serialize)]
-struct SourceDiagnostic {
+pub(crate) struct SourceDiagnostic {
     level: DiagnosticLevel,
     message: String,
     spans: Vec<String>,
@@ -2350,6 +2416,12 @@ struct SourceDiagnostic {
     /// The help line the batch run prints under the diagnostic.
     #[serde(skip_serializing_if = "Option::is_none")]
     help: Option<String>,
+    /// Text the batch run prints right after the diagnostic as
+    /// `note: {fancy_note}`, out of band rather than through rustc's emitter
+    /// (`verifier::Reporter::report_as`), so never deduplicated with it: the
+    /// expand-errors tree of a `diagnostics via expansion` note.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fancy_note: Option<String>,
 }
 
 impl SourceDiagnostic {
@@ -2359,13 +2431,20 @@ impl SourceDiagnostic {
     /// `note: ...`, and a primary span that contains another primary span
     /// gives way to it.
     fn of(message: &MessageX, level: MessageLevel) -> Self {
-        let mut spans: Vec<String> =
-            message.spans.iter().map(|span| span.as_string.clone()).collect();
+        let mut spans: Vec<(Option<(u32, u32)>, String)> = message
+            .spans
+            .iter()
+            .map(|span| (followups::raw_span_key(span), span.as_string.clone()))
+            .collect();
         while let Some(i) =
-            spans.iter().position(|a| spans.iter().any(|b| a != b && span_contains(a, b)))
+            spans.iter().position(|(_, a)| spans.iter().any(|(_, b)| a != b && span_contains(a, b)))
         {
             spans.remove(i);
         }
+        // `MultiSpan::from_spans` sorts them, so the first, which rustc
+        // prints the location of, is the earliest in the source map.
+        spans.sort_by_key(|(key, _)| *key);
+        let spans: Vec<String> = spans.into_iter().map(|(_, span)| span).collect();
         let custom = message.labels.iter().find(|label| label.is_custom_err);
         let text = match (level, custom) {
             (MessageLevel::Error, Some(label)) => label.note.clone(),
@@ -2389,6 +2468,7 @@ impl SourceDiagnostic {
                 })
                 .collect(),
             help: message.help.clone(),
+            fancy_note: message.fancy_note.clone(),
         }
     }
 }
@@ -2421,27 +2501,62 @@ struct SourceLabel {
     span: String,
 }
 
+/// What a check reported, in the order it reported it, and how the batch run
+/// would have handed each diagnostic to its reporter (see `followups`).
 #[derive(Default)]
-struct QueryDiagnostics(RefCell<Vec<SourceDiagnostic>>);
+struct QueryDiagnostics(RefCell<Vec<SourceDiagnostic>>, RefCell<Vec<Emitted>>);
 
 impl QueryDiagnostics {
+    fn push(&self, diagnostic: SourceDiagnostic, emit: Emit) {
+        let mut diagnostics = self.0.borrow_mut();
+        self.1.borrow_mut().push(Emitted::Diagnostic(diagnostics.len(), emit));
+        diagnostics.push(diagnostic);
+    }
+
+    /// A diagnostic the batch run reports as it comes.
     fn record(&self, message: &ArcDynMessage, level: MessageLevel) {
         let message = message.downcast_ref::<MessageX>().expect("VIR diagnostic message");
-        self.0.borrow_mut().push(SourceDiagnostic::of(message, level));
+        self.push(SourceDiagnostic::of(message, level), Emit::Now);
+    }
+
+    /// A failure with a model, which the batch run keeps until the
+    /// function's op chain flushes.
+    fn record_collected(&self, message: &ArcDynMessage, level: MessageLevel) {
+        let message = message.downcast_ref::<MessageX>().expect("VIR diagnostic message");
+        self.push(
+            SourceDiagnostic::of(message, level),
+            Emit::Collect(followups::sort_key(message)),
+        );
     }
 
     /// A diagnostic about the query as a whole rather than about one assertion
     /// the solver named: no labels, and the query's own span.
     fn bare(&self, level: DiagnosticLevel, message: String, span: &str) {
-        self.0.borrow_mut().push(SourceDiagnostic {
-            level,
-            message,
-            spans: vec![span.to_owned()],
-            labels: Vec::new(),
-            help: None,
-        });
+        self.push(
+            SourceDiagnostic {
+                level,
+                message,
+                spans: vec![span.to_owned()],
+                labels: Vec::new(),
+                help: None,
+                fancy_note: None,
+            },
+            Emit::Now,
+        );
+    }
+
+    /// A solver call that ran this long: the batch run's long-running hook
+    /// has flushed what the op chain collected by now.
+    fn ran_for(&self, elapsed: std::time::Duration) {
+        if elapsed >= LONG_RUNNING {
+            self.1.borrow_mut().push(Emitted::Flush);
+        }
     }
 }
+
+/// When the batch run's long-running hook first fires during a solver call
+/// (`verifier::check_result_validity`'s `report_long_running`).
+const LONG_RUNNING: std::time::Duration = std::time::Duration::from_secs(2);
 
 impl Diagnostics for QueryDiagnostics {
     fn report(&self, message: &ArcDynMessage) {
@@ -5683,6 +5798,7 @@ impl Server {
                 retain_only: self.info.retain_only,
                 rlimit: self.info.rlimit,
                 multiple_errors: self.info.multiple_errors,
+                followups: true,
                 input_files: &self.info.input_files,
                 buckets: &buckets,
             },
@@ -6231,6 +6347,8 @@ impl Server {
                     query: id,
                     rlimit: rlimit_override,
                     multiple_errors: errors_override,
+                    followups,
+                    expand_errors,
                     ..
                 } => {
                     let multiple_errors = errors_override.unwrap_or(multiple_errors);
@@ -6248,7 +6366,14 @@ impl Server {
                         continue;
                     }
                     let pinned_rung = self.pins.get(&(bucket_id.0, id.0)).copied();
-                    let answer = match check_query(
+                    let settings = FollowupSettings {
+                        followups,
+                        expand_errors,
+                        recommends: self.info.auto_recommends,
+                        sort: self.info.threaded,
+                        expansion: self.info.expansion.as_deref(),
+                    };
+                    let answer = match check_with_followups(
                         bucket,
                         id,
                         pinned_rung,
@@ -6256,6 +6381,7 @@ impl Server {
                         rlimit_override,
                         multiple_errors,
                         &set_rlimit,
+                        &settings,
                     ) {
                         Ok(answer) => answer,
                         Err(error) => return fatal(&mut output, error),
@@ -6267,6 +6393,8 @@ impl Server {
                     rlimit: rlimit_override,
                     multiple_errors: errors_override,
                     threads,
+                    followups,
+                    expand_errors,
                     ..
                 } => {
                     if queries.iter().any(|(b, q)| {
@@ -6289,6 +6417,13 @@ impl Server {
                     let cert_dir = cert_dir.as_deref();
                     let set_rlimit = &set_rlimit;
                     let queries = &queries;
+                    let settings = &FollowupSettings {
+                        followups,
+                        expand_errors,
+                        recommends: self.info.auto_recommends,
+                        sort: self.info.threaded,
+                        expansion: self.info.expansion.as_deref(),
+                    };
                     let mut fatal_error: Option<io::Error> = None;
                     std::thread::scope(|scope| {
                         let (sender, answers) = std::sync::mpsc::channel();
@@ -6302,7 +6437,7 @@ impl Server {
                                     }
                                     let i = next.fetch_add(1, Ordering::SeqCst);
                                     let Some(&(b, q)) = queries.get(i) else { break };
-                                    let answer = check_query(
+                                    let answer = check_with_followups(
                                         &buckets[b.0],
                                         q,
                                         pins.get(&(b.0, q.0)).copied(),
@@ -6310,6 +6445,7 @@ impl Server {
                                         rlimit_override,
                                         multiple_errors,
                                         set_rlimit,
+                                        settings,
                                     );
                                     if answer.is_err() {
                                         failed.store(true, Ordering::SeqCst);
@@ -6471,6 +6607,46 @@ struct CheckAnswer {
     inst_graph_error: Option<String>,
     rlimit: f32,
     kept_graph: Option<Option<InstantiationGraph>>,
+    /// How the batch run would have handed each diagnostic to its reporter.
+    emitted: Vec<Emitted>,
+    /// Whether some round ran out of its budget.
+    timed_out: bool,
+    /// The assertions the default prover named as failed, round by round.
+    failed_assert_ids: Vec<Vec<u64>>,
+    /// With `followups`: what the batch run prints for the check and its
+    /// follow-ups, in its order (see `followups`).
+    printed: Option<Vec<SourceDiagnostic>>,
+    followups: Option<FollowupReport>,
+}
+
+/// The follow-ups a check with `followups` ran after its failure.
+#[derive(Serialize, Default)]
+struct FollowupReport {
+    /// The recommends follow-up queries checked, in catalogue order.
+    recommends: Vec<FollowupCheck>,
+    /// The expand-errors chain, under `expand_errors`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    expanded: Option<ExpandedReport>,
+    /// Why the expand-errors chain the batch run would run could not be run
+    /// here; `printed` is then absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    expand_error: Option<String>,
+}
+
+#[derive(Serialize)]
+struct FollowupCheck {
+    query: QueryId,
+    result: QueryResult,
+    elapsed_ms: u128,
+}
+
+#[derive(Serialize)]
+struct ExpandedReport {
+    /// Expanded queries checked.
+    queries: usize,
+    /// Time spent rebuilding the bucket's context and lowering its ops.
+    rebuild_ms: u128,
+    elapsed_ms: u128,
 }
 
 /// Check one retained query in its solver, as a `check` request does: the
@@ -6626,12 +6802,17 @@ fn check_query(
     }
     let mut outcome = match certified {
         Some(outcome) => outcome,
-        None => air.check_valid(
-            &VirMessageInterface {},
-            &diagnostics,
-            &query.query,
-            QueryContext::default(),
-        ),
+        None => {
+            let started = Instant::now();
+            let outcome = air.check_valid(
+                &VirMessageInterface {},
+                &diagnostics,
+                &query.query,
+                QueryContext::default(),
+            );
+            diagnostics.ran_for(started.elapsed());
+            outcome
+        }
     };
     // The response describes round zero. Later error searches
     // replace AIR's provenance, even when their verdict differs.
@@ -6676,6 +6857,9 @@ fn check_query(
     let mut only_check_earlier = false;
     let mut verdict = None;
     let mut assert_id = None;
+    let mut timed_out = false;
+    let mut failed_assert_ids = Vec::new();
+    let default_prover = query.prover == vir::def::ProverChoice::DefaultProver;
     loop {
         match outcome {
             ValidityResult::Valid(_) => {
@@ -6698,6 +6882,7 @@ fn check_query(
                     &query.context.span.as_string,
                 );
                 verdict.get_or_insert(QueryResult::ResourceLimit);
+                timed_out = true;
                 break;
             }
             // A failure the solver gave no model for cannot be
@@ -6706,6 +6891,9 @@ fn check_query(
             // where `check_result_validity` stops.
             ValidityResult::Invalid(None, error, id)
             | ValidityResult::Invalid(_, error @ None, id) => {
+                if let (Some(id), true) = (&id, default_prover) {
+                    failed_assert_ids.push((**id).clone());
+                }
                 match error {
                     Some(error) => diagnostics.record(&error, level),
                     // Nothing came back to describe the
@@ -6724,8 +6912,12 @@ fn check_query(
                 break;
             }
             ValidityResult::Invalid(_, error, id) => {
+                if let (Some(id), true) = (&id, default_prover) {
+                    failed_assert_ids.push((**id).clone());
+                }
+                // A failure with a model: the batch run collects it.
                 if let Some(error) = error {
-                    diagnostics.record(&error, level);
+                    diagnostics.record_collected(&error, level);
                 }
                 // Later rounds only add diagnostics: the
                 // verdict and the reported assertion stay
@@ -6741,11 +6933,13 @@ fn check_query(
                     checks_remaining -= 1;
                     only_check_earlier = checks_remaining == 0;
                 }
+                let started = Instant::now();
                 outcome = air.check_valid_again(
                     &diagnostics,
                     only_check_earlier,
                     QueryContext::default(),
                 );
+                diagnostics.ran_for(started.elapsed());
                 drop(air.take_provenance());
                 drop(air.take_matching_loops());
                 drop(air.take_difficulty());
@@ -6865,11 +7059,17 @@ fn check_query(
         }
     }
     air.finish_query();
+    let QueryDiagnostics(diagnostics, emitted) = diagnostics;
     Ok(CheckAnswer {
         solver,
         result,
         assert_id,
-        diagnostics: diagnostics.0.into_inner(),
+        diagnostics: diagnostics.into_inner(),
+        emitted: emitted.into_inner(),
+        timed_out,
+        failed_assert_ids,
+        printed: None,
+        followups: None,
         elapsed_ms: start.elapsed().as_millis(),
         restore_ms,
         provenance,
@@ -6883,6 +7083,257 @@ fn check_query(
         rlimit: budget,
         kept_graph,
     })
+}
+
+/// How a check with `followups` follows a failure up (see `followups`).
+struct FollowupSettings<'a> {
+    /// The request asked for the batch run's follow-ups.
+    followups: bool,
+    /// The request asked for the expand-errors chain too.
+    expand_errors: bool,
+    /// The invocation checks recommends after a failure
+    /// (no `--no-auto-recommends-check`).
+    recommends: bool,
+    /// The invocation verifies with threads: its main thread sorts what a
+    /// function collected.
+    sort: bool,
+    expansion: Option<&'a ExpansionSource>,
+}
+
+/// Check a query as `check_query` does and, with `followups`, follow a failed
+/// body check up as the batch run does: the expand-errors chain (under
+/// `expand_errors`) and the recommends follow-up, answering `printed`, what
+/// the batch run prints for all of it in its order. A failure of any other
+/// query gets `printed` too, its own diagnostics in that order.
+fn check_with_followups(
+    bucket: &RetainedBucket,
+    id: QueryId,
+    pinned_rung: Option<Pin>,
+    cert_dir: Option<&std::path::Path>,
+    rlimit_override: Option<f32>,
+    multiple_errors: u32,
+    set_rlimit: &impl Fn(&mut Context, f32),
+    settings: &FollowupSettings<'_>,
+) -> io::Result<CheckAnswer> {
+    let mut answer = check_query(
+        bucket,
+        id,
+        pinned_rung,
+        cert_dir,
+        rlimit_override,
+        multiple_errors,
+        set_rlimit,
+    )?;
+    if !settings.followups || matches!(answer.result, QueryResult::Valid) {
+        return Ok(answer);
+    }
+    let mut order = PrintOrder::new(settings.sort);
+    order.replay(&answer.diagnostics, &answer.emitted);
+    let (solver, local) = bucket.addresses[id.0];
+    let (kind, level, fun, prefix, body) = {
+        let state =
+            bucket.state.lock().map_err(|_| io::Error::other("resident bucket poisoned"))?;
+        let query = &state[solver].journal.queries[local];
+        (
+            query.kind,
+            query.level,
+            query.context.fun.clone(),
+            query.prefix,
+            followups::query_text(&query.query),
+        )
+    };
+    let mut report = FollowupReport::default();
+    // The batch run follows up a body check whose first round failed
+    // (`any_invalid`), reported as an error.
+    if matches!(kind, QueryKind::Body) && level == MessageLevel::Error {
+        let recommends = settings.recommends && !answer.timed_out;
+        let expand_from =
+            answer.failed_assert_ids.first().cloned().filter(|_| settings.expand_errors);
+        if let Some(assert_id) = expand_from {
+            // Starting the chain flushes what the function collected.
+            order.flush();
+            let Some(source) = settings.expansion else {
+                report.expand_error = Some("this session cannot rebuild its buckets".to_owned());
+                answer.followups = Some(report);
+                return Ok(answer);
+            };
+            let started = Instant::now();
+            let mut first_check = None;
+            let budget = answer.rlimit;
+            let expansion =
+                source.expand(&bucket.id, &fun, &body, std::sync::Arc::new(assert_id), |cmds| {
+                    first_check.get_or_insert_with(Instant::now);
+                    check_expanded(
+                        bucket,
+                        solver,
+                        prefix,
+                        cmds,
+                        budget,
+                        multiple_errors,
+                        set_rlimit,
+                        &mut order,
+                    )
+                });
+            match expansion {
+                Ok(expansion) => {
+                    if let Some(note) = &expansion.note {
+                        let note = note.downcast_ref::<MessageX>().expect("VIR diagnostic message");
+                        order.now(SourceDiagnostic::of(note, note.level));
+                    }
+                    let rebuild = first_check.unwrap_or_else(Instant::now) - started;
+                    report.expanded = Some(ExpandedReport {
+                        queries: expansion.queries,
+                        rebuild_ms: rebuild.as_millis(),
+                        elapsed_ms: started.elapsed().as_millis(),
+                    });
+                }
+                Err(reason) => {
+                    report.expand_error = Some(reason);
+                    answer.followups = Some(report);
+                    return Ok(answer);
+                }
+            }
+        }
+        if recommends {
+            // The function's recommends follow-ups, which a session retains
+            // whether or not its own checks called for them.
+            let followups: Vec<QueryId> = {
+                let state = bucket
+                    .state
+                    .lock()
+                    .map_err(|_| io::Error::other("resident bucket poisoned"))?;
+                (0..bucket.queries.len())
+                    .filter(|&q| {
+                        let (s, l) = bucket.addresses[q];
+                        let query = &state[s].journal.queries[l];
+                        matches!(query.kind, QueryKind::RecommendsFollowup)
+                            && query.context.fun == fun
+                    })
+                    .map(QueryId)
+                    .collect()
+            };
+            for followup in followups {
+                let checked = check_query(
+                    bucket,
+                    followup,
+                    None,
+                    cert_dir,
+                    rlimit_override,
+                    multiple_errors,
+                    set_rlimit,
+                )?;
+                order.replay(&checked.diagnostics, &checked.emitted);
+                report.recommends.push(FollowupCheck {
+                    query: followup,
+                    result: checked.result,
+                    elapsed_ms: checked.elapsed_ms,
+                });
+            }
+        }
+    }
+    // As the batch run words an rlimit-out, which a session's own diagnostic
+    // leaves without the `--profile` hint (see `check_query`).
+    let mut printed = order.finish();
+    for diagnostic in &mut printed {
+        if diagnostic.message.ends_with(": Resource limit (rlimit) exceeded") {
+            diagnostic.message.push_str("; consider rerunning with --profile for more details");
+        }
+    }
+    answer.printed = Some(printed);
+    answer.followups = Some(report);
+    Ok(answer)
+}
+
+/// Check one expanded query's commands in the body's solver at the body's
+/// prefix, as the batch run checks a `Style::Expanded` query
+/// (`check_result_validity` with `expand_flag`): a failure with a model is
+/// not reported, an rlimit-out or a failure without one is, as a note; a
+/// failure looks for further errors as `--multiple-errors` asks, unreported.
+/// Says whether it failed and whether it ran out of budget.
+#[allow(clippy::too_many_arguments)]
+fn check_expanded(
+    bucket: &RetainedBucket,
+    solver: usize,
+    prefix: usize,
+    cmds: &vir::def::CommandsWithContext,
+    budget: f32,
+    multiple_errors: u32,
+    set_rlimit: &impl Fn(&mut Context, f32),
+    order: &mut PrintOrder,
+) -> io::Result<(bool, bool)> {
+    let mut state =
+        bucket.state.lock().map_err(|_| io::Error::other("resident bucket poisoned"))?;
+    let SolverState { air, journal } = &mut state[solver];
+    journal.restore_prefix(air, prefix)?;
+    set_rlimit(air, budget);
+    let level = QueryOp::Body(Style::Expanded).message_level();
+    let (mut invalid, mut timed_out) = (false, false);
+    for command in cmds.commands.iter() {
+        let CommandX::CheckValid(query) = &**command else {
+            return Err(io::Error::other("an expanded query batch with a declaration"));
+        };
+        let diagnostics = QueryDiagnostics::default();
+        let mut outcome =
+            air.check_valid(&VirMessageInterface {}, &diagnostics, query, QueryContext::default());
+        let mut checks_remaining = multiple_errors;
+        let mut only_check_earlier = false;
+        loop {
+            match outcome {
+                ValidityResult::Valid(_) => break,
+                ValidityResult::Canceled => {
+                    invalid = true;
+                    timed_out = true;
+                    diagnostics.bare(
+                        level.into(),
+                        format!("{}: Resource limit (rlimit) exceeded", cmds.context.desc),
+                        &cmds.context.span.as_string,
+                    );
+                    break;
+                }
+                ValidityResult::Invalid(None, error, _)
+                | ValidityResult::Invalid(_, error @ None, _) => {
+                    invalid = true;
+                    match error {
+                        Some(error) => diagnostics.record(&error, level),
+                        None => diagnostics.bare(
+                            level.into(),
+                            cmds.context.desc.clone(),
+                            &cmds.context.span.as_string,
+                        ),
+                    }
+                    break;
+                }
+                ValidityResult::Invalid(..) => {
+                    invalid = true;
+                    if multiple_errors == 0 {
+                        break;
+                    }
+                    if !only_check_earlier {
+                        checks_remaining -= 1;
+                        only_check_earlier = checks_remaining == 0;
+                    }
+                    outcome = air.check_valid_again(
+                        &diagnostics,
+                        only_check_earlier,
+                        QueryContext::default(),
+                    );
+                }
+                ValidityResult::TypeError(error) => {
+                    return Err(io::Error::other(error.to_string()));
+                }
+                ValidityResult::UnexpectedOutput(error) => return Err(io::Error::other(error)),
+            }
+        }
+        drop(air.take_provenance());
+        drop(air.take_unknown_reason());
+        drop(air.take_matching_loops());
+        drop(air.take_difficulty());
+        drop(air.take_inst_pressure());
+        air.finish_query();
+        let QueryDiagnostics(diagnostics, emitted) = diagnostics;
+        order.replay(&diagnostics.into_inner(), &emitted.into_inner());
+    }
+    Ok((invalid, timed_out))
 }
 
 /// Whether a `check` or `check_many` rlimit override can be run at: a
@@ -6982,6 +7433,8 @@ fn send_answer(
             inst_graph: answer.inst_graph,
             inst_graph_error: answer.inst_graph_error,
             rlimit: answer.rlimit,
+            printed: answer.printed,
+            followups: answer.followups,
         },
     )
 }

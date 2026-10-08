@@ -267,6 +267,102 @@ impl Diagnostics for Reporter<'_> {
     }
 }
 
+/// A reporter that also keeps what one function's op chain reports, in a
+/// resident invocation that checks its queries, in the order the run prints
+/// it: what is reported at once in turn, and a group reported together
+/// (`report_as_multi`, the chain's collected failures) sorted by first span
+/// when the run has threads, as `QueuedReporter`'s main thread sorts it. A
+/// session hands it to its caller as the failing function's `printed`
+/// (`resident::InitialVerdict`), which the caller prints instead of the
+/// function's per-query diagnostics.
+struct PrintTee<'r, R> {
+    inner: &'r R,
+    sort: bool,
+    kept: Option<std::cell::RefCell<Vec<(Message, MessageLevel)>>>,
+}
+
+impl<'r, R: Diagnostics> PrintTee<'r, R> {
+    fn new(inner: &'r R, sort: bool, keep: bool) -> Self {
+        PrintTee { inner, sort, kept: keep.then(|| std::cell::RefCell::new(Vec::new())) }
+    }
+
+    fn keep(&self, msg: &ArcDynMessage, level: Option<MessageLevel>) {
+        if let Some(kept) = &self.kept {
+            let msg: Message =
+                msg.clone().downcast().expect("unexpected value in Any -> Message conversion");
+            let level = level.unwrap_or(msg.level);
+            kept.borrow_mut().push((msg, level));
+        }
+    }
+
+    fn take(&self) -> Vec<crate::resident::SourceDiagnostic> {
+        self.kept
+            .as_ref()
+            .map(|kept| {
+                kept.borrow_mut()
+                    .drain(..)
+                    .map(|(msg, level)| crate::resident::printed_diagnostic(&msg, level))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+}
+
+impl<R: Diagnostics> air::messages::Diagnostics for PrintTee<'_, R> {
+    fn report(&self, msg: &ArcDynMessage) {
+        self.keep(msg, None);
+        self.inner.report(msg);
+    }
+
+    fn report_now(&self, msg: &ArcDynMessage) {
+        self.keep(msg, None);
+        self.inner.report_now(msg);
+    }
+
+    fn report_as(&self, msg: &ArcDynMessage, level: MessageLevel) {
+        self.keep(msg, Some(level));
+        self.inner.report_as(msg, level);
+    }
+
+    fn report_as_multi(&self, msgs: Vec<(ArcDynMessage, MessageLevel)>) {
+        if self.kept.is_some() {
+            let mut sorted: Vec<&(ArcDynMessage, MessageLevel)> = msgs.iter().collect();
+            if self.sort {
+                // `SpanData` order, which is `Span` order, without the
+                // session globals this thread does not have.
+                sorted.sort_by_key(|(msg, _)| {
+                    let msg: &MessageX = msg.downcast_ref().expect("VIR message");
+                    msg.spans.first().and_then(|span| {
+                        let raw = &(*span.raw_span) as &(dyn std::any::Any + Send + Sync);
+                        raw.downcast_ref::<rustc_span::SpanData>().map(|d| (d.lo, d.hi))
+                    })
+                });
+            }
+            for (msg, level) in sorted {
+                self.keep(msg, Some(*level));
+            }
+        }
+        self.inner.report_as_multi(msgs);
+    }
+
+    fn report_as_now(&self, msg: &ArcDynMessage, level: MessageLevel) {
+        self.keep(msg, Some(level));
+        self.inner.report_as_now(msg, level);
+    }
+}
+
+impl<R: Diagnostics> Diagnostics for PrintTee<'_, R> {
+    fn use_progress_bars(&self) -> bool {
+        self.inner.use_progress_bars()
+    }
+    fn add_progress_bar(&self, ctx: CommandContext) {
+        self.inner.add_progress_bar(ctx)
+    }
+    fn complete_progress_bar(&self, ctx: CommandContext) {
+        self.inner.complete_progress_bar(ctx)
+    }
+}
+
 /// A reporter message that is being collected by the main thread
 pub(crate) enum ReporterMessage {
     ReportLongRunning(CommandContext),
@@ -376,6 +472,9 @@ pub struct Verifier {
     resident_buckets: Vec<crate::resident::RetainedBucket>,
     resident_prepared: bool,
     resident_inputs: Vec<String>,
+    /// What a resident session rebuilds a bucket's context from for the
+    /// expand-errors chain of a check it answers (`resident::followups`).
+    resident_expansion: Option<Arc<crate::resident::ExpansionSource>>,
     /// A retain-only session already serving while the compilation goes on
     /// (`serve_resident_early`), and where to send how it ended. Only the
     /// main thread touches it, after the driver returns.
@@ -708,6 +807,7 @@ impl Verifier {
             resident_buckets: Vec::new(),
             resident_prepared: false,
             resident_inputs: Vec::new(),
+            resident_expansion: None,
             resident_early: None,
             resident_retain_only,
             resident_max_solvers,
@@ -773,6 +873,7 @@ impl Verifier {
             resident_buckets: Vec::new(),
             resident_prepared: false,
             resident_inputs: Vec::new(),
+            resident_expansion: None,
             resident_early: None,
             resident_retain_only: self.resident_retain_only,
             resident_max_solvers: self.resident_max_solvers,
@@ -943,6 +1044,9 @@ impl Verifier {
                 .resident_max_solvers
                 .filter(|_| self.resident_max_solvers_apply()),
             rlimit: self.args.rlimit,
+            auto_recommends: !self.args.no_auto_recommends_check,
+            threaded: self.args.num_threads != 1,
+            expansion: self.resident_expansion.clone(),
         }
     }
 
@@ -2259,10 +2363,18 @@ impl Verifier {
             );
         }
         let mut resident_spinoffs = Vec::new();
+        // What each failing function's op chain printed, for the session.
+        let mut resident_printed: HashMap<Fun, Vec<crate::resident::SourceDiagnostic>> =
+            HashMap::new();
+        let keep_printed = self.args.resident && !self.resident_retain_only;
 
         let bucket = self.get_bucket(bucket_id);
         let mut opgen = OpGenerator::new(ctx, krate, bucket.clone());
         while let Some(mut function_opgen) = opgen.next()? {
+            let tee = PrintTee::new(reporter, self.args.num_threads != 1, keep_printed);
+            let reporter = &tee;
+            // The functions whose checks failed in this op chain, in order.
+            let mut failed_funs: Vec<Fun> = Vec::new();
             let diagnostics_to_report: std::cell::RefCell<
                 Option<PanicOnDropVec<(Message, MessageLevel)>>,
             > = std::cell::RefCell::new(Some(PanicOnDropVec::new(Vec::new())));
@@ -2674,6 +2786,14 @@ impl Verifier {
                             }
                         }
 
+                        if any_invalid
+                            && level == MessageLevel::Error
+                            && includes_function
+                            && !failed_funs.contains(&function.x.name)
+                        {
+                            failed_funs.push(function.x.name.clone());
+                        }
+
                         // collect the smt run time from this command into the function duration
                         if commands_with_context_list.len() != 0 {
                             let func_time =
@@ -2766,6 +2886,13 @@ impl Verifier {
                     }
                 }
             }
+            let printed = tee.take();
+            if let Some((first, rest)) = failed_funs.split_first() {
+                resident_printed.insert(first.clone(), printed);
+                for fun in rest {
+                    resident_printed.insert(fun.clone(), Vec::new());
+                }
+            }
         }
         // if spinning off all, the regular profile loop inside has already profiled everything
         if let (Some(profile_all_file_name), false) = (profile_all_file_name, self.args.spinoff_all)
@@ -2841,6 +2968,7 @@ impl Verifier {
                         .with_sst_function_spans(&krate.functions),
                 ),
                 crate::provenance::Quantifiers::capture(&ctx.global),
+                resident_printed,
             ));
         }
 
@@ -3046,6 +3174,21 @@ impl Verifier {
         let buckets = user_filter.filter_buckets(buckets);
         let bucket_ids: Vec<BucketId> = buckets.iter().map(|p| p.0.clone()).collect();
         self.buckets = buckets.into_iter().collect();
+        if self.args.resident {
+            self.resident_expansion = Some(Arc::new(crate::resident::ExpansionSource {
+                krate: krate.clone(),
+                crate_id: self.crate_id.clone().expect("crate_id"),
+                global: std::sync::Mutex::new(
+                    global_ctx.from_self_with_log(Arc::new(std::sync::Mutex::new(None))),
+                ),
+                buckets: self
+                    .buckets
+                    .iter()
+                    .map(|(id, bucket)| (id.clone(), bucket.funs.clone()))
+                    .collect(),
+                error_format: self.error_format,
+            }));
+        }
 
         let time_verify_sequential_end = Instant::now();
         self.time_verify_crate_sequential =

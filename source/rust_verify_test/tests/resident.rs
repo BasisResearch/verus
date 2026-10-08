@@ -5403,3 +5403,170 @@ fn resident_check_many_checks_queries_concurrently() {
     assert_eq!(worker.send(json!({"command": "close", "session": session}))["event"], "closed");
     worker.finish(false);
 }
+
+const FOLLOWUP_SOURCE: &str = r#"
+use vstd::prelude::*;
+verus! {
+    spec fn p(x: int) -> bool { x > 3 && x < 100 }
+
+    spec fn r(x: int) -> bool
+        recommends x > 0,
+    {
+        x > 5
+    }
+
+    proof fn passes(x: int)
+        requires x > 5, x < 50,
+        ensures p(x),
+    {
+    }
+
+    proof fn fails_assert(x: int)
+        requires x > 1,
+    {
+        assert(p(x));
+    }
+
+    proof fn fails_post(x: int, y: int)
+        requires x > 0,
+        ensures x + y > 0 && p(x),
+    {
+    }
+
+    proof fn uses_r(x: int) {
+        assert(r(x));
+    }
+
+    proof fn many(x: int) {
+        assert(x > 1);
+        assert(x > 2);
+        assert(x > 3);
+    }
+
+    uninterp spec fn a(i: int) -> int;
+
+    #[verifier::rlimit(0.01)]
+    proof fn looping()
+        requires forall|i: int| #[trigger] a(i) < a(i + 1),
+        ensures a(0) > 100,
+    {
+    }
+}
+"#;
+
+/// What a session printed per failing function, by function name, with the
+/// fixture's directory taken out of its spans.
+fn printed_by_function<E: Endpoint>(
+    worker: &Worker<E>,
+    printed: impl Iterator<Item = (String, Value)>,
+) -> std::collections::BTreeMap<String, String> {
+    let dir = format!("{}/", worker.dir.path().display());
+    printed.map(|(function, printed)| (function, printed.to_string().replace(&dir, ""))).collect()
+}
+
+/// A check with `followups` follows a failed body check up as the batch run
+/// does, and answers what that run prints for the function in its order: the
+/// failures (sorted by span with threads, the `not all errors` note first),
+/// then under `expand_errors` the expand-errors chain's note and its tree,
+/// then the recommends follow-up. A session that checks its queries records
+/// the same off its own reporter, so the two are compared function by
+/// function, with and without expansion and with one thread.
+#[test]
+fn resident_followups_print_what_the_batch_run_prints() {
+    for (options, expand) in [
+        (&["--multiple-errors", "2"][..], true),
+        (&["--multiple-errors", "2"][..], false),
+        (&["--multiple-errors", "2", "--num-threads", "1"][..], true),
+    ] {
+        let mut open_options = options.to_vec();
+        if expand {
+            open_options.push("--expand-errors");
+        }
+        let mut opened = Worker::start(FOLLOWUP_SOURCE, &open_options);
+        let ready = opened.receive();
+        let from_open = printed_by_function(
+            &opened,
+            ready["buckets"].as_array().unwrap().iter().flat_map(|bucket| {
+                bucket["queries"].as_array().unwrap().iter().filter_map(|query| {
+                    let printed = query["initial"].get("printed")?;
+                    (query["kind"] == "body")
+                        .then(|| (query["function"].to_string(), printed.clone()))
+                })
+            }),
+        );
+        opened.send(json!({"command": "close", "session": ready["session"]}));
+        opened.finish(false);
+
+        let mut retained = Worker::start_with_env(
+            FOLLOWUP_SOURCE,
+            options,
+            &[("VERUS_RESIDENT_RETAIN_ONLY", "1")],
+        );
+        let ready = retained.receive();
+        assert_eq!(ready["followups"], true, "{ready}");
+        let session = ready["session"].clone();
+        let mut bodies = Vec::new();
+        for bucket in ready["buckets"].as_array().unwrap() {
+            for query in bucket["queries"].as_array().unwrap() {
+                if query["kind"] == "body" {
+                    bodies
+                        .push((json!([bucket["id"], query["id"]]), query["function"].to_string()));
+                }
+            }
+        }
+        let addresses: Vec<Value> = bodies.iter().map(|(address, _)| address.clone()).collect();
+        retained.raw(&format!(
+            "{}\n",
+            json!({"command": "check_many", "session": session, "queries": addresses,
+                "threads": 2, "followups": true, "expand_errors": expand})
+        ));
+        let mut answers = Vec::new();
+        loop {
+            let reply = retained.receive();
+            if reply["event"] == "checked_many" {
+                break;
+            }
+            answers.push(reply);
+        }
+        let function_of = |answer: &Value| {
+            let address = json!([answer["bucket"], answer["query"]]);
+            bodies.iter().find(|(a, _)| *a == address).unwrap().1.clone()
+        };
+        for answer in &answers {
+            assert_eq!(answer["printed"].is_array(), answer["result"] != "valid", "{answer}");
+        }
+        let fails_assert = answers
+            .iter()
+            .find(|answer| function_of(answer).ends_with("::fails_assert\""))
+            .unwrap();
+        let followups = &fails_assert["followups"];
+        assert_eq!(followups["recommends"].as_array().unwrap().len(), 1, "{fails_assert}");
+        assert_eq!(followups["expanded"].is_object(), expand, "{fails_assert}");
+        let from_checks = printed_by_function(
+            &retained,
+            answers
+                .iter()
+                .filter_map(|answer| Some((function_of(answer), answer.get("printed")?.clone()))),
+        );
+        assert_eq!(from_checks, from_open, "{options:?} expand {expand}");
+        let printed = |name: &str| {
+            from_checks.iter().find(|(function, _)| function.ends_with(name)).unwrap().1.clone()
+        };
+        assert_eq!(printed("::fails_assert\"").contains("diagnostics via expansion"), expand);
+        assert_eq!(printed("::fails_assert\"").contains("✘"), expand);
+        assert!(printed("::uses_r\"").contains("recommendation not met"));
+        let many = printed("::many\"");
+        let note_first = r#"[{"level":"note","message":"function body check: not all errors"#;
+        assert!(many.starts_with(note_first), "{}", many);
+        assert!(printed("::looping\"").contains("consider rerunning with --profile"));
+        // Without `followups` a check answers as it always has.
+        let plain = retained.send(json!({"command": "check", "session": session,
+            "bucket": fails_assert["bucket"], "query": fails_assert["query"]}));
+        assert!(plain.get("printed").is_none() && plain.get("followups").is_none(), "{}", plain);
+        assert_eq!(
+            retained.send(json!({"command": "close", "session": session}))["event"],
+            "closed"
+        );
+        retained.finish(true);
+    }
+}
