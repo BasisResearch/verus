@@ -61,6 +61,7 @@ states; simply disabling the action would fail the test.
 
 
 
+
 ## Cumulative campaign after rebase onto `fb8014b0`
 
 The table measures all 33 requested export targets: Anvil’s five (including both API adapters), IronKV host, nrkernel’s six, NR’s three, and all 18 Splinter attempts. Five additional campaign adapters/controls follow separately. A compiler error or timeout is **not** a zero-refusal export. `Before` uses the original campaign binary; `L1–3` uses the clean lane-3 checkout at `fb8014b0`; `After` uses the rebased lane-4 binary. Binary hashes and version strings are saved in `cumulative-results.json` (the parent binary embeds its pre-commit dirty version string).
@@ -69,7 +70,7 @@ The table measures all 33 requested export targets: Anvil’s five (including bo
 - **parent:** 17/33 zero-refusal exports; 17/33 also pass SANY; 5/9 saved-bound TLC runs complete; 7/9 explore without an evaluation error.
 - **after:** 20/33 zero-refusal exports; 20/33 also pass SANY; 5/9 saved-bound TLC runs complete; 7/9 explore without an evaluation error.
 
-Since the previous stack on `5e38e1ee`, zero-refusal exports **20→20**, zero-refusal exports passing SANY **20→20**, completed campaign-bound TLC runs **5→5**, and explorations **7→7**.
+Since the previous stack on `fb8014b0`, zero-refusal exports **20→20**, zero-refusal exports passing SANY **20→20**, completed campaign-bound TLC runs **5→5**, and explorations **7→7**.
 
 The table distinguishes completed runs, invariant counterexamples, and progress until timeout. Lane 4’s additional zero-refusal targets over lane 3 are identified by the intermediate column.
 
