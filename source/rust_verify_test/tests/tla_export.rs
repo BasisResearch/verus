@@ -10335,3 +10335,147 @@ pub open spec fn property() -> TempPred<State> {{ {expression} }}
         );
     }
 }
+
+/// Domain inference and expression emission must inspect the same instance.
+/// Each shape isolates a former body lookup; metadata must name that instance.
+#[test]
+fn tla_export_specialized_enum_bounds_and_step_metadata() {
+    for (generic, arm, call) in [
+        ("<T: Limit>", "update::<T>(pre, post, n)", "relation::<One>"),
+        ("<T: Limit>", "n < T::limit() && post.x == false", "relation::<One>"),
+        ("", "update::<One>(pre, post, n)", "relation"),
+    ] {
+        let code = format!(
+            r#"
+verus! {{
+pub trait Limit {{ spec fn limit() -> nat; }}
+pub struct One;
+impl Limit for One {{ open spec fn limit() -> nat {{ 1 }} }}
+pub struct State {{ pub x: bool }}
+pub enum Step {{ Go(nat) }}
+pub open spec fn update<T: Limit>(pre: State, post: State, n: nat) -> bool {{
+    n < T::limit() && post.x == false
+}}
+pub open spec fn relation{generic}(pre: State, post: State, step: Step) -> bool {{
+    match step {{ Step::Go(n) => {arm} }}
+}}
+pub open spec fn init(s: State) -> bool {{ s.x }}
+pub open spec fn next(pre: State, post: State) -> bool {{
+    exists|step: Step| {call}(pre, post, step)
+}}
+pub open spec fn inv(s: State) -> bool {{ s.x }}
+proof fn witness(s: State) {{ assert({call}(s, State {{ x: false }}, Step::Go(0))); }}
+}}
+"#
+        );
+        let ex = export_code(&code, "test_crate:inv");
+        assert_eq!(ex.report["refusals"], serde_json::json!([]), "{}", ex.report);
+        assert_eq!(ex.report["holes"], serde_json::json!([]), "{}", ex.report);
+        if arm.starts_with("update") {
+            let step = &ex.report["steps"]["arms"][0];
+            assert!(step["function"].as_str().unwrap().ends_with("::update"), "{}", step);
+            let operator = step["operator"].as_str().expect("specialized transition operator");
+            assert!(ex.tla.contains(&format!("{operator}(n) ==")), "{}", ex.tla);
+            assert_eq!(step["args"][0]["field"], "0");
+        }
+        let Some(jar) = tla_tools() else { continue };
+        sany(&jar, &ex.spec());
+        let out = tlc_output(&jar, &ex.spec(), &ex.cfg);
+        assert!(out.contains("Invariant inv is violated") && out.contains("x = FALSE"), "{}", out);
+        assert!(out.contains("2 distinct states found"), "{}", out);
+    }
+}
+
+/// Initializer assignment analysis follows a concrete trait body, including
+/// its method type arguments, rather than the bodyless trait declaration.
+#[test]
+fn tla_export_specialized_initializer_analysis() {
+    let ex = export_code(
+        r#"
+verus! {
+pub struct State { pub x: nat }
+pub trait Value { spec fn value() -> nat; }
+impl Value for bool { open spec fn value() -> nat { 7 } }
+pub trait Start { spec fn start<T: Value>(s: State) -> bool; }
+pub struct Concrete;
+impl Start for Concrete {
+    open spec fn start<T: Value>(s: State) -> bool { s.x == T::value() }
+}
+pub open spec fn helper<S: Start, T: Value>(s: State) -> bool { S::start::<T>(s) }
+pub open spec fn init(s: State) -> bool { helper::<Concrete, bool>(s) }
+pub open spec fn next(pre: State, post: State) -> bool { post.x == pre.x }
+pub open spec fn inv(s: State) -> bool { s.x == 7 }
+}
+"#,
+        "test_crate:inv",
+    );
+    assert_eq!(ex.report["refusals"], serde_json::json!([]), "{}", ex.report);
+    assert_eq!(ex.report["holes"], serde_json::json!([]), "{}", ex.report);
+    assert_eq!(ex.report["init_unassigned"], serde_json::json!([]), "{}", ex.report);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let run = tlc(&jar, &ex.spec(), &ex.cfg);
+    assert!(run.violated.is_empty(), "{:?}", run);
+    assert_eq!(run.distinct, 1);
+}
+
+/// The same source method name is not the same call instance. Exercise both
+/// ordinary generic calls and compiler-resolved trait targets, in Init/Next.
+#[test]
+fn tla_export_guard_identity_uses_resolved_instances() {
+    for (first, second) in [
+        ("pred::<bool>()", "pred::<int>()"),
+        ("<bool as Pick>::choose()", "<int as Pick>::choose()"),
+    ] {
+        for in_init in [false, true] {
+            let guards = format!("({first} ==> s.x == false) && (!{second} ==> s.x == false)");
+            let init = if in_init { guards.clone() } else { "s.x".into() };
+            let next =
+                if in_init { "post.x == pre.x".into() } else { guards.replace("s.x", "post.x") };
+            let code = format!(
+                r#"
+verus! {{
+pub trait Pick {{ spec fn choose() -> bool; }}
+impl Pick for bool {{ open spec fn choose() -> bool {{ false }} }}
+impl Pick for int {{ open spec fn choose() -> bool {{ true }} }}
+pub open spec fn pred<T: Pick>() -> bool {{ T::choose() }}
+pub struct State {{ pub x: bool }}
+pub open spec fn init(s: State) -> bool {{ {init} }}
+pub open spec fn next(pre: State, post: State) -> bool {{ {next} }}
+pub open spec fn inv(s: State) -> bool {{ s.x }}
+proof fn values() {{ assert(!{first}); assert({second}); }}
+}}
+"#
+            );
+            let ex = export_code(&code, "test_crate:inv");
+            assert_eq!(ex.report["refusals"], serde_json::json!([]), "{}", ex.report);
+            assert_eq!(ex.report["holes"], serde_json::json!([]), "{}", ex.report);
+            if in_init {
+                assert_eq!(ex.report["init_enumerated"][0]["variable"], "x", "{}", ex.report);
+            } else {
+                assert!(
+                    ex.report["transitions"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|t| t["operator"] == "next"
+                            && t["unassigned"] == serde_json::json!(["x"])),
+                    "{}",
+                    ex.report
+                );
+            }
+            let Some(jar) = tla_tools() else { continue };
+            sany(&jar, &ex.spec());
+            let out = tlc_output(&jar, &ex.spec(), &ex.cfg);
+            if in_init {
+                assert!(
+                    out.contains("Invariant inv is violated") && out.contains("x = FALSE"),
+                    "{}",
+                    out
+                );
+            } else {
+                assert!(out.contains("Successor state is not completely specified"), "{}", out);
+            }
+        }
+    }
+}
