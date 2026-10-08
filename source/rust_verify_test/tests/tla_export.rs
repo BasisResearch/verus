@@ -9398,7 +9398,7 @@ pub open spec fn next() -> spec_fn(State,State) -> bool {
 "#,
         "test_crate",
     );
-    assert!(!names(&ex.report["trace"]["general_relation_steps"]).contains(&"a".to_string()));
+    assert!(names(&ex.report["trace"]["general_relation_steps"]).contains(&"a".to_string()));
     trace_action_log(
         &ex,
         &[
@@ -9792,19 +9792,22 @@ pub open spec fn next() -> spec_fn(State,State) -> bool {
             (r#"{"step":"a","params":{"n":2},"state":{"x":2}}"#, 1),
         ],
     );
-    // Bounds inherited from a helper must keep their own evaluation guards.
+    // Computed bounds are ineligible even with a guard inside the helper.
     let guarded = code.replace("step(a(0))", "step(a(1))").replace(
         "exists|n:int| 0 <= n && n < 2 && #[trigger] step(a(n))(pre,post)",
         "pre.x != 0 && (exists|n:int| 0 <= n && n < 10int / (pre.x as int) && #[trigger] step(a(n))(pre,post))",
     );
     let guarded = export_code(&guarded, "test_crate");
-    trace_action_log(
-        &guarded,
-        &[
-            (r#"{"step":"a","params":{"n":1},"state":{"x":1}}"#, 2),
-            (r#"{"step":"a","state":{"x":1}}"#, 2),
-        ],
+    assert_eq!(
+        guarded.report["trace"]["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["step"] == "a")
+            .unwrap()["enumerated"],
+        false
     );
+    trace_action_log(&guarded, &[(r#"{"step":"a","params":{"n":1},"state":{"x":1}}"#, 2)]);
     // Neither the direct site's singleton nor the helper's quantified range
     // may replace the other when the general relation wins.
     let ex = export_code(&code.replace("step(a(0))", "step(a(3))"), "test_crate");
@@ -9817,4 +9820,277 @@ pub open spec fn next() -> spec_fn(State,State) -> bool {
             (r#"{"step":"a","params":{"n":2},"state":{"x":2}}"#, 1),
         ],
     );
+}
+
+const TRACE_SAFETY_PRECONDITION_GUARD: &str = r#"use vstd::prelude::*;
+verus! {
+#[verifier::reject_recursive_types(S)]
+pub struct Action<S> { pub precondition: spec_fn(S) -> bool, pub transition: spec_fn(S,S) -> bool }
+pub open spec fn step<S>(a: Action<S>) -> spec_fn(S,S) -> bool { |pre:S,post:S| (a.precondition)(pre) && (a.transition)(pre,post) }
+pub struct State { pub x:u8 }
+pub open spec fn a(n:u8) -> Action<State> { Action { precondition: |s:State| s.x != 0, transition: |pre:State,post:State| post.x==n } }
+pub open spec fn init() -> spec_fn(State) -> bool { |s:State| s.x==0 }
+pub open spec fn next() -> spec_fn(State,State) -> bool {
+ |pre:State,post:State| step(a((10int / (pre.x as int)) as u8))(pre,post) || post.x == 1
+}
+
+}
+"#;
+
+const TRACE_SAFETY_CALLER_GUARD: &str = r#"use vstd::prelude::*;
+verus! {
+#[verifier::reject_recursive_types(S)]
+pub struct Action<S> { pub precondition: spec_fn(S) -> bool, pub transition: spec_fn(S,S) -> bool }
+pub open spec fn step<S>(a: Action<S>) -> spec_fn(S,S) -> bool { |pre:S,post:S| (a.precondition)(pre) && (a.transition)(pre,post) }
+pub struct State { pub x:u8 }
+pub open spec fn a(n:int) -> Action<State> { Action { precondition: |s:State| true, transition: |pre:State,post:State| post.x==n } }
+pub open spec fn init() -> spec_fn(State) -> bool { |s:State| s.x==0 }
+pub open spec fn helper(pre:State,post:State)->bool { exists|n:int| 0 <= n && n < 10int / (pre.x as int) && #[trigger] step(a(n))(pre,post) }
+pub open spec fn next() -> spec_fn(State,State) -> bool {
+ |pre:State,post:State| step(a(1))(pre,post) || (pre.x != 0 && helper(pre,post))
+}
+
+}
+"#;
+
+fn assert_trace_general(ex: &Exported, step: &str) {
+    assert!(names(&ex.report["trace"]["general_relation_steps"]).contains(&step.to_string()));
+}
+
+// Audit row 1: neither singleton domains nor binder equalities may force an
+// argument before the action's own precondition.
+#[test]
+fn tla_export_trace_safety_fixed_inputs() {
+    let ex = export_code(TRACE_SAFETY_PRECONDITION_GUARD, "test_crate");
+    assert_trace_general(&ex, "a");
+    trace_action_log(
+        &ex,
+        &[
+            (r#"{"step":"a","params":{"n":1},"state":{"x":1}}"#, 1),
+            (r#"{"step":"next","state":{"x":1}}"#, 2),
+        ],
+    );
+}
+
+// Audit row 6: a helper's bound cannot escape a guard in its caller.
+#[test]
+fn tla_export_trace_safety_transitive_domains() {
+    let ex = export_code(TRACE_SAFETY_CALLER_GUARD, "test_crate");
+    assert_trace_general(&ex, "a");
+    let step =
+        ex.report["trace"]["steps"].as_array().unwrap().iter().find(|s| s["step"] == "a").unwrap();
+    assert_eq!(step["enumerated"], false);
+    assert!(step["params"][0]["domain"].is_null());
+    trace_action_log(
+        &ex,
+        &[
+            (r#"{"step":"a","params":{"n":1},"state":{"x":1}}"#, 2),
+            (r#"{"step":"a","params":{"n":2},"state":{"x":1}}"#, 1),
+        ],
+    );
+}
+
+// Audit row 2: one unsafe call site invalidates the whole selected union.
+#[test]
+fn tla_export_trace_safety_call_site_unions() {
+    let code = TRACE_SAFETY_PRECONDITION_GUARD
+        .replace("|| post.x == 1", "|| step(a(1))(pre,post) || post.x == 1");
+    let ex = export_code(&code, "test_crate");
+    assert_trace_general(&ex, "a");
+    trace_action_log(
+        &ex,
+        &[
+            (r#"{"step":"a","params":{"n":1},"state":{"x":1}}"#, 1),
+            (r#"{"step":"next","state":{"x":1}}"#, 2),
+        ],
+    );
+    // Literal and total pre-state projections still take the selected path.
+    for input in ["1u8", "pre.x"] {
+        let code = TRACE_SAFETY_PRECONDITION_GUARD
+            .replace("(10int / (pre.x as int)) as u8", input)
+            .replace("s.x != 0", "true");
+        let ex = export_code(&code, "test_crate");
+        assert!(!names(&ex.report["trace"]["general_relation_steps"]).contains(&"a".to_string()));
+        let n = if input == "pre.x" { 0 } else { 1 };
+        trace_action_log(
+            &ex,
+            &[(&format!(r#"{{"step":"a","params":{{"n":{n}}},"state":{{"x":{n}}}}}"#), 2)],
+        );
+    }
+}
+
+// Audit row 3: a copied IF is not a separate exception to eligibility.
+#[test]
+fn tla_export_trace_safety_conditional_paths() {
+    let code = TRACE_SAFETY_PRECONDITION_GUARD.replace(
+        "step(a((10int / (pre.x as int)) as u8))(pre,post)",
+        "(if pre.x == 0 { step(a((10int / (pre.x as int)) as u8))(pre,post) } else { step(a(1))(pre,post) })");
+    let ex = export_code(&code, "test_crate");
+    assert_trace_general(&ex, "a");
+    trace_action_log(
+        &ex,
+        &[
+            (r#"{"step":"a","params":{"n":1},"state":{"x":1}}"#, 1),
+            (r#"{"step":"next","state":{"x":1}}"#, 2),
+        ],
+    );
+}
+
+// Audit row 4: a cached quantifier cannot certify a computed domain.
+#[test]
+fn tla_export_trace_safety_cached_quantifiers() {
+    let code = TRACE_SAFETY_PRECONDITION_GUARD.replace(
+        "step(a((10int / (pre.x as int)) as u8))(pre,post)",
+        "(if pre.x != 0 { exists|n:u8| n < 10int / (pre.x as int) && #[trigger] step(a(n))(pre,post) } else { false })");
+    let ex = export_code(&code, "test_crate");
+    assert_trace_general(&ex, "a");
+    trace_action_log(
+        &ex,
+        &[
+            (r#"{"step":"a","params":{"n":1},"state":{"x":1}}"#, 1),
+            (r#"{"step":"a","state":{"x":1}}"#, 1),
+            (r#"{"step":"next","state":{"x":1}}"#, 2),
+        ],
+    );
+}
+
+// Audit row 5: field templates and direct dispatcher checks share the rule.
+#[test]
+fn tla_export_trace_safety_enum_and_dispatcher() {
+    let ex = export_code(
+        r#"use vstd::prelude::*;
+verus! {
+pub struct State { pub x:u8 }
+pub enum Step { A(u8) }
+pub open spec fn init(s:State)->bool { s.x==0 }
+pub open spec fn t_a(pre:State,post:State,n:u8)->bool { post.x==n }
+pub open spec fn next_step(pre:State,post:State,s:Step)->bool {
+    match s { Step::A(n) => n < 10int / ((pre.x as int) + 1) && t_a(pre,post,n) }
+}
+pub open spec fn next(pre:State,post:State)->bool { exists|s:Step| next_step(pre,post,s) }
+}"#,
+        "test_crate",
+    );
+    assert_trace_general(&ex, "t_a");
+    assert_trace_general(&ex, "next_step");
+    trace_action_log(
+        &ex,
+        &[
+            (r#"{"step":"t_a","params":{"n":1},"state":{"x":1}}"#, 2),
+            (r#"{"step":"t_a","params":{"n":0},"state":{"x":1}}"#, 1),
+            (r#"{"step":"next_step","params":{"s":{"tag":"A","v0":1}},"state":{"x":1}}"#, 2),
+        ],
+    );
+    // A certified field template keeps the original dispatcher even when a
+    // called transition contains a computed bound behind its own guard.
+    let ex = export_code(
+        r#"use vstd::prelude::*;
+verus! {
+pub struct State { pub x:u8 }
+pub enum Step { A(u8) }
+pub open spec fn init(s:State)->bool { s.x==0 }
+pub open spec fn t_a(pre:State,post:State,n:u8)->bool {
+    pre.x != 0 && (exists|m:u8| m < 10int / (pre.x as int) && #[trigger] id(m)==m && post.x==n)
+}
+pub open spec fn id(m:u8)->u8 { m }
+pub open spec fn next_step(pre:State,post:State,s:Step)->bool {
+    match s { Step::A(n) => n < 2 && t_a(pre,post,n) }
+}
+pub open spec fn next(pre:State,post:State)->bool { exists|s:Step| next_step(pre,post,s) }
+}"#,
+        "test_crate",
+    );
+    assert!(!names(&ex.report["trace"]["general_relation_steps"]).contains(&"t_a".to_string()));
+    trace_action_log(&ex, &[(r#"{"step":"t_a","params":{"n":1},"state":{"x":1}}"#, 1)]);
+    trace_safety_probe(&ex, "\\A r \\in TraceEnabled : r.step # \"t_a\"", 1);
+}
+
+// Audit row 7: logged membership and omitted-parameter enumeration cannot
+// use an unsafe domain. Unbounded omissions are explicit, never a partial union.
+#[test]
+fn tla_export_trace_safety_parameter_narrowing() {
+    let ex = export_code(TRACE_SAFETY_PRECONDITION_GUARD, "test_crate");
+    trace_action_log(
+        &ex,
+        &[
+            (r#"{"step":"a","params":{"n":1},"state":{"x":1}}"#, 1),
+            (r#"{"step":"a","state":{"x":1}}"#, 1),
+        ],
+    );
+    let ex = export_code(TRACE_SAFETY_CALLER_GUARD, "test_crate");
+    let Some(jar) = tla_tools() else { return };
+    let (spec, _, cfg) = trace_spec(&ex);
+    let log = ex.dir.path().join("omitted.ndjson");
+    std::fs::write(
+        &log,
+        concat!(
+            "{\"module\":\"State_tla\",\"export\":\"test_crate\",\"state\":{\"x\":0}}\n",
+            "{\"step\":\"a\",\"state\":{\"x\":1}}\n"
+        ),
+    )
+    .unwrap();
+    let out = stops(&jar, &spec, &cfg, &log, "");
+    assert!(out.contains("leaves out its parameter n"), "{}", out);
+    assert!(!out.contains("second argument of %"), "{}", out);
+}
+
+fn trace_safety_probe(ex: &Exported, predicate: &str, expected: u64) {
+    let Some(jar) = tla_tools() else { return };
+    let (spec, tla, cfg) = trace_spec(ex);
+    let probe = spec.with_file_name("Probe_trace.tla");
+    std::fs::write(
+        &probe,
+        tla.replace("MODULE State_tla_trace", "MODULE Probe_trace")
+            .replace("\n=====", &format!("\nProbe == trace_i = 1 => ({predicate})\n=====")),
+    )
+    .unwrap();
+    let (depth, out) =
+        follow(&jar, &probe, &cfg, &ex.dir.path().join("selection.ndjson"), "INVARIANT Probe\n");
+    assert_eq!(depth, expected, "{out}");
+}
+
+// Audit row 8: enumerate safe domains only, before ENABLED is invoked.
+#[test]
+fn tla_export_trace_safety_enabled_enumeration() {
+    for code in [TRACE_SAFETY_PRECONDITION_GUARD, TRACE_SAFETY_CALLER_GUARD] {
+        let ex = export_code(code, "test_crate");
+        trace_action_log(&ex, &[(r#"{"step":"next","state":{"x":1}}"#, 2)]);
+        trace_safety_probe(&ex, "\\A r \\in TraceEnabled : r.step # \"a\"", 2);
+        if code == TRACE_SAFETY_CALLER_GUARD {
+            let helper = ex.report["trace"]["steps"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|s| s["step"] == "helper")
+                .unwrap();
+            assert_eq!(helper["enumerated"], false);
+            assert_trace_general(&ex, "helper");
+            let Some(jar) = tla_tools() else { continue };
+            let (spec, _, cfg) = trace_spec(&ex);
+            let log = ex.dir.path().join("selection.ndjson");
+            std::fs::write(
+                &log,
+                concat!(
+                    "{\"module\":\"State_tla\",\"export\":\"test_crate\",\"state\":{\"x\":0}}\n",
+                    "{\"step\":\"helper\",\"state\":{\"x\":1}}\n"
+                ),
+            )
+            .unwrap();
+            let out = stops(&jar, &spec, &cfg, &log, "");
+            assert!(out.contains("cannot be checked independently"), "{}", out);
+        }
+    }
+}
+
+// Audit row 9: diagnosis must use the same eligibility decision as validation.
+#[test]
+fn tla_export_trace_safety_diagnosis() {
+    for (code, enabled, depth) in [
+        (TRACE_SAFETY_PRECONDITION_GUARD, "~TraceDiagnosis.step_enabled", 1),
+        (TRACE_SAFETY_CALLER_GUARD, "TraceDiagnosis.step_enabled", 2),
+    ] {
+        let ex = export_code(code, "test_crate");
+        trace_action_log(&ex, &[(r#"{"step":"a","params":{"n":1},"state":{"x":1}}"#, depth)]);
+        trace_safety_probe(&ex, enabled, depth);
+    }
 }

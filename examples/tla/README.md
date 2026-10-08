@@ -473,10 +473,21 @@ both their preconditions and transitions, including the path conditions of
 `if` branches. Fixed and quantified call sites of the same action are combined.
 If any occurrence cannot be selected, the whole action name uses the reported
 general-relation check so that other call sites are not silently dropped.
-Inputs whose evaluation needs an earlier conjunctive guard or an assigned
-successor also use that fallback. General action relations retain the union
-of finite argument domains established at call sites, including calls inside
-helpers, so falling back does not require logging a previously bounded input.
+Selection and domain reuse share one conservative eligibility rule: source
+operands must be literals or total pre-state projections. Existing quantifier
+and constructor binders may stay in their original scope, including dependent
+bounds; generated type domains and configured constants are also safe.
+Calls, indexing, casts, and arithmetic in an input or bound do not qualify,
+even if a surrounding guard happens to make them safe. That action name uses
+the reported general-relation check instead. Its parameters use certified
+call-site domains, or a safe finite type domain; if neither exists, they must
+be logged (`enumerated: false`). An unsafe component invalidates a domain
+union; it is never silently dropped. These same domains feed `TraceEnabled`
+and `TraceDiagnosis`, so diagnostics cannot reintroduce eager evaluation.
+A helper with a computed bound may depend on a caller guard that cannot be
+retained in an independent check. Such helpers are reported as general and
+non-enumerable, omitted from `TraceEnabled`, and fail explicitly when logged;
+use `next` for state-only validation in that case.
 The observed successor comparison is
 unchanged. TLC run on it
 (`INIT TraceInit`, `NEXT TraceNext`, `CONSTANT TraceLog = "<log path>"`)
@@ -503,7 +514,7 @@ precondition and transition (or use verus-tla's `forward` relation). A wrapper
 that permits skipping the action uses the reported general-relation check.
 Enum selection must account for every call site; an unsupported nested or
 indirect occurrence also makes the name a general relation. Conditional paths
-guard parameter domains as well as the selected bodies.
+retain their guards in the selected bodies; only eligible domains escape them.
 Coverage includes source-level calls inside helpers and returned closures,
 even when inlining removes their operator-call edges. Action occurrences in
 helpers likewise make the whole action name general. Inputs that read the post

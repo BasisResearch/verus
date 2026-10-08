@@ -618,9 +618,8 @@ struct Env {
     /// rustc gives every binding its own `VarIdent`, so a binder that
     /// shadows a name (`let k = k + 1`) never inherits the domain it had.
     domains: HashMap<VarIdent, Dom>,
-    /// Conditions preceding a domain's evaluation. None means a condition
-    /// depends on locals or the successor and cannot escape this scope.
-    domain_guards: Vec<Option<String>>,
+    /// Original quantifier/constructor binders available in this scope.
+    trace_binders: HashSet<VarIdent>,
     /// Names a pattern bound to a field of a whole state (`let State { x,
     /// .. } = post`), so `x == e` assigns it as `post.x == e` does.
     field_binders: HashMap<VarIdent, FieldBinder>,
@@ -647,7 +646,7 @@ impl Env {
             values: HashMap::new(),
             primed: HashSet::new(),
             domains: HashMap::new(),
-            domain_guards: Vec::new(),
+            trace_binders: HashSet::new(),
             field_binders: HashMap::new(),
         }
     }
@@ -824,6 +823,14 @@ struct Exporter {
     /// function. Keep the original quantifier/caller domains before inlining
     /// erases the call sites used by general trace relations.
     action_domains: HashMap<String, Vec<(Fun, Vec<Option<Dom>>)>>,
+    /// Domains built only from certified trace inputs and total generated
+    /// operations. Certification happens at construction, never by parsing
+    /// printed TLA. All trace consumers share this eligibility boundary.
+    safe_trace_domains: HashSet<String>,
+    /// A computed bound in an independently exposed helper may rely on a
+    /// caller's guard. Next itself retains that scope; a standalone helper
+    /// check cannot assume it, and must fail explicitly rather than crash TLC.
+    unsafe_trace_relations: HashSet<String>,
     /// Closure roots to lower after the model is complete, in a private copy.
     trace_roots: HashMap<OpKey, (Expr, Env)>,
     /// Enum-arm templates keyed by their existential expression.
@@ -1982,14 +1989,7 @@ impl Exporter {
             }
             ExprX::Logical(op, a, b) => {
                 let (sa, sb) = match op {
-                    LogicalOp::And => {
-                        let sa = self.expr(a, env);
-                        let mut guarded = env.clone();
-                        guarded
-                            .domain_guards
-                            .push(self.closed_domain(&sa, env, false).map(|_| sa.clone()));
-                        (sa, self.expr(b, &guarded))
-                    }
+                    LogicalOp::And => (self.expr(a, env), self.expr(b, env)),
                     LogicalOp::Or => {
                         let (sa, aa) = self.branch_expr(a, env);
                         let (sb, ab) = self.branch_expr(b, env);
@@ -2062,14 +2062,9 @@ impl Exporter {
             ExprX::WithTriggers { body, .. } => self.expr(body, env),
             ExprX::If(c, t, f) => {
                 let sc = self.quiet(|x| x.expr(c, env));
-                let mut guarded = env.clone();
-                let guard = self.closed_domain(&sc, env, false).map(|_| sc.clone());
-                guarded.domain_guards.push(guard.clone());
-                let (st, at) = self.branch_expr(t, &guarded);
-                guarded.domain_guards.pop();
-                guarded.domain_guards.push(guard.map(|g| format!("~({g})")));
+                let (st, at) = self.branch_expr(t, env);
                 let (sf, af) = match f {
-                    Some(f) => self.branch_expr(f, &guarded),
+                    Some(f) => self.branch_expr(f, env),
                     None => ("TRUE".into(), BTreeSet::new()),
                 };
                 self.meet(vec![at, af]);
@@ -3212,6 +3207,32 @@ impl Exporter {
         }
     }
 
+    /// A value may escape its source guard order only when it is a literal
+    /// or a total pre-state projection. Original binders are also valid when
+    /// kept in their scope (quantified templates and dependent field bounds).
+    /// Calls, indexing, casts and arithmetic are deliberately not inferred safe.
+    fn trace_input_eligible(&self, e: &Expr, env: &Env, depth: usize) -> bool {
+        if depth > 16 {
+            return false;
+        }
+        let e = peel(e);
+        if matches!(e.x, ExprX::Const(_)) || self.role_field(&e, env, Role::Pre).is_some() {
+            return true;
+        }
+        let Some(v) = read_var(&e) else { return false };
+        if env.roles.get(&v) == Some(&Role::Pre) {
+            return true;
+        }
+        if let Some((value, scope)) = env.values.get(&v) {
+            return self.trace_input_eligible(value, scope, depth + 1);
+        }
+        env.trace_binders.contains(&v)
+    }
+
+    fn trace_domain_eligible(&self, domain: &str) -> bool {
+        self.safe_trace_domains.contains(domain) || self.hole_typs.contains_key(domain)
+    }
+
     /// Only reuse domains already established in the model or literal
     /// singleton values. Computing a new argument value here could hoist a
     /// partial expression above its guard or read an unassigned post state.
@@ -3221,7 +3242,9 @@ impl Exporter {
         }
         let e = peel(e);
         if matches!(e.x, ExprX::Const(_)) {
-            return Some(Dom::Closed(format!("{{{}}}", self.quiet(|x| x.expr(&e, env))), false));
+            let domain = format!("{{{}}}", self.quiet(|x| x.expr(&e, env)));
+            self.safe_trace_domains.insert(domain.clone());
+            return Some(Dom::Closed(domain, false));
         }
         let v = read_var(&e)?;
         if let Some(d) = env.domains.get(&v) {
@@ -3731,6 +3754,7 @@ impl Exporter {
         let mut env2 = env.clone();
         for b in binders.iter() {
             self.bind_var(&mut env2, &b.name);
+            env2.trace_binders.insert(b.name.clone());
         }
         if !forall && binders.len() == 1 {
             if let Some(out) = self.exists_per_variant(e, &binders[0], body, &env2) {
@@ -3765,20 +3789,8 @@ impl Exporter {
                     None => self.type_domain(&name, &b.a, &e.span),
                 },
             };
-            if let Some(Dom::Closed(mut d, from_type)) =
-                self.closed_domain(&domain, &env2, from_type)
-            {
-                // Trace parameter domains escape the operator. Preserve the
-                // short-circuit conditions that made evaluating a bound safe.
-                // A local condition cannot be lifted, so retain the type
-                // fallback instead of exporting an unsafe domain.
-                if let Some(guards) = env.domain_guards.iter().cloned().collect::<Option<Vec<_>>>()
-                {
-                    for g in guards.iter().rev() {
-                        d = format!("(IF {g} THEN {d} ELSE {{}})");
-                    }
-                    env2.domains.insert(b.name.clone(), Dom::Closed(d, from_type));
-                }
+            if let Some(d) = self.closed_domain(&domain, &env2, from_type) {
+                env2.domains.insert(b.name.clone(), d);
             }
             bounds.push(format!("{name} \\in {domain}"));
         }
@@ -3963,6 +3975,7 @@ impl Exporter {
         // read as they would from a plain `\\E binder \\in domain`.
         let mut variants = Vec::new();
         let mut sets = Vec::new();
+        let mut trace_safe = true;
         for ((vname, fields, names, record), (bounded, s)) in
             all.into_iter().zip(field_bounds.into_iter().zip(split))
         {
@@ -3987,6 +4000,7 @@ impl Exporter {
                         constant
                     }
                 };
+                trace_safe &= self.trace_domain_eligible(&domain);
                 domains.push(domain);
             }
             let binds: Vec<String> =
@@ -4019,6 +4033,9 @@ impl Exporter {
         }
         let union = format!("({})", sets.join(" \\cup "));
         let mut env2 = env.clone();
+        if trace_safe {
+            self.safe_trace_domains.insert(union.clone());
+        }
         env2.domains.insert(x.clone(), Dom::Closed(union.clone(), true));
         let sb = self.in_branch(body, &env2);
         self.exists_printed.insert(Arc::as_ptr(e) as usize, (xname.clone(), union, sb.clone()));
@@ -4119,6 +4136,7 @@ impl Exporter {
                     match arg.as_ref().and_then(|v| field_of.get(v).map(|i| (v, *i))) {
                         Some((_, i)) if i < k => {
                             env.names.insert(p.x.name.clone(), names[i].clone());
+                            env.trace_binders.insert(p.x.name.clone());
                         }
                         Some((v, i)) => {
                             if v == &target && i == k {
@@ -4141,6 +4159,7 @@ impl Exporter {
                 for (v, i) in &field_of {
                     if *i < k {
                         env.names.insert(v.clone(), names[*i].clone());
+                        env.trace_binders.insert(v.clone());
                     } else {
                         unbound.push(v.clone());
                     }
@@ -4226,6 +4245,19 @@ impl Exporter {
     /// `seen` holds the datatypes being bounded, so a recursive datatype is
     /// a hole rather than an endless recursion.
     fn bound_from_type(
+        &mut self,
+        typ: &Typ,
+        span: &crate::messages::Span,
+        seen: &mut Vec<Path>,
+    ) -> Option<(String, u128)> {
+        let result = self.bound_from_type_inner(typ, span, seen);
+        if let Some((domain, _)) = &result {
+            self.safe_trace_domains.insert(domain.clone());
+        }
+        result
+    }
+
+    fn bound_from_type_inner(
         &mut self,
         typ: &Typ,
         span: &crate::messages::Span,
@@ -4580,10 +4612,16 @@ impl Exporter {
                     _ => continue,
                 };
                 let x = self.bind("x__");
-                return Some(match range.as_ref().and_then(|r| int_range_pred(&x, r)) {
+                let domain = match range.as_ref().and_then(|r| int_range_pred(&x, r)) {
                     Some(in_range) => format!("{{{x} \\in {set} : {in_range}}}"),
                     None => set,
-                });
+                };
+                if self.trace_input_eligible(&args[0], env, 0) {
+                    self.safe_trace_domains.insert(domain.clone());
+                } else {
+                    self.unsafe_trace_relations.insert(self.current.clone());
+                }
+                return Some(domain);
             }
         }
         // Integer range from inequalities and chained comparisons; a `char`
@@ -4593,9 +4631,11 @@ impl Exporter {
         }
         let mut lower: Option<String> = None;
         let mut upper: Option<String> = None;
+        let mut trace_safe = true;
         // `v op other`, with `strict` strict comparisons on the way (each one
         // step further from `other`).
         let mut note = |this: &mut Self, op: InequalityOp, other: &Expr, strict: usize| {
+            trace_safe &= this.trace_input_eligible(other, env, 0);
             let o = this.expr(other, env);
             let shifted = |sign: &str| {
                 if strict == 0 { o.clone() } else { format!("({o}) {sign} {strict}") }
@@ -4678,7 +4718,15 @@ impl Exporter {
             (u, t) => u.or(t.map(|t| t.to_string())),
         };
         match (lower, upper) {
-            (Some(l), Some(u)) => Some(format!("{l}..{u}")),
+            (Some(l), Some(u)) => {
+                let domain = format!("{l}..{u}");
+                if trace_safe {
+                    self.safe_trace_domains.insert(domain.clone());
+                } else {
+                    self.unsafe_trace_relations.insert(self.current.clone());
+                }
+                Some(domain)
+            }
             _ => None,
         }
     }
@@ -6674,11 +6722,6 @@ impl Exporter {
                     if action.selected {
                         let g = if positive { guard.clone() } else { format!("~({guard})") };
                         action.body = format!("IF {g} THEN ({}) ELSE FALSE", action.body);
-                        for (_, _, domain, _) in &mut action.params {
-                            if let Some(d) = domain {
-                                *d = format!("(IF {g} THEN {d} ELSE {{}})");
-                            }
-                        }
                     }
                     out.push(action);
                 }
@@ -6813,6 +6856,9 @@ impl Exporter {
                 }
                 let (name, domain, text) =
                     self.exists_printed.get(&(Arc::as_ptr(body) as usize)).cloned()?;
+                if !self.trace_domain_eligible(&domain) {
+                    return None;
+                }
                 (vec![(log_name, typ, Some(domain), name)], text)
             }
             ExprX::Quant(..) => return None,
@@ -6827,20 +6873,7 @@ impl Exporter {
                 if let Some((input, name)) = &forward_input {
                     inputs.push((name.clone(), input));
                 }
-                // A domain is evaluated before the selected action assigns
-                // successor variables. Keep post-dependent arguments in the
-                // original Next evaluation order via the general relation.
-                // A preceding conjunct may make evaluating the argument safe
-                // (division, indexing, casts, ...). Hoisting it into a domain
-                // or a binder equality would run it before that guard.
-                let guarded =
-                    conjuncts(&site).first().is_some_and(|e| !Arc::ptr_eq(e, &application));
-                if inputs.iter().any(|(_, input)| env.reads_post(input))
-                    || (guarded
-                        && inputs
-                            .iter()
-                            .any(|(_, input)| !matches!(peel(input).x, ExprX::Const(_))))
-                {
+                if inputs.iter().any(|(_, input)| !self.trace_input_eligible(input, env, 0)) {
                     return None;
                 }
                 let mut text = self.expr(body, env);
@@ -8428,6 +8461,7 @@ impl Exporter {
             self.op_names.insert(key.clone(), op.clone());
             self.emitted.insert(key);
             self.arity.insert(op.clone(), 0);
+            self.safe_trace_domains.insert(format!("{{{op}}}"));
             self.constant_ops.insert(fun.clone(), op.clone());
             constant_funs.push(fun);
         }
@@ -8676,6 +8710,8 @@ pub fn export_module(
         temporal_top_action: false,
         trace_actions: HashMap::new(),
         action_domains: HashMap::new(),
+        safe_trace_domains: HashSet::new(),
+        unsafe_trace_relations: HashSet::new(),
         trace_roots: HashMap::new(),
         trace_variants: HashMap::new(),
         exists_printed: HashMap::new(),
@@ -9812,7 +9848,9 @@ impl Exporter {
         visiting: &mut Vec<(OpKey, usize)>,
     ) -> Option<(String, bool)> {
         match d {
-            Dom::Closed(s, from_type) => Some((s.clone(), *from_type)),
+            Dom::Closed(s, from_type) => {
+                self.trace_domain_eligible(s).then(|| (s.clone(), *from_type))
+            }
             Dom::Param(k, i) => self.resolve_param(k, *i, reachable, visiting),
             Dom::Field { of, tag, var, access, hole, field_typ } => {
                 let (of, from_type) = self.resolve_dom(of, reachable, visiting)?;
@@ -10168,7 +10206,9 @@ impl Exporter {
         let mut out = Vec::new();
         for arm in arms.iter().filter(|a| a.operator.as_ref() == Some(&step.operator)) {
             let variant = variants.iter().find(|v| Some(&v.tag) == arm.variant.as_ref())?;
-            if arm.args.iter().any(|a| a.field.is_none()) {
+            if arm.args.iter().any(|a| a.field.is_none())
+                || variant.domains.iter().any(|d| !self.trace_domain_eligible(d))
+            {
                 return None;
             }
             let mapping = variant
@@ -10216,6 +10256,7 @@ impl Exporter {
                 .collect();
         self.op_names.get(&(fun.clone(), Variant::Plain, false)) == Some(&step.operator)
             && step.params.len() == 1
+            && self.trace_domain_eligible(domain)
             && step.params[0].domain.as_ref() == Some(domain)
             && self.param_roles(callee).iter().zip(args.iter()).all(|(role, arg)| match role {
                 Some(r) => read_var(arg).and_then(|v| root_roles.get(&v).copied()) == Some(*r),
@@ -10394,6 +10435,16 @@ impl Exporter {
         }
         // The loggable steps: every operator Next reaches through branches
         // (see [`Exporter::trace_operators`]) printed as a plain operator.
+        let unsafe_helpers: HashSet<_> = operators
+            .iter()
+            .filter(|key| *key != next_key)
+            .filter(|key| {
+                self.reachable_from(key)
+                    .iter()
+                    .any(|k| self.unsafe_trace_relations.contains(&fun_as_friendly_rust_name(&k.0)))
+            })
+            .map(|k| fun_as_friendly_rust_name(&k.0))
+            .collect();
         let by_name: HashMap<String, OpKey> =
             self.op_names.iter().map(|(k, n)| (n.clone(), k.clone())).collect();
         let mut steps: Vec<TraceStep> = Vec::new();
@@ -10542,7 +10593,7 @@ impl Exporter {
         let mut general_relation_steps = Vec::new();
         let identity = self.trace_name("TraceIdentity");
         arm_defs.push(format!("{identity}({j}) == {j}\n"));
-        for s in &steps {
+        for s in &mut steps {
             let typs = if let Some(typs) = action_typs.get(&s.operator) {
                 typs.clone()
             } else {
@@ -10570,6 +10621,21 @@ impl Exporter {
             let direct =
                 action_operators.contains(&s.operator) || self.trace_is_dispatcher(next_key, s);
             let variants = self.trace_variant_arms(next_key, s);
+            // An eligible template keeps the original dispatcher and guard
+            // order. Only a general helper check loses that calling scope.
+            if !direct
+                && variants.is_none()
+                && !action_typs.contains_key(&s.operator)
+                && unsafe_helpers.contains(&s.function)
+            {
+                s.enumerated = false;
+                general_relation_steps.push(s.step.clone());
+                step_arms.push(format!(
+                    "{guard} -> Next /\\ {declared} /\\ Assert(FALSE, \"trace: {} cannot be checked independently because its domain requires caller guards; log next instead\")",
+                    s.step
+                ));
+                continue;
+            }
             let specialized = variants.is_some();
             let mut selected_enabled = None;
             if let Some(variants) = variants {
