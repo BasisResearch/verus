@@ -1,0 +1,734 @@
+{
+  "before_commit": "5e38e1ee964c666c497aa9ee5d803eae6f131bc6",
+  "before": {
+    "binary": "/data/home/kirancodes/Documents/code/verus-research/wt-export-partial/source/target-verus/release/verus",
+    "group": "anvil",
+    "phase": "anvil-before",
+    "export_seconds": 90,
+    "tlc_seconds": 30,
+    "jobs": 2,
+    "sha256": {
+      "verus": "5ffa1cb2b1e0df2bbed030d98414f20640f9c0613551a62be858ad320bf87a2a",
+      "rust_verify": "876698000df07ece19d638fdc93650c9ad6024b68158bc420d6d5f373e980537"
+    },
+    "rows": [
+      {
+        "id": "anvil/sub_network",
+        "export_rc": 0,
+        "export_seconds": 1.806,
+        "status": "tlc_error",
+        "refusals": 2,
+        "holes": 5,
+        "restrictions": 0,
+        "reasons": [
+          "application of a spec_fn value that does not reduce to a closure"
+        ],
+        "sany_status": "ok",
+        "tlc_rc": 14,
+        "generated": 1,
+        "distinct": 1,
+        "errors": [
+          "Error: The first argument of Assert evaluated to FALSE; the second argument was:",
+          "Error: The behavior up to this point is:",
+          "Error: The first argument of Assert evaluated to FALSE; the second argument was:",
+          "Error: The behavior up to this point is:",
+          "Error: The error occurred when TLC was evaluating the nested"
+        ]
+      },
+      {
+        "id": "anvil/sub_controller",
+        "export_rc": 0,
+        "export_seconds": 1.805,
+        "status": "exported",
+        "refusals": 9,
+        "holes": 8,
+        "restrictions": 0,
+        "reasons": [
+          "application of a spec_fn value that does not reduce to a closure",
+          "closure value `model` used other than in an application"
+        ],
+        "sany_status": "ok"
+      },
+      {
+        "id": "anvil/sub_vrs_reconcile",
+        "export_rc": 0,
+        "export_seconds": 1.905,
+        "status": "tlc_error",
+        "refusals": 0,
+        "holes": 139,
+        "restrictions": 19,
+        "reasons": [],
+        "sany_status": "ok",
+        "tlc_rc": 75,
+        "generated": 1138,
+        "distinct": 2,
+        "errors": [
+          "Error: TLC threw an unexpected exception.",
+          "Error: The behavior up to this point is:",
+          "Error: TLC threw an unexpected exception.",
+          "Error: The behavior up to this point is:",
+          "Error: The error occurred when TLC was evaluating the nested"
+        ]
+      }
+    ]
+  },
+  "after": {
+    "binary": "/data/home/kirancodes/Documents/code/verus-research/wt-export-partial/source/target-verus/release/verus",
+    "group": "anvil",
+    "phase": "anvil-acceptance",
+    "export_seconds": 90,
+    "tlc_seconds": 30,
+    "jobs": 2,
+    "sha256": {
+      "verus": "5ffa1cb2b1e0df2bbed030d98414f20640f9c0613551a62be858ad320bf87a2a",
+      "rust_verify": "392bdb513502890508cf0a9cddf83fcad03e0041b3b4c960e60a04c26e3de1e4"
+    },
+    "rows": [
+      {
+        "id": "anvil/sub_network",
+        "export_rc": 0,
+        "export_seconds": 2.006,
+        "status": "tlc_error",
+        "refusals": 2,
+        "holes": 5,
+        "restrictions": 0,
+        "reasons": [
+          "application of a spec_fn value that does not reduce to a closure"
+        ],
+        "sany_status": "ok",
+        "tlc_rc": 14,
+        "invariant_violations": [],
+        "exploration_complete": false,
+        "generated": 1,
+        "distinct": 1,
+        "errors": [
+          "Error: The first argument of Assert evaluated to FALSE; the second argument was:",
+          "Error: The behavior up to this point is:",
+          "Error: The first argument of Assert evaluated to FALSE; the second argument was:",
+          "Error: The behavior up to this point is:",
+          "Error: The error occurred when TLC was evaluating the nested"
+        ]
+      },
+      {
+        "id": "anvil/sub_controller",
+        "export_rc": 0,
+        "export_seconds": 2.208,
+        "status": "sany_error",
+        "refusals": 9,
+        "holes": 8,
+        "restrictions": 0,
+        "reasons": [
+          "application of a spec_fn value that does not reduce to a closure",
+          "closure value `model` used other than in an application"
+        ],
+        "sany_status": "ok",
+        "tlc_rc": 150,
+        "invariant_violations": [],
+        "exploration_complete": false,
+        "errors": [
+          "Error: Parsing or semantic analysis failed."
+        ]
+      },
+      {
+        "id": "anvil/sub_vrs_reconcile",
+        "export_rc": 0,
+        "export_seconds": 2.005,
+        "status": "complete",
+        "refusals": 0,
+        "holes": 139,
+        "restrictions": 3,
+        "reasons": [],
+        "sany_status": "ok",
+        "tlc_rc": 0,
+        "invariant_violations": [
+          "not_error"
+        ],
+        "exploration_complete": true,
+        "generated": 7960,
+        "distinct": 7,
+        "errors": [
+          "Error: Invariant not_error is violated.",
+          "Error: The behavior up to this point is:"
+        ]
+      }
+    ]
+  },
+  "regressions_after": {
+    "binary": "/data/home/kirancodes/Documents/code/verus-research/wt-export-partial/source/target-verus/release/verus",
+    "group": "regressions",
+    "phase": "anvil-acceptance-regressions",
+    "export_seconds": 90,
+    "tlc_seconds": 30,
+    "jobs": 2,
+    "sha256": {
+      "verus": "5ffa1cb2b1e0df2bbed030d98414f20640f9c0613551a62be858ad320bf87a2a",
+      "rust_verify": "392bdb513502890508cf0a9cddf83fcad03e0041b3b4c960e60a04c26e3de1e4"
+    },
+    "rows": [
+      {
+        "id": "splinter/PagedBetree",
+        "export_rc": 0,
+        "export_seconds": 1.405,
+        "status": "complete",
+        "refusals": 0,
+        "holes": 37,
+        "restrictions": 33,
+        "reasons": [],
+        "sany_status": "ok",
+        "tlc_rc": 0,
+        "invariant_violations": [],
+        "exploration_complete": true,
+        "generated": 173,
+        "distinct": 25,
+        "errors": []
+      },
+      {
+        "id": "splinter/PivotBetree",
+        "export_rc": 0,
+        "export_seconds": 1.305,
+        "status": "complete",
+        "refusals": 0,
+        "holes": 42,
+        "restrictions": 64,
+        "reasons": [],
+        "sany_status": "ok",
+        "tlc_rc": 0,
+        "invariant_violations": [],
+        "exploration_complete": true,
+        "generated": 133,
+        "distinct": 25,
+        "errors": []
+      },
+      {
+        "id": "nrkernel/mmu_rl1",
+        "export_rc": 0,
+        "export_seconds": 6.709,
+        "status": "exported",
+        "refusals": 0,
+        "holes": 59,
+        "restrictions": 24,
+        "reasons": [],
+        "sany_status": "ok"
+      },
+      {
+        "id": "nrkernel/mmu_rl2",
+        "export_rc": 0,
+        "export_seconds": 6.811,
+        "status": "exported",
+        "refusals": 0,
+        "holes": 107,
+        "restrictions": 52,
+        "reasons": [],
+        "sany_status": "ok"
+      },
+      {
+        "id": "nrkernel/mmu_rl3",
+        "export_rc": 0,
+        "export_seconds": 6.609,
+        "status": "exported",
+        "refusals": 0,
+        "holes": 112,
+        "restrictions": 66,
+        "reasons": [],
+        "sany_status": "ok"
+      },
+      {
+        "id": "nrkernel/os",
+        "export_rc": 0,
+        "export_seconds": 13.116,
+        "status": "exported",
+        "refusals": 7,
+        "holes": 356,
+        "restrictions": 187,
+        "reasons": [
+          "choose (TLC cannot evaluate it)",
+          "integer type bound"
+        ],
+        "sany_status": "ok"
+      }
+    ]
+  },
+  "partial_after": {
+    "binary": "/data/home/kirancodes/Documents/code/verus-research/wt-export-partial/source/target-verus/release/verus",
+    "group": "partial",
+    "phase": "anvil-acceptance-partial",
+    "export_seconds": 90,
+    "tlc_seconds": 30,
+    "jobs": 2,
+    "sha256": {
+      "verus": "5ffa1cb2b1e0df2bbed030d98414f20640f9c0613551a62be858ad320bf87a2a",
+      "rust_verify": "392bdb513502890508cf0a9cddf83fcad03e0041b3b4c960e60a04c26e3de1e4"
+    },
+    "rows": [
+      {
+        "id": "nr/UnboundedLog-mono",
+        "export_rc": 0,
+        "export_seconds": 2.013,
+        "status": "tlc_error",
+        "refusals": 0,
+        "holes": 42,
+        "restrictions": 26,
+        "reasons": [],
+        "sany_status": "ok",
+        "tlc_rc": 151,
+        "invariant_violations": [],
+        "exploration_complete": false,
+        "errors": [
+          "Error: The constant parameter Table_arbitrary__tla_closed2 is not assigned a value by the configuration file."
+        ]
+      },
+      {
+        "id": "splinter/AbstractJournal",
+        "export_rc": 0,
+        "export_seconds": 1.505,
+        "status": "complete",
+        "refusals": 0,
+        "holes": 17,
+        "restrictions": 8,
+        "reasons": [],
+        "sany_status": "ok",
+        "tlc_rc": 0,
+        "invariant_violations": [],
+        "exploration_complete": true,
+        "generated": 413,
+        "distinct": 72,
+        "errors": []
+      },
+      {
+        "id": "splinter/AbstractMap",
+        "export_rc": 0,
+        "export_seconds": 1.104,
+        "status": "complete",
+        "refusals": 0,
+        "holes": 10,
+        "restrictions": 7,
+        "reasons": [],
+        "sany_status": "ok",
+        "tlc_rc": 0,
+        "invariant_violations": [],
+        "exploration_complete": true,
+        "generated": 33,
+        "distinct": 3,
+        "errors": []
+      },
+      {
+        "id": "splinter/CrashTolerantJournal",
+        "export_rc": 0,
+        "export_seconds": 1.105,
+        "status": "exploring_timeout",
+        "refusals": 0,
+        "holes": 28,
+        "restrictions": 24,
+        "reasons": [],
+        "sany_status": "ok",
+        "tlc_rc": 124,
+        "invariant_violations": [],
+        "exploration_complete": false,
+        "generated": 303,
+        "distinct": 35,
+        "errors": []
+      },
+      {
+        "id": "splinter/CrashTolerantMap",
+        "export_rc": 0,
+        "export_seconds": 1.105,
+        "status": "tlc_error",
+        "refusals": 0,
+        "holes": 19,
+        "restrictions": 20,
+        "reasons": [],
+        "sany_status": "ok",
+        "tlc_rc": 151,
+        "invariant_violations": [],
+        "exploration_complete": false,
+        "errors": [
+          "Error: The constant parameter Dom_Key is not assigned a value by the configuration file."
+        ]
+      },
+      {
+        "id": "splinter/LinkedJournal",
+        "export_rc": 0,
+        "export_seconds": 1.305,
+        "status": "invariant_violation",
+        "refusals": 0,
+        "holes": 29,
+        "restrictions": 27,
+        "reasons": [],
+        "sany_status": "ok",
+        "tlc_rc": 12,
+        "invariant_violations": [
+          "inv"
+        ],
+        "exploration_complete": false,
+        "generated": 9,
+        "distinct": 4,
+        "errors": [
+          "Error: Invariant inv is violated.",
+          "Error: The behavior up to this point is:"
+        ]
+      }
+    ]
+  },
+  "fixtures_after": {
+    "binary": "/data/home/kirancodes/Documents/code/verus-research/wt-export-partial/source/target-verus/release/verus",
+    "group": "fixtures",
+    "phase": "anvil-acceptance-fixtures",
+    "export_seconds": 90,
+    "tlc_seconds": 30,
+    "jobs": 2,
+    "sha256": {
+      "verus": "5ffa1cb2b1e0df2bbed030d98414f20640f9c0613551a62be858ad320bf87a2a",
+      "rust_verify": "392bdb513502890508cf0a9cddf83fcad03e0041b3b4c960e60a04c26e3de1e4"
+    },
+    "rows": [
+      {
+        "id": "adder_sync",
+        "export_rc": 0,
+        "export_seconds": 0.606,
+        "status": "exported",
+        "refusals": 0,
+        "holes": 1,
+        "restrictions": 0,
+        "reasons": [],
+        "sany_status": "ok"
+      },
+      {
+        "id": "assert_sync",
+        "export_rc": 0,
+        "export_seconds": 0.708,
+        "status": "exported",
+        "refusals": 0,
+        "holes": 0,
+        "restrictions": 0,
+        "reasons": [],
+        "sany_status": "ok"
+      },
+      {
+        "id": "counter",
+        "export_rc": 0,
+        "export_seconds": 0.504,
+        "status": "exported",
+        "refusals": 0,
+        "holes": 0,
+        "restrictions": 0,
+        "reasons": [],
+        "sany_status": "ok"
+      },
+      {
+        "id": "mutex_liveness",
+        "export_rc": 0,
+        "export_seconds": 0.506,
+        "status": "exported",
+        "refusals": 0,
+        "holes": 0,
+        "restrictions": 0,
+        "reasons": [],
+        "sany_status": "ok"
+      },
+      {
+        "id": "mutex_tla",
+        "export_rc": 0,
+        "export_seconds": 0.604,
+        "status": "exported",
+        "refusals": 0,
+        "holes": 0,
+        "restrictions": 0,
+        "reasons": [],
+        "sany_status": "ok"
+      },
+      {
+        "id": "toggle_sync",
+        "export_rc": 0,
+        "export_seconds": 0.606,
+        "status": "exported",
+        "refusals": 0,
+        "holes": 0,
+        "restrictions": 0,
+        "reasons": [],
+        "sany_status": "ok"
+      },
+      {
+        "id": "toydb",
+        "export_rc": 0,
+        "export_seconds": 1.604,
+        "status": "exported",
+        "refusals": 0,
+        "holes": 3,
+        "restrictions": 0,
+        "reasons": [],
+        "sany_status": "ok"
+      }
+    ]
+  },
+  "saved_stack_reproduction": {
+    "generated": 1138,
+    "distinct": 2,
+    "error": "Attempted to select nonexistent field \"v0\" from [tag |-> \"None\"]",
+    "log_sha256": "fc89e1e6db04f5dc5a67764c7dc6839f3b0de30a7807b8741f3472fb051599f7",
+    "spec_sha256": "e1edf5c503e75afcdce932635e62b880d7836df0171f3c037d999e3fc1b70503"
+  },
+  "fixture_comparison": [
+    {
+      "file": "adder_sync/export/State_tla.cfg",
+      "equal": true,
+      "sha256": "dc42f4ac7c164de76a1e973997e5ae2260509e35a94e5630e465dc8c72e68ae0"
+    },
+    {
+      "file": "adder_sync/export/State_tla.tla",
+      "equal": true,
+      "sha256": "8543fcd50a1d8953a6bcc4ad77dc76b66c3296a516c832512df874c3d380f4ec"
+    },
+    {
+      "file": "adder_sync/export/State_tla_trace.cfg",
+      "equal": true,
+      "sha256": "4c0dda1fee2484b902db6b6975cb40855f3c30e9ee28849bb5873db06d8fd6ba"
+    },
+    {
+      "file": "adder_sync/export/State_tla_trace.tla",
+      "equal": true,
+      "sha256": "6073c4dc0590ba3763597966daccf6f13cf14948d345d4eb21093aa33516cf7c"
+    },
+    {
+      "file": "assert_sync/export/State_tla.cfg",
+      "equal": true,
+      "sha256": "1d76b7c9bb7d8ce49c4b93bf801cfb6d424f3e8c34743eb59f32dcb52b42dc8f"
+    },
+    {
+      "file": "assert_sync/export/State_tla.tla",
+      "equal": true,
+      "sha256": "4f8b2690d458c291d49843ce47886c2b8331d8c95bc15b54d9de399d85a41c7f"
+    },
+    {
+      "file": "assert_sync/export/State_tla_trace.cfg",
+      "equal": true,
+      "sha256": "4c0dda1fee2484b902db6b6975cb40855f3c30e9ee28849bb5873db06d8fd6ba"
+    },
+    {
+      "file": "assert_sync/export/State_tla_trace.tla",
+      "equal": true,
+      "sha256": "b935daad11f45694a70f41958fdcd4585c72cdff969d6e97de40f9d6f3572b87"
+    },
+    {
+      "file": "counter/export/State_tla.cfg",
+      "equal": true,
+      "sha256": "07ea3953075a098d96c20f1553408b68a4c2ceb221a9ce5c468fd3bbd73fa2d7"
+    },
+    {
+      "file": "counter/export/State_tla.tla",
+      "equal": true,
+      "sha256": "36b11ce6b0077fb01d44e390d543360a1be4f0248dcc7ae6207c002ce154be18"
+    },
+    {
+      "file": "counter/export/State_tla_trace.cfg",
+      "equal": true,
+      "sha256": "4c0dda1fee2484b902db6b6975cb40855f3c30e9ee28849bb5873db06d8fd6ba"
+    },
+    {
+      "file": "counter/export/State_tla_trace.tla",
+      "equal": true,
+      "sha256": "93c356846281fea9b2d8775b063f81f879f015ce28fc535edd50c50f4997d03d"
+    },
+    {
+      "file": "mutex_liveness/export/ProgramState_tla.cfg",
+      "equal": true,
+      "sha256": "533a092f3d125531cff14cc059695cbef2e2f413479fce6d04e39f9a9aec25f5"
+    },
+    {
+      "file": "mutex_liveness/export/ProgramState_tla.tla",
+      "equal": true,
+      "sha256": "9e27c19574876bbd23c17b346401f9dee0f4afe39538338b4ecaafeb3e9eca46"
+    },
+    {
+      "file": "mutex_liveness/export/ProgramState_tla_trace.cfg",
+      "equal": true,
+      "sha256": "4c0dda1fee2484b902db6b6975cb40855f3c30e9ee28849bb5873db06d8fd6ba"
+    },
+    {
+      "file": "mutex_liveness/export/ProgramState_tla_trace.tla",
+      "equal": true,
+      "sha256": "96921e0e2309c939a3cf6d93903cbc2208c0b184f01593067ee11f34d6fdee81"
+    },
+    {
+      "file": "mutex_tla/export/State_tla.cfg",
+      "equal": true,
+      "sha256": "87833bc818627b60e0318620066a059bd45598a501e7acc4eca96e73c253b234"
+    },
+    {
+      "file": "mutex_tla/export/State_tla.tla",
+      "equal": true,
+      "sha256": "38cd23a4c57b84b1206f69640383f5240a3c4f67bce0eb48ecaed63eb8691e78"
+    },
+    {
+      "file": "mutex_tla/export/State_tla_trace.cfg",
+      "equal": true,
+      "sha256": "4c0dda1fee2484b902db6b6975cb40855f3c30e9ee28849bb5873db06d8fd6ba"
+    },
+    {
+      "file": "mutex_tla/export/State_tla_trace.tla",
+      "equal": true,
+      "sha256": "66dc230bc0d2126cd7925ca0126574c985fb016adbfa1fbff0ee65d179d5476c"
+    },
+    {
+      "file": "toggle_sync/export/State_tla.cfg",
+      "equal": true,
+      "sha256": "e34239e8f50d92f3290b25f157ce0cbae93e05596b46d8be30531cc66a6c2be9"
+    },
+    {
+      "file": "toggle_sync/export/State_tla.tla",
+      "equal": true,
+      "sha256": "806366842567db143b16430c8cf0631e211f7e935b9d133007d98f7b899e21fe"
+    },
+    {
+      "file": "toggle_sync/export/State_tla_trace.cfg",
+      "equal": true,
+      "sha256": "4c0dda1fee2484b902db6b6975cb40855f3c30e9ee28849bb5873db06d8fd6ba"
+    },
+    {
+      "file": "toggle_sync/export/State_tla_trace.tla",
+      "equal": true,
+      "sha256": "3b5997b17d7fefc6cbb2fcfe64276c50fc773fe59fca13aa99868b303205a0e0"
+    },
+    {
+      "file": "toydb/export/GState_tla.cfg",
+      "equal": true,
+      "sha256": "9a981c712bfa625bb8a523e592661c86cde5a227abe5412a34af54b6bc3b05b7"
+    },
+    {
+      "file": "toydb/export/GState_tla.tla",
+      "equal": true,
+      "sha256": "c573df8522483f57f208d0bb3972e8b04249592620fc0f171a1a9b9d39ca6ee8"
+    },
+    {
+      "file": "toydb/export/GState_tla_trace.cfg",
+      "equal": true,
+      "sha256": "4c0dda1fee2484b902db6b6975cb40855f3c30e9ee28849bb5873db06d8fd6ba"
+    },
+    {
+      "file": "toydb/export/GState_tla_trace.tla",
+      "equal": true,
+      "sha256": "e14592b3506b90046635551d5e547027a7dede87fff387443d5223019d866cab"
+    }
+  ],
+  "bounds": [
+    {
+      "file": "anvil/sub_controller/MC.cfg",
+      "unchanged": true,
+      "sha256": "db948d42cba9b86e47e079ffd931c1cc4438709cd254dab6c99fbd034f54387e"
+    },
+    {
+      "file": "anvil/sub_controller/MC.tla",
+      "unchanged": true,
+      "sha256": "9230f67a835f59a4441b936bc7665bab2aede046ad9ca8c9c681b0e3dbc2e0f8"
+    },
+    {
+      "file": "anvil/sub_network/MC.cfg",
+      "unchanged": true,
+      "sha256": "633f6bb8ce5c312d3693980b46324fa2c270ac5ccebeb586284a73d04d2951d5"
+    },
+    {
+      "file": "anvil/sub_network/MC.tla",
+      "unchanged": true,
+      "sha256": "9e026493adf3548d4a41baa7900e4e60e9b5fcd5bedefcf4b7a9de2b3a933e86"
+    },
+    {
+      "file": "anvil/sub_vrs_reconcile/MC.cfg",
+      "unchanged": true,
+      "sha256": "d3d323e21f9f8d3c8f7fbc78499675cece24487ca202c636ff3118107ab480bf"
+    },
+    {
+      "file": "anvil/sub_vrs_reconcile/MC.tla",
+      "unchanged": true,
+      "sha256": "874c29fbcd9d9fc495cf3c8f0cf5da68bfc9ddc43e3b709959c994774523f56a"
+    },
+    {
+      "file": "splinter/PagedBetree/MC.cfg",
+      "unchanged": true,
+      "sha256": "71c0d7f43c1cb91142fed2f73dae9df429a9f97c6e79bd87d8e2038cdb21c21a"
+    },
+    {
+      "file": "splinter/PagedBetree/MC.tla",
+      "unchanged": true,
+      "sha256": "e9bab152d8a64495c3cdbe800b9e96d87934737764f5fdea09765236689deaa3"
+    },
+    {
+      "file": "splinter/PivotBetree/MC.cfg",
+      "unchanged": true,
+      "sha256": "8d35621312779f0d0bf2a1e7e556c1139b1e212af2aa4bfbff909314515ce56b"
+    },
+    {
+      "file": "splinter/PivotBetree/MC.tla",
+      "unchanged": true,
+      "sha256": "96364023876479dde667923471750bf0b53bdb85adfe53cf6ef5d937d68ce3c3"
+    },
+    {
+      "file": "nr/UnboundedLog-mono/MC.cfg",
+      "unchanged": true,
+      "sha256": "ae1037d89032471b6e04c6aaadcf8c7dd48c351e9b57e0b835a54b1b4a22c620"
+    },
+    {
+      "file": "nr/UnboundedLog-mono/MC.tla",
+      "unchanged": true,
+      "sha256": "a54fcdbc4f5c23582a61ca71d80723532bd92b16225a9b3bbc5ca2bab5a568c7"
+    },
+    {
+      "file": "splinter/AbstractJournal/MC.cfg",
+      "unchanged": true,
+      "sha256": "d76106ef99644849ffa418c3ddaafc6c45506a1a490ddc8ea6f1c1f54202be8f"
+    },
+    {
+      "file": "splinter/AbstractJournal/MC.tla",
+      "unchanged": true,
+      "sha256": "c09d8b0a574f6a88c4ccd7b3dad5363a2cac80307b73273f2423171686f2368c"
+    },
+    {
+      "file": "splinter/AbstractMap/MC.cfg",
+      "unchanged": true,
+      "sha256": "382513109b0446183344f547aebfb647d9fbc3bdb889c53b756958399f13a966"
+    },
+    {
+      "file": "splinter/AbstractMap/MC.tla",
+      "unchanged": true,
+      "sha256": "0f720742e30c55c85e327e79ca6438386ff8e4b10e8a8af05344af811a1606d0"
+    },
+    {
+      "file": "splinter/CrashTolerantJournal/MC.cfg",
+      "unchanged": true,
+      "sha256": "24d03b449eeb46b495fb1dbd89773d3e9160a9c2078ee511d8e5d0503d5e2814"
+    },
+    {
+      "file": "splinter/CrashTolerantJournal/MC.tla",
+      "unchanged": true,
+      "sha256": "939952abfffe61daddd5cf3c83da64323f6b035287ec306d9be23a9c5ca9a1d6"
+    },
+    {
+      "file": "splinter/CrashTolerantMap/MC.cfg",
+      "unchanged": true,
+      "sha256": "dfad426d68bfe87194c2bd3206a1f32a26cac65d0c5c3bc7a76c2eee729400d6"
+    },
+    {
+      "file": "splinter/CrashTolerantMap/MC.tla",
+      "unchanged": true,
+      "sha256": "551a422f295fcdb641357b95bc29a4a91695d0b19617d0106d9f8ec9e6ca163a"
+    },
+    {
+      "file": "splinter/LinkedJournal/MC.cfg",
+      "unchanged": true,
+      "sha256": "dd78a3709745ec97ffb40b72a4ad10beb26aba9aa21eb6fc3a8cda128dc9b568"
+    },
+    {
+      "file": "splinter/LinkedJournal/MC.tla",
+      "unchanged": true,
+      "sha256": "19d7382da27db2cafa7faf43ace552d35d8ef85d3a0ebba36c5734ad650b9db4"
+    }
+  ],
+  "source_sha256": {
+    "source/vir/src/tla.rs": "2203de7330c16a240288372162b6d822470929563ca527d368fcb252e17f245e",
+    "source/rust_verify_test/tests/tla_export.rs": "a38d8fb97160998a65555c919b24b1aef01769b852f895ade3bd63760c3f1c71",
+    "audit/export-partial/replay.py": "954633aca79b9e3db323df087370bc5df9dd8b0574d7fccba317581ed0c77fe8"
+  },
+  "tests": {
+    "result": "test result: ok. 210 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 80.91s",
+    "TLA2TOOLS_JAR": "/Users/kirancodes/.verus-tools-mcp/tlc/basis-11305b4a05/tla2tools.jar",
+    "log_sha256": "e3858948217c97cd4ffa9b0f0c0f0cc861235d5ea6c07ddc924e880f052e11ef"
+  }
+}

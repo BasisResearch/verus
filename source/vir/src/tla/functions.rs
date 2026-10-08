@@ -6,6 +6,7 @@
 //! instance identity; type-independent emission does not erase semantic identity.
 use super::*;
 use std::cell::RefCell;
+use std::rc::Rc;
 
 pub(super) enum FunctionUse<'a> {
     Call(&'a CallTargetKind, &'a Fun, &'a Typs),
@@ -42,11 +43,13 @@ impl ResolvedFunction {
 }
 
 #[derive(Clone)]
-pub(super) struct Functions(RefCell<Registry>);
+// Interned function identities are independent of a printing snapshot.
+// Guard probes must share their resolved instances with the real exporter.
+pub(super) struct Functions(Rc<RefCell<Registry>>);
 
 impl Functions {
     pub(super) fn new(krate: &Krate) -> Self {
-        Self(RefCell::new(Registry {
+        Self(Rc::new(RefCell::new(Registry {
             functions: krate.functions.iter().map(|f| (f.x.name.clone(), f.clone())).collect(),
             instances: Vec::new(),
             assoc_types: krate.assoc_type_impls.clone(),
@@ -66,7 +69,7 @@ impl Functions {
                     _ => None,
                 })
                 .collect(),
-        }))
+        })))
     }
 
     /// Mandatory entry point for calls AND declaration/closure/operator roots.

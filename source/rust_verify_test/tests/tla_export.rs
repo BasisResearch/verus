@@ -812,10 +812,11 @@ fn tla_export_checks_a_narrowing_cast_where_it_is_evaluated() {
     assert_eq!(names(&ex.report["skipped_invariants"]), ["wide"]);
     let Some(jar) = tla_tools() else { return };
     sany(&jar, &ex.spec());
-    // 254 and 255 are reached; the step from 255 stops TLC at the cast.
-    let out = tlc_output(&jar, &ex.spec(), &ex.cfg);
-    assert!(out.contains("tla-export: value out of range of u8 in a cast at"), "{}", out);
-    assert!(out.contains("x = 255"), "{}", out);
+    // 254 and 255 are reached; the undefined cast disables the next step.
+    assert!(ex.report["restrictions"].as_array().unwrap().len() > 0);
+    let run = tlc(&jar, &ex.spec(), &ex.cfg);
+    assert_eq!(run.distinct, 2);
+    assert!(run.violated.is_empty());
 }
 
 /// A narrowing cast behind the guard that keeps it in range, the usual
@@ -8817,8 +8818,8 @@ fn tla_export_refuses_set_choose_and_a_function_parameter() {
     // a choice among the orders, and TLC would hold `ordered`, `clipped`
     // and `mixed` for the one it takes; `acc * 2 + x` chains `+` over an
     // operand reading `acc`, so `scaled` is refused too. `ISet::finite` is
-    // refused, as every set TLC builds is finite, and `Set::complement`, as
-    // `Set::full` is: it is `None` for an infinite type. A comprehension
+    // checked relative to its explicit finite carrier. `Set::complement`
+    // and `Set::full` remain refused: they are `None` for an infinite type. A comprehension
     // whose binder only a hole bounds is refused when the binder's type is a
     // type parameter (`others`, and vstd's generic bodies): one hole would
     // stand for every instantiation. A fold or `Set::new`
@@ -8840,7 +8841,6 @@ fn tla_export_refuses_set_choose_and_a_function_parameter() {
         ("vstd operation given a function that does not reduce to a closure", 1),
         ("vstd operation given a predicate that does not reduce to a closure", 1),
         ("Set::fold of a function not seen to be commutative", 4),
-        ("ISet::finite (the export builds only finite sets)", 1),
         ("Set::complement (unbounded)", 1),
         ("set comprehension over a type parameter (no hole can stand for every instantiation)", 1),
     ] {
@@ -8848,10 +8848,10 @@ fn tla_export_refuses_set_choose_and_a_function_parameter() {
         assert_eq!(at.len(), count, "{what}: {:?}", refusals);
         assert!(at.iter().all(|l| l.contains("test.rs:")), "{what}: {:?}", at);
     }
-    assert_eq!(names(&ex.report["invariants"]), ["small"], "{}", ex.cfg);
+    assert_eq!(names(&ex.report["invariants"]), ["finite", "small"], "{}", ex.cfg);
     let Some(jar) = tla_tools() else { return };
     sany(&jar, &ex.spec());
-    let run = tlc(&jar, &ex.spec(), &ex.cfg);
+    let run = tlc(&jar, &ex.spec(), &(ex.cfg.clone() + "\nCONSTANT Dom_int = {0, 1}\n"));
     assert_eq!(run.violated, Vec::<String>::new(), "{}", ex.tla);
 }
 
@@ -11959,4 +11959,617 @@ pub open spec fn bounded(s: State) -> bool { s.hosts.len() == 2 }
         std::fs::write(ex.spec(), text).unwrap();
         assert_eq!(tlc(&jar, &ex.spec(), &cfg).distinct, if complete { 1 } else { 2 });
     }
+}
+#[test]
+fn tla_export_partial_reads_before_guards_and_unguarded_sites() {
+    let ex = export_code_with(
+        r#"
+use vstd::map::*;
+use vstd::seq::*;
+verus! {
+pub struct State { pub n: nat, pub m: Map<nat, nat>, pub o: Option<nat>, pub q: Seq<nat> }
+pub open spec fn init(s: State) -> bool { s.n == 0 && s.m == Map::empty() && s.o == None && s.q == Seq::empty() }
+pub open spec fn payload<T>(o: Option<T>) -> T { o.unwrap() }
+pub open spec fn next(pre: State, post: State) -> bool {
+    ||| (pre.m[0] == 3 && pre.m.contains_key(0) && post == pre)
+    ||| (payload(pre.o) == 3 && pre.o is Some && post == pre)
+    ||| (pre.q[0] == 3 && post == pre)
+    ||| (!(pre.m[0] == 3) && post == State { n: 9, ..pre })
+    ||| (pre.n < 1 && post == State { n: 1, ..pre })
+}
+pub open spec fn bounded(s: State) -> bool { s.n <= 1 }
+}
+"#,
+        "test_crate",
+        &["--no-verify"],
+    );
+    assert!(ex.report["refusals"].as_array().unwrap().is_empty(), "{}", ex.report);
+    assert!(
+        ex.report["restrictions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["what"].as_str().unwrap().contains("partial read"))
+    );
+    assert!(ex.tla.contains("ELSE FALSE"), "{}", ex.tla);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let run = tlc(&jar, &ex.spec(), &ex.cfg);
+    assert_eq!(run.distinct, 2, "{}", ex.tla);
+    assert!(run.violated.is_empty());
+}
+
+#[test]
+fn tla_export_total_infinite_carriers_mk_map_finite_and_flatten() {
+    let ex = export_code_with(
+        r#"
+use vstd::imap::*;
+use vstd::iset::*;
+verus! {
+pub struct State { pub n: nat }
+pub open spec fn init(s: State) -> bool { s.n == 0 }
+pub open spec fn next(pre: State, post: State) -> bool { pre.n < 1 && post.n == pre.n + 1 }
+pub open spec fn total(s: State) -> bool { IMap::<nat, nat>::total(|k: nat| k + 1)[0] == 1 }
+pub open spec fn mapped(s: State) -> bool { ISet::<nat>::full().mk_map(|k: nat| k + 2)[1] == 3 }
+pub open spec fn finite(s: State) -> bool { ISet::<nat>::full().finite() }
+pub open spec fn full(s: State) -> bool { IMap::<nat, nat>::total(|k: nat| k).dom().is_full() }
+pub open spec fn flat(s: State) -> bool { ISet::<ISet<nat>>::empty().insert(ISet::<nat>::full()).flatten().contains(1) }
+pub open spec fn comprehension(s: State) -> bool { ISet::new(|k: nat| true).contains(1) }
+}
+"#,
+        "test_crate",
+        &["--no-verify"],
+    );
+    assert!(ex.report["refusals"].as_array().unwrap().is_empty(), "{}", ex.report);
+    assert!(ex.tla.contains("ASSUME IsFiniteSet(Dom_nat)"), "{}", ex.tla);
+    assert!(ex.tla.contains("model restricted to finite carrier Dom_nat"));
+    assert!(ex.tla.contains("UNION ("));
+    assert!(
+        ex.report["holes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|h| h["location"].as_str().unwrap().contains("test.rs:"))
+    );
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let run = tlc(&jar, &ex.spec(), &(ex.cfg.clone() + "\nCONSTANT Dom_nat = {0, 1}\n"));
+    assert_eq!(run.distinct, 2);
+    assert!(run.violated.is_empty(), "{:?}", run);
+}
+
+#[test]
+fn tla_export_recursive_partial_value_is_checked_to_the_base_case() {
+    let ex = export_code_with(
+        r#"
+use vstd::seq::*;
+verus! {
+pub struct State { pub n: nat, pub q: Seq<nat> }
+pub open spec fn sum(q: Seq<nat>, n: nat) -> nat
+    decreases n,
+{ if n == 0 { 0 } else { q[(n - 1) as int] + sum(q, (n - 1) as nat) } }
+pub open spec fn init(s: State) -> bool { s.n == 0 && s.q == seq![1nat] }
+pub open spec fn next(pre: State, post: State) -> bool {
+    ||| (sum(pre.q, 2) == 2 && post.n == 9 && post.q == pre.q)
+    ||| (pre.n == 0 && sum(pre.q, 1) == 1 && post.n == 1 && post.q == pre.q)
+}
+pub open spec fn bounded(s: State) -> bool { s.n <= 1 }
+}
+"#,
+        "test_crate",
+        &["--no-verify"],
+    );
+    assert!(ex.report["refusals"].as_array().unwrap().is_empty(), "{}", ex.report);
+    assert!(ex.tla.contains("RECURSIVE Defined_sum"), "{}", ex.tla);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let run = tlc(&jar, &ex.spec(), &ex.cfg);
+    assert_eq!(run.distinct, 2);
+    assert!(run.violated.is_empty(), "{:?}", run);
+}
+
+#[test]
+fn tla_export_finite_carrier_checks_record_keys() {
+    let ex = export_code_with(
+        r#"
+use vstd::imap::*;
+use vstd::iset::*;
+verus! {
+pub struct Key { pub n: nat, pub on: bool }
+pub struct State { pub n: nat }
+pub open spec fn init(s: State) -> bool { s.n == 0 }
+pub open spec fn next(pre: State, post: State) -> bool { post == pre }
+pub open spec fn total(s: State) -> bool {
+    IMap::<Key, nat>::total(|k: Key| k.n)[Key { n: 0, on: true }] == 0
+        && ISet::<Key>::new(|k: Key| true).contains(Key { n: 0, on: true })
+}
+}
+"#,
+        "test_crate",
+        &["--no-verify"],
+    );
+    assert!(ex.report["refusals"].as_array().unwrap().is_empty(), "{}", ex.report);
+    let Some(jar) = tla_tools() else { return };
+    let end = ex.tla.rfind("\n====").unwrap();
+    let with_keys =
+        |n: i32| format!("{}\nTestKeys == {{[n |-> {}, on |-> TRUE]}}\n====\n", &ex.tla[..end], n);
+    std::fs::write(ex.spec(), with_keys(0)).unwrap();
+    sany(&jar, &ex.spec());
+    let cfg = ex.cfg.clone() + "\nCONSTANT Dom_Key <- TestKeys\n";
+    let run = tlc(&jar, &ex.spec(), &cfg);
+    assert_eq!(run.distinct, 1);
+    assert!(run.violated.is_empty());
+    std::fs::write(ex.spec(), with_keys(-1)).unwrap();
+    let output =
+        tlc_output(&jar, &ex.spec(), "INIT Init\nNEXT Next\nCONSTANT Dom_Key <- TestKeys\n");
+    assert!(output.contains("Assumption") && output.contains("false"), "{}", output);
+}
+
+#[test]
+fn tla_export_moves_membership_and_variant_guards_without_restriction() {
+    let ex = export_code_with(
+        r#"
+use vstd::map::*;
+use vstd::seq::*;
+verus! {
+pub struct State { pub m: Map<nat, nat>, pub o: Option<nat>, pub q: Seq<nat> }
+pub open spec fn init(s: State) -> bool { s.m == Map::empty() && s.o == None && s.q == Seq::empty() }
+pub open spec fn next(pre: State, post: State) -> bool {
+    ||| (pre.m[0] == 1 && pre.m.contains_key(0) && post == pre)
+    ||| (pre.o.unwrap() == 1 && pre.o is Some && post == pre)
+    ||| (exists|i: int| 0 <= i < 2 && (pre.q[i] == 1 && 0 <= i < pre.q.len() && post == pre))
+}
+}
+"#,
+        "test_crate",
+        &["--no-verify"],
+    );
+    assert!(ex.report.get("restrictions").is_none(), "{}", ex.report);
+    assert!(ex.tla.contains("(0 \\in DOMAIN m) /\\ (m[0] = 1)"), "{}", ex.tla);
+    assert!(ex.tla.contains("(o.tag = \"Some\") /\\ (o.v0 = 1)"), "{}", ex.tla);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    assert_eq!(tlc(&jar, &ex.spec(), &ex.cfg).distinct, 1);
+}
+
+#[test]
+fn tla_export_partial_map_constructor_disables_the_enclosing_predicate() {
+    let ex = export_code_with(
+        r#"
+use vstd::map::*;
+use vstd::set::*;
+verus! {
+pub struct State { pub n: nat, pub m: Map<nat, nat> }
+pub open spec fn copy(m: Map<nat, nat>) -> Map<nat, nat> {
+    Map::new(Set::empty().insert(0), |k: nat| m[k])
+}
+pub open spec fn init(s: State) -> bool { s.n == 0 && s.m == Map::empty() }
+pub open spec fn next(pre: State, post: State) -> bool {
+    ||| (post.m == copy(pre.m) && post.n == 9)
+    ||| (pre.n == 0 && post.n == 1 && post.m == pre.m)
+}
+pub open spec fn bounded(s: State) -> bool { s.n <= 1 }
+}
+"#,
+        "test_crate",
+        &["--no-verify"],
+    );
+    assert!(ex.report["refusals"].as_array().unwrap().is_empty(), "{}", ex.report);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let run = tlc(&jar, &ex.spec(), &ex.cfg);
+    assert_eq!(run.distinct, 2);
+    assert!(run.violated.is_empty(), "{:?}", run);
+}
+
+#[test]
+fn tla_export_partial_requirements_keep_destructuring_locals_in_scope() {
+    let ex = export_code_with(
+        r#"
+use vstd::seq::*;
+verus! {
+pub struct State { pub n: nat, pub q: Seq<nat> }
+pub open spec fn get(q: Seq<nat>, i: nat) -> nat {
+    let (a, j) = match Some((q, i)) { Some((a, j)) => (a, j), None => (q, i) };
+    let entry = a[j as int];
+    entry
+}
+pub open spec fn init(s: State) -> bool { s.n == 0 && s.q == seq![1nat] }
+pub open spec fn next(pre: State, post: State) -> bool {
+    ||| (get(pre.q, 1) == 1 && post.n == 9 && post.q == pre.q)
+    ||| (pre.n == 0 && get(pre.q, 0) == 1 && post.n == 1 && post.q == pre.q)
+}
+pub open spec fn bounded(s: State) -> bool { s.n <= 1 }
+}
+"#,
+        "test_crate",
+        &["--no-verify"],
+    );
+    assert!(ex.report["refusals"].as_array().unwrap().is_empty(), "{}", ex.report);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let run = tlc(&jar, &ex.spec(), &ex.cfg);
+    assert_eq!(run.distinct, 2);
+    assert!(run.violated.is_empty(), "{:?}", run);
+}
+
+/// Exact parent exports, with only the checkout-dependent source path normalized.
+/// The source model is pinned too, so changes in the external toyDB checkout
+/// cannot silently change the expected exporter behavior.
+#[test]
+fn tla_export_partial_preserves_raft_and_all_example_bytes() {
+    let root = Path::new("tests/tla_export_fixtures/compat");
+    for (name, path, module) in [
+        ("adder_sync", fixture("adder_sync.rs"), "test_crate::Adder"),
+        ("assert_sync", fixture("assert_sync.rs"), "test_crate::Guarded"),
+        ("counter", fixture("counter.rs"), "test_crate"),
+        ("mutex_liveness", fixture("mutex_liveness.rs"), "test_crate"),
+        ("mutex_tla", fixture("mutex_tla.rs"), "test_crate"),
+        ("toggle_sync", fixture("toggle_sync.rs"), "test_crate::Toggle"),
+        ("toydb", root.join("raft.rs"), "test_crate"),
+    ] {
+        let ex = export_with(&path, module, &["--no-verify"]);
+        for suffix in [".tla", ".cfg", "_trace.tla", "_trace.cfg"] {
+            let file = format!("{}{}", ex.module, suffix);
+            let actual = std::fs::read_to_string(ex.dir.path().join("log").join(&file)).unwrap();
+            let actual = actual.replace(path.to_str().unwrap(), "@SOURCE@");
+            let expected = std::fs::read_to_string(root.join(format!("{name}-{file}"))).unwrap();
+            assert_eq!(actual, expected, "{name}: {file}");
+        }
+    }
+}
+
+#[test]
+fn tla_export_partial_cast_before_recursive_definedness() {
+    let ex = export_code_with(
+        r#"
+verus! {
+pub struct State { pub n: nat }
+pub open spec fn history(start: nat, end: nat) -> nat
+    decreases end
+{
+    if start == end { 0 } else {
+        let last = (end - 1) as nat;
+        history(start, last) + 1
+    }
+}
+pub open spec fn init(s: State) -> bool { s.n == 0 }
+pub open spec fn next(pre: State, post: State) -> bool {
+    ||| post.n == history(1, 0)
+    ||| (pre.n == 0 && post.n == 1)
+}
+pub open spec fn bounded(s: State) -> bool { s.n <= 1 }
+}
+"#,
+        "test_crate",
+        &["--no-verify"],
+    );
+    assert!(ex.report["refusals"].as_array().unwrap().is_empty(), "{}", ex.report);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let run = tlc(&jar, &ex.spec(), &ex.cfg);
+    assert_eq!(run.distinct, 2);
+    assert!(run.violated.is_empty());
+}
+
+#[test]
+fn tla_export_partial_shape_fact_is_invalidated_by_a_write() {
+    let ex = export_code_with(
+        r#"
+use vstd::seq::*;
+verus! {
+pub struct State { pub n: nat, pub q: Seq<int>, pub done: bool }
+pub open spec fn init(s: State) -> bool {
+    s.n == 1 && s.q == seq![7int] && s.q.len() == s.n && !s.done
+}
+pub open spec fn next(pre: State, post: State) -> bool {
+    ||| (!pre.done && post == State { n: pre.n, q: Seq::empty(), done: true })
+    ||| (pre.done && 0 < pre.n && pre.q[0] == 7 && post == pre)
+}
+}
+"#,
+        "test_crate",
+        &["--no-verify"],
+    );
+    assert!(!ex.report["restrictions"].as_array().unwrap().is_empty());
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    assert_eq!(tlc(&jar, &ex.spec(), &ex.cfg).distinct, 2);
+}
+
+#[test]
+fn tla_export_partial_lazy_condition_is_checked_at_use() {
+    let ex = export_code_with(
+        r#"
+use vstd::seq::*;
+verus! {
+pub struct State { pub q: Seq<int>, pub n: nat }
+pub open spec fn init(s: State) -> bool { s.q == Seq::empty() && s.n == 0 }
+pub open spec fn next(pre: State, post: State) -> bool {
+    let value = if pre.q[0] == 7 { 1nat } else { 2nat };
+    ||| (pre.q.len() > 0 && post == State { n: value, ..pre })
+    ||| (post == State { n: value, ..pre })
+    ||| (pre.n == 0 && post == State { n: 1, ..pre })
+}
+pub open spec fn bounded(s: State) -> bool { s.n <= 1 }
+}
+"#,
+        "test_crate",
+        &["--no-verify"],
+    );
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let run = tlc(&jar, &ex.spec(), &ex.cfg);
+    assert_eq!(run.distinct, 2);
+    assert!(run.violated.is_empty());
+}
+
+#[test]
+fn tla_export_partial_redundant_later_guard_does_not_reorder() {
+    let ex = export_code(
+        r#"
+use vstd::map::*;
+verus! {
+pub struct State { pub m: Map<int, int> }
+pub open spec fn init(s: State) -> bool { s.m == Map::empty().insert(0, 7) }
+pub open spec fn next(pre: State, post: State) -> bool {
+    pre.m.contains_key(0) && pre.m[0] == 7 && pre.m.contains_key(0) && post == pre
+}
+}
+"#,
+        "test_crate",
+    );
+    assert!(
+        ex.tla.contains("(((0 \\in DOMAIN m) /\\ (m[0] = 7)) /\\ (0 \\in DOMAIN m))"),
+        "{}",
+        ex.tla
+    );
+    assert!(ex.report.get("restrictions").is_none(), "{}", ex.report);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    assert_eq!(tlc(&jar, &ex.spec(), &ex.cfg).distinct, 1);
+}
+
+/// PagedBetree substitutes through a mutually recursive map constructor.
+/// The inner definedness body must see the outer operator's declaration.
+#[test]
+fn tla_export_mutually_recursive_substitution_definedness() {
+    let ex = export_code_with(
+        r#"
+use vstd::map::*;
+use vstd::set::*;
+verus! {
+pub struct State { pub m: Map<nat, nat>, pub n: nat }
+pub open spec fn substitute(m: Map<nat, nat>, n: nat) -> nat
+    decreases n, 1nat
+{
+    if n == 0 { m[0] } else { replaced_children(m, n) }
+}
+pub open spec fn replaced_children(m: Map<nat, nat>, n: nat) -> nat
+    decreases n, 0nat
+{
+    let replacement = substitute(m, (n - 1) as nat);
+    Map::<nat, nat>::new(Set::empty().insert(0), |k: nat| replacement)[0]
+}
+pub open spec fn init(s: State) -> bool { s.m == Map::empty() && s.n == 0 }
+pub open spec fn next(pre: State, post: State) -> bool {
+    ||| (post.m == pre.m && post.n == substitute(pre.m, 2))
+    ||| (pre.n == 0 && post == State { n: 1, ..pre })
+}
+pub open spec fn bounded(s: State) -> bool { s.n <= 1 }
+}
+"#,
+        "test_crate",
+        &["--no-verify"],
+    );
+    assert!(ex.report["refusals"].as_array().unwrap().is_empty(), "{}", ex.report);
+    let declaration = ex.tla.find("RECURSIVE Defined_substitute(").unwrap();
+    let inner_body = ex
+        .tla
+        .lines()
+        .find(|line| line.starts_with("Defined_replaced_children(") && line.contains(" =="))
+        .unwrap_or_else(|| panic!("{}", ex.tla));
+    let inner_body = ex.tla.find(inner_body).unwrap();
+    assert!(declaration < inner_body, "{}", ex.tla);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let run = tlc(&jar, &ex.spec(), &ex.cfg);
+    assert_eq!(run.distinct, 2);
+    assert!(run.violated.is_empty());
+}
+
+/// Forty shared helper layers have 2^40 paths but only forty bodies and one
+/// partial read. Definedness must follow the DAG, not expand all paths.
+#[test]
+fn tla_export_definedness_expansion_shares_helper_arguments() {
+    let mut code = String::from(
+        "use vstd::map::*;\nverus! {\npub struct State { pub m: Map<int, int>, pub n: nat }\npub open spec fn f0(m: Map<int, int>) -> int { m[0] }\n",
+    );
+    for i in 1..=40 {
+        code.push_str(&format!(
+            "pub open spec fn f{i}(m: Map<int, int>) -> int {{ f{}(m) + f{}(m) }}\n",
+            i - 1,
+            i - 1
+        ));
+    }
+    code.push_str(
+        r#"
+pub open spec fn init(s: State) -> bool { s.m == Map::empty() && s.n == 0 }
+pub open spec fn next(pre: State, post: State) -> bool {
+    ||| (f40(pre.m) == 0 && post == State { n: 2, ..pre })
+    ||| (pre.n == 0 && post == State { n: 1, ..pre })
+}
+pub open spec fn bounded(s: State) -> bool { s.n <= 1 }
+}
+"#,
+    );
+    let started = std::time::Instant::now();
+    let ex = export_code_with(&code, "test_crate", &["--no-verify"]);
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(30),
+        "shared DAG export exceeded 30 seconds"
+    );
+    assert!(ex.report["refusals"].as_array().unwrap().is_empty(), "{}", ex.report);
+    assert!(ex.tla.len() < 40_000, "expanded output: {} bytes", ex.tla.len());
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    // TLC eagerly preprocesses the duplicated value DAG itself. Exercise its
+    // semantics on eight layers; the export/SANY bound above covers all forty.
+    let small =
+        export_code_with(&code.replace("f40(pre.m)", "f8(pre.m)"), "test_crate", &["--no-verify"]);
+    let run = tlc(&jar, &small.spec(), &small.cfg);
+    assert_eq!(run.distinct, 2);
+    assert!(run.violated.is_empty());
+}
+
+/// A helper's domain guard passes the state as a record even when its value
+/// call uses the flattened state variables. The guard's variant must be emitted.
+#[test]
+fn tla_export_definedness_emits_guard_only_record_helper() {
+    let ex = export_code_with(
+        r#"
+use vstd::map::*;
+verus! {
+pub struct State { pub m: Map<int, int>, pub n: nat }
+pub open spec fn core_mem(s: State) -> Map<int, int> {
+    let _ = vstd::pervasive::spec_affirm(true);
+    s.m
+}
+pub open spec fn read(s: State) -> int { core_mem(s)[0] }
+pub open spec fn init(s: State) -> bool { s.m == Map::empty() && s.n == 0 }
+pub open spec fn next(pre: State, post: State) -> bool {
+    ||| (read(pre) == 7 && post == State { n: 2, ..pre })
+    ||| (pre.n == 0 && post == State { n: 1, ..pre })
+}
+pub open spec fn bounded(s: State) -> bool { s.n <= 1 }
+}
+"#,
+        "test_crate",
+        &["--no-verify"],
+    );
+    assert!(ex.report["refusals"].as_array().unwrap().is_empty(), "{}", ex.report);
+    assert!(ex.tla.contains("core_mem_rec(s) =="), "{}", ex.tla);
+    assert!(!ex.tla.contains("Table_spec_affirm"), "{}", ex.tla);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let run = tlc(&jar, &ex.spec(), &ex.cfg);
+    assert_eq!(run.distinct, 2);
+    assert!(run.violated.is_empty());
+}
+
+/// Anvil's response guard is inside a value-returning match helper. Making
+/// its negated condition FALSE would select the unsafe branch on None.
+#[test]
+fn tla_export_partial_option_helper_preserves_branch_selection() {
+    let ex = export_code_with(
+        r#"
+verus! {
+pub struct State { pub phase: u8, pub response: Option<int>, pub n: int }
+pub open spec fn extract(response: Option<int>) -> int { response.unwrap() }
+pub open spec fn advance(s: State) -> State {
+    match s.phase {
+        0 => State { phase: 1, ..s },
+        1 => {
+            if !(s.response.is_some() && extract(s.response) == 7) {
+                State { phase: 2, ..s }
+            } else {
+                State { phase: 3, n: extract(s.response), ..s }
+            }
+        },
+        _ => s,
+    }
+}
+pub open spec fn init(s: State) -> bool { s.phase == 0 && (s.response == None || s.response == Some(7)) && s.n == 0 }
+pub open spec fn next(pre: State, post: State) -> bool { post == advance(pre) }
+pub open spec fn bounded(s: State) -> bool { s.phase <= 3 && if s.phase == 3 { s.n == 7 } else { s.n == 0 } }
+}
+"#,
+        "test_crate",
+        &["--no-verify"],
+    );
+    assert!(ex.report["refusals"].as_array().unwrap().is_empty(), "{}", ex.report);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let run = tlc(&jar, &ex.spec(), &ex.cfg);
+    assert_eq!(run.distinct, 6);
+    assert!(run.violated.is_empty());
+}
+
+/// A match arm's guard and body can both call a partial value helper. Disable
+/// the enclosing transition, without changing the helper's condition or value.
+#[test]
+fn tla_export_partial_option_helper_in_match_arm_and_guard() {
+    for arm in [
+        "1 => State { phase: 2, n: extract(s.response), ..s },",
+        "1 if extract(s.response) > 0 => State { phase: 2, ..s },",
+    ] {
+        let code = format!(
+            r#"
+verus! {{
+pub struct State {{ pub phase: u8, pub response: Option<int>, pub n: int }}
+pub open spec fn extract(response: Option<int>) -> int {{
+    // The nested match also contributes guard LETs; they must not shadow
+    // the caller match's generated locals.
+    match response {{ Some(v) => v, None => response.unwrap() }}
+}}
+pub open spec fn advance(s: State) -> State {{
+    match s.phase {{ 0 => State {{ phase: 1, ..s }}, {arm} _ => s }}
+}}
+pub open spec fn init(s: State) -> bool {{ s.phase == 0 && s.response == None && s.n == 0 }}
+pub open spec fn next(pre: State, post: State) -> bool {{ post == advance(pre) }}
+pub open spec fn bounded(s: State) -> bool {{ s.phase <= 1 && s.n == 0 }}
+}}
+"#
+        );
+        let ex = export_code_with(&code, "test_crate", &["--no-verify"]);
+        assert!(ex.report["refusals"].as_array().unwrap().is_empty(), "{}", ex.report);
+        assert!(!ex.report["restrictions"].as_array().unwrap().is_empty(), "{}", ex.report);
+        let Some(jar) = tla_tools() else { return };
+        sany(&jar, &ex.spec());
+        let run = tlc(&jar, &ex.spec(), &ex.cfg);
+        assert_eq!(run.distinct, 2);
+        assert!(run.violated.is_empty());
+    }
+}
+
+/// A destructuring initializer's helper can bind a name used by a later LET.
+/// Later bindings must not capture the initializer's definedness expression.
+#[test]
+fn tla_export_partial_helper_guard_keeps_lexical_let_prefix() {
+    let ex = export_code_with(
+        r#"
+use vstd::map::*;
+use vstd::set::*;
+verus! {
+pub struct State { pub phase: u8, pub response: Option<int>, pub n: int }
+pub open spec fn split(response: Option<int>) -> (Map<int, int>, int) {
+    let split_element = response.unwrap();
+    let left = Map::new(Set::empty().insert(split_element), |k: int| Map::<int, int>::empty()[k]);
+    (left, 0)
+}
+pub open spec fn advance(s: State) -> State {
+    match s.phase {
+        0 => State { phase: 1, ..s },
+        1 => {
+            let (left, right) = split(s.response);
+            let split_element = 1int;
+            State { phase: 2, n: left[split_element] + right, ..s }
+        },
+        _ => s,
+    }
+}
+pub open spec fn init(s: State) -> bool { s.phase == 0 && s.response == Some(0) && s.n == 0 }
+pub open spec fn next(pre: State, post: State) -> bool { post == advance(pre) }
+pub open spec fn bounded(s: State) -> bool { s.phase <= 1 && s.n == 0 }
+}
+"#,
+        "test_crate",
+        &["--no-verify"],
+    );
+    assert!(ex.report["refusals"].as_array().unwrap().is_empty(), "{}", ex.report);
+    let Some(jar) = tla_tools() else { return };
+    sany(&jar, &ex.spec());
+    let run = tlc(&jar, &ex.spec(), &ex.cfg);
+    assert_eq!(run.distinct, 2);
+    assert!(run.violated.is_empty());
 }
