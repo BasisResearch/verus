@@ -28,19 +28,15 @@
 \* with neither it must be logged, and TraceEnabled leaves the step out (the
 \* report's trace steps say which, "enumerated"). A logged parameter outside
 \* its domain is a step the model cannot take.
-\* TraceNext conjoins Next, then the logged step, so it only ever narrows
-\* the model: a trace TLC follows to its end (TraceAccepted) is a behaviour of
-\* State_tla. Otherwise the deepest trace_i reached is the first logged step
-\* the model cannot take from any state that explains the log so far; and
-\* when TLC finds no initial state (0 states generated, depth 0), the header's
-\* observed state is none of Init's, so the log diverges before its first step.
-\* Next takes values only in the export's Dom_ holes, so the .cfg must give
-\* each one every value the log carries for it: a logged value outside it
-\* diverges as a step the model cannot take.
-\* A pass means the observed state sequence is a behaviour of the model: a
-\* logged step's name and parameters count only through their effect on the
-\* state, so a step that another of Next's steps explains (the same observed
-\* successor) is accepted even if the model never takes the logged one there.
+\* TraceNext selects the logged existential arm and its logged parameters.
+\* Missing parameters retain their original domains; dispatch guards and
+\* TypeOK are preserved. General relations retain their enclosing Next check
+\* (listed in trace.general_relation_steps). Unknown names fall back to Next,
+\* checking only the observed state sequence (trace.unknown_step).
+\* A trace conforms when it reaches TraceAccepted; otherwise the deepest trace_i
+\* is the first unexplained step; when TLC finds no initial state (0 states generated, depth 0),
+\* the header is rejected.
+\* A pass means the observed state sequence is a behaviour of the model.
 EXTENDS State_tla, Json, TLC, Integers, Sequences
 
 CONSTANT TraceLog  \* the log's path
@@ -108,10 +104,17 @@ TraceObservedKeyNext(k, j) ==
       [] OTHER -> Assert(FALSE, "trace: the state has no field " \o k)
 TraceObservedNext(j) == \A k \in DOMAIN j : TraceObservedKeyNext(k, j[k])
 
+TraceAction_acquire(thread) == ((thread < 2) /\ ((LET t == thread IN ((holder = [tag |-> "None"]) /\ (count < 3))) /\ (LET t_2 == thread IN (holder' = [tag |-> "Some", v0 |-> t_2] /\ count' = (count + 1)))))
+TraceAction_release == ((holder.tag = "Some") /\ (holder' = [tag |-> "None"] /\ count' = [holder |-> holder, count |-> count].count))
+TraceIdentity(j) == j
 TraceStep(e) ==
     CASE e.step \in {"next", "test_crate::next"} ->
-           TraceParamsDeclared(e, {}) /\ next
-      [] OTHER -> Assert(FALSE, "trace: the model has no step " \o e.step)
+           Next /\ TraceParamsDeclared(e, {}) /\ next
+      [] e.step \in {"acquire", "test_crate::acquire"} ->
+           TraceParamsDeclared(e, {"t"}) /\ \E a1_ \in TraceParam(e, "t", TraceDec_nat, 0..(2) - 1) : TraceAction_acquire(a1_) /\ TypeOK'
+      [] e.step \in {"release", "test_crate::release"} ->
+           TraceParamsDeclared(e, {}) /\ TraceAction_release /\ TypeOK'
+      [] OTHER -> Next
 
 TraceInit ==
     /\ TraceKeys(TraceHeader, {"module", "export", "state"}, "the log's header")
@@ -128,7 +131,6 @@ TraceNext ==
     /\ LET e == Trace[trace_i] IN
            /\ TraceKeys(e, {"step", "params", "state"}, "a step line")
            /\ Assert("step" \in DOMAIN e, "trace: a step line names no step")
-           /\ Next
            /\ TraceStep(e)
            /\ TraceObservedNext(TraceStateOf(e))
     /\ trace_i' = trace_i + 1
@@ -142,6 +144,9 @@ TraceStepAt == Trace[trace_i]
 \* (a step whose parameter has no finite domain is not enumerated).
 TraceEnabled ==
     (IF ENABLED (Next /\ next) THEN {[step |-> "next"]} ELSE {})
+    \cup {r \in {[step |-> "acquire", params |-> [t |-> a1_]] : a1_ \in 0..(2) - 1} :
+        ENABLED (TraceAction_acquire(r.params.t) /\ TypeOK')}
+    \cup (IF ENABLED (TraceAction_release /\ TypeOK') THEN {[step |-> "release"]} ELSE {})
 \* At a state where the log's next step cannot be taken: whether the logged
 \* step is enabled at all, and which observed fields no successor by it matches.
 TraceDiagnosis ==
@@ -150,3 +155,5 @@ TraceDiagnosis ==
       unmatched |-> {k \in DOMAIN TraceStateOf(e) :
                         ~ENABLED (Next /\ TraceStep(e) /\ TraceObservedKeyNext(k, TraceStateOf(e)[k]))} ]
 ===================================
+
+\* VERUS_TRACE_POLICY {"module":"State_tla_trace","index_variable":"trace_i","observables":["holder","count"],"steps":[{"step":"next","function":"test_crate::next","operator":"next","short_name_shared":false,"params":[],"enumerated":true},{"step":"acquire","function":"test_crate::acquire","operator":"TraceAction_acquire","short_name_shared":false,"params":[{"name":"t","typ":"nat","domain":"0..(2) - 1"}],"enumerated":true},{"step":"release","function":"test_crate::release","operator":"TraceAction_release","short_name_shared":false,"params":[],"enumerated":true}],"general_relation_steps":["next"],"unknown_step":"Next (state-only conformance; logged name and parameters are not checked)"}

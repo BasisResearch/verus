@@ -1,8 +1,16 @@
 # Partial reads and finite carriers — lane 3
 
-The six examples and toyDB Raft safety model re-export **byte-identically in all 28 `.tla`/`.cfg` files** against the parent lane. AbstractMap completes its unchanged bounded TLC run without the former cast assertion. The implementation is ready for review.
+The six examples and toyDB Raft safety model re-export **byte-identically in all 35 TLA/configuration/report files** against the parent lane. AbstractMap completes its unchanged bounded TLC run without the former cast assertion. The implementation is ready for review.
 
-The branch is stacked on `kg/export-nrkernel`, currently `6fc818cad8e20a29dc50432c8b8a7b0a49b91253`. Both that lane's implementation and tests were retained during the rebase. No campaign source, adapter, constraint, or constant assignment was changed.
+The branch is stacked on `kg/export-nrkernel`, now merged at `519e9295f3540890f0116f977ab9344ce58b662c`. This integration is a two-parent merge from `fb8014b0`, preserving history for lane 4. No campaign source, adapter, constraint, or constant assignment was changed.
+
+## Incoming-parent merge validation
+
+The merge retains the guard, carrier, recursive definedness, helper-match, and bounded-analysis rules alongside the incoming trace-arm bookkeeping, module-order fix, and single specialization entry point. Definedness calls and guard dependencies now use `Functions::resolve` and resolved handles throughout. The private function registry is shared across exporter snapshots so a guard probe's interned instance is available to real emission without exposing a raw lookup or copying bodies outside that entry point.
+
+All **264 exporter tests pass** with `TLA2TOOLS_JAR` set (the complete union of 210 lane-3 and 246 incoming tests); vstd verifies 2,045 functions without errors. All **35 artifacts** from the six examples and external Raft source are raw-byte-identical to the clean incoming-parent build at `519e9295`. The 28 portable TLA/configuration goldens were regenerated from that parent, retaining its intentional trace-arm changes, and the golden test now explicitly checks every one of the seven inputs.
+
+Rust formatting across the workspace and bundled parser libraries passes (`vargo fmt --exclude vstd -- --check`; vstd is unchanged). Workspace clippy and the exporter test target pass with warnings denied. `merge-measurements.json` records both parent commits, retained test counts, commands, source/binary hashes, and all 35 byte comparisons. Older campaign measurements below remain historical; this merge's acceptance checks are the full exporter suite and incoming-parent compatibility gate.
 
 ## Design and TLA+ rules
 
@@ -131,7 +139,7 @@ The nine supplemental modules have no saved `MC-command.json` in this campaign, 
 
 ## Validation and remaining work
 
-**210 exporter tests passed, 0 failed**, with `TLA2TOOLS_JAR` set. The vstd rebuild verified 2,045 functions with no errors. All 28 generated fixture files and all 22 saved campaign bound/configuration files compare byte-identically. The full golden regression and the separate raw re-export check both pass.
+**264 exporter tests passed, 0 failed**, with `TLA2TOOLS_JAR` set. The vstd rebuild verified 2,045 functions with no errors. All 28 generated fixture files and all 22 saved campaign bound/configuration files compare byte-identically. The full golden regression and the separate raw re-export check both pass.
 
 Seventeen new TLC-backed tests cover partial reads, carriers, recursive helpers and casts, lazy conditional values, invalidation of inferred shape facts, redundant guards, recursive substitution declarations, guard-only dependencies, bounded shared-helper analysis, Option projections in value helpers, and lexical scope of their guards. A separate golden regression pins Raft and every example's four generated files.
 
