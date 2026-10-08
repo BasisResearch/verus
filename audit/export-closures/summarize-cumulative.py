@@ -9,6 +9,7 @@ ap = argparse.ArgumentParser(description=__doc__)
 ap.add_argument('--tests', type=int, required=True)
 ap.add_argument('--after-phase', default='after')
 ap.add_argument('--parent-phase', default='parent')
+ap.add_argument('--previous-phase')
 args = ap.parse_args()
 HERE = Path(__file__).resolve().parent
 phase_dirs = {'before':'before', 'parent':args.parent_phase, 'after':args.after_phase}
@@ -37,6 +38,12 @@ golden={str(p.relative_to(old)):dict(sha256=hashlib.sha256(p.read_bytes()).hexdi
     identical=p.read_bytes()==(new/p.relative_to(old)).read_bytes()) for p in old.rglob('*') if p.suffix in ['.tla','.cfg']}
 assert len(golden)==28 and all(x['identical'] for x in golden.values())
 evidence=dict(base_commit=phases['after']['base_commit'],tests=args.tests,counts=summary_counts,phases=phases,golden=golden)
+previous_stack = None
+if args.previous_phase:
+    previous_stack = json.loads((HERE/f'cumulative-{args.previous_phase}/summary.json').read_text())
+    evidence['previous_stack'] = dict(base_commit=previous_stack['base_commit'],
+        head_commit=previous_stack['head_commit'],
+        primary=counts([r for r in previous_stack['rows'] if r['primary']]))
 previous = json.loads((HERE/'cumulative-after/summary.json').read_text())
 evidence['scope_repair'] = dict(
     before_fix_commit='5412e3a2',
@@ -54,10 +61,10 @@ lanes={
  'anvil/sub_network':'L4 removes both closure refusals',
  'ironkv/host_protocol_t':'L1 trait tables + L3 total collections already remove all refusals; L4 unchanged',
  'nrkernel/hlspec':'L1 trait table + L2 bit/Init + L3 carriers + L4 final bounded choose',
- 'nrkernel/mmu_rl1':'L1/L2 remove trait/bit refusals; L3 definedness expansion limit remains',
- 'nrkernel/mmu_rl2':'L1/L2 remove trait/bit refusals; L3/L4 export times out',
- 'nrkernel/mmu_rl3':'L1/L2 remove trait/bit refusals; L3/L4 export times out',
- 'nrkernel/os':'L1/L2 remove trait/bit refusals; L3/L4 export times out',
+ 'nrkernel/mmu_rl1':'L1/L2 trait/bit rules; L3 cached definedness removes expansion-limit refusals',
+ 'nrkernel/mmu_rl2':'L1/L2 trait/bit rules; L3 cached definedness removes export timeout',
+ 'nrkernel/mmu_rl3':'L1/L2 trait/bit rules; L3 cached definedness removes export timeout',
+ 'nrkernel/os':'L1/L2 trait/bit rules; L3 removes timeout; L4 removes choose; integer type bounds remain (os.rs:242,249; mmu/defs.rs:434)',
  'nrkernel/os_ext':'L2 bit/Init removes final refusal',
  'nr/AsynchronousSingleton':'L1 concrete dispatch/typed tables',
  'nr/SimpleLog':'L1 concrete dispatch/typed tables',
@@ -86,7 +93,8 @@ def sany(r):
 def tlc(r):
     status=r['tlc_status']
     label={'no_saved_bounds':'no saved bounds','complete':'complete','evaluation_error':'evaluation/config error','sany_error':'SANY error','timeout_before_progress':'timeout before progress','exploring_timeout':'progress; timeout','blocked_by_export':'export blocked','invariant_counterexample':'invariant CTI'}[status]
-    if status in ['complete','exploring_timeout','invariant_counterexample']: label+=f" ({r.get('distinct','?')} states)"
+    if status == 'exploring_timeout': label+=f" (at least {r.get('distinct','?')} states reported)"
+    elif status in ['complete','invariant_counterexample']: label+=f" ({r.get('distinct','?')} states)"
     return label
 maps={p:{r['machine']:r for r in s['rows']} for p,s in phases.items()}
 base = phases['after']['base_commit'][:8]
@@ -94,6 +102,10 @@ lines=[f'## Cumulative campaign after rebase onto `{base}`','',
  f'The table measures all 33 requested export targets: Anvil’s five (including both API adapters), IronKV host, nrkernel’s six, NR’s three, and all 18 Splinter attempts. Five additional campaign adapters/controls follow separately. A compiler error or timeout is **not** a zero-refusal export. `Before` uses the original campaign binary; `L1–3` uses the clean lane-3 checkout at `{base}`; `After` uses the rebased lane-4 binary. Binary hashes and version strings are saved in `cumulative-results.json` (the parent binary embeds its pre-commit dirty version string).','']
 for phase,s in summary_counts.items():
     p=s['primary'];lines.append(f"- **{phase}:** {p['zero_refusals']}/33 zero-refusal exports; {p['zero_refusals_and_sany']}/33 also pass SANY; {p['completes']}/9 saved-bound TLC runs complete; {p['explores']}/9 explore without an evaluation error.")
+if previous_stack:
+    old_counts = evidence['previous_stack']['primary']
+    new_counts = summary_counts['after']['primary']
+    lines += ['', f"Since the previous stack on `{previous_stack['base_commit'][:8]}`, zero-refusal exports increased **{old_counts['zero_refusals']}→{new_counts['zero_refusals']}**, zero-refusal exports passing SANY **{old_counts['zero_refusals_and_sany']}→{new_counts['zero_refusals_and_sany']}**, completed campaign-bound TLC runs **{old_counts['completes']}→{new_counts['completes']}**, and explorations **{old_counts['explores']}→{new_counts['explores']}**. The three MMU exports now finish with zero refusals; PagedBetree and PivotBetree regain their bounded completions."]
 lines+=['','The table distinguishes completed runs, invariant counterexamples, and progress until timeout. Lane 4’s additional zero-refusal targets over lane 3 are identified by the intermediate column.\n\nOriginal `MC.tla`, `MC.cfg`, and TLC commands/timeouts were replayed unchanged, with their hashes recorded. The other 24 primary targets have no saved campaign bounds; no new constants, table interpretations, adapters, or bounds were invented. Reaching states before a TLC evaluation error does not count as exploration. Lane-3 restrictions and finite carriers remain explicitly reported approximations, so a completed bounded run is not a proof of the unrestricted source.','',
  'L1 = traits; L2 = nrkernel bit operations/partial Init; L3 = partial reads/finite carriers; L4 = closure reduction/bounded choose. Intermediate attribution also uses the committed lane reports (`artifacts/nrkernel/report.txt`, `audit/export-partial/REPORT.md`) and the trait lane’s recorded campaign results. More refusals can mean reduction reached previously hidden unsupported expressions.','']
 for primary,title in [(True,'Requested campaign targets'),(False,'Additional campaign adapters and controls')]:
