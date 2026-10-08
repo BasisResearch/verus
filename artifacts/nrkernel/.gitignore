@@ -9,3 +9,6 @@
 !tests.log
 !os_ext-before-tlc.log
 !os_ext-after-tlc.log
+!merge-validation.txt
+!merge-compatibility.json
+!merge-tests.log

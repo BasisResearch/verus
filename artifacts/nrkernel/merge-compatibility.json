@@ -1,0 +1,231 @@
+{
+  "parent_commit": "d016cf3fa6dfb29a02f6f14a5d6651b631f95133",
+  "artifacts": [
+    {
+      "file": "adder_sync/State_tla.cfg",
+      "equal": true,
+      "parent_sha256": "dc42f4ac7c164de76a1e973997e5ae2260509e35a94e5630e465dc8c72e68ae0",
+      "merged_sha256": "dc42f4ac7c164de76a1e973997e5ae2260509e35a94e5630e465dc8c72e68ae0"
+    },
+    {
+      "file": "adder_sync/State_tla.tla",
+      "equal": true,
+      "parent_sha256": "725766b12b5b421dacb6c5054e41a53668ad7ca5d7b599e15ded5c790861510a",
+      "merged_sha256": "725766b12b5b421dacb6c5054e41a53668ad7ca5d7b599e15ded5c790861510a"
+    },
+    {
+      "file": "adder_sync/State_tla.tla.json",
+      "equal": true,
+      "parent_sha256": "9e586cdf9edf47b8c5562e1e31b046c28e8b8c96b774eb61b1a4e97120689901",
+      "merged_sha256": "9e586cdf9edf47b8c5562e1e31b046c28e8b8c96b774eb61b1a4e97120689901"
+    },
+    {
+      "file": "adder_sync/State_tla_trace.cfg",
+      "equal": true,
+      "parent_sha256": "322df0e96bbdd44f2cdb5a29a05ef6901d35a510c529533bf90e4dc830bf0557",
+      "merged_sha256": "322df0e96bbdd44f2cdb5a29a05ef6901d35a510c529533bf90e4dc830bf0557"
+    },
+    {
+      "file": "adder_sync/State_tla_trace.tla",
+      "equal": true,
+      "parent_sha256": "72699f40a53939fccbbdb2fe0dcf7afdf8168393f26b877262a4d104afb1dac9",
+      "merged_sha256": "72699f40a53939fccbbdb2fe0dcf7afdf8168393f26b877262a4d104afb1dac9"
+    },
+    {
+      "file": "assert_sync/State_tla.cfg",
+      "equal": true,
+      "parent_sha256": "1d76b7c9bb7d8ce49c4b93bf801cfb6d424f3e8c34743eb59f32dcb52b42dc8f",
+      "merged_sha256": "1d76b7c9bb7d8ce49c4b93bf801cfb6d424f3e8c34743eb59f32dcb52b42dc8f"
+    },
+    {
+      "file": "assert_sync/State_tla.tla",
+      "equal": true,
+      "parent_sha256": "21f47913911f6eddeab42094ff9457fd0c59b3ca17efeee1d33f7cf42f0b7b83",
+      "merged_sha256": "21f47913911f6eddeab42094ff9457fd0c59b3ca17efeee1d33f7cf42f0b7b83"
+    },
+    {
+      "file": "assert_sync/State_tla.tla.json",
+      "equal": true,
+      "parent_sha256": "0529116a70eed4501a419b6688aa611a83d7704c559e5d16c431045bccfa39af",
+      "merged_sha256": "0529116a70eed4501a419b6688aa611a83d7704c559e5d16c431045bccfa39af"
+    },
+    {
+      "file": "assert_sync/State_tla_trace.cfg",
+      "equal": true,
+      "parent_sha256": "322df0e96bbdd44f2cdb5a29a05ef6901d35a510c529533bf90e4dc830bf0557",
+      "merged_sha256": "322df0e96bbdd44f2cdb5a29a05ef6901d35a510c529533bf90e4dc830bf0557"
+    },
+    {
+      "file": "assert_sync/State_tla_trace.tla",
+      "equal": true,
+      "parent_sha256": "f8a83c5fd93fc8d3ccac57e63a63402661adc41291f110d32baf939247d12f04",
+      "merged_sha256": "f8a83c5fd93fc8d3ccac57e63a63402661adc41291f110d32baf939247d12f04"
+    },
+    {
+      "file": "counter/State_tla.cfg",
+      "equal": true,
+      "parent_sha256": "07ea3953075a098d96c20f1553408b68a4c2ceb221a9ce5c468fd3bbd73fa2d7",
+      "merged_sha256": "07ea3953075a098d96c20f1553408b68a4c2ceb221a9ce5c468fd3bbd73fa2d7"
+    },
+    {
+      "file": "counter/State_tla.tla",
+      "equal": true,
+      "parent_sha256": "32a3e06033059aba667eb83e746d9d0784a7689b22b0fcb353bfde97f64815d7",
+      "merged_sha256": "32a3e06033059aba667eb83e746d9d0784a7689b22b0fcb353bfde97f64815d7"
+    },
+    {
+      "file": "counter/State_tla.tla.json",
+      "equal": true,
+      "parent_sha256": "ccf39fd05947e9fcef454bab0b8a63f3f796d11bf7da52dd014f4c5e5e5cda53",
+      "merged_sha256": "ccf39fd05947e9fcef454bab0b8a63f3f796d11bf7da52dd014f4c5e5e5cda53"
+    },
+    {
+      "file": "counter/State_tla_trace.cfg",
+      "equal": true,
+      "parent_sha256": "322df0e96bbdd44f2cdb5a29a05ef6901d35a510c529533bf90e4dc830bf0557",
+      "merged_sha256": "322df0e96bbdd44f2cdb5a29a05ef6901d35a510c529533bf90e4dc830bf0557"
+    },
+    {
+      "file": "counter/State_tla_trace.tla",
+      "equal": true,
+      "parent_sha256": "29d2043f672d8618a0665b69b027d866ac50ecf080b6a11be0652a9852bc9c5d",
+      "merged_sha256": "29d2043f672d8618a0665b69b027d866ac50ecf080b6a11be0652a9852bc9c5d"
+    },
+    {
+      "file": "mutex_liveness/ProgramState_tla.cfg",
+      "equal": true,
+      "parent_sha256": "533a092f3d125531cff14cc059695cbef2e2f413479fce6d04e39f9a9aec25f5",
+      "merged_sha256": "533a092f3d125531cff14cc059695cbef2e2f413479fce6d04e39f9a9aec25f5"
+    },
+    {
+      "file": "mutex_liveness/ProgramState_tla.tla",
+      "equal": true,
+      "parent_sha256": "7c3ceee1e316f004b1d215305aff40280508c6e74fc25639f0ad93c5bf476bb6",
+      "merged_sha256": "7c3ceee1e316f004b1d215305aff40280508c6e74fc25639f0ad93c5bf476bb6"
+    },
+    {
+      "file": "mutex_liveness/ProgramState_tla.tla.json",
+      "equal": true,
+      "parent_sha256": "667eda0df03c930062c16c7a91e0f6f26547e1d762ea96ac42a14a174e0e8b6c",
+      "merged_sha256": "667eda0df03c930062c16c7a91e0f6f26547e1d762ea96ac42a14a174e0e8b6c"
+    },
+    {
+      "file": "mutex_liveness/ProgramState_tla_trace.cfg",
+      "equal": true,
+      "parent_sha256": "322df0e96bbdd44f2cdb5a29a05ef6901d35a510c529533bf90e4dc830bf0557",
+      "merged_sha256": "322df0e96bbdd44f2cdb5a29a05ef6901d35a510c529533bf90e4dc830bf0557"
+    },
+    {
+      "file": "mutex_liveness/ProgramState_tla_trace.tla",
+      "equal": true,
+      "parent_sha256": "eba5985faae1c1d661fbc9e23e7a18cceeb5671dcefea1dda8ad1d24f9ad524e",
+      "merged_sha256": "eba5985faae1c1d661fbc9e23e7a18cceeb5671dcefea1dda8ad1d24f9ad524e"
+    },
+    {
+      "file": "mutex_tla/State_tla.cfg",
+      "equal": true,
+      "parent_sha256": "87833bc818627b60e0318620066a059bd45598a501e7acc4eca96e73c253b234",
+      "merged_sha256": "87833bc818627b60e0318620066a059bd45598a501e7acc4eca96e73c253b234"
+    },
+    {
+      "file": "mutex_tla/State_tla.tla",
+      "equal": true,
+      "parent_sha256": "4d3dd5fb3d3da516180294f85e3e8005ed3ec2cb2f1df8e87179b3fa08d0d365",
+      "merged_sha256": "4d3dd5fb3d3da516180294f85e3e8005ed3ec2cb2f1df8e87179b3fa08d0d365"
+    },
+    {
+      "file": "mutex_tla/State_tla.tla.json",
+      "equal": true,
+      "parent_sha256": "d1e0d86f6cb008a33b797eb53bc9f4e93224969d12fb28abc99b00c5ba2b0166",
+      "merged_sha256": "d1e0d86f6cb008a33b797eb53bc9f4e93224969d12fb28abc99b00c5ba2b0166"
+    },
+    {
+      "file": "mutex_tla/State_tla_trace.cfg",
+      "equal": true,
+      "parent_sha256": "322df0e96bbdd44f2cdb5a29a05ef6901d35a510c529533bf90e4dc830bf0557",
+      "merged_sha256": "322df0e96bbdd44f2cdb5a29a05ef6901d35a510c529533bf90e4dc830bf0557"
+    },
+    {
+      "file": "mutex_tla/State_tla_trace.tla",
+      "equal": true,
+      "parent_sha256": "392951ac64d855b9f0a8942aafa3203d3ead92cc7c298abf02db6a4b732515d9",
+      "merged_sha256": "392951ac64d855b9f0a8942aafa3203d3ead92cc7c298abf02db6a4b732515d9"
+    },
+    {
+      "file": "safety/GState_tla.cfg",
+      "equal": true,
+      "parent_sha256": "eb12beca600714588a82fb1822d473615f947848839487780cf60d4898c69108",
+      "merged_sha256": "eb12beca600714588a82fb1822d473615f947848839487780cf60d4898c69108"
+    },
+    {
+      "file": "safety/GState_tla.tla",
+      "equal": true,
+      "parent_sha256": "97529bd4ed13f71080e27f0df7a577f7dc13c6c58716da8217ab0402d1c6b7dc",
+      "merged_sha256": "97529bd4ed13f71080e27f0df7a577f7dc13c6c58716da8217ab0402d1c6b7dc"
+    },
+    {
+      "file": "safety/GState_tla.tla.json",
+      "equal": true,
+      "parent_sha256": "98bcd314027cb30b6a19e9ba7d5a09fee48cc173eee36c2be7687bba703cba5d",
+      "merged_sha256": "98bcd314027cb30b6a19e9ba7d5a09fee48cc173eee36c2be7687bba703cba5d"
+    },
+    {
+      "file": "safety/GState_tla_trace.cfg",
+      "equal": true,
+      "parent_sha256": "322df0e96bbdd44f2cdb5a29a05ef6901d35a510c529533bf90e4dc830bf0557",
+      "merged_sha256": "322df0e96bbdd44f2cdb5a29a05ef6901d35a510c529533bf90e4dc830bf0557"
+    },
+    {
+      "file": "safety/GState_tla_trace.tla",
+      "equal": true,
+      "parent_sha256": "53aa2b0441502b75913cda058bc064c89b3b895c0d008ada588bad28373495cb",
+      "merged_sha256": "53aa2b0441502b75913cda058bc064c89b3b895c0d008ada588bad28373495cb"
+    },
+    {
+      "file": "toggle_sync/State_tla.cfg",
+      "equal": true,
+      "parent_sha256": "e34239e8f50d92f3290b25f157ce0cbae93e05596b46d8be30531cc66a6c2be9",
+      "merged_sha256": "e34239e8f50d92f3290b25f157ce0cbae93e05596b46d8be30531cc66a6c2be9"
+    },
+    {
+      "file": "toggle_sync/State_tla.tla",
+      "equal": true,
+      "parent_sha256": "9cc3234e6384a7f60c94351bbe7a70c07661729dbfc5effe5142c793b0124a2c",
+      "merged_sha256": "9cc3234e6384a7f60c94351bbe7a70c07661729dbfc5effe5142c793b0124a2c"
+    },
+    {
+      "file": "toggle_sync/State_tla.tla.json",
+      "equal": true,
+      "parent_sha256": "61e4f39ede07b504a49f4e55fd91d27fa04b565c7cddaace86cc3b6245e306e3",
+      "merged_sha256": "61e4f39ede07b504a49f4e55fd91d27fa04b565c7cddaace86cc3b6245e306e3"
+    },
+    {
+      "file": "toggle_sync/State_tla_trace.cfg",
+      "equal": true,
+      "parent_sha256": "322df0e96bbdd44f2cdb5a29a05ef6901d35a510c529533bf90e4dc830bf0557",
+      "merged_sha256": "322df0e96bbdd44f2cdb5a29a05ef6901d35a510c529533bf90e4dc830bf0557"
+    },
+    {
+      "file": "toggle_sync/State_tla_trace.tla",
+      "equal": true,
+      "parent_sha256": "a23c658d50539f63acad177d98c9927453ebf726d46a19e9640c66bd0b047025",
+      "merged_sha256": "a23c658d50539f63acad177d98c9927453ebf726d46a19e9640c66bd0b047025"
+    }
+  ],
+  "original_models_unchanged": [
+    "adder_sync/State_tla.cfg",
+    "adder_sync/State_tla.tla",
+    "assert_sync/State_tla.cfg",
+    "assert_sync/State_tla.tla",
+    "counter/State_tla.cfg",
+    "counter/State_tla.tla",
+    "mutex_liveness/ProgramState_tla.cfg",
+    "mutex_liveness/ProgramState_tla.tla",
+    "mutex_tla/State_tla.cfg",
+    "mutex_tla/State_tla.tla",
+    "safety/GState_tla.cfg",
+    "safety/GState_tla.tla",
+    "toggle_sync/State_tla.cfg",
+    "toggle_sync/State_tla.tla"
+  ]
+}
