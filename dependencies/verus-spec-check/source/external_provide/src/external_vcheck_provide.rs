@@ -1,4 +1,4 @@
-//! `external_vcheck_provide!` -- trusted exec stub for testing of spec 
+//! `external_vcheck_provide!` -- trusted exec stub for testing of spec
 //! functions defined **outside** the current `verus!` block
 //! (in another crate you don't control, e.g. `vstd`, or a public spec fn whose
 //! body isn't recoverable).

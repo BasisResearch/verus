@@ -24,10 +24,13 @@ path = "vstd.rs"
 verus_builtin_macros = { version = "=0.0.0-2026-08-30-0159", path = "../builtin_macros" }
 verus_builtin = { version = "=0.0.0-2026-08-30-0159", path = "../builtin" }
 verus_state_machines_macros = { version = "=0.0.0-2026-08-02-0125", path = "../state_machines_macros" }
+# The run-time of `verus --dyncov` (see source/docs/dyncov.md); re-exported as
+# `vstd::dyncov` so that an instrumented crate needs nothing beyond vstd.
+verus_dyncov = { version = "=0.0.0-2026-08-30-0159", path = "../dyncov", optional = true }
 
 [features]
 default = ["std"]
-std = ["alloc"]
+std = ["alloc", "dep:verus_dyncov"]
 alloc = []
 allocator = []
 strict_provenance_atomic_ptr = []

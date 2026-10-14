@@ -415,7 +415,7 @@ pub fn build_use_index(items: &[Item]) -> HashMap<String, String> {
 /// linear-resource path: `Tracked<&PointsTo<V>>` params
 /// become sampled memory models + guard materialization, and their view
 /// projections (`is_init` / `is_uninit` / `value` / `pptr`) are rewritten or
-/// discharged by the clause pre-pass. 
+/// discharged by the clause pre-pass.
 pub fn is_resource_native_ident(name: &str) -> bool {
     matches!(
         name,

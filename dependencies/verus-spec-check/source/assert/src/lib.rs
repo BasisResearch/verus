@@ -21,9 +21,9 @@
 //!     directly.
 //!
 //! ## What it deliberately doesn't do
-//! 
-//! This module doesn't do the spec->exec lowering, this doesn't 
-//! do any tracking of outer scope, and it doesn't generate any 
+//!
+//! This module doesn't do the spec->exec lowering, this doesn't
+//! do any tracking of outer scope, and it doesn't generate any
 //! harnesses directly.
 
 use verus_syn::spanned::Spanned;
@@ -691,7 +691,8 @@ fn expr_has_vcheck_inline_assert(expr: &Expr) -> bool {
         Expr::Tuple(t) => t.elems.iter().any(expr_has_vcheck_inline_assert),
         Expr::Array(a) => a.elems.iter().any(expr_has_vcheck_inline_assert),
         Expr::Call(c) => {
-            expr_has_vcheck_inline_assert(&c.func) || c.args.iter().any(expr_has_vcheck_inline_assert)
+            expr_has_vcheck_inline_assert(&c.func)
+                || c.args.iter().any(expr_has_vcheck_inline_assert)
         }
         Expr::MethodCall(mc) => {
             expr_has_vcheck_inline_assert(&mc.receiver)
@@ -791,7 +792,8 @@ mod tests {
 
     #[test]
     fn rejects_untyped_forall_binder() {
-        let mut f = parse_fn("fn caller() { #[vcheck] assert forall |w| w + w == 2u32 * w by { }; }");
+        let mut f =
+            parse_fn("fn caller() { #[vcheck] assert forall |w| w + w == 2u32 * w by { }; }");
         let mut targets = Vec::new();
         let err = discover_in_block(&mut f.block, "caller", &mut targets);
         assert!(err.is_err());
@@ -809,8 +811,9 @@ mod tests {
 
     #[test]
     fn discovers_multiple_asserts_in_order() {
-        let mut f =
-            parse_fn("fn caller(x: u32) { #[vcheck] assert(x > 0u32); #[vcheck] assert(x < 100u32); }");
+        let mut f = parse_fn(
+            "fn caller(x: u32) { #[vcheck] assert(x > 0u32); #[vcheck] assert(x < 100u32); }",
+        );
         let mut targets = Vec::new();
         discover_in_block(&mut f.block, "caller", &mut targets).unwrap();
         assert_eq!(targets.len(), 2);

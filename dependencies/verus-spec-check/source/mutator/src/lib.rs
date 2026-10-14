@@ -14,9 +14,9 @@
 //! be added with the same level of documentation, ideally.
 //!
 //! References:
-//! - "An Experimental Determination of Sufficient Mutant 
+//! - "An Experimental Determination of Sufficient Mutant
 //!    Operators" -- Offutt 1996
-//! - "Efficient Mutation Testing by Checking Invariant 
+//! - "Efficient Mutation Testing by Checking Invariant
 //!    Violations" -- Schuler 2009, ISSTA
 //!
 //! ### arith-swap
@@ -147,7 +147,7 @@ pub struct MutatorContext {
 
 impl MutatorContext {
     /// Build a context from a `verus_syn::Signature`. Walks the inputs,
-    /// extracting `(simple-ident, type-name)` pairs. 
+    /// extracting `(simple-ident, type-name)` pairs.
     ///
     /// The resulting map is "best-effort" e.g. fields not in the map
     /// are treated as untyped, so type-gated operators conservatively
@@ -195,7 +195,7 @@ impl MutatorContext {
 
 /// Extract a normalized type-name string from a `Type`. Strips
 /// references (`&i32` -> `"i32"`), unwraps single-segment paths to their
-/// final ident. 
+/// final ident.
 fn type_name(ty: &Type) -> Option<String> {
     match ty {
         Type::Path(tp) => tp.path.segments.last().map(|s| s.ident.to_string()),

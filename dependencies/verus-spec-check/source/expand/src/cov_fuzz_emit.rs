@@ -178,8 +178,11 @@ pub fn emit_cov_fuzz_block(classified: &Classified) -> Result<TokenStream2, Erro
             CovMutateBodySource::Method { method, .. } => method.block.clone(),
         };
         let marker_ident: Ident = format_ident!("__vcheck_covmark_{}", symbol);
-        let (sites, instrumented_body, hit_cap) =
-            crate::vcheck_instrument::instrument_branches(&body, &marker_ident, PER_FN_MAX_BRANCHES);
+        let (sites, instrumented_body, hit_cap) = crate::vcheck_instrument::instrument_branches(
+            &body,
+            &marker_ident,
+            PER_FN_MAX_BRANCHES,
+        );
         let n_sites = sites.len();
 
         // Hit/covered/scratch statics + marker fn. Const-item repetition

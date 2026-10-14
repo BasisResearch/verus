@@ -62,7 +62,7 @@ pub enum ParamShape {
     RefStr,
     /// `String` -- owned string. Harness samples directly.
     OwnedString,
-    /// `&mut <inner>`. 
+    /// `&mut <inner>`.
     MutRef(Box<ParamShape>),
     /// `Tracked<&PointsTo<V>>` -- a linear permission parameter.
     Resource {
@@ -73,7 +73,7 @@ pub enum ParamShape {
     },
     /// The exec handle coupled to a `Resource` permission param of the
     /// same `V`: `PPtr<V>` (tier `Pptr`) or `*mut V` / `*const V` (tier
-    /// `Raw`). 
+    /// `Raw`).
     ResourceHandle {
         value_ty: Box<Type>,
         tier: ResourceTier,
@@ -126,7 +126,7 @@ pub enum ResourceTier {
 }
 
 /// Element type used inside a parametrised collection (`Vec<E>`, `&[E]`,
-/// `Option<E>`, etc.) 
+/// `Option<E>`, etc.)
 #[derive(Clone, Debug)]
 pub enum ParamElem {
     Primitive(Type),
@@ -390,7 +390,7 @@ impl ParamShape {
             // Permission param: materialize the sampled model into real
             // memory (constructor replay -- real alloc + optional write)
             // and shadow the paired handle binding with the materialized
-            // pointer. 
+            // pointer.
             ParamShape::Resource {
                 value_ty,
                 handle_ident,
@@ -993,7 +993,7 @@ pub fn classify_return_result_err_elem(ty: &Type, user_types: &HashSet<String>) 
 /// If `ty` is a `Tracked<..>` wrapper over a `PointsTo<V>` permission
 /// (directly, `&PointsTo<V>`, or `&mut PointsTo<V>`; the `PointsTo` path may
 /// be module-qualified, e.g. `simple_pptr::PointsTo<V>`), return the value
-/// type `V` and the borrow mode. 
+/// type `V` and the borrow mode.
 pub fn tracked_points_to_resource(ty: &Type) -> Option<(Type, ResourceMode)> {
     // Outer `Tracked<X>` (last path segment; tolerate `vstd::prelude::`
     // qualification), with exactly one angle-bracketed type argument.
@@ -1470,7 +1470,10 @@ here doesn't fit; pass an owned form instead.",
             match name.as_str() {
                 "Vec" => {
                     let inner = first_type_arg(&seg.arguments).ok_or_else(|| {
-                        Error::new_spanned(ty, "verus_spec_check: expected Vec<T> with a type argument")
+                        Error::new_spanned(
+                            ty,
+                            "verus_spec_check: expected Vec<T> with a type argument",
+                        )
                     })?;
                     Ok(ParamShape::OwnedVec(classify_param_elem(
                         inner, user_types,
@@ -1489,7 +1492,10 @@ here doesn't fit; pass an owned form instead.",
                 }
                 "Option" => {
                     let inner = first_type_arg(&seg.arguments).ok_or_else(|| {
-                        Error::new_spanned(ty, "verus_spec_check: expected Option<T> with a type argument")
+                        Error::new_spanned(
+                            ty,
+                            "verus_spec_check: expected Option<T> with a type argument",
+                        )
                     })?;
                     Ok(ParamShape::OwnedOption(classify_param_elem(
                         inner, user_types,
@@ -1854,7 +1860,10 @@ pub fn classify_return(
                 }
                 "VecDeque" => {
                     let inner = first_type_arg(&seg.arguments).ok_or_else(|| {
-                        Error::new_spanned(ty, "verus_spec_check: expected VecDeque<T> in return type")
+                        Error::new_spanned(
+                            ty,
+                            "verus_spec_check: expected VecDeque<T> in return type",
+                        )
                     })?;
                     Ok(ReturnShape::OwnedVecDeque(classify_param_elem(
                         inner, user_types,
@@ -1862,7 +1871,10 @@ pub fn classify_return(
                 }
                 "Option" => {
                     let inner = first_type_arg(&seg.arguments).ok_or_else(|| {
-                        Error::new_spanned(ty, "verus_spec_check: expected Option<T> in return type")
+                        Error::new_spanned(
+                            ty,
+                            "verus_spec_check: expected Option<T> in return type",
+                        )
                     })?;
                     // `Option<Ordering>` (the `partial_cmp` return): `Ordering`
                     // is not a `ParamElem` (it's never sampled), but as a
@@ -1886,7 +1898,10 @@ pub fn classify_return(
                 }
                 "Result" => {
                     let (t, e) = first_two_type_args(&seg.arguments).ok_or_else(|| {
-                        Error::new_spanned(ty, "verus_spec_check: expected Result<T, E> in return type")
+                        Error::new_spanned(
+                            ty,
+                            "verus_spec_check: expected Result<T, E> in return type",
+                        )
                     })?;
                     // B3: the `Ok` element must classify normally (its value is
                     // commonly extracted/compared via `ret->Ok_0`), but the

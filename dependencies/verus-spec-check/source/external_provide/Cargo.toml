@@ -1,4 +1,6 @@
 [package]
+# dyncov: member of the Verus fork's workspace (vendored subtree)
+workspace = "../../../../source"
 name = "verus_spec_check_external_provide"
 version.workspace = true
 edition.workspace = true

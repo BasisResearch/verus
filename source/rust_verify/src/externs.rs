@@ -23,12 +23,15 @@ pub struct VerusExterns {
     pub verus_root: std::path::PathBuf,
     pub has_vstd: bool,
     pub has_builtin: bool,
+    /// `--dyncov`: the instrumented code links against the dyncov runtime
+    pub has_dyncov: bool,
 }
 
 pub enum VerusExtern {
     Macros,
     Builtin,
     Vstd,
+    Dyncov,
 }
 
 fn verus_builtin_std() -> Box<[(VerusExtern, &'static str, String)]> {
@@ -45,6 +48,7 @@ fn verus_builtin_std() -> Box<[(VerusExtern, &'static str, String)]> {
         ),
         (VerusExtern::Builtin, "verus_builtin", format!("libverus_builtin.rlib")),
         (VerusExtern::Vstd, "vstd", format!("libvstd.rlib")),
+        (VerusExtern::Dyncov, "verus_dyncov", format!("libverus_dyncov.rlib")),
     ]
     .into_boxed_slice()
 }
@@ -64,6 +68,11 @@ impl VerusExterns {
                 }
                 VerusExtern::Vstd => {
                     if !self.has_vstd {
+                        continue;
+                    }
+                }
+                VerusExtern::Dyncov => {
+                    if !self.has_dyncov {
                         continue;
                     }
                 }
@@ -88,6 +97,11 @@ impl VerusExterns {
                 }
                 VerusExtern::Vstd => {
                     if !self.has_vstd {
+                        continue;
+                    }
+                }
+                VerusExtern::Dyncov => {
+                    if !self.has_dyncov {
                         continue;
                     }
                 }

@@ -130,7 +130,7 @@ pub fn expand(input: TokenStream, verified: bool) -> TokenStream {
         Err(err) => return err.to_compile_error().into(),
     };
 
-    // Emit `exec_<name>` fns into the harness module so 
+    // Emit `exec_<name>` fns into the harness module so
     // contract calls `exec_<name>(..)` resolve. Errors here surface
     // as compile errors at the macro site.
     let external_companions = {
@@ -185,7 +185,12 @@ pub fn expand(input: TokenStream, verified: bool) -> TokenStream {
             .contract_targets
             .iter()
             .filter(|t| !t.skip_regular_harness())
-            .filter(|t| matches!(t.bolero_mode(), Some(crate::vcheck_attr::VcheckBoleroMode::Kani)))
+            .filter(|t| {
+                matches!(
+                    t.bolero_mode(),
+                    Some(crate::vcheck_attr::VcheckBoleroMode::Kani)
+                )
+            })
             .map(vcheck_harness_name)
             .collect();
         if names.is_empty() {

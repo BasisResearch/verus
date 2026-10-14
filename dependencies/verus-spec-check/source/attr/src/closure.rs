@@ -321,8 +321,8 @@ pub fn compute_closure(
         // Option 1: an `external_vcheck_provide!` stub takes precedence over a
         // sibling definition. If the user supplied a trusted exec twin for
         // `name`, do NOT fold the sibling spec fn (and do NOT recurse into its
-        // body). This lets a `#[vcheck]` reach a spec fn whose body depends 
-        // on a cross-module spec fn (which the sibling closure cannot pull), 
+        // body). This lets a `#[vcheck]` reach a spec fn whose body depends
+        // on a cross-module spec fn (which the sibling closure cannot pull),
         // by short-circuiting at `name` with the stub. Type defs / methods of
         // the same name are unaffected (a provide names a free fn).
         if externally_provided.contains(&name) {

@@ -46,7 +46,7 @@
 //!   would be an always-hit site that only inflates the denominator.
 //! - **`?` operator**: marking the error path requires expanding the
 //!   `?` into a match, which changes inference around `From::from`;
-//!   high build-failure risk for low signal. 
+//!   high build-failure risk for low signal.
 //! - **`let ... else`**: same restructuring concern as `?`.
 //! - **Guard-false fall-throughs** in `match`: see above.
 //!

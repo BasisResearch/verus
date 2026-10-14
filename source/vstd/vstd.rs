@@ -29,6 +29,13 @@
 #[cfg(feature = "alloc")]
 extern crate alloc;
 
+/// The run-time of `verus --dyncov` (dynamic verified coverage): the
+/// instrumented code the `verus!` macro emits refers to `::vstd::dyncov`.
+/// Plain Rust with no contracts of its own; nothing in vstd depends on it.
+#[cfg(feature = "std")]
+#[cfg_attr(verus_keep_ghost, verifier::external)]
+pub use verus_dyncov as dyncov;
+
 pub mod arithmetic;
 pub mod array;
 pub mod atomic;

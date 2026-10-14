@@ -19,6 +19,17 @@ members = [
   "tools/internals_interface",
   "tools/line_count",
   "tools/verus-reach",
+  "dyncov",
+  # verus-spec-check (vendored subtree at ../dependencies/verus-spec-check): the
+  # spec-to-exec lowering engine that `verus!` uses for dynamic coverage
+  "../dependencies/verus-spec-check/source/syntax",
+  "../dependencies/verus-spec-check/source/assert",
+  "../dependencies/verus-spec-check/source/mutator",
+  "../dependencies/verus-spec-check/source/instrument",
+  "../dependencies/verus-spec-check/source/exec_spec",
+  "../dependencies/verus-spec-check/source/external_provide",
+  "../dependencies/verus-spec-check/source/attr",
+  "../dependencies/verus-spec-check/source/expand",
 ]
 exclude = [
   "vstd",
@@ -27,6 +38,14 @@ exclude = [
 # do not modify the following two lines
 [workspace.metadata.vargo]
 tag = "workspace"
+
+# Only the vendored verus-spec-check crates inherit these
+[workspace.package]
+version = "0.0.0-2026-09-20-0158"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/verus-lang/verus-spec-check"
+authors = ["The Verus Contributors"]
 
 [workspace.dependencies]
 anyhow = "1.0.103"
@@ -97,6 +116,16 @@ verus_syn = { version = "=0.0.0-2026-08-02-0125", path = "../dependencies/syn", 
 verus-reach = { path = "tools/verus-reach" }
 vir-macros = { path = "vir_macros" }
 vir = { path = "vir" }
+verus_dyncov = { path = "dyncov" }
+# vendored verus-spec-check engine crates
+verus_spec_check_syntax = { path = "../dependencies/verus-spec-check/source/syntax" }
+verus_spec_check_assert = { path = "../dependencies/verus-spec-check/source/assert" }
+verus_spec_check_mutator = { path = "../dependencies/verus-spec-check/source/mutator" }
+verus_spec_check_instrument = { path = "../dependencies/verus-spec-check/source/instrument" }
+verus_spec_check_exec_spec = { path = "../dependencies/verus-spec-check/source/exec_spec" }
+verus_spec_check_external_provide = { path = "../dependencies/verus-spec-check/source/external_provide" }
+verus_spec_check_attr = { path = "../dependencies/verus-spec-check/source/attr" }
+verus_spec_check_expand = { path = "../dependencies/verus-spec-check/source/expand" }
 
 [workspace.lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = [

@@ -3293,8 +3293,13 @@ dependencies = [
  "syn 2.0.119",
  "synstructure",
  "verus_prettyplease",
+ "verus_spec_check_exec_spec",
  "verus_syn",
 ]
+
+[[package]]
+name = "verus_dyncov"
+version = "0.0.0-2026-08-30-0159"
 
 [[package]]
 name = "verus_prettyplease"
@@ -3302,6 +3307,90 @@ version = "0.0.0-2026-08-09-0044"
 dependencies = [
  "proc-macro2",
  "verus_syn",
+]
+
+[[package]]
+name = "verus_spec_check_assert"
+version = "0.0.0-2026-09-20-0158"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "verus_syn",
+]
+
+[[package]]
+name = "verus_spec_check_attr"
+version = "0.0.0-2026-09-20-0158"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "verus_spec_check_assert",
+ "verus_spec_check_exec_spec",
+ "verus_spec_check_external_provide",
+ "verus_spec_check_syntax",
+ "verus_syn",
+]
+
+[[package]]
+name = "verus_spec_check_exec_spec"
+version = "0.0.0-2026-09-20-0158"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "verus_spec_check_syntax",
+ "verus_syn",
+]
+
+[[package]]
+name = "verus_spec_check_expand"
+version = "0.0.0-2026-09-20-0158"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "verus_spec_check_assert",
+ "verus_spec_check_attr",
+ "verus_spec_check_exec_spec",
+ "verus_spec_check_external_provide",
+ "verus_spec_check_instrument",
+ "verus_spec_check_mutator",
+ "verus_spec_check_syntax",
+ "verus_syn",
+]
+
+[[package]]
+name = "verus_spec_check_external_provide"
+version = "0.0.0-2026-09-20-0158"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "verus_spec_check_exec_spec",
+ "verus_syn",
+]
+
+[[package]]
+name = "verus_spec_check_instrument"
+version = "0.0.0-2026-09-20-0158"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "verus_syn",
+]
+
+[[package]]
+name = "verus_spec_check_mutator"
+version = "0.0.0-2026-09-20-0158"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "verus_syn",
+]
+
+[[package]]
+name = "verus_spec_check_syntax"
+version = "0.0.0-2026-09-20-0158"
+dependencies = [
+ "proc-macro2",
+ "quote",
 ]
 
 [[package]]

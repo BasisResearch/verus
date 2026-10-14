@@ -87,6 +87,9 @@ fn main() {
         verus_target_path.join(format!("{}verus_state_machines_macros.{}", pre, dl));
     assert!(lib_state_machines_macros_path.exists());
     let lib_state_machines_macros_path = lib_state_machines_macros_path.to_str().unwrap();
+    let lib_dyncov_path = verus_target_path.join("libverus_dyncov.rlib");
+    assert!(lib_dyncov_path.exists());
+    let lib_dyncov_path = lib_dyncov_path.to_str().unwrap().to_string();
 
     if !std::env::var("VERUS_Z3_PATH").is_ok() {
         std::env::set_var("VERUS_Z3_PATH", if cfg!(windows) { ".\\z3.exe" } else { "./z3" });
@@ -100,6 +103,8 @@ fn main() {
         format!("verus_builtin_macros={lib_builtin_macros_path}"),
         "--extern".to_string(),
         format!("verus_state_machines_macros={lib_state_machines_macros_path}"),
+        "--extern".to_string(),
+        format!("verus_dyncov={lib_dyncov_path}"),
         "--crate-type=lib".to_string(),
         "--export".to_string(),
         verus_target_path.join(VSTD_VIR).to_str().unwrap().to_string(),

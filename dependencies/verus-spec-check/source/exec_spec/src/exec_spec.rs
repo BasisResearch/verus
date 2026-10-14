@@ -1,6 +1,179 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
+
+// ---------------------------------------------------------------------------
+// dyncov flavor (Verus fork, dynamic verified coverage)
+//
+// `verus --dyncov` lowers every spec fn and every contract clause of a user
+// crate with this engine, in `unverified` mode plus the adjustments below,
+// which are enabled by [`set_dyncov_mode`] for the duration of a call:
+// - `int`/`nat` are `SpecInt` (an `i128`), every arithmetic operation and
+//   comparison goes through `__vcheck_int` as in contracts, casts narrow
+//   with `to_<T>`, and `int`-typed quantifier binders iterate as `i128`;
+// - exec types are their own exec model (the macro gives every type
+//   declared in `verus!` a `type Exec<T> = T` alias and identity impls), so
+//   `String`, `Vec<T>`, `Box<T>` and references are accepted in signatures;
+// - twins get a plain Rust signature (no `ensures`), the original item is
+//   not re-emitted, and Verus-style chained comparisons are split.
+
+thread_local! {
+    static DYNCOV: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Enables the dyncov flavor for the current thread.
+pub fn set_dyncov_mode(on: bool) {
+    DYNCOV.with(|d| d.set(on));
+}
+
+fn dyncov() -> bool {
+    DYNCOV.with(|d| d.get())
+}
+
+fn vcheck_int(name: &str) -> TokenStream2 {
+    let id = Ident::new(name, Span::call_site());
+    quote! { ::verus_spec_check::__vcheck_int::#id }
+}
+
+/// Compiles one item in the dyncov flavor: the generated code only (the
+/// exec twin of a spec fn, the mirror of a spec-only struct/enum, the twin
+/// methods of an impl), without the original item and without the
+/// `verus!` wrapper. The caller places it next to the original.
+pub fn compile_item_dyncov(item: Item) -> Result<TokenStream2, Error> {
+    set_dyncov_mode(true);
+    let r = compile_item(item, true);
+    set_dyncov_mode(false);
+    r
+}
+
+/// The twin of a spec fn that has no lowering (no body, or a body the
+/// engine does not support): the same signature, and a body that panics
+/// with `reason`, which the dyncov runtime turns into `Unknown`. For a
+/// method, `self_ty` names the type and the result is the method alone
+/// (the caller wraps it in `impl Exec<self_ty>`).
+pub fn compile_spec_fn_stub_dyncov(
+    sig: &Signature,
+    vis: &Visibility,
+    self_ty: Option<&Ident>,
+    reason: &str,
+) -> Result<TokenStream2, Error> {
+    set_dyncov_mode(true);
+    let r = (|| {
+        let mut ctx = LocalCtx::new(&sig.ident);
+        let sig_tokens = compile_sig(&mut ctx, sig, vis, self_ty, true)?;
+        let msg = format!("dyncov: spec fn `{}`: {reason}", sig.ident);
+        let span = sig.span();
+        Ok(quote_spanned! { span =>
+            #sig_tokens { panic!(#msg) }
+        })
+    })();
+    set_dyncov_mode(false);
+    r
+}
+
+/// Whether an expression is numeric by its shape: a literal, arithmetic, a
+/// cast, a `len()`, or a variable the context knows to be an integer. In
+/// the dyncov flavor `==` on such operands compares in the `int` domain,
+/// since Verus spec integers are all `int` and the exec widths differ.
+fn is_numeric_expr(ctx: &LocalCtx, expr: &Expr) -> bool {
+    match expr {
+        Expr::Lit(lit) => matches!(lit.lit, Lit::Int(..)),
+        Expr::Paren(p) => is_numeric_expr(ctx, &p.expr),
+        // (`+` concatenates sequences too, so it is no evidence)
+        Expr::Binary(b) => matches!(
+            b.op,
+            BinOp::Sub(..) | BinOp::Mul(..) | BinOp::Div(..) | BinOp::Rem(..)
+        ),
+        Expr::Unary(u) => matches!(u.op, UnOp::Neg(..)),
+        Expr::Cast(c) => match c.ty.as_ref() {
+            Type::Path(tp) if tp.path.segments.len() == 1 => {
+                let n = tp.path.segments[0].ident.to_string();
+                n == "int" || n == "nat" || is_int_type_name(&n)
+            }
+            _ => false,
+        },
+        Expr::MethodCall(mc) => mc.method == "len",
+        Expr::Call(c) => match c.func.as_ref() {
+            Expr::Path(p) if p.path.segments.len() == 1 => {
+                matches!(
+                    p.path.segments[0].ident.to_string().as_str(),
+                    "add" | "sub" | "mul"
+                )
+            }
+            _ => false,
+        },
+        Expr::Path(p) if p.path.segments.len() == 1 => {
+            ctx.int_vars.contains(&p.path.segments[0].ident)
+        }
+        Expr::Field(_) => false,
+        _ => false,
+    }
+}
+
+fn is_int_type_name(n: &str) -> bool {
+    matches!(
+        n,
+        "u8" | "u16"
+            | "u32"
+            | "u64"
+            | "u128"
+            | "usize"
+            | "i8"
+            | "i16"
+            | "i32"
+            | "i64"
+            | "i128"
+            | "isize"
+    )
+}
+
+/// `int`, `nat`, or a primitive integer type (by name).
+fn is_int_like_type(ty: &Type) -> bool {
+    match ty {
+        Type::Path(tp) if tp.qself.is_none() && tp.path.segments.len() == 1 => {
+            let n = tp.path.segments[0].ident.to_string();
+            n == "int" || n == "nat" || is_int_type_name(&n)
+        }
+        Type::Reference(r) => is_int_like_type(&r.elem),
+        Type::Paren(p) => is_int_like_type(&p.elem),
+        Type::Group(g) => is_int_like_type(&g.elem),
+        _ => false,
+    }
+}
+
+/// A Verus chained comparison `a <= b < c` parses as `(a <= b) < c`; split
+/// it into `a <= b && b < c`. Only an unparenthesized comparison nested
+/// directly as the left operand of another comparison is a chain.
+fn split_chained_compare(expr: &ExprBinary) -> Option<Expr> {
+    fn is_cmp(op: &BinOp) -> bool {
+        matches!(
+            op,
+            BinOp::Lt(..) | BinOp::Le(..) | BinOp::Gt(..) | BinOp::Ge(..)
+        )
+    }
+    if !is_cmp(&expr.op) {
+        return None;
+    }
+    let Expr::Binary(inner) = expr.left.as_ref() else {
+        return None;
+    };
+    if !is_cmp(&inner.op) {
+        return None;
+    }
+    let (a, op1, b) = (&inner.left, &inner.op, &inner.right);
+    let (op2, c) = (&expr.op, &expr.right);
+    let left: Expr = verus_syn::parse_quote! { (#a #op1 #b) };
+    let right: Expr = verus_syn::parse_quote! { (#b #op2 #c) };
+    // The left part may itself be a chain
+    let left = match &left {
+        Expr::Paren(p) => match p.expr.as_ref() {
+            Expr::Binary(lb) => split_chained_compare(lb).unwrap_or(left.clone()),
+            _ => left.clone(),
+        },
+        _ => left,
+    };
+    Some(verus_syn::parse_quote! { (#left && #right) })
+}
 
 // Previously provided by `#[macro_use] mod syntax;` in the engine crate.
 use verus_spec_check_syntax::quote_vstd;
@@ -120,6 +293,24 @@ pub enum TypeKind {
 /// Converts a spec type to exec type via `<T as ExecSpecType>::Exec`.
 pub fn compile_type(typ: &Type, ctx: TypeKind) -> Result<TokenStream2, Error> {
     let span = typ.span();
+    if dyncov() {
+        // `vstd::seq::Seq<T>` and the like, by their last segment
+        if let Type::Path(tp) = typ {
+            if tp.qself.is_none()
+                && tp.path.segments.len() > 1
+                && tp.path.segments[0].ident == "vstd"
+            {
+                let last = tp.path.segments.last().unwrap().clone();
+                let mut path = Path {
+                    leading_colon: None,
+                    segments: Default::default(),
+                };
+                path.segments.push(last);
+                let single = Type::Path(verus_syn::TypePath { qself: None, path });
+                return compile_type(&single, ctx);
+            }
+        }
+    }
     match typ {
         // Treat Seq<T> and other vstd types as a special case since
         // we don't implement ExecSpecType for it
@@ -128,6 +319,17 @@ pub fn compile_type(typ: &Type, ctx: TypeKind) -> Result<TokenStream2, Error> {
             if type_path.path.segments.len() == 1 {
                 if type_path.path.segments[0].ident.to_string() == "Seq" {
                     let type_arg = get_seg_type_arg(&type_path.path.segments[0], 0)?;
+                    if dyncov() {
+                        if let Type::Path(tp) = type_arg {
+                            if tp.qself.is_none() && tp.path.is_ident("char") {
+                                // A `Seq<char>` is a string's view
+                                return match ctx {
+                                    TypeKind::Owned => Ok(quote_spanned! { span => String }),
+                                    TypeKind::Ref => Ok(quote_spanned! { span => &str }),
+                                };
+                            }
+                        }
+                    }
                     let param = compile_type(type_arg, TypeKind::Owned)?;
                     return match ctx {
                         TypeKind::Owned => Ok(quote_spanned! { span => Vec<#param> }),
@@ -138,9 +340,14 @@ pub fn compile_type(typ: &Type, ctx: TypeKind) -> Result<TokenStream2, Error> {
                     // impl ExecSpecType for Multiset to avoid this special case
                     let type_arg = get_seg_type_arg(&type_path.path.segments[0], 0)?;
                     let param = compile_type(type_arg, TypeKind::Owned)?;
+                    let ms = if dyncov() {
+                        quote! { ::verus_spec_check_vstd_ext::ExecMultiset }
+                    } else {
+                        quote! { ExecMultiset }
+                    };
                     return match ctx {
-                        TypeKind::Owned => Ok(quote_spanned! { span => ExecMultiset<#param> }),
-                        TypeKind::Ref => Ok(quote_spanned! { span => &ExecMultiset<#param> }),
+                        TypeKind::Owned => Ok(quote_spanned! { span => #ms<#param> }),
+                        TypeKind::Ref => Ok(quote_spanned! { span => &#ms<#param> }),
                     };
                 } else if type_path.path.segments[0].ident.to_string() == "MemContents" {
                     let type_arg = get_seg_type_arg(&type_path.path.segments[0], 0)?;
@@ -156,12 +363,17 @@ pub fn compile_type(typ: &Type, ctx: TypeKind) -> Result<TokenStream2, Error> {
                     let key_param = compile_type(key_type_arg, TypeKind::Owned)?;
                     let val_type_arg = get_seg_type_arg(&type_path.path.segments[0], 1)?;
                     let val_param = compile_type(val_type_arg, TypeKind::Owned)?;
+                    let hm = if dyncov() {
+                        quote! { ::std::collections::HashMap }
+                    } else {
+                        quote! { HashMap }
+                    };
                     return match ctx {
                         TypeKind::Owned => {
-                            Ok(quote_spanned! { span => HashMap<#key_param, #val_param> })
+                            Ok(quote_spanned! { span => #hm<#key_param, #val_param> })
                         }
                         TypeKind::Ref => {
-                            Ok(quote_spanned! { span => &HashMap<#key_param, #val_param> })
+                            Ok(quote_spanned! { span => &#hm<#key_param, #val_param> })
                         }
                     };
                 } else if type_path.path.segments[0].ident.to_string() == "Set" {
@@ -169,9 +381,14 @@ pub fn compile_type(typ: &Type, ctx: TypeKind) -> Result<TokenStream2, Error> {
                     // impl ExecSpecType for Map to avoid this special case
                     let key_type_arg = get_seg_type_arg(&type_path.path.segments[0], 0)?;
                     let key_param = compile_type(key_type_arg, TypeKind::Owned)?;
+                    let hs = if dyncov() {
+                        quote! { ::std::collections::HashSet }
+                    } else {
+                        quote! { HashSet }
+                    };
                     return match ctx {
-                        TypeKind::Owned => Ok(quote_spanned! { span => HashSet<#key_param> }),
-                        TypeKind::Ref => Ok(quote_spanned! { span => &HashSet<#key_param> }),
+                        TypeKind::Owned => Ok(quote_spanned! { span => #hs<#key_param> }),
+                        TypeKind::Ref => Ok(quote_spanned! { span => &#hs<#key_param> }),
                     };
                 } else if type_path.path.segments[0].ident.to_string() == "Option" {
                     // TODO: implement ExecSpecType for Option<T> so that
@@ -196,6 +413,31 @@ pub fn compile_type(typ: &Type, ctx: TypeKind) -> Result<TokenStream2, Error> {
                             Ok(quote_spanned! { span => Result<#t_param, #e_param> })
                         }
                         TypeKind::Ref => Ok(quote_spanned! { span => &Result<#t_param, #e_param> }),
+                    };
+                } else if dyncov()
+                    && (type_path.path.segments[0].ident.to_string() == "int"
+                        || type_path.path.segments[0].ident.to_string() == "nat")
+                {
+                    let t = vcheck_int("SpecInt");
+                    return Ok(quote_spanned! { span => #t });
+                } else if dyncov() && type_path.path.segments[0].ident.to_string() == "String" {
+                    return match ctx {
+                        TypeKind::Owned => Ok(quote_spanned! { span => String }),
+                        TypeKind::Ref => Ok(quote_spanned! { span => &str }),
+                    };
+                } else if dyncov() && type_path.path.segments[0].ident.to_string() == "Vec" {
+                    let type_arg = get_seg_type_arg(&type_path.path.segments[0], 0)?;
+                    let param = compile_type(type_arg, TypeKind::Owned)?;
+                    return match ctx {
+                        TypeKind::Owned => Ok(quote_spanned! { span => Vec<#param> }),
+                        TypeKind::Ref => Ok(quote_spanned! { span => &[#param] }),
+                    };
+                } else if dyncov() && type_path.path.segments[0].ident.to_string() == "Box" {
+                    let type_arg = get_seg_type_arg(&type_path.path.segments[0], 0)?;
+                    let param = compile_type(type_arg, TypeKind::Owned)?;
+                    return match ctx {
+                        TypeKind::Owned => Ok(quote_spanned! { span => Box<#param> }),
+                        TypeKind::Ref => Ok(quote_spanned! { span => &#param }),
                     };
                 // Special cases for common types to throw more informative errors
                 } else if type_path.path.segments[0].ident.to_string() == "Vec"
@@ -277,9 +519,58 @@ pub fn compile_type(typ: &Type, ctx: TypeKind) -> Result<TokenStream2, Error> {
             }
             // Other reference types fall through to the ExecSpecType
             // trait-lookup path, which will error if not implemented.
+            if dyncov() {
+                // `&T` in a spec signature is `T` in spec code; its exec
+                // form is the borrowed form of `T` either way
+                return compile_type(type_ref.elem.as_ref(), TypeKind::Ref);
+            }
+        }
+        Type::Slice(type_slice) if dyncov() => {
+            let param = compile_type(&type_slice.elem, TypeKind::Owned)?;
+            return match ctx {
+                TypeKind::Owned => Ok(quote_spanned! { span => Vec<#param> }),
+                TypeKind::Ref => Ok(quote_spanned! { span => &[#param] }),
+            };
+        }
+        Type::Array(type_array) if dyncov() => {
+            let param = compile_type(&type_array.elem, TypeKind::Owned)?;
+            return match ctx {
+                TypeKind::Owned => Ok(quote_spanned! { span => Vec<#param> }),
+                TypeKind::Ref => Ok(quote_spanned! { span => &[#param] }),
+            };
         }
 
         _ => {}
+    }
+
+    if dyncov() {
+        // Every type is its own exec model: by value for primitives, by
+        // reference for everything else
+        let by_value = match typ {
+            Type::Path(tp) if tp.qself.is_none() => tp
+                .path
+                .segments
+                .last()
+                .map(|s| {
+                    let n = s.ident.to_string();
+                    is_int_type_name(&n) || matches!(n.as_str(), "bool" | "char" | "f32" | "f64")
+                })
+                .unwrap_or(false),
+            Type::Tuple(t) => t.elems.is_empty(),
+            _ => false,
+        };
+        if let Type::Path(tp) = typ {
+            if tp.qself.is_none() && tp.path.is_ident("SpecString") {
+                return match ctx {
+                    TypeKind::Owned => Ok(quote_spanned! { span => String }),
+                    TypeKind::Ref => Ok(quote_spanned! { span => &str }),
+                };
+            }
+        }
+        return Ok(match (ctx, by_value) {
+            (_, true) | (TypeKind::Owned, _) => quote_spanned! { span => #typ },
+            (TypeKind::Ref, false) => quote_spanned! { span => &#typ },
+        });
     }
 
     // Otherwise we assume that the type has
@@ -295,7 +586,7 @@ pub fn compile_type(typ: &Type, ctx: TypeKind) -> Result<TokenStream2, Error> {
     })
 }
 
-/// Rejects `tracked` data-mode items. 
+/// Rejects `tracked` data-mode items.
 fn reject_tracked_data_mode(mode: &verus_syn::DataMode) -> Result<(), Error> {
     if let verus_syn::DataMode::Tracked(mode_tracked) = mode {
         return Err(Error::new_spanned(
@@ -309,7 +600,7 @@ fn reject_tracked_data_mode(mode: &verus_syn::DataMode) -> Result<(), Error> {
 
 /// Rejects explicit `tracked`/`ghost` markers on individual fields, which
 /// `compile_struct`/`compile_enum` would otherwise silently mirror into the
-/// `Exec*` type. 
+/// `Exec*` type.
 fn reject_field_mode_markers<'a>(
     fields: impl IntoIterator<Item = &'a verus_syn::Field>,
 ) -> Result<(), Error> {
@@ -496,11 +787,36 @@ pub(crate) fn compile_struct(item_struct: &ItemStruct) -> Result<TokenStream2, E
 
     let span = item_struct.span();
     let _vstd = crate::syntax::Vstd(span);
-    Ok(quote_spanned! { span =>
-        #[verifier::ext_equal]
-        #item_struct
+    // (dyncov) the original item stays where it is, and the mirror has no
+    // spec view (the exec types it is built from have none)
+    let original = if dyncov() {
+        quote! {}
+    } else {
+        quote_spanned! { span => #[verifier::ext_equal] #item_struct }
+    };
+    let deep_view_impl = if dyncov() {
+        quote! {}
+    } else {
+        quote_spanned! { span =>
+            impl DeepView for #exec_name {
+                type V = #spec_name;
 
-        #[derive(Eq, Hash, PartialEq, Debug)]
+                #open_or_close
+                spec fn deep_view(&self) -> #spec_name {
+                    #view_body
+                }
+            }
+        }
+    };
+    let derives = if dyncov() {
+        quote_spanned! { span => #[derive(Clone, Debug)] }
+    } else {
+        quote_spanned! { span => #[derive(Eq, Hash, PartialEq, Debug)] }
+    };
+    Ok(quote_spanned! { span =>
+        #original
+
+        #derives
         #vis struct #exec_name #exec_fields
 
         impl ::verus_spec_check_vstd_ext::ExecSpecType for #spec_name {
@@ -520,14 +836,7 @@ pub(crate) fn compile_struct(item_struct: &ItemStruct) -> Result<TokenStream2, E
             }
         }
 
-        impl DeepView for #exec_name {
-            type V = #spec_name;
-
-            #open_or_close
-            spec fn deep_view(&self) -> #spec_name {
-                #view_body
-            }
-        }
+        #deep_view_impl
 
         impl ::verus_spec_check_vstd_ext::DeepViewClone for #exec_name {
             fn deep_clone(&self) -> Self {
@@ -801,11 +1110,36 @@ pub(crate) fn compile_enum(item_enum: &ItemEnum) -> Result<TokenStream2, Error> 
 
     let span = item_enum.span();
     let _vstd = crate::syntax::Vstd(span);
-    Ok(quote_spanned! { span =>
-        #[verifier::ext_equal]
-        #item_enum
+    let original = if dyncov() {
+        quote! {}
+    } else {
+        quote_spanned! { span => #[verifier::ext_equal] #item_enum }
+    };
+    let deep_view_impl = if dyncov() {
+        quote! {}
+    } else {
+        quote_spanned! { span =>
+            impl DeepView for #exec_name {
+                type V = #spec_name;
 
-        #[derive(Eq, Hash, PartialEq, Debug)]
+                #open_or_close
+                spec fn deep_view(&self) -> #spec_name {
+                    match self {
+                        #(#deep_view_variant_arms,)*
+                    }
+                }
+            }
+        }
+    };
+    let derives = if dyncov() {
+        quote_spanned! { span => #[derive(Clone, Debug)] }
+    } else {
+        quote_spanned! { span => #[derive(Eq, Hash, PartialEq, Debug)] }
+    };
+    Ok(quote_spanned! { span =>
+        #original
+
+        #derives
         #vis enum #exec_name {
             #(#exec_variants,)*
         }
@@ -827,16 +1161,7 @@ pub(crate) fn compile_enum(item_enum: &ItemEnum) -> Result<TokenStream2, Error> 
             }
         }
 
-        impl DeepView for #exec_name {
-            type V = #spec_name;
-
-            #open_or_close
-            spec fn deep_view(&self) -> #spec_name {
-                match self {
-                    #(#deep_view_variant_arms,)*
-                }
-            }
-        }
+        #deep_view_impl
 
         impl ::verus_spec_check_vstd_ext::DeepViewClone for #exec_name {
             fn deep_clone(&self) -> Self {
@@ -967,14 +1292,15 @@ fn compile_sig(
             ..
         }) = sig.inputs.first()
         {
-            // Only `&self` is supported for now
-            if receiver.reference.is_none() {
+            // Only `&self` is supported for now (dyncov: any receiver, the
+            // twin reads through a reference either way)
+            if receiver.reference.is_none() && !dyncov() {
                 return Err(Error::new_spanned(
                     receiver,
                     "only `&self` is supported in exec_spec impl methods",
                 ));
             }
-            if receiver.mutability.is_some() {
+            if receiver.mutability.is_some() && !dyncov() {
                 return Err(Error::new_spanned(
                     receiver,
                     "`&mut self` is not supported in exec_spec impl methods",
@@ -987,7 +1313,11 @@ fn compile_sig(
                 ));
             }
             has_receiver = true;
-            let exec_self = Ident::new(&format!("Exec{}", self_ty_ident), self_ty_ident.span());
+            let exec_self = if dyncov() {
+                self_ty_ident.clone()
+            } else {
+                Ident::new(&format!("Exec{}", self_ty_ident), self_ty_ident.span())
+            };
             ctx.add(Ident::new("self", receiver.self_token.span), VarMode::Ref);
             let span = receiver.span();
             Some(quote_spanned! { span => self: &#exec_self })
@@ -1030,6 +1360,14 @@ fn compile_sig(
         .iter()
         .map(|(name, typ)| {
             ctx.add((*name).clone(), VarMode::Ref);
+            if dyncov() && is_int_like_type(typ) {
+                // An integer parameter of any width: the twin takes whatever
+                // integer the caller has and lifts it to `SpecInt` on entry
+                ctx.int_vars.insert((*name).clone());
+                let span = name.span();
+                let int_trait = vcheck_int("IntoSpecInt");
+                return Ok(quote_spanned! { span => #name: impl #int_trait });
+            }
             let typ = compile_type(typ, TypeKind::Ref)?;
             let span = name.span();
             Ok(quote_spanned! { span => #name: #typ })
@@ -1040,6 +1378,11 @@ fn compile_sig(
     let span = sig.output.span();
     let ret_type = match &sig.output {
         ReturnType::Default => quote_spanned! { span => () },
+        ReturnType::Type(_, _, _, ty) if dyncov() && is_int_like_type(ty) => {
+            // Integer results are `SpecInt` whatever their declared width
+            let t = vcheck_int("SpecInt");
+            quote_spanned! { span => #t }
+        }
         ReturnType::Type(_, _, _, ty) => {
             let typ = compile_type(ty, TypeKind::Owned)?;
             quote_spanned! { span => #typ }
@@ -1048,6 +1391,20 @@ fn compile_sig(
 
     let spec_name = &sig.ident;
     let exec_name = Ident::new(&format!("exec_{spec_name}"), spec_name.span());
+
+    if dyncov() {
+        // A plain Rust signature: the twin is not verified, and the exec
+        // types have no spec view to state its correctness with
+        let all_params: Vec<TokenStream2> = receiver_param.into_iter().chain(params).collect();
+        let span = sig.span();
+        return Ok(respan(
+            quote! {
+                #[allow(unused_variables, unused_parens, dead_code, non_snake_case)]
+                #vis fn #exec_name(#(#all_params,)*) -> #ret_type
+            },
+            span,
+        ));
+    }
 
     // Generate a specification stating that
     //   requires <recommends clause of spec_f>
@@ -1193,6 +1550,9 @@ struct LocalCtx {
     cur_fn: Ident,
     /// Mapping local variables to their modes
     vars: HashMap<Ident, VarMode>,
+    /// (dyncov) locals known to hold integers: `int`-typed params,
+    /// quantifier binders, `let`s bound to arithmetic
+    int_vars: HashSet<Ident>,
     /// A global counter for generating fresh trigger
     /// function names (unique per function).
     trigger_fns: Rc<RefCell<HashMap<Ident, Type>>>,
@@ -1203,6 +1563,7 @@ impl LocalCtx {
         LocalCtx {
             cur_fn: cur_fn.clone(),
             vars: HashMap::new(),
+            int_vars: HashSet::new(),
             trigger_fns: Rc::new(RefCell::new(HashMap::new())),
         }
     }
@@ -1244,9 +1605,14 @@ fn compile_pat_path(path: &Path) -> Result<Path, Error> {
             return Ok(path.clone());
         }
 
+        if dyncov() {
+            return Ok(path.clone());
+        }
         // Assuming this is either a enum variant (length 2)
         // or struct name (length 1)
         prefix_nth_segment(path, "Exec", 0)
+    } else if dyncov() {
+        Ok(path.clone())
     } else {
         Err(Error::new_spanned(path, "unexpected path"))
     }
@@ -1324,7 +1690,7 @@ fn infer_expr_path_kind(ctx: &LocalCtx, path: &Path) -> ExprPathKind {
         .any(|seg| seg.ident.to_string().chars().any(|c| c.is_uppercase()));
 
     if has_capital {
-        if path.segments.len() <= 2 {
+        if path.segments.len() <= 2 || dyncov() {
             ExprPathKind::StructOrEnum
         } else {
             ExprPathKind::Unknown
@@ -1439,7 +1805,13 @@ fn compile_expr_path(
         // Do not change local variables or function parameters
         ExprPathKind::Local(..) => path.clone(),
         ExprPathKind::FnName => prefix_nth_segment(path, "exec_", path.segments.len() - 1)?,
-        ExprPathKind::StructOrEnum => prefix_nth_segment(path, "Exec", 0)?,
+        ExprPathKind::StructOrEnum => {
+            if dyncov() {
+                path.clone()
+            } else {
+                prefix_nth_segment(path, "Exec", 0)?
+            }
+        }
         ExprPathKind::Constant => path.clone(),
         ExprPathKind::Unknown => return Err(Error::new_spanned(path, "unknown path kind")),
     };
@@ -1548,6 +1920,21 @@ fn compile_pattern(
             })
         }
 
+        // (dyncov) a literal matches the field's own type (an untyped
+        // integer literal takes the width of the scrutinee), and an
+        // or-pattern is the or of its alternatives, which bind the same names
+        Pat::Lit(pat_lit) if dyncov() => Ok(quote! { #pat_lit }),
+        Pat::Range(pat_range) if dyncov() => Ok(quote! { #pat_range }),
+        Pat::Or(pat_or) if dyncov() => {
+            let mut alts = Vec::new();
+            for case in pat_or.cases.iter() {
+                let mut locals = HashSet::new();
+                alts.push(compile_pattern(ctx, case, &mut locals)?);
+                new_locals.extend(locals);
+            }
+            Ok(quote! { #(#alts)|* })
+        }
+
         // TODO: maybe?
         // Pat::Struct(pat_struct) => todo!(),
         // Pat::Or(pat_or) => todo!(),
@@ -1558,21 +1945,38 @@ fn compile_pattern(
 }
 
 /// Compiles a match arm.
-fn compile_match_arm(ctx: &LocalCtx, arm: &Arm, unverified: bool) -> Result<TokenStream2, Error> {
+/// (dyncov) whether an `if` has an arm that is an integer by its shape.
+fn if_has_numeric_arm(ctx: &LocalCtx, expr_if: &verus_syn::ExprIf) -> bool {
+    fn block_tail(b: &Block) -> Option<&Expr> {
+        match b.stmts.last() {
+            Some(Stmt::Expr(e, None)) => Some(e),
+            _ => None,
+        }
+    }
+    if block_tail(&expr_if.then_branch).is_some_and(|e| is_numeric_expr(ctx, e)) {
+        return true;
+    }
+    match expr_if.else_branch.as_ref().map(|(_, e)| e.as_ref()) {
+        Some(Expr::Block(b)) => block_tail(&b.block).is_some_and(|e| is_numeric_expr(ctx, e)),
+        Some(Expr::If(inner)) => if_has_numeric_arm(ctx, inner),
+        Some(other) => is_numeric_expr(ctx, other),
+        None => false,
+    }
+}
+
+fn compile_match_arm(
+    ctx: &LocalCtx,
+    arm: &Arm,
+    unverified: bool,
+    lift_body: bool,
+) -> Result<TokenStream2, Error> {
     let mut ctx = ctx.clone();
     let mut new_locals = HashSet::new();
 
     let pat = compile_pattern(&mut ctx, &arm.pat, &mut new_locals)?;
 
     // New locals needs to be converted into the canonical borrowed types (e.g. from &String => &str)
-    let local_converts = new_locals
-        .iter()
-        .map(|ident| {
-            quote! {
-                let #ident = #ident.get_ref();
-            }
-        })
-        .collect::<Vec<_>>();
+    let local_converts = local_converts(&new_locals);
 
     let guard = match &arm.guard {
         Some((_, guard)) => {
@@ -1583,6 +1987,12 @@ fn compile_match_arm(ctx: &LocalCtx, arm: &Arm, unverified: bool) -> Result<Toke
     };
 
     let body = compile_expr(&ctx, &arm.body, VarMode::Owned, unverified)?;
+    let body = if lift_body {
+        let lift = vcheck_int("lift");
+        quote! { #lift(#body) }
+    } else {
+        body
+    };
 
     Ok(quote! {
         #pat #guard => {
@@ -1770,6 +2180,9 @@ fn check_quant_type(quant_type: &Type, unverified: bool) -> Result<(), Error> {
             if type_path.path.segments.len() == 1 {
                 let ident = &type_path.path.segments.first().unwrap().ident;
                 if unverified {
+                    if dyncov() && (ident == "int" || ident == "nat") {
+                        return Ok(());
+                    }
                     if !(ident == "u8"
                         || ident == "u16"
                         || ident == "u32"
@@ -2157,6 +2570,14 @@ fn compile_single_quant_var(
     };
 
     let mut compiled_lower = compile_expr(ctx, &var.bounds.lower, VarMode::Owned, true)?;
+    let mut compiled_upper = compile_expr(ctx, &var.bounds.upper, VarMode::Owned, true)?;
+    // (dyncov) every integer binder iterates as a `SpecInt`
+    let int_binder = dyncov() && !is_char;
+    if int_binder {
+        let lift = vcheck_int("lift");
+        compiled_lower = quote! { #lift(#compiled_lower) };
+        compiled_upper = quote! { #lift(#compiled_upper) };
+    }
     if let BinOp::Lt(..) = var.bounds.lower_op {
         compiled_lower = if is_char {
             quote! { char::from_u32(#compiled_lower as u32 + 1).unwrap(); }
@@ -2164,7 +2585,6 @@ fn compile_single_quant_var(
             quote! { #compiled_lower + 1 }
         };
     };
-    let mut compiled_upper = compile_expr(ctx, &var.bounds.upper, VarMode::Owned, true)?;
     if let BinOp::Le(..) = var.bounds.upper_op {
         compiled_upper = if is_char {
             quote! { char::from_u32(#compiled_upper as u32 + 1).unwrap(); }
@@ -2213,6 +2633,9 @@ fn compile_guarded_quant_loops_unverified(
 
     let mut body_ctx = ctx.clone();
     body_ctx.add(guarded_vars[0].quant_var.clone(), VarMode::Owned);
+    if dyncov() {
+        body_ctx.int_vars.insert(guarded_vars[0].quant_var.clone());
+    }
     let compiled_body;
     if guarded_vars.len() == 1 {
         let compiled_body_expr = compile_expr(&body_ctx, &body, VarMode::Ref, true)?;
@@ -2373,6 +2796,16 @@ fn compile_expr(
                 VarMode::Owned => quote! { #lit.to_string() },
             },
 
+            // (dyncov) an untyped integer literal is an `int`, lifted so
+            // that the type of what it flows into never waits on it; a
+            // constructor argument keeps the bare literal (see `raw_literal`)
+            Lit::Int(li) if dyncov() && matches!(li.suffix(), "" | "int" | "nat") => {
+                let typed =
+                    verus_syn::LitInt::new(&format!("{}i128", li.base10_digits()), li.span());
+                let lift = vcheck_int("lift");
+                quote! { #lift(#typed) }
+            }
+
             // Same owned/borrowed types for these cases
             Lit::Byte(..) | Lit::Char(..) | Lit::Int(..) | Lit::Float(..) | Lit::Bool(..) => {
                 quote! { #lit }
@@ -2387,7 +2820,7 @@ fn compile_expr(
             let block_expr = compile_block(ctx, &expr_block.block, unverified)?;
 
             match mode {
-                VarMode::Ref => quote! { #block_expr.get_ref() },
+                VarMode::Ref => quote! { (&#block_expr).get_ref() },
                 VarMode::Owned => quote! { #block_expr }, // block already have the owned mode
             }
         }
@@ -2405,19 +2838,23 @@ fn compile_expr(
                 let args = args
                     .0
                     .iter()
-                    .map(|arg| compile_expr(ctx, arg, VarMode::Owned, unverified))
+                    .map(|arg| compile_ctor_arg(ctx, arg, VarMode::Owned, unverified))
                     .collect::<Result<Vec<_>, Error>>()?;
 
                 // We need to convert each argument to the owned type
-                let owned = quote! { {
-                    let v = vec![ #(#args),* ];
-                    // Sometimes required for proving functional correctness
-                    assert(v.deep_view() == seq![ #spec_args ]);
-                    v
-                } };
+                let owned = if unverified {
+                    quote! { { let v = vec![ #(#args),* ]; v } }
+                } else {
+                    quote! { {
+                        let v = vec![ #(#args),* ];
+                        // Sometimes required for proving functional correctness
+                        assert(v.deep_view() == seq![ #spec_args ]);
+                        v
+                    } }
+                };
 
                 match mode {
-                    VarMode::Ref => quote! { #owned.get_ref() },
+                    VarMode::Ref => quote! { (&#owned).get_ref() },
                     VarMode::Owned => owned,
                 }
             } else {
@@ -2459,15 +2896,17 @@ fn compile_expr(
                     // Borrowed type should be structural, so we can just copy
                     (VarMode::Ref, VarMode::Ref) => quote! { #new_path },
                     (VarMode::Ref, VarMode::Owned) => quote! { (#new_path).get_owned() },
-                    (VarMode::Owned, VarMode::Ref) => quote! { (#new_path).get_ref() },
+                    (VarMode::Owned, VarMode::Ref) => quote! { (&(#new_path)).get_ref() },
 
                     // We still need to clone in this case, since
                     // we don't want to move the variable
-                    (VarMode::Owned, VarMode::Owned) => quote! { #new_path.get_ref().get_owned() },
+                    (VarMode::Owned, VarMode::Owned) => {
+                        quote! { (&#new_path).get_ref().get_owned() }
+                    }
                 },
 
                 ExprPathKind::StructOrEnum => match mode {
-                    VarMode::Ref => quote! { #new_path.get_ref() },
+                    VarMode::Ref => quote! { (&#new_path).get_ref() },
                     VarMode::Owned => quote! { #new_path },
                 },
 
@@ -2490,6 +2929,73 @@ fn compile_expr(
         // we can just apply the operator directly
         //
         // We also support equality (TODO)
+        Expr::Binary(expr_binary) if dyncov() && split_chained_compare(expr_binary).is_some() => {
+            let split = split_chained_compare(expr_binary).unwrap();
+            compile_expr(ctx, &split, mode, unverified)?
+        }
+
+        Expr::Binary(expr_binary)
+            if dyncov()
+                && matches!(
+                    expr_binary.op,
+                    BinOp::Add(..)
+                        | BinOp::Sub(..)
+                        | BinOp::Mul(..)
+                        | BinOp::Div(..)
+                        | BinOp::Rem(..)
+                        | BinOp::Lt(..)
+                        | BinOp::Le(..)
+                        | BinOp::Gt(..)
+                        | BinOp::Ge(..)
+                        | BinOp::Eq(..)
+                        | BinOp::Ne(..)
+                        | BinOp::BigEq(..)
+                        | BinOp::BigNe(..)
+                        | BinOp::ExtEq(..)
+                        | BinOp::ExtNe(..)
+                        | BinOp::ExtDeepEq(..)
+                        | BinOp::ExtDeepNe(..)
+                        | BinOp::Equiv(..)
+                        | BinOp::BitAnd(..)
+                        | BinOp::BitOr(..)
+                        | BinOp::BitXor(..)
+                        | BinOp::Shl(..)
+                        | BinOp::Shr(..)
+                ) =>
+        {
+            // The runtime dispatches on the operands' shapes: integers of
+            // any width compute in the `int` domain, sequences concatenate,
+            // references compare structurally
+            let left = compile_expr(ctx, &expr_binary.left, VarMode::Ref, unverified)?;
+            let right = compile_expr(ctx, &expr_binary.right, VarMode::Ref, unverified)?;
+            let name = match expr_binary.op {
+                BinOp::Add(..) => "dc_add",
+                BinOp::Sub(..) => "dc_sub",
+                BinOp::Mul(..) => "dc_mul",
+                BinOp::Div(..) => "dc_div",
+                BinOp::Rem(..) => "dc_rem",
+                BinOp::Lt(..) => "dc_lt",
+                BinOp::Le(..) => "dc_le",
+                BinOp::Gt(..) => "dc_gt",
+                BinOp::Ge(..) => "dc_ge",
+                BinOp::Ne(..) | BinOp::BigNe(..) | BinOp::ExtNe(..) | BinOp::ExtDeepNe(..) => {
+                    "dc_ne"
+                }
+                BinOp::BitAnd(..) => "dc_bitand",
+                BinOp::BitOr(..) => "dc_bitor",
+                BinOp::BitXor(..) => "dc_bitxor",
+                BinOp::Shl(..) => "dc_shl",
+                BinOp::Shr(..) => "dc_shr",
+                _ => "dc_eq",
+            };
+            let f = Ident::new(name, Span::call_site());
+            let owned = quote! { ::verus_spec_check::#f(#left, #right) };
+            match mode {
+                VarMode::Ref => quote! { (&#owned).get_ref() },
+                VarMode::Owned => owned,
+            }
+        }
+
         Expr::Binary(expr_binary) => match &expr_binary.op {
             // `bool` has the same owned and borrowed types, so no need to convert here
             BinOp::Eq(..) => {
@@ -2609,6 +3115,34 @@ fn compile_expr(
         // `as T` for a primitive T will be preserved
         // `as int`/`as nat` will be removed
         // TODO: more strict checking here
+        Expr::Cast(expr_cast) if dyncov() => {
+            let inner = compile_expr(ctx, &expr_cast.expr, VarMode::Ref, unverified)?;
+            let target = match expr_cast.ty.as_ref() {
+                Type::Path(tp) if tp.qself.is_none() && tp.path.segments.len() == 1 => {
+                    Some(tp.path.segments[0].ident.to_string())
+                }
+                _ => None,
+            };
+            match target.as_deref() {
+                Some("int") | Some("nat") => {
+                    let f = vcheck_int("lift");
+                    quote! { #f(#inner) }
+                }
+                Some(n) if is_int_type_name(n) => {
+                    let f = vcheck_int(&format!("to_{n}"));
+                    quote! { #f(#inner) }
+                }
+                Some("char") => {
+                    let f = vcheck_int("to_char");
+                    quote! { #f(#inner) }
+                }
+                _ => {
+                    let typ = compile_type(&expr_cast.ty, TypeKind::Ref)?;
+                    quote! { (#inner as #typ) }
+                }
+            }
+        }
+
         Expr::Cast(expr_cast) => match expr_cast.ty.as_ref() {
             Type::Path(type_path)
                 if is_path_eq(&type_path.path, &["int"])
@@ -2626,6 +3160,34 @@ fn compile_expr(
                 }
             }
         },
+
+        Expr::If(expr_if) if dyncov() && if_has_numeric_arm(ctx, expr_if) => {
+            // One arm is an integer, so all are (`int` in spec code): lift
+            // each to `SpecInt`, whatever width it computes in
+            let lift = vcheck_int("lift");
+            let cond = compile_expr(ctx, &expr_if.cond, VarMode::Ref, unverified)?;
+            let then_branch = compile_block(ctx, &expr_if.then_branch, unverified)?;
+            let else_branch = compile_expr(
+                ctx,
+                &expr_if
+                    .else_branch
+                    .as_ref()
+                    .ok_or(Error::new_spanned(
+                        expr_if,
+                        "else branch is required for if expression",
+                    ))?
+                    .1,
+                VarMode::Owned,
+                unverified,
+            )?;
+            let owned = quote! {
+                if #cond { #lift(#then_branch) } else { #lift(#else_branch) }
+            };
+            match mode {
+                VarMode::Ref => quote! { (&#owned).get_ref() },
+                VarMode::Owned => owned,
+            }
+        }
 
         Expr::If(expr_if) => {
             let cond = compile_expr(ctx, &expr_if.cond, VarMode::Ref, unverified)?;
@@ -2657,13 +3219,24 @@ fn compile_expr(
             };
 
             match mode {
-                VarMode::Ref => quote! { #owned.get_ref() },
+                VarMode::Ref => quote! { (&#owned).get_ref() },
                 VarMode::Owned => owned,
             }
         }
 
         // View expressions are ignored (e.g. "abc"@ => "abc")
         // TODO: more strict rules here
+        Expr::View(view) if dyncov() => {
+            // `x@`: the `View` twin of a user type, the identity of a std
+            // type (`DcView` in the runtime)
+            let expr = compile_expr(ctx, &view.expr, VarMode::Ref, unverified)?;
+            let viewed = quote! { (&((#expr).exec_view())).get_ref() };
+            match mode {
+                VarMode::Ref => viewed,
+                VarMode::Owned => quote! { #viewed.get_owned() },
+            }
+        }
+
         Expr::View(view) => {
             let expr = compile_expr(ctx, &view.expr, mode, unverified)?;
             quote! { #expr }
@@ -2675,6 +3248,7 @@ fn compile_expr(
         Expr::Index(expr_index) => {
             let base = compile_expr(ctx, &expr_index.expr, VarMode::Ref, unverified)?;
             let index = compile_expr(ctx, &expr_index.index, VarMode::Ref, unverified)?;
+            let index = as_usize(index);
 
             match mode {
                 VarMode::Ref => quote! { #base.exec_index(#index).get_ref() },
@@ -2686,6 +3260,10 @@ fn compile_expr(
 
         // Only support unary arithmetic operators
         Expr::Unary(expr_unary) => match &expr_unary.op {
+            UnOp::Neg(..) if dyncov() => {
+                let expr = compile_expr(ctx, &expr_unary.expr, VarMode::Ref, unverified)?;
+                quote! { ::verus_spec_check::dc_neg(#expr) }
+            }
             UnOp::Neg(..) | UnOp::Not(..) => {
                 let op = &expr_unary.op;
                 let expr = compile_expr(ctx, &expr_unary.expr, VarMode::Ref, unverified)?;
@@ -2699,7 +3277,7 @@ fn compile_expr(
                 let inner = compile_expr(ctx, &expr_unary.expr, VarMode::Owned, unverified)?;
                 match mode {
                     VarMode::Owned => quote! { #inner },
-                    VarMode::Ref => quote! { #inner.get_ref() },
+                    VarMode::Ref => quote! { (&#inner).get_ref() },
                 }
             }
             UnOp::Forall(..) | UnOp::Exists(..) => {
@@ -2708,14 +3286,14 @@ fn compile_expr(
                     let compiled =
                         compile_guarded_quant_unverified(ctx, &expr_unary.op, &expr_unary.expr)?;
                     match mode {
-                        VarMode::Ref => quote! { #compiled.get_ref() },
+                        VarMode::Ref => quote! { (&#compiled).get_ref() },
                         VarMode::Owned => compiled,
                     }
                 } else {
                     let compiled =
                         compile_guarded_quant_verified(ctx, &expr_unary.op, &expr_unary.expr)?;
                     match mode {
-                        VarMode::Ref => quote! { #compiled.get_ref() },
+                        VarMode::Ref => quote! { (&#compiled).get_ref() },
                         VarMode::Owned => compiled,
                     }
                 }
@@ -2756,6 +3334,56 @@ fn compile_expr(
                 return Err(Error::new_spanned(expr_call, "unsupported callee"));
             };
 
+            if dyncov() {
+                let first = fn_path.path.segments.first().map(|s| s.ident.to_string());
+                if matches!(
+                    first.as_deref(),
+                    Some("vstd") | Some("verus_builtin") | Some("builtin")
+                ) {
+                    // A few vstd spec functions have an executable meaning
+                    // (`verus_spec_check::vstd_fns`); the rest are unknown
+                    let last = fn_path.path.segments.last().map(|s| s.ident.to_string());
+                    if let Some(name) = last.filter(|n| matches!(n.as_str(), "increasing_seq")) {
+                        let f = Ident::new(&name, fn_path.span());
+                        let args = expr_call
+                            .args
+                            .iter()
+                            .map(|arg| compile_expr(ctx, arg, VarMode::Ref, unverified))
+                            .collect::<Result<Vec<_>, Error>>()?;
+                        let owned = quote! { ::verus_spec_check::vstd_fns::#f(#(#args),*) };
+                        return Ok(match mode {
+                            VarMode::Ref => quote! { (&#owned).get_ref() },
+                            VarMode::Owned => owned,
+                        });
+                    }
+                    return Err(Error::new_spanned(
+                        expr_call,
+                        "a spec function of vstd has no exec twin",
+                    ));
+                }
+                // `Seq::<T>::empty()`, `Set::empty()`, `Map::empty()`
+                let n = fn_path.path.segments.len();
+                if n >= 2 && expr_call.args.is_empty() {
+                    let container = fn_path.path.segments[n - 2].ident.to_string();
+                    let method = fn_path.path.segments[n - 1].ident.to_string();
+                    if method == "empty" {
+                        let args = &fn_path.path.segments[n - 2].arguments;
+                        let owned = match container.as_str() {
+                            "Seq" => Some(quote! { ::std::vec::Vec #args ::new() }),
+                            "Set" => Some(quote! { ::std::collections::HashSet #args ::new() }),
+                            "Map" => Some(quote! { ::std::collections::HashMap #args ::new() }),
+                            _ => None,
+                        };
+                        if let Some(owned) = owned {
+                            return Ok(match mode {
+                                VarMode::Ref => quote! { (&#owned).get_ref() },
+                                VarMode::Owned => owned,
+                            });
+                        }
+                    }
+                }
+            }
+
             // Special-case verus's arithmetic builtins (`add(a, b)`,
             // `sub(a, b)`, `mul(a, b)`) which appear in bit-vector specs
             // (e.g. `i << sub(8, t) == 0`). They have no exec companion;
@@ -2776,7 +3404,7 @@ fn compile_expr(
                     let r = compile_expr(ctx, rhs, VarMode::Owned, unverified)?;
                     let owned = quote! { (#l).#op(#r) };
                     let result = match mode {
-                        VarMode::Ref => quote! { #owned.get_ref() },
+                        VarMode::Ref => quote! { (&#owned).get_ref() },
                         VarMode::Owned => owned,
                     };
                     return Ok(result);
@@ -2817,7 +3445,7 @@ fn compile_expr(
                         },
                     };
                     let result = match mode {
-                        VarMode::Ref => quote! { #owned.get_ref() },
+                        VarMode::Ref => quote! { (&#owned).get_ref() },
                         VarMode::Owned => owned,
                     };
                     return Ok(result);
@@ -2832,7 +3460,7 @@ fn compile_expr(
                     let args = expr_call
                         .args
                         .iter()
-                        .map(|arg| compile_expr(ctx, arg, VarMode::Owned, unverified))
+                        .map(|arg| compile_ctor_arg(ctx, arg, VarMode::Owned, unverified))
                         .collect::<Result<Vec<_>, Error>>()?;
                     quote! { #exec_fn_path(#(#args),*) }
                 }
@@ -2850,7 +3478,7 @@ fn compile_expr(
             };
 
             match mode {
-                VarMode::Ref => quote! { #owned.get_ref() },
+                VarMode::Ref => quote! { (&#owned).get_ref() },
                 VarMode::Owned => owned,
             }
         }
@@ -2867,10 +3495,10 @@ fn compile_expr(
                 let receiver =
                     compile_expr(ctx, &expr_method_call.receiver, VarMode::Ref, unverified)?;
                 match mode {
-                    VarMode::Ref => quote! { #receiver.exec_dom().get_ref() },
+                    VarMode::Ref => quote! { (&#receiver.exec_dom()).get_ref() },
 
                     // Clone to avoid partial moves
-                    VarMode::Owned => quote! { #receiver.exec_dom().get_ref().get_owned() },
+                    VarMode::Owned => quote! { #receiver.exec_dom() },
                 }
             }
 
@@ -2882,6 +3510,7 @@ fn compile_expr(
                     VarMode::Ref,
                     unverified,
                 )?;
+                let index = as_usize(index);
 
                 match mode {
                     VarMode::Ref => quote! { #base.exec_index(#index).get_ref() },
@@ -2920,8 +3549,8 @@ fn compile_expr(
                 )?;
 
                 match mode {
-                    VarMode::Ref => quote! { #receiver.exec_add(#arg).get_ref() },
-                    VarMode::Owned => quote! { #receiver.exec_add(#arg).get_ref().get_owned() },
+                    VarMode::Ref => quote! { (&#receiver.exec_add(#arg)).get_ref() },
+                    VarMode::Owned => quote! { #receiver.exec_add(#arg) },
                 }
             }
 
@@ -2934,10 +3563,11 @@ fn compile_expr(
                     VarMode::Owned,
                     unverified,
                 )?;
+                let arg = as_elem(arg);
 
                 match mode {
-                    VarMode::Ref => quote! { #receiver.exec_push(#arg).get_ref() },
-                    VarMode::Owned => quote! { #receiver.exec_push(#arg).get_ref().get_owned() },
+                    VarMode::Ref => quote! { (&#receiver.exec_push(#arg)).get_ref() },
+                    VarMode::Owned => quote! { #receiver.exec_push(#arg) },
                 }
             }
 
@@ -2950,17 +3580,19 @@ fn compile_expr(
                     VarMode::Ref,
                     unverified,
                 )?;
+                let index = as_usize(index);
                 let arg = compile_expr(
                     ctx,
                     &expr_method_call.args.last().unwrap(),
                     VarMode::Owned,
                     unverified,
                 )?;
+                let arg = as_elem(arg);
 
                 match mode {
-                    VarMode::Ref => quote! { #receiver.exec_update(#index, #arg).get_ref() },
+                    VarMode::Ref => quote! { (&#receiver.exec_update(#index, #arg)).get_ref() },
                     VarMode::Owned => {
-                        quote! { #receiver.exec_update(#index, #arg).get_ref().get_owned() }
+                        quote! { #receiver.exec_update(#index, #arg) }
                     }
                 }
             }
@@ -2980,6 +3612,7 @@ fn compile_expr(
                     VarMode::Ref,
                     unverified,
                 )?;
+                let (arg1, arg2) = (as_usize(arg1), as_usize(arg2));
 
                 match mode {
                     VarMode::Ref => quote! { #receiver.exec_subrange(#arg1, #arg2) },
@@ -2992,8 +3625,8 @@ fn compile_expr(
                     compile_expr(ctx, &expr_method_call.receiver, VarMode::Ref, unverified)?;
 
                 match mode {
-                    VarMode::Ref => quote! { #receiver.exec_to_multiset().get_ref() },
-                    VarMode::Owned => quote! { #receiver.exec_to_multiset().get_ref().get_owned() },
+                    VarMode::Ref => quote! { (&#receiver.exec_to_multiset()).get_ref() },
+                    VarMode::Owned => quote! { #receiver.exec_to_multiset() },
                 }
             }
 
@@ -3006,6 +3639,7 @@ fn compile_expr(
                     VarMode::Ref,
                     unverified,
                 )?;
+                let arg = as_usize(arg);
 
                 match mode {
                     VarMode::Ref => quote! { #receiver.exec_take(#arg) },
@@ -3022,6 +3656,7 @@ fn compile_expr(
                     VarMode::Ref,
                     unverified,
                 )?;
+                let arg = as_usize(arg);
 
                 match mode {
                     VarMode::Ref => quote! { #receiver.exec_skip(#arg) },
@@ -3057,6 +3692,7 @@ fn compile_expr(
                     VarMode::Owned,
                     unverified,
                 )?;
+                let value = as_elem(value);
 
                 match mode {
                     VarMode::Ref => quote! { #base.exec_count(#value) },
@@ -3105,6 +3741,7 @@ fn compile_expr(
                     VarMode::Owned,
                     unverified,
                 )?;
+                let arg = as_elem(arg);
 
                 match mode {
                     VarMode::Ref => quote! { #receiver.exec_contains(#arg) },
@@ -3121,10 +3758,11 @@ fn compile_expr(
                     VarMode::Owned,
                     unverified,
                 )?;
+                let arg = as_elem(arg);
 
                 match mode {
-                    VarMode::Ref => quote! { #receiver.exec_get(#arg).get_ref() },
-                    VarMode::Owned => quote! { #receiver.exec_get(#arg).get_ref().get_owned() },
+                    VarMode::Ref => quote! { (&#receiver.exec_get(#arg)).get_ref() },
+                    VarMode::Owned => quote! { #receiver.exec_get(#arg) },
                 }
             }
 
@@ -3137,6 +3775,7 @@ fn compile_expr(
                     VarMode::Owned,
                     unverified,
                 )?;
+                let arg = as_elem(arg);
 
                 match mode {
                     VarMode::Ref => quote! { #receiver.exec_index_of(#arg) },
@@ -3153,11 +3792,12 @@ fn compile_expr(
                     VarMode::Owned,
                     unverified,
                 )?;
+                let arg = as_elem(arg);
 
                 match mode {
-                    VarMode::Ref => quote! { #receiver.exec_index_of_first(#arg).get_ref() },
+                    VarMode::Ref => quote! { (&#receiver.exec_index_of_first(#arg)).get_ref() },
                     VarMode::Owned => {
-                        quote! { #receiver.exec_index_of_first(#arg).get_ref().get_owned() }
+                        quote! { #receiver.exec_index_of_first(#arg) }
                     }
                 }
             }
@@ -3171,11 +3811,12 @@ fn compile_expr(
                     VarMode::Owned,
                     unverified,
                 )?;
+                let arg = as_elem(arg);
 
                 match mode {
-                    VarMode::Ref => quote! { #receiver.exec_index_of_last(#arg).get_ref() },
+                    VarMode::Ref => quote! { (&#receiver.exec_index_of_last(#arg)).get_ref() },
                     VarMode::Owned => {
-                        quote! { #receiver.exec_index_of_last(#arg).get_ref().get_owned() }
+                        quote! { #receiver.exec_index_of_last(#arg) }
                     }
                 }
             }
@@ -3196,11 +3837,12 @@ fn compile_expr(
                         VarMode::Owned,
                         unverified,
                     )?;
+                    let (arg1, arg2) = (as_elem(arg1), as_elem(arg2));
 
                     match mode {
-                        VarMode::Ref => quote! { #receiver.exec_insert(#arg1, #arg2).get_ref() },
+                        VarMode::Ref => quote! { (&#receiver.exec_insert(#arg1, #arg2)).get_ref() },
                         VarMode::Owned => {
-                            quote! { #receiver.exec_insert(#arg1, #arg2).get_ref().get_owned() }
+                            quote! { #receiver.exec_insert(#arg1, #arg2) }
                         }
                     }
                 } else {
@@ -3210,11 +3852,12 @@ fn compile_expr(
                         VarMode::Owned,
                         unverified,
                     )?;
+                    let arg = as_elem(arg);
 
                     match mode {
-                        VarMode::Ref => quote! { #receiver.exec_insert(#arg).get_ref() },
+                        VarMode::Ref => quote! { (&#receiver.exec_insert(#arg)).get_ref() },
                         VarMode::Owned => {
-                            quote! { #receiver.exec_insert(#arg).get_ref().get_owned() }
+                            quote! { #receiver.exec_insert(#arg) }
                         }
                     }
                 }
@@ -3229,10 +3872,11 @@ fn compile_expr(
                     VarMode::Owned,
                     unverified,
                 )?;
+                let arg = as_elem(arg);
 
                 match mode {
-                    VarMode::Ref => quote! { #receiver.exec_remove(#arg).get_ref() },
-                    VarMode::Owned => quote! { #receiver.exec_remove(#arg).get_ref().get_owned() },
+                    VarMode::Ref => quote! { (&#receiver.exec_remove(#arg)).get_ref() },
+                    VarMode::Owned => quote! { #receiver.exec_remove(#arg) },
                 }
             }
 
@@ -3247,9 +3891,9 @@ fn compile_expr(
                 )?;
 
                 match mode {
-                    VarMode::Ref => quote! { #receiver.exec_intersect(#arg).get_ref() },
+                    VarMode::Ref => quote! { (&#receiver.exec_intersect(#arg)).get_ref() },
                     VarMode::Owned => {
-                        quote! { #receiver.exec_intersect(#arg).get_ref().get_owned() }
+                        quote! { #receiver.exec_intersect(#arg) }
                     }
                 }
             }
@@ -3265,8 +3909,8 @@ fn compile_expr(
                 )?;
 
                 match mode {
-                    VarMode::Ref => quote! { #receiver.exec_union(#arg).get_ref() },
-                    VarMode::Owned => quote! { #receiver.exec_union(#arg).get_ref().get_owned() },
+                    VarMode::Ref => quote! { (&#receiver.exec_union(#arg)).get_ref() },
+                    VarMode::Owned => quote! { #receiver.exec_union(#arg) },
                 }
             }
 
@@ -3281,9 +3925,9 @@ fn compile_expr(
                 )?;
 
                 match mode {
-                    VarMode::Ref => quote! { #receiver.exec_difference(#arg).get_ref() },
+                    VarMode::Ref => quote! { (&#receiver.exec_difference(#arg)).get_ref() },
                     VarMode::Owned => {
-                        quote! { #receiver.exec_difference(#arg).get_ref().get_owned() }
+                        quote! { #receiver.exec_difference(#arg) }
                     }
                 }
             }
@@ -3299,8 +3943,8 @@ fn compile_expr(
                 )?;
 
                 match mode {
-                    VarMode::Ref => quote! { #receiver.exec_sub(#arg).get_ref() },
-                    VarMode::Owned => quote! { #receiver.exec_sub(#arg).get_ref().get_owned() },
+                    VarMode::Ref => quote! { (&#receiver.exec_sub(#arg)).get_ref() },
+                    VarMode::Owned => quote! { #receiver.exec_sub(#arg) },
                 }
             }
 
@@ -3309,8 +3953,8 @@ fn compile_expr(
                     compile_expr(ctx, &expr_method_call.receiver, VarMode::Ref, unverified)?;
 
                 match mode {
-                    VarMode::Ref => quote! { #receiver.exec_unwrap().get_ref() },
-                    VarMode::Owned => quote! { #receiver.exec_unwrap().get_ref().get_owned() },
+                    VarMode::Ref => quote! { (&#receiver.exec_unwrap()).get_ref() },
+                    VarMode::Owned => quote! { #receiver.exec_unwrap() },
                 }
             }
 
@@ -3333,7 +3977,7 @@ fn compile_expr(
                 let owned = quote! { #receiver.#exec_method(#(#args),*) };
 
                 match mode {
-                    VarMode::Ref => quote! { #owned.get_ref() },
+                    VarMode::Ref => quote! { (&#owned).get_ref() },
                     VarMode::Owned => owned,
                 }
             }
@@ -3341,10 +3985,15 @@ fn compile_expr(
 
         Expr::Match(expr_match) => {
             let expr = compile_expr(ctx, &expr_match.expr, VarMode::Ref, unverified)?;
+            let numeric = dyncov()
+                && expr_match
+                    .arms
+                    .iter()
+                    .any(|a| is_numeric_expr(ctx, &a.body));
             let arms = expr_match
                 .arms
                 .iter()
-                .map(|arm| compile_match_arm(ctx, arm, unverified))
+                .map(|arm| compile_match_arm(ctx, arm, unverified, numeric))
                 .collect::<Result<Vec<_>, Error>>()?;
 
             let owned = quote! {
@@ -3354,7 +4003,7 @@ fn compile_expr(
             };
 
             match mode {
-                VarMode::Ref => quote! { #owned.get_ref() },
+                VarMode::Ref => quote! { (&#owned).get_ref() },
                 VarMode::Owned => owned,
             }
         }
@@ -3367,7 +4016,7 @@ fn compile_expr(
                 .collect::<Result<Vec<_>, Error>>()?;
 
             match mode {
-                VarMode::Ref => quote! { (#(#exprs),*).get_ref() },
+                VarMode::Ref => quote! { (&(#(#exprs),*)).get_ref() },
                 VarMode::Owned => quote! { (#(#exprs),*) },
             }
         }
@@ -3394,19 +4043,27 @@ fn compile_expr(
                             "unsupported unamed field in struct expression",
                         ));
                     };
-                    let value = compile_expr(ctx, &field.expr, VarMode::Owned, unverified)?;
+                    let value = compile_ctor_arg(ctx, &field.expr, VarMode::Owned, unverified)?;
                     Ok(quote! { #name: #value })
                 })
                 .collect::<Result<Vec<_>, Error>>()?;
 
+            let rest = match &expr_struct.rest {
+                Some(rest) => {
+                    let r = compile_expr(ctx, rest, VarMode::Owned, unverified)?;
+                    quote! { ..#r }
+                }
+                None => quote! {},
+            };
             let owned = quote! {
                 #new_path {
                     #(#fields,)*
+                    #rest
                 }
             };
 
             match mode {
-                VarMode::Ref => quote! { #owned.get_ref() },
+                VarMode::Ref => quote! { (&#owned).get_ref() },
                 VarMode::Owned => owned,
             }
         }
@@ -3423,9 +4080,10 @@ fn compile_expr(
 
             let lhs = compile_expr(&ctx, lhs, VarMode::Ref, unverified)?;
 
+            let converts = local_converts(&new_locals);
             let true_rhs = if let Some(MatchesOpExpr { rhs, .. }) = op_expr {
                 let rhs = compile_expr(&ctx, rhs, VarMode::Owned, unverified)?;
-                quote! { { #rhs } }
+                quote! { { #(#converts)* #rhs } }
             } else {
                 quote! { true }
             };
@@ -3447,7 +4105,7 @@ fn compile_expr(
             };
 
             match mode {
-                VarMode::Ref => quote! { #owned.get_ref() },
+                VarMode::Ref => quote! { (&#owned).get_ref() },
                 VarMode::Owned => owned,
             }
         }
@@ -3486,7 +4144,7 @@ fn compile_expr(
                 }
             };
             match mode {
-                VarMode::Ref => quote! { (#owned).get_ref() },
+                VarMode::Ref => quote! { (&(#owned)).get_ref() },
                 VarMode::Owned => owned,
             }
         }
@@ -3520,7 +4178,7 @@ fn compile_expr(
                 }
             };
             match mode {
-                VarMode::Ref => quote! { (#owned).get_ref() },
+                VarMode::Ref => quote! { (&(#owned)).get_ref() },
                 VarMode::Owned => owned,
             }
         }
@@ -3592,7 +4250,7 @@ fn compile_expr(
                 }
             };
             match mode {
-                VarMode::Ref => quote! { (#owned).get_ref() },
+                VarMode::Ref => quote! { (&(#owned)).get_ref() },
                 VarMode::Owned => owned,
             }
         }
@@ -3636,6 +4294,107 @@ fn compile_expr(
     Ok(expr_ts)
 }
 
+/// (dyncov) the body of a twin: integer parameters are lifted to `SpecInt`
+/// on entry and an integer result is a `SpecInt` whatever the width the
+/// body computes in.
+fn dyncov_body(sig: &Signature, body: TokenStream2) -> TokenStream2 {
+    if !dyncov() {
+        return body;
+    }
+    let lift = vcheck_int("lift");
+    let lifts = sig.inputs.iter().filter_map(|p| match &p.kind {
+        FnArgKind::Typed(pt) if is_int_like_type(&pt.ty) => match get_simple_pat(&pt.pat) {
+            Ok((name, _)) => Some(quote! { let #name = #lift(#name); }),
+            Err(_) => None,
+        },
+        _ => None,
+    });
+    let int_ret = match &sig.output {
+        ReturnType::Type(_, _, _, ty) => is_int_like_type(ty),
+        ReturnType::Default => false,
+    };
+    if int_ret {
+        quote! { { #(#lifts)* #lift(#body) } }
+    } else {
+        quote! { { #(#lifts)* #body } }
+    }
+}
+
+/// The names a pattern binds, converted to the canonical borrowed types
+/// (`&String` to `&str`); in the dyncov flavor an integer bound by
+/// reference also becomes a `SpecInt` value (`dc_val`), the shape the
+/// lowering expects for integers.
+fn local_converts(locals: &HashSet<Ident>) -> Vec<TokenStream2> {
+    let mut names: Vec<&Ident> = locals.iter().collect();
+    names.sort_by_key(|i| i.to_string());
+    names
+        .iter()
+        .map(|ident| {
+            if dyncov() {
+                quote! { let #ident = (&#ident.get_ref()).dc_val(); }
+            } else {
+                quote! { let #ident = #ident.get_ref(); }
+            }
+        })
+        .collect()
+}
+
+/// (dyncov) a direct argument of an exec-type constructor, a struct field
+/// value or a `seq!` element: an untyped literal stays bare, for the field's
+/// type to decide it.
+fn compile_ctor_arg(
+    ctx: &LocalCtx,
+    expr: &Expr,
+    mode: VarMode,
+    unverified: bool,
+) -> Result<TokenStream2, Error> {
+    if dyncov() {
+        if let Expr::Lit(lit) = expr {
+            if let Lit::Int(li) = &lit.lit {
+                if matches!(li.suffix(), "" | "int" | "nat") {
+                    let bare = verus_syn::LitInt::new(li.base10_digits(), li.span());
+                    return Ok(quote! { #bare });
+                }
+            }
+        }
+        // A tuple narrows element-wise
+        if let Expr::Tuple(t) = expr {
+            let elems = t
+                .elems
+                .iter()
+                .map(|e| compile_ctor_arg(ctx, e, VarMode::Owned, unverified))
+                .collect::<Result<Vec<_>, Error>>()?;
+            return Ok(quote! { (#(#elems),*) });
+        }
+        // Any other value narrows to the field's type if it is an integer
+        // (`int` computations flow into fixed-width fields), else passes
+        let compiled = compile_expr(ctx, expr, mode, unverified)?;
+        return Ok(quote! { ::verus_spec_check::dc_into(#compiled) });
+    }
+    compile_expr(ctx, expr, mode, unverified)
+}
+
+/// (dyncov) an element argument of a sequence/set/map method: narrowed to
+/// the element type if it is an integer.
+fn as_elem(arg: TokenStream2) -> TokenStream2 {
+    if dyncov() {
+        quote! { ::verus_spec_check::dc_into(#arg) }
+    } else {
+        arg
+    }
+}
+
+/// (dyncov) an index or length argument, which may be a `SpecInt`, as a
+/// `usize`.
+fn as_usize(index: TokenStream2) -> TokenStream2 {
+    if dyncov() {
+        let f = vcheck_int("to_usize");
+        quote! { #f(#index) }
+    } else {
+        index
+    }
+}
+
 /// Compiles a block.
 ///
 /// TODO: to avoid issues of `temporary value dropped while borrowed`
@@ -3650,7 +4409,7 @@ fn compile_block(ctx: &LocalCtx, block: &Block, unverified: bool) -> Result<Toke
             // A local binding
             Stmt::Local(binding) => {
                 // Reject `let tracked` / `let ghost` markers instead of
-                // silently ignoring them. 
+                // silently ignoring them.
                 if let Some(tracked_token) = &binding.tracked {
                     return Err(Error::new_spanned(
                         tracked_token,
@@ -3667,9 +4426,28 @@ fn compile_block(ctx: &LocalCtx, block: &Block, unverified: bool) -> Result<Toke
                          at best redundant and at worst a sign the item isn't a spec fn",
                     ));
                 }
+                if dyncov() {
+                    if let Pat::Tuple(tuple) = &binding.pat {
+                        // `let (a, b) = e;` binds owned locals
+                        let Some(local_init) = &binding.init else {
+                            return Err(Error::new_spanned(stmt, "let without initializer"));
+                        };
+                        let expr =
+                            compile_expr(&ctx, &local_init.expr, VarMode::Owned, unverified)?;
+                        let mut vars = Vec::new();
+                        for elem in tuple.elems.iter() {
+                            let (var, _) = get_simple_pat(elem)?;
+                            ctx.add(var.clone(), VarMode::Owned);
+                            vars.push(var.clone());
+                        }
+                        ts.push(quote! { let (#(#vars),*) = #expr; });
+                        continue;
+                    }
+                }
+
                 let (var, typ) = get_simple_pat(&binding.pat)?;
 
-                if typ.is_some() {
+                if typ.is_some() && !dyncov() {
                     return Err(Error::new_spanned(
                         binding,
                         "typed local variables not supported",
@@ -3685,6 +4463,12 @@ fn compile_block(ctx: &LocalCtx, block: &Block, unverified: bool) -> Result<Toke
 
                 let expr = compile_expr(&ctx, &local_init.expr, VarMode::Owned, unverified)?;
 
+                if dyncov()
+                    && (is_numeric_expr(&ctx, &local_init.expr)
+                        || typ.as_ref().is_some_and(|t| is_int_like_type(t)))
+                {
+                    ctx.int_vars.insert(var.clone());
+                }
                 ctx.add(var.clone(), VarMode::Owned);
                 ts.push(quote! { let #var = #expr; });
             }
@@ -3703,7 +4487,7 @@ fn compile_block(ctx: &LocalCtx, block: &Block, unverified: bool) -> Result<Toke
 }
 
 /// Recursively sets the span of all tokens in a token stream to the given one.
-fn respan(input: TokenStream2, span: Span) -> TokenStream2 {
+pub fn respan(input: TokenStream2, span: Span) -> TokenStream2 {
     input
         .into_iter()
         .map(|mut tt| {
@@ -3737,6 +4521,7 @@ pub(crate) fn compile_spec_fn(item_fn: &ItemFn, unverified: bool) -> Result<Toke
 
     let sig = compile_sig(&mut ctx, &item_fn.sig, &item_fn.vis, None, unverified)?;
     let body = compile_block(&ctx, &item_fn.block, unverified)?;
+    let body = dyncov_body(&item_fn.sig, body);
 
     // Generate all promised trigger functions
     let trigger_fns = ctx
@@ -3751,6 +4536,13 @@ pub(crate) fn compile_spec_fn(item_fn: &ItemFn, unverified: bool) -> Result<Toke
         .collect::<Result<Vec<_>, Error>>()?;
 
     let span = item_fn.span();
+    if dyncov() {
+        return Ok(quote_spanned! { span =>
+            #[allow(unused_parens)]
+            #[allow(non_shorthand_field_patterns)]
+            #sig #body
+        });
+    }
     Ok(quote_spanned! { span =>
         #item_fn
 
@@ -3794,7 +4586,11 @@ fn compile_impl(item_impl: &ItemImpl, unverified: bool) -> Result<TokenStream2, 
             ));
         }
     };
-    let exec_self_ty = Ident::new(&format!("Exec{}", self_ty_ident), self_ty_ident.span());
+    let exec_self_ty = if dyncov() {
+        self_ty_ident.clone()
+    } else {
+        Ident::new(&format!("Exec{}", self_ty_ident), self_ty_ident.span())
+    };
 
     let mut exec_methods = Vec::new();
     for impl_item in &item_impl.items {
@@ -3820,6 +4616,7 @@ fn compile_impl(item_impl: &ItemImpl, unverified: bool) -> Result<TokenStream2, 
                     unverified,
                 )?;
                 let body = compile_block(&ctx, &impl_fn.block, unverified)?;
+                let body = dyncov_body(&impl_fn.sig, body);
 
                 let trigger_fns = ctx
                     .trigger_fns
@@ -3833,13 +4630,21 @@ fn compile_impl(item_impl: &ItemImpl, unverified: bool) -> Result<TokenStream2, 
                     .collect::<Vec<_>>();
 
                 let span = impl_fn.span();
-                exec_methods.push(quote_spanned! { span =>
-                    #(#trigger_fns)*
+                exec_methods.push(if dyncov() {
+                    quote_spanned! { span =>
+                        #[allow(unused_parens)]
+                        #[allow(non_shorthand_field_patterns)]
+                        #sig #body
+                    }
+                } else {
+                    quote_spanned! { span =>
+                        #(#trigger_fns)*
 
-                    #[allow(unused_parens)]
-                    #[allow(non_shorthand_field_patterns)]
-                    #[verifier::loop_isolation(false)]
-                    #sig #body
+                        #[allow(unused_parens)]
+                        #[allow(non_shorthand_field_patterns)]
+                        #[verifier::loop_isolation(false)]
+                        #sig #body
+                    }
                 });
             }
             _ => {
@@ -3852,6 +4657,13 @@ fn compile_impl(item_impl: &ItemImpl, unverified: bool) -> Result<TokenStream2, 
     }
 
     let span = item_impl.span();
+    if dyncov() {
+        return Ok(quote_spanned! { span =>
+            impl #exec_self_ty {
+                #(#exec_methods)*
+            }
+        });
+    }
     Ok(quote_spanned! { span =>
         #item_impl
 

@@ -286,7 +286,10 @@ mod bolero_emit_tests {
             out.contains(":: verus_spec_check :: bolero_generator :: TypeGenerator for Point"),
             "{out}"
         );
-        assert!(out.contains(":: verus_spec_check :: VcheckGen for Point"), "{out}");
+        assert!(
+            out.contains(":: verus_spec_check :: VcheckGen for Point"),
+            "{out}"
+        );
         // VcheckGen delegates to produce::<Point>().
         assert!(
             out.contains(":: verus_spec_check :: bolero_generator :: produce :: < Point > ()"),

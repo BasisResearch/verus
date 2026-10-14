@@ -6,7 +6,7 @@
 //!      and `x.f(...)` -> `x.exec_f(...)` for spec methods.
 //!
 //! The contract rewriter is in a sense a layer over exec_spec. While
-//! exec_spec does most of the work in making contracts executable, 
+//! exec_spec does most of the work in making contracts executable,
 //! the contract rewriter enables the support of particularly nasty types
 //! e.g. int, nat, real, and mut with dedicated runtime environments. For example,
 //! int requires the num_bigint library at runtime.
@@ -534,8 +534,8 @@ impl<'a> VisitMut for ContractRewriter<'a> {
         if let Expr::Unary(u) = expr {
             if matches!(u.op, verus_syn::UnOp::Deref(_)) {
                 if let Some(name) = ident_of_expr(&u.expr) {
-                    let strip =
-                        name.starts_with("__vcheck_pre_") || self.param_call_form.contains_key(&name);
+                    let strip = name.starts_with("__vcheck_pre_")
+                        || self.param_call_form.contains_key(&name);
                     if strip {
                         let inner = (*u.expr).clone();
                         *expr = inner;
@@ -2475,9 +2475,18 @@ mod int_nat_lowering_tests {
         // which makes the RHS SpecInt, so the outer `==` lifts to `eq`. Every
         // literal suffix is gone.
         let out = rewrite(verus_syn::parse_quote! { s == x * 2int + 1int }, &["s"]);
-        assert!(out.contains(":: verus_spec_check :: __vcheck_int :: eq"), "{out}");
-        assert!(out.contains(":: verus_spec_check :: __vcheck_int :: mul"), "{out}");
-        assert!(out.contains(":: verus_spec_check :: __vcheck_int :: add"), "{out}");
+        assert!(
+            out.contains(":: verus_spec_check :: __vcheck_int :: eq"),
+            "{out}"
+        );
+        assert!(
+            out.contains(":: verus_spec_check :: __vcheck_int :: mul"),
+            "{out}"
+        );
+        assert!(
+            out.contains(":: verus_spec_check :: __vcheck_int :: add"),
+            "{out}"
+        );
         // No spec-only literal suffix survives (the substring "int" itself is
         // fine — it appears in `__vcheck_int`; what must be gone is `2int`/`1int`).
         assert!(!out.contains("2int"), "int suffix leaked: {out}");
@@ -2536,7 +2545,10 @@ mod int_nat_lowering_tests {
         // `signed_double` example, where the raw `-` left an
         // `i32 >= BigInt` type error in the harness.
         let out = rewrite(verus_syn::parse_quote! { x >= -(i32::MAX / 2) }, &[]);
-        assert!(out.contains(":: verus_spec_check :: __vcheck_int :: neg"), "{out}");
+        assert!(
+            out.contains(":: verus_spec_check :: __vcheck_int :: neg"),
+            "{out}"
+        );
         assert!(
             out.contains(":: verus_spec_check :: __vcheck_int :: ge (x ,"),
             "{out}"
@@ -2556,7 +2568,10 @@ mod int_nat_lowering_tests {
             out.contains(":: verus_spec_check :: __vcheck_int :: neg (& s)"),
             "{out}"
         );
-        assert!(out.contains(":: verus_spec_check :: __vcheck_int :: add"), "{out}");
+        assert!(
+            out.contains(":: verus_spec_check :: __vcheck_int :: add"),
+            "{out}"
+        );
     }
 }
 
@@ -2633,13 +2648,19 @@ mod real_lowering_tests {
     #[test]
     fn as_real_cast_lowers_to_cast() {
         let out = rewrite_real(verus_syn::parse_quote! { x as real }, &[]);
-        assert_eq!(out, ":: verus_spec_check :: __vcheck_real :: cast (x)", "got: {out}");
+        assert_eq!(
+            out, ":: verus_spec_check :: __vcheck_real :: cast (x)",
+            "got: {out}"
+        );
     }
 
     #[test]
     fn real_addition_routes_to_vcheck_real_add() {
         let out = rewrite_real(verus_syn::parse_quote! { (x as real) + 1real }, &[]);
-        assert!(out.contains(":: verus_spec_check :: __vcheck_real :: add"), "{out}");
+        assert!(
+            out.contains(":: verus_spec_check :: __vcheck_real :: add"),
+            "{out}"
+        );
         assert!(
             out.contains(":: verus_spec_check :: __vcheck_real :: cast (x)"),
             "{out}"
@@ -2652,20 +2673,29 @@ mod real_lowering_tests {
     #[test]
     fn real_division_routes_to_vcheck_real_div() {
         let out = rewrite_real(verus_syn::parse_quote! { (x as real) / (y as real) }, &[]);
-        assert!(out.contains(":: verus_spec_check :: __vcheck_real :: div"), "{out}");
+        assert!(
+            out.contains(":: verus_spec_check :: __vcheck_real :: div"),
+            "{out}"
+        );
         assert!(!out.contains("__vcheck_int"), "{out}");
     }
 
     #[test]
     fn real_comparison_routes_to_vcheck_real_le() {
         let out = rewrite_real(verus_syn::parse_quote! { (x as real) <= 1.5real }, &[]);
-        assert!(out.contains(":: verus_spec_check :: __vcheck_real :: le"), "{out}");
+        assert!(
+            out.contains(":: verus_spec_check :: __vcheck_real :: le"),
+            "{out}"
+        );
     }
 
     #[test]
     fn real_as_int_lowers_to_floor() {
         let out = rewrite_real(verus_syn::parse_quote! { (x as real) as int }, &[]);
-        assert!(out.contains(":: verus_spec_check :: __vcheck_real :: floor"), "{out}");
+        assert!(
+            out.contains(":: verus_spec_check :: __vcheck_real :: floor"),
+            "{out}"
+        );
         assert!(
             out.contains(":: verus_spec_check :: __vcheck_real :: cast (x)"),
             "{out}"
@@ -2675,13 +2705,19 @@ mod real_lowering_tests {
     #[test]
     fn real_floor_method_lowers_to_floor() {
         let out = rewrite_real(verus_syn::parse_quote! { (x as real).floor() }, &[]);
-        assert!(out.contains(":: verus_spec_check :: __vcheck_real :: floor"), "{out}");
+        assert!(
+            out.contains(":: verus_spec_check :: __vcheck_real :: floor"),
+            "{out}"
+        );
     }
 
     #[test]
     fn real_negation_routes_to_vcheck_real_neg() {
         let out = rewrite_real(verus_syn::parse_quote! { -(x as real) }, &[]);
-        assert!(out.contains(":: verus_spec_check :: __vcheck_real :: neg"), "{out}");
+        assert!(
+            out.contains(":: verus_spec_check :: __vcheck_real :: neg"),
+            "{out}"
+        );
     }
 
     #[test]
@@ -2700,7 +2736,10 @@ mod real_lowering_tests {
         // Regression: an expression with no real operand still lowers through
         // the integer path.
         let out = rewrite_real(verus_syn::parse_quote! { x + 1int }, &[]);
-        assert!(out.contains(":: verus_spec_check :: __vcheck_int :: add"), "{out}");
+        assert!(
+            out.contains(":: verus_spec_check :: __vcheck_int :: add"),
+            "{out}"
+        );
         assert!(!out.contains("__vcheck_real"), "{out}");
     }
 
@@ -2731,7 +2770,10 @@ mod real_lowering_tests {
         // `(x as real) as int == 3`: floor returns a SpecInt, so the `==`
         // must lift through the INTEGER helper (BigInt), not the real one.
         let out = rewrite_real(verus_syn::parse_quote! { (x as real) as int == 3 }, &[]);
-        assert!(out.contains(":: verus_spec_check :: __vcheck_real :: floor"), "{out}");
+        assert!(
+            out.contains(":: verus_spec_check :: __vcheck_real :: floor"),
+            "{out}"
+        );
         assert!(
             out.contains(":: verus_spec_check :: __vcheck_int :: eq"),
             "compare must use int path: {out}"
@@ -2756,7 +2798,10 @@ mod real_lowering_tests {
     fn parenthesized_real_operand_is_detected() {
         // `expr_tail_is_vcheck_real` must see through parens.
         let out = rewrite_real(verus_syn::parse_quote! { ((x as real)) + 1real }, &[]);
-        assert!(out.contains(":: verus_spec_check :: __vcheck_real :: add"), "{out}");
+        assert!(
+            out.contains(":: verus_spec_check :: __vcheck_real :: add"),
+            "{out}"
+        );
     }
 }
 

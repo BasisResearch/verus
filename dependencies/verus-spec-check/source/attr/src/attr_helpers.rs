@@ -5,7 +5,7 @@ use super::*;
 // ---------------------------------------------------------------------------
 
 /// Sentinel doc attribute the `#[vcheck]` strip pass leaves behind on impl
-/// methods that were originally marked 
+/// methods that were originally marked
 pub const VERUS_SPEC_CHECK_HARNESS_SENTINEL: &str = "__verus_spec_check_harness_marker__";
 
 /// Lenient match for our marker attributes, mirroring `collect_attrs`:
@@ -182,8 +182,6 @@ pub fn impl_fn_has_attr(f: &verus_syn::ImplItemFn, name: &str) -> bool {
 pub fn strip_attr_impl_fn(f: &mut verus_syn::ImplItemFn, name: &str) {
     f.attrs.retain(|a| !attr_is(a, name));
 }
-
-
 
 /// Replace `#[vcheck]` on an impl method with the sentinel doc attribute. Used
 /// in place of `strip_attr_impl_fn(f, "vcheck")` when we want classify to know

@@ -116,8 +116,6 @@ pub fn impl_fn_vcheck_miri_mode(f: &verus_syn::ImplItemFn) -> VcheckMiriMode {
         .unwrap_or_default()
 }
 
-
-
 /// Stamp a `#[doc = "verus_spec_check::miri::mode = <mode>"]` sentinel attribute on
 /// the item when its `#[vcheck(...)]` carried `miri = "..."`. No-op when the
 /// item has no `#[vcheck]` attribute, no `miri` key, or the mode is the default
@@ -183,7 +181,7 @@ pub fn miri_mode_from_doc_sentinel(attrs: &[Attribute]) -> Option<VcheckMiriMode
 }
 
 /// Which property-testing backend a `#[vcheck]` harness should target?
-/// By default, proptest and bolero are supported. Miri may be supported 
+/// By default, proptest and bolero are supported. Miri may be supported
 /// in the future.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum VcheckBackend {
@@ -339,7 +337,6 @@ pub fn impl_fn_vcheck_bolero_mode(f: &verus_syn::ImplItemFn) -> Option<VcheckBol
         .find(|a| attr_is(a, "vcheck"))
         .and_then(parse_marker_bolero_mode)
 }
-
 
 /// Stamp a `#[doc = "verus_spec_check::backend = <name>"]` sentinel on the item when
 /// its `#[vcheck(...)]` selected a non-default backend. No-op when no `#[vcheck]`
@@ -787,9 +784,9 @@ mod mode_tests {
     //! doc sentinels that survive the `#[vcheck]` strip.
 
     use super::{
-        item_vcheck_backend, item_vcheck_bolero_mode, parse_marker_backend, parse_marker_bolero_mode,
-        stamp_backend_sentinel_item, stamp_bolero_mode_sentinel_item, strip_attr_item, VcheckBackend,
-        VcheckBoleroMode,
+        item_vcheck_backend, item_vcheck_bolero_mode, parse_marker_backend,
+        parse_marker_bolero_mode, stamp_backend_sentinel_item, stamp_bolero_mode_sentinel_item,
+        strip_attr_item, VcheckBackend, VcheckBoleroMode,
     };
     use verus_syn::parse_quote;
 
@@ -804,14 +801,20 @@ mod mode_tests {
     fn mode_fuzz_is_bolero_backend_fuzz_mode() {
         let attr: verus_syn::Attribute = parse_quote! { #[vcheck(mode = "fuzz")] };
         assert_eq!(parse_marker_backend(&attr), VcheckBackend::Bolero);
-        assert_eq!(parse_marker_bolero_mode(&attr), Some(VcheckBoleroMode::Fuzz));
+        assert_eq!(
+            parse_marker_bolero_mode(&attr),
+            Some(VcheckBoleroMode::Fuzz)
+        );
     }
 
     #[test]
     fn mode_kani_is_bolero_backend_kani_mode() {
         let attr: verus_syn::Attribute = parse_quote! { #[vcheck(mode = "kani")] };
         assert_eq!(parse_marker_backend(&attr), VcheckBackend::Bolero);
-        assert_eq!(parse_marker_bolero_mode(&attr), Some(VcheckBoleroMode::Kani));
+        assert_eq!(
+            parse_marker_bolero_mode(&attr),
+            Some(VcheckBoleroMode::Kani)
+        );
     }
 
     #[test]
@@ -833,7 +836,10 @@ mod mode_tests {
         let attr: verus_syn::Attribute =
             parse_quote! { #[vcheck(backend = "proptest", mode = "fuzz")] };
         assert_eq!(parse_marker_backend(&attr), VcheckBackend::Bolero);
-        assert_eq!(parse_marker_bolero_mode(&attr), Some(VcheckBoleroMode::Fuzz));
+        assert_eq!(
+            parse_marker_bolero_mode(&attr),
+            Some(VcheckBoleroMode::Fuzz)
+        );
     }
 
     #[test]
@@ -841,7 +847,10 @@ mod mode_tests {
         // Back-compat: the pre-`mode` spelling implies the general fuzz mode.
         let attr: verus_syn::Attribute = parse_quote! { #[vcheck(backend = "bolero")] };
         assert_eq!(parse_marker_backend(&attr), VcheckBackend::Bolero);
-        assert_eq!(parse_marker_bolero_mode(&attr), Some(VcheckBoleroMode::Fuzz));
+        assert_eq!(
+            parse_marker_bolero_mode(&attr),
+            Some(VcheckBoleroMode::Fuzz)
+        );
     }
 
     #[test]
@@ -849,7 +858,10 @@ mod mode_tests {
         let attr: verus_syn::Attribute =
             parse_quote! { #[vcheck(miri = "skip", mode = "kani", N = 4)] };
         assert_eq!(parse_marker_backend(&attr), VcheckBackend::Bolero);
-        assert_eq!(parse_marker_bolero_mode(&attr), Some(VcheckBoleroMode::Kani));
+        assert_eq!(
+            parse_marker_bolero_mode(&attr),
+            Some(VcheckBoleroMode::Kani)
+        );
     }
 
     #[test]

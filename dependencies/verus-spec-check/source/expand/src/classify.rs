@@ -130,7 +130,7 @@ pub struct Classified {
     pub user_type_names: HashSet<String>,
     /// Contract-bearing fns / methods that need a harness.
     pub contract_targets: Vec<ContractTarget>,
-    /// Token bodies of `external_vcheck_provide!` invocations 
+    /// Token bodies of `external_vcheck_provide!` invocations
     pub external_provide_bodies: Vec<TokenStream2>,
     /// `runtime fn name -> spec fn name` redirect from
     /// `#[verifier::when_used_as_spec(spec_X)]` attributes. The contract
@@ -294,7 +294,9 @@ pub fn attr_is_vcheck_cov_mutate(attr: &verus_syn::Attribute) -> bool {
     let segs: Vec<&str> = segs.iter().map(|s| s.as_str()).collect();
     matches!(
         &segs[..],
-        ["vcheck_cov_mutate"] | ["contrib", "vcheck_cov_mutate"] | ["vstd", "contrib", "vcheck_cov_mutate"]
+        ["vcheck_cov_mutate"]
+            | ["contrib", "vcheck_cov_mutate"]
+            | ["vstd", "contrib", "vcheck_cov_mutate"]
     )
 }
 
@@ -388,7 +390,9 @@ pub fn attr_is_vcheck_cov_fuzz(attr: &verus_syn::Attribute) -> bool {
     let segs: Vec<&str> = segs.iter().map(|s| s.as_str()).collect();
     matches!(
         &segs[..],
-        ["vcheck_cov_fuzz"] | ["contrib", "vcheck_cov_fuzz"] | ["vstd", "contrib", "vcheck_cov_fuzz"]
+        ["vcheck_cov_fuzz"]
+            | ["contrib", "vcheck_cov_fuzz"]
+            | ["vstd", "contrib", "vcheck_cov_fuzz"]
     )
 }
 
@@ -646,7 +650,11 @@ pub fn classify(items: Vec<Item>) -> Classified {
                     // block (it would trip the uninterp diagnostic) and out of
                     // `spec_fn_names` (so calls route to the view rewrite, not
                     // an `exec_view` rename).
-                    if item_fn.attrs.iter().any(|a| attr_is_ident(a, "vcheck_view")) {
+                    if item_fn
+                        .attrs
+                        .iter()
+                        .any(|a| attr_is_ident(a, "vcheck_view"))
+                    {
                         // Nothing to emit; the original stays in the user's
                         // (non-test) source for the verifier.
                     } else {
@@ -665,8 +673,8 @@ pub fn classify(items: Vec<Item>) -> Classified {
                         // Read `#[vcheck(miri = "skip")]` (if any) before we
                         // strip the marker, so the harness can carry the
                         // `#[cfg_attr(miri, ignore)]` translation.
-                        let miri_skip =
-                            crate::vcheck_attr::item_vcheck_miri_mode(&item).should_skip_under_miri();
+                        let miri_skip = crate::vcheck_attr::item_vcheck_miri_mode(&item)
+                            .should_skip_under_miri();
                         // Read the selected backend from the same source
                         // (`#[vcheck(backend = "...")]`, recovered via the doc
                         // sentinel after the marker strip).
@@ -865,7 +873,8 @@ pub fn classify(items: Vec<Item>) -> Classified {
                                         let miri_skip =
                                             crate::vcheck_attr::impl_fn_vcheck_miri_mode(impl_fn)
                                                 .should_skip_under_miri();
-                                        let backend = crate::vcheck_attr::impl_fn_vcheck_backend(impl_fn);
+                                        let backend =
+                                            crate::vcheck_attr::impl_fn_vcheck_backend(impl_fn);
                                         let bolero_mode =
                                             crate::vcheck_attr::impl_fn_vcheck_bolero_mode(impl_fn);
                                         // See FreeFn equivalent above for
@@ -951,15 +960,17 @@ pub fn classify(items: Vec<Item>) -> Classified {
                 // macro item itself does not pass through to verus!.
                 if let Item::Macro(m) = &item {
                     if macro_path_is_external_provide(&m.mac.path) {
-                        for n in crate::external_vcheck_provide::provided_names(m.mac.tokens.clone()) {
+                        for n in
+                            crate::external_vcheck_provide::provided_names(m.mac.tokens.clone())
+                        {
                             spec_fn_names.insert(n);
                         }
                         // int/nat-returning twins: register so the contract
                         // rewriter routes their call results through the
                         // SpecInt domain (casts, comparisons).
-                        for n in
-                            crate::external_vcheck_provide::int_returning_names(m.mac.tokens.clone())
-                        {
+                        for n in crate::external_vcheck_provide::int_returning_names(
+                            m.mac.tokens.clone(),
+                        ) {
                             register_int_returning_provided(n);
                         }
                         external_provide_bodies.push(m.mac.tokens.clone());

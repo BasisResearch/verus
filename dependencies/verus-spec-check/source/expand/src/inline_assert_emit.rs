@@ -134,7 +134,8 @@ pub fn emit_inline_assert_checker_fn(
     // before we got here (the discovery pass mutates passthrough_items),
     // so the cloned ContractTarget body may or may not still carry the
     // attribute depending on which clone-vs-original path was used.
-    let applied = crate::vcheck_assert::rewrite_path_assert_at_line(&mut body, line, idx, &panic_msg);
+    let applied =
+        crate::vcheck_assert::rewrite_path_assert_at_line(&mut body, line, idx, &panic_msg);
     if !applied {
         return Err(Error::new(
             proc_macro2::Span::call_site(),
@@ -191,7 +192,8 @@ pub fn emit_inline_assert_forall_harness(
 
     let line = target.line;
     let encfn_label = sanitize_label(&target.enclosing_fn_label);
-    let test_fn_ident: Ident = format_ident!("__vcheck_assert_forall_{}_at_line{}", encfn_label, line);
+    let test_fn_ident: Ident =
+        format_ident!("__vcheck_assert_forall_{}_at_line{}", encfn_label, line);
 
     // Build the strategy tuple from the binder types, using the same
     // shape-classification path as regular `#[vcheck]` parameters. We

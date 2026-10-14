@@ -151,18 +151,16 @@ pub fn vcheck_provide_preprocess(items: &mut Vec<Item>) -> bool {
                             synthesize_vcheck_wrapper_from_assume_spec(&variant)
                         {
                             if i > 0 {
-                                synthesized.sig.ident = quote::format_ident!(
-                                    "{}_v{}",
-                                    synthesized.sig.ident,
-                                    i + 1
-                                );
+                                synthesized.sig.ident =
+                                    quote::format_ident!("{}_v{}", synthesized.sig.ident, i + 1);
                             }
                             synthesized_wrappers.push(Item::Fn(synthesized));
                         }
                     }
                 } else {
                     let asp_copy = asp.clone();
-                    if let Some(synthesized) = synthesize_vcheck_wrapper_from_assume_spec(&asp_copy) {
+                    if let Some(synthesized) = synthesize_vcheck_wrapper_from_assume_spec(&asp_copy)
+                    {
                         synthesized_wrappers.push(Item::Fn(synthesized));
                     }
                 }
@@ -232,7 +230,8 @@ pub fn vcheck_provide_preprocess(items: &mut Vec<Item>) -> bool {
         let marker_at: Vec<bool> = items
             .iter()
             .map(|item| {
-                let item_marker = item_has_attr(item, "vcheck_provide") || item_has_attr(item, "vcheck");
+                let item_marker =
+                    item_has_attr(item, "vcheck_provide") || item_has_attr(item, "vcheck");
                 let method_marker = match item {
                     Item::Impl(im) => im.items.iter().any(|ii| match ii {
                         ImplItem::Fn(f) => {
@@ -272,7 +271,9 @@ pub fn vcheck_provide_preprocess(items: &mut Vec<Item>) -> bool {
                         if let ImplItem::Fn(f) = ii {
                             // Only lift methods that carry the marker;
                             // unmarked sibling methods stay where they are.
-                            if !impl_fn_has_attr(f, "vcheck") && !impl_fn_has_attr(f, "vcheck_provide") {
+                            if !impl_fn_has_attr(f, "vcheck")
+                                && !impl_fn_has_attr(f, "vcheck_provide")
+                            {
                                 continue;
                             }
                             if let Some(new_fn) = lift_trait_method_to_free_fn(
@@ -504,11 +505,11 @@ or impl method instead.",
             }
         }
         // #[vcheck] / #[vcheck_provide] on a method inside an impl: include the
-        // whole impl block and the impl's Self type. 
+        // whole impl block and the impl's Self type.
         if let Item::Impl(im) = item {
             let mut impl_has_marker = false;
-            let impl_attr_subst =
-                item_marker_subst(item, "vcheck").or_else(|| item_marker_subst(item, "vcheck_provide"));
+            let impl_attr_subst = item_marker_subst(item, "vcheck")
+                .or_else(|| item_marker_subst(item, "vcheck_provide"));
             let mut method_subst: Option<Subst> = None;
             for (mi, ii) in im.items.iter().enumerate() {
                 if let ImplItem::Fn(f) = ii {
