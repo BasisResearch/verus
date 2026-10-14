@@ -24,5 +24,7 @@ verus_spec_check_exec_spec.workspace = true
 verus_spec_check_external_provide.workspace = true
 verus_spec_check_syntax.workspace = true
 
-[lints]
-workspace = true
+# Upstream code, reviewed there: the fork's workspace-wide `clippy -D warnings`
+# does not apply to it.
+[lints.clippy]
+all = { level = "allow", priority = -1 }

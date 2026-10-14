@@ -148,7 +148,7 @@ fn end_to_end_sets_and_taint() {
     // lowering disagreements, which do not affect coverage
     assert_eq!(
         t,
-        vec!["always_false", "mixed", "use_dead", "via_trusted"]
+        ["always_false", "mixed", "use_dead", "via_trusted"]
             .iter()
             .map(|s| s.to_string())
             .collect::<Vec<_>>(),

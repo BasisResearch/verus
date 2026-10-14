@@ -151,7 +151,6 @@ fn stats() -> std::sync::MutexGuard<'static, Stats> {
 }
 
 struct Frame {
-    id: FnId,
     kind: Kind,
     tainted: bool,
 }
@@ -254,7 +253,7 @@ fn install_term_handler() {
     // SAFETY: `signal` is provided by the C runtime std links against; the
     // handler is an `extern "C" fn` that only stores an atomic.
     unsafe {
-        signal(SIGTERM, on_term as usize);
+        signal(SIGTERM, on_term as *const () as usize);
     }
 }
 
@@ -313,7 +312,7 @@ pub fn enter(id: FnId, kind: Kind) -> Guard {
     stats().functions.entry(id).or_default().calls += 1;
     let depth = STACK.with(|s| {
         let mut s = s.borrow_mut();
-        s.push(Frame { id, kind, tainted: false });
+        s.push(Frame { kind, tainted: false });
         s.len() - 1
     });
     Guard { depth, id }

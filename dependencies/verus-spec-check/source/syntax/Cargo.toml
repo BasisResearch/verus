@@ -19,5 +19,7 @@ path = "src/lib.rs"
 proc-macro2.workspace = true
 quote.workspace = true
 
-[lints]
-workspace = true
+# Upstream code, reviewed there: the fork's workspace-wide `clippy -D warnings`
+# does not apply to it.
+[lints.clippy]
+all = { level = "allow", priority = -1 }
