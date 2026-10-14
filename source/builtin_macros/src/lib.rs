@@ -158,6 +158,26 @@ pub(crate) fn cfg_erase() -> EraseGhost {
     EraseGhost::EraseAll
 }
 
+/// Whether `--cfg verus_dyncov` is set on the crate being compiled (by
+/// `verus --dyncov`, for its erase-and-compile pass): the `verus!` macro
+/// then instruments exec code for dynamic verified coverage.
+///
+/// Not cached: the verifier runs its keep-ghost pass and its compile pass
+/// in one process, and only the latter sets the cfg.
+#[cfg(verus_keep_ghost)]
+pub(crate) fn cfg_dyncov() -> bool {
+    let ts: proc_macro::TokenStream = quote::quote! { ::core::cfg!(verus_dyncov) }.into();
+    match ts.expand_expr() {
+        Ok(name) => name.to_string() == "true",
+        Err(_) => false,
+    }
+}
+
+#[cfg(not(verus_keep_ghost))]
+pub(crate) fn cfg_dyncov() -> bool {
+    false
+}
+
 #[derive(Clone, Copy)]
 enum VstdKind {
     /// The current crate is vstd.

@@ -5,6 +5,7 @@ use std::{
 
 use yansi::Paint;
 
+mod dyncov;
 #[path = "../../../tools/common/mcp_gate.rs"]
 mod mcp_gate;
 mod record;
@@ -338,6 +339,15 @@ fn run() -> Result<std::process::ExitStatus, String> {
     // so we currently need the old behavior of rustup of adding the bin directory to the PATH.
     #[cfg(windows)]
     cmd.env("RUSTUP_WINDOWS_PATH_ADD_BIN", "1");
+
+    // `--dyncov` is an argument of a standalone run; under cargo-verus it
+    // travels in the driver-args environment variables
+    let dyncov = args.iter().any(|a| a == "--dyncov")
+        || std::env::vars()
+            .any(|(k, v)| k.contains("__VERUS_DRIVER_ARGS") && v.contains("--dyncov"));
+    if !record && record_history_project_dirs.is_none() && dyncov {
+        std::process::exit(dyncov::run_with_retries(&mut cmd, &args));
+    }
 
     if !record && record_history_project_dirs.is_none() {
         match platform::exec(&mut cmd) {

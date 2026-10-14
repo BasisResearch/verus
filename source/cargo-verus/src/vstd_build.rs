@@ -23,6 +23,8 @@ pub struct VstdBuild {
 /// - `libverus_builtin.rlib`
 /// - `libverus_builtin_macros.dylib`
 /// - `libverus_state_machines_macros.dylib`
+/// - `libverus_dyncov.rlib` (the `verus --dyncov` run-time vstd re-exports;
+///   absent from a `no_std` vstd)
 ///
 /// The implementation makes the following assumptions:
 /// - Files to hoist are siblings of `vstd.rmeta`.
@@ -88,6 +90,7 @@ pub fn build_vstd(vstd_build: &VstdBuild, mut command: Command) -> Result<ExitCo
     let verus_builtin_macros_dylib = get_artifact_file("verus_builtin_macros", DLL_EXTENSION)?;
     let verus_state_machines_macros_dylib =
         get_artifact_file("verus_state_machines_macros", DLL_EXTENSION)?;
+    let verus_dyncov_rlib = get_artifact_file("verus_dyncov", "rlib").ok();
 
     fn copy_file(src: &Utf8Path, dst: &Utf8Path) -> Result<()> {
         let _ = std::fs::copy(src.as_std_path(), dst.as_std_path())
@@ -107,6 +110,10 @@ pub fn build_vstd(vstd_build: &VstdBuild, mut command: Command) -> Result<ExitCo
         &vstd_rlib
             .with_file_name(format!("{DLL_PREFIX}verus_state_machines_macros.{DLL_EXTENSION}")),
     )?;
+    if let Some(rlib) = verus_dyncov_rlib {
+        // vstd's rlib names this dependency; rustc looks it up beside vstd
+        copy_file(rlib, &vstd_rlib.with_file_name("libverus_dyncov.rlib"))?;
+    }
 
     Ok(exit_code)
 }

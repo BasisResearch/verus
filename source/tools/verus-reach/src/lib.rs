@@ -7,7 +7,11 @@
 //! crates and computes what is reachable from the chosen roots: which
 //! functions run, and which ghost functions (specs and proofs) the running
 //! code's contracts and proofs use. Coverage is the share of verified
-//! functions, exec and ghost alike, that are reachable.
+//! functions, exec and ghost alike, that are reachable. [`dyncov`] joins
+//! the run-time profiles of an instrumented build (`verus --dyncov`) with
+//! these reports.
+
+pub mod dyncov;
 
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
@@ -175,16 +179,8 @@ pub fn load(paths: &[PathBuf]) -> Result<Vec<Report>, String> {
         }
     }
     let reports: Vec<Report> = files.iter().map(|f| load_file(f)).collect::<Result<_, _>>()?;
-    // A test build holds the library's functions again, under another id
-    for test in reports.iter().filter(|r| r.crate_type == "test") {
-        if reports.iter().any(|r| r.krate == test.krate && r.crate_type != "test") {
-            return Err(format!(
-                "crate `{}` has both a test report and a lib or bin report: a test build \
-                 includes the library's functions, which would count twice; keep one",
-                test.krate
-            ));
-        }
-    }
+    // A test build holds the library's functions again, under another id;
+    // the graph counts the copies once (see `Graph::canonical`)
     Ok(reports)
 }
 
@@ -200,6 +196,21 @@ fn load_file(path: &Path) -> Result<Report, String> {
         ));
     }
     Ok(report)
+}
+
+/// See [`Graph::canonical`]: a `krate(test)::path` id stands for
+/// `krate::path` or `krate(bin)::path` when a report defines that id.
+fn canonical_ids(nodes: &BTreeMap<String, Node>) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    for id in nodes.keys() {
+        let canonical = id
+            .split_once("(test)::")
+            .map(|(krate, rest)| [format!("{krate}::{rest}"), format!("{krate}(bin)::{rest}")])
+            .and_then(|candidates| candidates.into_iter().find(|c| nodes.contains_key(c)))
+            .unwrap_or_else(|| id.clone());
+        map.insert(id.clone(), canonical);
+    }
+    map
 }
 
 /// How to pick the roots of the reachability analysis. Functions marked
@@ -232,6 +243,15 @@ pub struct Graph {
     /// Every function the user wrote, of every crate, by id. Synthesized
     /// items (see [`Node::is_synthesized`]) are left out; their edges stay.
     pub nodes: BTreeMap<String, Node>,
+    /// Every edge of every crate
+    edges: Vec<Edge>,
+    /// Id → the id the function is counted under. A crate compiled both
+    /// normally and in test mode (a library and its unit tests) reports its
+    /// functions twice, under `krate::` and `krate(test)::` ids; the copies
+    /// are the same source, so the non-test one stands for both.
+    pub canonical: HashMap<String, String>,
+    /// Canonical id → every id it stands for (itself included)
+    pub copies: HashMap<String, Vec<String>>,
     pub roots: Vec<String>,
     /// Runs: reached from a root through calls only
     pub reachable: HashSet<String>,
@@ -334,7 +354,23 @@ impl Graph {
                 connected.insert(edge.from.clone());
             }
         }
-        Ok(Graph { nodes, roots: root_ids, reachable, used, connected, referred })
+        let edges = reports.iter().flat_map(|r| r.edges.iter().cloned()).collect();
+        let canonical = canonical_ids(&nodes);
+        let mut copies: HashMap<String, Vec<String>> = HashMap::new();
+        for (id, canon) in &canonical {
+            copies.entry(canon.clone()).or_default().push(id.clone());
+        }
+        Ok(Graph {
+            nodes,
+            edges,
+            canonical,
+            copies,
+            roots: root_ids,
+            reachable,
+            used,
+            connected,
+            referred,
+        })
     }
 
     /// Verified functions that mention used code but are not used: what the
@@ -354,6 +390,23 @@ impl Graph {
             .into_iter()
             .filter(|n| !self.referred.contains(&n.id))
             .collect()
+    }
+
+    pub fn edges(&self) -> &[Edge] {
+        &self.edges
+    }
+
+    /// The functions counted once: the canonical copy of each
+    pub fn counted(&self) -> impl Iterator<Item = &Node> + '_ {
+        self.nodes.values().filter(move |n| self.canonical.get(&n.id) == Some(&n.id))
+    }
+
+    /// Used through any copy of the function (see [`Graph::is_used`])
+    pub fn is_reachable_any(&self, node: &Node) -> bool {
+        let canon = self.canonical.get(&node.id).unwrap_or(&node.id);
+        self.copies.get(canon).map_or(false, |ids| {
+            ids.iter().any(|id| self.nodes.get(id).map_or(false, |n| self.is_used(n)))
+        })
     }
 
     /// An exec function is reachable when it runs; a ghost function, when
@@ -730,15 +783,28 @@ mod tests {
     }
 
     #[test]
-    fn a_test_report_beside_the_library_is_rejected() {
+    fn a_test_report_beside_the_library_is_folded_onto_it() {
         let dir = tempfile::tempdir().unwrap();
         for (name, ty) in [("lib", "lib"), ("lib", "test")] {
-            let r = report(name, ty, None, vec![], vec![]);
-            std::fs::write(dir.path().join(r.file_name()), serde_json::to_string(&r).unwrap())
-                .unwrap();
+            let mut r = report(name, ty, None, vec![node("lib::f", true, false)], vec![]);
+            if ty == "test" {
+                r.nodes[0].id = "lib(test)::f".into();
+            }
+            std::fs::write(
+                dir.path().join(if ty == "test" {
+                    "lib.test-x.json".to_string()
+                } else {
+                    r.file_name()
+                }),
+                serde_json::to_string(&r).unwrap(),
+            )
+            .unwrap();
         }
-        let err = load(&[dir.path().to_path_buf()]).unwrap_err();
-        assert!(err.contains("test report"), "{err}");
+        let reports = load(&[dir.path().to_path_buf()]).unwrap();
+        assert_eq!(reports.len(), 2);
+        let graph = Graph::new(&reports, &Roots::default()).unwrap();
+        assert_eq!(graph.canonical["lib(test)::f"], "lib::f");
+        assert_eq!(graph.counted().count(), 1);
     }
 
     #[test]

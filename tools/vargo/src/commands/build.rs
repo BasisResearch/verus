@@ -123,11 +123,12 @@ pub fn build(
     context: &VargoContext,
     vargo_cmd: &VargoBuild,
 ) -> anyhow::Result<()> {
-    const PACKAGES: &[&str; 7] = &[
+    const PACKAGES: &[&str; 8] = &[
         "rust_verify",
         "verus_builtin",
         "verus_builtin_macros",
         "verus_state_machines_macros",
+        "verus_dyncov",
         "vstd_build",
         "verus",
         "cargo-verus",
@@ -180,6 +181,7 @@ cd "$( dirname "${{BASH_SOURCE[0]}}" )"
 
     for from_f_name in [
         "libverus_builtin.rlib".to_owned(),
+        "libverus_dyncov.rlib".to_owned(),
         format!("{}verus_builtin_macros.{}", LIB_PRE, LIB_DL),
         format!("{}verus_state_machines_macros.{}", LIB_PRE, LIB_DL),
         format!("rust_verify{}", EXE),

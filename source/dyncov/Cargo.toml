@@ -1,0 +1,22 @@
+[package]
+name = "verus_dyncov"
+version = "0.0.0-2026-08-30-0159"
+edition = "2021"
+license = "MIT"
+description = "Runtime for dynamic verified coverage (`verus --dyncov`): counts calls and contract verdicts of instrumented Verus code, and hosts the executable mirror of the spec vocabulary that the lowered contracts use"
+repository = "https://github.com/BasisResearch/verus"
+publish = false
+
+# The `verus!` macro, in dyncov mode, emits code that refers to this crate
+# as `::verus_dyncov`. A crate built with `--dyncov` must depend on it.
+# It depends on nothing but std, so that it can be linked into a program
+# whose `vstd` was built by Verus itself (the standalone `verus --dyncov
+# file.rs` flow) as well as into cargo projects.
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(verus_keep_ghost)'] }

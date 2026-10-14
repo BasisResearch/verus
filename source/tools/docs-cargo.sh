@@ -34,6 +34,7 @@ RUSTC_BOOTSTRAP=1 eval ""VERUSDOC=1 VSTD_KIND=IsVstd VERUS_Z3_PATH="$(pwd)/z3"  
   --extern verus_builtin=target-verus/debug/libverus_builtin.rlib \
   --extern verus_builtin_macros=target-verus/debug/libverus_builtin_macros.$DYN_LIB_EXT \
   --extern verus_state_machines_macros=target-verus/debug/libverus_state_machines_macros.$DYN_LIB_EXT \
+  --extern verus_dyncov=target-verus/debug/libverus_dyncov.rlib \
   --edition=2018 \
   --cfg verus_keep_ghost \
   --cfg verus_keep_ghost_body \
