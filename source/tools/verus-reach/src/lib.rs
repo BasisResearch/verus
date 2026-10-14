@@ -250,6 +250,8 @@ pub struct Graph {
     /// functions twice, under `krate::` and `krate(test)::` ids; the copies
     /// are the same source, so the non-test one stands for both.
     pub canonical: HashMap<String, String>,
+    /// Canonical id → every id it stands for (itself included)
+    pub copies: HashMap<String, Vec<String>>,
     pub roots: Vec<String>,
     /// Runs: reached from a root through calls only
     pub reachable: HashSet<String>,
@@ -354,7 +356,21 @@ impl Graph {
         }
         let edges = reports.iter().flat_map(|r| r.edges.iter().cloned()).collect();
         let canonical = canonical_ids(&nodes);
-        Ok(Graph { nodes, edges, canonical, roots: root_ids, reachable, used, connected, referred })
+        let mut copies: HashMap<String, Vec<String>> = HashMap::new();
+        for (id, canon) in &canonical {
+            copies.entry(canon.clone()).or_default().push(id.clone());
+        }
+        Ok(Graph {
+            nodes,
+            edges,
+            canonical,
+            copies,
+            roots: root_ids,
+            reachable,
+            used,
+            connected,
+            referred,
+        })
     }
 
     /// Verified functions that mention used code but are not used: what the
@@ -388,10 +404,9 @@ impl Graph {
     /// Used through any copy of the function (see [`Graph::is_used`])
     pub fn is_reachable_any(&self, node: &Node) -> bool {
         let canon = self.canonical.get(&node.id).unwrap_or(&node.id);
-        self.canonical
-            .iter()
-            .filter(|(_, c)| *c == canon)
-            .any(|(id, _)| self.nodes.get(id).map_or(false, |n| self.is_used(n)))
+        self.copies.get(canon).map_or(false, |ids| {
+            ids.iter().any(|id| self.nodes.get(id).map_or(false, |n| self.is_used(n)))
+        })
     }
 
     /// An exec function is reachable when it runs; a ghost function, when

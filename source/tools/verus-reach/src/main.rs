@@ -320,7 +320,7 @@ fn dynamic_summary(
         .unwrap();
     writeln!(
         out,
-        "(T: called, precondition never false, never tainted by a false trusted ensures or assume)"
+        "(T: called, precondition never false, never tainted by a false trusted ensures)"
     )
     .unwrap();
     if let Some(executed) = llvm {
@@ -380,7 +380,10 @@ fn trust_findings(graph: &Graph, dynamic: &Dynamic) -> String {
         .filter_map(|(id, f)| graph.nodes.get(id).map(|n| (n, f)))
         .filter(|(n, f)| n.external_body && f.post.iter().sum::<u64>() > 0)
         .collect();
-    if !trusted.is_empty() || !dynamic.trust_violations.is_empty() {
+    if !trusted.is_empty()
+        || !dynamic.trust_violations.is_empty()
+        || !dynamic.trusted_pre_false.is_empty()
+    {
         writeln!(out, "\ntrust findings:").unwrap();
     }
     for (n, f) in trusted {
@@ -402,11 +405,13 @@ fn trust_findings(graph: &Graph, dynamic: &Dynamic) -> String {
         });
         writeln!(out, "  violated {count} time(s): {name}").unwrap();
     }
-    for (site, counts) in &dynamic.assumes {
+    for (id, (total, verified)) in &dynamic.trusted_pre_false {
+        let name = graph.nodes.get(id).map_or(id.clone(), |n| {
+            format!("{}:{}   {}", n.span.file, n.span.start_line, n.name())
+        });
         writeln!(
             out,
-            "  {site}   [true {}, unknown {}, false {}]",
-            counts[0], counts[1], counts[2]
+            "  requires false {total} time(s) ({verified} from verified callers): {name}"
         )
         .unwrap();
     }
@@ -483,11 +488,8 @@ fn dynamic_diff(graph: &Graph, dynamic: &Dynamic) -> String {
         .copied()
         .filter(|n| dynamic.static_reachable(graph, n) && !dynamic.called.contains(&n.id))
         .collect();
-    let (gap, over): (Vec<&Node>, Vec<&Node>) = s_not_d.into_iter().partition(|n| {
-        callers.get(n.id.as_str()).map_or(false, |cs| {
-            cs.iter().any(|c| dynamic.called.contains(*c) || graph.roots.iter().any(|r| r == c))
-        })
-    });
+    let (gap, over): (Vec<&Node>, Vec<&Node>) =
+        s_not_d.into_iter().partition(|n| dynamic.has_called_caller(graph, &callers, &n.id));
     writeln!(
         out,
         "S \\ D, never called with an executed static caller (workload gap): {}",

@@ -120,7 +120,9 @@ fn error_messages(stderr: &[u8]) -> Vec<(Location, String)> {
     let mut locs: Vec<(Location, String)> = Vec::new();
     for line in String::from_utf8_lossy(stderr).lines() {
         let Some(d) = parse_json_line(line) else { continue };
-        if d.level != "error" {
+        // Only rustc's own errors come from lowered code that does not
+        // type-check; a verification failure is not something to disable
+        if d.level != "error" || !d.coded {
             continue;
         }
         for l in d.primary {
@@ -135,13 +137,19 @@ fn error_messages(stderr: &[u8]) -> Vec<(Location, String)> {
 
 struct Diag {
     level: String,
+    /// Has an error code: a rustc error, as opposed to a verification
+    /// failure reported by Verus
+    coded: bool,
     message: String,
     rendered: Option<String>,
     primary: Vec<Location>,
 }
 
 /// A minimal reading of a rustc JSON diagnostic (no JSON library here): the
-/// level, the rendered text, and the primary spans' file and line.
+/// level, whether it carries an error code (rustc's own errors do, Verus's
+/// verification failures do not), the rendered text, and the primary spans'
+/// file and line, from the diagnostic's own `spans` only (not its children's,
+/// and not the macro-expansion sites nested in them).
 fn parse_json_line(line: &str) -> Option<Diag> {
     if !line.starts_with('{') || !line.contains("\"$message_type\":\"diagnostic\"") {
         return None;
@@ -149,24 +157,103 @@ fn parse_json_line(line: &str) -> Option<Diag> {
     let level = find_string(line, "\"level\":\"")?;
     let message = find_string(line, "\"message\":\"").map(unescape).unwrap_or_default();
     let rendered = find_string(line, "\"rendered\":\"").map(unescape);
-    // Primary spans: each `"is_primary":true` sits in a span object that
-    // starts with `"file_name":"..."` and has `"line_start":N`
+    let coded = line.find("\"code\":").map_or(false, |i| line[i + 7..].starts_with('{'));
     let mut primary = Vec::new();
-    let mut rest = line;
-    while let Some(i) = rest.find("\"file_name\":\"") {
-        let span = &rest[i..];
-        let end = span.find("\"expansion\":").unwrap_or(span.len());
-        let obj = &span[..end];
-        if obj.contains("\"is_primary\":true") {
-            if let (Some(file), Some(l)) =
-                (find_string(obj, "\"file_name\":\""), find_number(obj, "\"line_start\":"))
-            {
-                primary.push(Location { file: unescape(file), line: l });
+    if let Some(spans) = top_level_array(line, "\"spans\":") {
+        for obj in top_level_objects(spans) {
+            // The span's own fields come before its nested `expansion`
+            let own = &obj[..obj.find("\"expansion\":").unwrap_or(obj.len())];
+            if own.contains("\"is_primary\":true") {
+                if let (Some(file), Some(l)) =
+                    (find_string(own, "\"file_name\":\""), find_number(own, "\"line_start\":"))
+                {
+                    primary.push(Location { file: unescape(file), line: l });
+                }
             }
         }
-        rest = &span[1..];
     }
-    Some(Diag { level, message, rendered, primary })
+    Some(Diag { level, message, coded, rendered, primary })
+}
+
+/// The text inside the brackets of `key:[...]`, where `key` is a field of
+/// the outermost object (the first occurrence outside any nested value).
+fn top_level_array<'a>(line: &'a str, key: &str) -> Option<&'a str> {
+    let bytes = line.as_bytes();
+    let (mut depth, mut in_str, mut esc) = (0i32, false, false);
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if in_str {
+            if esc {
+                esc = false;
+            } else if c == b'\\' {
+                esc = true;
+            } else if c == b'"' {
+                in_str = false;
+            }
+        } else {
+            match c {
+                b'"' => {
+                    if depth == 1 && line[i..].starts_with(key) {
+                        let start = i + key.len();
+                        if bytes.get(start) == Some(&b'[') {
+                            let end = matching_close(line, start)?;
+                            return Some(&line[start + 1..end]);
+                        }
+                    }
+                    in_str = true;
+                }
+                b'{' | b'[' => depth += 1,
+                b'}' | b']' => depth -= 1,
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// The index of the bracket closing the one at `open`.
+fn matching_close(s: &str, open: usize) -> Option<usize> {
+    let bytes = s.as_bytes();
+    let (mut depth, mut in_str, mut esc) = (0i32, false, false);
+    for (i, &c) in bytes.iter().enumerate().skip(open) {
+        if in_str {
+            if esc {
+                esc = false;
+            } else if c == b'\\' {
+                esc = true;
+            } else if c == b'"' {
+                in_str = false;
+            }
+            continue;
+        }
+        match c {
+            b'"' => in_str = true,
+            b'{' | b'[' => depth += 1,
+            b'}' | b']' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// The objects of a JSON array's text, each as its own text.
+fn top_level_objects(array: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while let Some(rel) = array[i..].find('{') {
+        let open = i + rel;
+        let Some(close) = matching_close(array, open) else { break };
+        out.push(&array[open..=close]);
+        i = close + 1;
+    }
+    out
 }
 
 fn find_string(s: &str, key: &str) -> Option<String> {

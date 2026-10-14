@@ -178,21 +178,24 @@ pub mod __vcheck_int {
             .unwrap_or_else(|| panic!("__vcheck_int::to_char: value out of range for char: {}", x))
     }
 
-    /// `x << n` as `x * 2^n`, checked.
+    /// `x << n`: Verus truncates the result to the width of `x`, which the
+    /// `int` model no longer knows, so the value cannot be computed here
+    /// (it is `Unknown`).
     #[inline]
     pub fn shl(a: impl IntoSpecInt, n: impl IntoSpecInt) -> SpecInt {
-        let a = a.into_spec_int();
-        let n = n.into_spec_int();
-        let n = u32::try_from(n).unwrap_or_else(|_| {
-            panic!("__vcheck_int::shl: shift count out of range for u32: {}", n)
-        });
-        if n >= 127 {
-            if a == 0 {
-                return 0;
-            }
-            panic!("{}", RANGE_MSG);
+        let _ = (a.into_spec_int(), n.into_spec_int());
+        panic!("dyncov: `<<` without a fixed width")
+    }
+
+    /// A bounded quantifier iterates its range; one this large would take
+    /// too long per evaluation, and is `Unknown` instead.
+    pub const MAX_QUANT_RANGE: SpecInt = 1_000_000;
+
+    #[inline]
+    pub fn check_quant_range(lower: SpecInt, upper: SpecInt) {
+        if upper.saturating_sub(lower) > MAX_QUANT_RANGE {
+            panic!("dyncov: quantifier range too large ({} to {})", lower, upper);
         }
-        a.checked_mul(1i128 << n).unwrap_or_else(|| panic!("{}", RANGE_MSG))
     }
 
     /// `x >> n` as floor division by `2^n`.
@@ -1093,4 +1096,47 @@ mod vstd_fns_tests {
         assert!(!super::vstd_fns::increasing_seq(&[1, 1]));
         assert!(!super::vstd_fns::increasing_seq(&[2, 1]));
     }
+}
+
+/// `!x` in a lowered expression: for a `bool` its negation; for an integer
+/// (lifted to the `int` model) the bitwise complement would need the
+/// operand's width, so it is `Unknown`.
+pub trait DcNot {
+    type Out;
+    fn dc_not(self) -> Self::Out;
+}
+
+impl DcNot for bool {
+    type Out = bool;
+    #[inline(always)]
+    fn dc_not(self) -> bool {
+        !self
+    }
+}
+
+impl DcNot for &bool {
+    type Out = bool;
+    #[inline(always)]
+    fn dc_not(self) -> bool {
+        !*self
+    }
+}
+
+impl DcNot for SpecInt {
+    type Out = SpecInt;
+    fn dc_not(self) -> SpecInt {
+        panic!("dyncov: `!` on an integer without a fixed width")
+    }
+}
+
+impl DcNot for &SpecInt {
+    type Out = SpecInt;
+    fn dc_not(self) -> SpecInt {
+        panic!("dyncov: `!` on an integer without a fixed width")
+    }
+}
+
+#[inline(always)]
+pub fn dc_not<A: DcNot>(a: A) -> A::Out {
+    a.dc_not()
 }

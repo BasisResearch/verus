@@ -22,8 +22,9 @@
 //! function of the parameters it mentions. Whatever the engine cannot
 //! lower becomes `Unknown` at run time: an unsupported clause is recorded
 //! as such, and a spec fn without a lowering gets a twin that panics (the
-//! runtime catches it). Generated code that fails to type-check is a
-//! compile error of the instrumented build; see `verus-reach --dynamic`
+//! runtime catches it). Generated code that fails to type-check is
+//! reported by the `verus` wrapper and disabled on a retry
+//! (`VERUS_DYNCOV_DISABLE`, see `disabled`); see `verus-reach --dynamic`
 //! for how the profiles are read.
 
 use crate::{EraseGhost, VstdKind};
@@ -794,7 +795,7 @@ impl Pass {
                     }
                     let is_main = f.sig.ident == "main" && f.sig.inputs.is_empty();
                     let generics = generic_names(&f.sig.generics, None);
-                    self.wrap(&mut f.attrs, &f.vis, &f.sig, &mut f.block, None, &generics, is_main);
+                    self.wrap(&mut f.attrs, &f.sig, &mut f.block, None, &generics, is_main);
                 }
                 Item::Impl(imp) => {
                     if external_attr(&imp.attrs, "external") {
@@ -815,7 +816,6 @@ impl Pass {
                                 let generics = generic_names(&m.sig.generics, Some(&impl_generics));
                                 self.wrap(
                                     &mut m.attrs,
-                                    &m.vis,
                                     &m.sig,
                                     &mut m.block,
                                     self_ty.as_ref(),
@@ -836,16 +836,7 @@ impl Pass {
                                 if let Some(block) = m.default.as_mut() {
                                     let generics =
                                         generic_names(&m.sig.generics, Some(&tr.generics));
-                                    let vis = Visibility::Inherited;
-                                    self.wrap(
-                                        &mut m.attrs,
-                                        &vis,
-                                        &m.sig,
-                                        block,
-                                        None,
-                                        &generics,
-                                        false,
-                                    );
+                                    self.wrap(&mut m.attrs, &m.sig, block, None, &generics, false);
                                 }
                             }
                         }
@@ -1052,7 +1043,6 @@ impl Pass {
     fn wrap(
         &mut self,
         attrs: &mut Vec<Attribute>,
-        _vis: &Visibility,
         sig: &Signature,
         block: &mut Block,
         self_ty: Option<&Type>,
@@ -1070,6 +1060,13 @@ impl Pass {
         let name = &sig.ident;
         let name_str = name.to_string();
         let line = line_of(sig.fn_token.span);
+        // The wrapper's own tokens carry the function's span, so that an
+        // error in them (a parameter that is not `Clone` for `old(p)`, a
+        // body that consumes a parameter the `ensures` reads) is reported
+        // at the function, and the retry loop can then disable the
+        // wrapper: the frame stays, every clause becomes `Unknown`
+        let span = sig.ident.span();
+        let wrapper_disabled = disabled(&[span]);
         let kind = if trusted {
             quote! { Trusted }
         } else {
@@ -1078,7 +1075,6 @@ impl Pass {
 
         // The parameters as the clauses see them
         let mut params: Vec<Param> = Vec::new();
-        let mut unsupported_names: HashSet<String> = HashSet::new();
         let ensures: Vec<Expr> = if trusted {
             sig.spec
                 .ensures
@@ -1156,9 +1152,6 @@ impl Pass {
                             None => Err(format!("unsupported parameter type of `{ident}`")),
                         }
                     };
-                    if spec.is_err() {
-                        unsupported_names.insert(ident.to_string());
-                    }
                     // `old(p)` of a `&mut` parameter: a clone taken on entry
                     if old_params.contains(&ident.to_string()) {
                         let old_name = format_ident!("__old_{}", ident);
@@ -1167,7 +1160,7 @@ impl Pass {
                             Type::Reference(r) => (*r.elem).clone(),
                             t => t.clone(),
                         };
-                        snapshot_stmts.push(quote! {
+                        snapshot_stmts.push(quote_spanned! { span =>
                             let #snap: ::core::option::Option<#inner_ty> =
                                 ::vstd::dyncov::snapshot(|| ::core::clone::Clone::clone(&*#ident));
                         });
@@ -1231,7 +1224,12 @@ impl Pass {
                 .enumerate()
                 .map(|(i, c)| {
                     let line = line_of(c.span());
-                    let body = match this.lower_clause(kind, name, i, c, &params) {
+                    let call = if wrapper_disabled {
+                        Err("the wrapper does not compile".to_string())
+                    } else {
+                        this.lower_clause(kind, name, i, c, &params)
+                    };
+                    let body = match call {
                         Ok(call) => call,
                         Err(reason) => {
                             let reason = format!("not lowered: {reason}");
@@ -1245,36 +1243,48 @@ impl Pass {
         let pre_clauses = lowered(self, "req", &requires);
         let post_clauses = if trusted { lowered(self, "ens", &ensures) } else { vec![] };
 
+        if wrapper_disabled {
+            snapshot_stmts.clear();
+        }
         let flush = if is_main {
-            quote! { let __dc_flush = ::vstd::dyncov::FlushOnExit; }
+            quote_spanned! { span => let __dc_flush = ::vstd::dyncov::FlushOnExit; }
         } else {
             quote! {}
         };
         let pre = if pre_clauses.is_empty() {
             quote! {}
         } else {
-            quote! {
+            quote_spanned! { span =>
                 ::vstd::dyncov::pre(
                     &__dc_guard,
                     ::vstd::dyncov::eval(&[#(#pre_clauses),*]),
-                    ::core::panic::Location::caller(),
                 );
             }
         };
-        let prelude = quote! {
+        // A disabled wrapper cannot run the body as a closure to check the
+        // result: the `ensures` is `Unknown`
+        let post_unknown = if trusted && wrapper_disabled && !post_clauses.is_empty() {
+            quote_spanned! { span =>
+                ::vstd::dyncov::trusted_post(
+                    &__dc_guard,
+                    ::vstd::dyncov::Eval::unknown("the wrapper does not compile"),
+                );
+            }
+        } else {
+            quote! {}
+        };
+        let prelude = quote_spanned! { span =>
             #flush
             let __dc_guard = ::vstd::dyncov::enter(
                 ::vstd::dyncov::FnId { file: ::core::file!(), line: #line, name: #name_str },
                 ::vstd::dyncov::Kind::#kind,
             );
             #pre
+            #post_unknown
             #(#snapshot_stmts)*
         };
-        if !is_main && !attrs.iter().any(|a| a.path().is_ident("track_caller")) {
-            attrs.push(verus_syn::parse_quote! { #[track_caller] });
-        }
         let prelude_stmt = Stmt::Expr(Expr::Verbatim(prelude), None);
-        if trusted && !post_clauses.is_empty() {
+        if trusted && !post_clauses.is_empty() && !wrapper_disabled {
             // The body runs as a closure so that its result can be checked
             let stmts = std::mem::take(&mut block.stmts);
             let inner = Block { brace_token: block.brace_token, stmts };
@@ -1283,11 +1293,14 @@ impl Pass {
                 Some(_) => quote! {},
                 None => quote! { -> () },
             };
-            let call: Stmt = verus_syn::parse_quote! {
-                let __dc_ret = (|| #ret_annot #inner)();
-            };
+            let call = Stmt::Expr(
+                Expr::Verbatim(quote_spanned! { span =>
+                    let __dc_ret = (|| #ret_annot #inner)();
+                }),
+                None,
+            );
             let post = Stmt::Expr(
-                Expr::Verbatim(quote! {
+                Expr::Verbatim(quote_spanned! { span =>
                     ::vstd::dyncov::trusted_post(
                         &__dc_guard,
                         ::vstd::dyncov::eval(&[#(#post_clauses),*]),
@@ -1295,12 +1308,11 @@ impl Pass {
                 }),
                 None,
             );
-            let result = Stmt::Expr(verus_syn::parse_quote! { __dc_ret }, None);
+            let result = Stmt::Expr(Expr::Verbatim(quote_spanned! { span => __dc_ret }), None);
             block.stmts = vec![prelude_stmt, call, post, result];
         } else {
             block.stmts.insert(0, prelude_stmt);
         }
-        let _ = unsupported_names;
     }
 }
 
@@ -1317,6 +1329,3 @@ fn generic_names(
     }
     names
 }
-
-#[allow(dead_code)]
-fn _unused(_: &ItemStruct, _: &ItemEnum, _: &Fields) {}

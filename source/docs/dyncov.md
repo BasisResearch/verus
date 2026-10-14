@@ -86,13 +86,19 @@ functions):
 - D, called at least once;
 - T, in D with no false precondition on any call and never tainted.
 
-A false precondition is classified by its caller: from a verified exec
+A false precondition is classified by its caller, the instrumented
+function below it on the thread's frame stack (not the source location,
+which `#[track_caller]` chains would misattribute): from a verified exec
 function it is a *lowering disagreement* (Verus proved the precondition
 there; the lowering is wrong; the run fails but coverage is not affected),
-from anything else it is a *violation* (the program uses the function
-outside its verified domain). `Unknown` counts as covered, like the static
-check: the function ran and its contract was not disproven; the spec
-report lists why each clause was unknown.
+from a trusted function or from outside the instrumented code it is a
+*violation* (the program uses the function outside its verified domain).
+A trusted function's own false `requires` is listed under the trust
+findings. `Unknown` counts as covered, like the static check: the function
+ran and its contract was not disproven; the spec report lists why each
+clause was unknown. Clauses after the first false one are not evaluated
+(a later clause may assume the earlier ones), so their counts cover only
+the calls that reached them.
 
 Outputs: the summary (with the per-module S/D/T table, the functions not
 in T with their reason, the trust findings, and diagnostics), `--diff`
@@ -123,13 +129,18 @@ fork adds to it:
 - `int` and `nat` are `i128`; every arithmetic operation and comparison of
   a lowered expression goes through checked `int` arithmetic, so the exec
   widths never overflow silently, and a value outside `i128` is `Unknown`;
-- a struct or enum declared inside `verus!` is its own exec model (a `type
-  ExecFoo = Foo` alias and identity conversions, equality and cloning when
-  it derives `PartialEq` and `Clone`); a spec-only type (ghost, or with
-  `Seq`/`Set`/`Map`/`int` fields) gets a mirror with exec fields;
-- bounded quantifiers (`forall|i: int| lo <= i < hi ==> ...`) are loops;
-  unbounded ones, `choose`, closures, and spec functions without a body
-  (`uninterp`) are `Unknown`;
+  `<<` and `!` on an integer need the operand's width, which the model
+  lost, and are `Unknown` too;
+- a struct or enum declared inside `verus!` is its own exec model; the
+  instrumented build adds `#[derive(Clone, PartialEq)]` to one that lacks
+  them (unless it has a ghost field, or implements them by hand in the
+  same file), since contracts compare and snapshot values; a spec-only
+  type (ghost, or with `Seq`/`Set`/`Map`/`int` fields) gets a mirror with
+  exec fields;
+- bounded quantifiers (`forall|i: int| lo <= i < hi ==> ...`) are loops,
+  `Unknown` when the range exceeds a million values; unbounded ones,
+  `choose`, closures, and spec functions without a body (`uninterp`) are
+  `Unknown`;
 - `Seq`, `Set`, `Map`, `Option`, `String` and tuples use the executable
   companions in `vstd::dyncov::vstd_ext`, a port of the engine's
   `vstd_ext` crate that depends on nothing but std; the vstd spec
@@ -150,7 +161,12 @@ clause.
 Limits worth knowing: the frame stack is per thread, so a violation on a
 spawned thread does not taint the spawner; `assume` statements are not
 evaluated; trait and generic impls' spec methods have no twins; vstd's own
-exec functions are not instrumented.
+exec functions are not instrumented; every instrumented call takes a
+global lock, and a busy thread writes the profile itself every
+`VERUS_DYNCOV_FLUSH_MS`, which a multithreaded server will notice. The
+profile is written whole (a temporary file, then a rename), so a reader
+never sees a partial one. The runtime installs a SIGTERM handler only if
+the program has none.
 
 ## Tests
 

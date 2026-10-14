@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
-pub const PROFILE_SCHEMA_VERSION: u32 = 2;
+pub const PROFILE_SCHEMA_VERSION: u32 = 3;
 
 /// One process's profile, as written by the runtime.
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
@@ -28,11 +28,6 @@ pub struct Profile {
     pub tainted: BTreeMap<String, u64>,
     #[serde(default)]
     pub trust_violations: BTreeMap<String, u64>,
-    /// By `assume@file:line:col`, `[true, unknown, false]`
-    #[serde(default)]
-    pub assumes: BTreeMap<String, [u64; 3]>,
-    #[serde(default)]
-    pub assume_unknown_reasons: BTreeMap<String, u64>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
@@ -43,7 +38,7 @@ pub struct FnProfile {
     #[serde(default)]
     pub post: [u64; 3],
     #[serde(default)]
-    pub pre_false_sites: BTreeMap<String, u64>,
+    pub pre_false_callers: BTreeMap<String, u64>,
     #[serde(default)]
     pub pre_unknown_reasons: BTreeMap<String, u64>,
     #[serde(default)]
@@ -73,7 +68,7 @@ impl Profile {
             g.calls += f.calls;
             add_triple(&mut g.pre, &f.pre);
             add_triple(&mut g.post, &f.post);
-            add_counts(&mut g.pre_false_sites, &f.pre_false_sites);
+            add_counts(&mut g.pre_false_callers, &f.pre_false_callers);
             add_counts(&mut g.pre_unknown_reasons, &f.pre_unknown_reasons);
             add_counts(&mut g.post_unknown_reasons, &f.post_unknown_reasons);
             for (k, v) in &f.clauses {
@@ -82,10 +77,6 @@ impl Profile {
         }
         add_counts(&mut self.tainted, &other.tainted);
         add_counts(&mut self.trust_violations, &other.trust_violations);
-        for (k, v) in &other.assumes {
-            add_triple(self.assumes.entry(k.clone()).or_default(), v);
-        }
-        add_counts(&mut self.assume_unknown_reasons, &other.assume_unknown_reasons);
     }
 }
 
@@ -141,13 +132,6 @@ fn parse_fn_id(id: &str) -> Option<(&str, usize, &str)> {
     Some((file, line.parse().ok()?, name))
 }
 
-/// `path:line:col` of a call site
-fn parse_site(site: &str) -> Option<(&str, usize)> {
-    let (rest, _col) = site.rsplit_once(':')?;
-    let (file, line) = rest.rsplit_once(':')?;
-    Some((file, line.parse().ok()?))
-}
-
 fn same_file(a: &str, b: &str) -> bool {
     // The runtime reports `file!()`, the static side the diagnostics
     // file name; both are the path rustc was given, but tolerate one being
@@ -155,7 +139,38 @@ fn same_file(a: &str, b: &str) -> bool {
     a == b || a.ends_with(&format!("/{b}")) || b.ends_with(&format!("/{a}"))
 }
 
-/// A false precondition at a call site, classified by the caller.
+/// The static node a `pre_false_callers` key names, when it is a wrapped
+/// function (`verified@<key>` / `trusted@<key>`).
+fn caller_node<'a>(
+    caller: &str,
+    key_to_id: &HashMap<String, String>,
+    graph: &'a Graph,
+) -> Option<&'a Node> {
+    let (_, key) = caller.split_once('@')?;
+    graph.nodes.get(key_to_id.get(key)?)
+}
+
+/// `Some(def_path)` when the caller is a verified exec function (so Verus
+/// proved the precondition there: a lowering disagreement), else `None`.
+fn classify_caller(
+    caller: &str,
+    key_to_id: &HashMap<String, String>,
+    graph: &Graph,
+) -> Option<String> {
+    let n = caller_node(caller, key_to_id, graph)?;
+    (caller.starts_with("verified@") && n.is_verified_exec()).then(|| n.def_path.clone())
+}
+
+/// The caller's name for the report, when it is known.
+fn caller_name(caller: &str, key_to_id: &HashMap<String, String>, graph: &Graph) -> Option<String> {
+    match caller_node(caller, key_to_id, graph) {
+        Some(n) => Some(n.def_path.clone()),
+        None if caller == "outside" => None,
+        None => Some(caller.split_once('@').map_or(caller, |(_, k)| k).to_string()),
+    }
+}
+
+/// A false precondition, classified by the caller.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Violation {
     /// The caller is a verified exec function: Verus proved the
@@ -194,7 +209,9 @@ pub struct Dynamic {
     /// Sources of trust violations (a trusted fn's static id or its raw
     /// profile key, or `assume@...`) with counts
     pub trust_violations: BTreeMap<String, u64>,
-    pub assumes: BTreeMap<String, [u64; 3]>,
+    /// Trusted (`external_body`) functions whose `requires` was false:
+    /// static id → (times, of which from a verified caller)
+    pub trusted_pre_false: BTreeMap<String, (u64, u64)>,
 }
 
 impl Dynamic {
@@ -216,22 +233,8 @@ impl Dynamic {
                 .iter()
                 .copied()
                 .find(|n| n.name() == name)
-                .or_else(|| candidates.first().copied())
+                .or_else(|| candidates.iter().copied().min_by(|a, b| a.id.cmp(&b.id)))
         };
-        let node_containing = |file: &str, line: usize| -> Option<&Node> {
-            graph
-                .nodes
-                .values()
-                .filter(|n| {
-                    same_file(&n.span.file, file)
-                        && n.span.start_line <= line
-                        && line <= n.span.end_line
-                })
-                // The innermost function (nested fns are rare; pick the
-                // latest start)
-                .max_by_key(|n| n.span.start_line)
-        };
-
         let canonical = graph.canonical.clone();
         let mut profiled: BTreeMap<String, FnProfile> = BTreeMap::new();
         let mut unmatched = vec![];
@@ -262,6 +265,22 @@ impl Dynamic {
         unmatched.sort();
         unmatched.dedup();
 
+        let mut trusted_pre_false = BTreeMap::new();
+        for (id, f) in &profiled {
+            let node = &graph.nodes[id];
+            if node.is_verified_exec() || f.pre_false_callers.is_empty() {
+                continue;
+            }
+            let total: u64 = f.pre_false_callers.values().sum();
+            let verified: u64 = f
+                .pre_false_callers
+                .iter()
+                .filter(|(c, _)| classify_caller(c, &key_to_id, graph).is_some())
+                .map(|(_, n)| n)
+                .sum();
+            trusted_pre_false.insert(id.clone(), (total, verified));
+        }
+
         let mut called = BTreeSet::new();
         let mut true_reachable = BTreeSet::new();
         let mut excluded = BTreeMap::new();
@@ -273,20 +292,19 @@ impl Dynamic {
             }
             called.insert(id.clone());
             let mut violations = vec![];
-            for (site, count) in &f.pre_false_sites {
-                let caller = parse_site(site).and_then(|(file, line)| node_containing(file, line));
-                match caller {
-                    Some(c) if c.is_verified_exec() => {
+            for (caller, count) in &f.pre_false_callers {
+                match classify_caller(caller, &key_to_id, graph) {
+                    Some(c) => {
                         let v = Violation::LoweringDisagreement {
-                            site: site.clone(),
-                            caller: c.def_path.clone(),
+                            site: caller.clone(),
+                            caller: c,
                             count: *count,
                         };
                         lowering_disagreements.push((id.clone(), v));
                     }
-                    c => violations.push(Violation::Violation {
-                        site: site.clone(),
-                        caller: c.map(|c| c.def_path.clone()),
+                    None => violations.push(Violation::Violation {
+                        site: caller.clone(),
+                        caller: caller_name(caller, &key_to_id, graph),
                         count: *count,
                     }),
                 }
@@ -309,7 +327,7 @@ impl Dynamic {
             unmatched,
             tainted,
             trust_violations,
-            assumes: profile.assumes.clone(),
+            trusted_pre_false,
         }
     }
 
@@ -394,7 +412,8 @@ pub fn llvm_executed(
             let Some(regions) = f.get("regions").and_then(|r| r.as_array()) else { continue };
             let Some(first) = regions.first().and_then(|r| r.as_array()) else { continue };
             let line = first.first().and_then(|l| l.as_u64()).unwrap_or(0) as usize;
-            let file_index = first.get(6).and_then(|i| i.as_u64()).unwrap_or(0) as usize;
+            // Region: [LineStart, ColStart, LineEnd, ColEnd, Count, FileID, ExpandedFileID, Kind]
+            let file_index = first.get(5).and_then(|i| i.as_u64()).unwrap_or(0) as usize;
             let Some(file) = files.get(file_index) else { continue };
             for n in graph.nodes.values() {
                 if same_file(&n.span.file, file)
@@ -420,7 +439,7 @@ mod tests {
         for (id, calls, pre, sites) in entries {
             let mut f = FnProfile { calls: *calls, pre: *pre, ..Default::default() };
             for (s, n) in sites.iter() {
-                f.pre_false_sites.insert(s.to_string(), *n);
+                f.pre_false_callers.insert(s.to_string(), *n);
             }
             p.functions.insert(id.to_string(), f);
         }
@@ -450,7 +469,7 @@ mod tests {
         let p = profile(&[
             ("x.rs:1:wired", 3, [3, 0, 0], &[]),
             ("x.rs:10:helper", 2, [1, 1, 0], &[]),
-            ("src/x.rs:20:inc", 1, [0, 0, 1], &[("x.rs:35:5", 1)]),
+            ("src/x.rs:20:inc", 1, [0, 0, 1], &[("outside", 1)]),
             ("y.rs:7:nope", 1, [1, 0, 0], &[]),
         ]);
         let d = Dynamic::new(&g, &p);
@@ -458,14 +477,13 @@ mod tests {
         assert!(d.called.contains("lib::wired"));
         assert!(d.called.contains("lib::helper"));
         assert!(d.called.contains("lib::verified::inc"));
-        // Unknown counts as covered; a false pre from unverified main is a violation
+        // Unknown counts as covered; a false pre from outside the
+        // instrumented code (the unverified main) is a violation
         assert!(d.true_reachable.contains("lib::wired"));
         assert!(d.true_reachable.contains("lib::helper"));
         assert!(!d.true_reachable.contains("lib::verified::inc"));
         let ex = &d.excluded["lib::verified::inc"];
-        assert!(
-            matches!(&ex.violations[0], Violation::Violation { caller: Some(c), count: 1, .. } if c == "app(bin)::main")
-        );
+        assert!(matches!(&ex.violations[0], Violation::Violation { caller: None, count: 1, .. }));
         assert!(d.lowering_disagreements.is_empty());
         assert_eq!(d.coverage(&g), (2, 3));
         assert_eq!(d.hits(&g.nodes["lib::helper"]), 2);
@@ -475,7 +493,10 @@ mod tests {
     #[test]
     fn false_pre_from_verified_caller_is_a_lowering_disagreement() {
         let g = graph();
-        let p = profile(&[("x.rs:10:helper", 1, [0, 0, 1], &[("x.rs:2:9", 1)])]);
+        let p = profile(&[
+            ("x.rs:1:wired", 1, [1, 0, 0], &[]),
+            ("x.rs:10:helper", 1, [0, 0, 1], &[("verified@x.rs:1:wired", 1)]),
+        ]);
         let d = Dynamic::new(&g, &p);
         assert_eq!(d.lowering_disagreements.len(), 1);
         assert!(
@@ -549,7 +570,7 @@ mod tests {
         a.merge(&b);
         assert_eq!(a.functions["x.rs:1:wired"].calls, 3);
         assert_eq!(a.functions["x.rs:1:wired"].pre, [1, 1, 1]);
-        assert_eq!(a.functions["x.rs:1:wired"].pre_false_sites["s"], 1);
+        assert_eq!(a.functions["x.rs:1:wired"].pre_false_callers["s"], 1);
         assert_eq!(a.functions.len(), 2);
     }
 }

@@ -155,7 +155,18 @@ fn end_to_end_sets_and_taint() {
         "T = {:?}",
         t
     );
-    assert_eq!(dynamic.lowering_disagreements.len(), 3);
+    // One entry per (function, caller): always_false twice and mixed once
+    // from main
+    assert_eq!(dynamic.lowering_disagreements.len(), 2);
+    let disagreeing_calls: u64 = dynamic
+        .lowering_disagreements
+        .iter()
+        .map(|(_, v)| match v {
+            verus_reach::dyncov::Violation::LoweringDisagreement { count, .. } => *count,
+            _ => 0,
+        })
+        .sum();
+    assert_eq!(disagreeing_calls, 3);
     let speak = graph.nodes.values().find(|n| n.name() == "speak").unwrap();
     assert!(graph.is_reachable(speak));
     assert!(!dynamic.called.contains(&speak.id));
@@ -164,25 +175,45 @@ fn end_to_end_sets_and_taint() {
 
 #[test]
 fn unverified_callers_make_violations() {
+    // `main` is outside `verus!` (not instrumented); `relay` is a trusted
+    // function inside it. The caller of a false precondition is the frame
+    // below on the stack: `outside` for main, `relay` for relay, even
+    // though a source location would have pointed at main in both cases.
     let code = verus_code_str! {
         pub fn needs_small(x: u64) -> u64
             requires x < 10,
         { x }
+
+        #[verifier::external_body]
+        pub fn relay(x: u64) -> u64 { needs_small(x) }
     }
     .to_string()
-        + "\nfn main() { needs_small(3); needs_small(30); needs_small(31); }\n";
+        + "\nfn main() { needs_small(3); needs_small(30); relay(31); }\n";
     let (profile, graph, _dir) = run_dyncov(&code);
     let f = fn_profile(&profile, "needs_small");
     assert_eq!(f.calls, 3);
     assert_eq!(f.pre, [1, 0, 2]);
-    assert_eq!(f.pre_false_sites.len(), 2);
+    let callers: Vec<(&str, u64)> =
+        f.pre_false_callers.iter().map(|(k, v)| (k.as_str(), *v)).collect();
+    assert_eq!(callers.len(), 2, "{:?}", callers);
+    assert_eq!(callers[0], ("outside", 1), "{:?}", callers);
+    assert!(
+        callers[1].0.starts_with("trusted@") && callers[1].0.ends_with(":relay"),
+        "{:?}",
+        callers
+    );
     let dynamic = verus_reach::dyncov::Dynamic::new(&graph, &profile);
     assert!(dynamic.lowering_disagreements.is_empty());
-    assert!(dynamic.true_reachable.is_empty());
-    let ex = dynamic.excluded.values().next().unwrap();
+    assert!(!dynamic.true_reachable.iter().any(|id| id.ends_with("needs_small")));
+    let id = dynamic.excluded.keys().find(|id| id.ends_with("needs_small")).unwrap();
+    let ex = &dynamic.excluded[id];
     assert_eq!(ex.violations.len(), 2);
+    assert!(matches!(
+        &ex.violations[0],
+        verus_reach::dyncov::Violation::Violation { caller: None, count: 1, .. }
+    ));
     assert!(
-        matches!(&ex.violations[0], verus_reach::dyncov::Violation::Violation { caller: Some(c), .. } if c.ends_with("main"))
+        matches!(&ex.violations[1], verus_reach::dyncov::Violation::Violation { caller: Some(c), count: 1, .. } if c.ends_with("relay"))
     );
 }
 

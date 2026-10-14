@@ -3,8 +3,7 @@
 //! The `verus!` macro, in dyncov mode, wraps every exec function of a user
 //! crate: on entry the wrapper registers a frame and evaluates the lowered
 //! `requires` on the real arguments; an `external_body` function also has
-//! its `ensures` evaluated on the result; an `assume(e)` in exec code is
-//! evaluated where it stands. The outcomes are counted here and [`flush`]
+//! its `ensures` evaluated on the result. The outcomes are counted here and [`flush`]
 //! writes them as JSON, which `verus-reach --dynamic` joins with the static
 //! reachability reports.
 //!
@@ -54,7 +53,6 @@ pub mod prelude {
 
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
-use std::panic::Location;
 use std::sync::{Mutex, Once, RwLock};
 
 /// Where a wrapped function is defined: the `file:line` of its `fn`
@@ -80,6 +78,15 @@ pub enum Kind {
     /// An `external_body` exec function: both clauses are checked, and a
     /// false `ensures` taints every verified caller on the stack.
     Trusted,
+}
+
+impl Kind {
+    fn label(self) -> &'static str {
+        match self {
+            Kind::Verified => "verified",
+            Kind::Trusted => "trusted",
+        }
+    }
 }
 
 /// The outcome of evaluating a clause or a list of clauses.
@@ -119,7 +126,12 @@ pub struct FnStats {
     /// `[true, unknown, false]`
     pub pre: [u64; 3],
     pub post: [u64; 3],
-    pub pre_false_sites: BTreeMap<String, u64>,
+    /// Who called when the precondition was false: `verified@<key>` or
+    /// `trusted@<key>` for the wrapped function that was on the stack
+    /// (`<key>` is its `file:line:name`), `outside` for a caller that is
+    /// not instrumented. Taken from the frame stack, not from the source
+    /// location, since `#[track_caller]` would forward through callers.
+    pub pre_false_callers: BTreeMap<String, u64>,
     pub pre_unknown_reasons: BTreeMap<String, u64>,
     pub post_unknown_reasons: BTreeMap<String, u64>,
     /// Per clause: `"pre:0@<line>"`, `"post:1@<line>"`, ... → `[true, unknown, false]`
@@ -131,19 +143,14 @@ pub struct Stats {
     pub functions: BTreeMap<FnId, FnStats>,
     /// Verified frames popped while tainted
     pub tainted: BTreeMap<FnId, u64>,
-    /// Trusted `ensures` (keyed by function) and `assume`s (keyed by
-    /// `assume@file:line:col`) observed false
+    /// Trusted `ensures` observed false, keyed by function
     pub trust_violations: BTreeMap<String, u64>,
-    pub assume_stats: BTreeMap<String, [u64; 3]>,
-    pub assume_unknown_reasons: BTreeMap<String, u64>,
 }
 
 static STATS: Mutex<Stats> = Mutex::new(Stats {
     functions: BTreeMap::new(),
     tainted: BTreeMap::new(),
     trust_violations: BTreeMap::new(),
-    assume_stats: BTreeMap::new(),
-    assume_unknown_reasons: BTreeMap::new(),
 });
 
 fn stats() -> std::sync::MutexGuard<'static, Stats> {
@@ -151,6 +158,7 @@ fn stats() -> std::sync::MutexGuard<'static, Stats> {
 }
 
 struct Frame {
+    id: FnId,
     kind: Kind,
     tainted: bool,
 }
@@ -161,17 +169,22 @@ thread_local! {
 
 /// Pops its frame on drop, which also runs during unwinding.
 pub struct Guard {
-    depth: usize,
+    /// Index of the frame on this thread's stack; `None` when no frame
+    /// could be pushed (the thread's locals are being destroyed)
+    depth: Option<usize>,
     id: FnId,
 }
 
 impl Drop for Guard {
     fn drop(&mut self) {
-        let tainted = STACK.with(|s| {
-            let mut s = s.borrow_mut();
-            s.truncate(self.depth + 1);
-            s.pop().map_or(false, |f| f.tainted)
-        });
+        let Some(depth) = self.depth else { return };
+        let tainted = STACK
+            .try_with(|s| {
+                let mut s = s.borrow_mut();
+                s.truncate(depth + 1);
+                s.pop().map_or(false, |f| f.tainted)
+            })
+            .unwrap_or(false);
         if tainted {
             *stats().tainted.entry(self.id).or_default() += 1;
         }
@@ -214,8 +227,7 @@ fn install_periodic_flush() {
         }
         let secs: u64 =
             std::env::var("VERUS_DYNCOV_FLUSH_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(1);
-        install_term_handler();
-        let _ = std::thread::Builder::new().name("dyncov-flush".into()).spawn(move || {
+        let spawned = std::thread::Builder::new().name("dyncov-flush".into()).spawn(move || {
             let tick = std::time::Duration::from_millis(10);
             let mut waited = std::time::Duration::ZERO;
             loop {
@@ -233,6 +245,10 @@ fn install_periodic_flush() {
                 }
             }
         });
+        // Only a running flush thread acts on the flag
+        if spawned.is_ok() {
+            install_term_handler();
+        }
     });
 }
 
@@ -240,7 +256,10 @@ static TERM_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::Atomic
 
 /// SIGTERM (Unix) sets a flag the flush thread acts on: a process that a
 /// harness stops with SIGTERM instead of SIGKILL keeps its profile. The
-/// handler itself only stores the flag, which is async-signal-safe.
+/// handler itself only stores the flag, which is async-signal-safe. A
+/// program that handles (or ignores) SIGTERM itself keeps its handler: the
+/// program's behaviour comes first, and its own exit path reaches
+/// `atexit`.
 #[cfg(unix)]
 fn install_term_handler() {
     extern "C" {
@@ -252,8 +271,12 @@ fn install_term_handler() {
     const SIGTERM: i32 = 15;
     // SAFETY: `signal` is provided by the C runtime std links against; the
     // handler is an `extern "C" fn` that only stores an atomic.
+    const SIG_DFL: usize = 0;
     unsafe {
-        signal(SIGTERM, on_term as *const () as usize);
+        let previous = signal(SIGTERM, on_term as *const () as usize);
+        if previous != SIG_DFL {
+            signal(SIGTERM, previous);
+        }
     }
 }
 
@@ -310,11 +333,13 @@ pub fn enter(id: FnId, kind: Kind) -> Guard {
     install_periodic_flush();
     flush_on_activity();
     stats().functions.entry(id).or_default().calls += 1;
-    let depth = STACK.with(|s| {
-        let mut s = s.borrow_mut();
-        s.push(Frame { kind, tainted: false });
-        s.len() - 1
-    });
+    let depth = STACK
+        .try_with(|s| {
+            let mut s = s.borrow_mut();
+            s.push(Frame { id, kind, tainted: false });
+            s.len() - 1
+        })
+        .ok();
     Guard { depth, id }
 }
 
@@ -338,16 +363,30 @@ fn record_clauses(f: &mut FnStats, prefix: &str, eval: &Eval) {
     }
 }
 
+/// The wrapped function below the current frame, as a `pre_false_callers`
+/// key: `verified@<key>`, `trusted@<key>`, or `outside`.
+fn caller_key(guard: &Guard) -> String {
+    let parent = guard.depth.filter(|d| *d > 0).and_then(|d| {
+        STACK
+            .try_with(|s| {
+                s.borrow().get(d - 1).map(|f| format!("{}@{}", f.kind.label(), f.id.key()))
+            })
+            .ok()
+            .flatten()
+    });
+    parent.unwrap_or_else(|| "outside".to_string())
+}
+
 /// Records the verdict of the `requires` of the current frame.
-pub fn pre(guard: &Guard, eval: Eval, caller: &'static Location<'static>) {
+pub fn pre(guard: &Guard, eval: Eval) {
+    let caller = if eval.verdict == Verdict::False { Some(caller_key(guard)) } else { None };
     let mut stats = stats();
     let f = stats.functions.entry(guard.id).or_default();
     f.pre[eval.verdict.index()] += 1;
     record_clauses(f, "pre", &eval);
     match eval.verdict {
         Verdict::False => {
-            let site = format!("{}:{}:{}", caller.file(), caller.line(), caller.column());
-            *f.pre_false_sites.entry(site).or_default() += 1;
+            *f.pre_false_callers.entry(caller.unwrap_or_default()).or_default() += 1;
         }
         Verdict::Unknown => {
             let reason = eval.unknown_reason.as_deref().unwrap_or("unknown");
@@ -361,7 +400,7 @@ pub fn pre(guard: &Guard, eval: Eval, caller: &'static Location<'static>) {
 /// false assumption.
 fn trust_violation(source: String) {
     *stats().trust_violations.entry(source).or_default() += 1;
-    STACK.with(|s| {
+    let _ = STACK.try_with(|s| {
         for frame in s.borrow_mut().iter_mut() {
             if frame.kind == Kind::Verified {
                 frame.tainted = true;
@@ -384,22 +423,6 @@ pub fn trusted_post(guard: &Guard, eval: Eval) {
     }
     if eval.verdict == Verdict::False {
         trust_violation(guard.id.key());
-    }
-}
-
-/// Records the verdict of an `assume` in exec code.
-pub fn assume(eval: Eval, site: &'static Location<'static>) {
-    let key = format!("assume@{}:{}:{}", site.file(), site.line(), site.column());
-    {
-        let mut stats = stats();
-        stats.assume_stats.entry(key.clone()).or_default()[eval.verdict.index()] += 1;
-        if eval.verdict == Verdict::Unknown {
-            let reason = eval.unknown_reason.as_deref().unwrap_or("unknown");
-            *stats.assume_unknown_reasons.entry(format!("{key} {reason}")).or_default() += 1;
-        }
-    }
-    if eval.verdict == Verdict::False {
-        trust_violation(key);
     }
 }
 
@@ -433,14 +456,18 @@ fn install_panic_hook() {
 }
 
 /// Runs lowered clauses under `catch_unwind`. Each clause is its source
-/// line and a closure; evaluation stops at the first `False`. A clause
+/// line and a closure; evaluation stops at the first `False` (a later
+/// clause may assume the earlier ones, so it is not evaluated). A clause
 /// that panics (an index out of range, an `int` outside the `i128` model,
-/// a `choose` with no witness) makes the whole evaluation `Unknown`.
+/// a `choose` with no witness) is `Unknown` and so is the whole
+/// evaluation.
 pub fn eval(clauses: &[(u32, &dyn Fn() -> Clause)]) -> Eval {
     install_panic_hook();
-    let was_silent = SILENT.with(|s| s.replace(true));
+    let was_silent = SILENT.try_with(|s| s.replace(true)).unwrap_or(false);
+    // Filled as the clauses run, so that a panic still leaves the earlier
+    // verdicts (and names the clause that panicked: the next one)
+    let progress: RefCell<Vec<(u32, Verdict)>> = RefCell::new(Vec::with_capacity(clauses.len()));
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let mut verdicts = Vec::with_capacity(clauses.len());
         let mut verdict = Verdict::True;
         let mut reason = None;
         for (line, clause) in clauses {
@@ -454,17 +481,18 @@ pub fn eval(clauses: &[(u32, &dyn Fn() -> Clause)]) -> Eval {
                     Verdict::Unknown
                 }
             };
-            verdicts.push((*line, v));
+            progress.borrow_mut().push((*line, v));
             verdict = verdict.and(v);
             if v == Verdict::False {
                 break;
             }
         }
-        Eval { verdict, clauses: verdicts, unknown_reason: reason }
+        (verdict, reason)
     }));
-    SILENT.with(|s| s.set(was_silent));
+    let _ = SILENT.try_with(|s| s.set(was_silent));
+    let mut seen = progress.into_inner();
     match result {
-        Ok(eval) => eval,
+        Ok((verdict, reason)) => Eval { verdict, clauses: seen, unknown_reason: reason },
         Err(payload) => {
             let reason = if let Some(s) = payload.downcast_ref::<&'static str>() {
                 panic_reason(s)
@@ -473,7 +501,10 @@ pub fn eval(clauses: &[(u32, &dyn Fn() -> Clause)]) -> Eval {
             } else {
                 std::borrow::Cow::Borrowed("panic")
             };
-            Eval::unknown(reason)
+            if let Some((line, _)) = clauses.get(seen.len()) {
+                seen.push((*line, Verdict::Unknown));
+            }
+            Eval { verdict: Verdict::Unknown, clauses: seen, unknown_reason: Some(reason) }
         }
     }
 }
@@ -492,6 +523,10 @@ fn panic_reason(msg: &str) -> std::borrow::Cow<'static, str> {
         "spec fn whose lowering does not compile"
     } else if msg.contains("not lowered") {
         "spec fn not lowered"
+    } else if msg.contains("without a fixed width") {
+        "shift or bitwise not without a fixed width"
+    } else if msg.contains("quantifier range") {
+        "quantifier range too large"
     } else if msg.contains("i128") || msg.contains("out of range") {
         "int outside the i128 model"
     } else if msg.contains("index out of bounds") || msg.contains("out of bounds") {
@@ -571,14 +606,12 @@ fn json_triples(out: &mut String, m: &BTreeMap<String, [u64; 3]>) {
     out.push('}');
 }
 
-/// The profile as JSON, schema version 2 (see `verus-reach`).
+/// The profile as JSON, schema version 3 (see `verus-reach`).
 pub fn to_json() -> String {
     let stats = stats();
     let mut out = String::new();
-    out.push_str("{\"schema_version\":2,\"functions\":{");
-    let mut fns: Vec<(&FnId, &FnStats)> = stats.functions.iter().collect();
-    fns.sort_by_key(|(id, _)| id.key());
-    for (i, (id, f)) in fns.iter().enumerate() {
+    out.push_str("{\"schema_version\":3,\"functions\":{");
+    for (i, (id, f)) in stats.functions.iter().enumerate() {
         if i > 0 {
             out.push(',');
         }
@@ -587,8 +620,8 @@ pub fn to_json() -> String {
         json_triple(&mut out, &f.pre);
         out.push_str(",\"post\":");
         json_triple(&mut out, &f.post);
-        out.push_str(",\"pre_false_sites\":");
-        json_counts(&mut out, &f.pre_false_sites);
+        out.push_str(",\"pre_false_callers\":");
+        json_counts(&mut out, &f.pre_false_callers);
         out.push_str(",\"pre_unknown_reasons\":");
         json_counts(&mut out, &f.pre_unknown_reasons);
         out.push_str(",\"post_unknown_reasons\":");
@@ -602,55 +635,54 @@ pub fn to_json() -> String {
     json_counts(&mut out, &tainted);
     out.push_str(",\"trust_violations\":");
     json_counts(&mut out, &stats.trust_violations);
-    out.push_str(",\"assumes\":");
-    json_triples(&mut out, &stats.assume_stats);
-    out.push_str(",\"assume_unknown_reasons\":");
-    json_counts(&mut out, &stats.assume_unknown_reasons);
     out.push_str("}\n");
     out
 }
 
+/// The profile's path, decided once: `$VERUS_DYNCOV_OUT` names a directory
+/// (it exists, or ends with a separator and is created) and the file is
+/// `dyncov.<pid>-<start>.json` in it, or else it is a prefix and the file
+/// is `<prefix>.<pid>-<start>.json`.
 fn output_path() -> Option<String> {
-    static TOKEN: RwLock<Option<String>> = RwLock::new(None);
+    static PATH: RwLock<Option<String>> = RwLock::new(None);
+    if let Some(p) = &*PATH.read().unwrap_or_else(|e| e.into_inner()) {
+        return Some(p.clone());
+    }
     let prefix = std::env::var("VERUS_DYNCOV_OUT").ok()?;
     if prefix.is_empty() {
         return None;
     }
-    let token = {
-        let read = TOKEN.read().unwrap_or_else(|e| e.into_inner());
-        match &*read {
-            Some(t) => t.clone(),
-            None => {
-                drop(read);
-                let start = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_millis())
-                    .unwrap_or(0);
-                let t = format!("{}-{}", std::process::id(), start);
-                *TOKEN.write().unwrap_or_else(|e| e.into_inner()) = Some(t.clone());
-                t
-            }
-        }
-    };
+    let start = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let token = format!("{}-{}", std::process::id(), start);
     let path = std::path::Path::new(&prefix);
-    Some(if path.is_dir() {
+    let is_dir =
+        path.is_dir() || prefix.ends_with('/') || prefix.ends_with(std::path::MAIN_SEPARATOR);
+    let full = if is_dir {
+        let _ = std::fs::create_dir_all(path);
         path.join(format!("dyncov.{token}.json")).display().to_string()
     } else {
         format!("{prefix}.{token}.json")
-    })
+    };
+    let mut slot = PATH.write().unwrap_or_else(|e| e.into_inner());
+    Some(slot.get_or_insert(full).clone())
 }
 
-/// Writes the profile to `$VERUS_DYNCOV_OUT.<pid>-<start>.json` (or into
-/// that directory, if it names one). Counters are cumulative, so a later
-/// flush overwrites an earlier one. Does nothing when the variable is not
-/// set.
+/// Writes the profile (see [`output_path`]). Counters are cumulative, so a
+/// later flush replaces an earlier one; the file is written whole (to a
+/// temporary name, then renamed) and flushes are serialised, so a reader
+/// never sees a torn profile, whichever threads flush. Does nothing when
+/// `VERUS_DYNCOV_OUT` is not set.
 pub fn flush() {
+    static WRITING: Mutex<()> = Mutex::new(());
     let Some(path) = output_path() else { return };
+    let _writing = WRITING.lock().unwrap_or_else(|e| e.into_inner());
     let json = to_json();
-    if let Some(parent) = std::path::Path::new(&path).parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    if let Err(e) = std::fs::write(&path, json) {
+    let tmp = format!("{path}.tmp");
+    let written = std::fs::write(&tmp, json).and_then(|_| std::fs::rename(&tmp, &path));
+    if let Err(e) = written {
         eprintln!("dyncov: could not write {path}: {e}");
     }
 }
@@ -667,8 +699,6 @@ pub fn stats_snapshot() -> Stats {
         functions: s.functions.clone(),
         tainted: s.tainted.clone(),
         trust_violations: s.trust_violations.clone(),
-        assume_stats: s.assume_stats.clone(),
-        assume_unknown_reasons: s.assume_unknown_reasons.clone(),
     }
 }
 
@@ -681,10 +711,6 @@ mod tests {
 
     fn id(name: &'static str) -> FnId {
         FnId { file: "t.rs", line: 1, name }
-    }
-
-    fn here() -> &'static Location<'static> {
-        Location::caller()
     }
 
     #[test]
@@ -718,10 +744,10 @@ mod tests {
         reset();
         {
             let outer = enter(id("outer"), Kind::Verified);
-            pre(&outer, eval(&[(1, &|| Ok(true))]), here());
+            pre(&outer, eval(&[(1, &|| Ok(true))]));
             {
                 let done = enter(id("done"), Kind::Verified);
-                pre(&done, eval(&[(1, &|| Ok(false))]), here());
+                pre(&done, eval(&[(1, &|| Ok(false))]));
             }
             {
                 let trusted = enter(id("trusted"), Kind::Trusted);
@@ -730,22 +756,24 @@ mod tests {
             {
                 let _after = enter(id("after"), Kind::Verified);
             }
-            assume(eval(&[(9, &|| Ok(false))]), here());
         }
         let s = stats_snapshot();
         assert_eq!(s.functions[&id("outer")].calls, 1);
         assert_eq!(s.functions[&id("outer")].pre, [1, 0, 0]);
         assert_eq!(s.functions[&id("done")].pre, [0, 0, 1]);
-        assert_eq!(s.functions[&id("done")].pre_false_sites.len(), 1);
+        assert_eq!(
+            s.functions[&id("done")].pre_false_callers,
+            BTreeMap::from([("verified@t.rs:1:outer".to_string(), 1)]),
+            "attributed to the frame below, not to a source location"
+        );
         assert_eq!(s.functions[&id("trusted")].post, [0, 0, 1]);
         assert_eq!(s.tainted.get(&id("outer")), Some(&1), "on the stack during the violation");
         assert_eq!(s.tainted.get(&id("done")), None, "returned before it");
         assert_eq!(s.tainted.get(&id("after")), None, "entered after it");
         assert_eq!(s.tainted.get(&id("trusted")), None, "never verified");
-        assert_eq!(s.trust_violations.len(), 2);
-        assert_eq!(s.assume_stats.len(), 1);
+        assert_eq!(s.trust_violations.len(), 1);
         let json = to_json();
-        assert!(json.contains("\"schema_version\":2"));
+        assert!(json.contains("\"schema_version\":3"));
         assert!(json.contains("t.rs:1:outer"));
     }
 

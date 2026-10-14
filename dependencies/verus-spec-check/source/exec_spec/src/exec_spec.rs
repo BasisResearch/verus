@@ -2597,9 +2597,17 @@ fn compile_single_quant_var(
     let upper = Ident::new(&format!("_upper_{}", quant_var), quant_var.span());
     let cur = quant_var;
 
+    // (dyncov) a range too large to iterate makes the clause `Unknown`
+    let range_check = if int_binder {
+        let check = vcheck_int("check_quant_range");
+        quote! { #check(#lower, #upper); }
+    } else {
+        quote! {}
+    };
     let init = quote! {
         let #lower = #compiled_lower;
         let #upper = #compiled_upper;
+        #range_check
         let mut #cur = #lower;
     };
 
@@ -3263,6 +3271,12 @@ fn compile_expr(
             UnOp::Neg(..) if dyncov() => {
                 let expr = compile_expr(ctx, &expr_unary.expr, VarMode::Ref, unverified)?;
                 quote! { ::verus_spec_check::dc_neg(#expr) }
+            }
+            // (dyncov) `!` of a bool negates; of an integer it would need
+            // the operand's width, which the `int` model lost: `Unknown`
+            UnOp::Not(..) if dyncov() => {
+                let expr = compile_expr(ctx, &expr_unary.expr, VarMode::Owned, unverified)?;
+                quote! { ::verus_spec_check::dc_not(#expr) }
             }
             UnOp::Neg(..) | UnOp::Not(..) => {
                 let op = &expr_unary.op;
